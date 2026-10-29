@@ -85,7 +85,7 @@ const PRINCIPAL_A: &str = "11111111-2222-3333-4444-555555555555";
 const UNMINTED_REQUEST_ID: &str = "00000000-0000-4000-8000-000000000000";
 
 /// A router over an organization instance, that instance's ARN, and the engine behind it.
-fn organization_fixture() -> (MultiServiceRouter, String, Arc<engine::InMemoryEngine>) {
+pub(crate) fn organization_fixture() -> (MultiServiceRouter, String, Arc<engine::InMemoryEngine>) {
     let (engine, instance_arn) = organization_engine();
     (router_over(Arc::clone(&engine)), instance_arn, engine)
 }
@@ -106,17 +106,36 @@ pub(crate) fn hold_provisionings(engine: &Arc<engine::InMemoryEngine>, due_at: S
 }
 
 /// An instant far enough ahead that every held provisioning is still in flight.
-fn in_flight() -> SystemTime {
+pub(crate) fn in_flight() -> SystemTime {
     SystemTime::now() + Duration::from_secs(3600)
 }
 
+/// The same clock move as [`hold_provisionings`], applied only to the provisionings that
+/// have NOT landed yet.
+///
+/// A copy that has already reached its target accounts stays landed, so a test can hold
+/// several accepted workflows in flight at once and then decide which of them completes
+/// first.
+pub(crate) fn hold_unapplied_provisionings(
+    engine: &Arc<engine::InMemoryEngine>,
+    due_at: SystemTime,
+) {
+    with_store(engine, |store| {
+        for record in &mut store.permission_set_provisionings {
+            if !record.applied {
+                record.succeeded_due = due_at;
+            }
+        }
+    });
+}
+
 /// An instant far enough behind that every held provisioning has completed.
-fn completed() -> SystemTime {
+pub(crate) fn completed() -> SystemTime {
     SystemTime::now() - Duration::from_secs(60)
 }
 
 /// Create a permission set over the wire and return its minted ARN.
-async fn create_permission_set(
+pub(crate) async fn create_permission_set(
     router: &MultiServiceRouter,
     instance_arn: &str,
     name: &str,

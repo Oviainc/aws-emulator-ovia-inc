@@ -588,6 +588,28 @@ fn provisioning_status_of(provisioned_revision: &str, current_revision: &str) ->
     }
 }
 
+/// The ordering key of the instant a provisioning CAPTURED the definition it carries: the
+/// whole seconds and the sub-second nanoseconds of that instant, which compare exactly as
+/// the instant itself does.
+fn capture_key(captured_at: &DateTime) -> (i64, u32) {
+    (captured_at.secs(), captured_at.subsec_nanos())
+}
+
+/// Whether a provisioning that captured its definition at `captured_at` is NOT OLDER than
+/// the provisioning whose copy is recorded, which captured its own definition at
+/// `recorded_at` — the condition under which the first one's copy is the one in place.
+///
+/// A provisioning copies the definition it captured when it was ACCEPTED, so which copy an
+/// account ends up holding is decided by those capture instants and not by the order the
+/// copies happen to land in: a provisioning accepted while an earlier one was still in
+/// flight carries the later definition, and the earlier one landing afterwards must not
+/// rewind the account to the definition it captured. The two instants being EQUAL answers
+/// true, hence "not older": two provisionings that captured at the same instant captured the
+/// same definition, so either may stand.
+fn is_not_older_than_recorded_copy(captured_at: &DateTime, recorded_at: &DateTime) -> bool {
+    capture_key(captured_at) >= capture_key(recorded_at)
+}
+
 /// The refusal a `ProvisioningStatus` outside the model's enum earns, as the message of
 /// the caller's own `ValidationException`. BUILT from the member the request got wrong
 /// and the values the model declares for it
@@ -2127,6 +2149,16 @@ pub struct AccountAssignmentRecord {
     /// since been left behind by a change to the permission set, without having to
     /// re-derive what the account was given.
     pub provisioned_revision: String,
+    /// The instant the provisioning that recorded [`Self::provisioned_revision`] CAPTURED
+    /// that definition: the instant this assignment was granted while the revision is the
+    /// one the grant provisioned, and the instant a later `ProvisionPermissionSet` call was
+    /// accepted once that provisioning has refreshed the copy.
+    ///
+    /// An account holds the copy the LAST provisioning put there, and a provisioning copies
+    /// the definition it captured when it was accepted rather than when it lands, so this
+    /// instant is what orders the two ([`is_not_older_than_recorded_copy`]): a provisioning that
+    /// captured an older definition never replaces this one, however much later it lands.
+    pub provisioned_at: DateTime,
 }
 
 impl AccountAssignmentRecord {
@@ -2621,6 +2653,11 @@ pub struct ProvisionedCopyRecord {
     /// compares against the permission set's revision now to tell an account holding the
     /// latest definition from one the permission set has changed since.
     pub revision: String,
+    /// The instant the provisioning that delivered [`Self::revision`] CAPTURED it — when
+    /// that provisioning was accepted — which is what orders this copy against every other
+    /// provisioning of the same account, exactly as
+    /// [`AccountAssignmentRecord::provisioned_at`] does for the copy a grant delivered.
+    pub provisioned_at: DateTime,
 }
 
 /// One COPY of a permission set an account holds, as the single pass over the records
@@ -2865,6 +2902,13 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// account, whose revision is what [`Self::provisioned_accounts`] compares for an
     /// assigned account, and as a [`ProvisionedCopyRecord`], which is what a reader has for
     /// an account no assignment reaches.
+    ///
+    /// Either place can already hold a copy a LATER provisioning recorded — granting an
+    /// assignment provisions the permission set into its account at the instant the grant
+    /// is accepted, so a grant made while this workflow was in flight carries the later
+    /// definition — and such a copy is left alone ([`is_not_older_than_recorded_copy`]): this
+    /// provisioning copies what it captured when it was accepted, which does not undo the
+    /// provisioning that followed it.
     fn apply_provisioning(&mut self, index: usize) {
         let Some(record) = self.permission_set_provisionings.get_mut(index) else {
             return;
@@ -2876,6 +2920,7 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         let instance_arn = record.instance_arn.clone();
         let permission_set_arn = record.permission_set_arn.clone();
         let revision = record.revision.clone();
+        let captured_at = record.created_date;
         let accounts = record.accounts.clone();
         for row in &mut self.account_assignments {
             if row.instance_arn != instance_arn || row.permission_set_arn != permission_set_arn {
@@ -2884,16 +2929,31 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
             if !accounts.contains(&row.account_id) {
                 continue;
             }
+            if !is_not_older_than_recorded_copy(&captured_at, &row.provisioned_at) {
+                continue;
+            }
             row.provisioned_revision = revision.clone();
+            row.provisioned_at = captured_at;
         }
         for account_id in &accounts {
-            self.record_provisioned_copy(&instance_arn, &permission_set_arn, account_id, &revision);
+            self.record_provisioned_copy(
+                &instance_arn,
+                &permission_set_arn,
+                account_id,
+                &revision,
+                captured_at,
+            );
         }
     }
 
-    /// Record that `account_id` holds the copy of `permission_set_arn` a provisioning
-    /// delivered at `revision`, REPLACING the copy that account held before: an account
-    /// holds one copy of a permission set, the one the last provisioning put there.
+    /// Record that `account_id` holds the copy of `permission_set_arn` a provisioning that
+    /// captured its definition at `captured_at` delivered at `revision`, REPLACING the copy
+    /// that account held before: an account holds one copy of a permission set, the one the
+    /// last provisioning put there.
+    ///
+    /// A copy a LATER provisioning recorded is kept instead, under the rule
+    /// [`is_not_older_than_recorded_copy`] states: the copy in place is the one whose definition
+    /// was captured last, whatever order the provisionings carrying them landed in.
     ///
     /// Evicts the copies that landed longest ago while the store is over
     /// [`MAX_RECORDS_PER_STORE`], for the reason given on [`Self::provisioned_copies`].
@@ -2903,11 +2963,15 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         permission_set_arn: &str,
         account_id: &str,
         revision: &str,
+        captured_at: DateTime,
     ) {
         if let Some(copy) =
             self.provisioned_copy_mut(instance_arn, permission_set_arn, account_id)
         {
-            copy.revision = revision.to_string();
+            if is_not_older_than_recorded_copy(&captured_at, &copy.provisioned_at) {
+                copy.revision = revision.to_string();
+                copy.provisioned_at = captured_at;
+            }
             return;
         }
         self.provisioned_copies.push(ProvisionedCopyRecord {
@@ -2915,6 +2979,7 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
             permission_set_arn: permission_set_arn.to_string(),
             account_id: account_id.to_string(),
             revision: revision.to_string(),
+            provisioned_at: captured_at,
         });
         let excess = self
             .provisioned_copies
@@ -2949,17 +3014,25 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// go on reporting the same definition. Nothing is recorded for an account no
     /// provisioning ever targeted, so withdrawing its last assignment deprovisions it as
     /// before.
+    ///
+    /// `captured_at` is the instant the withdrawn row's copy was captured, so a copy a
+    /// LATER provisioning delivered is kept instead, under the one rule
+    /// [`is_not_older_than_recorded_copy`] states.
     pub fn keep_withdrawn_copy(
         &mut self,
         instance_arn: &str,
         permission_set_arn: &str,
         account_id: &str,
         revision: &str,
+        captured_at: DateTime,
     ) {
         if let Some(copy) =
             self.provisioned_copy_mut(instance_arn, permission_set_arn, account_id)
         {
-            copy.revision = revision.to_string();
+            if is_not_older_than_recorded_copy(&captured_at, &copy.provisioned_at) {
+                copy.revision = revision.to_string();
+                copy.provisioned_at = captured_at;
+            }
         }
     }
 
@@ -3621,20 +3694,19 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
 
     /// The ONE expression of "which copy of a permission set an account holds" under
     /// `instance_arn`: every (permission set, account) pair a provisioning has put a copy
-    /// into, with the status that copy is in, yielded in the order the records put it
-    /// there.
+    /// into, with the status that copy is in.
     ///
     /// An account holds a permission set once it has been provisioned there — which both
     /// granting an account assignment on that account and provisioning the permission set
     /// into it do — however many principals were assigned through it. Both ways a copy
     /// reaches an account are walked here, the copies a provisioning delivered to the
-    /// accounts it targeted ([`Self::provisioned_copies`]) before the revision each
-    /// assignment granted on an account recorded
-    /// ([`AccountAssignmentRecord::provisioned_revision`]), so a pair reached both ways
-    /// is yielded LAST as its assignment row, which is the later of the two and the copy
-    /// in place. A projection collecting by one axis therefore keeps the last yield for a
-    /// pair, and a provisioning that followed a change to the permission set brings the
-    /// account back up to date.
+    /// accounts it targeted ([`Self::provisioned_copies`]) and the revision each assignment
+    /// granted on an account recorded ([`AccountAssignmentRecord::provisioned_revision`]),
+    /// and the copy a pair is yielded with is the one whose definition was captured LAST
+    /// ([`is_not_older_than_recorded_copy`]) — the copy the last provisioning of that account put
+    /// there, whether that provisioning was a grant or a `ProvisionPermissionSet` call. A
+    /// pair is therefore yielded exactly once, so either projection of this relation reports
+    /// an account, or a permission set, at most once.
     ///
     /// The status is COMPUTED, in the one place that comparison is made
     /// ([`provisioning_status_of`]), against the revision of each permission set as it
@@ -3652,9 +3724,8 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
             .filter(|copy| copy.instance_arn == instance_arn)
             .map(|copy| {
                 (
-                    copy.permission_set_arn.as_str(),
-                    copy.account_id.as_str(),
-                    copy.revision.as_str(),
+                    (copy.permission_set_arn.as_str(), copy.account_id.as_str()),
+                    (&copy.provisioned_at, copy.revision.as_str()),
                 )
             });
         let rows = self
@@ -3663,27 +3734,39 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
             .filter(|row| row.instance_arn == instance_arn)
             .map(|row| {
                 (
-                    row.permission_set_arn.as_str(),
-                    row.account_id.as_str(),
-                    row.provisioned_revision.as_str(),
+                    (row.permission_set_arn.as_str(), row.account_id.as_str()),
+                    (&row.provisioned_at, row.provisioned_revision.as_str()),
                 )
             });
+        // The copy IN PLACE for each pair: the one the last provisioning of that account
+        // recorded, which the capture instant beside each recorded revision decides.
+        let mut in_place: BTreeMap<(&str, &str), (&DateTime, &str)> = BTreeMap::new();
+        for (pair, recorded) in copies.chain(rows) {
+            let keep = in_place
+                .get(&pair)
+                .is_none_or(|held| is_not_older_than_recorded_copy(recorded.0, held.0));
+            if keep {
+                in_place.insert(pair, recorded);
+            }
+        }
         // Each permission set's current revision, derived at most once however many
         // records provisioned it, and absent for one this instance no longer holds.
         let mut revisions: BTreeMap<&str, Option<String>> = BTreeMap::new();
-        copies
-            .chain(rows)
-            .filter_map(|(permission_set_arn, account_id, recorded_revision)| {
-                let current = revisions.entry(permission_set_arn).or_insert_with(|| {
-                    self.permission_set(instance_arn, permission_set_arn)
-                        .map(|permission_set| permission_set.definition_revision())
-                });
-                Some(HeldCopy {
-                    permission_set_arn,
-                    account_id,
-                    status: provisioning_status_of(recorded_revision, current.as_deref()?),
-                })
-            })
+        in_place
+            .into_iter()
+            .filter_map(
+                |((permission_set_arn, account_id), (_, recorded_revision))| {
+                    let current = revisions.entry(permission_set_arn).or_insert_with(|| {
+                        self.permission_set(instance_arn, permission_set_arn)
+                            .map(|permission_set| permission_set.definition_revision())
+                    });
+                    Some(HeldCopy {
+                        permission_set_arn,
+                        account_id,
+                        status: provisioning_status_of(recorded_revision, current.as_deref()?),
+                    })
+                },
+            )
             .collect()
     }
 

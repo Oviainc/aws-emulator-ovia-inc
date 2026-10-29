@@ -318,6 +318,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 created_date,
                 request_id: request_id.clone(),
                 provisioned_revision,
+                // The grant provisions the permission set NOW, so this is the instant the
+                // definition recorded above was captured: a provisioning accepted earlier
+                // and still in flight carries an older definition and leaves this copy
+                // alone when it lands.
+                provisioned_at: created_date,
             });
         store.assignment_operations.insert(
             request_id.clone(),

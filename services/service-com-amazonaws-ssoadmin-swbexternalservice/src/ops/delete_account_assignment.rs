@@ -274,6 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &removed.permission_set_arn,
             &removed.account_id,
             &removed.provisioned_revision,
+            removed.provisioned_at,
         );
         // The creation status of that assignment goes with it: a status record reports on
         // one assignment, so keeping it after the assignment is gone would report work on

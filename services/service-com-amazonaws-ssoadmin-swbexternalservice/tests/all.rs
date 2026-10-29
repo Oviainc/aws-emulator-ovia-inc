@@ -155,6 +155,8 @@ mod permissions_boundary_get;
 mod policy_attach_conflict;
 #[path = "all/provisioned_copy_projections.rs"]
 mod provisioned_copy_projections;
+#[path = "all/provisioning_capture_order.rs"]
+mod provisioning_capture_order;
 #[path = "all/region_describe.rs"]
 mod region_describe;
 #[path = "all/region_list.rs"]
