@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // The authorization gate, BEFORE any member of the payload is examined.
-        crate::state::require_administrator(&store, &region)?;
+        crate::state::require_administrator_at(&store, &region, now)?;
 
         // The SERVICE-OWNED members are taken out of the stored copy:
         // `ResourceSetRecord` is the single source of truth for the `Id`, the

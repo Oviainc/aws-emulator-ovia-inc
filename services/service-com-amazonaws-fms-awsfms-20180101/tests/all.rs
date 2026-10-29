@@ -85,6 +85,12 @@ mod pending_transition_settling;
 #[path = "all/policy_document_defaults.rs"]
 mod policy_document_defaults;
 
+// Declared beside them, for the same reason: this suite's name sorts right into
+// the contended region of the list below. The suite itself is an ordinary
+// `tests/all/<name>.rs` file.
+#[path = "all/administrator_gate_clock_reading.rs"]
+mod administrator_gate_clock_reading;
+
 #[path = "all/admin_account_disassociation.rs"]
 mod admin_account_disassociation;
 #[path = "all/admin_account_scopes.rs"]

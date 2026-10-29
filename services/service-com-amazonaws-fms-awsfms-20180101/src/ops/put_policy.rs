@@ -500,7 +500,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before the `PolicyId` is resolved and before anything is written, so an
         // unauthorized caller learns nothing about what the organisation holds
         // and a refused call leaves the store exactly as it was.
-        crate::state::require_administrator(&store, &region)?;
+        crate::state::require_administrator_at(&store, &region, now)?;
 
         // Everything the caller sent is stored verbatim; nothing the service
         // owns is.

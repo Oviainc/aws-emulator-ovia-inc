@@ -234,7 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the organization must have been onboarded to Firewall Manager by
         // `AssociateAdminAccount` for there to be an organization to onboard an
         // administrator into.
-        let default_admin = crate::state::require_administrator(&store, &region)?
+        let default_admin = crate::state::require_administrator_at(&store, &region, now)?
             .account_id
             .clone();
 

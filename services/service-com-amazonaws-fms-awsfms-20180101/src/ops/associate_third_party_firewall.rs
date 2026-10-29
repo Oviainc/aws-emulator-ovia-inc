@@ -183,7 +183,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // The authorization gate, BEFORE the vendor association is touched.
-        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+        crate::state::require_administrator_at(
+            &store,
+            &crate::state::request_region(ctx.parts()),
+            now,
+        )?;
 
         let record = store
             .third_party_firewalls

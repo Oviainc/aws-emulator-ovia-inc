@@ -2330,7 +2330,7 @@ fn out_of_admin_scope_refusal(
 /// `AccessDeniedException`, which this service's model declares for no
 /// operation (hence [`crate::scaffolded::Scaffolded::access_denied`], HTTP 400).
 ///
-/// It answers through [`AdminAccountRecord::is_active`], so an association
+/// It answers through [`AdminAccountRecord::is_active_at`], so an association
 /// `DisassociateAdminAccount` has torn down is no administrator: the gate closes
 /// again once the tear-down the clock owed has completed, whether or not any
 /// operation has materialised the `DELETED` status yet. It therefore takes the
@@ -2371,9 +2371,14 @@ pub fn no_administrator_refusal<E>(region: &str) -> crate::scaffolded::Scaffolde
     ))
 }
 
-/// The association that authorizes an organization-scoped call: the active
-/// Firewall Manager administrator, or [`no_administrator_refusal`] when the
-/// organization holds none.
+/// The association that authorizes an organization-scoped call AS OF `now`: the
+/// administrator that is active at that instant, or [`no_administrator_refusal`]
+/// when the organization holds none then.
+///
+/// It takes `now` for the same reason [`AdminAccountRecord::is_active_at`] does:
+/// the gate and everything the request answers from decide from ONE reading of a
+/// clock that is not monotonic, so a request cannot be authorized at one instant
+/// and answered — or written — from another.
 ///
 /// It is taken only by the operations whose recorded answer to a caller with no
 /// administrator association IS this refusal. The resource-level tagging
@@ -2381,15 +2386,34 @@ pub fn no_administrator_refusal<E>(region: &str) -> crate::scaffolded::Scaffolde
 /// `ResourceArn` and nothing else, declare no authorization error in their error
 /// unions, and are answered from that ARN alone — its form, then its resolution
 /// — so they do not call this.
-pub fn require_administrator<'store, E>(
+pub fn require_administrator_at<'store, E>(
     store: &'store ComAmazonawsFmsAwsfms20180101State,
     region: &str,
+    now: SystemTime,
 ) -> Result<&'store AdminAccountRecord, crate::scaffolded::Scaffolded<E>> {
     store
         .admin_account
         .as_ref()
-        .filter(|admin| admin.is_active())
+        .filter(|admin| admin.is_active_at(now))
         .ok_or_else(|| no_administrator_refusal(region))
+}
+
+/// [`require_administrator_at`] at the current instant: the gate for a handler
+/// that makes no OTHER clock-derived decision, so this reading is the whole
+/// request's one reading.
+///
+/// A handler that already holds a reading — because it settles what the clock
+/// owes, projects a status as of an instant, or writes a due instant — calls
+/// [`require_administrator_at`] with THAT reading instead, the same way
+/// [`ComAmazonawsFmsAwsfms20180101State::active_admin_account_mut_at`] exists
+/// beside [`ComAmazonawsFmsAwsfms20180101State::active_admin_account`]: a clock
+/// that is not monotonic must not be able to authorize a request at one instant
+/// and answer it from another.
+pub fn require_administrator<'store, E>(
+    store: &'store ComAmazonawsFmsAwsfms20180101State,
+    region: &str,
+) -> Result<&'store AdminAccountRecord, crate::scaffolded::Scaffolded<E>> {
+    require_administrator_at(store, region, SystemTime::now())
 }
 
 /// The `AdminScope` of the organization's DEFAULT administrator: everything.

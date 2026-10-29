@@ -178,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The authorization gate, BEFORE the pagination token is examined: this
         // call is organisation-scoped, so a caller that is not entitled to it
         // cannot learn anything about what the organization holds.
-        crate::state::require_administrator(&store, &region)?;
+        crate::state::require_administrator_at(&store, &region, now)?;
 
         // A token this service did not mint names no page boundary. The model
         // declares no client-input error for this operation, so refuse it as a

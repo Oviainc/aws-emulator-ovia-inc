@@ -196,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The authorization gate, BEFORE the account is looked up, so a caller
         // that is not entitled to an organization-scoped call cannot learn
         // whether an account is an administrator.
-        let default_admin = crate::state::require_administrator(&store, &region)?.clone();
+        let default_admin = crate::state::require_administrator_at(&store, &region, now)?.clone();
 
         if input.admin_account == default_admin.account_id {
             return Ok(GetAdminScopeOutput {
