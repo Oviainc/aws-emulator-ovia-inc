@@ -370,18 +370,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if store
-            .firewall_rule_group_associations
-            .values()
-            .any(|record| record.vpc_id == input.vpc_id && record.priority == input.priority)
-        {
+        if let Some(holder) = store.firewall_rule_group_association_holding_priority(
+            &input.vpc_id,
+            input.priority,
+            None,
+        ) {
+            let holder_id = holder.id.clone();
             return Err(AssociateFirewallRuleGroupErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "Priority {} is already in use by another rule group associated with VPC {}",
-                        input.priority, input.vpc_id
-                    )),
-                },
+                crate::state::association_priority_in_use(&holder_id),
             )
             .into());
         }

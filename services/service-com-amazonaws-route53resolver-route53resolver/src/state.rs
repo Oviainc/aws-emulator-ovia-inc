@@ -333,6 +333,27 @@ pub const RSLVR_CODE_INVALID_IAM_POLICY: &str = "RSLVR-02035";
 /// [`query_log_config_policy_access_denied`].
 pub const RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_ACCESS_DENIED: &str = "RSLVR-01600";
 
+/// The Route 53 Resolver service error code reported when a DNS Firewall
+/// rule-group association is asked for a `Priority` another association of the
+/// same VPC already holds.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP
+/// status (400) and the exception shape name together do not say which Resolver
+/// fault occurred — the associate and the update both raise
+/// `ValidationException` for several distinct faults — and the model states no
+/// message text, so this code comes from the recorded responses of those two
+/// operations. See [`association_priority_in_use`].
+pub const RSLVR_CODE_ASSOCIATION_PRIORITY_IN_USE: &str = "RSLVR-02303";
+
+/// The Route 53 Resolver service error code reported when a change to, or a
+/// removal of, a DNS Firewall rule-group association is refused because the
+/// association carries mutation protection.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ASSOCIATION_PRIORITY_IN_USE`],
+/// and it comes from the recorded responses of the update and the disassociate.
+/// See [`mutation_protection_forbids_change`].
+pub const RSLVR_CODE_ASSOCIATION_MUTATION_PROTECTED: &str = "RSLVR-02307";
+
 /// `ResourceNotFoundException$ResourceType`, "the type of resource that doesn't
 /// exist": the modelled shape name of a Resolver endpoint.
 pub const RESOURCE_TYPE_RESOLVER_ENDPOINT: &str = "ResolverEndpoint";
@@ -1791,17 +1812,42 @@ pub fn firewall_rule_group_association_not_found(
 ///
 /// `MutationProtection`'s doc states what the setting does: "If enabled, this
 /// setting disallows modification or removal of the association, to help prevent
-/// against accidentally altering DNS firewall protections." A caller that asked
-/// for that protection is told which association refused the change and how to
-/// lift it.
-pub fn mutation_protection_forbids_change(
-    firewall_rule_group_association_id: &str,
+/// against accidentally altering DNS firewall protections." The refusal is the
+/// RSLVR-coded sentence the service states for that fault
+/// ([`RSLVR_CODE_ASSOCIATION_MUTATION_PROTECTED`]): it names neither the
+/// association nor the member that was to change, so nothing is interpolated
+/// into it, and the update and the disassociate report the same body.
+pub fn mutation_protection_forbids_change() -> ValidationException {
+    ValidationException {
+        message: Some(rslvr_message(
+            RSLVR_CODE_ASSOCIATION_MUTATION_PROTECTED,
+            "The DNS Firewall rule group association is under mutation protection. \
+             Remove the mutation protection and try again",
+        )),
+    }
+}
+
+/// The `ValidationException` the associate and the update of a rule-group
+/// association are refused with when the `Priority` they ask for is one another
+/// association of the same VPC already holds.
+///
+/// `AssociateFirewallRuleGroup$Priority`'s doc states the rule: "You must
+/// specify a unique priority for each rule group that you associate with a
+/// single VPC." The refusal is the RSLVR-coded sentence the service states for
+/// that fault ([`RSLVR_CODE_ASSOCIATION_PRIORITY_IN_USE`]), which names the
+/// association that already holds the priority — read out of this store, so the
+/// caller can address the one it clashed with — and asks for another number.
+pub fn association_priority_in_use(
+    holding_firewall_rule_group_association_id: &str,
 ) -> ValidationException {
     ValidationException {
-        message: Some(format!(
-            "The firewall rule group association with ID \
-             \"{firewall_rule_group_association_id}\" has MutationProtection {MUTATION_PROTECTION_ENABLED}; \
-             disable it before modifying or removing the association"
+        message: Some(rslvr_message(
+            RSLVR_CODE_ASSOCIATION_PRIORITY_IN_USE,
+            &format!(
+                "This priority is the same with another association: \
+                 \"{holding_firewall_rule_group_association_id}\" . \
+                 Try again with another priority number"
+            ),
         )),
     }
 }
@@ -4808,6 +4854,31 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
             .find(|record| {
                 record.firewall_rule_group_id == firewall_rule_group_id && record.vpc_id == vpc_id
             })
+    }
+
+    /// The association of `vpc_id` that already holds `priority`, if the store
+    /// holds one, skipping the association `excluding` names.
+    ///
+    /// "You must specify a unique priority for each rule group that you
+    /// associate with a single VPC": this is the lookup both
+    /// `AssociateFirewallRuleGroup` and `UpdateFirewallRuleGroupAssociation`
+    /// consult before writing a priority, so the two cannot drift apart, and it
+    /// answers the record itself because the refusal names the association that
+    /// holds the priority ([`association_priority_in_use`]). `excluding` is the
+    /// association being updated, which never clashes with itself. The scan is
+    /// over a store bounded by
+    /// [`MAX_STORED_FIREWALL_RULE_GROUP_ASSOCIATIONS`].
+    pub fn firewall_rule_group_association_holding_priority(
+        &self,
+        vpc_id: &str,
+        priority: i32,
+        excluding: Option<&str>,
+    ) -> Option<&FirewallRuleGroupAssociationRecord> {
+        self.firewall_rule_group_associations.values().find(|record| {
+            record.vpc_id == vpc_id
+                && record.priority == priority
+                && excluding.is_none_or(|id| record.id != id)
+        })
     }
 
     /// Every stored rule-group-to-VPC association in creation order — the order

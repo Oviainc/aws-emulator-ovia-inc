@@ -192,9 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if mutation_protection == crate::state::MUTATION_PROTECTION_ENABLED {
                 return Err(
                     DisassociateFirewallRuleGroupErrorModeled::ValidationException(
-                        crate::state::mutation_protection_forbids_change(
-                            &input.firewall_rule_group_association_id,
-                        ),
+                        crate::state::mutation_protection_forbids_change(),
                     )
                     .into(),
                 );

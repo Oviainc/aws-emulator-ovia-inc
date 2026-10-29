@@ -284,9 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(
                 UpdateFirewallRuleGroupAssociationErrorModeled::ValidationException(
-                    crate::state::mutation_protection_forbids_change(
-                        &input.firewall_rule_group_association_id,
-                    ),
+                    crate::state::mutation_protection_forbids_change(),
                 )
                 .into(),
             );
@@ -296,18 +294,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // associate with a single VPC": a priority another association of the
         // same VPC already holds is refused and nothing is written.
         if let Some(priority) = input.priority {
-            if store.firewall_rule_group_associations.values().any(|record| {
-                record.vpc_id == vpc_id
-                    && record.priority == priority
-                    && record.id != input.firewall_rule_group_association_id
-            }) {
+            let holder = store
+                .firewall_rule_group_association_holding_priority(
+                    &vpc_id,
+                    priority,
+                    Some(&input.firewall_rule_group_association_id),
+                )
+                .map(|record| record.id.clone());
+            if let Some(holder_id) = holder {
                 return Err(
                     UpdateFirewallRuleGroupAssociationErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(format!(
-                                "Priority {priority} is already in use by another rule group associated with VPC {vpc_id}"
-                            )),
-                        },
+                        crate::state::association_priority_in_use(&holder_id),
                     )
                     .into(),
                 );
