@@ -5008,7 +5008,65 @@ impl ComAmazonawsGroundstationGroundstationState {
         Some(removed)
     }
 
-    /// The contacts the ephemeris `ephemeris_id` names POINTS, whatever status each of them
+    /// The ephemeris in force for every satellite the account holds one for, keyed by the
+    /// `satelliteId` it was stored against: this crate's ONE answer to "which ephemeris is
+    /// a satellite's trajectory computed from", built once for every caller of it.
+    ///
+    /// An ephemeris is in force for the satellite it was stored against once it is
+    /// [`EPHEMERIS_ENABLED`] — the status of one whose data validated and which the
+    /// account asked to be used, where every other status an ephemeris can hold is one no
+    /// trajectory is computed from (still validating, kept disabled, failed validation, or
+    /// expired) — and the one of highest precedence takes the satellite
+    /// ([`ephemeris_precedence`]), so AT MOST ONE is in force per satellite however many
+    /// enabled ones the account holds for it.
+    ///
+    /// Keyed by the satellite each ephemeris is held for in ONE pass over the ephemerides,
+    /// so the work is linear in the store rather than a scan of it per satellite. The key
+    /// is the id the ephemeris names, whether or not this account is on-boarded to a
+    /// satellite under it.
+    fn ephemerides_in_force(&self) -> HashMap<&str, &Ephemeris> {
+        let mut in_force: HashMap<&str, &Ephemeris> = HashMap::new();
+        for ephemeris in self.ephemerides.values() {
+            let Some(satellite_id) = ephemeris.satellite_id.as_deref() else {
+                continue;
+            };
+            if ephemeris.status != EPHEMERIS_ENABLED {
+                continue;
+            }
+            let takes_over = in_force.get(satellite_id).is_none_or(|held| {
+                ephemeris_precedence(ephemeris, held) == ::std::cmp::Ordering::Greater
+            });
+            if takes_over {
+                in_force.insert(satellite_id, ephemeris);
+            }
+        }
+        in_force
+    }
+
+    /// The ephemeris in force for the satellite `satellite_id` names, by the rule
+    /// [`Self::ephemerides_in_force`] states; `None` when the account holds none in force
+    /// for it.
+    pub fn ephemeris_in_force_for_satellite(&self, satellite_id: &str) -> Option<&Ephemeris> {
+        self.ephemerides_in_force().get(satellite_id).copied()
+    }
+
+    /// The ARN of the satellite whose passes are flown on the ephemeris `ephemeris_id`
+    /// names; `None` when no pass is flown on it.
+    ///
+    /// A pass is flown on the ephemeris in force for the satellite it is flown against
+    /// ([`Self::ephemeris_in_force_for_satellite`]), so an ephemeris is the trajectory of a
+    /// satellite's passes only while it is the one in force for it: one that applies to no
+    /// satellite, one of a satellite this account is not on-boarded to, and one another
+    /// held for the same satellite supersedes are each the trajectory of nothing.
+    fn satellite_flown_on_ephemeris(&self, ephemeris_id: &str) -> Option<&str> {
+        let satellite_id = self.ephemerides.get(ephemeris_id)?.satellite_id.as_deref()?;
+        let in_force = self.ephemeris_in_force_for_satellite(satellite_id)?;
+        if in_force.ephemeris_id != ephemeris_id {
+            return None;
+        }
+        Some(self.satellites.get(satellite_id)?.satellite_arn.as_str())
+    }
+
     /// holds — what a listing filtering on an ephemeris selects; empty when it points
     /// nothing.
     ///
@@ -5026,42 +5084,33 @@ impl ComAmazonawsGroundstationGroundstationState {
     /// restriction belongs to the IN-USE question alone
     /// ([`Self::contacts_using_ephemeris`]), which is a different question.
     ///
-    /// For the SATELLITE coupling, only an ephemeris whose status is [`EPHEMERIS_ENABLED`]
-    /// is in force: that status is what "whether or not the ephemeris is enabled"
-    /// (`smithy_query(query="operation", operation="DescribeEphemeris")`) reports, and one
-    /// still validating, disabled, invalid or expired is not the trajectory anything is
-    /// flown on. A contact that names an ephemeris OUTRIGHT holds it whatever its status:
-    /// the reference is the contact's own configuration, not a trajectory the service
-    /// chose. CHOSEN coupling: AWS documents only which ephemeris a pass is flown on, so
-    /// which contacts an ephemeris points is this emulator's rule, stated once here rather
-    /// than per operation.
+    /// For the SATELLITE coupling, the ephemeris a satellite's passes are flown on is the
+    /// ONE in force for it ([`Self::ephemeris_in_force_for_satellite`]): being
+    /// [`EPHEMERIS_ENABLED`] only puts an ephemeris in the running, and of those held for
+    /// one satellite the highest precedence takes it, so a superseded ephemeris is the
+    /// trajectory of no pass. A contact that names an ephemeris OUTRIGHT holds it whatever
+    /// its status: the reference is the contact's own configuration, not a trajectory the
+    /// service chose. CHOSEN coupling: AWS documents only which ephemeris a pass is flown
+    /// on, so which contacts an ephemeris points is this emulator's rule, stated once here
+    /// rather than per operation.
     ///
     /// Sorted, so every answer built from it reads the same on every call whatever order
     /// the map iterates in.
     pub fn contacts_pointed_by_ephemeris(&self, ephemeris_id: &str) -> Vec<String> {
-        let Some(ephemeris) = self.ephemerides.get(ephemeris_id) else {
+        if !self.ephemerides.contains_key(ephemeris_id) {
             return Vec::new();
-        };
-        // The satellite whose passes are flown on this ephemeris, when it is in force at
-        // all and applies to a satellite this account is on-boarded to: an ephemeris that
-        // applies to no satellite is the trajectory of nothing.
-        let flown_satellite_arn = if ephemeris.status == EPHEMERIS_ENABLED {
-            ephemeris
-                .satellite_id
-                .as_deref()
-                .and_then(|satellite_id| self.satellites.get(satellite_id))
-                .map(|satellite| satellite.satellite_arn.clone())
-        } else {
-            None
-        };
+        }
+        // The satellite whose passes are flown on this ephemeris: the one it was stored
+        // against, when this is the ephemeris in force for it and that satellite is one
+        // this account is on-boarded to. An ephemeris that applies to no satellite, and one
+        // another supersedes, is the trajectory of nothing.
+        let flown_satellite_arn = self.satellite_flown_on_ephemeris(ephemeris_id);
         let mut pointed: Vec<String> = self
             .contacts
             .values()
             .filter(|contact| {
                 contact.program_tracks_ephemeris(ephemeris_id)
-                    || flown_satellite_arn
-                        .as_deref()
-                        .is_some_and(|arn| contact.flies_satellite(arn))
+                    || flown_satellite_arn.is_some_and(|arn| contact.flies_satellite(arn))
             })
             .map(|contact| contact.contact_id.clone())
             .collect();
@@ -5118,40 +5167,32 @@ impl ComAmazonawsGroundstationGroundstationState {
     /// later caller could otherwise have seen. Callers that depend on an ephemeris status
     /// the clock has already made due call [`Self::settle_due_ephemerides`] first.
     ///
-    /// An ephemeris is in force for the satellite it was stored against once it is
-    /// [`EPHEMERIS_ENABLED`] — the status of one whose data validated and which the
-    /// account asked to be used, where every other status an ephemeris can hold is one no
-    /// trajectory is computed from (still validating, kept disabled, failed validation, or
-    /// expired) — and the one of highest precedence takes the satellite
-    /// ([`ephemeris_precedence`]).
+    /// An ephemeris is in force for the satellite it was stored against by the one rule
+    /// [`Self::ephemerides_in_force`] states, which this shares with every other caller
+    /// that asks which ephemeris a satellite's passes are flown on.
     ///
     /// An ephemeris in force supersedes whatever default ephemeris the onboarding knows
     /// (AWS generates one from Space Track outside this API), so a default is left alone
     /// here and only a customer-provided reference is dropped — which is how a satellite
     /// falls back to its default once the account holds nothing in force for it.
     pub fn refresh_current_ephemerides(&mut self) {
-        // ONE pass over the ephemerides, keyed by the satellite each is held for, so the
-        // work is linear in the store rather than a scan of it per satellite.
-        let mut in_force: HashMap<&str, &Ephemeris> = HashMap::new();
-        for ephemeris in self.ephemerides.values() {
-            let Some(satellite_id) = ephemeris.satellite_id.as_deref() else {
-                continue;
-            };
-            if ephemeris.status != EPHEMERIS_ENABLED {
-                continue;
-            }
-            let takes_over = in_force.get(satellite_id).is_none_or(|held| {
-                ephemeris_precedence(ephemeris, held) == ::std::cmp::Ordering::Greater
-            });
-            if takes_over {
-                in_force.insert(satellite_id, ephemeris);
-            }
-        }
+        // The metadata is taken OWNED first, so the borrow of the ephemerides this reads
+        // ends before the satellites it writes are borrowed.
+        let in_force: HashMap<String, EphemerisMetaData> = self
+            .ephemerides_in_force()
+            .into_iter()
+            .map(|(satellite_id, ephemeris)| {
+                (
+                    satellite_id.to_string(),
+                    customer_ephemeris_metadata(ephemeris),
+                )
+            })
+            .collect();
 
         for satellite in self.satellites.values_mut() {
             match in_force.get(satellite.satellite_id.as_str()) {
-                Some(ephemeris) => {
-                    satellite.current_ephemeris = Some(customer_ephemeris_metadata(ephemeris));
+                Some(metadata) => {
+                    satellite.current_ephemeris = Some(metadata.clone());
                 }
                 None => {
                     let customer_provided = satellite.current_ephemeris.as_ref().is_some_and(
@@ -5371,11 +5412,16 @@ impl ComAmazonawsGroundstationGroundstationState {
     /// data is in force for it.
     ///
     /// Pointing data is in force when it belongs to an ENABLED ephemeris
-    /// ([`EPHEMERIS_ENABLED`] — the same reading of "in force" as
-    /// [`Self::contacts_using_ephemeris`]) that applies to that satellite and was supplied
+    /// ([`EPHEMERIS_ENABLED`]) that applies to that satellite and was supplied
     /// for that station: az/el data "is specific to this ground station and can't be used at
     /// other locations" (`smithy_query(query="doc", shape="AzElEphemeris",
     /// member="groundStation")`).
+    ///
+    /// SEVERAL enabled ephemerides of one satellite can each describe a pass here, which is
+    /// a WIDER reading of "in force" than the single one the satellite coupling takes
+    /// ([`Self::ephemerides_in_force`]): `priority` decides "which ephemeris to use when
+    /// multiple ephemerides overlap", so two that do NOT overlap each describe passes of
+    /// their own.
     ///
     /// Where two ephemerides describe the same instants, the HIGHER PRIORITY one is the one
     /// used — `priority` is "a priority score that determines which ephemeris to use when

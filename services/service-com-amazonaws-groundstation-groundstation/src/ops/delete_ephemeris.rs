@@ -11,14 +11,16 @@
 //! resource.
 //!
 //! An ephemeris a contact still to be flown depends on is NOT removed: the trajectory a
-//! pass is flown on is the ephemeris in force for the contact's satellite, so while any
-//! contact of that satellite is in a non-terminal `ContactStatus` the delete is refused
-//! with the modelled `ResourceInUseException` and nothing is written
-//! (`state::contacts_using_ephemeris`). A delete first materialises every status move the
-//! clock has already made due — the end of an ephemeris's validation, its expiration, and
-//! the scheduler's and a release's moves on a contact — which is owed whether or not
-//! anybody called, and is what makes "in force" and "non-terminal" read the statuses that
-//! hold at this instant.
+//! pass is flown on is the ONE ephemeris in force for the contact's satellite — of those
+//! the account holds enabled for it, the one of highest precedence — so while this is that
+//! ephemeris and any contact of that satellite is in a non-terminal `ContactStatus` the
+//! delete is refused with the modelled `ResourceInUseException` and nothing is written
+//! (`state::contacts_using_ephemeris`). An ephemeris another supersedes is the trajectory
+//! of no pass, so it deletes while those contacts stand. A delete first materialises every
+//! status move the clock has already made due — the end of an ephemeris's validation, its
+//! expiration, and the scheduler's and a release's moves on a contact — which is owed
+//! whether or not anybody called, and is what makes "in force" and "non-terminal" read the
+//! statuses that hold at this instant.
 //!
 //! ## Shape of an operation
 //!
