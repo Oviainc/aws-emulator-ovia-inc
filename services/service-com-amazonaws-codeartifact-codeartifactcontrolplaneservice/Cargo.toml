@@ -19,7 +19,9 @@ aws-smithy-types = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
-serde_json = { workspace = true }
+# `raw_value`: a published npm manifest is kept as the TEXT it arrived as, so nothing
+# re-orders what the publisher declared (a dependency list is reported in declared order).
+serde_json = { workspace = true, features = ["raw_value"] }
 tracing = { workspace = true }
 # Stable, content-derived suffixes for the asset-bucket and KMS-key ARNs a domain
 # reports (SHA-256 of the domain's account/region/name), so the same domain reports the
@@ -30,7 +32,16 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 # `arn`: the one parse of a caller-supplied `resourceArn`, so this service agrees with
 # every other on which ARNs name its own resources and what an ARN's fields are.
+# `data_plane_addressing`: the one reading of how a client addresses a data plane, which
+# the repository endpoints this service publishes are. `iam_authorization`: the shared
+# evaluation of policy documents against an action on a resource, so every service that
+# enforces authorization decides alike.
 service-common = { path = "../common" }
+# The STS store, for the session an access key id speaks for: the principal a token mint
+# is authorized as, and the temporary-credential expiry `durationSeconds=0` ties a token to.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The IAM store, for the identity-based policy documents in force on that principal.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # The remaining two algorithms of the model's `HashAlgorithm` enum, which an
 # `AssetSummary.hashes` map reports beside SHA-256 and SHA-512.
 md-5 = "0.10"
@@ -42,6 +53,9 @@ base64 = "0.22"
 # caller-supplied `resourceArn` back into them. Also the `resourceArn` query value the
 # tagging suite sends, as it is for the sibling service crates.
 percent-encoding = "2.3"
+# The STREAMING read of an npm metadata document, so a dependency list is reported in the
+# order the document declares it whatever map type `serde_json` was built with.
+serde = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

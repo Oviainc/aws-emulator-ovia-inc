@@ -250,7 +250,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             repository.package(&input.format, input.namespace.as_deref(), &input.package)
         else {
             return Err(not_found(
-                crate::state::package_not_found_message(&input.package, &input.repository),
+                crate::state::package_not_found_message(
+                    &input.format,
+                    input.namespace.as_deref(),
+                    &input.package,
+                ),
                 &input.package,
                 crate::state::PACKAGE_RESOURCE_TYPE,
             ));

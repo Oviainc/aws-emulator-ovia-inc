@@ -19,12 +19,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    AssetSummary, DomainDescription, DomainEntryPoint, DomainSummary, PackageGroupDescription,
-    PackageGroupOriginConfiguration, PackageGroupOriginRestriction, PackageGroupReference,
-    PackageGroupSummary, PackageOriginConfiguration, PackageOriginRestrictions, PackageSummary,
-    PackageVersionDescription, PackageVersionOrigin, PackageVersionSummary, RepositoryDescription,
-    RepositoryExternalConnectionInfo, RepositorySummary, ResourcePolicy, Tag,
-    UpstreamRepositoryInfo, ValidationException, PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES,
+    AssetSummary, DomainDescription, DomainEntryPoint, DomainSummary, LicenseInfo,
+    PackageGroupDescription, PackageGroupOriginConfiguration, PackageGroupOriginRestriction,
+    PackageGroupReference, PackageGroupSummary, PackageOriginConfiguration,
+    PackageOriginRestrictions, PackageSummary, PackageVersionDescription, PackageVersionOrigin,
+    PackageVersionSummary, RepositoryDescription, RepositoryExternalConnectionInfo,
+    RepositorySummary, ResourcePolicy, Tag, UpstreamRepositoryInfo, ValidationException,
+    PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES,
 };
 
 /// This service's SigV4 signing name, which is also the service segment of every ARN
@@ -202,6 +203,11 @@ pub const MAX_STORED_ASSET_BYTES: i64 = 256 * 1024 * 1024;
 /// be published using this API" (the operation's own documentation).
 pub const PACKAGE_FORMAT_GENERIC: &str = "generic";
 
+/// The `PackageFormat` whose packages are published and resolved over an npm registry —
+/// the repository endpoint `crate::service::npm_registry` serves — as the model spells it
+/// (`smithy_query(query="shape",shape="PackageFormat")`).
+pub const PACKAGE_FORMAT_NPM: &str = "npm";
+
 /// The `PackageFormat`s whose namespace is a SCOPE, so the scope is part of how a package
 /// of that format is written: "The namespace of an npm or Swift package version is its
 /// scope" (`PackageVersionDescription$namespace`,
@@ -328,6 +334,14 @@ pub struct ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState {
     /// domains per region; a later slice that needs that distinction should widen this
     /// key to `(region, name)` rather than add a second map.
     pub domains: BTreeMap<String, Domain>,
+    /// Every bearer credential `GetAuthorizationToken` has minted and not let expire,
+    /// keyed by the DIGEST of the token ([`authorization_token_digest`]) rather than by
+    /// the token itself, so the secret a client holds is not kept in this store.
+    ///
+    /// A repository endpoint authenticates the token a package manager presents against
+    /// this map: the credential is this service's own, so this service is what resolves
+    /// it. Bounded by [`MAX_AUTHORIZATION_TOKENS`].
+    pub authorization_tokens: BTreeMap<String, AuthorizationToken>,
 }
 
 impl ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState {
@@ -363,6 +377,119 @@ impl ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState {
             total.saturating_add(domain.asset_size_bytes())
         })
     }
+
+    /// The total CONTENT bytes this service currently retains: every asset's bytes plus
+    /// every version's metadata document ([`PackageVersion::manifest`]) — the whole of
+    /// what a publish leaves in the store, which is what [`MAX_STORED_ASSET_BYTES`] has to
+    /// bound.
+    ///
+    /// Distinct from [`Self::stored_asset_bytes`], which is the ASSET total a domain
+    /// reports as its `assetSizeBytes`: a metadata document is not an asset, so it is not
+    /// part of that reported value, but it is retained caller content and so is part of
+    /// what the ceiling is checked against. Derived on each call for the same reason, and
+    /// costs the NUMBER of stored versions and assets (bounded by the record ceilings
+    /// above), never their bytes.
+    pub fn stored_content_bytes(&self) -> i64 {
+        self.domains
+            .values()
+            .flat_map(|domain| domain.repositories.values())
+            .flat_map(|repository| repository.packages.values())
+            .flat_map(|package| package.versions.values())
+            .fold(0i64, |total, version| {
+                total
+                    .saturating_add(version.asset_size_bytes())
+                    .saturating_add(version.manifest_size_bytes())
+            })
+    }
+
+    /// Remember a bearer credential this service just minted: which domain it is scoped
+    /// to, and when it stops being valid.
+    ///
+    /// Only the token's DIGEST is kept, so the store holds nothing a client could present
+    /// as the credential. Records the clock has already expired are dropped first, which
+    /// is what keeps the map inside [`MAX_AUTHORIZATION_TOKENS`] without ever giving up a
+    /// credential that is still valid; at the ceiling with nothing expired, the record
+    /// expiring soonest makes room, so a mint never fails for want of space.
+    pub fn record_authorization_token(
+        &mut self,
+        token: &str,
+        domain: &str,
+        domain_owner: &str,
+        principal: &str,
+        expires_at: SystemTime,
+        now: SystemTime,
+    ) {
+        self.authorization_tokens
+            .retain(|_, held| now < held.expires_at);
+        while self.authorization_tokens.len() >= MAX_AUTHORIZATION_TOKENS {
+            let Some(soonest) = self
+                .authorization_tokens
+                .iter()
+                .min_by_key(|(digest, held)| (held.expires_at, (*digest).clone()))
+                .map(|(digest, _)| digest.clone())
+            else {
+                break;
+            };
+            self.authorization_tokens.remove(&soonest);
+        }
+        self.authorization_tokens.insert(
+            authorization_token_digest(token),
+            AuthorizationToken {
+                domain: domain.to_string(),
+                domain_owner: domain_owner.to_string(),
+                principal: principal.to_string(),
+                expires_at,
+            },
+        );
+    }
+
+    /// The record of the bearer credential `token`, when this service minted it and the
+    /// clock has not passed its expiry.
+    ///
+    /// A READ: a token past its expiry is simply not resolved, and nothing is written, so
+    /// presenting one twice answers the same way both times.
+    pub fn authorization_token(&self, token: &str, now: SystemTime) -> Option<&AuthorizationToken> {
+        self.authorization_tokens
+            .get(&authorization_token_digest(token))
+            .filter(|held| now < held.expires_at)
+    }
+}
+
+/// How many minted bearer credentials this service remembers at once.
+///
+/// A mint is a request-driven insert, so the map needs a declared ceiling. The value is a
+/// chosen emulator bound, far above any test or demo workload; AWS publishes no such
+/// limit.
+pub const MAX_AUTHORIZATION_TOKENS: usize = 1_024;
+
+/// One bearer credential `GetAuthorizationToken` minted: the scope it was issued for and
+/// when it stops being valid. The token itself is NOT part of the record — the map is
+/// keyed by its digest.
+#[derive(Debug, Clone)]
+pub struct AuthorizationToken {
+    /// The domain the token is scoped to: "The name of the domain that is in scope for the
+    /// generated authorization token" (`GetAuthorizationToken`'s `domain`).
+    pub domain: String,
+    /// The account that owns that domain.
+    pub domain_owner: String,
+    /// The principal the credential speaks for, as `sts:GetCallerIdentity` reports it for
+    /// the request that minted it. Kept because a repository endpoint a token is presented
+    /// to has to decide what THAT principal may do there, which is what a repository's
+    /// resource policy states.
+    pub principal: String,
+    /// The instant the token expires, as the mint reported it to the caller.
+    pub expires_at: SystemTime,
+}
+
+/// The key a minted bearer credential is remembered under: the lowercase-hex SHA-256 of
+/// the token.
+///
+/// A digest rather than the token, so this store never holds a value that could be
+/// presented as the credential; the same token always digests to the same key, which is
+/// what lets a presented token be resolved without the token being kept.
+#[must_use]
+pub fn authorization_token_digest(token: &str) -> String {
+    sha256_hex(token.as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,6 +1441,30 @@ pub fn package_display_name(format: &str, namespace: Option<&str>, package: &str
     }
 }
 
+/// The distribution tag a package manager resolves "the latest version" through, and the
+/// one `defaultDisplayVersion` names for a format that carries tags ("For npm packages,
+/// it's the version referenced by the latest tag").
+pub const LATEST_DIST_TAG: &str = "latest";
+
+/// How many distribution tags one package carries at most.
+///
+/// A tag is a request-driven insert whose KEY the caller chooses (npm's
+/// `PUT /-/package/<package>/dist-tags/<tag>`, and the `dist-tags` object of a publish
+/// document), so the map needs a declared ceiling like every other per-request insert in
+/// this store. The value is a chosen emulator bound, far above the handful of channels a
+/// package is published on (`latest`, `next`, `beta`, a release line per major version);
+/// AWS publishes no such limit.
+pub const MAX_DIST_TAGS_PER_PACKAGE: usize = 100;
+
+/// The asset an npm package version's content is stored as.
+///
+/// CodeArtifact keeps an npm version's tarball under ONE asset name, fixed for the format
+/// rather than derived from the package name or the version — which is what lets
+/// `GetPackageVersionAsset` address any npm version's content by the same `asset` value.
+/// The name npm's own tarball URL publishes is derived from the version instead (see
+/// `crate::service::npm_registry`), so the two are deliberately different strings.
+pub const NPM_TARBALL_ASSET: &str = "package.tgz";
+
 /// A stored package inside a repository.
 ///
 /// A package is identified by the triple (`format`, `namespace`, `name`) — the same triple
@@ -1333,6 +1484,14 @@ pub struct Package {
     pub origin_restrictions: PackageOriginRestrictions,
     /// The package's versions, keyed by version string.
     pub versions: BTreeMap<String, PackageVersion>,
+    /// The package's distribution tags — the named pointers a package manager resolves a
+    /// request for "the latest version" through — keyed by tag name.
+    ///
+    /// Only a format whose package manager HAS tags ever fills this: npm's publish
+    /// document carries a `dist-tags` object, and `latest` is the tag its clients resolve
+    /// by default. A version published through `PublishPackageVersion` carries no
+    /// metadata, so a generic package's tags stay empty.
+    pub dist_tags: BTreeMap<String, String>,
 }
 
 impl Package {
@@ -1352,6 +1511,7 @@ impl Package {
                 upstream: ORIGIN_RESTRICTION_ALLOW.to_string(),
             },
             versions: BTreeMap::new(),
+            dist_tags: BTreeMap::new(),
         }
     }
 
@@ -1408,9 +1568,9 @@ impl Package {
     /// the version referenced by the latest tag. If the latest tag is not set, it's the
     /// most recently published package version"
     /// (`smithy_query(query="doc",shape="ListPackageVersionsResult",member="defaultDisplayVersion")`).
-    /// No version this service holds carries a dist-tag — versions are published through
-    /// `PublishPackageVersion`, which takes generic assets and no package metadata — so
-    /// every format falls to the same branch: the most recently published version.
+    /// A package whose format carries distribution tags therefore reports the version its
+    /// [`LATEST_DIST_TAG`] names, and every other package — and any package whose latest
+    /// tag names no displayable version — falls to the most recently published one.
     ///
     /// Only a version in [`PACKAGE_VERSION_STATUS_PUBLISHED`] is a candidate, because that
     /// is the one status in which a version is both listed and resolvable: an `Unlisted`
@@ -1422,6 +1582,15 @@ impl Package {
     /// Ties are broken by the greater version string, so the answer is a function of the
     /// stored records and not of the order they were walked in.
     pub fn default_display_version(&self) -> Option<String> {
+        let tagged = self
+            .dist_tags
+            .get(LATEST_DIST_TAG)
+            .and_then(|version| self.versions.get(version))
+            .filter(|version| version.status == PACKAGE_VERSION_STATUS_PUBLISHED)
+            .map(|version| version.version.clone());
+        if tagged.is_some() {
+            return tagged;
+        }
         self.versions
             .values()
             .filter(|version| version.status == PACKAGE_VERSION_STATUS_PUBLISHED)
@@ -1457,6 +1626,16 @@ pub struct PackageVersion {
     pub entry_point_repository: String,
     /// The version's assets, keyed by asset name.
     pub assets: BTreeMap<String, Asset>,
+    /// The version's own METADATA document, as its package manager published it — an npm
+    /// `package.json`, a Maven `pom.xml` — or `None` for a version published through
+    /// `PublishPackageVersion`, which takes generic assets and no metadata.
+    ///
+    /// Kept because CodeArtifact reports a version's summary, home page, licenses, source
+    /// repository and declared dependencies out of exactly this document rather than
+    /// inventing them ("CodeArtifact extracts the dependencies for a package version from
+    /// the metadata file for the package format"). It is not an ASSET: the format decides
+    /// what a version's assets are, and for npm that is the tarball alone.
+    pub manifest: Option<String>,
 }
 
 impl PackageVersion {
@@ -1476,6 +1655,11 @@ impl PackageVersion {
         use base64::Engine as _;
 
         let mut fields: Vec<&str> = vec![self.version.as_str(), self.status.as_str()];
+        // The metadata document is part of the version's content too: a version restored
+        // with the same assets but a different manifest is not the same version.
+        if let Some(manifest) = &self.manifest {
+            fields.push(manifest.as_str());
+        }
         for (name, asset) in &self.assets {
             fields.push(name.as_str());
             fields.push(asset.sha256_hex());
@@ -1489,18 +1673,33 @@ impl PackageVersion {
     /// format's own display rule ([`package_display_name`]), so every described version
     /// reports one.
     ///
-    /// `licenses` is reported as the list it is, and the list is EMPTY: CodeArtifact reads
-    /// license data out of a package's own metadata file (a `pom.xml`, a `package.json`),
-    /// and the versions this service holds are published through `PublishPackageVersion`,
-    /// which takes generic assets carrying no such metadata. An absent list is not an
-    /// empty one — a client that iterates `licenses` must see "no licenses", not "no
-    /// information" — so the member is present whenever the version is described.
+    /// `summary`, `homePage`, `sourceCodeRepository` and `licenses` are the
+    /// METADATA-SOURCED members: CodeArtifact reads them out of the package's own metadata
+    /// file (a `package.json`, a `pom.xml`), so they are reported exactly where the version
+    /// carries one ([`Self::manifest`]) and it declares them. A version published through
+    /// `PublishPackageVersion` carries no such file, and a member the file does not declare
+    /// stays absent — absent is precisely "this package version has no such value", which
+    /// inventing a string would not be.
     ///
-    /// `summary`, `homePage` and `sourceCodeRepository` are the other metadata-sourced
-    /// members, and they stay absent: they are single values with no source here, and
-    /// absent is exactly "this package version has no such value", which inventing a
-    /// string would not be.
+    /// `licenses` is reported as the list it is, and is EMPTY rather than absent for a
+    /// version whose metadata names no license: a client that iterates `licenses` must see
+    /// "no licenses", not "no information".
     pub fn description(&self, package: &Package) -> PackageVersionDescription {
+        let metadata = self
+            .manifest
+            .as_deref()
+            .and_then(crate::service::npm_manifest::read)
+            .filter(|_| package.format == PACKAGE_FORMAT_NPM);
+        let licenses = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.license.clone())
+            .map(|name| {
+                vec![LicenseInfo {
+                    name: Some(name),
+                    url: None,
+                }]
+            })
+            .unwrap_or_default();
         PackageVersionDescription {
             format: Some(package.format.clone()),
             namespace: package.namespace.clone(),
@@ -1511,11 +1710,17 @@ impl PackageVersion {
                 &package.name,
             )),
             version: Some(self.version.clone()),
-            summary: None,
-            home_page: None,
-            source_code_repository: None,
+            summary: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.description.clone()),
+            home_page: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.homepage.clone()),
+            source_code_repository: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.repository_url.clone()),
             published_time: Some(self.published_time.into()),
-            licenses: Some(Vec::new()),
+            licenses: Some(licenses),
             revision: Some(self.revision()),
             status: Some(self.status.clone()),
             origin: Some(PackageVersionOrigin {
@@ -1559,6 +1764,17 @@ impl PackageVersion {
         self.assets.values().fold(0i64, |total, asset| {
             total.saturating_add(asset.size_bytes())
         })
+    }
+
+    /// The size of this version's metadata document, or `0` for a version that carries
+    /// none. Retained caller content, so it counts towards
+    /// [`ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState::stored_content_bytes`]
+    /// even though it is not an asset.
+    pub fn manifest_size_bytes(&self) -> i64 {
+        self.manifest
+            .as_ref()
+            .and_then(|manifest| i64::try_from(manifest.len()).ok())
+            .unwrap_or_default()
     }
 }
 
@@ -1690,6 +1906,29 @@ impl Asset {
             .get(HASH_ALGORITHM_SHA256)
             .map(String::as_str)
             .unwrap_or_default()
+    }
+
+    /// The asset's stored SHA-1, lowercase hex — the digest an npm client reads as a
+    /// tarball's `shasum`. Always present: [`Asset::new`] computes it.
+    pub fn sha1_hex(&self) -> &str {
+        self.hashes
+            .get(HASH_ALGORITHM_SHA1)
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
+
+    /// The asset's stored SHA-512, base64 of the digest BYTES — the spelling a
+    /// Subresource-Integrity value (`sha512-…`) carries, which is how an npm client states
+    /// a tarball's integrity. Always present: [`Asset::new`] computes it.
+    pub fn sha512_base64(&self) -> String {
+        use base64::Engine as _;
+
+        let digest = self
+            .hashes
+            .get(HASH_ALGORITHM_SHA512)
+            .map(String::as_str)
+            .unwrap_or_default();
+        base64::engine::general_purpose::STANDARD.encode(hex::decode(digest).unwrap_or_default())
     }
 }
 
@@ -2266,10 +2505,24 @@ pub fn package_version_resource_id(
 }
 
 /// The `ResourceNotFoundException` message for a package the addressed repository does not
-/// hold. A package is addressed by its whole `(format, namespace, name)` triple, so the
-/// sentence quotes the name the request asked for and the repository it asked in.
-pub fn package_not_found_message(package: &str, repository: &str) -> String {
-    format!("Package {package} not found in repository {repository}.")
+/// hold.
+///
+/// A package is addressed by its whole `(format, namespace, name)` triple, so the refusal
+/// states that whole triple: a caller that addressed the right name under the wrong format
+/// — or without the namespace the package carries — addressed a DIFFERENT package, and a
+/// sentence naming only the name could not tell it which of the three was wrong. The
+/// namespace clause appears exactly where the request carried one, since a format whose
+/// packages carry no namespace component has none to name.
+pub fn package_not_found_message(format: &str, namespace: Option<&str>, package: &str) -> String {
+    match namespace {
+        Some(namespace) => format!(
+            "Package not found in repository. Package = {{format={format}, \
+             namespace={namespace}, name={package}}}"
+        ),
+        None => {
+            format!("Package not found in repository. Package = {{format={format}, name={package}}}")
+        }
+    }
 }
 
 /// The `ResourceNotFoundException` message for a version the addressed package does not

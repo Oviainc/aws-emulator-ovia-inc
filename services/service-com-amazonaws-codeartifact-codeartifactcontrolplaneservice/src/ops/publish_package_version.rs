@@ -310,8 +310,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the service already retains, read before the store is borrowed mutably:
         // every insert below checks the PROJECTED total against
         // `MAX_STORED_ASSET_BYTES`, so accepted publishes cannot accumulate past the
-        // ceiling even though each one is inside the per-asset bound.
-        let stored_asset_bytes = store.stored_asset_bytes();
+        // ceiling even though each one is inside the per-asset bound. The total is the
+        // whole of what the store retains — assets and the metadata documents a
+        // package-manager publish leaves beside them — so one ceiling holds over both
+        // publish paths.
+        let stored_asset_bytes = store.stored_content_bytes();
 
         let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
             return Err(not_found(
@@ -430,6 +433,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             input.asset_name.clone(),
                             asset,
                         )]),
+                        // A generic publish carries assets and no metadata document: this
+                        // API "takes" no `package.json` or `pom.xml`, so there is nothing
+                        // for the metadata-sourced members to be read from.
+                        manifest: None,
                     },
                 );
             }

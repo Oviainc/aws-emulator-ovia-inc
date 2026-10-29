@@ -39,6 +39,28 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! Two things this service needs that the model does not express live in modules beside
+//! this one:
+//!
+//! - [`npm_registry`] — the npm REGISTRY a repository's npm endpoint serves. The URL
+//!   `GetRepositoryEndpoint` hands out names the DOMAIN's own host and speaks a package
+//!   manager's protocol, not this API's, so the front door could resolve no service for it
+//!   and answered `404 UnknownService` for the one address this service told the client to
+//!   use. [`can_handle`](Service::can_handle) also claims a request addressed to a
+//!   repository endpoint this service holds, and
+//!   [`override_routing_error`](Service::override_routing_error) answers it out of the same
+//!   package and asset records the control plane writes.
+//! - [`npm_manifest`] — the one reading of an npm metadata document, which is where every
+//!   member this service reports off one comes from.
+//! - [`token_authorization`] — whether IAM lets the caller mint a repository bearer
+//!   credential, which `GetAuthorizationToken` takes before anything is minted.
+
+pub mod npm_manifest;
+
+pub mod npm_registry;
+
+pub mod token_authorization;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
@@ -140,6 +162,13 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because a repository ENDPOINT's own traffic ([`npm_registry`]) is claimed
+    /// by `can_handle` and served from `override_routing_error`, neither of which is an
+    /// operation with a `self.engine` of its own: both must read the one store the
+    /// control-plane operations write, not a second copy.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -148,7 +177,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
         }
     }
 }
@@ -166,8 +196,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            Some(key) if key == self.entry.identity().signing_name() => true,
+            // And a repository ENDPOINT's own traffic: a request addressed to a repository
+            // endpoint this service holds a record for ([`npm_registry::claims_parts`]).
+            // Such a request names no modelled operation and carries no credential scope
+            // naming this service — its host is the DOMAIN's published endpoint host, whose
+            // first label names no service — so the front door could resolve no target
+            // service for it and answered `404 UnknownService`, for the one address
+            // `GetRepositoryEndpoint` told the client to use.
+            //
+            // The claim is narrowed to a repository this service HOLDS, read from the one
+            // shared store, rather than to a host or a path shape alone, so one request
+            // keeps one claimant.
+            _ => npm_registry::claims_parts(&*self.engine, parts),
         }
     }
 
@@ -220,9 +261,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501).
+        //
+        // A repository endpoint's own traffic is exactly that case by construction — no
+        // modelled operation is bound under a repository endpoint's path — so this is where
+        // it is served, BEFORE authentication, which is what lets a package manager
+        // presenting an npm bearer token rather than a SigV4 signature be answered at all.
+        if npm_registry::claims_request(&*self.engine, req) {
+            return Some(npm_registry::serve(&*self.engine, req));
+        }
         None
     }
 

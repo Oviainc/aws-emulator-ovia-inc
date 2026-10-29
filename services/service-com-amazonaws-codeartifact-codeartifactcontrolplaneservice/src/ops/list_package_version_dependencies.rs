@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPackageVersionDependencies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPackageVersionDependencies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPackageVersionDependencies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the direct dependencies one package version DECLARES, read out of the metadata
+//! document its package manager published with it — "CodeArtifact extracts the dependencies
+//! for a package version from the metadata file for the package format (for example, the
+//! package.json file for npm packages)" — in the order that document declares them. A
+//! version carrying no such document declares no dependencies, which is an empty list
+//! rather than a refusal.
+//!
+//! A pure READ: it resolves the coordinate the request addresses and reports what the
+//! stored version holds, writing nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -191,20 +192,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPackageVersionDependencies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPackageVersionDependenciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPackageVersionDependencies"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListPackageVersionDependenciesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the CodeArtifact store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        // This operation issues no cursor (see the one page below), so a `nextToken` is a
+        // token this service never minted: refused as the invalid input it is, rather than
+        // ignored and answered with the first page again.
+        if let Some(token) = input.next_token.as_deref() {
+            return Err(ListPackageVersionDependenciesErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!("Invalid next token: {token}"),
+                    reason: Some(crate::state::VALIDATION_REASON_FIELD_FAILED.to_string()),
+                },
+            )
+            .into());
+        }
+        // A read: the guard is taken immutably, so nothing a later caller sees moves
+        // because this version's dependencies were listed.
+        let store = state.lock();
+
+        let Some(domain) = store.domain(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(not_found(
+                crate::state::domain_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                ),
+                &input.domain,
+                crate::state::DOMAIN_RESOURCE_TYPE,
+            ));
+        };
+        let Some(repository) = domain.repositories.get(&input.repository) else {
+            return Err(not_found(
+                crate::state::repository_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                    &input.repository,
+                ),
+                &input.repository,
+                crate::state::REPOSITORY_RESOURCE_TYPE,
+            ));
+        };
+        // A package is identified by its whole `(format, namespace, name)` triple: the same
+        // name in another format, or under another namespace, is another package.
+        let Some(package) =
+            repository.package(&input.format, input.namespace.as_deref(), &input.package)
+        else {
+            return Err(not_found(
+                crate::state::package_not_found_message(
+                    &input.format,
+                    input.namespace.as_deref(),
+                    &input.package,
+                ),
+                &input.package,
+                crate::state::PACKAGE_RESOURCE_TYPE,
+            ));
+        };
+        let Some(version) = package.versions.get(&input.package_version) else {
+            return Err(not_found(
+                crate::state::package_version_not_found_message(
+                    &input.package,
+                    &input.package_version,
+                    &input.repository,
+                ),
+                &crate::state::package_version_resource_id(
+                    input.namespace.as_deref(),
+                    &input.package,
+                    &input.package_version,
+                ),
+                crate::state::PACKAGE_VERSION_RESOURCE_TYPE,
+            ));
+        };
+
+        // "CodeArtifact extracts the dependencies for a package version from the metadata
+        // file for the package format" — so the answer is read out of the version's own
+        // stored metadata document, in the order that document declares them, and a version
+        // carrying no such document (one published through `PublishPackageVersion`, which
+        // takes generic assets and no metadata) declares no dependencies. "Any package
+        // version dependencies that are not listed in the configuration file are not
+        // returned."
+        let declared = version
+            .manifest
+            .as_deref()
+            .and_then(crate::service::npm_manifest::read)
+            .filter(|_| input.format == crate::state::PACKAGE_FORMAT_NPM)
+            .map(|metadata| metadata.dependencies)
+            .unwrap_or_default();
+        let dependencies: Vec<PackageDependency> = declared
+            .iter()
+            .map(|dependency| {
+                // A dependency is reported by the same coordinate a package is addressed
+                // by, so an npm scope is reported as the `namespace` it is.
+                let (namespace, name) = dependency.coordinate();
+                PackageDependency {
+                    namespace,
+                    package: Some(name),
+                    dependency_type: Some(dependency.dependency_type.to_string()),
+                    version_requirement: Some(dependency.version_requirement.clone()),
+                }
+            })
+            .collect();
+
+        Ok(ListPackageVersionDependenciesOutput {
+            format: Some(package.format.clone()),
+            namespace: package.namespace.clone(),
+            package: Some(package.name.clone()),
+            version: Some(version.version.clone()),
+            version_revision: Some(version.revision()),
+            // The whole declared list is returned in one page: it is the content of one
+            // metadata file, which is bounded by the version that carries it, so there is
+            // nothing left for a cursor to resolve.
+            next_token: None,
+            dependencies: Some(dependencies),
+        })
     }
+}
+
+/// A `ResourceNotFoundException` (404) naming the resource that was addressed.
+fn not_found(
+    message: String,
+    resource_id: &str,
+    resource_type: &str,
+) -> ListPackageVersionDependenciesError {
+    ListPackageVersionDependenciesErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message,
+            resource_id: Some(resource_id.to_string()),
+            resource_type: Some(resource_type.to_string()),
+        },
+    )
+    .into()
 }

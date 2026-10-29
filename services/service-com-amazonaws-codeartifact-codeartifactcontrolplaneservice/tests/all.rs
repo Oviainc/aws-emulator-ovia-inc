@@ -77,3 +77,7 @@ mod package_version_listing;
 mod package_version_input_status;
 #[path = "all/authorization_token_issuance.rs"]
 mod authorization_token_issuance;
+#[path = "all/npm_registry_endpoint.rs"]
+mod npm_registry_endpoint;
+#[path = "all/authorization_token_caller_binding.rs"]
+mod authorization_token_caller_binding;

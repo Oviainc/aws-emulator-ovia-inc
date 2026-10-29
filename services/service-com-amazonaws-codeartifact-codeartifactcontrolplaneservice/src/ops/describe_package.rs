@@ -208,8 +208,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DescribePackageErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::package_not_found_message(
+                        &input.format,
+                        input.namespace.as_deref(),
                         &input.package,
-                        &input.repository,
                     ),
                     resource_id: Some(input.package.clone()),
                     resource_type: Some("package".to_string()),
