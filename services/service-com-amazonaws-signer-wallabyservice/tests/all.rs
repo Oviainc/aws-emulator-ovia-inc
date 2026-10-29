@@ -79,3 +79,6 @@ mod state_roundtrip;
 
 #[path = "all/supplied_nothing_refusal_wording.rs"]
 mod supplied_nothing_refusal_wording;
+
+#[path = "all/tag_keys_supplied_nothing_wording.rs"]
+mod tag_keys_supplied_nothing_wording;

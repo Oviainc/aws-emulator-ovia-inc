@@ -15,8 +15,9 @@
 //! The cases are tables. They span what the rule generalises over — which member
 //! misses, whether it misses by being omitted or by carrying nothing, how many
 //! entries a supplied list carries, and which other class of refusal fires — and
-//! the members are those the model binds, read off the one operation of this
-//! service that binds a list to the query string.
+//! the members are those the model binds: this suite drives the one
+//! `GetRevocationStatus` binds, and `tag_keys_supplied_nothing_wording` drives the
+//! one `UntagResource` binds on `DELETE /tags/{resourceArn}`.
 
 use std::sync::Arc;
 
