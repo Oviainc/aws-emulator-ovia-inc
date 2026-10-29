@@ -151,11 +151,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(denied);
         }
         // The account-global registry catalog record is the ONE Region-scoped ECR Public
-        // write: `UnsupportedCommandException` says the action is not offered in the
-        // caller's Region, so the write is served from every Region this API is published
-        // in (`crate::state::ENDPOINT_REGIONS`) and only a request whose credential scope
-        // names a Region that carries no ECR Public endpoint is refused with it — before
-        // the record is touched. Every other operation of this service — including the
+        // write: an account-global control action is performed in a single Region of its
+        // surface (`crate::state::API_REGION`), and `UnsupportedCommandException` says the
+        // action is not offered in the caller's Region — so a request whose credential
+        // scope names any other Region is refused with it, before the record is touched,
+        // even when that Region publishes an ECR Public endpoint a caller reaches the rest
+        // of this surface at. Every other operation of this service — including the
         // matching read (`GetRegistryCatalogData`) and the whole repository, image, layer,
         // tag and policy surface — is served whatever Region its request names. See
         // `crate::state::serves_region`.

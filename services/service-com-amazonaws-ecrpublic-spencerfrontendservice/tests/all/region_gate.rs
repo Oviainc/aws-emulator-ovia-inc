@@ -7,11 +7,11 @@
 //! publishes one endpoint, a client points at it with whatever Region its own configuration
 //! carries, and AWS serves that surface from either published endpoint, so the Region in a
 //! request's SigV4 credential scope decides nothing for them. Second, the Region-scoped
-//! call — the write of the account-global registry catalog data — is served from every
-//! Region this API is published in (`state::ENDPOINT_REGIONS`), and a request whose
-//! credential scope names a Region that carries no ECR Public endpoint at all is answered
-//! with the service-common `UnsupportedCommandException` (HTTP 400) naming the operation
-//! and the Region such a caller is directed to, before the record is touched.
+//! call — the write of the account-global registry catalog data — is performed in ONE
+//! Region (`state::API_REGION`), so a request whose credential scope names any other
+//! Region, INCLUDING the second Region this API publishes an endpoint in, is answered with
+//! the service-common `UnsupportedCommandException` (HTTP 400) naming the operation and
+//! the Region such a caller is directed to, before the record is touched.
 //!
 //! `UnsupportedCommandException` ("The action isn't supported in this Region", client,
 //! httpError 400) is declared service-wide rather than per operation —
@@ -24,7 +24,8 @@
 //! catalog legs, the tag read, the push, and all three layer-upload legs) crossed with
 //! Regions from several partitions and every Region ECR Public publishes an endpoint in,
 //! each in three letter cases; and, for the Region-scoped write, every one of those Regions
-//! crossed with the operation names the refusal's wording is built from.
+//! — the Region that performs it, the other published one, and Regions that publish no
+//! endpoint — crossed with the operation names the refusal's wording is built from.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::{
@@ -198,21 +199,20 @@ async fn every_operation_but_the_region_scoped_write_is_served_whatever_region_i
 }
 
 #[tokio::test]
-async fn the_region_scoped_call_is_served_from_every_published_region_and_refused_elsewhere() {
+async fn the_region_scoped_call_is_served_only_from_the_region_that_performs_it() {
     // The decision function the Region-scoped handler calls, over every Region a caller can
-    // sign for, in every letter case: a Region this API is published in serves the write,
-    // and a Region that carries no ECR Public endpoint at all refuses it.
+    // sign for, in every letter case: the one Region the account-global action is performed
+    // in serves the write, and every other Region refuses it — publishing an ECR Public
+    // endpoint does not make a Region perform this call.
     for reached_as in every_region_spelling() {
         let reached_as = reached_as.as_str();
-        let published = ENDPOINT_REGIONS
-            .iter()
-            .any(|region| reached_as.eq_ignore_ascii_case(region));
+        let performs = reached_as.eq_ignore_ascii_case(API_REGION);
         let case = format!("signed for {reached_as}");
 
         let served = serves_region(reached_as);
         assert_eq!(
-            served, published,
-            "case {case:?}: expected served={published}, got {served}"
+            served, performs,
+            "case {case:?}: expected served={performs}, got {served}"
         );
 
         // The refusal's wording is built from the operation the caller named and the
@@ -227,9 +227,9 @@ async fn the_region_scoped_call_is_served_from_every_published_region_and_refuse
             let refusal = unsupported_for_region(reached_as, operation);
             assert_eq!(
                 refusal.is_none(),
-                published,
+                performs,
                 "case {case:?}: expected refused={}, got {refusal:?}",
-                !published
+                !performs
             );
             if let Some(refusal) = refusal {
                 let expected = expected_refusal_message(operation, API_REGION);
@@ -256,7 +256,7 @@ async fn a_request_that_names_no_region_has_nothing_to_be_refused_for() {
     let rows: Vec<(&str, Option<&str>, bool)> = vec![
         ("no Authorization header at all", None, false),
         (
-            "a credential scope for the primary Region this API is published in",
+            "a credential scope for the Region this action is performed in",
             Some(
                 "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/ecr-public/aws4_request, \
                  SignedHeaders=host, Signature=00",
@@ -269,7 +269,7 @@ async fn a_request_that_names_no_region_has_nothing_to_be_refused_for() {
                 "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-west-2/ecr-public/aws4_request, \
                  SignedHeaders=host, Signature=00",
             ),
-            false,
+            true,
         ),
         (
             "a credential scope for a Region this service publishes no endpoint in",
@@ -309,8 +309,8 @@ async fn a_request_that_names_no_region_has_nothing_to_be_refused_for() {
             refusal.is_some(),
             refused,
             "case {case:?}: a request that names no Region has nothing to be refused for, \
-             and one naming a Region that carries no ECR Public endpoint is refused, \
-             got {refusal:?}"
+             and one naming any Region other than the one that performs the action is \
+             refused, got {refusal:?}"
         );
     }
 }

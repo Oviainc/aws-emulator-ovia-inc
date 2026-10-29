@@ -1,25 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Which Regions the account-global registry catalog WRITE is offered in, pinned against a
+//! Which Region the account-global registry catalog WRITE is offered in, pinned against a
 //! hand-written Region table rather than against the service's own decision function.
 //!
 //! The rule under test: `UnsupportedCommandException` ("The action isn't supported in this
 //! Region", client, HTTP 400 — `smithy_query(query="service_info")` reports it under
-//! `common_errors`) refuses a caller whose Region does not offer the action, so
-//! `PutRegistryCatalogData` is served from EVERY Region this API is published in and is
-//! refused only from a Region that carries no ECR Public endpoint at all. A served write
-//! stores `displayName` verbatim into the account-singleton catalog and `GetRegistryCatalogData`
-//! reports it whatever Region the reader signed for; a refused one leaves the stored name
-//! alone.
+//! `common_errors`) refuses a caller whose Region does not offer the action, and the
+//! account-global catalog write is an account-wide control action AWS performs in ONE
+//! Region — so `PutRegistryCatalogData` is served only from that Region and refused from
+//! every other, including the second Region this API publishes an endpoint in. A served
+//! write stores `displayName` verbatim into the account-singleton catalog and
+//! `GetRegistryCatalogData` reports it whatever Region the reader signed for; a refused one
+//! leaves the stored name alone.
 //!
 //! The sibling suite in `registry_catalog_write_regions.rs` drives the same rule through the
 //! crate's `serves_region`, so it follows that function wherever it goes. This table is
-//! written out by hand instead, from the Region list AWS publishes for this API's
-//! `endpointPrefix` (`api.ecr-public`, `smithy_query(query="service_info")`): endpoints in
-//! `us-east-1` and `us-west-2`, and none in any other Region. It spans both published
-//! Regions in the letter cases a Region name arrives in, and six Regions that publish no ECR
-//! Public endpoint, drawn from four partitions (commercial, China, GovCloud) and from the
-//! commercial Regions a caller is most likely to be configured for.
+//! written out by hand instead: the one Region AWS performs this control action in
+//! (`us-east-1`), the other Region AWS publishes an `api.ecr-public` endpoint in
+//! (`us-west-2`, `smithy_query(query="service_info")` — reachable for every other operation,
+//! and still refused for this one), and six Regions that publish no ECR Public endpoint,
+//! drawn from four partitions (commercial, China, GovCloud) and from the commercial Regions
+//! a caller is most likely to be configured for. Each Region appears in the letter cases a
+//! Region name arrives in.
 
 use serde_json::json;
 
@@ -29,24 +31,27 @@ use crate::registry_catalog_write_regions::{
 };
 use crate::repository_image_lifecycle::{call_signed_for, service};
 
-/// The Region ECR Public's own Region refusal directs a caller to: the primary Region of
-/// this API, written out here so the wording is pinned against AWS's text rather than
-/// against the crate constant the service formats it from.
+/// The Region ECR Public's own Region refusal directs a caller to: the single Region this
+/// account-global control action is performed in, written out here so the wording is pinned
+/// against AWS's text rather than against the crate constant the service formats it from.
 const REFUSAL_REGION: &str = "us-east-1";
 
-/// Every Region in the table, with whether this API is published in it.
+/// Every Region in the table, with whether this account-global control action is performed
+/// in it.
 ///
-/// Source: the Region list AWS publishes for `api.ecr-public` (two Regions); every other
-/// Region name below carries no ECR Public endpoint. The letter case of a Region name is not
-/// part of it, so both published Regions appear in upper and mixed case as well.
+/// Source: the one Region AWS performs the ECR Public registry-catalog write in
+/// (`us-east-1`); `us-west-2` publishes an `api.ecr-public` endpoint but does not perform
+/// this action, and every other Region name below carries no ECR Public endpoint at all.
+/// The letter case of a Region name is not part of it, so each Region appears in upper and
+/// mixed case as well.
 fn region_table() -> Vec<(&'static str, bool)> {
     vec![
         ("us-east-1", true),
         ("US-EAST-1", true),
         ("Us-East-1", true),
-        ("us-west-2", true),
-        ("US-WEST-2", true),
-        ("Us-West-2", true),
+        ("us-west-2", false),
+        ("US-WEST-2", false),
+        ("Us-West-2", false),
         ("us-east-2", false),
         ("eu-central-1", false),
         ("ap-northeast-1", false),
@@ -80,11 +85,11 @@ fn display_names() -> Vec<(&'static str, String)> {
 }
 
 #[tokio::test]
-async fn the_catalog_write_is_offered_in_every_region_this_api_is_published_in() {
+async fn the_catalog_write_is_offered_only_in_the_region_that_performs_it() {
     let router = service();
     let refusal_message = expected_refusal_message(REGION_SCOPED_OPERATION, REFUSAL_REGION);
 
-    for (region, published) in region_table() {
+    for (region, performs) in region_table() {
         for (name_case, name) in display_names() {
             let case = format!("{name_case}, written from {region}");
 
@@ -106,11 +111,11 @@ async fn the_catalog_write_is_offered_in_every_region_this_api_is_published_in()
             )
             .await;
 
-            if !published {
+            if !performs {
                 assert_eq!(
                     status, 400,
-                    "case {case:?}: a Region with no ECR Public endpoint is refused, got \
-                     {status} with {written}"
+                    "case {case:?}: a Region that does not perform this account-global \
+                     action is refused, got {status} with {written}"
                 );
                 let wire_type = written["__type"].as_str().unwrap_or_default().to_string();
                 assert!(
@@ -140,7 +145,7 @@ async fn the_catalog_write_is_offered_in_every_region_this_api_is_published_in()
 
             assert_eq!(
                 status, 200,
-                "case {case:?}: a Region this API is published in serves the write, got \
+                "case {case:?}: the Region that performs this action serves the write, got \
                  {status} with {written}"
             );
             assert_eq!(
@@ -170,14 +175,14 @@ async fn the_catalog_write_is_offered_in_every_region_this_api_is_published_in()
 }
 
 #[tokio::test]
-async fn a_name_past_the_modelled_bound_is_refused_from_every_published_region() {
+async fn a_name_past_the_modelled_bound_is_refused_in_the_region_that_performs_the_write() {
     let router = service();
     let expected_message = expected_length_refusal("displayName", MAX_DISPLAY_NAME_LEN);
 
-    // The modelled bound is a property of the member, so it answers in every Region that
+    // The modelled bound is a property of the member, so it answers in the Region that
     // serves the write — and it answers before anything is stored.
-    for (region, published) in region_table() {
-        if !published {
+    for (region, performs) in region_table() {
+        if !performs {
             continue;
         }
         let stored = format!("stored from {region}");

@@ -4,14 +4,14 @@
 //! caller can reach this endpoint as.
 //!
 //! The rule under test: `PutRegistryCatalogData` is the one ECR Public call whose Region is
-//! part of its contract — `UnsupportedCommandException` says the action is not offered in
-//! the caller's Region, so the write is served from every Region this API is published in
-//! (`state::ENDPOINT_REGIONS`) and a `displayName` within the modelled
+//! part of its contract — this account-global control action is performed in a single
+//! Region (`state::API_REGION`), so a `displayName` within the modelled
 //! `RegistryDisplayName` length
 //! (`smithy_query(query="shape", shape="RegistryDisplayName")`: `length {min: 0, max: 100}`)
-//! is stored verbatim and read back by `GetRegistryCatalogData` signed for any Region,
-//! while a request signed for a Region that carries no ECR Public endpoint is refused HTTP
-//! 400 `UnsupportedCommandException` and stores nothing, and one whose `displayName` is past
+//! submitted from that Region is stored verbatim and read back by `GetRegistryCatalogData`
+//! signed for any Region, while a request signed for ANY other Region — including the
+//! second Region this API publishes an endpoint in — is refused HTTP 400
+//! `UnsupportedCommandException` and stores nothing, and one whose `displayName` is past
 //! the modelled length is refused HTTP 400 `InvalidParameterException` naming the member
 //! and the modelled bound, before the stored value is touched.
 //!
@@ -105,8 +105,8 @@ async fn the_catalog_write_is_served_for_the_region_that_performs_it_and_refused
     let refusal_message = expected_refusal_message(REGION_SCOPED_OPERATION, API_REGION);
 
     // Every Region, in every letter case, crossed with every in-range display name: the
-    // write answers 200 and echoes what it stored for the Region that performs it, and is
-    // refused for every other without storing anything.
+    // write answers 200 and echoes what it stored for the one Region that performs it, and
+    // is refused for every other — published endpoint or not — without storing anything.
     for region in every_region_spelling() {
         let region = region.as_str();
         for (name_case, name) in in_range_display_names() {

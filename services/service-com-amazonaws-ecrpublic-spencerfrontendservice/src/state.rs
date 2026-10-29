@@ -55,33 +55,35 @@ pub const ARN_NAMESPACE: &str = "ecr-public";
 /// templates a host per Region (`endpointPrefix` `api.ecr-public`) — so the model says any
 /// ECR Public call CAN be refused for the Region it was signed for, and says nothing about
 /// which Regions the service answers in. AWS's service-endpoint reference lists exactly
-/// these two for `api.ecr-public`, and the registry and repository surface —
-/// repositories, images, layer uploads, tags, policies and both catalog legs — is served
-/// from either of them.
+/// these two for `api.ecr-public`, and the repository, image, layer upload, tag, policy
+/// and repository-catalog surface — plus the registry catalog READ — is served from either
+/// of them.
 ///
-/// Nothing but the one Region-scoped call consults the Region at all: the repository,
-/// image, layer, tag and policy surface is served whatever Region a request names, and
-/// [`serves_region`] governs the Region-scoped call alone — which is served from every
-/// Region in this list and refused from a Region that carries no ECR Public endpoint.
+/// ADDRESSING this API from a Region is not the same as an action being OFFERED there: a
+/// caller signed for any Region in this list reaches the surface, while the one
+/// Region-scoped call is offered in a strictly narrower set ([`serves_region`]).
 pub const ENDPOINT_REGIONS: &[&str] = &["us-east-1", "us-west-2"];
 
-/// The primary Region of this surface: the first of [`ENDPOINT_REGIONS`], and the one the
-/// Region refusal below names.
+/// The ONE Region the Region-scoped call of this service is performed in: an
+/// account-global control action is carried out in a single Region of its surface, which
+/// here is the primary one (the first of [`ENDPOINT_REGIONS`]).
 ///
-/// It is the Region a caller that reached this API from a Region it is not offered in is
-/// directed to, and the Region ordinary (Region-independent) calls are signed for.
+/// It is the Region the Region refusal below directs a caller to, and the Region ordinary
+/// (Region-independent) calls are signed for.
 pub const API_REGION: &str = ENDPOINT_REGIONS[0];
 
-/// Whether a Region-scoped call a request names `region` for is one this service offers
-/// there: `UnsupportedCommandException` says the action is not supported in the caller's
-/// Region, so the call is served from every Region this API is published in
-/// ([`ENDPOINT_REGIONS`]) and refused only from a Region that publishes none of it.
+/// Whether a Region-scoped call a request names `region` for is performed there:
+/// `UnsupportedCommandException` says the action is not supported in the caller's Region,
+/// and an account-global control action is performed in exactly one Region
+/// ([`API_REGION`]), so only a request whose credential scope names that Region is served.
+///
+/// A Region that merely publishes an endpoint of this API ([`ENDPOINT_REGIONS`]) is NOT
+/// enough: a caller reaches every Region-independent operation there while this one is
+/// still refused.
 ///
 /// A Region name is case-insensitive, so the comparison is too.
 pub fn serves_region(region: &str) -> bool {
-    ENDPOINT_REGIONS
-        .iter()
-        .any(|published| region.eq_ignore_ascii_case(published))
+    region.eq_ignore_ascii_case(API_REGION)
 }
 
 /// The `UnsupportedCommandException` a Region-scoped call naming `region` is refused with,
@@ -104,7 +106,7 @@ pub fn unsupported_for_region(
 }
 
 /// The `UnsupportedCommandException` a Region-scoped ECR Public call signed for a Region
-/// that carries no ECR Public endpoint is refused with, or `None` when it is served
+/// that does not perform it is refused with, or `None` when it is served
 /// ([`unsupported_for_region`]).
 ///
 /// This is the gate of the ONE Region-scoped operation: it is called by

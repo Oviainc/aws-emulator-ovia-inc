@@ -47,6 +47,8 @@ mod registry_catalog_data;
 mod registry_catalog_write_published_regions;
 #[path = "all/registry_catalog_write_regions.rs"]
 mod registry_catalog_write_regions;
+#[path = "all/registry_catalog_write_wrong_region_is_inert.rs"]
+mod registry_catalog_write_wrong_region_is_inert;
 #[path = "all/registry_describe.rs"]
 mod registry_describe;
 #[path = "all/repository_catalog_data.rs"]
