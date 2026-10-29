@@ -682,7 +682,7 @@ async fn an_add_past_the_pools_custom_attribute_quota_is_refused_whole() {
 }
 
 #[tokio::test]
-async fn an_add_to_an_absent_pool_is_a_404_and_touches_no_other_pool() {
+async fn an_add_to_an_absent_pool_is_a_400_and_touches_no_other_pool() {
     let router = router();
     // A live pool, so each refusal is about the id and not about an empty store.
     let live_id = pool(&router, "live-pool").await;
@@ -716,8 +716,8 @@ async fn an_add_to_an_absent_pool_is_a_404_and_touches_no_other_pool() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: expected a 404 ResourceNotFoundException, got {status} with {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {case:?}: expected a 400 ResourceNotFoundException, got {status} with {payload}"
         );
     }
 

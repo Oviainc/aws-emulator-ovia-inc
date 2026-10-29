@@ -513,7 +513,7 @@ async fn a_client_credentials_grant_issues_one_scoped_access_token_of_the_app_cl
             case,
             "GetUser",
             &json!({ "AccessToken": access_token }),
-            403,
+            400,
             "NotAuthorizedException",
         )
         .await;
@@ -594,21 +594,21 @@ async fn a_client_credentials_grant_is_refused_against_stored_configuration() {
         (
             "a ClientId nothing created",
             json!({ "ClientId": UNKNOWN_CLIENT_ID, "Secret": CLIENT_SECRET }),
-            404,
+            400,
             "ResourceNotFoundException",
             format!("User pool client {UNKNOWN_CLIENT_ID} does not exist."),
         ),
         (
             "a Secret that is not the one the app client stores",
             json!({ "ClientId": served.client_id, "Secret": WRONG_CLIENT_SECRET }),
-            403,
+            400,
             "NotAuthorizedException",
             bad_secret.to_string(),
         ),
         (
             "an app client that holds no secret at all",
             json!({ "ClientId": secretless_client, "Secret": CLIENT_SECRET }),
-            403,
+            400,
             "NotAuthorizedException",
             bad_secret.to_string(),
         ),
@@ -800,7 +800,7 @@ async fn a_token_without_the_self_service_scope_is_told_apart_from_no_access_tok
             case,
             "GetUser",
             &json!({ "AccessToken": presented }),
-            403,
+            400,
             "NotAuthorizedException",
         )
         .await;

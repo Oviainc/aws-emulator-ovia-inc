@@ -368,7 +368,7 @@ async fn a_deleted_replica_is_gone_once_the_clock_owes_its_removal() {
     .await;
     assert_eq!(
         (answered, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
+        (400, "ResourceNotFoundException"),
         "a replica a delete has started is no longer there to configure, got {answered} with \
          {payload}"
     );

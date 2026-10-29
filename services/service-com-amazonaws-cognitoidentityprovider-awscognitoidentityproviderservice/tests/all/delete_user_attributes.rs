@@ -14,7 +14,7 @@
 //! one removal, so the call is idempotent. A name the pool's schema does not
 //! declare, one it declares immutable and one it marks required are all refused
 //! with 400 `InvalidParameterException`, and a token that names no signed-in
-//! user with 403 `NotAuthorizedException` — and a refused request writes
+//! user with 400 `NotAuthorizedException` — and a refused request writes
 //! nothing.
 //!
 //! The pools, app clients, users and access tokens are all real: they come from
@@ -771,8 +771,8 @@ async fn a_token_that_names_no_signed_in_user_is_refused() {
         let (status, payload) = delete(&router, &token, &["nickname"]).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (403, "NotAuthorizedException"),
-            "case {case:?}: expected 403 NotAuthorizedException, got {status} with {payload}"
+            (400, "NotAuthorizedException"),
+            "case {case:?}: expected 400 NotAuthorizedException, got {status} with {payload}"
         );
     }
 

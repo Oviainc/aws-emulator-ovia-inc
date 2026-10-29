@@ -11,7 +11,7 @@
 //! drops nothing and still succeeds. The drop is PERSISTED: a later
 //! `AdminListGroupsForUser` no longer lists the group and a later sign-in's
 //! tokens no longer carry it in their `cognito:groups` claim. An absent pool or
-//! group is a 404 `ResourceNotFoundException` and an absent user a 404
+//! group is a 400 `ResourceNotFoundException` and an absent user a 400
 //! `UserNotFoundException`, and a refused removal persists nothing.
 //!
 //! Each table row names the case it asserts.
@@ -438,7 +438,7 @@ async fn an_absent_pool_group_or_user_is_refused_and_persists_nothing() {
                 "Username": "dave",
                 "GroupName": "admins",
             }),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "a group the pool does not hold",
@@ -447,7 +447,7 @@ async fn an_absent_pool_group_or_user_is_refused_and_persists_nothing() {
                 "Username": "dave",
                 "GroupName": "absent-group",
             }),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "a group name differing only in case, which is a different group",
@@ -456,7 +456,7 @@ async fn an_absent_pool_group_or_user_is_refused_and_persists_nothing() {
                 "Username": "dave",
                 "GroupName": "Admins",
             }),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "a user the pool does not hold",
@@ -465,7 +465,7 @@ async fn an_absent_pool_group_or_user_is_refused_and_persists_nothing() {
                 "Username": "absent-user",
                 "GroupName": "admins",
             }),
-            (404, "UserNotFoundException"),
+            (400, "UserNotFoundException"),
         ),
     ] {
         let (status, payload) = call(&router, "AdminRemoveUserFromGroup", &body).await;

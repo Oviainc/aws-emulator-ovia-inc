@@ -12,7 +12,7 @@
 //! and the submitted language-to-URL map unchanged, its name is unique to that
 //! app client (a duplicate is refused and leaves the stored set untouched, while
 //! the same name on another app client is a different resource), and an absent
-//! pool, app client or `TermsId` is a 404. Each table row names the case it
+//! pool, app client or `TermsId` is a 400. Each table row names the case it
 //! asserts.
 
 use bytes::Bytes;
@@ -482,7 +482,7 @@ async fn both_document_types_live_side_by_side_on_one_app_client() {
 }
 
 #[tokio::test]
-async fn an_absent_pool_client_or_terms_id_is_a_404() {
+async fn an_absent_pool_client_or_terms_id_is_a_400() {
     let router = router();
     let user_pool_id = pool(&router, "notfound-terms-pool").await;
     let client_id = client(&router, &user_pool_id, "notfound-terms-client").await;
@@ -562,8 +562,8 @@ async fn an_absent_pool_client_or_terms_id_is_a_404() {
         let (status, payload) = call(&router, operation, &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: must be a 404 ResourceNotFoundException, got {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: must be a 400 ResourceNotFoundException, got {payload}"
         );
     }
 }

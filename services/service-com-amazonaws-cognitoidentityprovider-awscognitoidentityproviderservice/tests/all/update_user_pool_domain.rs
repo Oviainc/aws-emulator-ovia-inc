@@ -601,7 +601,7 @@ async fn a_request_the_documented_rules_forbid_is_refused() {
         (
             "managed login branding on a pool in the Lite feature plan",
             json!({ "UserPoolId": lite_pool, "Domain": "lite-prefix", "ManagedLoginVersion": 2 }),
-            (403, "FeatureUnavailableInTierException"),
+            (400, "FeatureUnavailableInTierException"),
         ),
         (
             "a custom domain configuration on a prefix domain",
@@ -628,17 +628,17 @@ async fn a_request_the_documented_rules_forbid_is_refused() {
         (
             "a domain the named pool does not hold",
             json!({ "UserPoolId": user_pool_id, "Domain": "never-created", "ManagedLoginVersion": 2 }),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "a domain another pool holds",
             json!({ "UserPoolId": other_pool, "Domain": "refusal-prefix", "ManagedLoginVersion": 2 }),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "a user pool that does not exist",
             json!({ "UserPoolId": "us-east-1_absent", "Domain": "refusal-prefix" }),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "an absent pool whose other members are invalid too",
@@ -647,7 +647,7 @@ async fn a_request_the_documented_rules_forbid_is_refused() {
                 "Domain": "refusal-prefix",
                 "ManagedLoginVersion": 3,
             }),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
     ] {
         let (status, payload) = call(&router, "UpdateUserPoolDomain", &body).await;

@@ -13,8 +13,8 @@
 //! configuration of `phone_number` — the only delivery medium and the only
 //! attribute name an `MFAOptionType` may carry — is refused with 400
 //! `InvalidParameterException`; a pool this emulator does not hold is refused
-//! with 404 `ResourceNotFoundException` and a user that pool does not hold with
-//! 404 `UserNotFoundException`. A refused request writes nothing.
+//! with 400 `ResourceNotFoundException` and a user that pool does not hold with
+//! 400 `UserNotFoundException`. A refused request writes nothing.
 //!
 //! The pools, app clients, users and access tokens are all real: they come from
 //! `CreateUserPool`, `CreateUserPoolClient`, `AdminCreateUser`,
@@ -722,21 +722,21 @@ const ABSENT_CASES: &[AbsentCase] = &[
         existing_pool: false,
         username: "ada",
         code: "ResourceNotFoundException",
-        status: 404,
+        status: 400,
     },
     AbsentCase {
         case: "a username the pool does not hold",
         existing_pool: true,
         username: "nobody",
         code: "UserNotFoundException",
-        status: 404,
+        status: 400,
     },
     AbsentCase {
         case: "a sub no user of the pool holds",
         existing_pool: true,
         username: "11111111-2222-3333-4444-555555555555",
         code: "UserNotFoundException",
-        status: 404,
+        status: 400,
     },
 ];
 

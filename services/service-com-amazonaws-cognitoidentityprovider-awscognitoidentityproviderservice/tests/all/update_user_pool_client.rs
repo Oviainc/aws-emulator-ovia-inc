@@ -653,7 +653,7 @@ async fn a_replaced_auth_flow_list_is_observable_through_admin_initiate_auth() {
 }
 
 #[tokio::test]
-async fn an_update_of_an_absent_pool_or_client_is_a_404() {
+async fn an_update_of_an_absent_pool_or_client_is_a_400() {
     let router = router();
     let (user_pool_id, created) = pool_with_rich_client(&router).await;
     let client_id = created["ClientId"].as_str().expect("a client id").to_string();
@@ -675,8 +675,8 @@ async fn an_update_of_an_absent_pool_or_client_is_a_404() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: an absent pool must answer 404, got {status} with {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {case:?}: an absent pool must answer 400, got {status} with {payload}"
         );
     }
 
@@ -697,8 +697,8 @@ async fn an_update_of_an_absent_pool_or_client_is_a_404() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: an absent app client must answer 404, got {status} with {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {case:?}: an absent app client must answer 400, got {status} with {payload}"
         );
     }
 

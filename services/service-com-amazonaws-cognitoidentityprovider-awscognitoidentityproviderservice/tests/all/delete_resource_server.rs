@@ -6,10 +6,10 @@
 //!
 //! The rule under test: `DeleteResourceServer` drops the one resource server the
 //! pair (`UserPoolId`, `Identifier`) names from the pool's stored resource
-//! servers, so every later read of that pair is a 404 and no other stored
+//! servers, so every later read of that pair is a 400 and no other stored
 //! resource server, pool or app client is touched; a pair that names no stored
 //! resource server — an absent pool, an identifier the pool does not hold, an
-//! identifier of another pool, or one a previous call already deleted — is a 404
+//! identifier of another pool, or one a previous call already deleted — is a 400
 //! `ResourceNotFoundException` that stores nothing — worded, as every reader of
 //! the same pair words it, by naming the identifier, what is wrong with it, and
 //! the pool it was looked for in. Because a pool defines a
@@ -260,7 +260,7 @@ async fn a_delete_removes_exactly_the_resource_server_it_names() {
         .await;
         assert_eq!(
             (read_status, error_code(&read)),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
             "case {label:?}: a deleted resource server is gone from DescribeResourceServer, got {read}"
         );
         // Every reader of a pair naming no stored resource server words the miss
@@ -314,7 +314,7 @@ async fn a_delete_removes_exactly_the_resource_server_it_names() {
 }
 
 #[tokio::test]
-async fn a_pair_that_names_no_stored_resource_server_is_a_404_that_stores_nothing() {
+async fn a_pair_that_names_no_stored_resource_server_is_a_400_that_stores_nothing() {
     let router = router();
     let user_pool_id = pool(&router, "delete-rs-notfound-pool").await;
     let other_pool = pool(&router, "delete-rs-other-pool").await;
@@ -364,8 +364,8 @@ async fn a_pair_that_names_no_stored_resource_server_is_a_404_that_stores_nothin
             let (status, payload) = call(&router, "DeleteResourceServer", &body).await;
             assert_eq!(
                 (status, error_code(&payload)),
-                (404, "ResourceNotFoundException"),
-                "case {label:?} / {row:?}: a pair naming no stored resource server is a 404 ResourceNotFoundException, got {payload}"
+                (400, "ResourceNotFoundException"),
+                "case {label:?} / {row:?}: a pair naming no stored resource server is a 400 ResourceNotFoundException, got {payload}"
             );
             assert_eq!(
                 error_message(&payload),
@@ -390,7 +390,7 @@ async fn a_pair_that_names_no_stored_resource_server_is_a_404_that_stores_nothin
         .await;
 
         // A second delete of the same pair names no stored resource server, so
-        // it is the same 404 as any other miss.
+        // it is the same 400 as any other miss.
         let (status, payload) = call(
             &router,
             "DeleteResourceServer",
@@ -399,8 +399,8 @@ async fn a_pair_that_names_no_stored_resource_server_is_a_404_that_stores_nothin
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: a repeated delete is a 404 ResourceNotFoundException, got {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: a repeated delete is a 400 ResourceNotFoundException, got {payload}"
         );
         assert_eq!(
             error_message(&payload),

@@ -11,7 +11,7 @@
 //! scopes exactly as submitted (an empty list when the request set none), a
 //! second resource server under an identifier the pool already holds is refused
 //! and leaves the stored one untouched, and an absent pool or identifier is a
-//! 404. Each table row names the case it asserts.
+//! 400. Each table row names the case it asserts.
 
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
@@ -366,7 +366,7 @@ async fn a_resource_server_is_keyed_by_its_pool_and_its_exact_identifier() {
 }
 
 #[tokio::test]
-async fn an_absent_pool_or_identifier_is_a_404() {
+async fn an_absent_pool_or_identifier_is_a_400() {
     let router = router();
     let user_pool_id = pool(&router, "notfound-rs-pool").await;
     ok(
@@ -404,8 +404,8 @@ async fn an_absent_pool_or_identifier_is_a_404() {
         let (status, payload) = call(&router, operation, &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: must be a 404 ResourceNotFoundException, got {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: must be a 400 ResourceNotFoundException, got {payload}"
         );
     }
 }
@@ -507,7 +507,7 @@ async fn a_request_outside_a_modelled_constraint_is_refused() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
             "case {label:?}: a refused create stores no resource server, got {payload}"
         );
     }

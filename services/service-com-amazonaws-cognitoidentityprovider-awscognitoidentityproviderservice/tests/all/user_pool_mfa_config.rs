@@ -644,7 +644,7 @@ async fn an_sms_factor_without_an_sns_caller_is_refused_while_mfa_is_on() {
 }
 
 #[tokio::test]
-async fn an_absent_pool_is_a_404_for_both_operations() {
+async fn an_absent_pool_is_a_400_for_both_operations() {
     let router = router();
     // Ids no pool was created under, each satisfying the modelled
     // `UserPoolIdType` pattern `^[\w-]+_[0-9a-zA-Z]+$` in a different form.
@@ -668,9 +668,9 @@ async fn an_absent_pool_is_a_404_for_both_operations() {
                 "GetUserPoolMfaConfig",
                 json!({ "UserPoolId": user_pool_id }),
             ),
-            // An absent pool is a 404 whatever else the body carries: the lookup
+            // An absent pool is a 400 whatever else the body carries: the lookup
             // is answered before any question about the factors it configures,
-            // so a body that would be refused on a live pool is still a 404 here.
+            // so a body that would be refused on a live pool is still a 400 here.
             (
                 "SetUserPoolMfaConfig",
                 json!({ "UserPoolId": user_pool_id, "MfaConfiguration": "ON",
@@ -679,8 +679,8 @@ async fn an_absent_pool_is_a_404_for_both_operations() {
         ] {
             let (status, payload) = call(&router, operation, &body).await;
             assert_eq!(
-                status, 404,
-                "case {label:?}: {operation} on an absent pool must answer 404, got {status} \
+                status, 400,
+                "case {label:?}: {operation} on an absent pool must answer 400, got {status} \
                  with {payload}"
             );
             assert_eq!(

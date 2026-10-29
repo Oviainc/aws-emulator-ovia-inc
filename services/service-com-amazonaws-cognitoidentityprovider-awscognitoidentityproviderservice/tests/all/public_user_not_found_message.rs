@@ -332,8 +332,8 @@ async fn an_absent_user_of_a_public_operation_is_refused_as_an_unresolved_pair()
                 dispatch(&emulator, Addressing::Anonymous, operation, &body).await;
             assert_eq!(
                 (status, error_code(&payload)),
-                (404, "UserNotFoundException"),
-                "case {case:?}: expected a 404 UserNotFoundException, got {status} with {payload}"
+                (400, "UserNotFoundException"),
+                "case {case:?}: expected a 400 UserNotFoundException, got {status} with {payload}"
             );
             let message = error_message(&payload);
             assert_eq!(
@@ -356,8 +356,8 @@ async fn an_absent_user_of_a_public_operation_is_refused_as_an_unresolved_pair()
                 dispatch(&emulator, Addressing::Anonymous, operation, &body).await;
             assert_eq!(
                 (status, error_code(&payload)),
-                (403, "NotAuthorizedException"),
-                "case {case:?}: expected a 403 NotAuthorizedException, got {status} with {payload}"
+                (400, "NotAuthorizedException"),
+                "case {case:?}: expected a 400 NotAuthorizedException, got {status} with {payload}"
             );
             let message = error_message(&payload);
             assert_eq!(
@@ -392,8 +392,8 @@ async fn an_absent_user_of_a_public_operation_is_refused_as_an_unresolved_pair()
             let (status, payload) = dispatch(target, *addressing, operation, body).await;
             assert_eq!(
                 (status, error_code(&payload)),
-                (404, "UserNotFoundException"),
-                "case {case:?}: expected a 404 UserNotFoundException, got {status} with {payload}"
+                (400, "UserNotFoundException"),
+                "case {case:?}: expected a 400 UserNotFoundException, got {status} with {payload}"
             );
             let message = error_message(&payload);
             assert_eq!(

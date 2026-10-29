@@ -266,7 +266,7 @@ async fn sign_up_requires_the_secret_hash_of_an_app_client_that_holds_a_secret()
             confidential.client_id.clone(),
             "bob",
             None,
-            403,
+            400,
             Some("NotAuthorizedException"),
         ),
         (
@@ -274,7 +274,7 @@ async fn sign_up_requires_the_secret_hash_of_an_app_client_that_holds_a_secret()
             confidential.client_id.clone(),
             "carol",
             Some("notTheHash".to_string()),
-            403,
+            400,
             Some("NotAuthorizedException"),
         ),
         (
@@ -286,7 +286,7 @@ async fn sign_up_requires_the_secret_hash_of_an_app_client_that_holds_a_secret()
                 "dave",
                 &confidential.client_id,
             )),
-            403,
+            400,
             Some("NotAuthorizedException"),
         ),
         (
@@ -294,7 +294,7 @@ async fn sign_up_requires_the_secret_hash_of_an_app_client_that_holds_a_secret()
             confidential.client_id.clone(),
             "erin",
             Some(secret_hash(secret, &confidential.client_id, "erin")),
-            403,
+            400,
             Some("NotAuthorizedException"),
         ),
         (
@@ -302,7 +302,7 @@ async fn sign_up_requires_the_secret_hash_of_an_app_client_that_holds_a_secret()
             confidential.client_id.clone(),
             "frank",
             Some(secret_hash(secret, "grace", &confidential.client_id)),
-            403,
+            400,
             Some("NotAuthorizedException"),
         ),
         (
@@ -371,7 +371,7 @@ async fn sign_up_requires_the_secret_hash_of_an_app_client_that_holds_a_secret()
             );
         } else {
             assert_eq!(
-                status, 404,
+                status, 400,
                 "case {case:?}: a refused registration stores no user, got {status} with \
                  {payload}"
             );

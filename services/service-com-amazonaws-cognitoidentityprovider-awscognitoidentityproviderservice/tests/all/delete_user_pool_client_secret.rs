@@ -326,8 +326,8 @@ async fn grant_accepts(router: &MultiServiceRouter, client_id: &str, secret: &st
     }
     assert_eq!(
         (status, error_code(&payload)),
-        (403, "NotAuthorizedException"),
-        "a refused grant is a 403 NotAuthorizedException, got ({status}, {:?}) with {payload}",
+        (400, "NotAuthorizedException"),
+        "a refused grant is a 400 NotAuthorizedException, got ({status}, {:?}) with {payload}",
         error_code(&payload)
     );
     false
@@ -522,7 +522,7 @@ async fn a_deleted_client_secret_is_dropped_and_every_other_one_stays_active() {
             case,
             DELETE,
             &delete_body(&fixture.user_pool_id, &fixture.client_id, &deleted_id),
-            404,
+            400,
             "ResourceNotFoundException",
         )
         .await;
@@ -778,7 +778,7 @@ async fn a_delete_for_a_resource_no_app_client_holds_is_refused() {
             &case,
             DELETE,
             &delete_body(&user_pool_id, &client_id, &secret_id),
-            404,
+            400,
             "ResourceNotFoundException",
         )
         .await;

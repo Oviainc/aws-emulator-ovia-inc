@@ -245,7 +245,7 @@ async fn a_temporary_password_expires_only_once_the_window_is_past() {
 
 /// A pool's own `TemporaryPasswordValidityDays` is the window the refusal uses:
 /// a sign-in inside it gets the password-change challenge, and one past it is
-/// refused with `NotAuthorizedException` (403).
+/// refused with `NotAuthorizedException` (400).
 #[tokio::test]
 async fn an_expired_temporary_password_is_refused_over_the_wire() {
     // Each row: case name, the pool's window in days (None = the documented
@@ -270,7 +270,7 @@ async fn an_expired_temporary_password_is_refused_over_the_wire() {
             "default window, set eight days ago",
             None,
             8 * DAY,
-            403,
+            400,
             "NotAuthorizedException",
         ),
         (
@@ -284,7 +284,7 @@ async fn an_expired_temporary_password_is_refused_over_the_wire() {
             "one-day window, set two days ago",
             Some(1),
             2 * DAY,
-            403,
+            400,
             "NotAuthorizedException",
         ),
         (
@@ -298,7 +298,7 @@ async fn an_expired_temporary_password_is_refused_over_the_wire() {
             "thirty-day window, set thirty-one days ago",
             Some(30),
             31 * DAY,
-            403,
+            400,
             "NotAuthorizedException",
         ),
     ];

@@ -508,8 +508,8 @@ async fn a_stack_provisions_the_cognito_user_pool_group_its_template_declares() 
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404 from GetGroup once the stack deleted the group, \
+            status, 400,
+            "case {case:?}: expected HTTP 400 from GetGroup once the stack deleted the group, \
              got {status} with body {gone}"
         );
         assert!(

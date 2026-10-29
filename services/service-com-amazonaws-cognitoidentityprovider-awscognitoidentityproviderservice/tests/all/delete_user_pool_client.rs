@@ -321,7 +321,7 @@ async fn a_deleted_app_client_is_gone_from_the_pool_and_from_every_read() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
             "case {label:?}: a deleted client is no longer readable, got {status} with {payload}"
         );
 
@@ -361,7 +361,7 @@ async fn a_deleted_app_client_is_gone_from_the_pool_and_from_every_read() {
             .await;
             assert_eq!(
                 (status, error_code(&payload)),
-                (404, "ResourceNotFoundException"),
+                (400, "ResourceNotFoundException"),
                 "case {label:?}: the deleted client's terms document {terms_id} is gone, \
                  got {status} with {payload}"
             );
@@ -396,7 +396,7 @@ async fn a_deleted_app_client_is_gone_from_the_pool_and_from_every_read() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
             "case {label:?}: deleting a client twice is refused the second time, \
              got {status} with {payload}"
         );
@@ -455,7 +455,7 @@ async fn a_deleted_app_client_can_no_longer_sign_a_user_in() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
+        (400, "ResourceNotFoundException"),
         "a sign-in naming a deleted app client is refused, got {status} with {payload}"
     );
 
@@ -511,8 +511,8 @@ async fn a_delete_that_names_no_stored_app_client_is_refused() {
         let (status, payload) = call(&router, "DeleteUserPoolClient", &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: expected a 404 ResourceNotFoundException, got {status} with {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: expected a 400 ResourceNotFoundException, got {status} with {payload}"
         );
         let message = error_message(&payload);
         assert_eq!(

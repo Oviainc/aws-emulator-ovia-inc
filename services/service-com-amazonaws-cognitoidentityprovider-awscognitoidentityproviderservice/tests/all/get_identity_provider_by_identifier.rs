@@ -9,9 +9,9 @@
 //! matching an entry exactly, and renders that stored provider — the same
 //! document `DescribeIdentityProvider` renders for it; an identifier no provider
 //! of that pool carries, including one carried only by a provider of another
-//! pool, is a 404 `ResourceNotFoundException` whose message is built from the
+//! pool, is a 400 `ResourceNotFoundException` whose message is built from the
 //! request (it names the identifier asked for and the pool it was looked up in),
-//! and an absent pool is a 404 reported as the unknown pool. Each table row
+//! and an absent pool is a 400 reported as the unknown pool. Each table row
 //! names the case it asserts.
 
 use bytes::Bytes;
@@ -304,7 +304,7 @@ async fn an_identifier_is_scoped_to_the_pool_the_request_names() {
     let second_pool = pool(&router, "second-get-idp-pool").await;
 
     // The SAME identifier in two pools is two providers; each pool resolves its
-    // own, and a pool holding no provider with that identifier is a 404.
+    // own, and a pool holding no provider with that identifier is a 400.
     for (label, user_pool_id, provider_name, issuer) in [
         (
             "the first pool",
@@ -365,8 +365,8 @@ async fn an_identifier_is_scoped_to_the_pool_the_request_names() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
-        "an identifier carried only by another pool's provider is a 404 ResourceNotFoundException, got {payload}"
+        (400, "ResourceNotFoundException"),
+        "an identifier carried only by another pool's provider is a 400 ResourceNotFoundException, got {payload}"
     );
     assert_eq!(
         payload["message"],
@@ -385,7 +385,7 @@ fn identifier_not_found_message(idp_identifier: &str, user_pool_id: &str) -> Str
 }
 
 #[tokio::test]
-async fn an_identifier_no_provider_of_the_pool_carries_is_a_404() {
+async fn an_identifier_no_provider_of_the_pool_carries_is_a_400() {
     let router = router();
     let user_pool_id = pool(&router, "absent-identifier-pool").await;
     ok(
@@ -443,8 +443,8 @@ async fn an_identifier_no_provider_of_the_pool_carries_is_a_404() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: must be a 404 ResourceNotFoundException, got {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: must be a 400 ResourceNotFoundException, got {payload}"
         );
         // The message is built from the request, so it names the identifier the
         // caller asked with and the pool it was looked up in.
@@ -465,8 +465,8 @@ async fn an_identifier_no_provider_of_the_pool_carries_is_a_404() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
-        "an absent user pool is a 404 ResourceNotFoundException, got {payload}"
+        (400, "ResourceNotFoundException"),
+        "an absent user pool is a 400 ResourceNotFoundException, got {payload}"
     );
     assert_eq!(
         payload["message"],

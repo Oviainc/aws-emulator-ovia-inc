@@ -639,7 +639,7 @@ async fn a_replica_call_a_pool_does_not_admit_is_refused_and_persists_nothing() 
             case: "a create naming a pool that does not exist",
             operation: "CreateUserPoolReplica",
             body: |_| json!({ "UserPoolId": ABSENT_POOL, "RegionName": REGION }),
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
             message: Some("User pool us-east-1_absentpool does not exist."),
         },
@@ -663,7 +663,7 @@ async fn a_replica_call_a_pool_does_not_admit_is_refused_and_persists_nothing() 
             case: "a listing of a pool that does not exist",
             operation: "ListUserPoolReplicas",
             body: |_| json!({ "UserPoolId": ABSENT_POOL }),
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
             message: Some("User pool us-east-1_absentpool does not exist."),
         },
@@ -683,7 +683,7 @@ async fn a_replica_call_a_pool_does_not_admit_is_refused_and_persists_nothing() 
                 "RegionName": REGION,
                 "Status": REPLICA_STATUS_INACTIVE,
             }),
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
             message: Some("User pool us-east-1_absentpool does not exist."),
         },
@@ -695,7 +695,7 @@ async fn a_replica_call_a_pool_does_not_admit_is_refused_and_persists_nothing() 
                 "RegionName": UNREPLICATED_REGION,
                 "Status": REPLICA_STATUS_ACTIVE,
             }),
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
             // The service words this refusal as fixed text, interpolating no
             // value.
@@ -709,7 +709,7 @@ async fn a_replica_call_a_pool_does_not_admit_is_refused_and_persists_nothing() 
                 "RegionName": PRIMARY_REGION,
                 "Status": REPLICA_STATUS_INACTIVE,
             }),
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
             message: Some("Replica not found in the requested region"),
         },
@@ -909,7 +909,7 @@ async fn replication_is_refused_on_the_feature_plan_that_does_not_include_it() {
     .await;
     assert_eq!(
         (answered, error_code(&payload)),
-        (403, "FeatureUnavailableInTierException"),
+        (400, "FeatureUnavailableInTierException"),
         "a pool on the LITE plan can't be replicated, got {answered} with {payload}"
     );
     assert!(

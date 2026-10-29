@@ -10,7 +10,7 @@
 //! for member — the same record a read by `TermsId` renders, including whatever a
 //! later update wrote — it changes nothing a later caller sees, and an absent
 //! pool, an app client the pool does not hold, or a name that app client holds no
-//! documents under is a 404 `ResourceNotFoundException` carrying no terms
+//! documents under is a 400 `ResourceNotFoundException` carrying no terms
 //! documents — an unresolved pool or app client worded from the request's own
 //! values, and an unresolved set of documents worded as the one fixed sentence
 //! that class of refusal carries.
@@ -451,9 +451,9 @@ async fn one_name_on_two_app_clients_resolves_to_each_client_own_documents() {
 }
 
 #[tokio::test]
-async fn an_absent_pool_client_or_name_is_a_404() {
+async fn an_absent_pool_client_or_name_is_a_400() {
     let router = router();
-    let user_pool_id = pool(&router, "describe-by-client-404-pool").await;
+    let user_pool_id = pool(&router, "describe-by-client-400-pool").await;
     let client_id = client(&router, &user_pool_id, "notfound-client").await;
     let bare_client = client(&router, &user_pool_id, "holds-nothing").await;
     let other_pool = pool(&router, "describe-by-client-other-pool").await;
@@ -538,8 +538,8 @@ async fn an_absent_pool_client_or_name_is_a_404() {
         let (status, payload) = call(&router, "DescribeTermsByClient", &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: must be a 404 ResourceNotFoundException, got {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: must be a 400 ResourceNotFoundException, got {payload}"
         );
         assert_eq!(
             error_message(&payload),
@@ -690,8 +690,8 @@ async fn a_client_of_another_pool_is_refused_and_leaves_every_pool_listing_untou
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: a client that is not an app client of the named pool is a 404 ResourceNotFoundException, got {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: a client that is not an app client of the named pool is a 400 ResourceNotFoundException, got {payload}"
         );
         assert_eq!(
             error_message(&payload),
@@ -813,7 +813,7 @@ async fn a_request_outside_a_modelled_constraint_is_refused() {
     }
 
     // A client id at the length maximum 128 is INSIDE the constraint, so it is
-    // answered by the lookup (a 404) rather than refused as malformed.
+    // answered by the lookup (a 400) rather than refused as malformed.
     let (status, payload) = call(
         &router,
         "DescribeTermsByClient",
@@ -826,7 +826,7 @@ async fn a_request_outside_a_modelled_constraint_is_refused() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
-        "a client id at the length maximum 128 is well formed, so it is a 404 and not a 400, got {payload}"
+        (400, "ResourceNotFoundException"),
+        "a client id at the length maximum 128 is well formed, so it is a 400 and not a 400, got {payload}"
     );
 }

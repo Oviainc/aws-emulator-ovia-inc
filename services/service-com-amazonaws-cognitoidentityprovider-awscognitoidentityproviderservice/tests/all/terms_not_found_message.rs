@@ -297,8 +297,8 @@ async fn a_lookup_that_resolves_no_terms_documents_answers_one_fixed_sentence() 
         let (status, payload) = call(&router, operation, &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: must be a 404 ResourceNotFoundException, got {status} with {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {case:?}: must be a 400 ResourceNotFoundException, got {status} with {payload}"
         );
         let message = error_message(&payload);
         assert_eq!(
@@ -394,8 +394,8 @@ async fn an_unresolved_app_client_keeps_its_own_wording() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: must be a 404 ResourceNotFoundException, got {status} with {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {case:?}: must be a 400 ResourceNotFoundException, got {status} with {payload}"
         );
         let message = error_message(&payload);
         assert_eq!(

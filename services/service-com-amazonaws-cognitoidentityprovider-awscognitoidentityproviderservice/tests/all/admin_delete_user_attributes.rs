@@ -13,8 +13,8 @@
 //! holds no value of removes nothing and a name listed twice is one removal, so
 //! the call is idempotent. A name the pool's schema does not declare, one it
 //! declares immutable and one it marks required are all refused with 400
-//! `InvalidParameterException`; a pool that does not exist with 404
-//! `ResourceNotFoundException` and a user the pool does not hold with 404
+//! `InvalidParameterException`; a pool that does not exist with 400
+//! `ResourceNotFoundException` and a user the pool does not hold with 400
 //! `UserNotFoundException` — and a refused request writes nothing.
 //!
 //! The same shared plan serves the self-service `DeleteUserAttributes`, so one
@@ -671,13 +671,13 @@ async fn a_deletion_of_a_resource_that_does_not_exist_is_refused() {
             "a user pool that does not exist",
             absent_pool.as_str(),
             "ada",
-            (404u16, "ResourceNotFoundException"),
+            (400u16, "ResourceNotFoundException"),
         ),
         (
             "a user the pool does not hold",
             user_pool_id.as_str(),
             "grace",
-            (404, "UserNotFoundException"),
+            (400, "UserNotFoundException"),
         ),
     ] {
         let (status, payload) = delete(&router, pool_id, username, &["nickname"]).await;

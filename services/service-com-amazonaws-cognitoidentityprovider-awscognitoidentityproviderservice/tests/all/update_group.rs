@@ -9,7 +9,7 @@
 //! IAM role and description — a member the request carries replaces what the group
 //! held, a member it leaves out keeps its stored value — leaves the group's name,
 //! pool and creation instant alone, advances its last-modified instant, returns the
-//! stored group, and refuses an absent pool or group with a 404
+//! stored group, and refuses an absent pool or group with a 400
 //! `ResourceNotFoundException`. Each table row names the case it asserts.
 
 use bytes::Bytes;
@@ -494,7 +494,7 @@ async fn an_update_touches_only_the_group_it_names() {
 }
 
 #[tokio::test]
-async fn an_absent_pool_or_group_is_a_404_and_stores_nothing() {
+async fn an_absent_pool_or_group_is_a_400_and_stores_nothing() {
     let router = router();
     let user_pool_id = pool(&router, "update-notfound-pool").await;
     let created = ok(
@@ -521,8 +521,8 @@ async fn an_absent_pool_or_group_is_a_404_and_stores_nothing() {
         let (status, payload) = call(&router, "UpdateGroup", &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: must be a 404 ResourceNotFoundException, got {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: must be a 400 ResourceNotFoundException, got {payload}"
         );
     }
 
@@ -545,7 +545,7 @@ async fn an_absent_pool_or_group_is_a_404_and_stores_nothing() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
+        (400, "ResourceNotFoundException"),
         "a refused update stores no group, got {payload}"
     );
 }

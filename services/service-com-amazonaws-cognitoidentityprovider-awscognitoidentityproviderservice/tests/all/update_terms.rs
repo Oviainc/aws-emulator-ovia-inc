@@ -13,7 +13,7 @@
 //! `DescribeTerms` renders the same thing. A document's name stays unique to its
 //! app client, so a rename onto a name that app client already holds other
 //! documents under is refused and stores nothing, while the same name on another
-//! app client is free; an unknown pool or `TermsId` is a 404 and a request
+//! app client is free; an unknown pool or `TermsId` is a 400 and a request
 //! outside a modelled constraint is a 400. Each table row names the case it
 //! asserts.
 
@@ -600,7 +600,7 @@ async fn both_enforcement_points_of_the_name_uniqueness_rule_word_the_refusal_th
 }
 
 #[tokio::test]
-async fn an_update_of_an_absent_pool_or_terms_id_is_a_404() {
+async fn an_update_of_an_absent_pool_or_terms_id_is_a_400() {
     let router = router();
     let user_pool_id = pool(&router, "update-notfound-pool").await;
     let client_id = client(&router, &user_pool_id, "update-notfound-client").await;
@@ -646,8 +646,8 @@ async fn an_update_of_an_absent_pool_or_terms_id_is_a_404() {
         let (status, payload) = call(&router, "UpdateTerms", &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: must be a 404 ResourceNotFoundException, got {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: must be a 400 ResourceNotFoundException, got {payload}"
         );
     }
 

@@ -17,7 +17,7 @@
 //! byte for byte; a read of an app client with no branding of its own falls back
 //! to the pool-level default, a read of a pool with no branding at either level
 //! answers an empty object, and a level named for a pool or an app client that
-//! does not exist is a 404.
+//! does not exist is a 400.
 //!
 //! Each table row names the case it asserts.
 
@@ -936,8 +936,8 @@ async fn an_absent_pool_or_app_client_is_refused() {
     ] {
         let (status, payload) = call(&router, operation, &body).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: an absent resource is a 404, got {status} with {payload}"
+            status, 400,
+            "case {case:?}: an absent resource is a 400, got {status} with {payload}"
         );
         assert_eq!(
             error_code(&payload),

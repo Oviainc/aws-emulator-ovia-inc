@@ -649,14 +649,14 @@ async fn user_password_auth_answers_from_the_stored_client_and_user() {
             client_id: &enabled_client,
             username: "alice",
             password: Some("Wr0ngPassword!"),
-            expected: refused(403, "NotAuthorizedException"),
+            expected: refused(400, "NotAuthorizedException"),
         },
         Row {
             case: "the stored password, in a different case: the stored one is exact",
             client_id: &enabled_client,
             username: "alice",
             password: Some("passw0rd!2024"),
-            expected: refused(403, "NotAuthorizedException"),
+            expected: refused(400, "NotAuthorizedException"),
         },
         Row {
             case: "no PASSWORD parameter for a flow that requires one",
@@ -670,14 +670,14 @@ async fn user_password_auth_answers_from_the_stored_client_and_user() {
             client_id: &enabled_client,
             username: "nobody",
             password: Some(GOOD_PASSWORD),
-            expected: refused(404, "UserNotFoundException"),
+            expected: refused(400, "UserNotFoundException"),
         },
         Row {
             case: "a user the pool does not hold, on a client that hides user existence",
             client_id: &discreet_client,
             username: "nobody",
             password: Some(GOOD_PASSWORD),
-            expected: refused(403, "NotAuthorizedException"),
+            expected: refused(400, "NotAuthorizedException"),
         },
         Row {
             case: "a client that does not enable this flow",
@@ -709,7 +709,7 @@ async fn user_password_auth_answers_from_the_stored_client_and_user() {
     }
 
     // A `ClientId` no pool holds: the app client is what names the pool here, so an
-    // unknown one is a 404 and not a sign-in.
+    // unknown one is a refusal and not a sign-in.
     let (status, payload) = dispatch(
         &serving,
         ANONYMOUS,
@@ -723,8 +723,8 @@ async fn user_password_auth_answers_from_the_stored_client_and_user() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
-        "an unknown ClientId must be a 404 ResourceNotFoundException, got {payload}"
+        (400, "ResourceNotFoundException"),
+        "an unknown ClientId must be a 400 ResourceNotFoundException, got {payload}"
     );
 }
 
@@ -769,7 +769,7 @@ async fn the_stored_user_state_decides_the_refusal() {
             username: "disabled",
             store: |user| user.enabled = false,
             password: GOOD_PASSWORD,
-            expected: refused(403, "NotAuthorizedException"),
+            expected: refused(400, "NotAuthorizedException"),
         },
         Row {
             case: "a user Amazon Cognito put in RESET_REQUIRED",
@@ -794,7 +794,7 @@ async fn the_stored_user_state_decides_the_refusal() {
                     Some(SystemTime::now() - BEYOND_TEMPORARY_PASSWORD_VALIDITY);
             },
             password: GOOD_PASSWORD,
-            expected: refused(403, "NotAuthorizedException"),
+            expected: refused(400, "NotAuthorizedException"),
         },
         // The credential is checked BEFORE the user's state is reported, so a caller
         // that does not hold the password learns nothing about the user it named: each
@@ -805,21 +805,21 @@ async fn the_stored_user_state_decides_the_refusal() {
             username: "unconfirmedwrongpassword",
             store: |user| user.status = state::UserStatus::Unconfirmed,
             password: "NotTheP4ssword!",
-            expected: refused(403, "NotAuthorizedException"),
+            expected: refused(400, "NotAuthorizedException"),
         },
         Row {
             case: "the wrong password for a user in RESET_REQUIRED",
             username: "resetrequiredwrongpassword",
             store: |user| user.status = state::UserStatus::ResetRequired,
             password: "NotTheP4ssword!",
-            expected: refused(403, "NotAuthorizedException"),
+            expected: refused(400, "NotAuthorizedException"),
         },
         Row {
             case: "the wrong password for a disabled user",
             username: "disabledwrongpassword",
             store: |user| user.enabled = false,
             password: "NotTheP4ssword!",
-            expected: refused(403, "NotAuthorizedException"),
+            expected: refused(400, "NotAuthorizedException"),
         },
     ];
 
@@ -1027,19 +1027,19 @@ async fn refresh_token_auth_renews_the_tokens_of_the_stored_refresh_token() {
             case: "a token this emulator never issued",
             client_id: &fixture.client_id,
             token: Some("notatokenthisemulatorissued"),
-            expected: refused(403, "NotAuthorizedException"),
+            expected: refused(400, "NotAuthorizedException"),
         },
         Row {
             case: "an access token presented as a refresh token",
             client_id: &fixture.client_id,
             token: Some(access_token),
-            expected: refused(403, "NotAuthorizedException"),
+            expected: refused(400, "NotAuthorizedException"),
         },
         Row {
             case: "a refresh token issued for another app client",
             client_id: &fixture.client_id,
             token: Some(&other_refresh_token),
-            expected: refused(403, "NotAuthorizedException"),
+            expected: refused(400, "NotAuthorizedException"),
         },
         Row {
             case: "no REFRESH_TOKEN parameter",

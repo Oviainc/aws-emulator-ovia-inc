@@ -11,7 +11,7 @@
 //! order, a page of at most `MaxResults` entries at a time, where the
 //! `NextToken` of a non-final page resumes the listing strictly after the last
 //! entry that page served and the final page carries none. It writes nothing: a
-//! repeated call answers the same. An absent pool is a 404
+//! repeated call answers the same. An absent pool is a 400
 //! `ResourceNotFoundException` and a `NextToken` this listing never minted a 400
 //! `InvalidParameterException`.
 //!
@@ -605,7 +605,7 @@ async fn an_absent_pool_and_an_unissued_token_are_refused() {
         (
             "an absent user pool",
             list_request("us-east-1_absent", None, None),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "a NextToken no listing of this service minted",

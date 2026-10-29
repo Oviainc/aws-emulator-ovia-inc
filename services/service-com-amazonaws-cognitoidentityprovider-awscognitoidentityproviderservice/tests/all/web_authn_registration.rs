@@ -18,7 +18,7 @@
 //! already holding every passkey one user may hold with 400
 //! `LimitExceededException`, and a token that names no signed-in user — one this
 //! emulator never issued, one that is not an ACCESS token, a revoked one, one the
-//! clock has expired, and one whose pool or user is gone — with 403
+//! clock has expired, and one whose pool or user is gone — with 400
 //! `NotAuthorizedException`.
 //!
 //! A passkey credential comes into existence through
@@ -1001,7 +1001,7 @@ async fn a_token_that_names_no_signed_in_user_is_refused() {
         let (status, payload) = start(&router, token).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (403, "NotAuthorizedException"),
+            (400, "NotAuthorizedException"),
             "case {case:?}: the token names no signed-in user, got {status} with {payload}"
         );
     }

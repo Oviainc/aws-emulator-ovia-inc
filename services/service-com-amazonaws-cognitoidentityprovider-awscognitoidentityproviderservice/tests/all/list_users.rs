@@ -12,7 +12,7 @@
 //! `Limit` entries at a time, where the `PaginationToken` of a non-final page
 //! resumes that same search strictly after the last user the page served and the
 //! final page carries none. It writes nothing: a repeated call answers the same,
-//! and so does every other reader of the same state. An absent pool is a 404
+//! and so does every other reader of the same state. An absent pool is a 400
 //! `ResourceNotFoundException`; a filter that is not such a comparison, and a
 //! `PaginationToken` this search never minted, are a 400
 //! `InvalidParameterException`.
@@ -930,7 +930,7 @@ async fn an_absent_pool_a_filter_that_is_no_search_and_an_unissued_token_are_ref
         (
             "an absent user pool",
             search("us-east-1_absent", None),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "a filter that is a bare attribute name",

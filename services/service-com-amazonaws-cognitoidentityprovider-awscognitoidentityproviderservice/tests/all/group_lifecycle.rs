@@ -8,7 +8,7 @@
 //! The rule under test: a created group is keyed by (`UserPoolId`, `GroupName`),
 //! it renders every member the request set and none it did not, a second group
 //! under a name the pool already holds is refused, and a group of an absent pool
-//! or an absent name is a 404. Each table row names the case it asserts.
+//! or an absent name is a 400. Each table row names the case it asserts.
 
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
@@ -368,7 +368,7 @@ async fn a_group_is_keyed_by_its_pool_and_its_exact_name() {
 }
 
 #[tokio::test]
-async fn an_absent_pool_or_group_is_a_404() {
+async fn an_absent_pool_or_group_is_a_400() {
     let router = router();
     let user_pool_id = pool(&router, "notfound-pool").await;
     ok(
@@ -398,8 +398,8 @@ async fn an_absent_pool_or_group_is_a_404() {
         let (status, payload) = call(&router, operation, &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: must be a 404 ResourceNotFoundException, got {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: must be a 400 ResourceNotFoundException, got {payload}"
         );
     }
 }
@@ -472,7 +472,7 @@ async fn a_request_outside_a_modelled_constraint_is_refused() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
             "case {label:?}: a refused create stores no group, got {payload}"
         );
     }

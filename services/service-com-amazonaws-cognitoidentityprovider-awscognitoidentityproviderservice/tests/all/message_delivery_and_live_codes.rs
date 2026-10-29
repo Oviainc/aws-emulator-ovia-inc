@@ -532,7 +532,7 @@ async fn a_requested_delivery_medium_needs_the_attribute_that_addresses_it() {
                 .await;
                 assert_eq!(
                     (read_status, error_code(&read_back)),
-                    (404, "UserNotFoundException"),
+                    (400, "UserNotFoundException"),
                     "case {case:?}: a refused create writes no user, got {read_status} \
                      with {read_back}"
                 );
@@ -1007,8 +1007,8 @@ async fn an_absent_user_is_reported_by_the_scope_the_lookup_used() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "UserNotFoundException"),
-            "case {case:?} (ConfirmSignUp): expected a 404 UserNotFoundException, got \
+            (400, "UserNotFoundException"),
+            "case {case:?} (ConfirmSignUp): expected a 400 UserNotFoundException, got \
              {status} with {payload}"
         );
         let message = error_message(&payload);
@@ -1027,8 +1027,8 @@ async fn an_absent_user_is_reported_by_the_scope_the_lookup_used() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "UserNotFoundException"),
-            "case {case:?} (AdminGetUser): expected a 404 UserNotFoundException, got \
+            (400, "UserNotFoundException"),
+            "case {case:?} (AdminGetUser): expected a 400 UserNotFoundException, got \
              {status} with {payload}"
         );
         let message = error_message(&payload);

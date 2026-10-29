@@ -16,7 +16,7 @@
 //!   (`DeleteUserPoolDomain`, `UpdateUserPoolDomain`) resolves that pair as a
 //!   unit, so a pair holding no stored domain is refused the same way whichever
 //!   half of it is wrong, with one sentence that reports the pair and names
-//!   neither half — `404 ResourceNotFoundException` where the operation
+//!   neither half — `400 ResourceNotFoundException` where the operation
 //!   reconfigures an existing domain record, and `400
 //!   InvalidParameterException` where it removes one.
 //! * the device surface of a pool that set no `DeviceConfiguration` is refused
@@ -317,7 +317,7 @@ async fn a_read_of_a_domain_no_pool_holds_reports_an_empty_description() {
 /// that pair as a unit, so every way the pair can fail to resolve is refused
 /// identically for that operation, with one sentence that names neither half:
 /// the operation that reconfigures an existing domain answers the resource it
-/// cannot find (404), and the one that removes a domain answers its bad-parameter
+/// cannot find (400), and the one that removes a domain answers its bad-parameter
 /// refusal (400). Over a table spanning both operations and every way the pair
 /// can fail to resolve.
 #[tokio::test]
@@ -382,7 +382,7 @@ async fn an_unresolved_pool_and_domain_pair_is_refused_the_same_way_however_it_f
         ),
         (
             "UpdateUserPoolDomain",
-            404,
+            400,
             "ResourceNotFoundException",
             DOMAIN_NOT_FOUND,
         ),
@@ -504,7 +504,7 @@ async fn the_device_surface_of_a_pool_with_no_device_configuration_states_one_se
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
+        (400, "ResourceNotFoundException"),
         "a pool with device remembering refuses an unknown key as a missing device, \
          got {status} with {payload}"
     );

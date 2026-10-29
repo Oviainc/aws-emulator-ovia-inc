@@ -12,9 +12,9 @@
 //! (`ListWebAuthnCredentials`, and `StartWebAuthnRegistration`'s
 //! `excludeCredentials`). A `CredentialId` the signed-in user holds no passkey
 //! under names no resource — a second deletion of the same credential, and the
-//! credential id of another user's passkey, included — so it is refused with 404
+//! credential id of another user's passkey, included — so it is refused with 400
 //! `ResourceNotFoundException` and deletes nothing, and a token that names no
-//! signed-in user is refused with 403 `NotAuthorizedException`.
+//! signed-in user is refused with 400 `NotAuthorizedException`.
 //!
 //! The pools, app clients, users, passkey configurations, access tokens and
 //! credentials are all real: they come from `CreateUserPool`,
@@ -636,7 +636,7 @@ async fn a_credential_id_naming_no_passkey_of_the_user_is_refused() {
         let (status, payload) = delete(&router, token, credential_id).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
             "case {case:?}: an id naming no passkey of this user is refused, got {status} \
              with {payload}"
         );
@@ -691,7 +691,7 @@ async fn a_token_that_names_no_signed_in_user_deletes_nothing() {
         let (status, payload) = delete(&router, token, REGISTERED[0].credential_id).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (403, "NotAuthorizedException"),
+            (400, "NotAuthorizedException"),
             "case {case:?}: a token naming no signed-in user is refused, got {status} with \
              {payload}"
         );
@@ -714,7 +714,7 @@ async fn a_token_that_names_no_signed_in_user_deletes_nothing() {
     let (status, payload) = delete(&router, &access, REGISTERED[0].credential_id).await;
     assert_eq!(
         (status, error_code(&payload)),
-        (403, "NotAuthorizedException"),
+        (400, "NotAuthorizedException"),
         "case {case:?}: a revoked token is refused, got {status} with {payload}"
     );
 
@@ -777,7 +777,7 @@ async fn a_request_outside_a_modelled_constraint_is_refused() {
     let (status, payload) = delete(&router, &token, &at_the_maximum).await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
+        (400, "ResourceNotFoundException"),
         "case {case:?}: a well-formed id naming no passkey is refused as not found, got \
          {status} with {payload}"
     );

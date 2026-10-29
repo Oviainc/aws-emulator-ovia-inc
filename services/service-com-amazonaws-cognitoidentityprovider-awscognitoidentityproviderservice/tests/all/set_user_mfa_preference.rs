@@ -919,8 +919,8 @@ async fn set_user_mfa_preference_refuses_a_token_that_names_no_signed_in_user() 
         )
         .await;
         assert_eq!(
-            status, 403,
-            "case {case:?}: the refusal is a 403, got {status} with {payload}"
+            status, 400,
+            "case {case:?}: the refusal is a 400, got {status} with {payload}"
         );
         let code = error_code(&payload);
         assert!(

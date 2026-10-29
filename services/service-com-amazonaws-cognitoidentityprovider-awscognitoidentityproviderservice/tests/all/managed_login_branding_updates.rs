@@ -679,7 +679,7 @@ async fn an_update_outside_the_rules_is_refused_and_changes_nothing() {
     for (label, status, code, message, body) in [
         (
             "an update naming a pool that does not exist",
-            404,
+            400,
             "ResourceNotFoundException",
             "User pool us-east-1_absent does not exist.".to_string(),
             json!({
@@ -690,7 +690,7 @@ async fn an_update_outside_the_rules_is_refused_and_changes_nothing() {
         ),
         (
             "an update naming a style id the pool does not hold",
-            404,
+            400,
             "ResourceNotFoundException",
             BRANDING_NOT_FOUND.to_string(),
             json!({
@@ -701,7 +701,7 @@ async fn an_update_outside_the_rules_is_refused_and_changes_nothing() {
         ),
         (
             "an update naming a style stored in another pool",
-            404,
+            400,
             "ResourceNotFoundException",
             BRANDING_NOT_FOUND.to_string(),
             json!({
@@ -838,8 +838,8 @@ async fn deleting_a_style_releases_its_app_client() {
         let (status, payload) = call(&router, operation, &body).await;
         assert_eq!(
             (status, error_code(&payload), error_message(&payload)),
-            (404, "ResourceNotFoundException", BRANDING_NOT_FOUND),
-            "case {label:?}: expected the 404 not-found refusal, got {status} with {payload}"
+            (400, "ResourceNotFoundException", BRANDING_NOT_FOUND),
+            "case {label:?}: expected the 400 not-found refusal, got {status} with {payload}"
         );
     }
 
@@ -854,7 +854,7 @@ async fn deleting_a_style_releases_its_app_client() {
     assert_eq!(
         (status, error_code(&payload), error_message(&payload)),
         (
-            404,
+            400,
             "ResourceNotFoundException",
             by_client_message.as_str()
         ),
@@ -1094,7 +1094,7 @@ async fn an_overlapping_update_and_delete_leave_one_consistent_style() {
                         "ConcurrentModificationException",
                         CONCURRENT_MODIFICATION
                     )
-                    || refusal == (404, "ResourceNotFoundException", BRANDING_NOT_FOUND),
+                    || refusal == (400, "ResourceNotFoundException", BRANDING_NOT_FOUND),
                 "case {case}: racer {racer} must be refused for the overlap or for the style being gone, got {status} with {payload}"
             );
         }
@@ -1110,7 +1110,7 @@ async fn an_overlapping_update_and_delete_leave_one_consistent_style() {
         if delete_applied {
             assert_eq!(
                 (status, error_code(&payload), error_message(&payload)),
-                (404, "ResourceNotFoundException", BRANDING_NOT_FOUND),
+                (400, "ResourceNotFoundException", BRANDING_NOT_FOUND),
                 "case {case}: the delete was applied, so the style is gone, got {status} with {payload}"
             );
             let (by_client_status, by_client) = call(
@@ -1121,7 +1121,7 @@ async fn an_overlapping_update_and_delete_leave_one_consistent_style() {
             .await;
             assert_eq!(
                 (by_client_status, error_code(&by_client)),
-                (404, "ResourceNotFoundException"),
+                (400, "ResourceNotFoundException"),
                 "case {case}: the app client of the deleted style has none, got {by_client_status} with {by_client}"
             );
         } else {

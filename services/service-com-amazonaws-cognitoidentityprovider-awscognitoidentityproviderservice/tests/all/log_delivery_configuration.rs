@@ -476,8 +476,8 @@ async fn activity_logs_need_the_plan_that_includes_them() {
 
         assert_eq!(
             (status, error_code(&payload)),
-            (403, "FeatureUnavailableInTierException"),
-            "case {case:?}: expected a 403 FeatureUnavailableInTierException, got {status} \
+            (400, "FeatureUnavailableInTierException"),
+            "case {case:?}: expected a 400 FeatureUnavailableInTierException, got {status} \
              with {payload}"
         );
         let message = error_message(&payload);
@@ -500,7 +500,7 @@ async fn activity_logs_need_the_plan_that_includes_them() {
 }
 
 #[tokio::test]
-async fn a_pool_that_does_not_exist_is_a_404_on_both_operations() {
+async fn a_pool_that_does_not_exist_is_a_400_on_both_operations() {
     let router = router();
 
     // Ids satisfying `UserPoolIdType`'s pattern `^[\w-]+_[0-9a-zA-Z]+$` that no
@@ -519,8 +519,8 @@ async fn a_pool_that_does_not_exist_is_a_404_on_both_operations() {
             let (status, payload) = call(&router, operation, &request).await;
             assert_eq!(
                 (status, error_code(&payload)),
-                (404, "ResourceNotFoundException"),
-                "case {case:?}: expected a 404 ResourceNotFoundException, got {status} \
+                (400, "ResourceNotFoundException"),
+                "case {case:?}: expected a 400 ResourceNotFoundException, got {status} \
                  with {payload}"
             );
             let message = error_message(&payload);

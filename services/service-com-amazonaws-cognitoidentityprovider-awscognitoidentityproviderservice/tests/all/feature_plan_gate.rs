@@ -6,7 +6,7 @@
 //!
 //! The rule under test: an operation that configures a user pool refuses any
 //! request member whose feature the pool's stored `UserPoolTier` does not
-//! include — HTTP 403, error code `FeatureUnavailableInTierException`, message
+//! include — HTTP 400, error code `FeatureUnavailableInTierException`, message
 //! "The following feature is not available for the <tier> pricing tier
 //! configured: <feature>" with the pool's stored tier and that feature's name —
 //! and persists NOTHING; a pool on the cheapest plan that includes the feature,
@@ -290,8 +290,8 @@ async fn a_feature_the_pools_plan_excludes_is_refused_and_persists_nothing() {
 
             assert_eq!(
                 (status, error_code(&payload)),
-                (403, "FeatureUnavailableInTierException"),
-                "case {case:?}: expected a 403 FeatureUnavailableInTierException, got {status} \
+                (400, "FeatureUnavailableInTierException"),
+                "case {case:?}: expected a 400 FeatureUnavailableInTierException, got {status} \
                  with {payload}"
             );
             let message = error_message(&payload);
@@ -391,8 +391,8 @@ async fn email_mfa_is_served_from_the_floor_plan_upwards_and_refused_below_it() 
 
         assert_eq!(
             (status, error_code(&payload)),
-            (403, "FeatureUnavailableInTierException"),
-            "case {case:?}: expected a 403 FeatureUnavailableInTierException, got {status} with \
+            (400, "FeatureUnavailableInTierException"),
+            "case {case:?}: expected a 400 FeatureUnavailableInTierException, got {status} with \
              {payload}"
         );
         assert_eq!(

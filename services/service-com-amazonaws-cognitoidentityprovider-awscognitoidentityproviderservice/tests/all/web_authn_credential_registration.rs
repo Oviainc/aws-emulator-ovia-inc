@@ -23,7 +23,7 @@
 //! that is not a passkey with 400 `WebAuthnCredentialNotSupportedException`, a
 //! response this service cannot read with 400 `InvalidParameterException`, a user
 //! already holding every passkey one user may hold with 400
-//! `LimitExceededException`, and a token that names no signed-in user with 403
+//! `LimitExceededException`, and a token that names no signed-in user with 400
 //! `NotAuthorizedException`.
 //!
 //! The pools, app clients, users, passkey configurations and access tokens are
@@ -1035,7 +1035,7 @@ async fn a_credential_id_already_registered_is_refused() {
     );
 }
 
-/// Every token that names no signed-in user is refused with 403
+/// Every token that names no signed-in user is refused with 400
 /// `NotAuthorizedException`, whatever the response carries.
 #[tokio::test]
 async fn a_token_that_names_no_signed_in_user_registers_nothing() {
@@ -1075,7 +1075,7 @@ async fn a_token_that_names_no_signed_in_user_registers_nothing() {
     ] {
         let (status, payload) = complete(&router, &token, &REGISTERED[0].document(&challenge)).await;
         assert_eq!(
-            status, 403,
+            status, 400,
             "case {case:?}: the response is refused, got {status} with {payload}"
         );
         assert_eq!(

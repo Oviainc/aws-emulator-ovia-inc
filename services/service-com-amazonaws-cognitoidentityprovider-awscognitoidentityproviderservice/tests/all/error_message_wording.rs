@@ -256,8 +256,8 @@ async fn an_absent_user_is_refused_with_one_fixed_message() {
             let (status, payload) = call(&router, operation, body).await;
             assert_eq!(
                 (status, error_code(&payload)),
-                (404, "UserNotFoundException"),
-                "case {case:?}: expected a 404 UserNotFoundException, got {status} with {payload}"
+                (400, "UserNotFoundException"),
+                "case {case:?}: expected a 400 UserNotFoundException, got {status} with {payload}"
             );
             let message = error_message(&payload);
             assert_eq!(
@@ -363,8 +363,8 @@ async fn an_absent_group_is_refused_with_one_fixed_message() {
             let (status, payload) = call(&router, operation, body).await;
             assert_eq!(
                 (status, error_code(&payload)),
-                (404, "ResourceNotFoundException"),
-                "case {case:?}: expected a 404 ResourceNotFoundException, got {status} with {payload}"
+                (400, "ResourceNotFoundException"),
+                "case {case:?}: expected a 400 ResourceNotFoundException, got {status} with {payload}"
             );
             let message = error_message(&payload);
             assert_eq!(
@@ -637,8 +637,8 @@ async fn a_feature_the_pools_plan_excludes_is_refused_with_the_tier_template() {
 
             assert_eq!(
                 (status, error_code(&payload)),
-                (403, "FeatureUnavailableInTierException"),
-                "case {case:?}: expected a 403 FeatureUnavailableInTierException, got {status} \
+                (400, "FeatureUnavailableInTierException"),
+                "case {case:?}: expected a 400 FeatureUnavailableInTierException, got {status} \
                  with {payload}"
             );
             let message = error_message(&payload);

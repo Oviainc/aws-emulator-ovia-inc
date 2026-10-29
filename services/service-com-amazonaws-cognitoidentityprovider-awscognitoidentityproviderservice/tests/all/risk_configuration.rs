@@ -926,8 +926,8 @@ async fn a_level_this_emulator_does_not_hold_is_refused() {
             call(&router, operation, &json!({ "UserPoolId": absent_pool })).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: {operation} on a pool nothing created is a 404, got {status} with \
+            (400, "ResourceNotFoundException"),
+            "case {case:?}: {operation} on a pool nothing created is a 400, got {status} with \
              {payload}"
         );
         assert_eq!(
@@ -944,8 +944,8 @@ async fn a_level_this_emulator_does_not_hold_is_refused() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: {operation} on a client the pool does not hold is a 404, got \
+            (400, "ResourceNotFoundException"),
+            "case {case:?}: {operation} on a client the pool does not hold is a 400, got \
              {status} with {payload}"
         );
         assert_eq!(

@@ -594,7 +594,7 @@ async fn device_remembering_decides_whether_a_refresh_needs_a_device_key() {
                 "case {case:?}: the refresh must be served, got {refreshed}"
             );
         } else {
-            refused(&router, case, REFRESH, &body, 403, "NotAuthorizedException").await;
+            refused(&router, case, REFRESH, &body, 400, "NotAuthorizedException").await;
         }
     }
 }
@@ -697,43 +697,43 @@ async fn only_a_live_refresh_token_of_the_app_client_refreshes() {
         TokenRow {
             case: "a refresh token nothing issued",
             body: |t| json!({ "ClientId": t.client_id, "RefreshToken": "not.a.token" }),
-            status: 403,
+            status: 400,
             code: "NotAuthorizedException",
         },
         TokenRow {
             case: "the access token of the same sign-in",
             body: |t| json!({ "ClientId": t.client_id, "RefreshToken": t.access }),
-            status: 403,
+            status: 400,
             code: "NotAuthorizedException",
         },
         TokenRow {
             case: "the id token of the same sign-in",
             body: |t| json!({ "ClientId": t.client_id, "RefreshToken": t.id }),
-            status: 403,
+            status: 400,
             code: "NotAuthorizedException",
         },
         TokenRow {
             case: "a refresh token of another app client of the pool",
             body: |t| json!({ "ClientId": t.client_id, "RefreshToken": t.other_client_refresh }),
-            status: 403,
+            status: 400,
             code: "NotAuthorizedException",
         },
         TokenRow {
             case: "this app client's refresh token against the other app client",
             body: |t| json!({ "ClientId": t.other_client_id, "RefreshToken": t.refresh }),
-            status: 403,
+            status: 400,
             code: "NotAuthorizedException",
         },
         TokenRow {
             case: "a refresh token the clock has expired",
             body: |t| json!({ "ClientId": t.client_id, "RefreshToken": t.expired_refresh }),
-            status: 403,
+            status: 400,
             code: "NotAuthorizedException",
         },
         TokenRow {
             case: "a ClientId nothing created",
             body: |t| json!({ "ClientId": UNKNOWN_CLIENT_ID, "RefreshToken": t.refresh }),
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
         },
     ];
@@ -783,7 +783,7 @@ async fn the_users_own_state_decides_the_refresh() {
         "the token's user is disabled",
         REFRESH,
         &body,
-        403,
+        400,
         "NotAuthorizedException",
     )
     .await;
@@ -835,7 +835,7 @@ async fn the_users_own_state_decides_the_refresh() {
                     case,
                     REFRESH,
                     &reissued_body,
-                    403,
+                    400,
                     "NotAuthorizedException",
                 )
                 .await;
@@ -854,7 +854,7 @@ async fn the_users_own_state_decides_the_refresh() {
         "the token's user is gone",
         REFRESH,
         &reissued_body,
-        403,
+        400,
         "NotAuthorizedException",
     )
     .await;
@@ -936,7 +936,7 @@ async fn a_client_secret_is_required_exactly_when_the_app_client_holds_one() {
                     "case {case:?}: the refresh must be served, got {refreshed}"
                 );
             } else {
-                refused(&router, &case, REFRESH, &body, 403, "NotAuthorizedException").await;
+                refused(&router, &case, REFRESH, &body, 400, "NotAuthorizedException").await;
             }
         }
     }

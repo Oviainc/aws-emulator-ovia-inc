@@ -291,8 +291,8 @@ async fn grant_accepts(router: &MultiServiceRouter, client_id: &str, secret: &st
     }
     assert_eq!(
         (status, error_code(&payload)),
-        (403, "NotAuthorizedException"),
-        "a refused grant is a 403 NotAuthorizedException, got ({status}, {:?}) with {payload}",
+        (400, "NotAuthorizedException"),
+        "a refused grant is a 400 NotAuthorizedException, got ({status}, {:?}) with {payload}",
         error_code(&payload)
     );
     false
@@ -585,7 +585,7 @@ async fn a_listing_for_a_resource_no_pool_holds_is_refused() {
             ),
         };
         let body = json!({ "UserPoolId": user_pool_id, "ClientId": client_id });
-        let payload = refused(&router, &case, LIST, &body, 404, "ResourceNotFoundException").await;
+        let payload = refused(&router, &case, LIST, &body, 400, "ResourceNotFoundException").await;
         assert_eq!(
             error_message(&payload),
             expected,

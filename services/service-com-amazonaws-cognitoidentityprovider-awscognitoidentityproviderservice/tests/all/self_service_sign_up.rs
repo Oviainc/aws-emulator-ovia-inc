@@ -329,7 +329,7 @@ async fn sign_up_registers_a_user_in_the_pool_of_the_app_client_it_names() {
             "grace",
             Some(GOOD_PASSWORD),
             vec![],
-            404,
+            400,
             Some("ResourceNotFoundException"),
         ),
     ];
@@ -552,19 +552,19 @@ async fn get_user_answers_the_profile_the_access_token_identifies() {
         (
             "the id token of the same sign-in",
             id_token.clone(),
-            403,
+            400,
             Some("NotAuthorizedException"),
         ),
         (
             "the refresh token of the same sign-in",
             refresh_token.clone(),
-            403,
+            400,
             Some("NotAuthorizedException"),
         ),
         (
             "a token this emulator never issued",
             "not.a.token".to_string(),
-            403,
+            400,
             Some("NotAuthorizedException"),
         ),
         (
@@ -575,7 +575,7 @@ async fn get_user_answers_the_profile_the_access_token_identifies() {
                 tampered.push(if last == 'A' { 'B' } else { 'A' });
                 tampered
             },
-            403,
+            400,
             Some("NotAuthorizedException"),
         ),
     ];

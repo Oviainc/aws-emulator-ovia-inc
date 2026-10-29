@@ -259,7 +259,7 @@ async fn the_admin_lifecycle_round_trips_through_stored_state() {
         "the stored auth flows must be the requested ones, got {client}"
     );
 
-    // An unknown pool is a 404, for the client and the user alike.
+    // An unknown pool is a 400, for the client and the user alike.
     let (status, payload) = call(
         &router,
         "CreateUserPoolClient",
@@ -268,8 +268,8 @@ async fn the_admin_lifecycle_round_trips_through_stored_state() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
-        "a client on an absent pool is a 404 ResourceNotFoundException, got {payload}"
+        (400, "ResourceNotFoundException"),
+        "a client on an absent pool is a 400 ResourceNotFoundException, got {payload}"
     );
 
     // ---- AdminCreateUser ------------------------------------------------
@@ -471,11 +471,11 @@ async fn the_admin_lifecycle_round_trips_through_stored_state() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (403, "NotAuthorizedException"),
-        "a wrong password is a 403 NotAuthorizedException, got {payload}"
+        (400, "NotAuthorizedException"),
+        "a wrong password is a 400 NotAuthorizedException, got {payload}"
     );
 
-    // An absent user is a 404 for this client (PreventUserExistenceErrors=LEGACY).
+    // An absent user is a 400 for this client (PreventUserExistenceErrors=LEGACY).
     let (status, payload) = call(
         &router,
         "AdminGetUser",
@@ -484,8 +484,8 @@ async fn the_admin_lifecycle_round_trips_through_stored_state() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "UserNotFoundException"),
-        "reading an absent user is a 404 UserNotFoundException, got {payload}"
+        (400, "UserNotFoundException"),
+        "reading an absent user is a 400 UserNotFoundException, got {payload}"
     );
 
     // ---- AdminDeleteUser ------------------------------------------------
@@ -508,7 +508,7 @@ async fn the_admin_lifecycle_round_trips_through_stored_state() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "UserNotFoundException"),
+        (400, "UserNotFoundException"),
         "a deleted user is gone, got {payload}"
     );
 
@@ -541,8 +541,8 @@ async fn the_admin_lifecycle_round_trips_through_stored_state() {
         let (status, payload) = call(&router, operation, &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "{operation} on a deleted pool is a 404 ResourceNotFoundException, got {payload}"
+            (400, "ResourceNotFoundException"),
+            "{operation} on a deleted pool is a 400 ResourceNotFoundException, got {payload}"
         );
     }
 }
@@ -633,7 +633,7 @@ async fn a_created_pool_and_client_read_back_through_describe() {
         "the estimate must count the stored users, got {described_pool}"
     );
 
-    // Unknown ids are 404s, for either resource.
+    // Unknown ids are 400s, for either resource.
     for (case, operation, request) in [
         (
             "an absent pool",
@@ -649,8 +649,8 @@ async fn a_created_pool_and_client_read_back_through_describe() {
         let (status, payload) = call(&router, operation, &request).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: an absent resource is a 404, got {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {case:?}: an absent resource is a 400, got {payload}"
         );
     }
 }
@@ -1416,9 +1416,9 @@ async fn an_absent_user_is_reported_as_the_app_client_configures() {
     // `PreventUserExistenceErrors` is the rule: LEGACY names the absent user,
     // ENABLED answers the same error a wrong password gets.
     let cases = [
-        ("the default, which is LEGACY", None, 404, "UserNotFoundException"),
-        ("LEGACY", Some("LEGACY"), 404, "UserNotFoundException"),
-        ("ENABLED", Some("ENABLED"), 403, "NotAuthorizedException"),
+        ("the default, which is LEGACY", None, 400, "UserNotFoundException"),
+        ("LEGACY", Some("LEGACY"), 400, "UserNotFoundException"),
+        ("ENABLED", Some("ENABLED"), 400, "NotAuthorizedException"),
     ];
 
     for (case, setting, expected_status, expected_code) in cases {
@@ -1501,7 +1501,7 @@ async fn usernames_are_compared_as_the_pool_configures() {
         } else {
             assert_eq!(
                 (status, error_code(&payload)),
-                (404, "UserNotFoundException"),
+                (400, "UserNotFoundException"),
                 "case {case:?}: a case variant is a different user, got {payload}"
             );
         }
@@ -1549,7 +1549,7 @@ async fn a_protected_pool_is_not_deleted_until_protection_is_off() {
     )
     .await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "case \"DeletionProtection=ACTIVE\": the pool is still stored, so the ABSENT USER \
          is what is missing"
     );
@@ -1572,7 +1572,7 @@ async fn a_protected_pool_is_not_deleted_until_protection_is_off() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
+        (400, "ResourceNotFoundException"),
         "case \"already deleted\": a deleted pool is gone, got {payload}"
     );
 }
@@ -1663,7 +1663,7 @@ async fn resending_an_invitation_is_the_only_second_create_a_username_accepts() 
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "UserNotFoundException"),
+        (400, "UserNotFoundException"),
         "case \"RESEND to an absent user\": there is nothing to resend, got {payload}"
     );
 }

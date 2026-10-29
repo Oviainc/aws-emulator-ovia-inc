@@ -13,7 +13,7 @@
 //! non-final page resumes the listing strictly after the last client that page
 //! served and the final page carries none. It writes nothing: a repeated call
 //! answers the same, and so does every other reader of the same state. An
-//! absent pool is a 404 `ResourceNotFoundException` and a `NextToken` this
+//! absent pool is a 400 `ResourceNotFoundException` and a `NextToken` this
 //! listing never minted a 400 `InvalidParameterException`.
 //!
 //! Each table row names the case it asserts and every assertion reports the
@@ -607,7 +607,7 @@ async fn an_absent_pool_and_an_unissued_token_are_refused() {
             "an absent user pool",
             list_request("us-east-1_absent", None, None),
             (
-                404,
+                400,
                 "ResourceNotFoundException",
                 "User pool us-east-1_absent does not exist.".to_string(),
             ),

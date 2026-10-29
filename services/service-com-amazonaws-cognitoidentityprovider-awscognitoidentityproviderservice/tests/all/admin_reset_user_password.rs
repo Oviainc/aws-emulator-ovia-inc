@@ -458,7 +458,7 @@ async fn an_admin_reset_follows_the_pools_account_recovery_setting() {
             "a pool that reserves account recovery to administrators",
             admin_only,
             vec![("email", "f@example.com"), ("email_verified", "true")],
-            403,
+            400,
             "NotAuthorizedException",
         ),
         (
@@ -685,8 +685,8 @@ async fn the_reset_blocks_sign_in_until_its_own_code_completes_it() {
     let (status, payload) = sign_in(&setup, &user_pool_id, &client_id, username, GOOD_PASSWORD).await;
     assert_eq!(
         (status, error_code(&payload)),
-        (403, "NotAuthorizedException"),
-        "case \"the password the reset replaced\": expected a 403 NotAuthorizedException, got \
+        (400, "NotAuthorizedException"),
+        "case \"the password the reset replaced\": expected a 400 NotAuthorizedException, got \
          {status} with {payload}"
     );
 
@@ -917,17 +917,17 @@ async fn a_reset_the_store_cannot_serve_is_refused_and_writes_nothing() {
         (
             "an absent user pool",
             json!({ "UserPoolId": "us-east-1_absent", "Username": "jane" }),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "a user the pool does not hold",
             json!({ "UserPoolId": user_pool_id.clone(), "Username": "absent" }),
-            (404, "UserNotFoundException"),
+            (400, "UserNotFoundException"),
         ),
         (
             "a deactivated user",
             json!({ "UserPoolId": user_pool_id.clone(), "Username": "kim" }),
-            (403, "NotAuthorizedException"),
+            (400, "NotAuthorizedException"),
         ),
     ] {
         let (status, payload) = dispatch(

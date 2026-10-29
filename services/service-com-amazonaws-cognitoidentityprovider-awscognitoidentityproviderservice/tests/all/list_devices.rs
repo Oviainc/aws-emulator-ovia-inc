@@ -12,8 +12,8 @@
 //! last device that page served and the final page carries none. It writes
 //! nothing: a repeated call answers the same. A token this emulator never
 //! issued, one that is not an ACCESS token, a revoked one and one the clock has
-//! expired are all refused with 403 `NotAuthorizedException`; a token whose pool
-//! or user is gone with 404 `ResourceNotFoundException` / `UserNotFoundException`;
+//! expired are all refused with 400 `NotAuthorizedException`; a token whose pool
+//! or user is gone with 400 `ResourceNotFoundException` / `UserNotFoundException`;
 //! and a `PaginationToken` this listing never minted with 400
 //! `InvalidParameterException`.
 //!
@@ -781,37 +781,37 @@ async fn an_access_token_that_names_no_signed_in_user_is_refused() {
         (
             "a token this emulator never issued",
             "not-an-issued-token".to_string(),
-            (403, "NotAuthorizedException"),
+            (400, "NotAuthorizedException"),
         ),
         (
             "the id token of the same sign-in, which is not an access token",
             id_token,
-            (403, "NotAuthorizedException"),
+            (400, "NotAuthorizedException"),
         ),
         (
             "the refresh token of the same sign-in",
             refresh_token,
-            (403, "NotAuthorizedException"),
+            (400, "NotAuthorizedException"),
         ),
         (
             "a revoked access token",
             revoked.clone(),
-            (403, "NotAuthorizedException"),
+            (400, "NotAuthorizedException"),
         ),
         (
             "an access token the clock has expired",
             EXPIRED.to_string(),
-            (403, "NotAuthorizedException"),
+            (400, "NotAuthorizedException"),
         ),
         (
             "an access token naming a user pool this emulator does not hold",
             POOL_GONE.to_string(),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "an access token naming a user its pool does not hold",
             USER_GONE.to_string(),
-            (404, "UserNotFoundException"),
+            (400, "UserNotFoundException"),
         ),
     ] {
         let (status, payload) = list(&router, &list_request(&token, None, None)).await;

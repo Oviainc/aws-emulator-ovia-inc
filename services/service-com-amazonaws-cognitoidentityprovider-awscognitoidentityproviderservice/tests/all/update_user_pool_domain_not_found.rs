@@ -9,7 +9,7 @@
 //! your domain, delete it with DeleteUserPoolDomain and create a new domain
 //! with CreateUserPoolDomain"), so a pair that resolves no stored domain names a
 //! resource the service cannot find — `ResourceNotFoundException`, which the
-//! model gives HTTP 404
+//! model gives HTTP 400
 //! (`smithy_query(query="operation",operation="UpdateUserPoolDomain")`) — and
 //! not a malformed parameter, whichever half of the pair is wrong and whatever
 //! else the request carries. The sentence it carries is fixed text in full: the
@@ -277,8 +277,8 @@ async fn an_unresolvable_pool_and_domain_pair_is_the_resource_the_service_cannot
         let (status, payload) = call(&router, "UpdateUserPoolDomain", &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: expected a 404 ResourceNotFoundException, got {status} with {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: expected a 400 ResourceNotFoundException, got {status} with {payload}"
         );
         assert_eq!(
             error_message(&payload),

@@ -613,7 +613,7 @@ async fn confirm_device_registers_the_device_a_sign_in_minted() {
                 "Username": "alice",
                 "DeviceKey": device_key,
             }),
-            404,
+            400,
             "ResourceNotFoundException",
         )
         .await;
@@ -650,7 +650,7 @@ async fn confirm_device_registers_the_device_a_sign_in_minted() {
                 row.case,
                 "GetDevice",
                 &get_device,
-                404,
+                400,
                 "ResourceNotFoundException",
             )
             .await;
@@ -737,7 +737,7 @@ async fn the_device_surface_refuses_what_it_cannot_serve() {
             case: "GetDevice with a device key nothing minted",
             operation: "GetDevice",
             body: |_, token| json!({ "AccessToken": token, "DeviceKey": UNKNOWN_DEVICE_KEY }),
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
         },
         RefusalRow {
@@ -750,7 +750,7 @@ async fn the_device_surface_refuses_what_it_cannot_serve() {
                     "DeviceKey": UNKNOWN_DEVICE_KEY,
                 })
             },
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
         },
         RefusalRow {
@@ -763,14 +763,14 @@ async fn the_device_surface_refuses_what_it_cannot_serve() {
                     "DeviceKey": UNKNOWN_DEVICE_KEY,
                 })
             },
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
         },
         RefusalRow {
             case: "GetDevice with no access token, so no signed-in user",
             operation: "GetDevice",
             body: |_, _| json!({ "DeviceKey": UNKNOWN_DEVICE_KEY }),
-            status: 403,
+            status: 400,
             code: "NotAuthorizedException",
         },
         RefusalRow {
@@ -779,14 +779,14 @@ async fn the_device_surface_refuses_what_it_cannot_serve() {
             body: |_, _| {
                 json!({ "AccessToken": "not.a.token", "DeviceKey": UNKNOWN_DEVICE_KEY })
             },
-            status: 403,
+            status: 400,
             code: "NotAuthorizedException",
         },
         RefusalRow {
             case: "ConfirmDevice with a device key nothing minted",
             operation: "ConfirmDevice",
             body: |_, token| json!({ "AccessToken": token, "DeviceKey": UNKNOWN_DEVICE_KEY }),
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
         },
         RefusalRow {
@@ -799,7 +799,7 @@ async fn the_device_surface_refuses_what_it_cannot_serve() {
                     "DeviceRememberedStatus": "remembered",
                 })
             },
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
         },
         RefusalRow {
@@ -813,14 +813,14 @@ async fn the_device_surface_refuses_what_it_cannot_serve() {
                     "DeviceRememberedStatus": "not_remembered",
                 })
             },
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
         },
         RefusalRow {
             case: "ForgetDevice with a device key nothing minted",
             operation: "ForgetDevice",
             body: |_, token| json!({ "AccessToken": token, "DeviceKey": UNKNOWN_DEVICE_KEY }),
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
         },
         RefusalRow {
@@ -833,7 +833,7 @@ async fn the_device_surface_refuses_what_it_cannot_serve() {
                     "DeviceKey": UNKNOWN_DEVICE_KEY,
                 })
             },
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
         },
         RefusalRow {
@@ -847,14 +847,14 @@ async fn the_device_surface_refuses_what_it_cannot_serve() {
             case: "ListDevices with an access token this emulator never issued",
             operation: "ListDevices",
             body: |_, _| json!({ "AccessToken": "not.a.token" }),
-            status: 403,
+            status: 400,
             code: "NotAuthorizedException",
         },
         RefusalRow {
             case: "AdminListDevices for a user the pool does not hold",
             operation: "AdminListDevices",
             body: |pool, _| json!({ "UserPoolId": pool, "Username": "nobody" }),
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
         },
     ];
@@ -1250,7 +1250,7 @@ async fn updating_a_devices_status_persists_the_remembered_answer() {
                     &case,
                     "GetDevice",
                     &get_device,
-                    404,
+                    400,
                     "ResourceNotFoundException",
                 )
                 .await;

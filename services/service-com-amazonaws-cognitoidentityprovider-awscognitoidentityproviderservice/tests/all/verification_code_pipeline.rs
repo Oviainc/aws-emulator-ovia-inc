@@ -538,7 +538,7 @@ async fn a_sign_up_confirmation_code_is_single_use_and_a_resend_supersedes_it() 
             )
             .await;
             assert_eq!(
-                replay_status, 403,
+                replay_status, 400,
                 "case {case:?}: a confirmed account refuses a second confirmation, got \
                  {replay_status} with {replay}"
             );
@@ -1493,7 +1493,7 @@ async fn forgot_password_follows_the_pools_account_recovery_setting() {
             "a pool that reserves resets to administrators",
             admin_only,
             vec![("email", "e@example.com"), ("email_verified", "true")],
-            403,
+            400,
             "NotAuthorizedException",
         ),
         (

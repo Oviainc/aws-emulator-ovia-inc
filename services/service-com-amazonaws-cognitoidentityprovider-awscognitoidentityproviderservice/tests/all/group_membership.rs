@@ -9,8 +9,8 @@
 //! no-op that still succeeds; and every group the stored user belongs to is
 //! carried by the access and identity tokens of a later sign-in as their
 //! `cognito:groups` claim (`AdminAddUserToGroup`'s own model documentation),
-//! while the refresh token carries none. An absent pool or group is a 404
-//! `ResourceNotFoundException` and an absent user a 404 `UserNotFoundException`,
+//! while the refresh token carries none. An absent pool or group is a 400
+//! `ResourceNotFoundException` and an absent user a 400 `UserNotFoundException`,
 //! and a refused request persists nothing.
 //!
 //! The stored membership is read back here through the issued tokens'
@@ -499,7 +499,7 @@ async fn an_absent_pool_group_or_user_is_refused_and_persists_nothing() {
                 "Username": "dave",
                 "GroupName": "admins",
             }),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "a group the pool does not hold",
@@ -508,7 +508,7 @@ async fn an_absent_pool_group_or_user_is_refused_and_persists_nothing() {
                 "Username": "dave",
                 "GroupName": "absent-group",
             }),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "a group name differing only in case, which is a different group",
@@ -517,7 +517,7 @@ async fn an_absent_pool_group_or_user_is_refused_and_persists_nothing() {
                 "Username": "dave",
                 "GroupName": "Admins",
             }),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "a user the pool does not hold",
@@ -526,7 +526,7 @@ async fn an_absent_pool_group_or_user_is_refused_and_persists_nothing() {
                 "Username": "absent-user",
                 "GroupName": "admins",
             }),
-            (404, "UserNotFoundException"),
+            (400, "UserNotFoundException"),
         ),
     ] {
         let (status, payload) = call(&router, "AdminAddUserToGroup", &body).await;

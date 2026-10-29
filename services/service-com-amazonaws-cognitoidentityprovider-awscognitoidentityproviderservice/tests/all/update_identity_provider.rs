@@ -731,7 +731,7 @@ async fn a_detail_map_that_resolves_every_endpoint_is_accepted() {
 }
 
 #[tokio::test]
-async fn an_absent_pool_or_provider_name_is_a_404() {
+async fn an_absent_pool_or_provider_name_is_a_400() {
     let router = router();
     let user_pool_id = pool(&router, "update-idp-notfound-pool").await;
     let stored = Stored {
@@ -767,8 +767,8 @@ async fn an_absent_pool_or_provider_name_is_a_404() {
         let (status, payload) = call(&router, "UpdateIdentityProvider", &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: must be a 404 ResourceNotFoundException, got {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: must be a 400 ResourceNotFoundException, got {payload}"
         );
         assert_eq!(
             error_message(&payload),

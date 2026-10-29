@@ -12,7 +12,7 @@
 //! A submitted option that is not an SMS configuration of `phone_number` — the
 //! only delivery medium and the only attribute name an `MFAOptionType` may carry
 //! — is refused with 400 `InvalidParameterException`, and a token that names no
-//! signed-in user with 403 `NotAuthorizedException`; a refused request writes
+//! signed-in user with 400 `NotAuthorizedException`; a refused request writes
 //! nothing.
 //!
 //! The pools, app clients, users and access tokens are all real: they come from
@@ -690,8 +690,8 @@ async fn set_user_settings_refuses_a_token_that_names_no_signed_in_user() {
         };
         let (status, payload) = set_settings(&router, &token, &[SMS_OPTION]).await;
         assert_eq!(
-            status, 403,
-            "case {case:?}: the refusal is a 403, got {status} with {payload}"
+            status, 400,
+            "case {case:?}: the refusal is a 400, got {status} with {payload}"
         );
         let code = error_code(&payload);
         assert!(

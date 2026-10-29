@@ -16,8 +16,8 @@
 //! declare, one it declares immutable, blanking one it marks required, a name
 //! submitted twice and a list longer than the schema are all refused with 400
 //! `InvalidParameterException`, a value another user holds as an active alias
-//! with 400 `AliasExistsException`, an absent pool with 404
-//! `ResourceNotFoundException` and an absent user with 404
+//! with 400 `AliasExistsException`, an absent pool with 400
+//! `ResourceNotFoundException` and an absent user with 400
 //! `UserNotFoundException` — and a refused request writes nothing.
 //!
 //! The pools, their schemas and their users are all real: they come from
@@ -966,14 +966,14 @@ async fn a_pool_or_user_the_store_does_not_hold_is_refused() {
             "a user pool this emulator never created",
             "us-east-1_absentpool".to_string(),
             "ada".to_string(),
-            404,
+            400,
             "ResourceNotFoundException",
         ),
         (
             "a user the pool does not hold",
             user_pool_id.clone(),
             "grace".to_string(),
-            404,
+            400,
             "UserNotFoundException",
         ),
     ] {

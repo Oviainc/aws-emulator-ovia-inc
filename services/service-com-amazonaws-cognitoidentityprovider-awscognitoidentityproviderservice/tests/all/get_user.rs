@@ -10,8 +10,8 @@
 //! first one did and every other reader of the same user sees the same thing. A
 //! token that names no signed-in user is refused instead: one this emulator never
 //! issued, one that is not an ACCESS token, a revoked one and one the clock has
-//! expired with 403 `NotAuthorizedException`, one whose pool is gone with 404
-//! `ResourceNotFoundException` and one whose user is gone with 404
+//! expired with 400 `NotAuthorizedException`, one whose pool is gone with 400
+//! `ResourceNotFoundException` and one whose user is gone with 400
 //! `UserNotFoundException`.
 //!
 //! The pools, app clients, custom attributes, users, MFA configurations and
@@ -616,49 +616,49 @@ const TOKEN_CASES: &[TokenCase] = &[
     TokenCase {
         case: "a token this emulator never issued",
         token: SubmittedToken::NeverIssued,
-        status: 403,
+        status: 400,
         code: "NotAuthorizedException",
         message: "Invalid Access Token",
     },
     TokenCase {
         case: "the id token of the same sign-in, which is not the token the member asks for",
         token: SubmittedToken::IdToken,
-        status: 403,
+        status: 400,
         code: "NotAuthorizedException",
         message: "Invalid Access Token",
     },
     TokenCase {
         case: "the refresh token of the same sign-in",
         token: SubmittedToken::RefreshToken,
-        status: 403,
+        status: 400,
         code: "NotAuthorizedException",
         message: "Invalid Access Token",
     },
     TokenCase {
         case: "a revoked access token",
         token: SubmittedToken::Planted(REVOKED),
-        status: 403,
+        status: 400,
         code: "NotAuthorizedException",
         message: "Invalid Access Token",
     },
     TokenCase {
         case: "an access token the clock has expired",
         token: SubmittedToken::Planted(EXPIRED),
-        status: 403,
+        status: 400,
         code: "NotAuthorizedException",
         message: "Access Token has expired",
     },
     TokenCase {
         case: "an access token whose user pool is gone",
         token: SubmittedToken::Planted(POOL_GONE),
-        status: 404,
+        status: 400,
         code: "ResourceNotFoundException",
         message: "User pool does not exist.",
     },
     TokenCase {
         case: "an access token whose user is gone",
         token: SubmittedToken::Planted(USER_GONE),
-        status: 404,
+        status: 400,
         code: "UserNotFoundException",
         message: "User does not exist.",
     },

@@ -524,7 +524,7 @@ async fn resetting_deletion_protection_is_observable_through_delete_user_pool() 
     )
     .await;
 
-    // And the pool is gone, so the next update is a 404.
+    // And the pool is gone, so the next update is a 400.
     let (status, payload) = call(
         &router,
         "UpdateUserPool",
@@ -532,13 +532,13 @@ async fn resetting_deletion_protection_is_observable_through_delete_user_pool() 
     )
     .await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "case \"deleted pool\": got {status} with {payload}"
     );
 }
 
 #[tokio::test]
-async fn an_update_of_an_absent_pool_is_a_404() {
+async fn an_update_of_an_absent_pool_is_a_400() {
     let router = router();
     // Ids no pool was created under, each satisfying the modelled
     // `UserPoolIdType` pattern `^[\w-]+_[0-9a-zA-Z]+$` in a different form.
@@ -560,8 +560,8 @@ async fn an_update_of_an_absent_pool_is_a_404() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: an absent pool must answer 404, got {status} with {payload}"
+            status, 400,
+            "case {case:?}: an absent pool must answer 400, got {status} with {payload}"
         );
         assert_eq!(
             error_code(&payload),

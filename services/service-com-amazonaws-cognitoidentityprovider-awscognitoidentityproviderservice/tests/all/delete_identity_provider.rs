@@ -11,7 +11,7 @@
 //! pool through that IdP" (this operation's model documentation). Every other
 //! provider, every other entry of a client's list, and every other pool is left
 //! untouched. A pool the request does not name, or a provider the named pool
-//! does not hold (a second delete of the same provider included), is a 404
+//! does not hold (a second delete of the same provider included), is a 400
 //! `ResourceNotFoundException` that persists nothing, worded as every operation
 //! that resolves an IdP against a pool words it: it names what was asked for and
 //! the pool it was looked up in.
@@ -429,7 +429,7 @@ async fn a_deleted_identity_provider_is_gone_and_every_app_client_reference_is_s
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
             "case {label:?}: a deleted IdP is no longer readable, got {payload}"
         );
         let listed = listed_provider_names(&router, &user_pool_id).await;
@@ -450,7 +450,7 @@ async fn a_deleted_identity_provider_is_gone_and_every_app_client_reference_is_s
             .await;
             assert_eq!(
                 (status, error_code(&payload)),
-                (404, "ResourceNotFoundException"),
+                (400, "ResourceNotFoundException"),
                 "case {label:?}: identifier {identifier:?} of a deleted IdP resolves nothing, got {payload}"
             );
         }
@@ -508,7 +508,7 @@ async fn a_deleted_identity_provider_is_gone_and_every_app_client_reference_is_s
 }
 
 #[tokio::test]
-async fn a_delete_that_resolves_no_provider_or_no_pool_is_a_404_and_persists_nothing() {
+async fn a_delete_that_resolves_no_provider_or_no_pool_is_a_400_and_persists_nothing() {
     let router = router();
     let user_pool_id = pool(&router, "absent-idp-delete-pool").await;
     let created = create_provider(
@@ -568,8 +568,8 @@ async fn a_delete_that_resolves_no_provider_or_no_pool_is_a_404_and_persists_not
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: must be a 404 ResourceNotFoundException, got {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: must be a 400 ResourceNotFoundException, got {payload}"
         );
         assert_eq!(
             payload["message"],
@@ -618,8 +618,8 @@ async fn a_delete_that_resolves_no_provider_or_no_pool_is_a_404_and_persists_not
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
-        "a second delete of the same IdP is a 404 ResourceNotFoundException, got {payload}"
+        (400, "ResourceNotFoundException"),
+        "a second delete of the same IdP is a 400 ResourceNotFoundException, got {payload}"
     );
     assert_eq!(
         payload["message"],

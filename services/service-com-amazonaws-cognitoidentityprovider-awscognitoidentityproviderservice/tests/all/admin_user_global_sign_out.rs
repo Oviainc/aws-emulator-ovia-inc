@@ -253,7 +253,7 @@ async fn assert_signed_out(
         let (status, payload) = present_access_token(router, token).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (403, "NotAuthorizedException"),
+            (400, "NotAuthorizedException"),
             "case {case:?}: the {what} must not authorize a request after the sign-out, \
              got {status} with {payload}"
         );
@@ -261,7 +261,7 @@ async fn assert_signed_out(
     let (status, payload) = present_refresh_token(router, client_id, &tokens.refresh).await;
     assert_eq!(
         (status, error_code(&payload), error_message(&payload)),
-        (403, "NotAuthorizedException", REVOKED_REFRESH_TOKEN),
+        (400, "NotAuthorizedException", REVOKED_REFRESH_TOKEN),
         "case {case:?}: expected the refresh token to be refused as revoked, \
          got {status} with {payload}"
     );
@@ -481,7 +481,7 @@ async fn the_profile_is_untouched_and_the_user_signs_in_again() {
     let (status, payload) = present_refresh_token(&router, &client_id, &first.refresh).await;
     assert_eq!(
         (status, error_message(&payload)),
-        (403, REVOKED_REFRESH_TOKEN),
+        (400, REVOKED_REFRESH_TOKEN),
         "case \"the revoked refresh token after a re-sign-in\": expected it to stay revoked, \
          got {status} with {payload}"
     );
@@ -544,8 +544,8 @@ async fn a_revoked_refresh_token_is_told_apart_from_an_unresolvable_one() {
         match expected {
             Some(message) => assert_eq!(
                 (status, error_code(&payload), error_message(&payload)),
-                (403, "NotAuthorizedException", message),
-                "case {case:?}: expected a 403 NotAuthorizedException saying {message:?}, \
+                (400, "NotAuthorizedException", message),
+                "case {case:?}: expected a 400 NotAuthorizedException saying {message:?}, \
                  got {status} with {payload}"
             ),
             None => assert_eq!(
@@ -572,7 +572,7 @@ async fn an_absent_pool_or_user_is_refused_and_revokes_nothing() {
             "frank".to_string(),
             "us-east-1_absent".to_string(),
             (
-                404,
+                400,
                 "ResourceNotFoundException",
                 "User pool us-east-1_absent does not exist.".to_string(),
             ),
@@ -581,19 +581,19 @@ async fn an_absent_pool_or_user_is_refused_and_revokes_nothing() {
             "a user the pool does not hold",
             "absent-user".to_string(),
             user_pool_id.clone(),
-            (404, "UserNotFoundException", "User does not exist.".to_string()),
+            (400, "UserNotFoundException", "User does not exist.".to_string()),
         ),
         (
             "a user of another pool",
             "grace".to_string(),
             user_pool_id.clone(),
-            (404, "UserNotFoundException", "User does not exist.".to_string()),
+            (400, "UserNotFoundException", "User does not exist.".to_string()),
         ),
         (
             "a sub that names no user of the pool",
             "11111111-2222-3333-4444-555555555555".to_string(),
             user_pool_id.clone(),
-            (404, "UserNotFoundException", "User does not exist.".to_string()),
+            (400, "UserNotFoundException", "User does not exist.".to_string()),
         ),
     ] {
         let (status, payload) = sign_out(&router, &pool_named, &identifier).await;

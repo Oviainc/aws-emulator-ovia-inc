@@ -565,7 +565,7 @@ async fn a_request_the_documented_rules_forbid_is_refused() {
         (
             "managed login branding on a pool in the Lite feature plan",
             json!({ "UserPoolId": lite_pool, "Domain": "lite-managed", "ManagedLoginVersion": 2 }),
-            (403, "FeatureUnavailableInTierException"),
+            (400, "FeatureUnavailableInTierException"),
         ),
         (
             "routing without a custom domain configuration",
@@ -584,7 +584,7 @@ async fn a_request_the_documented_rules_forbid_is_refused() {
         (
             "a domain on a user pool that does not exist",
             json!({ "UserPoolId": "us-east-1_absent", "Domain": "orphan-domain" }),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "a domain on an absent pool whose other members are invalid too",
@@ -593,7 +593,7 @@ async fn a_request_the_documented_rules_forbid_is_refused() {
                 "Domain": "orphan-bad-version",
                 "ManagedLoginVersion": 3,
             }),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
     ] {
         let (status, payload) = call(&router, "CreateUserPoolDomain", &body).await;

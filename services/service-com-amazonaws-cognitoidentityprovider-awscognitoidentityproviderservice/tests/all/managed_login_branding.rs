@@ -14,7 +14,7 @@
 //! that client is refused and leaves the stored one untouched while another app
 //! client is a different resource; a request that asks for the Cognito-provided
 //! defaults and supplies customizations as well is refused; and an absent pool,
-//! app client or style id is a 404. The reader's MERGED view
+//! app client or style id is a 400. The reader's MERGED view
 //! (`ReturnMergedResources` true) answers the same style with the options it
 //! leaves at the service's defaults filled in, which the sibling
 //! `managed_login_branding_updates` suite covers in full. Each table row names
@@ -671,7 +671,7 @@ async fn the_cognito_provided_default_style_cannot_carry_customizations() {
 }
 
 #[tokio::test]
-async fn an_absent_pool_client_or_branding_id_is_a_404() {
+async fn an_absent_pool_client_or_branding_id_is_a_400() {
     let router = router();
     let user_pool_id = pool(&router, "notfound-branding-pool").await;
     let client_id = client(&router, &user_pool_id, "notfound-branding-client").await;
@@ -727,8 +727,8 @@ async fn an_absent_pool_client_or_branding_id_is_a_404() {
         let (status, payload) = call(&router, operation, &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: must be a 404 ResourceNotFoundException, got {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: must be a 400 ResourceNotFoundException, got {payload}"
         );
     }
 }
@@ -768,7 +768,7 @@ async fn a_deleted_app_client_takes_its_branding_style_with_it() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
+        (400, "ResourceNotFoundException"),
         "a style linked to a deleted app client is gone with it, got {payload}"
     );
 }

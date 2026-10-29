@@ -375,7 +375,7 @@ async fn an_administrative_confirmation_activates_the_account_and_verifies_nothi
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (403, "NotAuthorizedException"),
+        (400, "NotAuthorizedException"),
         "the code of an already confirmed account confirms nothing, got {status} with {payload}"
     );
     assert_eq!(
@@ -444,8 +444,8 @@ async fn a_user_in_any_other_status_is_refused_with_that_status_named() {
 
         assert_eq!(
             (http_status, error_code(&payload)),
-            (403, "NotAuthorizedException"),
-            "case {case:?}: expected a 403 NotAuthorizedException, got {http_status} with \
+            (400, "NotAuthorizedException"),
+            "case {case:?}: expected a 400 NotAuthorizedException, got {http_status} with \
              {payload}"
         );
         let message = error_message(&payload);
@@ -501,8 +501,8 @@ async fn an_absent_pool_or_user_is_refused_and_confirms_nothing() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "UserNotFoundException"),
-            "case {case:?}: expected a 404 UserNotFoundException, got {status} with {payload}"
+            (400, "UserNotFoundException"),
+            "case {case:?}: expected a 400 UserNotFoundException, got {status} with {payload}"
         );
         let message = error_message(&payload);
         assert_eq!(
@@ -522,8 +522,8 @@ async fn an_absent_pool_or_user_is_refused_and_confirms_nothing() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: expected a 404 ResourceNotFoundException, got {status} with {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {case:?}: expected a 400 ResourceNotFoundException, got {status} with {payload}"
         );
         let message = error_message(&payload);
         let expected = format!("User pool {ABSENT_POOL_ID} does not exist.");
@@ -677,8 +677,8 @@ async fn the_confirmation_resolves_the_user_the_named_pool_resolves() {
 
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "UserNotFoundException"),
-            "case {case:?}: {named:?} resolves no user, so expected a 404 \
+            (400, "UserNotFoundException"),
+            "case {case:?}: {named:?} resolves no user, so expected a 400 \
              UserNotFoundException, got {status} with {payload}"
         );
         let message = error_message(&payload);

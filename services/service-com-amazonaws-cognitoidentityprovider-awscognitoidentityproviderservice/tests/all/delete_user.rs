@@ -7,12 +7,12 @@
 //! `AccessToken` removes the whole STORED profile that token was issued to — its
 //! attributes, its group memberships and the challenge state that could sign it
 //! in — and nothing else, so a later read of that user answers the error for a
-//! user that is gone (404 `UserNotFoundException`), whether it is read
+//! user that is gone (400 `UserNotFoundException`), whether it is read
 //! administratively or through an access token that still names it, while every
 //! other user of the pool reads back unchanged. The deleted profile "can't be
 //! restored": creating the same username again mints a DIFFERENT user, which the
 //! old token does not resolve to. A token that names no signed-in user is refused
-//! with 403 `NotAuthorizedException` and deletes nothing.
+//! with 400 `NotAuthorizedException` and deletes nothing.
 //!
 //! The pools, app clients, users, groups and access tokens are all real: they
 //! come from `CreateUserPool`, `CreateUserPoolClient`, `CreateGroup`,
@@ -514,8 +514,8 @@ async fn a_deletion_removes_the_signed_in_users_whole_profile_and_nothing_else()
         let (status, payload) = admin_get_user(&router, &user_pool_id, username).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "UserNotFoundException"),
-            "case {case:?}: expected 404 UserNotFoundException reading the deleted user, \
+            (400, "UserNotFoundException"),
+            "case {case:?}: expected 400 UserNotFoundException reading the deleted user, \
              got {status} with {payload}"
         );
         // ... and through every access token that still names it, the one the
@@ -524,8 +524,8 @@ async fn a_deletion_removes_the_signed_in_users_whole_profile_and_nothing_else()
             let (status, payload) = get_user(&router, token).await;
             assert_eq!(
                 (status, error_code(&payload)),
-                (404, "UserNotFoundException"),
-                "case {case:?}: expected 404 UserNotFoundException from GetUser on access token \
+                (400, "UserNotFoundException"),
+                "case {case:?}: expected 400 UserNotFoundException from GetUser on access token \
                  {position} of the deleted user, got {status} with {payload}"
             );
         }
@@ -533,16 +533,16 @@ async fn a_deletion_removes_the_signed_in_users_whole_profile_and_nothing_else()
         let (status, payload) = delete(&router, &tokens[0]).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "UserNotFoundException"),
-            "case {case:?}: expected 404 UserNotFoundException deleting the same user twice, \
+            (400, "UserNotFoundException"),
+            "case {case:?}: expected 400 UserNotFoundException deleting the same user twice, \
              got {status} with {payload}"
         );
         // A deleted profile "can no longer be used to sign in".
         let (status, payload) = initiate_auth(&router, &client_id, username).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "UserNotFoundException"),
-            "case {case:?}: expected 404 UserNotFoundException signing the deleted user in, \
+            (400, "UserNotFoundException"),
+            "case {case:?}: expected 400 UserNotFoundException signing the deleted user in, \
              got {status} with {payload}"
         );
         // Its group memberships went with it.
@@ -615,7 +615,7 @@ async fn a_deleted_profile_is_not_restored_by_creating_its_username_again() {
     let (status, payload) = get_user(&router, &token).await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "UserNotFoundException"),
+        (400, "UserNotFoundException"),
         "the deleted user's token must not name the user created after it, \
          got {status} with {payload}"
     );
@@ -667,8 +667,8 @@ async fn an_administrative_deletion_leaves_the_users_token_naming_a_user_that_is
     ] {
         assert_eq!(
             (status_and_code.0, status_and_code.1.as_str()),
-            (404, "UserNotFoundException"),
-            "case {case:?}: expected 404 UserNotFoundException, got {status_and_code:?}"
+            (400, "UserNotFoundException"),
+            "case {case:?}: expected 400 UserNotFoundException, got {status_and_code:?}"
         );
     }
 }
@@ -703,8 +703,8 @@ async fn a_token_that_names_no_signed_in_user_is_refused_and_deletes_nothing() {
         let (status, payload) = delete(&router, &token).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (403, "NotAuthorizedException"),
-            "case {case:?}: expected 403 NotAuthorizedException, got {status} with {payload}"
+            (400, "NotAuthorizedException"),
+            "case {case:?}: expected 400 NotAuthorizedException, got {status} with {payload}"
         );
     }
 

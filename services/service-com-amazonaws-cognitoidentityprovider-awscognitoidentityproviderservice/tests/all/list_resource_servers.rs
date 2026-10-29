@@ -9,7 +9,7 @@
 //! single-resource read renders it, in one stable order; a page serves at most
 //! the page size the request asked for and carries a `NextToken` only while
 //! items remain; a token belongs to the listing that issued it; and an absent
-//! pool is a 404. Each table row names the case it asserts.
+//! pool is a 400. Each table row names the case it asserts.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -423,12 +423,12 @@ async fn a_listing_reports_only_the_pool_it_names() {
 }
 
 #[tokio::test]
-async fn a_bad_request_is_refused_and_an_absent_pool_is_a_404() {
+async fn a_bad_request_is_refused_and_an_absent_pool_is_a_400() {
     let router = router();
     let user_pool_id = pool(&router, "listing-refusal-pool").await;
     resource_server(&router, &user_pool_id, "solar-system-data").await;
 
-    // An absent pool is a 404, whatever else the request carries.
+    // An absent pool is a 400, whatever else the request carries.
     for (label, body) in [
         (
             "an absent pool",
@@ -442,8 +442,8 @@ async fn a_bad_request_is_refused_and_an_absent_pool_is_a_404() {
         let (status, payload) = call(&router, "ListResourceServers", &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: must be a 404 ResourceNotFoundException, got {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: must be a 400 ResourceNotFoundException, got {payload}"
         );
     }
 

@@ -463,7 +463,7 @@ async fn a_new_password_response_completes_the_sign_in_and_is_read_back() {
             admin_initiate_auth(&router, &fixture, row.username, TEMPORARY_PASSWORD).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (403, "NotAuthorizedException"),
+            (400, "NotAuthorizedException"),
             "case {case:?}: the replaced temporary password must not sign in, got {status} with \
              {payload}"
         );
@@ -493,7 +493,7 @@ async fn a_new_password_response_completes_the_sign_in_and_is_read_back() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (403, "NotAuthorizedException"),
+            (400, "NotAuthorizedException"),
             "case {case:?}: a spent session answers no second response, got {status} with \
              {payload}"
         );
@@ -634,21 +634,21 @@ async fn a_response_that_does_not_satisfy_the_challenge_is_refused_and_writes_no
         Refused {
             case: "a Session this emulator never handed out",
             session: SessionSource::Unknown,
-            status: 403,
+            status: 400,
             code: "NotAuthorizedException",
             ..CORRECT
         },
         Refused {
             case: "a Session started on another app client",
             session: SessionSource::OtherClient,
-            status: 403,
+            status: 400,
             code: "NotAuthorizedException",
             ..CORRECT
         },
         Refused {
             case: "a Session started in another user pool",
             session: SessionSource::OtherPool,
-            status: 403,
+            status: 400,
             code: "NotAuthorizedException",
             ..CORRECT
         },
@@ -704,7 +704,7 @@ async fn a_response_that_does_not_satisfy_the_challenge_is_refused_and_writes_no
         Refused {
             case: "a USERNAME the session was not started for",
             responded_username: Some("mallory"),
-            status: 403,
+            status: 400,
             code: "NotAuthorizedException",
             ..CORRECT
         },
@@ -725,14 +725,14 @@ async fn a_response_that_does_not_satisfy_the_challenge_is_refused_and_writes_no
         Refused {
             case: "a user pool this emulator does not hold",
             user_pool_id: Some("us-east-1_absent"),
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
             ..CORRECT
         },
         Refused {
             case: "an app client the pool does not hold",
             client_id: Some("absentclient"),
-            status: 404,
+            status: 400,
             code: "ResourceNotFoundException",
             ..CORRECT
         },
@@ -891,7 +891,7 @@ async fn an_expired_session_answers_no_challenge() {
         }
         assert_eq!(
             (status, error_code(&payload)),
-            (403, "NotAuthorizedException"),
+            (400, "NotAuthorizedException"),
             "case {case:?}: an expired session must be refused, got {status} with {payload}"
         );
         let after = stored_user(&router, &fixture.user_pool_id, "alice").await;

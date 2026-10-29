@@ -10,7 +10,7 @@
 //! member the request omits to its default (no custom scopes), leaves every
 //! read-only field and every other resource untouched, and answers with the
 //! stored record, so a later `DescribeResourceServer` renders the same thing. An
-//! unknown pool or identifier is a 404 `ResourceNotFoundException` that stores
+//! unknown pool or identifier is a 400 `ResourceNotFoundException` that stores
 //! nothing. Each table row names the case it asserts.
 
 use bytes::Bytes;
@@ -502,7 +502,7 @@ async fn updating_a_resource_server_leaves_every_app_clients_allowed_oauth_scope
 }
 
 #[tokio::test]
-async fn an_absent_pool_or_identifier_is_a_404_and_stores_nothing() {
+async fn an_absent_pool_or_identifier_is_a_400_and_stores_nothing() {
     let router = router();
     let user_pool_id = pool(&router, "update-rs-notfound-pool").await;
     ok(
@@ -548,8 +548,8 @@ async fn an_absent_pool_or_identifier_is_a_404_and_stores_nothing() {
         let (status, payload) = call(&router, "UpdateResourceServer", &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: must be a 404 ResourceNotFoundException, got {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: must be a 400 ResourceNotFoundException, got {payload}"
         );
         // The message is built from the request and the store, never freely
         // worded: the thing that was not found, then the pool it was looked for
@@ -577,7 +577,7 @@ async fn an_absent_pool_or_identifier_is_a_404_and_stores_nothing() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
+        (400, "ResourceNotFoundException"),
         "a refused update must not have created a resource server, got {payload}"
     );
 }

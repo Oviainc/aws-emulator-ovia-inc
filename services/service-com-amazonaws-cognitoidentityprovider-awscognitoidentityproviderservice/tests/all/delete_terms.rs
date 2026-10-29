@@ -9,7 +9,7 @@
 //! the name it held is free for its app client again, and every other stored
 //! record is untouched; a request naming a pool that does not exist, or an id
 //! the named pool does not hold (never minted, already deleted, or stored in
-//! another pool), is refused with a 404 `ResourceNotFoundException` and deletes
+//! another pool), is refused with a 400 `ResourceNotFoundException` and deletes
 //! nothing.
 //!
 //! Each table row names the case it asserts.
@@ -325,7 +325,7 @@ async fn a_delete_removes_the_named_set_and_leaves_every_other_stored_one() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
             "case {label:?}: the deleted documents are no longer readable by id, got {status} \
              with {payload}"
         );
@@ -341,7 +341,7 @@ async fn a_delete_removes_the_named_set_and_leaves_every_other_stored_one() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
             "case {label:?}: the deleted documents are no longer readable through their app \
              client, got {status} with {payload}"
         );
@@ -456,7 +456,7 @@ async fn the_deleted_name_is_free_for_its_app_client_again() {
 }
 
 #[tokio::test]
-async fn an_id_the_named_pool_does_not_hold_is_a_404_and_deletes_nothing() {
+async fn an_id_the_named_pool_does_not_hold_is_a_400_and_deletes_nothing() {
     let router = router();
     let user_pool_id = pool(&router, "refusal-delete-pool").await;
     let other_pool = pool(&router, "other-delete-pool").await;
@@ -509,8 +509,8 @@ async fn an_id_the_named_pool_does_not_hold_is_a_404_and_deletes_nothing() {
         let (status, payload) = call(&router, "DeleteTerms", &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: expected a 404 ResourceNotFoundException, got {status} with {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: expected a 400 ResourceNotFoundException, got {status} with {payload}"
         );
     }
 

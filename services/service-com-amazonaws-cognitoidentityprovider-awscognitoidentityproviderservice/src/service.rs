@@ -13,7 +13,7 @@
 //! table — built from the Smithy model at compile time. You do not edit the
 //! entry; you edit the behavioral seams below.
 //!
-//! Five opt-in seams are yours to change; every one defaults to the framework's
+//! Six opt-in seams are yours to change; every one defaults to the framework's
 //! own behaviour, so an unedited service still routes and answers correctly:
 //!
 //! - `can_handle` — which requests this service claims. The default matches the
@@ -42,6 +42,10 @@
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
+//! - `override_protocol` — EDITED HERE: the model's own `awsJson1_1`, wrapped so that an
+//!   ERROR is answered the way this endpoint is recorded answering one — the status every
+//!   refusal of the caller carries, and the `x-amzn-errortype` naming its error shape.
+//!   See the `error_wire` module for the rule.
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
@@ -58,6 +62,11 @@ use smithy_server_runtime::{
     Refused, Service,
 };
 use std::sync::Arc;
+
+/// How this service answers an ERROR on the wire: the status a refusal of the caller
+/// carries, and the header naming the error shape it refused with. Private: it is reached
+/// through `override_protocol` and the refusal tail below, not by a caller.
+mod error_wire;
 
 /// The error code Amazon Cognito answers a bad parameter with, and the code this service
 /// gives a refusal the framework made before any handler ran. Restated beside the message
@@ -97,6 +106,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// the generated table uses — and built from the SAME shared engine, so a wrapped
     /// operation reads and writes the one store.
     with_submitted_values: OperationRoutingTable,
+    /// This service's wire protocol, built ONCE here because `override_protocol` hands
+    /// out a borrow of it rather than a new one per request. It is the `awsJson1_1` the
+    /// model declares, answering an error the way this endpoint is recorded answering one
+    /// (see [`error_wire`]).
+    protocol: error_wire::ErrorWireProtocol,
 }
 
 /// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
@@ -261,6 +275,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             engine,
             with_submitted_values,
+            protocol: error_wire::ErrorWireProtocol::new(),
         }
     }
 }
@@ -347,12 +362,19 @@ where
             .map(|(violation, echo)| quoting_the_submitted_collection(violation, echo))
             .collect();
             if let Some(message) = constraints::envelope(&refused) {
-                return svc.definition().refusal_response(
-                    ProtocolError::Invalid(refused),
-                    Some(Refused {
-                        code: INVALID_PARAMETER_EXCEPTION.to_string(),
-                        message,
-                    }),
+                // The framework renders the refusal in this service's own envelope; the
+                // one thing it does not state on an awsJson error is the error shape in
+                // `x-amzn-errortype`, which this service answers on EVERY error, so the
+                // code chosen here names it there too (see [`error_wire`]).
+                return error_wire::naming_the_error_shape(
+                    svc.definition().refusal_response(
+                        ProtocolError::Invalid(refused),
+                        Some(Refused {
+                            code: INVALID_PARAMETER_EXCEPTION.to_string(),
+                            message,
+                        }),
+                    ),
+                    INVALID_PARAMETER_EXCEPTION,
                 );
             }
             self.operation.run(svc, req, ctx).await
@@ -513,6 +535,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             .headers_mut()
             .insert("content-type", "application/json");
         Some(response)
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model-derived protocol is `awsJson1_1`, and so is this one: it delegates
+        // routing, request deserialization and the success body to the framework's own
+        // `awsJson1_1`, and differs only in how an ERROR is answered — the status every
+        // refusal of the caller carries and the `x-amzn-errortype` naming its error
+        // shape, both of this endpoint's recorded wire. See [`error_wire`] for the rule.
+        Some(&self.protocol)
     }
 
     fn override_framework_error(

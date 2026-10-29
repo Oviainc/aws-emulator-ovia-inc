@@ -551,9 +551,9 @@ async fn only_a_waiting_job_starts_and_only_a_running_job_stops() {
 }
 
 #[tokio::test]
-async fn a_job_or_pool_that_is_not_stored_is_a_404() {
+async fn a_job_or_pool_that_is_not_stored_is_a_400() {
     let router = router();
-    let user_pool_id = pool(&router, "import-404-pool").await;
+    let user_pool_id = pool(&router, "import-400-pool").await;
     let created = ok(
         &router,
         "CreateUserImportJob",
@@ -596,8 +596,8 @@ async fn a_job_or_pool_that_is_not_stored_is_a_404() {
         }
         let (status, payload) = call(&router, operation, &Value::Object(body)).await;
         assert_eq!(
-            status, 404,
-            "case \"{operation} on an absent user pool\": expected HTTP 404, got {status} with {payload}"
+            status, 400,
+            "case \"{operation} on an absent user pool\": expected HTTP 400, got {status} with {payload}"
         );
         let code = error_code(&payload);
         assert!(
@@ -618,8 +618,8 @@ async fn a_job_or_pool_that_is_not_stored_is_a_404() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case \"{operation} on an absent job\": expected HTTP 404, got {status} with {payload}"
+            status, 400,
+            "case \"{operation} on an absent job\": expected HTTP 400, got {status} with {payload}"
         );
         let code = error_code(&payload);
         assert!(

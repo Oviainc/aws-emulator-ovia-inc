@@ -10,7 +10,7 @@
 //! `cognito:groups` claims" (this operation's model documentation) — leaving
 //! every other group and every other membership of the pool, and every other
 //! pool, untouched. A pool it does not name, or a group the named pool does not
-//! hold (a second delete of the same group included), is a 404
+//! hold (a second delete of the same group included), is a 400
 //! `ResourceNotFoundException` that persists nothing, and a group lookup that
 //! found nothing says so in ONE fixed sentence that names no group — the same
 //! sentence whatever name was asked for, in every operation that resolves a
@@ -267,7 +267,7 @@ async fn deleting_a_group_removes_it_and_unassigns_every_membership_of_it() {
             "case {label:?}: deleting a stored group succeeds, got {status} with {payload}"
         );
 
-        // The group is GONE from stored state: its reader answers a 404.
+        // The group is GONE from stored state: its reader answers a 400.
         let (status, payload) = call(
             &router,
             "GetGroup",
@@ -276,7 +276,7 @@ async fn deleting_a_group_removes_it_and_unassigns_every_membership_of_it() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
             "case {label:?}: a deleted group is no longer readable, got {status} with {payload}"
         );
         // The refusal names no group: the same sentence for every row's name.
@@ -310,7 +310,7 @@ async fn deleting_a_group_removes_it_and_unassigns_every_membership_of_it() {
             );
         }
 
-        // A group the pool no longer holds is a 404, so a second delete of the
+        // A group the pool no longer holds is a 400, so a second delete of the
         // same name is refused rather than silently succeeding.
         let (status, payload) = call(
             &router,
@@ -320,8 +320,8 @@ async fn deleting_a_group_removes_it_and_unassigns_every_membership_of_it() {
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: a second delete of the same group is a 404, got {status} with {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: a second delete of the same group is a 400, got {status} with {payload}"
         );
         assert_eq!(
             message(&payload),
@@ -378,7 +378,7 @@ async fn a_delete_touches_only_the_pool_it_names() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
+        (400, "ResourceNotFoundException"),
         "case \"the pool the delete named\": its group is gone, got {status} with {payload}"
     );
     let first_memberships = memberships(&router, &first_pool, "alice").await;
@@ -406,7 +406,7 @@ async fn a_delete_touches_only_the_pool_it_names() {
 }
 
 #[tokio::test]
-async fn an_absent_pool_or_group_is_a_404_and_persists_nothing() {
+async fn an_absent_pool_or_group_is_a_400_and_persists_nothing() {
     let router = router();
     let user_pool_id = pool(&router, "notfound-pool").await;
     let stored = group(&router, &user_pool_id, "admins").await;
@@ -436,8 +436,8 @@ async fn an_absent_pool_or_group_is_a_404_and_persists_nothing() {
         let (status, payload) = call(&router, "DeleteGroup", &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: must be a 404 ResourceNotFoundException, got {status} with {payload}"
+            (400, "ResourceNotFoundException"),
+            "case {label:?}: must be a 400 ResourceNotFoundException, got {status} with {payload}"
         );
     }
 

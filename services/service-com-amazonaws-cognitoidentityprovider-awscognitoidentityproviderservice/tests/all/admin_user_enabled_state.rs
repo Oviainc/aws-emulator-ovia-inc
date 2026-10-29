@@ -375,12 +375,12 @@ async fn an_absent_pool_or_user_is_refused_and_stores_nothing() {
             (
                 "an absent user pool",
                 json!({ "UserPoolId": "us-east-1_absent", "Username": "dave" }),
-                (404, "ResourceNotFoundException"),
+                (400, "ResourceNotFoundException"),
             ),
             (
                 "a user the pool does not hold",
                 json!({ "UserPoolId": user_pool_id, "Username": "absent-user" }),
-                (404, "UserNotFoundException"),
+                (400, "UserNotFoundException"),
             ),
         ] {
             let (status, payload) = call(&router, operation, &body).await;
@@ -525,8 +525,8 @@ async fn a_deactivated_user_cannot_sign_in_and_its_tokens_are_revoked() {
         let (status, payload) = call(&router, operation, &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (403, "NotAuthorizedException"),
-            "case {label:?}: expected a 403 NotAuthorizedException, got {status} with {payload}"
+            (400, "NotAuthorizedException"),
+            "case {label:?}: expected a 400 NotAuthorizedException, got {status} with {payload}"
         );
     }
 
@@ -558,8 +558,8 @@ async fn a_deactivated_user_cannot_sign_in_and_its_tokens_are_revoked() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (403, "NotAuthorizedException"),
-        "case \"a revoked token after the activation\": expected a 403 NotAuthorizedException, got {status} with {payload}"
+        (400, "NotAuthorizedException"),
+        "case \"a revoked token after the activation\": expected a 400 NotAuthorizedException, got {status} with {payload}"
     );
 }
 

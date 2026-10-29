@@ -685,8 +685,8 @@ async fn the_native_provider_deactivation_withdraws_password_sign_in() {
     let (status, payload) = sign_in(&router, &user_pool_id, &client_id, "erin").await;
     assert_eq!(
         (status, error_code(&payload)),
-        (403, "NotAuthorizedException"),
-        "case \"a password sign-in after the native deactivation\": expected a 403 \
+        (400, "NotAuthorizedException"),
+        "case \"a password sign-in after the native deactivation\": expected a 400 \
          NotAuthorizedException, got {status} with {payload}"
     );
 
@@ -761,12 +761,12 @@ async fn a_deactivation_naming_nothing_stored_is_refused() {
         (
             "an absent user pool",
             json!({ "UserPoolId": "us-east-1_absent", "User": native_identity("dave") }),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "a native identity naming a user the pool does not hold",
             json!({ "UserPoolId": user_pool_id, "User": native_identity("absent-user") }),
-            (404, "UserNotFoundException"),
+            (400, "UserNotFoundException"),
         ),
         (
             "an identifier naming no provider",
@@ -872,7 +872,7 @@ async fn a_link_requires_a_configured_provider_and_a_stored_destination() {
             "a source provider the pool holds no IdP for",
             identity("Unconfigured", "email", "frank@example.com"),
             "frank".to_string(),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
             Some(format!(
                 "Identity provider Unconfigured for tenantId {user_pool_id} does not exist."
             )),
@@ -881,7 +881,7 @@ async fn a_link_requires_a_configured_provider_and_a_stored_destination() {
             "a source naming the native provider, which is no IdP of the pool",
             identity(NATIVE_PROVIDER, SUBJECT_ATTRIBUTE, "frank"),
             "frank".to_string(),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
             Some(format!(
                 "Identity provider Cognito for tenantId {user_pool_id} does not exist."
             )),
@@ -890,7 +890,7 @@ async fn a_link_requires_a_configured_provider_and_a_stored_destination() {
             "a destination the pool holds no user for",
             configured.clone(),
             "absent-user".to_string(),
-            (404, "UserNotFoundException"),
+            (400, "UserNotFoundException"),
             Some("User does not exist.".to_string()),
         ),
         (
@@ -922,7 +922,7 @@ async fn a_link_requires_a_configured_provider_and_a_stored_destination() {
         }
     }
 
-    // An absent pool is a 404 too, and nothing above was stored: the profile
+    // An absent pool is a 400 too, and nothing above was stored: the profile
     // still holds no link.
     let (status, payload) = link(
         &router,
@@ -933,8 +933,8 @@ async fn a_link_requires_a_configured_provider_and_a_stored_destination() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
-        "case \"an absent user pool\": expected a 404 ResourceNotFoundException, got {status} with {payload}"
+        (400, "ResourceNotFoundException"),
+        "case \"an absent user pool\": expected a 400 ResourceNotFoundException, got {status} with {payload}"
     );
     let (status, payload) = disable(&router, &user_pool_id, &native_identity("frank")).await;
     assert_not_linked("a profile no refused link reached", status, &payload);

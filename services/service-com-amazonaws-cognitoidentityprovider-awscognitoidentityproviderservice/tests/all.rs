@@ -73,6 +73,8 @@ mod device_remembering;
 mod domain_lookup_and_condition_messages;
 #[path = "all/error_message_wording.rs"]
 mod error_message_wording;
+#[path = "all/error_wire.rs"]
+mod error_wire;
 #[path = "all/explicit_auth_flows.rs"]
 mod explicit_auth_flows;
 #[path = "all/feature_plan_gate.rs"]

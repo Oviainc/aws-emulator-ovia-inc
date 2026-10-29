@@ -14,7 +14,7 @@
 //! STORED set, empty for a pool nothing has tagged. An ARN that is not a user-pool
 //! ARN of this service names no resource (HTTP 400 `InvalidParameterException`), and
 //! one naming a pool this service does not hold in that Region names a missing
-//! resource (HTTP 404 `ResourceNotFoundException`); neither writes anything.
+//! resource (HTTP 400 `ResourceNotFoundException`); neither writes anything.
 //!
 //! Each table row names the case it asserts and every assertion reports the actual
 //! value.
@@ -621,7 +621,7 @@ async fn an_arn_that_names_no_user_pool_of_this_service_is_refused() {
 }
 
 #[tokio::test]
-async fn an_arn_naming_a_pool_this_service_does_not_hold_is_a_404() {
+async fn an_arn_naming_a_pool_this_service_does_not_hold_is_a_400() {
     let router = router();
     let (_, pool_arn) = pool(&router, "present-pool").await;
 
@@ -656,8 +656,8 @@ async fn an_arn_naming_a_pool_this_service_does_not_hold_is_a_404() {
             let (status, payload) = call(&router, operation, &request).await;
             assert_eq!(
                 (status, error_code(&payload)),
-                (404, "ResourceNotFoundException"),
-                "case {case:?}: expected a 404 ResourceNotFoundException, got {status} \
+                (400, "ResourceNotFoundException"),
+                "case {case:?}: expected a 400 ResourceNotFoundException, got {status} \
                  with {payload}"
             );
             let message = error_message(&payload);

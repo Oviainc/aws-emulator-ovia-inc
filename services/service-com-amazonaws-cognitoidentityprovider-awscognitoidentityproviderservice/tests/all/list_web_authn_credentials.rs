@@ -11,7 +11,7 @@
 //! of a non-final page resuming the listing strictly after the last credential
 //! it served. Only that user's passkeys are reported, a `NextToken` this listing
 //! never minted names no page (400 `InvalidParameterException`), a token that
-//! names no signed-in user is refused (403 `NotAuthorizedException`), and the
+//! names no signed-in user is refused (400 `NotAuthorizedException`), and the
 //! read changes nothing a later caller sees.
 //!
 //! The pools, app clients, users, passkey configurations, access tokens and
@@ -770,7 +770,7 @@ async fn a_token_that_names_no_signed_in_user_is_refused() {
         let (status, payload) = list(&router, &list_request(token, None, None)).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (403, "NotAuthorizedException"),
+            (400, "NotAuthorizedException"),
             "case {case:?}: a token naming no signed-in user is refused, got {status} with \
              {payload}"
         );
@@ -798,7 +798,7 @@ async fn a_token_that_names_no_signed_in_user_is_refused() {
     let (status, payload) = list(&router, &list_request(&access, None, None)).await;
     assert_eq!(
         (status, error_code(&payload)),
-        (403, "NotAuthorizedException"),
+        (400, "NotAuthorizedException"),
         "case {case:?}: a revoked token is refused, got {status} with {payload}"
     );
 }

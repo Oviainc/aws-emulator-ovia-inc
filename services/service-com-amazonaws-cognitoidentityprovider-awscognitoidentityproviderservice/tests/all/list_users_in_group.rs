@@ -11,7 +11,7 @@
 //! `NextToken` of a non-final page resumes the listing strictly after the last
 //! user that page served and the final page carries none. It writes nothing: a
 //! repeated call answers the same, and so does every other reader of the same
-//! state. An absent pool or group is a 404 `ResourceNotFoundException` and a
+//! state. An absent pool or group is a 400 `ResourceNotFoundException` and a
 //! `NextToken` this listing never minted a 400 `InvalidParameterException`.
 //!
 //! Each table row names the case it asserts.
@@ -529,8 +529,8 @@ async fn a_removed_member_leaves_the_listing_and_a_deleted_group_is_gone() {
     .await;
     assert_eq!(
         (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
-        "case \"a deleted group\": expected a 404 ResourceNotFoundException, got {status} with \
+        (400, "ResourceNotFoundException"),
+        "case \"a deleted group\": expected a 400 ResourceNotFoundException, got {status} with \
          {payload}"
     );
 }
@@ -566,17 +566,17 @@ async fn an_absent_pool_or_group_and_an_unissued_token_are_refused() {
         (
             "an absent user pool",
             list_request("us-east-1_absent", "admins", None, None),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "a group the pool does not hold",
             list_request(&user_pool_id, "absent-group", None, None),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "a group name differing only in case, which GroupNameType matches exactly",
             list_request(&user_pool_id, "Admins", None, None),
-            (404, "ResourceNotFoundException"),
+            (400, "ResourceNotFoundException"),
         ),
         (
             "a NextToken no listing of this service minted",
