@@ -17,6 +17,13 @@
 //! the resource whose tag set it changed, which keys the request named and the outcome, on
 //! the refusal paths as much as on the success one.
 //!
+//! A removal that takes a key off the resource MODIFIES that resource, so it moves the
+//! record's last-modified instant to the instant of the removal
+//! ([`crate::state::ComplianceInquiry::record_modification`]) — the tag set is persisted on
+//! the inquiry record, so a reader of that record cannot report an instant before a change
+//! `ListTagsForResource` reports back. A request naming only keys the resource does not
+//! carry changes nothing, so it leaves that instant where it was.
+//!
 //! An ARN that names no resource this account holds is answered HTTP 401
 //! `UnauthorizedException`, as every resource lookup in this service is — see
 //! [`crate::ops::tag_resource`].
@@ -211,6 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let Some(resource) = store.tagged_resource_mut(&input.resource_arn) else {
             // The same refusal a tag write answers: whether the account holds the resource
@@ -237,6 +245,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if resource.tags.remove(key).is_some() {
                 removed += 1;
             }
+        }
+
+        if removed > 0 {
+            // The resource's own record changed, so the instant it reports as its last
+            // modification is this write's. A request that removed nothing is left out:
+            // it wrote nothing for the field to report.
+            resource.record_modification(now);
         }
 
         // The removal is attributable on the same terms as the tag write: the caller's

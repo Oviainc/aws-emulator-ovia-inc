@@ -40,7 +40,9 @@
 //! `resourceArn` names, and the only resource an account owns here is an inquiry (see
 //! [`ComAmazonawsArtifactArtifactState::tagged_resource`]), so the tags live on the
 //! inquiry record that `CreateComplianceInquiry` already accepts them with rather than in
-//! a second map beside it.
+//! a second map beside it. A tag write is therefore a modification of the INQUIRY, so it
+//! moves that record's last-modified instant exactly as the clock-owed transition does
+//! ([`ComplianceInquiry::record_modification`]).
 //!
 //! FEEDBACK is the other record a caller writes onto an inquiry:
 //! `PutComplianceInquiryFeedback` records a rating on one of the inquiry's queries (or on
@@ -1108,6 +1110,31 @@ impl ComplianceInquiry {
             self.status = INQUIRY_STATUS_COMPLETED.to_string();
             self.status_message = INQUIRY_MESSAGE_COMPLETE.to_string();
         }
+    }
+
+    /// Record that a caller's write CHANGED this inquiry at `now`, which is what
+    /// [`updated_at`](Self::updated_at) — "Timestamp indicating when the resource was last
+    /// modified" — reports.
+    ///
+    /// The resource is everything its own projection reports
+    /// ([`to_detail`](Self::to_detail) and [`reported_tags`](Self::reported_tags)): its
+    /// TAG SET as much as its status, because this service persists the tags on this very
+    /// record and reports them beside the timestamp. So a write that changes any of them
+    /// is a modification of the resource and moves the timestamp to the instant it was
+    /// made, and the field never reports an instant before a change a later read of the
+    /// resource can observe.
+    ///
+    /// The transition the CLOCK owed is applied FIRST
+    /// ([`materialise`](Self::materialise)): it changed the record at its own due instant,
+    /// which is before this write, so applying it afterwards would drag the timestamp back
+    /// behind this change.
+    ///
+    /// Called only where the resource really changed — a call that leaves it as it was
+    /// modified nothing, which is what makes a repeat of an `@idempotent` tag write
+    /// unobservable.
+    pub fn record_modification(&mut self, now: SystemTime) {
+        self.materialise(now);
+        self.updated_at = now;
     }
 
     /// Every query identifier this inquiry OWNS, in the ascending order its queries are

@@ -49,6 +49,8 @@ mod front_door_errors;
 mod harness;
 #[path = "all/implemented_inquiry_operations.rs"]
 mod implemented_inquiry_operations;
+#[path = "all/inquiry_last_modified.rs"]
+mod inquiry_last_modified;
 #[path = "all/inquiry_query_identifier_rules.rs"]
 mod inquiry_query_identifier_rules;
 #[path = "all/inquiry_tags_reporting.rs"]

@@ -28,6 +28,13 @@
 //! state-changing call that changed nothing is still attributable. Never a tag VALUE, and
 //! never the inquiry's `@sensitive` name or content.
 //!
+//! A write that changes the resource's tag set MODIFIES that resource, so it moves the
+//! record's last-modified instant to the instant of the write
+//! ([`crate::state::ComplianceInquiry::record_modification`]) — the tag set is persisted on
+//! the inquiry record, so a reader of that record cannot report an instant before a change
+//! `ListTagsForResource` reports back. A request writing the values the resource already
+//! carries changes nothing, so it leaves that instant where it was.
+//!
 //! The resource is named by its ARN, and the only resource an account owns in this service
 //! is a compliance inquiry — see
 //! [`crate::state::ComAmazonawsArtifactArtifactState::tagged_resource`]. An ARN that
@@ -227,6 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let Some(resource) = store.tagged_resource_mut(&input.resource_arn) else {
             // An ARN none of this account's resources answers to names nothing the caller
@@ -271,10 +279,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // Whether this write CHANGES the resource, decided against the set it already
+        // carries: a request writing the values it holds already asks for the state it is
+        // in, so nothing is written for the last-modified instant to report.
+        let changed = tags != resource.tags;
         resource.tags = tags;
-        // `updatedAt` is NOT moved: it reports when the inquiry's own record was last
-        // modified, which this service moves with the processing transition the clock owes
-        // it, and no AWS documentation ties it to a write of the resource's tag set.
+        if changed {
+            // The resource's own record changed, so the instant it reports as its last
+            // modification is this write's.
+            resource.record_modification(now);
+        }
 
         // The tag write is attributable: the access key id the caller presented (a public
         // identifier, never a secret), the scope's region, the resource whose tag set
