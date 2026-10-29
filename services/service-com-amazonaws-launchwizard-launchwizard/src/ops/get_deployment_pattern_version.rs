@@ -158,34 +158,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `@readonly`: the catalogue is read-only, so this is a pure read — nothing a
         // later caller sees changes. The three names are resolved in the order they
-        // scope each other (a pattern belongs to a workload, a version to a pattern),
-        // each against the SAME records the pattern-reporting operations read, so the
+        // scope each other (a pattern belongs to a workload, a version to a pattern):
+        // the first two through `state::resolve_pattern`, the one statement of that
+        // step, against the SAME records the pattern-reporting operations read, so the
         // version reported here is one of the versions that pattern publishes. Every
         // message is the fixed, identifier-free one a catalogue lookup carries, so a
         // caller cannot probe the catalogue through the error channel.
         let store = state.lock();
-        let Some(workload) = store.workloads.get(&input.workload_name) else {
-            return Err(
+        let pattern = store
+            .resolve_pattern(&input.workload_name, &input.deployment_pattern_name)
+            .map_err(|message| {
                 GetDeploymentPatternVersionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::WORKLOAD_NOT_FOUND_MESSAGE.to_string()),
+                        message: Some(message.to_string()),
                     },
                 )
-                .into(),
-            );
-        };
-        let Some(pattern) = workload.patterns.get(&input.deployment_pattern_name) else {
-            return Err(
-                GetDeploymentPatternVersionErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(
-                            crate::state::DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE.to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        };
+            })?;
         let Some(summary) = pattern.version_summary(&input.deployment_pattern_version_name) else {
             return Err(
                 GetDeploymentPatternVersionErrorModeled::ResourceNotFoundException(

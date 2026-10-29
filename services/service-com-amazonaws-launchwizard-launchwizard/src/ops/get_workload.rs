@@ -145,19 +145,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
-        // A pure read of the catalogue: the entry is looked up by the requested name,
-        // and an absent one is the modelled 404 carrying the fixed, identifier-free
-        // message every workload lookup answers with (see
-        // `state::WORKLOAD_NOT_FOUND_MESSAGE`) — never a 501, and never the requested
-        // name echoed back.
-        let Some(workload) = store.workloads.get(&input.workload_name) else {
-            return Err(GetWorkloadErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::WORKLOAD_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        };
+        // A pure read of the catalogue: the entry is looked up by the requested name
+        // through `state::resolve_workload`, the one statement of that step, and an
+        // absent one is the modelled 404 carrying the fixed, identifier-free message
+        // every workload lookup answers with (see `state::WORKLOAD_NOT_FOUND_MESSAGE`)
+        // — never a 501, and never the requested name echoed back.
+        let workload = store
+            .resolve_workload(&input.workload_name)
+            .map_err(|message| {
+                GetWorkloadErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(message.to_string()),
+                })
+            })?;
 
         // Every member comes from the stored catalogue entry — nothing is echoed from
         // this request.

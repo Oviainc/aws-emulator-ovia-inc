@@ -158,20 +158,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // `@readonly`: a page is a pure read of the seeded catalogue. The workload is
-        // resolved first, so a name the catalogue does not hold is a 404 rather than an
-        // empty list — an empty list means "this workload offers no pattern".
+        // resolved first, through `state::resolve_workload` — the one statement of that
+        // step — so a name the catalogue does not hold is a 404 rather than an empty
+        // list; an empty list means "this workload offers no pattern".
         let summaries: Vec<WorkloadDeploymentPatternDataSummary> = {
             let store = state.lock();
-            let Some(workload) = store.workloads.get(&input.workload_name) else {
-                return Err(
+            let workload = store
+                .resolve_workload(&input.workload_name)
+                .map_err(|message| {
                     ListWorkloadDeploymentPatternsErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some(crate::state::WORKLOAD_NOT_FOUND_MESSAGE.to_string()),
+                            message: Some(message.to_string()),
                         },
                     )
-                    .into(),
-                );
-            };
+                })?;
             // `patterns` is keyed by `deploymentPatternName`, so the patterns are
             // reported in that order and a token resumes after the one the previous
             // page ended on.

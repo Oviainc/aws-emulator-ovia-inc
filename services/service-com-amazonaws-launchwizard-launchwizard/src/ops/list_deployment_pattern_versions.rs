@@ -203,35 +203,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // `@readonly`: a page is a pure read of the seeded catalogue. The workload and
-        // the pattern are resolved in the order they scope each other, so a name the
-        // catalogue does not hold is a 404 rather than an empty list — an empty list
-        // means "this pattern publishes no version the filters select". Both messages
-        // are the fixed, identifier-free ones a catalogue lookup carries, so a caller
-        // cannot probe the catalogue through the error channel.
+        // the pattern are resolved through `state::resolve_pattern`, the one statement
+        // of that two-step lookup, so a name the catalogue does not hold is a 404
+        // rather than an empty list — an empty list means "this pattern publishes no
+        // version the filters select". Its message is the fixed, identifier-free one a
+        // catalogue lookup carries for the kind that is missing, so a caller cannot
+        // probe the catalogue through the error channel.
         let summaries: Vec<DeploymentPatternVersionDataSummary> = {
             let store = state.lock();
-            let Some(workload) = store.workloads.get(&input.workload_name) else {
-                return Err(
+            let pattern = store
+                .resolve_pattern(&input.workload_name, &input.deployment_pattern_name)
+                .map_err(|message| {
                     ListDeploymentPatternVersionsErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some(crate::state::WORKLOAD_NOT_FOUND_MESSAGE.to_string()),
+                            message: Some(message.to_string()),
                         },
                     )
-                    .into(),
-                );
-            };
-            let Some(pattern) = workload.patterns.get(&input.deployment_pattern_name) else {
-                return Err(
-                    ListDeploymentPatternVersionsErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(
-                                crate::state::DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE.to_string(),
-                            ),
-                        },
-                    )
-                    .into(),
-                );
-            };
+                })?;
             // The versions this pattern publishes, oldest first, in the projection the
             // single-version read reports from — so a version a page carries reads
             // exactly as `GetDeploymentPatternVersion` reports it. Every filter has to

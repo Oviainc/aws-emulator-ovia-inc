@@ -874,6 +874,43 @@ impl Default for ComAmazonawsLaunchwizardLaunchwizardState {
 }
 
 impl ComAmazonawsLaunchwizardLaunchwizardState {
+    /// The catalogue entry `workload_name` names, or the message a refusal carries when
+    /// the catalogue does not hold it.
+    ///
+    /// The ONE statement in this crate of the first step every catalogue lookup takes:
+    /// everything this service's catalogue publishes below a workload is scoped by it, so
+    /// each handler resolves the workload first and answers [`WORKLOAD_NOT_FOUND_MESSAGE`]
+    /// when that name resolves nothing. The `Err` is the message of the KIND of resource
+    /// that is missing, which the calling handler lifts into its OWN operation's modelled
+    /// `ResourceNotFoundException` (HTTP 404) — the enum variant is per operation, the
+    /// sentence is not.
+    pub fn resolve_workload(&self, workload_name: &str) -> Result<&Workload, &'static str> {
+        self.workloads
+            .get(workload_name)
+            .ok_or(WORKLOAD_NOT_FOUND_MESSAGE)
+    }
+
+    /// The deployment pattern `pattern_name` of the workload `workload_name`, or the
+    /// message of the kind of resource that is missing.
+    ///
+    /// A deployment pattern exists only INSIDE a workload, so the two names are resolved
+    /// in the order they scope each other and the refusal names the outermost kind the
+    /// request asked for that the catalogue does not hold: a request naming neither is
+    /// refused for the workload, never for the pattern. Built on
+    /// [`Self::resolve_workload`], so the two steps cannot drift apart, and handing back
+    /// the resolved entry itself keeps every pattern view reading the same record (see
+    /// [`Workload::patterns`]).
+    pub fn resolve_pattern(
+        &self,
+        workload_name: &str,
+        pattern_name: &str,
+    ) -> Result<&DeploymentPattern, &'static str> {
+        self.resolve_workload(workload_name)?
+            .patterns
+            .get(pattern_name)
+            .ok_or(DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE)
+    }
+
     /// Mint a `deploymentId` no stored deployment already carries, or `None` when every
     /// draw of a BOUNDED retry collided with a stored id.
     ///

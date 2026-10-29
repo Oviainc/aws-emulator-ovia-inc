@@ -155,33 +155,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // `@readonly`: the catalogue is read-only, so this is a pure read. The
-        // workload and then the pattern are resolved against the SAME records
-        // `ListWorkloadDeploymentPatterns` summarises, so the two views agree member
+        // workload and then the pattern are resolved through `state::resolve_pattern`,
+        // the one statement of that two-step lookup and of which kind of missing
+        // resource a refusal names, against the SAME records
+        // `ListWorkloadDeploymentPatterns` summarises — so the two views agree member
         // for member; only the specification schema is reported here alone, because
         // only `WorkloadDeploymentPatternData` carries it.
         let store = state.lock();
-        let Some(workload) = store.workloads.get(&input.workload_name) else {
-            return Err(
+        let pattern = store
+            .resolve_pattern(&input.workload_name, &input.deployment_pattern_name)
+            .map_err(|message| {
                 GetWorkloadDeploymentPatternErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::WORKLOAD_NOT_FOUND_MESSAGE.to_string()),
+                        message: Some(message.to_string()),
                     },
                 )
-                .into(),
-            );
-        };
-        let Some(pattern) = workload.patterns.get(&input.deployment_pattern_name) else {
-            return Err(
-                GetWorkloadDeploymentPatternErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(
-                            crate::state::DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE.to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        };
+            })?;
 
         Ok(GetWorkloadDeploymentPatternOutput {
             workload_deployment_pattern: Some(pattern.to_data()),

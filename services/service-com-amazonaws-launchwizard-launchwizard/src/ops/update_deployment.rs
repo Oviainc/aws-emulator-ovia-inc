@@ -228,19 +228,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let deployed_pattern_version = deployment.pattern_version_name.clone();
 
         // The settings are judged against the specification schema of the pattern this
-        // deployment deploys, which is also where its versions come from.
-        let Some(pattern) = store
-            .workloads
-            .get(&workload_name)
-            .and_then(|workload| workload.patterns.get(&pattern_name))
-        else {
-            return Err(UpdateDeploymentErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        };
+        // deployment deploys, which is also where its versions come from. Resolved
+        // through `state::resolve_pattern`, the one statement of that two-step lookup —
+        // so a refusal here names the kind of resource that is actually missing rather
+        // than the pattern's whatever is absent.
+        let pattern = store
+            .resolve_pattern(&workload_name, &pattern_name)
+            .map_err(|message| {
+                UpdateDeploymentErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message.to_string()),
+                    },
+                )
+            })?;
         // A version the caller names has to be one the catalogue holds for this
         // deployment's workload and pattern: naming one it does not is a resource that
         // cannot be found rather than a setting that is merely odd. A pattern publishes

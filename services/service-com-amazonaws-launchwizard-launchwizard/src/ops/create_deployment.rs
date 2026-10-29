@@ -221,26 +221,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due(now);
 
         // The workload and its deployment pattern are resolved against the seeded
-        // catalogue: an unknown one is a 404, not a deployment of something that does
-        // not exist. Both messages are the fixed, identifier-free ones a catalogue
-        // lookup carries (see `state::WORKLOAD_NOT_FOUND_MESSAGE`), so the names the
-        // caller asked about are not echoed back.
-        let Some(workload) = store.workloads.get(&input.workload_name) else {
-            return Err(CreateDeploymentErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::WORKLOAD_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        };
-        let Some(pattern) = workload.patterns.get(&input.deployment_pattern_name) else {
-            return Err(CreateDeploymentErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        };
+        // catalogue through `state::resolve_pattern`, the one statement of that
+        // two-step lookup: an unknown one is a 404, not a deployment of something that
+        // does not exist. Its message is the fixed, identifier-free one a catalogue
+        // lookup carries for the kind that is missing (see
+        // `state::WORKLOAD_NOT_FOUND_MESSAGE`), so the names the caller asked about are
+        // not echoed back.
+        let pattern = store
+            .resolve_pattern(&input.workload_name, &input.deployment_pattern_name)
+            .map_err(|message| {
+                CreateDeploymentErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message.to_string()),
+                    },
+                )
+            })?;
         // The versions this deployment deploys are the catalogue's for the pattern it
         // is created against — the pattern's CURRENT version, the newest one the
         // catalogue publishes for it: `CreateDeployment` models no version members, so
