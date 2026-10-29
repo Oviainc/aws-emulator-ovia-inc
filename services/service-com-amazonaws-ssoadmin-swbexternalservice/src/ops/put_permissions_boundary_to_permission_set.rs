@@ -157,14 +157,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The CHOICE `PermissionsBoundary` documents, checked FIRST: it is a property of
         // the request body alone, so it depends on no instance or permission set the
         // request names, and it is the one rule the model's two optional members cannot
-        // express.
+        // express. The refusal is built from the members THIS request got wrong, so a
+        // body that named both kinds is told to drop one and a body that named neither is
+        // told to add one.
         let boundary = crate::state::PermissionsBoundaryRecord::from_shape(
             &input.permissions_boundary,
         )
-        .ok_or_else(|| {
+        .map_err(|violation| {
             PutPermissionsBoundaryToPermissionSetErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(crate::state::PERMISSIONS_BOUNDARY_CHOICE_MESSAGE.to_string()),
+                    message: Some(violation.message()),
                     // The model's `ValidationExceptionReason` enum carries only KMS key
                     // states, none of which this refusal is.
                     reason: None,

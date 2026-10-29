@@ -1795,10 +1795,17 @@ pub enum PermissionsBoundaryRecord {
 }
 
 impl PermissionsBoundaryRecord {
-    /// The record a modeled `PermissionsBoundary` describes, or `None` when it names
-    /// BOTH policy kinds or NEITHER — the one thing the model's two optional members
-    /// cannot express, and which the shape's documented "specify either … or …" forbids.
-    pub fn from_shape(boundary: &PermissionsBoundary) -> Option<Self> {
+    /// The record a modeled `PermissionsBoundary` describes, or the way it broke the
+    /// documented choice when it names BOTH policy kinds or NEITHER — the one thing the
+    /// model's two optional members cannot express, and which the shape's documented
+    /// "specify either … or …" forbids.
+    ///
+    /// The two malformed forms are kept APART rather than collapsed into one "bad
+    /// boundary", because the member a caller has to change differs between them
+    /// ([`PermissionsBoundaryChoiceViolation`]).
+    pub fn from_shape(
+        boundary: &PermissionsBoundary,
+    ) -> Result<Self, PermissionsBoundaryChoiceViolation> {
         match (
             &boundary.customer_managed_policy_reference,
             &boundary.managed_policy_arn,
@@ -1808,15 +1815,16 @@ impl PermissionsBoundaryRecord {
                 // [`CustomerManagedPolicyReferenceRecord::from_shape`] — so a boundary's
                 // reference and an attached reference normalise identically.
                 let reference = CustomerManagedPolicyReferenceRecord::from_shape(reference);
-                Some(Self::CustomerManagedPolicy {
+                Ok(Self::CustomerManagedPolicy {
                     name: reference.name,
                     path: reference.path,
                 })
             }
-            (None, Some(managed_policy_arn)) => Some(Self::ManagedPolicy {
+            (None, Some(managed_policy_arn)) => Ok(Self::ManagedPolicy {
                 managed_policy_arn: managed_policy_arn.clone(),
             }),
-            _ => None,
+            (Some(_), Some(_)) => Err(PermissionsBoundaryChoiceViolation::BothKinds),
+            (None, None) => Err(PermissionsBoundaryChoiceViolation::NeitherKind),
         }
     }
 
@@ -1845,15 +1853,50 @@ impl PermissionsBoundaryRecord {
     }
 }
 
-/// The refusal a `PermissionsBoundary` that names both policy kinds, or neither, earns —
-/// as the message of the modelled `ValidationException` (HTTP 400).
+/// The two halves of the choice `PermissionsBoundary` documents, spelled as the wire
+/// spells them (`PermissionsBoundary$CustomerManagedPolicyReference` and
+/// `PermissionsBoundary$ManagedPolicyArn`), so the refusal below names the members a
+/// caller sent rather than a re-spelling of them.
+const PERMISSIONS_BOUNDARY_MEMBERS: (&str, &str) =
+    ("CustomerManagedPolicyReference", "ManagedPolicyArn");
+
+/// How a `PermissionsBoundary` broke the choice its own documentation states — the only
+/// two ways a request can, since the structure carries exactly these two optional
+/// members.
 ///
-/// BUILT from the members the request got wrong, which is what the shape's documented
-/// choice ("Specify either `CustomerManagedPolicyReference` … or `ManagedPolicyArn`") is
-/// about; the caller has to fix the request from this text alone.
-pub const PERMISSIONS_BOUNDARY_CHOICE_MESSAGE: &str =
-    "Specify either CustomerManagedPolicyReference or ManagedPolicyArn in \
-     PermissionsBoundary, but not both.";
+/// They are distinct because the FIX differs: a request that named both kinds has to drop
+/// one, and a request that named neither has to add one. Telling the second it must "not"
+/// name both would be a false statement about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionsBoundaryChoiceViolation {
+    /// Both `CustomerManagedPolicyReference` and `ManagedPolicyArn` were named.
+    BothKinds,
+    /// Neither was named.
+    NeitherKind,
+}
+
+impl PermissionsBoundaryChoiceViolation {
+    /// The refusal this violation earns, as the message of the modelled
+    /// `ValidationException` (HTTP 400).
+    ///
+    /// BUILT from the members the request got wrong, which is what the shape's documented
+    /// choice ("Specify either `CustomerManagedPolicyReference` … or `ManagedPolicyArn`")
+    /// is about; the caller has to fix the request from this text alone, so only the form
+    /// it actually sent is described.
+    pub fn message(self) -> String {
+        let (customer_managed, managed_policy) = PERMISSIONS_BOUNDARY_MEMBERS;
+        match self {
+            Self::BothKinds => format!(
+                "Specify either {customer_managed} or {managed_policy} in \
+                 PermissionsBoundary, but not both."
+            ),
+            Self::NeitherKind => format!(
+                "Specify either {customer_managed} or {managed_policy} in \
+                 PermissionsBoundary."
+            ),
+        }
+    }
+}
 
 /// A permission set, keyed in [`ComAmazonawsSsoadminSwbexternalserviceState::permission_sets`]
 /// by the ARN minted for it at creation.

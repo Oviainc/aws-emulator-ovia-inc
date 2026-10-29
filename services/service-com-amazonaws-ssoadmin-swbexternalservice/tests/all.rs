@@ -145,6 +145,8 @@ mod permission_set_update;
 mod permission_sets_provisioned_to_account;
 #[path = "all/permissions_boundary.rs"]
 mod permissions_boundary;
+#[path = "all/permissions_boundary_choice_refusal.rs"]
+mod permissions_boundary_choice_refusal;
 #[path = "all/permissions_boundary_delete.rs"]
 mod permissions_boundary_delete;
 #[path = "all/permissions_boundary_get.rs"]
