@@ -13,7 +13,10 @@
 use std::time::Instant;
 
 use super::{PendingChange, PendingStatus, ARN_NAMESPACE};
-use crate::ops::types::{DBProxy, DBProxyTarget, Tag, TargetHealth, UserAuthConfigInfo};
+use crate::ops::types::{
+    ConnectionPoolConfigurationInfo, DBProxy, DBProxyTarget, DBProxyTargetGroup, Tag, TargetHealth,
+    UserAuthConfigInfo,
+};
 
 /// How many proxies one region holds. The cap is this emulator's, and it bounds the store
 /// the same way the other per-region quotas in `src/state.rs` do.
@@ -40,6 +43,46 @@ pub const DEFAULT_DB_PROXY_TARGET_GROUP: &str = "default";
 
 /// `CreateDBProxy$IdleClientTimeout`'s documented default: "Default: 1800 (30 minutes)".
 pub const DEFAULT_IDLE_CLIENT_TIMEOUT: i32 = 1800;
+
+/// The `EngineFamily` whose connection pool defaults differ from every other engine's.
+pub const ENGINE_FAMILY_SQLSERVER: &str = "SQLSERVER";
+
+/// `ConnectionPoolConfiguration$MaxConnectionsPercent`'s documented default for RDS for
+/// Microsoft SQL Server: "Default: 10 for RDS for Microsoft SQL Server, and 100 for all
+/// other engines".
+pub const DEFAULT_MAX_CONNECTIONS_PERCENT_SQLSERVER: i32 = 10;
+
+/// `ConnectionPoolConfiguration$MaxConnectionsPercent`'s documented default for every
+/// other engine (same sentence as above).
+pub const DEFAULT_MAX_CONNECTIONS_PERCENT: i32 = 100;
+
+/// `ConnectionPoolConfiguration$ConnectionBorrowTimeout`'s documented default:
+/// "Default: 120" seconds.
+pub const DEFAULT_CONNECTION_BORROW_TIMEOUT: i32 = 120;
+
+/// The connection pool settings a proxy's target group starts with, which are the ones
+/// `ConnectionPoolConfiguration` documents as its defaults for `engine_family`:
+/// `MaxConnectionsPercent` is engine-family dependent, and "the default value of
+/// `MaxIdleConnectionsPercent` is half of the value of `MaxConnectionsPercent`" — which is
+/// the 5 and 50 that member documents for SQL Server and for all other engines.
+pub fn default_connection_pool_config(engine_family: &str) -> ConnectionPoolConfigurationInfo {
+    let max_connections_percent = if engine_family == ENGINE_FAMILY_SQLSERVER {
+        DEFAULT_MAX_CONNECTIONS_PERCENT_SQLSERVER
+    } else {
+        DEFAULT_MAX_CONNECTIONS_PERCENT
+    };
+    ConnectionPoolConfigurationInfo {
+        max_connections_percent: Some(max_connections_percent),
+        max_idle_connections_percent: Some(max_connections_percent / 2),
+        connection_borrow_timeout: Some(DEFAULT_CONNECTION_BORROW_TIMEOUT),
+        // "Each item in the list represents a class of SQL operations" exempted from
+        // pinning: a target group starts with none exempted.
+        session_pinning_filters: Some(Vec::new()),
+        // "One or more SQL statements for the proxy to run when opening each new database
+        // connection" — none until a modification sets one.
+        init_query: None,
+    }
+}
 
 /// `CreateDBProxy$DefaultAuthScheme`'s default, the `DefaultAuthScheme` value that leaves
 /// authentication to the `Auth` list rather than using end-to-end IAM authentication.
@@ -92,6 +135,38 @@ pub fn check_target_group_name(proxy_name: &str, requested: Option<&str>) -> Res
     }
 }
 
+/// The one target group a proxy has, as this service persists it.
+///
+/// "Currently, each target group is associated with exactly one RDS DB instance or Aurora
+/// DB cluster" and each proxy has exactly one target group, so the group is held on the
+/// proxy record rather than keyed separately; its NAME is therefore not stored (it is
+/// always [`DEFAULT_DB_PROXY_TARGET_GROUP`], which is what `check_target_group_name`
+/// resolves against) and its registrations live in `DbProxyRecord::targets`. What IS
+/// stored is what a modification of the group changes: its connection pool settings, and
+/// when the group itself was created and last updated.
+#[derive(Debug, Clone)]
+pub struct DbProxyTargetGroupRecord {
+    /// `DBProxyTargetGroup$ConnectionPoolConfig`.
+    pub connection_pool_config: ConnectionPoolConfigurationInfo,
+    /// `DBProxyTargetGroup$CreatedDate`.
+    pub created_date: ::aws_smithy_types::DateTime,
+    /// `DBProxyTargetGroup$UpdatedDate`.
+    pub updated_date: ::aws_smithy_types::DateTime,
+}
+
+impl DbProxyTargetGroupRecord {
+    /// The target group a proxy of `engine_family` is created with at `now`: the
+    /// documented default connection pool settings, created and last updated at the
+    /// instant the proxy was.
+    pub fn new(engine_family: &str, now: ::aws_smithy_types::DateTime) -> Self {
+        Self {
+            connection_pool_config: default_connection_pool_config(engine_family),
+            created_date: now,
+            updated_date: now,
+        }
+    }
+}
+
 /// One registration in a proxy's target group: which database was registered, and when.
 #[derive(Debug, Clone)]
 pub struct DbProxyTargetRecord {
@@ -141,6 +216,8 @@ pub struct DbProxyRecord {
     pub created_date: ::aws_smithy_types::DateTime,
     /// `UpdatedDate`.
     pub updated_date: ::aws_smithy_types::DateTime,
+    /// The proxy's one target group, which it is created with.
+    pub target_group: DbProxyTargetGroupRecord,
     /// The databases registered in the proxy's one target group, in registration order.
     pub targets: Vec<DbProxyTargetRecord>,
     /// The tags the create carried. The `DBProxy` shape reports none, so these are held
@@ -178,6 +255,25 @@ impl DbProxyRecord {
             &self.region,
             &format!("{TARGET_GROUP_ARN_RESOURCE_TYPE}:{}", self.name),
         )
+    }
+
+    /// Project the proxy's one target group onto the modelled `DBProxyTargetGroup`.
+    ///
+    /// `IsDefault` is `true` because "each proxy is currently associated with a single
+    /// target group", and the group reports the PROXY's status: it is created with the
+    /// proxy and has no provisioning of its own, so it is ready exactly when the proxy is
+    /// ("Other values indicate that you must wait for the target group to be ready").
+    pub fn target_group_to_wire(&self) -> DBProxyTargetGroup {
+        DBProxyTargetGroup {
+            db_proxy_name: Some(self.name.clone()),
+            target_group_name: Some(DEFAULT_DB_PROXY_TARGET_GROUP.to_string()),
+            target_group_arn: Some(self.target_group_arn()),
+            is_default: Some(true),
+            status: Some(self.status.clone()),
+            connection_pool_config: Some(self.target_group.connection_pool_config.clone()),
+            created_date: Some(self.target_group.created_date),
+            updated_date: Some(self.target_group.updated_date),
+        }
     }
 
     /// "The endpoint that you can use to connect to the DB proxy", whose published form is

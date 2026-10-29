@@ -123,10 +123,12 @@ pub use custom_engine_versions::{
     MEDIA_TYPE_CUSTOMER_PROVIDED,
 };
 pub use db_proxies::{
-    check_target_group_name, target_to_wire, DbProxyRecord, DbProxyTargetRecord, RegisteredDatabase,
-    DEFAULT_AUTH_SCHEME_NONE, DEFAULT_DB_PROXY_TARGET_GROUP, DEFAULT_IDLE_CLIENT_TIMEOUT,
+    check_target_group_name, default_connection_pool_config, target_to_wire, DbProxyRecord,
+    DbProxyTargetGroupRecord, DbProxyTargetRecord, RegisteredDatabase, DEFAULT_AUTH_SCHEME_NONE,
+    DEFAULT_CONNECTION_BORROW_TIMEOUT, DEFAULT_DB_PROXY_TARGET_GROUP, DEFAULT_IDLE_CLIENT_TIMEOUT,
+    DEFAULT_MAX_CONNECTIONS_PERCENT, DEFAULT_MAX_CONNECTIONS_PERCENT_SQLSERVER,
     DB_PROXY_QUOTA_PER_REGION, DB_PROXY_STATUS_AVAILABLE, DB_PROXY_STATUS_CREATING,
-    DB_PROXY_TARGET_QUOTA_PER_PROXY, NETWORK_TYPE_IPV4,
+    DB_PROXY_TARGET_QUOTA_PER_PROXY, ENGINE_FAMILY_SQLSERVER, NETWORK_TYPE_IPV4,
 };
 pub use engine_log::InstanceLog;
 pub use export_tasks::{

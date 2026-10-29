@@ -278,13 +278,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mint = store.next_mint();
         let now = crate::state::now_as_wire_timestamp();
+        let engine_family = input.engine_family;
         // A new proxy is not ready to handle requests yet: it reports `creating` and
         // reaches `available` on its own. The due instant is stored on the record — nothing
         // sleeps.
         let record = crate::state::DbProxyRecord {
             name: input.db_proxy_name,
             region: region.clone(),
-            engine_family: input.engine_family,
+            engine_family: engine_family.clone(),
             default_auth_scheme: input
                 .default_auth_scheme
                 .unwrap_or_else(|| crate::state::DEFAULT_AUTH_SCHEME_NONE.to_string()),
@@ -322,6 +323,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )),
             created_date: now,
             updated_date: now,
+            // The proxy's one target group comes up with the proxy, with the connection
+            // pool settings `ConnectionPoolConfiguration` documents as its defaults for
+            // this engine family.
+            target_group: crate::state::DbProxyTargetGroupRecord::new(&engine_family, now),
             targets: Vec::new(),
             tags,
         };
