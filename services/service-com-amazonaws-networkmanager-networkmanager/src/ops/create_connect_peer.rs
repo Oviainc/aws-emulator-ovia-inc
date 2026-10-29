@@ -316,7 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let core_network_asn = store
             .core_networks
             .get(&core_network_id)
-            .and_then(|core_network| core_network.topology.edge_asn(&edge_location));
+            .and_then(|core_network| core_network.topology().edge_asn(&edge_location));
 
         let id = store.next_id(crate::state::CONNECT_PEER_KIND);
         let record = crate::state::ConnectPeerRecord {

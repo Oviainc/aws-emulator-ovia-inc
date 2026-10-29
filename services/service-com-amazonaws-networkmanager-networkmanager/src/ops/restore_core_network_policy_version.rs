@@ -189,6 +189,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The description travels with the document: restoring reproduces that version's
         // submission, and this call carries no description of its own to replace it with.
         let description = restored.description.clone();
+        // So does the DERIVED topology: it was derived where this document was accepted, by
+        // the request that carried it and before that request locked the store, so the
+        // version this restore mints takes a copy of it rather than parsing the document
+        // again here.
+        let topology = restored.topology.clone();
 
         // Like a put, a restore APPENDS to an immutable history, so it is bounded by the
         // history's own cap. This operation models no `ServiceQuotaExceededException`
@@ -223,7 +228,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owes falls due and `READY_TO_EXECUTE` after it. It carries no `ClientToken`: this
         // operation models none (`smithy_query
         // query="operation" operation="RestoreCoreNetworkPolicyVersion"`).
-        let stored = core_network.add_policy_version(document, description, None, now, false);
+        let stored =
+            core_network.add_policy_version(document, topology, description, None, now, false);
 
         Ok(RestoreCoreNetworkPolicyVersionOutput {
             core_network_policy: Some(stored),

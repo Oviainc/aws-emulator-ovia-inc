@@ -255,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.core_network_id)
             .map(|core_network| {
                 core_network
-                    .topology
+                    .topology()
                     .attachment_claim(&crate::state::AttachmentCandidate {
                         attachment_type: crate::state::ATTACHMENT_TYPE_CONNECT,
                         edge_location: &input.edge_location,

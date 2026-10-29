@@ -1377,6 +1377,20 @@ pub struct CoreNetworkPolicyRecord {
     pub settled_at: SystemTime,
     /// The policy document, verbatim as the request supplied it.
     pub document: String,
+    /// The topology [`policy_topology`] derived from [`Self::document`], derived ONCE where
+    /// that document was accepted — before the store was locked, by the request that
+    /// carried it — and kept here beside it.
+    ///
+    /// A version's document never changes, so neither does this: it is what the core
+    /// network reports while this version is the LIVE one
+    /// ([`CoreNetworkRecord::topology`]), the submitted side of this version's own change
+    /// set, and what a restore of this version carries to the version it mints. Nothing
+    /// re-parses the document to get it, so no operation of this service parses a policy
+    /// document while holding the store lock. What it holds is bounded by the caps
+    /// [`validate_policy_document`] put on the document before it was stored — the topology
+    /// is linear in the document it came from — and a version is itself bounded by
+    /// [`MAX_POLICY_VERSIONS_PER_CORE_NETWORK`].
+    pub topology: PolicyTopology,
     /// The `ClientToken` of the `PutCoreNetworkPolicy` that minted this version, kept so a
     /// retry of that request answers this version instead of minting a second one.
     pub client_token: Option<String>,
@@ -1893,9 +1907,10 @@ impl ConnectionRecord {
 /// A stored core network: the Cloud WAN managed network a global network owns.
 ///
 /// Its `state` is a function of the clock, like the records above, and its topology
-/// (`Segments`, `NetworkFunctionGroups`, `Edges`) is derived from the LIVE policy document
-/// once, where that document is accepted — nothing about a core network is kept twice and
-/// no read re-parses the document.
+/// (`Segments`, `NetworkFunctionGroups`, `Edges`) is the one derived from the LIVE policy
+/// version's document where that document was accepted
+/// ([`CoreNetworkPolicyRecord::topology`], reached through [`Self::topology`]) — nothing
+/// about a core network is kept twice and no read re-parses the document.
 #[derive(Debug, Clone)]
 pub struct CoreNetworkRecord {
     pub id: String,
@@ -1914,11 +1929,6 @@ pub struct CoreNetworkRecord {
     /// is never reused: the next put takes this plus one even when the version that held
     /// it has since been deleted.
     pub policy_version_counter: i32,
-    /// The topology [`policy_topology`] derived from the LIVE policy document when
-    /// that document was put in force: what the core network reports once its policy is in
-    /// force. A version that has not been executed is not in force, so putting one leaves
-    /// this untouched.
-    pub topology: PolicyTopology,
     /// The instant the `UPDATING` -> `AVAILABLE` transition the clock owes becomes due,
     /// set by the update that reconfigured this core network — a description the caller
     /// supplied, or the execution that put a policy version in force — and `None` while no
@@ -2003,19 +2013,40 @@ impl CoreNetworkRecord {
             .collect()
     }
 
-    /// Store `document` as this core network's next policy version and answer that
-    /// version's modelled `CoreNetworkPolicy`.
+    /// The topology of the policy in force on this core network: the one derived from the
+    /// LIVE version's document where that document was accepted
+    /// ([`CoreNetworkPolicyRecord::topology`]), or the topology of no policy at all
+    /// ([`NO_POLICY_IN_FORCE`]) while no version is in force — a core network created
+    /// without a policy document, until a version's change set is executed.
+    ///
+    /// Derived data is kept beside the document it comes from and nowhere else, so this is
+    /// a view of the LIVE version rather than a second copy: putting another version in
+    /// force moves which version answers here and copies nothing.
+    pub fn topology(&self) -> &PolicyTopology {
+        self.live_policy_version
+            .and_then(|live| self.policy_versions.get(&live))
+            .map_or(&NO_POLICY_IN_FORCE, |live| &live.topology)
+    }
+
+    /// Store `document`, whose derived topology is `topology`, as this core network's next
+    /// policy version and answer that version's modelled `CoreNetworkPolicy`.
+    ///
+    /// `topology` is the answer [`policy_topology`] gives for `document`, derived by the
+    /// caller where the document was ACCEPTED and before the store was locked, so
+    /// appending a version parses no policy document: the work done here is a comparison
+    /// of two topologies both already derived and both bounded by
+    /// [`validate_policy_document`].
     ///
     /// `executed` says whether this version's change set is being executed, which is what
     /// puts its document in force: an executed version becomes the LIVE one. A freshly
     /// minted version always carries the highest id in the history, so its alias follows
     /// from `executed` alone — `LIVE` for the version just put in force, `LATEST`
     /// otherwise — and the answer is built from the record itself rather than looked up
-    /// again. The DERIVED topology stays the caller's to set, because deriving it means
-    /// parsing the document and handlers do that before they lock the store.
+    /// again.
     pub fn add_policy_version(
         &mut self,
         document: String,
+        topology: PolicyTopology,
         description: Option<String>,
         client_token: Option<String>,
         now: SystemTime,
@@ -2023,16 +2054,9 @@ impl CoreNetworkRecord {
     ) -> CoreNetworkPolicy {
         let version_id = self.policy_version_counter.saturating_add(1);
         self.policy_version_counter = version_id;
-        // The change set generated with the version: the difference between the document in
-        // force right now and the one being stored. The base is the LIVE version's own
-        // document rather than `self.topology`, which the caller may already have set to
-        // the topology of the document being stored.
-        let in_force = self
-            .live_policy_version
-            .and_then(|live| self.policy_versions.get(&live))
-            .map(|live| policy_topology(&live.document))
-            .unwrap_or_default();
-        let changes = policy_changes(&in_force, &policy_topology(&document));
+        // The change set generated with the version: the difference between the policy in
+        // force right now and the one being stored.
+        let changes = policy_changes(self.topology(), &topology);
         let record = CoreNetworkPolicyRecord {
             core_network_id: self.id.clone(),
             version_id,
@@ -2040,6 +2064,7 @@ impl CoreNetworkRecord {
             created_at: now,
             settled_at: now + SETTLE_DELAY,
             document,
+            topology,
             client_token,
             executed_at: executed.then_some(now),
             // Freshly generated against the document in force a moment ago, so it is the
@@ -2065,8 +2090,9 @@ impl CoreNetworkRecord {
     /// version's change set does. A no-op for a version this core network does not hold,
     /// which a caller refuses before reaching here.
     ///
-    /// Executing a change set makes its version the LIVE one and the topology its document
-    /// describes the one the core network reports, starts the `EXECUTING` ->
+    /// Executing a change set makes its version the LIVE one — and with it the topology
+    /// its document describes the one the core network reports ([`Self::topology`]) —
+    /// starts the `EXECUTING` ->
     /// `EXECUTION_SUCCEEDED` span the clock then owes that change set (and with it the
     /// `IN_PROGRESS` -> `COMPLETE` span of each of its changes,
     /// [`CoreNetworkPolicyRecord::change_events_at`]) and the `UPDATING` -> `AVAILABLE`
@@ -2080,17 +2106,15 @@ impl CoreNetworkRecord {
         };
         version.executed_at = Some(now);
         version.settled_at = now + SETTLE_DELAY;
-        // The document is the one this service stored, already capped by
-        // [`validate_policy_document`] where it was accepted, so deriving its topology here
-        // is bounded work on a value no caller of THIS request chose.
-        let topology = policy_topology(&version.document);
         for (id, superseded) in self.policy_versions.iter_mut() {
             if *id != version_id && superseded.executed_at.is_none() {
                 superseded.out_of_date = true;
             }
         }
+        // The topology this core network reports follows from WHICH version is live: it was
+        // derived where that version's document was accepted, so putting the document in
+        // force re-parses nothing here.
         self.live_policy_version = Some(version_id);
-        self.topology = topology;
         self.updating_until = Some(now + SETTLE_DELAY);
     }
 
@@ -2126,9 +2150,9 @@ impl CoreNetworkRecord {
     /// topology away: a policy IS in force there, the one that execution put in force.
     pub fn to_shape_with_state(&self, state: &str) -> CoreNetwork {
         let topology = if state == STATE_DELETING {
-            ::std::borrow::Cow::Owned(PolicyTopology::default())
+            &NO_POLICY_IN_FORCE
         } else {
-            ::std::borrow::Cow::Borrowed(&self.topology)
+            self.topology()
         };
         CoreNetwork {
             global_network_id: Some(self.global_network_id.clone()),
@@ -6903,6 +6927,21 @@ pub struct PolicyTopology {
     pub static_routes: Vec<SegmentStaticRoute>,
 }
 
+/// The topology of NO policy: what a core network with no policy version in force reports,
+/// and what one being deleted reports ([`CoreNetworkRecord::to_shape_with_state`]).
+///
+/// A constant rather than a value built per read, so answering either costs nothing and
+/// [`CoreNetworkRecord::topology`] can hand a reference back.
+pub static NO_POLICY_IN_FORCE: PolicyTopology = PolicyTopology {
+    edges: Vec::new(),
+    segments: Vec::new(),
+    network_function_groups: Vec::new(),
+    attachment_policies: Vec::new(),
+    shares: Vec::new(),
+    service_insertions: Vec::new(),
+    static_routes: Vec::new(),
+};
+
 /// One `segment-actions[]` entry of action `create-route`: the STATIC routes a policy
 /// document declares for one segment.
 ///
@@ -7686,9 +7725,11 @@ fn edges_by_location(topology: &PolicyTopology) -> BTreeMap<&str, &CoreNetworkEd
 /// [`validate_policy_document`] has accepted it, which also caps every list this walks,
 /// so the work and the result are bounded by those caps.
 ///
-/// Called ONCE, where the document is accepted, and the answer is stored on the record
-/// beside it: a read of a core network reports the derived topology and never re-parses
-/// the document.
+/// Called ONCE per document, where that document is accepted and BEFORE the store is
+/// locked, and the answer is stored on the record beside it
+/// ([`CoreNetworkPolicyRecord::topology`]): a read of a core network reports the derived
+/// topology, and no operation — a read, an execution or a restore — re-parses the
+/// document or parses one while holding the store lock.
 pub fn policy_topology(document: &str) -> PolicyTopology {
     let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(document) else {
         return PolicyTopology::default();

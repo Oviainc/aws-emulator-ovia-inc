@@ -141,11 +141,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // The document is parsed and checked BEFORE the store is locked: it is the one
-        // part of this request whose size the caller chooses, so no other caller waits on
-        // it. A document that does not hold up is refused with the modelled
-        // `CoreNetworkPolicyException` (HTTP 400) and no version is minted, exactly as
-        // `CreateCoreNetwork` refuses the document it carries.
+        // The document is parsed, checked and expanded into its topology BEFORE the store
+        // is locked: it is the one part of this request whose size the caller chooses, so no
+        // other caller waits on it. A document that does not hold up is refused with the
+        // modelled `CoreNetworkPolicyException` (HTTP 400) and no version is minted, exactly
+        // as `CreateCoreNetwork` refuses the document it carries. The topology travels with
+        // the document into the version it is stored as, so nothing under the lock parses it
+        // again — not this put's change set, not an execution of it, not a restore of it.
         if let Err(errors) = crate::state::validate_policy_document(&input.policy_document) {
             return Err(
                 PutCoreNetworkPolicyErrorModeled::CoreNetworkPolicyException(
@@ -154,6 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        let topology = crate::state::policy_topology(&input.policy_document);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutCoreNetworkPolicyErrorModeled::InternalServerException(InternalServerException {
                 message: "the networkmanager store is unavailable".to_string(),
@@ -272,6 +275,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // span the clock owes falls due and `READY_TO_EXECUTE` after it.
         let stored = core_network.add_policy_version(
             input.policy_document,
+            topology,
             input.description,
             client_token,
             now,

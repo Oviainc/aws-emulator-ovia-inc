@@ -228,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store
                 .core_networks
                 .get(&record.core_network_id)
-                .map(|core_network| &core_network.topology),
+                .map(|core_network| core_network.topology()),
             &requested,
         )
         .map_err(UpdateDirectConnectGatewayAttachmentErrorModeled::ValidationException)?;

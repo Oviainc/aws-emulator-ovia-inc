@@ -143,10 +143,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The policy document is parsed, checked and expanded into its topology BEFORE the
         // store is locked: it is the one part of this request whose size the caller
         // chooses, so no other caller waits on it, and it is derived exactly once here
-        // rather than on every later read of the core network.
-        let topology = match input.policy_document.as_deref() {
-            Some(document) => match crate::state::validate_policy_document(document) {
-                Ok(()) => Some(crate::state::policy_topology(document)),
+        // rather than again under the lock or on every later read of the core network. The
+        // document and its topology travel together from here into the version this create
+        // stores them as.
+        let policy = match input.policy_document {
+            Some(document) => match crate::state::validate_policy_document(&document) {
+                Ok(()) => {
+                    let topology = crate::state::policy_topology(&document);
+                    Some((document, topology))
+                }
                 Err(errors) => {
                     return Err(CreateCoreNetworkErrorModeled::CoreNetworkPolicyException(
                         crate::state::policy_rejection(errors),
@@ -217,7 +222,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             |existing| {
                 existing.global_network_id == input.global_network_id
                     && existing.description == input.description
-                    && existing.created_policy_document() == input.policy_document.as_deref()
+                    && existing.created_policy_document()
+                        == policy.as_ref().map(|(document, _)| document.as_str())
                     && crate::state::same_tags(
                         &existing.tags,
                         input.tags.as_deref().unwrap_or_default(),
@@ -270,9 +276,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy_versions: ::std::collections::BTreeMap::new(),
             live_policy_version: None,
             policy_version_counter: 0,
-            topology: topology.unwrap_or_default(),
             updating_until: None,
-            created_with_policy_document: input.policy_document.is_some(),
+            created_with_policy_document: policy.is_some(),
             client_token,
             tags: input.tags.unwrap_or_default(),
         };
@@ -282,8 +287,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // network's LIVE policy. A core network created without a document holds no
         // version at all until a `PutCoreNetworkPolicy` mints one. This operation reports
         // the CORE NETWORK, so the version's own shape is not part of its answer.
-        if let Some(document) = input.policy_document {
-            record.add_policy_version(document, None, None, now, true);
+        if let Some((document, topology)) = policy {
+            record.add_policy_version(document, topology, None, None, now, true);
         }
         // AWS answers this create with the core network already `AVAILABLE`, so no
         // transition is owed on its creation and the policy the create carried is in force

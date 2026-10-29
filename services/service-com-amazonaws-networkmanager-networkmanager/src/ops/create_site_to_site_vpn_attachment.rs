@@ -211,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?
             .to_string();
-        if !core_network.topology.has_edge_location(&edge_location) {
+        if !core_network.topology().has_edge_location(&edge_location) {
             return Err(CreateSiteToSiteVpnAttachmentErrorModeled::ValidationException(
                 crate::state::no_such_edge(
                     crate::state::FIELD_VPN_CONNECTION_ARN,
@@ -229,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the attachment is created. The decision is taken here, once, and stored on the
         // record, so a later read reports what the policy in force at create time decided.
         let claim = core_network
-            .topology
+            .topology()
             .attachment_claim(&crate::state::AttachmentCandidate {
                 attachment_type: crate::state::ATTACHMENT_TYPE_SITE_TO_SITE_VPN,
                 edge_location: &edge_location,

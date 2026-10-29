@@ -151,6 +151,8 @@ mod network_resources;
 mod network_telemetry;
 #[path = "all/organization_service_access.rs"]
 mod organization_service_access;
+#[path = "all/policy_topology_derivation.rs"]
+mod policy_topology_derivation;
 #[path = "all/register_transit_gateway_account_ownership.rs"]
 mod register_transit_gateway_account_ownership;
 #[path = "all/resource_not_found_message.rs"]

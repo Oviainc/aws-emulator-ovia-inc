@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?
         .to_string();
-        if !core_network.topology.has_edge_location(&edge_location) {
+        if !core_network.topology().has_edge_location(&edge_location) {
             return Err(CreateTransitGatewayPeeringErrorModeled::ValidationException(
                 crate::state::no_such_edge(
                     crate::state::FIELD_TRANSIT_GATEWAY_ARN,

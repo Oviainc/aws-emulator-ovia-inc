@@ -307,11 +307,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `AVAILABLE` transition the clock owes has fallen due, which is exactly when a read
         // of the core network reports its segments and edges, so until then it declares no
         // segment here either.
-        let nothing_in_force = crate::state::PolicyTopology::default();
         let topology = if core_network.state_at(now) == crate::state::STATE_AVAILABLE {
-            &core_network.topology
+            core_network.topology()
         } else {
-            &nothing_in_force
+            &crate::state::NO_POLICY_IN_FORCE
         };
         if !topology.has_segment(&input.segment_name) {
             return Err(

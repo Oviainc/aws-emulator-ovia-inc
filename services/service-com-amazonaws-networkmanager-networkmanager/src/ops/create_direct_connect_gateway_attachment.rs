@@ -203,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // policy configures, and no location twice.
         crate::state::check_edge_location_list(
             &input.core_network_id,
-            Some(&core_network.topology),
+            Some(core_network.topology()),
             &input.edge_locations,
         )
         .map_err(CreateDirectConnectGatewayAttachmentErrorModeled::ValidationException)?;
@@ -234,7 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A rule's `region` condition compares ONE edge location, so it is compared against
         // the primary of the several this attachment spans.
         let claim = core_network
-            .topology
+            .topology()
             .attachment_claim(&crate::state::AttachmentCandidate {
                 attachment_type: crate::state::ATTACHMENT_TYPE_DIRECT_CONNECT_GATEWAY,
                 edge_location: &primary_edge,

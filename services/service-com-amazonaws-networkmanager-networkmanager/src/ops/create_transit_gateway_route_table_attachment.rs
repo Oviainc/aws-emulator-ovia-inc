@@ -249,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let claim = core_network
-            .topology
+            .topology()
             .attachment_claim(&crate::state::AttachmentCandidate {
                 attachment_type: crate::state::ATTACHMENT_TYPE_TRANSIT_GATEWAY_ROUTE_TABLE,
                 edge_location: &edge_location,
