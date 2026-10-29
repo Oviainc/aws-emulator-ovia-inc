@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteContext
-//! IMPLEMENTED: removes the named context from `crate::state`, answering its ARN, and
-//! refuses an unknown one with the modelled `ResourceNotFound`. This is the ONLY file
+//! IMPLEMENTED: removes the named context from `crate::state`, answering its ARN,
+//! refuses an unknown one with the modelled `ResourceNotFound` and refuses one that is
+//! still the source of a lineage association. This is the ONLY file
 //! to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -139,14 +140,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = crate::state::context_key(ctx, &input.context_name);
 
         let mut store = state.lock();
-        let Some(context) = store.contexts.remove(&key) else {
+        if !store.contexts.contains_key(&key) {
             // A delete of something that was never created is refused, so a caller
             // cannot read a 200 as "it used to exist".
             return Err(DeleteContextErrorModeled::ResourceNotFound(ResourceNotFound {
                 message: Some(format!("Context {key} does not exist.")),
             })
             .into());
-        };
+        }
+
+        // A lineage entity that is still the SOURCE of an association is REFUSED rather
+        // than released, exactly as the other lineage-entity deletes refuse one: deleting
+        // it would leave the graph recording an edge out of an entity no reader can
+        // describe. The caller clears the condition itself with `DeleteAssociation`, so the
+        // refusal is the 400 `ValidationException` and the store is left untouched.
+        if store.is_association_source(&key) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::ENTITY_WITH_ASSOCIATIONS,
+            ));
+        }
+
+        let context = store
+            .contexts
+            .remove(&key)
+            .expect("the context just resolved is still in the store under its ARN");
         drop(store);
 
         crate::state::record_state_change(Self::NAME, &context.arn, ctx);

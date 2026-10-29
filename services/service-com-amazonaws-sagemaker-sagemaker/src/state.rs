@@ -6525,6 +6525,16 @@ pub const ACTION_KIND: &str = "action";
 /// entry it holds is released by `DeleteAssociation`.
 pub const ASSOCIATION_QUOTA: usize = 10_000;
 
+/// How SageMaker refuses the delete of a lineage entity that is still the SOURCE of an
+/// association the account holds.
+///
+/// Entirely FIXED text: the recorded refusal interpolates nothing — no entity name, ARN or
+/// edge count — so the sentence is stated once here and every lineage-entity delete words
+/// the referential-integrity refusal the same way. The caller clears the condition itself
+/// with `DeleteAssociation`, so this is the 400 `ValidationException` rather than an error
+/// any of those deletes models.
+pub const ENTITY_WITH_ASSOCIATIONS: &str = "Cannot delete entity with associations.";
+
 /// One lineage association created by `AddAssociation`, as `DeleteAssociation` releases
 /// it.
 ///
@@ -6592,6 +6602,22 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// Whether another association fits, i.e. the store is below [`ASSOCIATION_QUOTA`].
     pub fn associations_below_quota(&self) -> bool {
         self.associations.len() < ASSOCIATION_QUOTA
+    }
+
+    /// Whether the lineage entity `arn` names is still the SOURCE of an association the
+    /// account holds, i.e. an edge the graph records starts at it.
+    ///
+    /// The referential-integrity question every lineage-entity delete asks before releasing
+    /// its record ([`ENTITY_WITH_ASSOCIATIONS`]): an entity deleted out from under an edge
+    /// that starts at it would leave `ListAssociations` reporting an origin no reader can
+    /// describe. The association store is keyed by the `(SourceArn, DestinationArn)` pair,
+    /// so the source side is the key's first component and this asks whether any stored key
+    /// carries `arn` there — the one place the question is asked, so the deletes of the five
+    /// entity kinds an `AssociationEntityArn` admits cannot answer it differently.
+    pub fn is_association_source(&self, arn: &str) -> bool {
+        self.associations
+            .keys()
+            .any(|(source_arn, _)| source_arn == arn)
     }
 
     /// Whether `arn` names a lineage entity this service holds, i.e. one an association

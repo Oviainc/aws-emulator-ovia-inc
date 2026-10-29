@@ -5,7 +5,8 @@
 //! `DescribeArtifact` cannot find it and its name is free again. The artifact is
 //! resolved by `ArtifactArn` when the request carries one and otherwise by the
 //! `Source`'s URI within the Region the request signed for; a request carrying neither
-//! identifier, and one naming an artifact nothing created, are both refused.
+//! identifier, and one naming an artifact nothing created, are both refused — as is one
+//! that is still the source of a lineage association.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -177,6 +178,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+        // A lineage entity that is still the SOURCE of an association is REFUSED rather
+        // than released, exactly as the other lineage-entity deletes refuse one: deleting
+        // it would leave the graph recording an edge out of an entity no reader can
+        // describe. The caller clears the condition itself with `DeleteAssociation`, so the
+        // refusal is the 400 `ValidationException` and the store is left untouched.
+        if store.is_association_source(&arn) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::ENTITY_WITH_ASSOCIATIONS,
+            ));
+        }
+
         let removed = store
             .artifacts
             .remove(&arn)

@@ -7,7 +7,8 @@
 //! hold gets the modelled `ResourceNotFound`, and one that is still part of a trial is
 //! refused, because SageMaker documents disassociation from every trial as this
 //! operation's precondition, so the membership index never keeps an edge to a component
-//! that is gone. This is the ONLY file to touch for this operation.
+//! that is gone; one that is still the source of a lineage association is refused for the
+//! same reason. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -184,6 +185,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  {holding} trial(s). A trial component must be disassociated from all \
                  trials before the trial component can be deleted."
             )));
+        }
+
+        // A lineage entity that is still the SOURCE of an association is REFUSED rather
+        // than released, exactly as the other lineage-entity deletes refuse one (an
+        // `AssociationEntityArn` names a trial component too): deleting it would leave the
+        // graph recording an edge out of an entity no reader can describe. The caller clears
+        // the condition itself with `DeleteAssociation`, so this too is the 400
+        // `ValidationException` and the store is left untouched.
+        if store.is_association_source(&arn) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::ENTITY_WITH_ASSOCIATIONS,
+            ));
         }
 
         // Disassociated from every trial, so the record itself is all there is to release:

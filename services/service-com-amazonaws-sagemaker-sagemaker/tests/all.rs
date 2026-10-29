@@ -79,6 +79,8 @@ mod lineage_action_lifecycle;
 mod lineage_associations;
 #[path = "all/lineage_context_lifecycle.rs"]
 mod lineage_context_lifecycle;
+#[path = "all/lineage_entity_association_guard.rs"]
+mod lineage_entity_association_guard;
 #[path = "all/lineage_group_policy.rs"]
 mod lineage_group_policy;
 #[path = "all/lineage_group_reporting.rs"]
