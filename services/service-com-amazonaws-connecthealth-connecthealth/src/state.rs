@@ -1401,17 +1401,35 @@ pub fn to_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
 }
 
+/// How a page scope spells "no filter was asked for", which is a collection of its own:
+/// one no filter value can also spell, since every value a filter takes is a modelled
+/// enum's wire value and those are `[A-Z_]`.
+const UNFILTERED_PAGE_SCOPE: &str = "*";
+
 /// The collection a `ListDomains` cursor enumerates: ONE account's domains in ONE
-/// Region, since this endpoint is regional and the listing reports the calling account's
-/// domains alone. Every record of this emulator belongs to the one canonical account
-/// ([`owning_account_id`]), so the Region is the only part of that scope two live
-/// collections can differ in, and so the only part the key carries.
-pub fn domains_page_scope(region: &str) -> String {
-    format!("domains/{region}")
+/// Region, narrowed by the `status` filter the request states — `None` being the
+/// unfiltered listing, a different collection from any one status's.
+///
+/// EVERY request value that narrows which records a listing enumerates belongs in the
+/// scope, because a cursor is a bare "resume strictly after this key" position: a cursor
+/// accepted under a different narrowing would skip every record sorting at or before its
+/// key, including records the resuming request's own narrowing never served. The account
+/// is not part of it because every record of this emulator belongs to the one canonical
+/// account ([`owning_account_id`]); the Region and the `status` filter are, because two
+/// live collections of this listing differ in exactly those.
+pub fn domains_page_scope(region: &str, status: Option<DomainStatus>) -> String {
+    format!(
+        "domains/{region}/{}",
+        status.map_or(UNFILTERED_PAGE_SCOPE, DomainStatus::as_wire)
+    )
 }
 
 /// The collection a `ListSubscriptions` cursor enumerates: the subscriptions of ONE
-/// domain in ONE Region, which is the only collection that listing reports.
+/// domain in ONE Region, which is the only collection that listing reports — it narrows
+/// by no filter of its own
+/// (`smithy_query(query="operation",operation="ListSubscriptions")` reports `domainId`,
+/// `maxResults` and `nextToken` as its whole input), so the domain and the Region are the
+/// narrowing values the scope carries.
 pub fn subscriptions_page_scope(region: &str, domain_id: &str) -> String {
     format!("subscriptions/{region}/{domain_id}")
 }

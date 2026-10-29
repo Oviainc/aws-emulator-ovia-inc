@@ -31,6 +31,8 @@ mod encryption_context_projection;
 mod error_detail_member;
 #[path = "all/list_domains_account_scope.rs"]
 mod list_domains_account_scope;
+#[path = "all/list_domains_filter_cursor_scope.rs"]
+mod list_domains_filter_cursor_scope;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
 #[path = "all/pagination_token_issuance.rs"]

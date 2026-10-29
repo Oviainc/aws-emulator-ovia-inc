@@ -4,7 +4,8 @@
 //! IMPLEMENTED: one `DomainSummary` per domain PERSISTED FOR THE ACCOUNT the request was
 //! signed for IN THE REGION it was signed for, filtered by the `status` query parameter
 //! when present, paged by `maxResults` with an opaque `nextToken` that resumes exactly
-//! after the last domain the previous page returned.
+//! after the last domain the previous page returned — a resume point for the listing it
+//! was issued for (that Region and that `status` filter) and no other.
 //!
 //! ## Shape of an operation
 //!
@@ -193,8 +194,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // too; what belongs to this operation is only the channel a refusal travels on —
         // and this is a fault in the REQUEST, which the model carries no shape of its own
         // for, so the scaffold channel's client refusal is what words it.
+        //
+        // The collection a cursor of this listing is a position into is narrowed by the
+        // `status` filter as well as the Region, so the filter is part of the scope: a
+        // cursor issued under one filter is not a resume point for a listing narrowed
+        // differently, which would otherwise skip domains that listing never served.
         let page = match crate::state::Page::resolve(
-            crate::state::domains_page_scope(&region),
+            crate::state::domains_page_scope(&region, wanted),
             input.max_results,
             input.next_token.as_deref(),
         ) {

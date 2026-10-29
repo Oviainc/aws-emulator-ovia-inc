@@ -234,7 +234,7 @@ async fn list_domains_resumes_only_from_a_cursor_it_issued() {
         ),
         (
             "a cursor of this collection in another Region".to_string(),
-            encode_page_token(&domains_page_scope(OTHER_REGION), &first_key),
+            encode_page_token(&domains_page_scope(OTHER_REGION, None), &first_key),
         ),
         (
             "an issued cursor with its tag altered".to_string(),
