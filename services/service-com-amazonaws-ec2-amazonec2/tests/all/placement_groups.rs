@@ -14,7 +14,10 @@
 //! `partition`, `SpreadLevel` only for `spread`), is minted with a service-owned `pg-` id
 //! and an ARN naming the signed Region and the group's name, is `available`, and reads back
 //! unchanged through `DescribePlacementGroups` by id, by name and through every filter that
-//! operation documents. A name the account already holds is refused, and a member that
+//! operation documents. `DescribePlacementGroups` answers for the groups its selectors
+//! NAMED, narrowed by every filter it carries: a named group a filter excludes is an absent
+//! row, while an id or a name that resolves to no group of the account is refused whatever
+//! the filters would have made of it. A name the account already holds is refused, and a member that
 //! belongs to another strategy is refused rather than stored. `DeletePlacementGroup` then
 //! TAKES THE GROUP IT NAMES OUT OF THE ACCOUNT: neither its name nor its id resolves for
 //! any later caller, the name is free for a new group, and a name the account holds no
@@ -994,6 +997,196 @@ async fn describe_joins_its_filters_with_and() {
         actual, expected,
         "case {case:?}: expected {expected:?}, got {actual:?} from {body}"
     );
+}
+
+/// One row of the selector-and-filter table: the case, the form fields naming the groups
+/// the request selects on, the filters it carries (each a name and its values) and the group
+/// names the describe must report.
+type SelectorFilterCase = (
+    &'static str,
+    Vec<Param>,
+    Vec<(&'static str, Vec<&'static str>)>,
+    Vec<&'static str>,
+);
+
+#[tokio::test]
+async fn describe_filters_the_groups_its_selectors_named() {
+    // "Describes the specified placement groups or all of your placement groups"
+    // (`DescribePlacementGroups`) and "If you specify multiple filters, the filters are
+    // joined with an AND" (`Filter`): the selectors say which groups the request asked
+    // about, and every filter must then hold of each of them. So a named group a filter
+    // excludes is an ABSENT ROW rather than a refusal — the selector refusal is about an id
+    // or a name that resolves to no group of the account, never about one the filters leave
+    // out.
+    let router = emulator();
+    let seeds = seeded(&router).await;
+    let id_of = |name: &str| -> String {
+        seeds
+            .iter()
+            .find(|(group_name, _)| group_name == name)
+            .map(|(_, group_id)| group_id.clone())
+            .unwrap_or_else(|| panic!("no seeded group named {name}"))
+    };
+
+    // Each row varies what the rule generalises over: which selector list named the groups
+    // (ids, names, or both), how many it named, and which filter — a scalar member, a tag,
+    // a wildcard value, or two filters at once — is then asked of them.
+    let cases: Vec<SelectorFilterCase> = vec![
+        (
+            "one id and a filter it satisfies",
+            vec![param("GroupId.1", &id_of("seed-cluster"))],
+            vec![("strategy", vec!["cluster"])],
+            vec!["seed-cluster"],
+        ),
+        (
+            "one id and a filter it fails",
+            vec![param("GroupId.1", &id_of("seed-cluster"))],
+            vec![("strategy", vec!["spread"])],
+            vec![],
+        ),
+        (
+            "one name and a filter it satisfies",
+            vec![param("GroupName.1", "seed-spread")],
+            vec![("spread-level", vec!["rack"])],
+            vec!["seed-spread"],
+        ),
+        (
+            "one name and a filter it fails",
+            vec![param("GroupName.1", "seed-spread")],
+            vec![("spread-level", vec!["host"])],
+            vec![],
+        ),
+        (
+            "two names and a filter that holds of one of them",
+            vec![
+                param("GroupName.1", "seed-cluster"),
+                param("GroupName.2", "seed-spread"),
+            ],
+            vec![("strategy", vec!["spread"])],
+            vec!["seed-spread"],
+        ),
+        (
+            "two names and a filter whose values hold of both",
+            vec![
+                param("GroupName.1", "seed-cluster"),
+                param("GroupName.2", "seed-spread"),
+            ],
+            vec![("strategy", vec!["cluster", "spread"])],
+            vec!["seed-cluster", "seed-spread"],
+        ),
+        (
+            "an id and another group's name, with a filter both satisfy",
+            vec![
+                param("GroupId.1", &id_of("seed-cluster")),
+                param("GroupName.1", "seed-spread"),
+            ],
+            vec![("state", vec!["available"])],
+            vec!["seed-cluster", "seed-spread"],
+        ),
+        (
+            "an id and another group's name, with a tag filter only one satisfies",
+            vec![
+                param("GroupId.1", &id_of("seed-cluster")),
+                param("GroupName.1", "seed-spread"),
+            ],
+            vec![("tag:Strategy", vec!["spread"])],
+            vec!["seed-spread"],
+        ),
+        (
+            "two names narrowed by a wildcard filter",
+            vec![
+                param("GroupName.1", "seed-cluster"),
+                param("GroupName.2", "seed-partition"),
+            ],
+            vec![("group-name", vec!["seed-p*"])],
+            vec!["seed-partition"],
+        ),
+        (
+            "every id, narrowed by two filters joined with AND",
+            seeds
+                .iter()
+                .enumerate()
+                .map(|(index, (_, group_id))| {
+                    param(&format!("GroupId.{}", index + 1), group_id)
+                })
+                .collect(),
+            vec![("strategy", vec!["cluster"]), ("tag-key", vec!["Strategy"])],
+            vec!["seed-cluster"],
+        ),
+        (
+            "every id, with two filters that cannot both hold",
+            seeds
+                .iter()
+                .enumerate()
+                .map(|(index, (_, group_id))| {
+                    param(&format!("GroupId.{}", index + 1), group_id)
+                })
+                .collect(),
+            vec![
+                ("strategy", vec!["cluster"]),
+                ("tag:Strategy", vec!["spread"]),
+            ],
+            vec![],
+        ),
+        (
+            "a name and a filter no group of the account satisfies",
+            vec![param("GroupName.1", "seed-cluster")],
+            vec![("group-name", vec!["nothing-like-this*"])],
+            vec![],
+        ),
+    ];
+
+    for (case, selectors, filters, expected_names) in cases {
+        let mut params = selectors;
+        for (position, (name, values)) in filters.iter().enumerate() {
+            let index = position + 1;
+            params.push(param(&format!("Filter.{index}.Name"), name));
+            for (offset, value) in values.iter().enumerate() {
+                params.push(param(
+                    &format!("Filter.{index}.Value.{}", offset + 1),
+                    value,
+                ));
+            }
+        }
+        let body = describe_ok(case, &router, &params).await;
+        // The store reports in `GroupId` order, which is the order the ids were minted.
+        let mut expected: Vec<String> = expected_names.iter().map(|name| id_of(name)).collect();
+        expected.sort();
+        let actual = reported_ids(case, &body);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected the groups {expected_names:?} ({expected:?}), got \
+             {actual:?} from {body}"
+        );
+    }
+
+    // A selector that resolves to no group of the account is refused whatever the filters
+    // would have made of it: the two questions are answered in that order, so a filter that
+    // selects nothing never turns an unknown group into an empty result.
+    let refusals: Vec<(&str, Param, &str)> = vec![
+        (
+            "an unknown name beside a filter that holds of the account's groups",
+            param("GroupName.1", "nothing-here"),
+            "nothing-here",
+        ),
+        (
+            "an unknown id beside a filter that holds of no group",
+            param("GroupId.1", "pg-0000000000000dead"),
+            "pg-0000000000000dead",
+        ),
+    ];
+    for (case, selector, named) in refusals {
+        let (status, body) = describe(
+            &router,
+            &[
+                selector,
+                param("Filter.1.Name", "strategy"),
+                param("Filter.1.Value.1", "cluster"),
+            ],
+        )
+        .await;
+        assert_unknown_group(case, named, status, &body);
+    }
 }
 
 #[tokio::test]
