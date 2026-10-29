@@ -151,6 +151,25 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 /// cased.
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
+/// The most characters an error message of this service may carry.
+///
+/// Every error shape on this surface declares its `message` against `GenericString`,
+/// whose `@length` is `min 0, max 1024`
+/// (`smithy_query(query="shape",shape="GenericString,ValidationException")`). The members a
+/// message quotes are bounded far more loosely than that — one `resourceTags` list carries
+/// up to 200 keys of up to 128 characters each, and a `ResourceArn` up to 2048 — so a
+/// message built by quoting them is bounded HERE, by
+/// [`within_message_bound`], before it goes on the wire. A client that sized or stored a
+/// message against the maximum its own copy of the model declares then never sees a value
+/// the model said could not occur.
+pub const MAX_MESSAGE_LENGTH: usize = 1024;
+
+/// What a message carries in place of the text [`MAX_MESSAGE_LENGTH`] left no room for.
+const MESSAGE_ELISION: &str = "...";
+
+/// How a message separates the values it quotes from a modelled list.
+const MESSAGE_LIST_SEPARATOR: &str = ", ";
+
 /// How the TAGGING path words a `ResourceArn` that resolves to no stored resource.
 ///
 /// A constant, carrying nothing from the request — which is what the recorded
@@ -1326,6 +1345,76 @@ pub fn is_reserved_tag_key(key: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
 }
 
+/// `message` within [`MAX_MESSAGE_LENGTH`] characters: itself when it already fits, else
+/// its longest prefix that leaves room for [`MESSAGE_ELISION`] — cut between characters,
+/// never inside one — followed by that marker.
+///
+/// The last step of every message this service builds by quoting a value the request
+/// carried, because those members admit far more text than the message member that would
+/// have to hold it (see [`MAX_MESSAGE_LENGTH`]). Characters, not bytes: `@length` on a
+/// string counts characters, which is what the boundary validator charges a value by.
+pub fn within_message_bound(message: impl Into<String>) -> String {
+    let message = message.into();
+    if message.chars().count() <= MAX_MESSAGE_LENGTH {
+        return message;
+    }
+    let kept = MAX_MESSAGE_LENGTH - MESSAGE_ELISION.chars().count();
+    let mut bounded: String = message.chars().take(kept).collect();
+    bounded.push_str(MESSAGE_ELISION);
+    bounded
+}
+
+/// How a message accounts for the `omitted` values a bound left no room for — nothing at
+/// all when it listed every one of them.
+fn omitted_values_notice(omitted: usize) -> String {
+    if omitted == 0 {
+        return String::new();
+    }
+    format!(" and {omitted} more")
+}
+
+/// `values` quoted into a message that has `budget` characters left for them: as many as
+/// fit, joined with [`MESSAGE_LIST_SEPARATOR`], and a COUNT of the ones that do not.
+///
+/// A message quoting a modelled list has to stay inside the bound of the member carrying
+/// it however many entries the request named, and the two ways to get there are not
+/// equal: cutting the rendered text would end the message inside a value, which reads as a
+/// value the caller never sent, while stopping at a whole value and counting the rest
+/// leaves every quoted value exact and still says how many more the request carried. The
+/// room the closing count needs is reserved before each value is admitted, so the result
+/// never exceeds `budget` — with every value quoted when the whole list fits.
+fn values_within(values: &[&str], budget: usize) -> String {
+    let mut quoted = String::new();
+    let mut listed = 0usize;
+    for (index, value) in values.iter().enumerate() {
+        let separator = if index == 0 { "" } else { MESSAGE_LIST_SEPARATOR };
+        // What this function would close with if the NEXT value did not fit, which is
+        // exactly the notice it does close with when it stops at that value.
+        let notice = omitted_values_notice(values.len() - index - 1);
+        let needed = quoted.chars().count()
+            + separator.chars().count()
+            + value.chars().count()
+            + notice.chars().count();
+        if needed > budget {
+            break;
+        }
+        quoted.push_str(separator);
+        quoted.push_str(value);
+        listed += 1;
+    }
+    let notice = omitted_values_notice(values.len() - listed);
+    if quoted.is_empty() {
+        // No value fit at all, so the count is the whole of what this function has to
+        // say and it is rendered without the separating space it would have carried
+        // after a value. Out of reach of either caller today — the clause each of them
+        // builds leaves room for several values at their modelled maximum length — and
+        // kept correct rather than left to produce a sentence with a hole in it.
+        return notice.trim_start().to_string();
+    }
+    quoted.push_str(&notice);
+    quoted
+}
+
 /// `Ok(())` when no key in `keys` is in the reserved namespace, or the refusal message
 /// for the ones that are — the text a `ValidationException` carries.
 ///
@@ -1336,6 +1425,12 @@ pub fn is_reserved_tag_key(key: &str) -> bool {
 /// refusal: it names the member that broke the rule, the offending keys and the rule
 /// itself. The offenders are sorted and deduplicated so one request that names a key
 /// twice reports it once and the text does not depend on iteration order.
+///
+/// The keys are quoted within what [`MAX_MESSAGE_LENGTH`] leaves after the clause itself
+/// ([`values_within`]), because the lists this rule is applied to are bounded by their own
+/// models and not by the message member's: `resourceTags` and `resourceTagKeys` each carry
+/// up to 200 keys of up to 128 characters, so quoting all of them unconditionally puts a
+/// message on the wire some twenty-five times the maximum the model declares for it.
 pub fn check_tag_keys_not_reserved<'a>(
     member: &str,
     keys: impl IntoIterator<Item = &'a str>,
@@ -1349,12 +1444,16 @@ pub fn check_tag_keys_not_reserved<'a>(
     }
     reserved.sort_unstable();
     reserved.dedup();
-    Err(format!(
+    let clause = format!(
         "{member}: the '{RESERVED_TAG_KEY_PREFIX}' prefix is reserved for tags Amazon Web \
          Services generates and cannot be set or removed by a caller, so these keys are not \
-         allowed: {}",
-        reserved.join(", ")
-    ))
+         allowed: "
+    );
+    let budget = MAX_MESSAGE_LENGTH.saturating_sub(clause.chars().count());
+    Err(within_message_bound(format!(
+        "{clause}{}",
+        values_within(&reserved, budget)
+    )))
 }
 
 /// The tag list to STORE when `incoming` is applied to the resource that currently

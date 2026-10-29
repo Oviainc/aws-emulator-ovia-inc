@@ -263,9 +263,16 @@ pub struct ResourceNotFound {
 
 impl ResourceNotFound {
     /// A not-found answer for `resource_id`, worded by `message`.
+    ///
+    /// `message` is bounded by [`crate::state::within_message_bound`]: a client reads this
+    /// body as the modelled `ResourceNotFoundException` — that is the wire error code
+    /// beside it — and that shape's `message` admits 1024 characters, while the ARN a
+    /// per-operation template quotes admits 2048. `resource_id` keeps the identifier
+    /// WHOLE: it is the value the caller addressed and the one it has to act on, and the
+    /// member carrying it is this service's own rather than a modelled one.
     pub fn new(resource_id: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
+            message: crate::state::within_message_bound(message),
             resource_id: resource_id.into(),
         }
     }

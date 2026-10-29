@@ -311,12 +311,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A scheduled report reports on a dashboard, so the dashboard it names has to
         // be one this account stores. This operation models no
         // `ResourceNotFoundException`, so the refusal is its modelled
-        // `ValidationException` (400), with the offending ARN in the message.
+        // `ValidationException` (400), with the offending ARN in the message — quoted
+        // within the bound that member declares (`crate::state::within_message_bound`),
+        // because `DashboardArn` admits twice the text `ValidationException$message` does.
         if !state.dashboards.contains_key(&requested.dashboard_arn) {
             crate::state::record_state_change(ctx, Self::NAME, "-", "ValidationException");
             return Err(CreateScheduledReportErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!("Dashboard not found: {}", requested.dashboard_arn),
+                    message: crate::state::within_message_bound(format!(
+                        "Dashboard not found: {}",
+                        requested.dashboard_arn
+                    )),
                 },
             )
             .into());

@@ -31,6 +31,8 @@ mod dashboard_name_uniqueness;
 mod delete_dashboard_idempotency;
 #[path = "all/delete_scheduled_report.rs"]
 mod delete_scheduled_report;
+#[path = "all/error_message_length_bound.rs"]
+mod error_message_length_bound;
 #[path = "all/execution_token_scope.rs"]
 mod execution_token_scope;
 #[path = "all/listing_pagination.rs"]

@@ -21,7 +21,10 @@
 //! `ValidationException` (HTTP 400) and stores NOTHING, so none of its other tags are
 //! applied either. The refusal is decided from the request alone, before the ARN is
 //! resolved, so a reserved key is refused as such whether or not the ARN names a stored
-//! resource.
+//! resource. It names the offending keys within what the message member it travels in
+//! admits ([`crate::state::MAX_MESSAGE_LENGTH`]), and counts the rest: one request may
+//! carry 200 keys of 128 characters, and `ValidationException$message` 1024 characters
+//! in all.
 //!
 //! The stored tag list is bounded by [`crate::state::MAX_TAGS_PER_RESOURCE`]: the
 //! modelled `resourceTags` length bounds one REQUEST, not the list a merge grows, so a
