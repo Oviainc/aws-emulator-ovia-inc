@@ -17,8 +17,10 @@
 //!   framework's deserialize-and-validate boundary — a body that breaks a modelled
 //!   constraint earns the same 403 as a conforming one. The check below is the same
 //!   rule, kept so no path can write to the store for a caller the gate refuses.
-//! * `ClientToken` (`@idempotencyToken`) replay returns the team the first call minted —
-//!   same `Arn`, same `VersionId`, no second team.
+//! * `ClientToken` (`@idempotencyToken`) replay returns the ANSWER the first call gave:
+//!   same `Arn`, same `Name`, same `CreationTime`, same `VersionId`, no second team. The
+//!   answer is repeated from what was recorded when that call gave it, so a version the
+//!   team has since moved to is never reported as one this create minted.
 //! * A `Name` a live team already holds earns `ConflictException` (409).
 //! * An `MofN` strategy asking for more approvals (M) than the team has approvers (N)
 //!   can never be satisfied, so it earns `ValidationException` (400). The model bounds M
@@ -247,10 +249,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `@idempotencyToken` replay: the same token answers with the team the first
-        // call minted, rather than minting a second one. The token is recorded under its
+        // `@idempotencyToken` replay: the same token answers with the ANSWER the first
+        // call gave, rather than minting a second team. The token is recorded under its
         // RESOURCE KIND (`crate::state::idempotency_key`), so a token the caller also
         // used on another create resolves to that create's resource, not to this one.
+        //
+        // The answer is repeated from what was recorded when the first call gave it
+        // (`crate::state::IdempotentCreate`), not re-rendered out of the team as it
+        // stands now: the team's live version id MOVES once it is updated, and a client
+        // retrying a create it never saw the answer to must not be told a version its
+        // create did not mint. The members fixed when the team was minted are still read
+        // back out of the stored record, so a replay only ever describes a team this
+        // store really holds.
         let client_token = input
             .client_token
             .as_deref()
@@ -258,11 +268,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|token| {
                 crate::state::idempotency_key(crate::state::APPROVAL_TEAM_RESOURCE, token)
             });
-        if let Some(token) = client_token.as_deref() {
-            if let Some(arn) = state.idempotency_tokens.get(token).cloned() {
-                if let Some(team) = state.team(&arn) {
-                    return Ok(created(team));
-                }
+        if let Some(first) = client_token
+            .as_deref()
+            .and_then(|token| state.idempotent_create(token))
+        {
+            if let Some(team) = state.team(&first.arn) {
+                return Ok(replayed(team, first));
             }
         }
 
@@ -437,9 +448,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             seq,
         };
         state.insert_team(team);
-        if let Some(token) = client_token {
-            state.idempotency_tokens.insert(token, arn.clone());
-        }
 
         // Read the answer back out of the store, so the response can only ever
         // describe a team that was really recorded.
@@ -452,7 +460,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        Ok(created(team))
+        let answer = created(team);
+
+        // The token records THIS answer, so a retry is told what this call told the
+        // caller — including the version this create minted, which the team moves past
+        // the first time it is updated.
+        if let Some(token) = client_token {
+            state.record_idempotent_create(
+                token,
+                crate::state::IdempotentCreate {
+                    arn,
+                    version_id: answer.version_id.clone(),
+                },
+            );
+        }
+        Ok(answer)
     }
 }
 
@@ -467,4 +489,20 @@ fn created(team: &crate::state::ApprovalTeam) -> CreateApprovalTeamOutput {
         version_id: Some(team.version_id.clone()),
         creation_time: Some(::aws_smithy_types::DateTime::from(team.creation_time)),
     }
+}
+
+/// The answer a `ClientToken` replay repeats: the version id the FIRST call returned, as
+/// it was recorded then, over the members the team keeps for as long as it exists.
+///
+/// A record carrying no version — nothing in this service writes one for a team — leaves
+/// the stored team's own, which is the version it was created with.
+fn replayed(
+    team: &crate::state::ApprovalTeam,
+    first: &crate::state::IdempotentCreate,
+) -> CreateApprovalTeamOutput {
+    let mut answer = created(team);
+    if first.version_id.is_some() {
+        answer.version_id = first.version_id.clone();
+    }
+    answer
 }

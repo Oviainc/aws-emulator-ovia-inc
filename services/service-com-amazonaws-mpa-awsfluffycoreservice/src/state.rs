@@ -2085,6 +2085,34 @@ pub fn idempotency_key(resource_kind: &str, token: &str) -> String {
     format!("{resource_kind}/{token}")
 }
 
+/// The ANSWER the first call of an `@idempotencyToken` create returned, recorded under
+/// that token's [`idempotency_key`].
+///
+/// A retry the token identifies repeats that answer; it does not re-render one out of the
+/// resource as it stands now. The whole point of the token is that a client which never
+/// saw the first answer can ask again and be told the same thing, so a member whose
+/// stored source a LATER call moves may not drift between two answers to the same
+/// request.
+///
+/// A member fixed when the resource is minted (its ARN, its name, its type, the instant
+/// it was created) is still read back out of the stored record, so a replay can only ever
+/// describe a resource this store really holds — and an entry whose resource is gone is
+/// dropped, so the replay mints a new one instead. The members a later call CAN move are
+/// the ones recorded here.
+#[derive(Clone, Debug)]
+pub struct IdempotentCreate {
+    /// ARN of the resource the first call minted: what the replay resolves the stored
+    /// record through, and what frees this entry when that resource is removed.
+    pub arn: String,
+    /// The version id the first call answered with, for a created resource that carries
+    /// one. An approval team's live version id MOVES — `UpdateApprovalTeam` applies a
+    /// change in place on a team no approver has activated yet, and installs an approved
+    /// change's version on an active one — so the version the stored team carries is not
+    /// the version the create returned. `None` for a create whose answer names no
+    /// version.
+    pub version_id: Option<String>,
+}
+
 /// Resource kind of an approval team, as [`idempotency_key`] names it — the resource
 /// name `ApprovalTeamArn`'s pattern carries.
 pub const APPROVAL_TEAM_RESOURCE: &str = "approval-team";
@@ -2547,12 +2575,13 @@ pub struct ComAmazonawsMpaAwsfluffycoreserviceState {
     pub approval_teams: BTreeMap<String, ApprovalTeam>,
     /// Team name -> ARN. Backs the `ConflictException` a duplicate name earns.
     pub name_index: BTreeMap<String, String>,
-    /// `ClientToken` -> ARN. Backs the idempotent replay of the `@idempotencyToken`
+    /// `ClientToken` -> the answer the create it was given to returned
+    /// ([`IdempotentCreate`]). Backs the idempotent replay of the `@idempotencyToken`
     /// creates (`CreateApprovalTeam`, `CreateIdentitySource`). An `@idempotencyToken` is
     /// scoped to the resource the request creates, so an entry is keyed through
     /// [`idempotency_key`] and the same token used on two different creates replays each
     /// against its own resource instead of overwriting the other's record.
-    pub idempotency_tokens: BTreeMap<String, String>,
+    pub idempotency_tokens: BTreeMap<String, IdempotentCreate>,
     /// The account that is the MANAGEMENT account of the organization this store
     /// records, if any.
     ///
@@ -2938,12 +2967,30 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
                 self.name_index.remove(&team.name);
             }
         }
-        self.idempotency_tokens.retain(|_, stored| stored != arn);
+        self.idempotency_tokens
+            .retain(|_, first| first.arn != arn);
         // A session asks ONE team's approvers, so it cannot outlive that team: when the
         // team is gone its sessions name nobody, and `GetSession` answers for them the
         // same 404 `GetApprovalTeam` answers for the team.
         self.sessions
             .retain(|_, session| session.approval_team_arn != arn);
+    }
+
+    /// The answer the create that was given this idempotency key already returned, if
+    /// this store recorded one.
+    ///
+    /// The one place a `@idempotencyToken` replay is resolved, so every create of this
+    /// service answers a retry out of what its first call really returned
+    /// ([`IdempotentCreate`]) rather than out of the resource as it stands now.
+    #[must_use]
+    pub fn idempotent_create(&self, key: &str) -> Option<&IdempotentCreate> {
+        self.idempotency_tokens.get(key)
+    }
+
+    /// Record the answer a create returned under its idempotency key, so a retry carrying
+    /// the same token repeats it.
+    pub fn record_idempotent_create(&mut self, key: String, first: IdempotentCreate) {
+        self.idempotency_tokens.insert(key, first);
     }
 
     /// The stored team with this ARN.
@@ -3020,7 +3067,8 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     /// rather than answering with a record that is gone.
     pub fn remove_identity_source(&mut self, arn: &str) {
         self.identity_sources.remove(arn);
-        self.idempotency_tokens.retain(|_, stored| stored != arn);
+        self.idempotency_tokens
+            .retain(|_, first| first.arn != arn);
     }
 
     /// The ARN of a stored approval team whose approvers authenticate through the

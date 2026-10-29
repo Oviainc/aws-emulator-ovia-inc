@@ -35,6 +35,8 @@ mod clock_due_order;
 mod clock_owed_order;
 #[path = "all/create_tag_ceiling.rs"]
 mod create_tag_ceiling;
+#[path = "all/idempotent_create_replay.rs"]
+mod idempotent_create_replay;
 #[path = "all/identity_source_approval_portal.rs"]
 mod identity_source_approval_portal;
 #[path = "all/identity_source_arn_addressing.rs"]

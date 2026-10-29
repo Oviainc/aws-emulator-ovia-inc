@@ -13,7 +13,9 @@
 //! materialises for every later reader (`ListIdentitySources`).
 //!
 //! `ClientToken` is `@idempotencyToken`: a replay with a token this account already used
-//! answers with the source that call minted instead of minting a second one.
+//! repeats the answer that call gave instead of minting a second source. Every member
+//! this create answers with is fixed when the source is minted, so the repeated answer is
+//! the stored record's.
 //!
 //! Setting an organization's identity source up is restricted to its MANAGEMENT
 //! account, the same rule `create_approval_team.rs` enforces for an approval team: a
@@ -229,10 +231,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `@idempotencyToken` replay: the same token answers with the identity source the
-        // first call minted, rather than minting a second one. The token is recorded under
-        // its RESOURCE KIND (`crate::state::idempotency_key`), so a token the caller also
-        // used on another create resolves to that create's resource, not to this one.
+        // `@idempotencyToken` replay: the same token answers with the ANSWER the first
+        // call gave, rather than minting a second identity source. The token is recorded
+        // under its RESOURCE KIND (`crate::state::idempotency_key`), so a token the caller
+        // also used on another create resolves to that create's resource, not to this one.
+        // Every member this create answers with is fixed when the source is minted — its
+        // type, its ARN and its creation instant — so the recorded answer names the
+        // resource and the stored record still supplies them.
         let client_token = input
             .client_token
             .as_deref()
@@ -240,11 +245,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|token| {
                 crate::state::idempotency_key(crate::state::IDENTITY_SOURCE_RESOURCE, token)
             });
-        if let Some(token) = client_token.as_deref() {
-            if let Some(arn) = state.idempotency_tokens.get(token).cloned() {
-                if let Some(source) = state.identity_source(&arn) {
-                    return Ok(created(source));
-                }
+        if let Some(first) = client_token
+            .as_deref()
+            .and_then(|token| state.idempotent_create(token))
+        {
+            if let Some(source) = state.identity_source(&first.arn) {
+                return Ok(created(source));
             }
         }
 
@@ -365,9 +371,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(activation_not_computable());
         };
         state.insert_identity_source(source);
-        if let Some(token) = client_token {
-            state.idempotency_tokens.insert(token, arn.clone());
-        }
 
         // Read the answer back out of the store, so the response can only ever describe
         // an identity source that was really recorded.
@@ -380,7 +383,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        Ok(created(source))
+        let answer = created(source);
+
+        // The token records this answer, so a retry is told what this call told the
+        // caller. `CreateIdentitySource` answers no version id, so the record names only
+        // the resource it minted.
+        if let Some(token) = client_token {
+            state.record_idempotent_create(
+                token,
+                crate::state::IdempotentCreate {
+                    arn,
+                    version_id: None,
+                },
+            );
+        }
+        Ok(answer)
     }
 }
 
