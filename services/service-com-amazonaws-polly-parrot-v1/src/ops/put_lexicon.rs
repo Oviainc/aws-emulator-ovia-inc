@@ -8,8 +8,9 @@
 //!
 //! The PLS document is parsed with a real namespace-aware XML reader (`quick-xml`),
 //! never scanned as text: `Alphabet` is the `<lexicon>` element's `alphabet`
-//! attribute, `LanguageCode` its `xml:lang`, and `LexemesCount` the number of
-//! `<lexeme>` elements. A store is an INSERT-OR-REPLACE keyed by the REGION and the
+//! attribute, `LanguageCode` the language its `xml:lang` names — in the spelling the
+//! model's own `LanguageCode` enum uses for it, because that enum is what the reported
+//! member targets — and `LexemesCount` the number of `<lexeme>` elements. A store is an INSERT-OR-REPLACE keyed by the REGION and the
 //! name, so re-putting a name in that Region overwrites the entry and moves its
 //! `LastModified` forward rather than adding a second one, while a lexicon of another
 //! Region is neither read nor replaced.
@@ -201,9 +202,11 @@ pub struct ParsedLexicon {
     /// The `<lexicon alphabet="...">` attribute, absent when the document omits it
     /// (PLS allows a per-phoneme alphabet instead).
     pub alphabet: Option<String>,
-    /// The `<lexicon xml:lang="...">` attribute. Not optional: PLS requires the
-    /// document element to declare the lexicon's language, so a document that parses
-    /// at all has one.
+    /// The language the `<lexicon xml:lang="...">` attribute names, spelled as the
+    /// model's `LanguageCode` catalog spells it rather than as the document did — the
+    /// reported member targets that enum ([`supported_language`]). Not optional: PLS
+    /// requires the document element to declare the lexicon's language, so a document
+    /// that parses at all has one.
     pub language_code: String,
     /// How many `<lexeme>` elements the document declares.
     pub lexemes_count: i32,
@@ -552,32 +555,50 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
             return Err(PlsRejection::UnsupportedAlphabet(alphabet.clone()));
         }
     }
-    if !language_is_supported(&document_element.language_code) {
+    let Some(language_code) = supported_language(&document_element.language_code) else {
         return Err(PlsRejection::UnsupportedLanguage(
             document_element.language_code,
         ));
-    }
+    };
     Ok(ParsedLexicon {
         alphabet: document_element.alphabet,
-        language_code: document_element.language_code,
+        // The CATALOG's spelling, not the document's: see [`supported_language`].
+        language_code: language_code.to_string(),
         lexemes_count,
     })
 }
 
-/// Whether `language` is a language Amazon Polly supports.
+/// The language `language` names, spelled as this service's catalog spells it, or
+/// `None` when Amazon Polly supports no such language.
 ///
 /// The catalog is the model's own `LanguageCode` enum. A bare primary subtag counts:
 /// `LexiconAttributes$LanguageCode`'s documentation says "A lexicon with a language
 /// code such as \"en\" would be applied to all English languages (en-GB, en-US,
 /// en-AUS, en-WLS, and so on", so `en` is a language a lexicon may declare even
 /// though it is not itself an enum value.
-fn language_is_supported(language: &str) -> bool {
-    LANGUAGE_CODE_VALUES.iter().any(|code| {
-        code.eq_ignore_ascii_case(language)
-            || code
-                .split('-')
-                .next()
-                .is_some_and(|primary| primary.eq_ignore_ascii_case(language))
+///
+/// The comparison is case-INSENSITIVE because `xml:lang` carries a language tag and a
+/// language tag's subtags are defined to be case-insensitive (RFC 5646: "language tags
+/// … are to be treated as case-insensitive"), so a document spelling a supported
+/// language in another case still names that language. What is returned is therefore
+/// the CATALOG entry rather than the document's spelling: every value this service
+/// reports for `LanguageCode` has to be one the enum the member targets declares — or,
+/// for the bare-subtag form above, the catalog's own spelling of that subtag —
+/// otherwise a read answers an enum variant no client can deserialize.
+fn supported_language(language: &str) -> Option<&'static str> {
+    // A whole tag the catalog declares wins over a primary subtag, so a catalog entry
+    // that is itself subtag-shaped is reported as the entry it is.
+    if let Some(code) = LANGUAGE_CODE_VALUES
+        .iter()
+        .copied()
+        .find(|code| code.eq_ignore_ascii_case(language))
+    {
+        return Some(code);
+    }
+    LANGUAGE_CODE_VALUES.iter().copied().find_map(|code| {
+        code.split('-')
+            .next()
+            .filter(|primary| primary.eq_ignore_ascii_case(language))
     })
 }
 
@@ -961,14 +982,38 @@ mod tests {
     fn a_primary_language_subtag_is_a_supported_language() {
         for language in ["en", "en-GB", "arb", "cmn-CN", "yue-CN"] {
             assert!(
-                language_is_supported(language),
+                supported_language(language).is_some(),
                 "language {language:?}: expected supported"
             );
         }
         for language in ["xx", "klingon", ""] {
             assert!(
-                !language_is_supported(language),
+                supported_language(language).is_none(),
                 "language {language:?}: expected unsupported"
+            );
+        }
+    }
+
+    /// A supported language is reported in the catalog's spelling whatever case the
+    /// document spells it in, so the reported member is always a value of the enum it
+    /// targets (or the catalog's spelling of a primary subtag of one).
+    #[test]
+    fn a_supported_language_is_reported_in_the_catalog_spelling() {
+        for (case, declared, expected) in [
+            ("already canonical", "en-US", "en-US"),
+            ("an upper-case region", "en-us", "en-US"),
+            ("an upper-case primary subtag", "EN-US", "en-US"),
+            ("mixed case throughout", "Fr-fR", "fr-FR"),
+            ("a three-subtag tag", "en-gb-wls", "en-GB-WLS"),
+            ("a subtag-shaped entry", "ARB", "arb"),
+            ("a bare primary subtag", "EN", "en"),
+            ("a three-letter primary subtag", "YUE", "yue"),
+        ] {
+            assert_eq!(
+                supported_language(declared),
+                Some(expected),
+                "case {case:?}: expected {expected:?} for {declared:?}, got {:?}",
+                supported_language(declared)
             );
         }
     }

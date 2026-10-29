@@ -19,6 +19,8 @@ mod error_document_message;
 mod error_message_wording;
 #[path = "all/error_semantics.rs"]
 mod error_semantics;
+#[path = "all/lexicon_language_code.rs"]
+mod lexicon_language_code;
 #[path = "all/lexicon_listing.rs"]
 mod lexicon_listing;
 #[path = "all/lexicon_regions.rs"]
