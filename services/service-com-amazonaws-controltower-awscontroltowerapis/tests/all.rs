@@ -113,3 +113,5 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
+#[path = "all/update_refusal_order.rs"]
+mod update_refusal_order;

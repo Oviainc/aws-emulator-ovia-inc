@@ -196,27 +196,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // An operation still changing this enablement owns it: a change starting now
-        // would apply on top of one half applied, which is the inconsistent state
-        // `ConflictException` reports. This operation is not `@idempotent`, so a repeat
-        // is refused rather than reported as the same operation.
-        if let Some(in_flight) = store.baseline_change_in_flight_on(&arn) {
-            return Err(UpdateEnabledBaselineErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "baseline operation {in_flight} is still in progress against \
-                         {arn}; updating it now would leave this enablement in an \
-                         inconsistent state"
-                    ),
-                },
-            )
-            .into());
-        }
-
-        // The version and the parameters are checked against the CATALOG entry of the
-        // baseline this enablement applies — the one the enable was accepted for — so an
-        // update cannot move an enablement to a version its baseline does not offer or
-        // configure it with a parameter that baseline does not declare.
+        // WHAT the request asks for is settled before the enablement's own state is
+        // looked at, the order the sibling `UpdateEnabledControl` and the enable handlers
+        // apply: the version and the parameters are checked against the CATALOG entry of
+        // the baseline this enablement applies — the one the enable was accepted for,
+        // which no operation changes — so an update cannot move an enablement to a
+        // version its baseline does not offer or configure it with a parameter that
+        // baseline does not declare, and a request carrying such a value is answered with
+        // the same `ValidationException` whether or not a change is still in flight.
         let stored_baseline_identifier = store
             .enabled_baselines
             .get(&arn)
@@ -264,6 +251,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(UpdateEnabledBaselineErrorModeled::ValidationException(
                 ValidationException { message },
+            )
+            .into());
+        }
+
+        // The request itself is one the service accepts, so now the enablement's own
+        // state decides: an operation still changing it owns it, and a change starting
+        // now would apply on top of one half applied, which is the inconsistent state
+        // `ConflictException` reports. This operation is not `@idempotent`, so a repeat
+        // is refused rather than reported as the same operation.
+        if let Some(in_flight) = store.baseline_change_in_flight_on(&arn) {
+            return Err(UpdateEnabledBaselineErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "baseline operation {in_flight} is still in progress against \
+                         {arn}; updating it now would leave this enablement in an \
+                         inconsistent state"
+                    ),
+                },
             )
             .into());
         }
