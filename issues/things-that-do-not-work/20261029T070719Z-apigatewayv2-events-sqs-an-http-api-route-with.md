@@ -1,0 +1,33 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: apigatewayv2__events__sqs.xsvc-apigatewayv2-1-putevents-subtype-routes-to-custom-bus-rule-queue apigatewayv2__events__sqs.xsvc-apigatewayv2-1-putevents-without-events-permission-denied-delivers-nothing
+Issue-Key: apigatewayv2__events__sqs.xsvc-apigatewayv2-1-putevents-subtype-routes-to-custom-bus-rule-queue|_poll_http#26|Timeout|time.sleep(interval_s)
+Issue-Key: apigatewayv2__events__sqs.xsvc-apigatewayv2-1-putevents-without-events-permission-denied-delivers-nothing|_poll_http#25|Timeout|time.sleep(interval_s)
+Issue-Commit: cc767c9c860d2029dd9667f4e637f1644e38e746
+
+# apigatewayv2__events__sqs: an HTTP API route with the first-class EventBridge-PutEvents integration subtype never answers, so neither custom-bus delivery nor the permission-denied refusal is produced
+
+> _Note: this issue was identified against the code base at commit `cc767c9c860d2029dd9667f4e637f1644e38e746`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateIntegration
+
+## Description
+One net-new root cause covering both failing checks.
+
+Cause 1 of 1: a route whose integration is IntegrationType=AWS_PROXY with IntegrationSubtype=EventBridge-PutEvents produces no response at all, on the happy path and on the permission-denied path alike.
+
+AWS:      Smithy: Integration.IntegrationSubtype together with IntegrationType=AWS_PROXY, CredentialsArn and RequestParameters define a first-class service integration; for EventBridge-PutEvents the mapped RequestParameters (Source, DetailType, Detail, EventBusName) are passed to events:PutEvents under the CredentialsArn role. On success the route answers 200 and returns the PutEvents result — an Entries list carrying the assigned EventId with FailedEntryCount 0 — and the event lands on the named custom bus, where a rule matching Source and DetailType delivers it to its SQS target. EventBridge string matching is exact and case-sensitive, so a sibling rule whose detail-type differs only in letter case must NOT match and its queue must stay empty. When the CredentialsArn role lacks events:PutEvents, the gateway refuses the request with HTTP 400 and error code AccessDeniedException and nothing is put on the bus; granting that one permission makes the same route deliver. recorded behavior only for the statuses and the AccessDeniedException code, which are the recorded data-plane responses. Fixed text of the requirement: the 200-with-EventId / 400 AccessDeniedException classification and the case-sensitive rule match. Variable parts: the source and detail-type strings, bus and queue names, role ARN and the generated EventId, all taken from the request and the emulator's state — the recorded EventId is never part of the contract.
+Emulator: the route never answers. Both checks reach the harness cap with no status at all — "Check timed out after 60.0s" — so no 200 with an EventId, no 400 AccessDeniedException, and no queue observation (neither the matching rule's delivery nor the case-folded rule's silence) is ever produced.
+Why:      A client using the first-class EventBridge integration gets a hang instead of a result. It cannot publish events through an HTTP API at all, and cannot distinguish "my integration role is missing events:PutEvents" (fix the role; 400 AccessDeniedException) from "the gateway is unreachable" (retry). The negative case is the worse loss: the emulator never shows that an under-privileged integration role is actually refused and delivers nothing, so a missing-permission regression looks identical to a timeout.
+Fix:      The execute-api HTTP data-plane dispatch for AWS_PROXY integrations with an IntegrationSubtype: resolve the subtype, map RequestParameters, assume CredentialsArn, call the target service operation (events:PutEvents), return its result as the route response, and classify a role lacking the required permission as 400 AccessDeniedException with nothing delivered.
+Traces:   apigatewayv2__events__sqs.xsvc-apigatewayv2-1-putevents-subtype-routes-to-custom-bus-rule-queue, apigatewayv2__events__sqs.xsvc-apigatewayv2-1-putevents-without-events-permission-denied-delivers-nothing. The open issue 20261025T002357Z-apigatewayv2-events-sqs-an-http-api-route-with-a-first-class.md describes a similar first-class PutEvents integration failure but does not carry these two checks' replay keys, so it does not cover this cause; close them together if one fix serves both.
+
+## Evidence
+Expected (happy path): POST to the route returns 200 with a PutEvents body containing an Entries[0].EventId and FailedEntryCount 0; the SQS target of the rule matching Source=app.orders / DetailType=OrderPlaced on the custom bus receives the event carrying that EventId, while the near-miss rule with detail-type "orderplaced" (differing only in case) delivers nothing to its queue.
+Expected (negative path): with a CredentialsArn role lacking events:PutEvents, the same route returns HTTP 400 with error code AccessDeniedException and no event is delivered; a permitted sibling route still delivers; granting events:PutEvents makes the original route deliver to the matching queue.
+Actual: no status at all on either path — `[mismatch] apigatewayv2__events__sqs.xsvc-apigatewayv2-1-putevents-subtype-routes-to-custom-bus-rule-queue — Error: Check timed out after 60.0s` and `[mismatch] apigatewayv2__events__sqs.xsvc-apigatewayv2-1-putevents-without-events-permission-denied-delivers-nothing — Error: Check timed out after 60.0s`.
+
+## Steps to Reproduce
+Create a custom EventBridge bus with two rules — one matching source app.orders / detail-type OrderPlaced and one matching detail-type "orderplaced" — each targeting its own SQS queue. Create an HTTP API route whose integration is IntegrationType=AWS_PROXY, IntegrationSubtype=EventBridge-PutEvents, with RequestParameters mapping Source/DetailType/Detail/EventBusName and a CredentialsArn role granting events:PutEvents; deploy the stage and POST a body. Expect 200 with an EventId, delivery to the exact-match queue only. Then repeat with a CredentialsArn role lacking events:PutEvents and expect HTTP 400 AccessDeniedException with nothing delivered, then grant the permission and expect delivery. Replay checks apigatewayv2__events__sqs.xsvc-apigatewayv2-1-putevents-subtype-routes-to-custom-bus-rule-queue and apigatewayv2__events__sqs.xsvc-apigatewayv2-1-putevents-without-events-permission-denied-delivers-nothing.
