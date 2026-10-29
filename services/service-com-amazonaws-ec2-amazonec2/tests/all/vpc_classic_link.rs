@@ -19,10 +19,20 @@
 //! names, how many times it is named, and which of the documented filters and ids the
 //! describe narrows by. The one recorded call — a disable of a VPC that was never enabled,
 //! answered `true` — is ONE row among them rather than the specification.
+//!
+//! Three further rules of the reporting side are asserted below, each over its own table: a
+//! filter VALUE is a case-sensitive pattern rather than a literal (`*`, `?`, and a backslash
+//! that makes the next character literal); a request past any of this crate's filtering
+//! ceilings is refused naming the ceiling rather than answered with a narrowed set; and the
+//! tags reported for a VPC are read off that VPC when the describe runs, so a tag written or
+//! removed after its ClassicLink status was set is what the next describe reports.
 
 use std::collections::BTreeMap;
 
-use ec2::state::ComAmazonawsEc2Amazonec2State as Ec2State;
+use ec2::state::{
+    ComAmazonawsEc2Amazonec2State as Ec2State, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+    MAX_FILTERS, MAX_RESOURCE_IDS,
+};
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -693,4 +703,473 @@ async fn a_dry_run_reports_the_outcome_and_writes_nothing() {
     // Nothing above wrote anything: every VPC still reports the status it was seeded with.
     let expected: Vec<bool> = ROWS.iter().map(|row| row.enabled_first).collect();
     assert_statuses(&router, "after the dry runs", &ids, &expected).await;
+}
+
+// ---------------------------------------------------------------------------
+// What a filter VALUE matches
+// ---------------------------------------------------------------------------
+
+/// One value case: the `Filters` entries it sends, and which VPCs the describe must then
+/// report — by index into the ids the case was given, where `0..5` are [`ROWS`] and `5` is
+/// the extra VPC whose tag value carries a literal `*`.
+struct ValueCase {
+    case: &'static str,
+    entries: &'static [(&'static str, &'static [&'static str])],
+    expected: &'static [usize],
+}
+
+/// A filter value is a PATTERN, not a literal: `*` stands for zero or more characters, `?`
+/// for exactly one, a backslash makes the next character literal, and the comparison is
+/// case-sensitive ("Filter names are case-sensitive" and the values are matched the same
+/// way — `Filter$Values`). A VPC carrying no value for the attribute a filter names matches
+/// nothing rather than everything.
+///
+/// Each row differs along what that generalises over: where the wildcard sits, how much it
+/// stands for, whether it is escaped, which attribute is filtered, and the case of the
+/// value.
+#[tokio::test]
+async fn a_filter_value_matches_with_wildcards_and_case_sensitively() {
+    let (router, _engine, mut ids) = emulator().await;
+    // A VPC whose tag VALUE carries a literal `*`, so an escaped wildcard has something to
+    // tell apart from the pattern character — index 5 of the cases below.
+    ids.push(create_vpc(&router, "a literal star", "10.8.0.0/16", &[("Owner", "Team*")]).await);
+
+    let cases: [ValueCase; 16] = [
+        // A value with no wildcard in it is the value itself.
+        ValueCase {
+            case: "tag:Owner exactly",
+            entries: &[("tag:Owner", &["TeamA"])],
+            expected: &[1],
+        },
+        // `*`: "zero or more characters", wherever it sits.
+        ValueCase {
+            case: "tag:Owner with a trailing *",
+            entries: &[("tag:Owner", &["Team*"])],
+            expected: &[1, 2, 5],
+        },
+        ValueCase {
+            case: "tag:Owner with a leading *",
+            entries: &[("tag:Owner", &["*A"])],
+            expected: &[1],
+        },
+        ValueCase {
+            case: "tag:Owner with * alone",
+            entries: &[("tag:Owner", &["*"])],
+            expected: &[1, 2, 5],
+        },
+        // `?`: exactly one character — including a `*` held in the value.
+        ValueCase {
+            case: "tag:Owner with a trailing ?",
+            entries: &[("tag:Owner", &["Team?"])],
+            expected: &[1, 2, 5],
+        },
+        ValueCase {
+            case: "tag:Owner with ? where the value has two characters",
+            entries: &[("tag:Owner", &["Tea?"])],
+            expected: &[],
+        },
+        // A backslash makes the next character literal, so an escaped `*` selects the VPC
+        // whose tag value IS a star and no other.
+        ValueCase {
+            case: "tag:Owner with an escaped *",
+            entries: &[("tag:Owner", &[r"Team\*"])],
+            expected: &[5],
+        },
+        // Case-sensitive, and a value nothing holds selects nothing at all.
+        ValueCase {
+            case: "tag:Owner in the wrong case",
+            entries: &[("tag:Owner", &["teama"])],
+            expected: &[],
+        },
+        ValueCase {
+            case: "tag:Owner no VPC holds",
+            entries: &[("tag:Owner", &["Gamma*"])],
+            expected: &[],
+        },
+        // The same patterns on another tag key, and on the key filter.
+        ValueCase {
+            case: "tag:Phase by prefix",
+            entries: &[("tag:Phase", &["tes*"])],
+            expected: &[2, 4],
+        },
+        ValueCase {
+            case: "tag-key with * alone",
+            entries: &[("tag-key", &["*"])],
+            expected: &[1, 2, 4, 5],
+        },
+        ValueCase {
+            case: "tag-key by prefix",
+            entries: &[("tag-key", &["P*"])],
+            expected: &[2, 4],
+        },
+        ValueCase {
+            case: "tag-key with a trailing ?",
+            entries: &[("tag-key", &["Phas?"])],
+            expected: &[2, 4],
+        },
+        ValueCase {
+            case: "tag-key in the wrong case",
+            entries: &[("tag-key", &["phase"])],
+            expected: &[],
+        },
+        // Every VPC carries a ClassicLink status, so `*` on it selects all of them, while a
+        // pattern selects the ones whose status it matches.
+        ValueCase {
+            case: "is-classic-link-enabled with * alone",
+            entries: &[("is-classic-link-enabled", &["*"])],
+            expected: &[0, 1, 2, 3, 4, 5],
+        },
+        ValueCase {
+            case: "is-classic-link-enabled with a trailing ?",
+            entries: &[("is-classic-link-enabled", &["tru?"])],
+            expected: &[0, 1, 2],
+        },
+    ];
+    for ValueCase {
+        case,
+        entries,
+        expected: wanted,
+    } in cases
+    {
+        // The case's own VPCs are named beside the filters, because the account also holds
+        // the ambient default VPC, which carries no tag of this suite's.
+        let mut params = indexed(
+            "VpcId",
+            &ids.iter().map(String::as_str).collect::<Vec<&str>>(),
+        );
+        params.extend(super::ec2_query::filters(entries));
+        let got = described_ids(&router, case, &params).await;
+        let mut expected: Vec<String> = wanted.iter().map(|index| ids[*index].clone()).collect();
+        expected.sort();
+        assert_eq!(
+            got, expected,
+            "case {case:?}: expected {expected:?}, got {got:?}"
+        );
+    }
+
+    // Several filters are AND'd across attributes as well as within one: the VPCs carrying
+    // an `Owner` tag that are NOT enabled is the one whose value holds the star.
+    let mut params = indexed(
+        "VpcId",
+        &ids.iter().map(String::as_str).collect::<Vec<&str>>(),
+    );
+    params.extend(super::ec2_query::filters(&[
+        ("tag-key", &["Owner"]),
+        ("is-classic-link-enabled", &["false"]),
+    ]));
+    let case = "an Owner tag and not enabled";
+    let expected = vec![ids[5].clone()];
+    let got = described_ids(&router, case, &params).await;
+    assert_eq!(
+        got, expected,
+        "case {case:?}: expected {expected:?}, got {got:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// How much filtering work one describe will do
+// ---------------------------------------------------------------------------
+
+/// Matching cost is the PRODUCT of how many ids and filters a request carries, how many
+/// values each filter carries, how long a value is and how many VPCs the account holds, and
+/// the model bounds none of them (`FilterList`, `Filter$Values` and `VpcClassicLinkIdList`
+/// carry no `@length`). So a request AT each of this crate's ceilings is answered in full,
+/// and one PAST any of them is refused with `InvalidParameterValue` naming the ceiling
+/// rather than served a silently narrowed answer. Each row is one factor of that product,
+/// named by the constant it is derived from rather than by a literal.
+#[tokio::test]
+async fn a_describe_at_each_filtering_ceiling_is_answered_and_one_past_it_is_refused() {
+    let (router, _engine, ids) = emulator().await;
+    let named: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let every_id: Vec<String> = {
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted
+    };
+
+    // One filter carrying `MAX_FILTER_VALUES` values, all but one of which no VPC holds, so
+    // the ceiling is reached and the OR still selects what it should.
+    let at_value_ceiling: Vec<String> = (0..MAX_FILTER_VALUES - 1)
+        .map(|n| format!("Team-{n}"))
+        .collect();
+    let mut at_value_ceiling: Vec<&str> = at_value_ceiling.iter().map(String::as_str).collect();
+    at_value_ceiling.push("TeamA");
+    let at_filter_ceiling: Vec<(&str, &[&str])> = (0..MAX_FILTERS)
+        .map(|_| ("is-classic-link-enabled", &["*"][..]))
+        .collect();
+    let at_byte_ceiling = "a".repeat(MAX_FILTER_VALUE_BYTES);
+    let at_id_ceiling = vec![ids[0].as_str(); MAX_RESOURCE_IDS];
+
+    // Rows: (the case, the request's params, the VPCs it must report).
+    let answered: Vec<(&str, Vec<Param>, Vec<String>)> = vec![
+        (
+            "MAX_FILTERS filters",
+            {
+                let mut params = indexed("VpcId", &named);
+                params.extend(super::ec2_query::filters(&at_filter_ceiling));
+                params
+            },
+            every_id.clone(),
+        ),
+        (
+            "MAX_FILTER_VALUES values in one filter",
+            {
+                let mut params = indexed("VpcId", &named);
+                params.extend(super::ec2_query::filters(&[(
+                    "tag:Owner",
+                    &at_value_ceiling,
+                )]));
+                params
+            },
+            vec![ids[1].clone()],
+        ),
+        (
+            // A value at the ceiling is compared, not refused: no VPC holds it, so the
+            // answer is an empty set rather than an error.
+            "a value of MAX_FILTER_VALUE_BYTES bytes",
+            {
+                let mut params = indexed("VpcId", &named);
+                params.extend(super::ec2_query::filters(&[(
+                    "tag:Owner",
+                    &[at_byte_ceiling.as_str()],
+                )]));
+                params
+            },
+            Vec::new(),
+        ),
+        (
+            // A repeated id reports its VPC once, so the ceiling is on the request's list
+            // and not on the answer.
+            "MAX_RESOURCE_IDS ids",
+            indexed("VpcId", &at_id_ceiling),
+            vec![ids[0].clone()],
+        ),
+    ];
+    for (case, params, want) in answered {
+        let got = described_ids(&router, case, &params).await;
+        assert_eq!(
+            got, want,
+            "case {case:?}: expected {want:?} at the ceiling, got {got:?}"
+        );
+    }
+
+    let past_value_ceiling: Vec<String> = (0..=MAX_FILTER_VALUES)
+        .map(|n| format!("Team-{n}"))
+        .collect();
+    let past_value_ceiling: Vec<&str> = past_value_ceiling.iter().map(String::as_str).collect();
+    let past_filter_ceiling: Vec<(&str, &[&str])> = (0..=MAX_FILTERS)
+        .map(|_| ("is-classic-link-enabled", &["*"][..]))
+        .collect();
+    let past_byte_ceiling = "a".repeat(MAX_FILTER_VALUE_BYTES + 1);
+    let past_id_ceiling = vec![ids[0].as_str(); MAX_RESOURCE_IDS + 1];
+    let past_id_ceiling_unheld = vec![UNHELD_VPC; MAX_RESOURCE_IDS + 1];
+
+    // Rows: (the case, the params, the whole message the refusal must carry — formed from
+    // the ceiling's constant and the count the request asked for, never from a literal).
+    let refused: Vec<(&str, Vec<Param>, String)> = vec![
+        (
+            "one filter past MAX_FILTERS",
+            super::ec2_query::filters(&past_filter_ceiling),
+            format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                MAX_FILTERS + 1
+            ),
+        ),
+        (
+            "one value past MAX_FILTER_VALUES",
+            super::ec2_query::filters(&[("tag:Owner", &past_value_ceiling)]),
+            format!(
+                "The filter 'tag:Owner' carries {} values, above the maximum of \
+                 {MAX_FILTER_VALUES}",
+                MAX_FILTER_VALUES + 1
+            ),
+        ),
+        (
+            "one byte past MAX_FILTER_VALUE_BYTES",
+            super::ec2_query::filters(&[("tag:Owner", &[past_byte_ceiling.as_str()])]),
+            format!(
+                "A value of the filter 'tag:Owner' carries {} bytes, above the maximum of \
+                 {MAX_FILTER_VALUE_BYTES}",
+                MAX_FILTER_VALUE_BYTES + 1
+            ),
+        ),
+        (
+            "one id past MAX_RESOURCE_IDS",
+            indexed("VpcId", &past_id_ceiling),
+            format!(
+                "VpcIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                MAX_RESOURCE_IDS + 1
+            ),
+        ),
+        (
+            // The ceiling is checked BEFORE the ids are resolved, so a list past it is
+            // refused for its size rather than for the VPCs it names — the same message as
+            // the row above, not an `InvalidVpcID.NotFound`.
+            "one unheld id past MAX_RESOURCE_IDS",
+            indexed("VpcId", &past_id_ceiling_unheld),
+            format!(
+                "VpcIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                MAX_RESOURCE_IDS + 1
+            ),
+        ),
+    ];
+    for (case, params, want_message) in refused {
+        let (status, body) = describe(&router, &params).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValue",
+            "case {case:?}: unexpected error code in {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            want_message,
+            "case {case:?}: unexpected message in {body}"
+        );
+        let got = elements(&body, "vpcId");
+        assert!(
+            got.is_empty(),
+            "case {case:?}: a refused describe reports no VPC, got {got:?}"
+        );
+    }
+
+    // `DryRun` asks whether the request WOULD have succeeded, so one past a ceiling is
+    // refused with that reason rather than reporting the dry run's outcome.
+    let mut params = super::ec2_query::filters(&past_filter_ceiling);
+    params.push(param("DryRun", "true"));
+    let (status, body) = describe(&router, &params).await;
+    assert_eq!(
+        status, 400,
+        "a dry run past MAX_FILTERS: expected HTTP 400, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InvalidParameterValue",
+        "a dry run past MAX_FILTERS: unexpected error code in {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Where the reported tags come from
+// ---------------------------------------------------------------------------
+
+/// Write `tags` onto `resource_id` through `CreateTags`.
+async fn create_tags(
+    router: &MultiServiceRouter,
+    case: &str,
+    resource_id: &str,
+    tags: &[(&str, &str)],
+) {
+    let mut params = vec![param("ResourceId.1", resource_id)];
+    for (position, (key, value)) in tags.iter().enumerate() {
+        params.push(param(&format!("Tag.{}.Key", position + 1), key));
+        params.push(param(&format!("Tag.{}.Value", position + 1), value));
+    }
+    let (status, body) = super::ec2_query::call(router, REGION, "CreateTags", &params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: CreateTags must succeed, got {status} with body {body}"
+    );
+}
+
+/// Take the tags with the keys `keys` off `resource_id` through `DeleteTags`.
+async fn delete_tags(router: &MultiServiceRouter, case: &str, resource_id: &str, keys: &[&str]) {
+    let mut params = vec![param("ResourceId.1", resource_id)];
+    for (position, key) in keys.iter().enumerate() {
+        params.push(param(&format!("Tag.{}.Key", position + 1), key));
+    }
+    let (status, body) = super::ec2_query::call(router, REGION, "DeleteTags", &params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DeleteTags must succeed, got {status} with body {body}"
+    );
+}
+
+/// What one VPC must be reported as, asserted against the rows one describe reported.
+fn assert_reported(
+    case: &str,
+    rows: &BTreeMap<String, Reported>,
+    vpc_id: &str,
+    enabled: bool,
+    tags: &[(&str, &str)],
+) {
+    let mut want_tags: Vec<(String, String)> = tags
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect();
+    want_tags.sort();
+    let want = Reported {
+        classic_link_enabled: wire_bool(enabled),
+        tags: want_tags,
+    };
+    let got = rows
+        .get(vpc_id)
+        .unwrap_or_else(|| panic!("case {case:?}: {vpc_id} must be reported, got {rows:?}"));
+    assert_eq!(
+        got, &want,
+        "case {case:?}: expected {vpc_id} reported as {want:?}, got {got:?}"
+    );
+}
+
+/// "Any tags assigned to the VPC" is read off the VPC when the describe runs, not copied
+/// when its ClassicLink status was set: a tag written or removed afterwards is what the next
+/// describe reports, and what its tag filters then select on. The status itself is untouched
+/// by tagging, which writes no ClassicLink state.
+///
+/// The rows are the tag counts the change moves between — none to one, one to two, two to
+/// one — over both starting statuses.
+#[tokio::test]
+async fn the_reported_tags_are_read_off_the_vpc_when_the_describe_runs() {
+    let (router, _engine, ids) = emulator().await;
+    let named: Vec<&str> = ids.iter().map(String::as_str).collect();
+
+    // A VPC seeded with no tag at all, which was never enabled: one tag written onto it
+    // afterwards is reported, and its status stays off.
+    let case = "a tag written onto an untagged VPC";
+    create_tags(&router, case, &ids[3], &[("Phase", "beta")]).await;
+    let rows = described(&router, case, &indexed("VpcId", &named)).await;
+    assert_reported(case, &rows, &ids[3], false, &[("Phase", "beta")]);
+    // Seeded with no tag and left alone, so the other untagged VPC is unaffected.
+    assert_reported(case, &rows, &ids[0], true, &[]);
+
+    // A second tag onto a VPC that already carried one, which IS enabled.
+    let case = "a second tag written onto a tagged VPC";
+    create_tags(&router, case, &ids[1], &[("Phase", "beta")]).await;
+    let rows = described(&router, case, &indexed("VpcId", &named)).await;
+    assert_reported(
+        case,
+        &rows,
+        &ids[1],
+        true,
+        &[("Owner", "TeamA"), ("Phase", "beta")],
+    );
+
+    // The tag filters select on what the VPC carries NOW: both VPCs tagged above.
+    let case = "the new tag is what the filter selects on";
+    let mut params = indexed("VpcId", &named);
+    params.extend(super::ec2_query::filters(&[("tag:Phase", &["beta"])]));
+    let got = described_ids(&router, case, &params).await;
+    let mut expected = vec![ids[1].clone(), ids[3].clone()];
+    expected.sort();
+    assert_eq!(
+        got, expected,
+        "case {case:?}: expected {expected:?}, got {got:?}"
+    );
+
+    // A tag taken off is gone from the next describe, and from what the filters select.
+    let case = "a tag taken off a tagged VPC";
+    delete_tags(&router, case, &ids[1], &["Owner"]).await;
+    let rows = described(&router, case, &indexed("VpcId", &named)).await;
+    assert_reported(case, &rows, &ids[1], true, &[("Phase", "beta")]);
+    let mut params = indexed("VpcId", &named);
+    params.extend(super::ec2_query::filters(&[("tag-key", &["Owner"])]));
+    let got = described_ids(&router, case, &params).await;
+    assert_eq!(
+        got,
+        vec![ids[2].clone()],
+        "case {case:?}: expected only the VPC that still carries an Owner tag, got {got:?}"
+    );
 }
