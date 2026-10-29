@@ -5,12 +5,16 @@
 //!
 //! The rule under test: a value outside that range is refused with the operation's
 //! `InvalidParameterException`, whose message states the rule the value broke — the member
-//! and the ONE bound it crossed for a member bounding a period or a count, the smallest
-//! page for a `maxResults` below the page-size range and the whole range for one above it
-//! — while every value inside the range, each published bound included, is accepted and
-//! acted on. The refusal is a property of the BOUND, not of the operation or of how far
-//! past it the value is, so the table below varies the member, the operation, the bound
-//! crossed and the distance past it.
+//! and the ONE bound it crossed for a member bounding a period or a count, while a
+//! `maxResults` carries the page-size sentence its own operation words — and every value
+//! inside the range, each published bound included, is accepted and acted on. The refusal
+//! is a property of the BOUND, not of the operation or of how far past it the value is, so
+//! the table below varies the member, the operation, the bound crossed and the distance
+//! past it.
+//!
+//! The page-size sentences are driven over every paging operation and both ends of every
+//! documented range in [`crate::page_size_range_refusals`]; the rows here are the ones
+//! that sit beside the other bounded integers.
 //!
 //! The bounds and their sentences come from the members' own docs
 //! (`smithy_query(query="doc",shape="<Request>",member="<member>")`):
@@ -199,7 +203,7 @@ async fn an_integer_outside_its_documented_range_is_refused_naming_the_bound_it_
             "a daemon list page below the range",
             "ListDaemonTaskDefinitions",
             json!({ "maxResults": 0 }),
-            "Max results can not be lesser than 1",
+            "MaxResults must be a positive number between 1-100.",
         ),
         (
             "a daemon list page far above the range",

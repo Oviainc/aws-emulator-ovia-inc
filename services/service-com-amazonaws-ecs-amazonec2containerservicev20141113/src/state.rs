@@ -771,10 +771,11 @@ pub fn integer_bound_message(member: &str, value: i32, min: i32, max: i32) -> Op
     }
 }
 
-/// `InvalidParameterException$message` for a `maxResults` ABOVE the largest page its own
-/// doc states ("This value can be between 1 and 100"). Amazon ECS states the RANGE the
-/// page size has to fall in and echoes neither the value the request carried nor the
-/// member's spelling on the wire.
+/// `InvalidParameterException$message` for a `maxResults` outside the inclusive page-size
+/// range its own doc states ("This value can be between 1 and 100"). Amazon ECS states the
+/// RANGE the page size has to fall in and echoes neither the value the request carried nor
+/// the member's spelling on the wire — only the two bounds, which are the operation's own
+/// documented minimum and maximum page size.
 pub fn page_size_range_message(min: i32, max: i32) -> String {
     format!("MaxResults must be a positive number between {min}-{max}.")
 }
@@ -790,13 +791,16 @@ pub fn below_minimum_message(subject: &str, min: i32) -> String {
     format!("{subject} can not be lesser than {min}")
 }
 
-/// The refusal a `maxResults` earns when it falls outside the inclusive page-size range
-/// `min..=max` its own doc states, or `None` when it is inside it.
+/// The refusal a `maxResults` of one of this API's LONG-STANDING list operations earns
+/// when it falls outside the inclusive page-size range `min..=max` its own doc states, or
+/// `None` when it is inside it.
 ///
-/// Spelled once for every operation in this crate that pages, so the refusal cannot drift
-/// between the lists — each with its own documented range. A page BELOW the range is the
+/// Spelled once for every such operation in this crate, so the refusal cannot drift
+/// between those lists — each with its own documented range. A page BELOW the range is the
 /// below-the-minimum refusal every such member answers ([`below_minimum_message`]); one
-/// above it states the range the page size has to fall in.
+/// above it states the range the page size has to fall in. The operations added with the
+/// daemon plane state that range at EITHER end instead, so they reach for
+/// [`page_size_range_violation`].
 pub fn page_size_violation(max_results: i32, min: i32, max: i32) -> Option<String> {
     if max_results < min {
         Some(below_minimum_message(&member_subject("maxResults"), min))
@@ -805,6 +809,19 @@ pub fn page_size_violation(max_results: i32, min: i32, max: i32) -> Option<Strin
     } else {
         None
     }
+}
+
+/// The refusal a `maxResults` of a DAEMON-PLANE list earns when it falls outside the
+/// inclusive page-size range `min..=max` its own doc states, or `None` when it is inside
+/// it.
+///
+/// Both ends of one documented range are the same violation of one rule for these
+/// operations, so both earn the one sentence that states that range
+/// ([`page_size_range_message`]) with that operation's own bounds — unlike the
+/// long-standing lists, whose low end names the bound the value crossed
+/// ([`page_size_violation`]).
+pub fn page_size_range_violation(max_results: i32, min: i32, max: i32) -> Option<String> {
+    (max_results < min || max_results > max).then(|| page_size_range_message(min, max))
 }
 
 /// The launch type a task takes when the request names neither a `launchType` nor a

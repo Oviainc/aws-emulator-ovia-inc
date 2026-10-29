@@ -172,9 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // "This value can be between 1 and 100."
+        // "This value can be between 1 and 100." Either end of that range is the same
+        // violation of the one documented rule, so both earn the sentence stating it.
         if let Some(message) = input.max_results.and_then(|max_results| {
-            crate::state::page_size_violation(
+            crate::state::page_size_range_violation(
                 max_results,
                 crate::state::MIN_LIST_PAGE_SIZE,
                 crate::state::MAX_LIST_PAGE_SIZE,

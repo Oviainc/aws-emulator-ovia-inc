@@ -85,6 +85,8 @@ mod load_balancer_target_group_placement;
 mod load_balancer_target_groups;
 #[path = "all/name_pattern_refusals.rs"]
 mod name_pattern_refusals;
+#[path = "all/page_size_range_refusals.rs"]
+mod page_size_range_refusals;
 #[path = "all/primary_task_set.rs"]
 mod primary_task_set;
 #[path = "all/reserved_tag_prefix.rs"]
