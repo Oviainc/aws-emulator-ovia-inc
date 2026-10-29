@@ -7,7 +7,9 @@
 //!
 //! * how a wire answer is REDUCED to what a suite asserts on — the status, the bare
 //!   error code behind `x-amzn-errortype`, the `Message` member of a restJson1 error
-//!   document, and the raw body ([`Reply`]);
+//!   document, and the raw body ([`Reply`]) — and how a request is DISPATCHED, including
+//!   the access key id it presents ([`send`], [`send_as`]), which is the one thing that
+//!   names the principal it speaks for;
 //! * how a job comes to EXIST for a test of this crate — this service's model binds no
 //!   operation that creates, lists or deletes a job, so the shared job directory the
 //!   SageMaker control plane writes is the only place an ARN can be resolved
@@ -47,24 +49,34 @@ pub const UPDATE_REWARD_PATH: &str = "/update-reward";
 pub const ACCOUNT: &str = "000000000000";
 pub const REGION: &str = "us-east-1";
 
+/// The access key id a call carries when a suite does not choose one: a key neither STS
+/// nor IAM holds a record for, which is the position the account's own published
+/// credential is in.
+pub const DEFAULT_ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+
 /// A SigV4 `Authorization` header whose credential scope names `service` — the primary
-/// routing signal `resolve_route_key` reads. Request authentication is off on the test
+/// routing signal `resolve_route_key` reads — presenting `access_key_id`, which is what
+/// names the principal the request speaks for. Request authentication is off on the test
 /// router, so the signature itself is never checked.
 #[must_use]
-pub fn authorization(service: &str) -> String {
+pub fn authorization_as(access_key_id: &str, service: &str) -> String {
     format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/us-east-1/{service}/aws4_request, \
+        "AWS4-HMAC-SHA256 \
+         Credential={access_key_id}/20240101/us-east-1/{service}/aws4_request, \
          SignedHeaders=host, Signature=\
          0000000000000000000000000000000000000000000000000000000000000000"
     )
 }
 
-/// The `Authorization` header of a request to THIS service, whose sigv4 signing name is
-/// `sagemaker`.
+/// The same header, presenting [`DEFAULT_ACCESS_KEY_ID`].
 #[must_use]
-pub fn service_authorization() -> String {
-    authorization("sagemaker")
+pub fn authorization(service: &str) -> String {
+    authorization_as(DEFAULT_ACCESS_KEY_ID, service)
 }
+
+/// This service's own sigv4 signing name, which the credential scope of a request to it
+/// carries (`smithy_query(query="service_info")`: `sigv4Name`).
+pub const SIGNING_NAME: &str = "sagemaker";
 
 /// One HTTP answer, reduced to what the suites of this crate assert on.
 #[derive(Debug)]
@@ -155,10 +167,23 @@ pub fn mounted_service() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
     (engine, router)
 }
 
-/// Dispatch one request to `path` with `headers` and `body`, signed for this service, and
-/// reduce the answer.
+/// Dispatch one request to `path` with `headers` and `body`, signed for this service with
+/// [`DEFAULT_ACCESS_KEY_ID`], and reduce the answer.
 pub async fn send(
     router: &MultiServiceRouter,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+) -> Reply {
+    send_as(router, DEFAULT_ACCESS_KEY_ID, path, headers, body).await
+}
+
+/// The same dispatch, presenting `access_key_id` — the one thing that names the principal
+/// a request speaks for, so a suite about WHO may call an operation varies it and every
+/// other suite takes the default.
+pub async fn send_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
     path: &str,
     headers: &[(&str, &str)],
     body: Vec<u8>,
@@ -166,7 +191,7 @@ pub async fn send(
     let mut request = http::Request::builder()
         .method("POST")
         .uri(format!("https://{HOST}{path}"))
-        .header("authorization", service_authorization())
+        .header("authorization", authorization_as(access_key_id, SIGNING_NAME))
         .header("host", HOST);
     for (name, value) in headers {
         request = request.header(*name, *value);

@@ -39,10 +39,24 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! Beside those seams, this file owns one submodule: [`authorization`], the IAM decision
+//! every operation of this service takes before it resolves what a request names. It sits
+//! here because it is about the REQUEST and the credentials it was signed with — the same
+//! subject as `can_handle` and the refusal seams — rather than about the trajectories
+//! `crate::state` holds.
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+
+/// WHO may reach this service's operations: the IAM authorization step every one of its
+/// handlers runs before it resolves the job or the trajectory a request names.
+///
+/// It is a submodule of this file rather than of `state`, because the decision is about
+/// the REQUEST and the caller's credentials — not about the trajectories this service
+/// stores, which `state` owns.
+pub mod authorization;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::constraints;

@@ -221,7 +221,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // IAM decides authorization before the trajectory is resolved, under this
+        // operation's own IAM action ([`crate::service::authorization`]).
+        crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME, &input.job_arn)
+            .map_err(CompleteRolloutErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CompleteRolloutErrorModeled::InternalServiceError(
                 InternalServiceError {

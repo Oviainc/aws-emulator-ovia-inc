@@ -7,7 +7,9 @@ publish = false
 build = "build.rs"
 
 [dependencies]
-# The shared request-claim rule for a SigV4 signing name several services share.
+# The shared request-claim rule for a SigV4 signing name several services share, and
+# `iam_authorization`: the shared evaluation of a principal's policy documents against an
+# action on a resource, so every service that enforces authorization decides alike.
 service-common = { path = "../common" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
@@ -27,6 +29,11 @@ tracing = { workspace = true }
 # each captured turn reports.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The STS store, for the identity an access key id speaks for: the principal
+# `sts:GetCallerIdentity` answers for the credentials a request signed with.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The IAM store, for the identity-based policy documents in force on that principal.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
