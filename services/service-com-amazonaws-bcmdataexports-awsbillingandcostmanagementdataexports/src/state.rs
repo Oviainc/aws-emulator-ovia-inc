@@ -829,21 +829,18 @@ fn not_taggable() -> ValidationException {
 /// account and resource segments hold by the time a handler runs. The RESOURCE segment is
 /// deliberately not judged here: an ARN of this account whose resource names no export is
 /// a resource this service looked for and did not find, which is the 404.
+///
+/// The account segment is read through the shared ARN parse, so this service's idea of
+/// which field of an ARN is the account is the tree's one idea of it.
 pub fn validate_taggable_resource_arn(arn: &str) -> Result<(), ValidationException> {
-    let names_this_account = arn
-        .split(':')
-        .nth(ARN_ACCOUNT_SEGMENT)
-        .is_some_and(|account| account == ::engine::emulator_account_id());
+    let names_this_account = ::service_common::arn::parse(arn)
+        .is_some_and(|parsed| parsed.account == ::engine::emulator_account_id());
     if names_this_account {
         Ok(())
     } else {
         Err(not_taggable())
     }
 }
-
-/// The 0-based position of the account segment in an ARN
-/// (`arn:<partition>:<service>:<region>:<account>:<resource>`).
-const ARN_ACCOUNT_SEGMENT: usize = 4;
 
 /// The status a freshly created export carries.
 ///

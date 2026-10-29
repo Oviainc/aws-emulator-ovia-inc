@@ -73,6 +73,8 @@ mod refusal_message_bounds;
 mod reserved_tag_keys;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/shared_arn_parse.rs"]
+mod shared_arn_parse;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/status_timestamp_wire_form.rs"]

@@ -32,7 +32,9 @@ sha2 = { workspace = true }
 # relation a statement names (including the ones inside joins and sub-queries).
 sqlparser = { version = "0.59", features = ["visitor"] }
 # `iam_authorization`: the shared evaluation of IAM policy documents against
-# (action, resource, principal), which this service's authorization check runs.
+# (action, resource, principal), which this service's authorization check runs; `arn`:
+# the one parse of an ARN's six fields, which both the tagging account check and the
+# principal resolution read an ARN through; `validation`: the refusal renderer.
 service-common = { path = "../common" }
 # The IAM store holds the identity-based policies of the principal a request speaks
 # for, and the STS store resolves which principal that is: this service reads both

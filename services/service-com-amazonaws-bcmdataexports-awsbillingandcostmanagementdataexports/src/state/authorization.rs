@@ -279,19 +279,12 @@ fn iam_user_name(arn: &str) -> Option<&str> {
 }
 
 /// The resource part of an ARN whose service segment is `service`.
+///
+/// Read through the shared ARN parse ([`::service_common::arn::parse_of`]), so this
+/// service and the services that mint these ARNs agree on what an ARN is and which of
+/// its fields the resource is.
 fn arn_resource<'a>(arn: &'a str, service: &str) -> Option<&'a str> {
-    let mut fields = arn.splitn(6, ':');
-    let (Some("arn"), Some(_partition), Some(named), Some(_region), Some(_account), Some(resource)) = (
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-    ) else {
-        return None;
-    };
-    (named == service).then_some(resource)
+    ::service_common::arn::parse_of(arn, service).map(|parsed| parsed.resource)
 }
 
 /// The inline policy documents one entity holds, from the IAM store's
