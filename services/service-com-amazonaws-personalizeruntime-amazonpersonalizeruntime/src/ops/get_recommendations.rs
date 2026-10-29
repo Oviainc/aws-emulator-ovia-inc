@@ -23,7 +23,7 @@
 //! 4. **Filter.** `filterArn` is resolved against the registry (400 when unknown) and
 //!    its expression, bound to `filterValues`, decides which stored catalog entries
 //!    come back — not what any of them scores.
-//! 5. **Score and order.** Each candidate's score is [`crate::state::scoring::relevance`]
+//! 5. **Score and order.** Each candidate's score is [`crate::state::scoring::Seed::relevance`]
 //!    of its STORED `base_score`, the request's `context` and only the ONE
 //!    personalization input the resolved resource uses (see
 //!    [`crate::state::RequiredInput::personalization`]), so an identical request
@@ -279,7 +279,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //    related-items one, leaves the scored catalog — and therefore the items
         //    returned and their order — exactly as it was.
         let personalization = resolved.required_input.personalization(user_id, item_id);
-        let context_seed = scoring::context_seed(input.context.as_ref());
+        let seed = scoring::Seed::with_context(
+            &resolved.scope,
+            personalization,
+            input.context.as_ref(),
+        );
         let mut candidates: Vec<(usize, f64)> = resolved
             .items
             .iter()
@@ -287,18 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|(_, item)| {
                 !(resolved.required_input == RequiredInput::Item && item.item_id == item_id)
             })
-            .map(|(index, item)| {
-                let score = scoring::relevance(
-                    item.base_score,
-                    &[
-                        &resolved.scope,
-                        personalization,
-                        &context_seed,
-                        &item.item_id,
-                    ],
-                );
-                (index, score)
-            })
+            .map(|(index, item)| (index, seed.relevance(item.base_score, &item.item_id)))
             .collect();
         // The reported score of an item is the model's certainty for the resolved
         // resource, the request's personalization inputs and that item, so the

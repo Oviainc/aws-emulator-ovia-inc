@@ -15,6 +15,10 @@
 //! therefore return the same ordering with the same scores, which is what a caller
 //! replaying an idempotent call observes against the real service.
 //!
+//! Which of those inputs seed one request, and in which order, is part of that rule,
+//! so it is composed in ONE place — [`Seed`] — and every operation scores each stored
+//! entry through it rather than spelling the tuple out again.
+//!
 //! The user/item-specific half comes from SHA-256 over the seed parts (the `sha2`
 //! crate, already a workspace dependency), read as a unit interval. A hash is used
 //! purely as a stable, well-distributed mixing function: it gives a different — but
@@ -70,16 +74,83 @@ pub fn affinity(parts: &[&str]) -> f64 {
 ///
 /// Monotone in `base_score` for a fixed request, and never negative: a stored entry
 /// with no popularity scores 0.
-pub fn relevance(base_score: f64, parts: &[&str]) -> f64 {
+///
+/// PRIVATE: which parts seed one request, and in which order, is the rule this module
+/// states, so it is composed in exactly one place — [`Seed`], the entry point every
+/// operation scores through.
+fn relevance(base_score: f64, parts: &[&str]) -> f64 {
     let weight = FLOOR_WEIGHT + (1.0 - FLOOR_WEIGHT) * affinity(parts);
     base_score.max(0.0) * weight
+}
+
+/// Everything about ONE request a stored entry's prediction score is a function of,
+/// composed once: the resolved resource the entry was read from, the personalization
+/// input that resource uses, and the request's `context`.
+///
+/// Built once per request, then asked for the score of each entry of that resource's
+/// stored catalog ([`Seed::relevance`]). The composition lives here and nowhere else
+/// because it is the rule, not an implementation detail of one operation: the three
+/// runtime operations serve DISJOINT recipe types, so a composition spelled out per
+/// handler could differ per handler and no single request would ever score through two
+/// of them to show it.
+#[derive(Debug, Clone)]
+pub struct Seed<'a> {
+    /// The resolved campaign or recommender: the scope every score is derived under,
+    /// so two resources never share an ordering over the same catalog.
+    scope: &'a str,
+    /// The ONE personalization input the resolved resource uses — `userId` or
+    /// `itemId`; see [`crate::state::RequiredInput::personalization`].
+    personalization: &'a str,
+    /// The request's `context` rendered by [`context_seed`], or `None` for an
+    /// operation whose model carries no `context` member at all: a member no request
+    /// to that operation can send is not part of its seed, rather than an empty part
+    /// of it.
+    context: Option<String>,
+}
+
+impl<'a> Seed<'a> {
+    /// The seed of a request to an operation that models `context`, which seeds the
+    /// score whether the request carried a map or not (an absent map is an empty
+    /// context, and still a context this operation has).
+    pub fn with_context(
+        scope: &'a str,
+        personalization: &'a str,
+        context: Option<&HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            scope,
+            personalization,
+            context: Some(context_seed(context)),
+        }
+    }
+
+    /// The seed of a request to an operation whose model carries no `context` member.
+    pub fn without_context(scope: &'a str, personalization: &'a str) -> Self {
+        Self {
+            scope,
+            personalization,
+            context: None,
+        }
+    }
+
+    /// The prediction score of one stored catalog entry — whose popularity is
+    /// `base_score` and whose id is `entry_id` — for this request.
+    pub fn relevance(&self, base_score: f64, entry_id: &str) -> f64 {
+        match self.context.as_deref() {
+            Some(context) => relevance(
+                base_score,
+                &[self.scope, self.personalization, context, entry_id],
+            ),
+            None => relevance(base_score, &[self.scope, self.personalization, entry_id]),
+        }
+    }
 }
 
 /// The request's `context` map rendered as one stable seed part.
 ///
 /// Sorted, so an equal map hashes equally however the wire order arrived — the map
 /// is unordered on the wire, and an idempotent call may not depend on its order.
-pub fn context_seed(context: Option<&HashMap<String, String>>) -> String {
+fn context_seed(context: Option<&HashMap<String, String>>) -> String {
     let Some(context) = context else {
         return String::new();
     };

@@ -20,7 +20,7 @@
 //!    version ("The solution backing the campaign must have been created using a
 //!    recipe of type PERSONALIZED_RANKING") — otherwise 400.
 //! 3. Each `inputList` entry is looked up in the campaign's STORED Items catalog. An
-//!    entry the catalog holds is scored by [`crate::state::scoring::relevance`] from
+//!    entry the catalog holds is scored by [`crate::state::scoring::Seed::relevance`] from
 //!    its stored `base_score` and the request's `userId`/`context`; an entry the
 //!    catalog does not hold "is appended to the end of the reranked list", with no
 //!    relevance score for the user. The reported score is the entry's share of the
@@ -247,21 +247,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //    to name, nor the ones the request's `filterArn` kept. Re-ranking the same
         //    user over a longer list, or with a filter, therefore reports an item with
         //    the same score, and a ranking of part of the catalog sums to at most 1.0.
-        let context_seed = scoring::context_seed(input.context.as_ref());
+        let seed = scoring::Seed::with_context(
+            &campaign.arn,
+            &input.user_id,
+            input.context.as_ref(),
+        );
         let mut catalog_shares: Vec<f64> = campaign
             .items
             .iter()
-            .map(|item| {
-                scoring::relevance(
-                    item.base_score,
-                    &[
-                        &campaign.arn,
-                        &input.user_id,
-                        &context_seed,
-                        &item.item_id,
-                    ],
-                )
-            })
+            .map(|item| seed.relevance(item.base_score, &item.item_id))
             .collect();
         scoring::normalize(&mut catalog_shares);
 

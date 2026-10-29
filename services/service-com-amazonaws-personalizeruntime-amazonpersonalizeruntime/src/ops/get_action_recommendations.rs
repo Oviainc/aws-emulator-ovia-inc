@@ -22,7 +22,7 @@
 //! 3. `filterArn` is resolved the same way (400 when unknown) and its expression, bound to
 //!    `filterValues`, decides which stored Actions-catalog entries come back — not
 //!    what any of them scores.
-//! 4. Each action's score is [`crate::state::scoring::relevance`] of its STORED
+//! 4. Each action's score is [`crate::state::scoring::Seed::relevance`] of its STORED
 //!    `base_score` and the request's `userId`, so an identical request returns an
 //!    identical ordering (the operation is `@idempotent`), and the list is reported
 //!    descending by score. The scores are normalized across the whole stored Actions
@@ -227,15 +227,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // 5. Score every stored action, settle each one's share of the certainty over
         //    the whole stored Actions catalog, then let the request's filter and
-        //    `numResults` decide which of them come back.
+        //    `numResults` decide which of them come back. The seed is composed by the
+        //    same shared helper the sibling operations score through, without the
+        //    `context` member this operation's model does not carry.
+        let seed = scoring::Seed::without_context(&campaign.arn, user_id);
         let mut ranked: Vec<(&Action, f64)> = campaign
             .actions
             .iter()
             .map(|action| {
-                let score = scoring::relevance(
-                    action.base_score,
-                    &[&campaign.arn, user_id, &action.action_id],
-                );
+                let score = seed.relevance(action.base_score, &action.action_id);
                 (action, score)
             })
             .collect();

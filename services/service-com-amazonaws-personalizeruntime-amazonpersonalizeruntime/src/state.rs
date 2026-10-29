@@ -208,7 +208,7 @@ pub struct Item {
     /// The `itemId` a `PredictedItem` reports.
     pub item_id: String,
     /// The entry's popularity in the stored catalog: the term every prediction score
-    /// is derived from (see [`scoring::relevance`]).
+    /// is derived from (see [`scoring::Seed::relevance`]).
     pub base_score: f64,
     /// The entry's Items-dataset columns, keyed by column name. Read by
     /// `metadataColumns` and by filter expressions over `Items.<COLUMN>`.
