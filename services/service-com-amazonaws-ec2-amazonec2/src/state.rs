@@ -28314,9 +28314,10 @@ pub fn echoed_resource_id(id: &str) -> String {
 /// The all-zero id is the value every client reaches for as a placeholder, and the mint
 /// counts from one ([`ComAmazonawsEc2Amazonec2State::next_id`]), so no resource can ever
 /// hold it. The ONE definition of that clause, for the id readers whose kind AWS answers
-/// `Invalid<Kind>.Malformed` for it ([`issued_long_id_is_well_formed`] and
-/// [`snapshot_id_is_well_formed`], each on the evidence recorded with it) — it is not a rule
-/// about every EC2 id, so [`prefixed_id_is_well_formed`] does not read it.
+/// `Invalid<Kind>.Malformed` for it ([`issued_long_id_is_well_formed`],
+/// [`snapshot_id_is_well_formed`] and [`fpga_image_id_is_well_formed`], each on the evidence
+/// recorded with it) — it is not a rule about every EC2 id, so
+/// [`prefixed_id_is_well_formed`] does not read it.
 fn id_is_not_the_null_id(prefix: &str, id: &str) -> bool {
     id.strip_prefix(prefix)
         .and_then(|rest| rest.strip_prefix('-'))
@@ -31434,14 +31435,24 @@ pub fn resource_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
     Scaffolded::service_error(RESOURCE_LIMIT_EXCEEDED, 400, message)
 }
 
-/// Is `id` shaped like an AFI id?
+/// Is `id` shaped like an AFI id EC2 could have ISSUED?
 ///
 /// `afi-` followed by 8 or 17 lowercase hexadecimal digits — the short and the long id form,
 /// the same two forms [`volume_id_is_well_formed`] and [`image_id_is_well_formed`] accept,
-/// read by the one [`prefixed_id_is_well_formed`] every resource of this module asks.
+/// read by the one [`prefixed_id_is_well_formed`] every resource of this module asks — of
+/// which not every digit is `0` ([`id_is_not_the_null_id`]). The null id is the placeholder
+/// every client reaches for and the mint counts from one
+/// ([`ComAmazonawsEc2Amazonec2State::next_id`]), so no AFI can ever hold it: the recorded
+/// refusal of an all-zero AFI id is `InvalidFpgaImageID.Malformed`, not the `NotFound` a
+/// well-formed id nothing is stored under is answered with. That clause is a fact of THIS id
+/// kind, the way it is of an instance id ([`instance_id_is_well_formed`]) and a Capacity
+/// Reservation Fleet id, and not of every EC2 id — a network interface id answers `NotFound`
+/// for the same suffix — so it is read here rather than in [`prefixed_id_is_well_formed`].
+///
 /// EC2 answers `InvalidFpgaImageID.Malformed` for anything else, BEFORE it looks the id up.
 pub fn fpga_image_id_is_well_formed(id: &str) -> bool {
     prefixed_id_is_well_formed(FPGA_IMAGE_ID_PREFIX, id)
+        && id_is_not_the_null_id(FPGA_IMAGE_ID_PREFIX, id)
 }
 
 /// Refuse a request that named an AFI id the account holds no FPGA image for: HTTP 400
@@ -31469,11 +31480,19 @@ pub fn invalid_fpga_image_id_not_found<E>(fpga_image_id: &str) -> Scaffolded<E> 
 /// malformed-before-not-found order for an AFI; they are two functions rather than one
 /// `require_known_…` because every operation that takes an AFI id answers its `DryRun`
 /// probe between them.
+///
+/// The AFI refusal words itself `Image ID '<id>' is invalid.` rather than with the
+/// [`invalid_id_message`] template the other id kinds of this service share: that is what the
+/// recorded refusals of an unreadable AFI id show, on the copy path
+/// (`crate::ops::copy_fpga_image`) and on the delete path alike, so it is the wording of the
+/// FPGA-image id kind and lives here, where every operation resolving an AFI reads it. Only
+/// the id is variable, and it is the one the REQUEST carried, bounded by
+/// [`echoed_resource_id`] the way every refusal that echoes a caller-chosen id is.
 pub fn invalid_fpga_image_id_malformed<E>(fpga_image_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_FPGA_IMAGE_ID_MALFORMED,
         400,
-        invalid_id_message(fpga_image_id),
+        format!("Image ID '{}' is invalid.", echoed_resource_id(fpga_image_id)),
     )
 }
 

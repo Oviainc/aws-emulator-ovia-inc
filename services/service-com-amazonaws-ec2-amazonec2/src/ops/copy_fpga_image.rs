@@ -131,19 +131,15 @@ impl From<CopyFpgaImageErrorModeled> for CopyFpgaImageError {
 /// malformed-before-not-found pair `crate::state::invalid_fpga_image_id_malformed` /
 /// `crate::state::invalid_fpga_image_id_not_found` that every operation resolving an AFI of
 /// its own Region keeps: the recorded service answers a copy whose well-formed source id
-/// names no AFI with `InvalidFpgaImageID.Malformed` and `Image ID '<id>' is invalid.`. The
-/// message is built from the request's own id, and the code is the one
-/// `crate::state::INVALID_FPGA_IMAGE_ID_MALFORMED` every AFI refusal of this service names,
-/// so there is one definition of it.
+/// names no AFI with the MALFORMED answer, whichever way the id failed to resolve.
 ///
-/// It lives here rather than in `crate::state` because `CopyFpgaImage` is the only operation
-/// that answers it.
+/// What it answers with is the one `crate::state::invalid_fpga_image_id_malformed` every AFI
+/// refusal of this service words — the code and the `Image ID '<id>' is invalid.` sentence of
+/// the FPGA-image id kind, built from the request's own id — so the copy path cannot word an
+/// unreadable AFI id a second way. Only the CHOICE of that answer for a source nothing is
+/// stored under is this operation's own, which is why the choice lives here.
 fn unresolvable_source_fpga_image_id(fpga_image_id: &str) -> CopyFpgaImageError {
-    crate::scaffolded::Scaffolded::service_error(
-        crate::state::INVALID_FPGA_IMAGE_ID_MALFORMED,
-        400,
-        format!("Image ID '{fpga_image_id}' is invalid."),
-    )
+    crate::state::invalid_fpga_image_id_malformed(fpga_image_id)
 }
 
 /// The `CopyFpgaImage` operation.

@@ -4,19 +4,25 @@
 //! driven over the wire the service actually speaks — `ec2Query`, through the crate's
 //! shared [`super::ec2_query`] harness.
 //!
-//! The rule under test: every `Invalid<Kind>.Malformed` this service answers carries HTTP
-//! 400, that kind's own error code, and a message built from the REQUEST — the fixed
-//! prefix `Invalid id: ` followed by the offending value in DOUBLE quotes. One template,
-//! whatever kind of id the parameter names and whichever operation resolves it, so a
-//! client that parses the refusal to learn WHICH value it could not read reads every one
-//! of them the same way. [`ec2::state::invalid_id_message`] is where the service words it,
-//! and this suite drives it over the wire rather than restating the text per row.
+//! The rule under test: every `Invalid<Kind>.Malformed` this service answers out of the
+//! SHARED template carries HTTP 400, that kind's own error code, and a message built from
+//! the REQUEST — the fixed prefix `Invalid id: ` followed by the offending value in DOUBLE
+//! quotes. One template, whatever kind of id the parameter names and whichever operation
+//! resolves it, so a client that parses the refusal to learn WHICH value it could not read
+//! reads every one of them the same way. [`ec2::state::invalid_id_message`] is where the
+//! service words it, and this suite drives it over the wire rather than restating the text
+//! per row.
+//!
+//! The id kinds AWS words with a sentence of their OWN are outside this template and so
+//! outside this suite — an Amazon FPGA Image id (`Image ID '<id>' is invalid.`, pinned by
+//! [`super::fpga_image_id_form`]) and an AMI usage report id — each pinned by the suite
+//! that owns its resource.
 //!
 //! Each row is a distinct input along what the rule generalises over:
 //!
 //! * the ID KIND and the operation that resolves it — an instance, a volume, an AMI, a
-//!   security group, a Spot Instance request, a Dedicated Host, an AFI, an event window, a
-//!   VPC endpoint and an Elastic IP allocation, each named through a different operation,
+//!   security group, a Spot Instance request, a Dedicated Host, an event window, a VPC
+//!   endpoint and an Elastic IP allocation, each named through a different operation,
 //!   so no row is the specification and no operation's own wording is;
 //! * the WAY the value fails to be an id of that kind — the prefix alone, a suffix of
 //!   neither published length, a non-hexadecimal digit, an upper-case digit, another
@@ -31,11 +37,10 @@
 //! id refusal and not another member's validation.
 
 use ec2::state::{
-    INVALID_ALLOCATION_ID_MALFORMED, INVALID_AMI_ID_MALFORMED, INVALID_FPGA_IMAGE_ID_MALFORMED,
-    INVALID_GROUP_ID_MALFORMED, INVALID_HOST_ID_MALFORMED,
-    INVALID_INSTANCE_EVENT_WINDOW_ID_MALFORMED, INVALID_SPOT_INSTANCE_REQUEST_ID_MALFORMED,
-    INVALID_VOLUME_ID_MALFORMED, INVALID_VPC_ENDPOINT_ID_MALFORMED,
-    MAX_ECHOED_RESOURCE_ID_CHARS,
+    INVALID_ALLOCATION_ID_MALFORMED, INVALID_AMI_ID_MALFORMED, INVALID_GROUP_ID_MALFORMED,
+    INVALID_HOST_ID_MALFORMED, INVALID_INSTANCE_EVENT_WINDOW_ID_MALFORMED,
+    INVALID_SPOT_INSTANCE_REQUEST_ID_MALFORMED, INVALID_VOLUME_ID_MALFORMED,
+    INVALID_VPC_ENDPOINT_ID_MALFORMED, MAX_ECHOED_RESOURCE_ID_CHARS,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 
@@ -121,11 +126,11 @@ fn rows() -> Vec<Row> {
             code: INVALID_HOST_ID_MALFORMED,
         },
         Row {
-            case: "the prefix without its separator, as an AFI id",
-            action: "DeleteFpgaImage",
-            field: "FpgaImageId",
-            id: "afi0a1b2c3d".to_string(),
-            code: INVALID_FPGA_IMAGE_ID_MALFORMED,
+            case: "the prefix without its separator, as a volume id",
+            action: "DeleteVolume",
+            field: "VolumeId",
+            id: "vol0a1b2c3d".to_string(),
+            code: INVALID_VOLUME_ID_MALFORMED,
         },
         Row {
             case: "a suffix one digit too long, as an event window id",

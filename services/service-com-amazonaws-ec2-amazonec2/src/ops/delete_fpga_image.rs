@@ -4,14 +4,14 @@
 //! IMPLEMENTED: takes the Amazon FPGA Image the request names out of [`crate::state`] and
 //! answers whether the delete succeeded. This is the ONLY file to touch for this operation.
 //!
-//! The refusals, in the order the service answers them: something that is not an AFI id at
-//! all is `InvalidFpgaImageID.Malformed`; a `DryRun` request a caller holds the permissions
-//! for is `DryRunOperation` and deletes nothing; and a well-formed id the account holds no
-//! AFI for is `InvalidFpgaImageID.NotFound`. `DryRun` sits BEFORE the lookup because the
-//! flag asks whether the CALLER MAY make the request — "checks whether you have the
-//! required permissions for the action, without actually making the request"
-//! (`DeleteFpgaImageRequest$DryRun`) — which is a question about the caller, not about the
-//! resource, and AWS answers it for an id nothing is stored under.
+//! The refusals, in the order the service answers them: a value outside the form EC2 could
+//! have ISSUED an AFI id in is `InvalidFpgaImageID.Malformed`; a `DryRun` request a caller
+//! holds the permissions for is `DryRunOperation` and deletes nothing; and an id inside that
+//! form the account holds no AFI for is `InvalidFpgaImageID.NotFound`. `DryRun` sits BEFORE
+//! the lookup because the flag asks whether the CALLER MAY make the request — "checks
+//! whether you have the required permissions for the action, without actually making the
+//! request" (`DeleteFpgaImageRequest$DryRun`) — which is a question about the caller, not
+//! about the resource, and AWS answers it for an id nothing is stored under.
 //!
 //! ## Shape of an operation
 //!
@@ -144,8 +144,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request was signed for.
         let _ = ctx;
 
-        // Something that is not an AFI id at all is refused as malformed, before there is
-        // anything to look up.
+        // A value outside the form EC2 issues an AFI id in is refused as malformed, before
+        // there is anything to look up.
         if !fpga_image_id_is_well_formed(&input.fpga_image_id) {
             return Err(invalid_fpga_image_id_malformed(&input.fpga_image_id));
         }
