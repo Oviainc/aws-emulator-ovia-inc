@@ -5,10 +5,11 @@
 //!
 //! The rule every case here holds the service to: **`ListResourceScans` reports the resource
 //! scans THIS account and Region persists, from newest to oldest by the scan's own
-//! `StartTime`, for exactly one `ScanType` — the one the request names, or `FULL` when it
-//! names none — with every member of a summary read off the stored scan, one page of at most
-//! `MaxResults` summaries at a time (10 by default, 100 at the most) plus the token that
-//! resumes after it, answering the empty list for an account that holds no such scan.**
+//! `StartTime`, narrowed to one `ScanType` where the request names one and over every scan
+//! type where it names none, with every member of a summary read off the stored scan, one
+//! page of at most `MaxResults` summaries at a time (10 by default, 100 at the most) plus the
+//! token that resumes after it, answering the empty list for an account that holds no such
+//! scan.**
 //!
 //! The table below is one row per scan-type selection, over seeded records spanning both
 //! `ScanType` values, every `ResourceScanStatus` value, scans that have finished and one
@@ -189,9 +190,12 @@ async fn each_scan_type_selection_reports_its_scans_newest_first() {
     // order is by `StartTime` descending, which is not the order the records were written.
     let cases: Vec<SelectionCase> = vec![
         (
-            "no ScanTypeFilter: the documented default scan type",
+            // A request that names no scan type is about the account's scans whatever type
+            // they covered, so both scan types' records are reported, interleaved by their
+            // own `StartTime`.
+            "no ScanTypeFilter: every scan type",
             vec![],
-            vec![3, 4, 1],
+            vec![5, 2, 3, 4, 1],
         ),
         (
             "ScanTypeFilter FULL: the same scans, named explicitly",
@@ -245,9 +249,14 @@ async fn each_scan_type_selection_reports_its_scans_newest_first() {
 async fn one_summary_carries_every_member_the_record_holds() {
     let router = router_with_seeded_scans();
 
-    // The `FAILED` scan is the newest `FULL` one, so it is the first summary of the default
+    // The `FAILED` scan is the newest `FULL` one, so it is the first summary of the `FULL`
     // selection: every member below is read off that record.
-    let (status_code, body) = call(&router, "ListResourceScans", &[]).await;
+    let (status_code, body) = call(
+        &router,
+        "ListResourceScans",
+        &[member("ScanTypeFilter", scan_type::FULL)],
+    )
+    .await;
     assert_eq!(
         status_code, 200,
         "case \"one record's members\": expected 200, got {status_code} {body}"
@@ -315,7 +324,11 @@ async fn a_read_reports_only_the_region_it_was_signed_for() {
     // A scan covers "the resources in this account in this Region", so the Region the
     // request was signed for is the one whose scans it reports.
     for (case, region, expected) in [
-        ("the Region the records were seeded in", REGION, vec![3, 4, 1]),
+        (
+            "the Region the records were seeded in",
+            REGION,
+            vec![5, 2, 3, 4, 1],
+        ),
         ("another Region, holding one scan of its own", OTHER_REGION, vec![6]),
         ("a Region holding no scan at all", "eu-west-1", vec![]),
     ] {

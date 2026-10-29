@@ -702,7 +702,7 @@ async fn the_refusals_around_listing_related_resources() {
     );
     assert_eq!(
         xml_text(&body, "Message").as_deref(),
-        Some(scans::SCAN_IN_PROGRESS),
+        Some(scans::OPERATION_WHILE_SCANNING),
         "case {case:?}: expected the sentence that refusal carries, got {body}"
     );
 

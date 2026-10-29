@@ -2,8 +2,9 @@
 
 //! @op ListResourceScans
 //! IMPLEMENTED: reports the resource scans this account and Region persists
-//! ([`crate::state::resource_scans`]), newest to oldest, for the one scan type the request
-//! names — or the documented default when it names none — one bounded page at a time.
+//! ([`crate::state::resource_scans`]), newest to oldest, narrowed to the one scan type the
+//! request names — and over every scan type where it names none — one bounded page at a
+//! time.
 //!
 //! ## Shape of an operation
 //!
@@ -67,9 +68,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::resource_scans::{
-    StoredResourceScan, DEFAULT_MAX_RESULTS, DEFAULT_SCAN_TYPE_FILTER,
-};
+use crate::state::resource_scans::{StoredResourceScan, DEFAULT_MAX_RESULTS};
 
 /// One stored scan as the modelled `ResourceScanSummary`: "a summary of the resource scan",
 /// every member read off the record.
@@ -162,14 +161,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx.parts());
-        // "The scan type that you want to get summary information about. The default is
-        // FULL": the response is about ONE scan type, the request's or the documented
-        // default, so a scan of the other type is not one this read reports.
-        let scan_type = input
-            .scan_type_filter
-            .as_deref()
-            .unwrap_or(DEFAULT_SCAN_TYPE_FILTER)
-            .to_string();
+        // "The scan type that you want to get summary information about": a request that
+        // names a scan type is about THAT type's scans, and one that names none is about the
+        // account's scans whatever type they covered — a scan this account and Region started
+        // is reported here whether the call that started it named scan filters or not, so the
+        // same scan is visible from the item read and from the listing.
+        let scan_type = input.scan_type_filter.clone();
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no scan store to read, so this
@@ -189,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let matching: Vec<ResourceScanSummary> = store
             .resource_scans_newest_first(&region)
             .into_iter()
-            .filter(|scan| scan.is_scan_type(&scan_type))
+            .filter(|scan| scan.is_scan_type(scan_type.as_deref()))
             .map(resource_scan_summary)
             .collect();
 

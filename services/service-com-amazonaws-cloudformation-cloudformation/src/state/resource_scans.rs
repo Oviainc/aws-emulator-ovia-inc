@@ -88,9 +88,14 @@ pub mod scan_type {
     pub const PARTIAL: &str = "PARTIAL";
 }
 
-/// The scan type a request that names no `ScanTypeFilter` selects:
-/// "The scan type that you want to get summary information about. The default is FULL."
-pub const DEFAULT_SCAN_TYPE_FILTER: &str = scan_type::FULL;
+/// Whether a record is one a request naming `wanted` as its `ScanTypeFilter` reports: "the
+/// scan type that you want to get summary information about" selects the scans of THAT type,
+/// and a request naming no scan type selects over every type — a scan the account started is
+/// reported by the listing whatever the call that started it covered, so the same scan is
+/// visible from the item read and from the listing.
+pub fn selected_by_scan_type(stored_scan_type: &str, wanted: Option<&str>) -> bool {
+    wanted.is_none_or(|wanted| wanted == stored_scan_type)
+}
 
 /// How many summaries a response carries when the request names no `MaxResults`:
 /// "The default value is 10."
@@ -478,9 +483,10 @@ impl StoredResourceScan {
     }
 
     /// Whether this record is one the `ScanTypeFilter` selects: "the scan type that you want
-    /// to get summary information about".
-    pub fn is_scan_type(&self, scan_type: &str) -> bool {
-        self.scan_type == scan_type
+    /// to get summary information about", or every record where the request names none
+    /// ([`selected_by_scan_type`]).
+    pub fn is_scan_type(&self, scan_type: Option<&str>) -> bool {
+        selected_by_scan_type(&self.scan_type, scan_type)
     }
 
     /// Whether this scan is still running — the set the one-scan-at-a-time refusal meters.
@@ -668,10 +674,23 @@ pub fn too_many_requested_resources(requested: usize) -> String {
 }
 
 /// The message answered when a scan of this account and Region is already running, which is
-/// the sentence the modelled `ResourceScanInProgressException` documents.
+/// the sentence the modelled `ResourceScanInProgressException` documents. The refusal of a
+/// request to START another scan: what it states is the exclusivity.
 pub const SCAN_IN_PROGRESS: &str =
     "A resource scan is currently in progress. Only one can be run at a time for an account \
      in a Region.";
+
+/// The message answered a request that operates ON a scan that has not finished — a read of
+/// the result a running scan has not produced yet.
+///
+/// The same modelled `ResourceScanInProgressException`, but a DIFFERENT sentence from
+/// [`SCAN_IN_PROGRESS`]: this one tells the caller to wait for THAT scan and where to watch
+/// it, rather than stating the one-scan-at-a-time rule a start is refused under. Entirely
+/// fixed text, naming nothing of the request.
+pub const OPERATION_WHILE_SCANNING: &str =
+    "The ResourceScan is in progress. Please wait for it to finish before performing any \
+     further operations on it. Describe ResourceScans to see the status of the in-progress \
+     ResourceScan.";
 
 /// A scan's ARN from its id: `ResourceScanId` is "the Amazon Resource Name (ARN) of the
 /// resource scan. The format is

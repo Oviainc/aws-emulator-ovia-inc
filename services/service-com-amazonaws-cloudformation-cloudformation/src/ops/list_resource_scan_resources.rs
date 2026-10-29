@@ -187,12 +187,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A scan that is still running has no result to list: its rows are what it finds, and
         // it has not finished finding them — the modelled `ResourceScanInProgressException`,
-        // the same set `DescribeResourceScan` withholds its counts for.
+        // the same set `DescribeResourceScan` withholds its counts for. The sentence is the
+        // one a request operating on an unfinished scan carries
+        // ([`scans::OPERATION_WHILE_SCANNING`]), not the one a second start is refused with.
         if scan.is_in_flight() {
             return Err(
                 ListResourceScanResourcesErrorModeled::ResourceScanInProgressException(
                     ResourceScanInProgressException {
-                        message: Some(scans::SCAN_IN_PROGRESS.to_string()),
+                        message: Some(scans::OPERATION_WHILE_SCANNING.to_string()),
                     },
                 )
                 .into(),
