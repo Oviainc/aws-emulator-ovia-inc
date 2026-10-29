@@ -90,11 +90,20 @@ pub fn transition_refusal(current: &str, requested: &str) -> Option<String> {
     None
 }
 
-/// Check a request's `statusDetails` against the bounds a job execution's details
-/// carry — at most [`MAX_STATUS_DETAIL_PAIRS`] name/value pairs, each name within
-/// [`MAX_STATUS_DETAIL_NAME_LEN`] and each value within
-/// [`MAX_STATUS_DETAIL_VALUE_LEN`] characters — and answer `Err` with the reason the
-/// caller reports as its modelled client error.
+/// Check a request's `statusDetails` against what a job execution's `DetailsMap`
+/// admits and the framework's own constraint walk does NOT check — at most
+/// [`MAX_STATUS_DETAIL_PAIRS`] name/value pairs, each NAME satisfying the map's KEY
+/// shape `DetailsKey` ([`is_modeled_status_detail_name`]) and each VALUE within the
+/// published [`MAX_STATUS_DETAIL_VALUE_LEN`] ceiling — and answer `Err` with the
+/// reason the caller reports as its modelled client error.
+///
+/// A map's key and value each carry their OWN declared constraints, and a name is
+/// bounded by the KEY shape's, never by the ceiling published for a value. The walk
+/// the framework runs ahead of a handler treats a map's key as a path segment rather
+/// than as a constrained leaf, so it reports a value outside `DetailsValue`'s
+/// declared length or pattern and reports NOTHING about a name: the name's own
+/// constraints are therefore the handler's to apply, and the value's declared ones
+/// are not re-checked here.
 ///
 /// NOTHING about the stored record enters the check: a supplied map REPLACES the
 /// stored one ([`JobExecutionRecord::try_replace_status_details`]), so the map the
@@ -110,6 +119,12 @@ pub fn check_status_details(details: Option<&HashMap<String, String>>) -> Result
         if name_len > MAX_STATUS_DETAIL_NAME_LEN {
             return Err(format!(
                 "a statusDetails name of {name_len} characters is over the {MAX_STATUS_DETAIL_NAME_LEN} character maximum"
+            ));
+        }
+        // Within the maximum, so the name a refusal reads back is bounded by it.
+        if !is_modeled_status_detail_name(name) {
+            return Err(format!(
+                "the statusDetails name {name} is not 1..{MAX_STATUS_DETAIL_NAME_LEN} characters matching {STATUS_DETAIL_NAME_PATTERN}"
             ));
         }
         let value_len = value.chars().count();
@@ -187,11 +202,25 @@ pub const MAX_STORED_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
 /// Jobs quota for a job execution's status details.
 pub const MAX_STATUS_DETAIL_PAIRS: usize = 10;
 /// "The maximum length of the value in the name/value pair is 1,024 characters"
-/// — every member that carries `DetailsMap`.
+/// — the published bound on the VALUE of a `statusDetails` pair, which `DetailsValue`
+/// itself leaves open above (`length min 1`), so it is the one bound on a value no
+/// constraint walk can report.
 pub const MAX_STATUS_DETAIL_VALUE_LEN: usize = 1_024;
-/// The model documents a maximum for the VALUE only; the same ceiling is applied to
-/// the NAME so a record cannot be grown through long keys either.
-pub const MAX_STATUS_DETAIL_NAME_LEN: usize = 1_024;
+/// `DetailsKey`'s declared maximum length (`length 1..128`) — the bound on a
+/// `statusDetails` NAME, which is the key shape's own and is eight times tighter
+/// than the ceiling published for a value.
+pub const MAX_STATUS_DETAIL_NAME_LEN: usize = 128;
+/// `DetailsKey`'s declared pattern, as a refusal states it: a `statusDetails` name is
+/// one or more of these characters and nothing else, so a name carrying a space,
+/// other punctuation or a non-ASCII character is not a name the map admits.
+pub const STATUS_DETAIL_NAME_PATTERN: &str = "^[a-zA-Z0-9:_-]+$";
+
+/// Whether `name` satisfies `DetailsKey`, the KEY shape of the `DetailsMap` every
+/// `statusDetails` member targets: 1..[`MAX_STATUS_DETAIL_NAME_LEN`] characters
+/// matching [`STATUS_DETAIL_NAME_PATTERN`].
+pub fn is_modeled_status_detail_name(name: &str) -> bool {
+    is_restricted_name(name, MAX_STATUS_DETAIL_NAME_LEN)
+}
 
 /// `stepTimeoutInMinutes`'s documented lower bound: "Valid values for this parameter
 /// range from 1 to 10080 (1 minute to 7 days)."
@@ -215,11 +244,20 @@ pub const MAX_THING_NAME_LEN: usize = 128;
 ///
 /// ONE rule for the whole IoT family: a name that fails it can never be addressed by
 /// a `/things/{thingName}/...` request, so an execution stored under it would exist
-/// and be unreachable. Smithy `length` counts CHARACTERS, so this does too.
+/// and be unreachable.
 pub fn is_modeled_thing_name(name: &str) -> bool {
-    let length = name.chars().count();
-    (1..=MAX_THING_NAME_LEN).contains(&length)
-        && name
+    is_restricted_name(name, MAX_THING_NAME_LEN)
+}
+
+/// Whether `text` is 1..=`max` characters of the restricted set the IoT family's
+/// name shapes declare (`^[a-zA-Z0-9:_-]+$`) — the test behind
+/// [`is_modeled_thing_name`] and [`is_modeled_status_detail_name`], which differ only
+/// in the maximum their own shape declares. Smithy `length` counts CHARACTERS, so
+/// this does too.
+fn is_restricted_name(text: &str, max: usize) -> bool {
+    let length = text.chars().count();
+    (1..=max).contains(&length)
+        && text
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'))
 }
@@ -1058,6 +1096,52 @@ mod tests {
             "case one pair too many: the refused write must change nothing, got {:?}",
             record.status_details
         );
+    }
+
+    /// RULE: a `statusDetails` NAME is admitted only within what the map's KEY shape
+    /// declares — 1..[`MAX_STATUS_DETAIL_NAME_LEN`] characters of
+    /// [`STATUS_DETAIL_NAME_PATTERN`] — which is the key's own bound and not the
+    /// ceiling published for a VALUE.
+    ///
+    /// The rows span the length (the minimum, the maximum, one past it, and lengths
+    /// only a value's ceiling would admit) and the character classes the pattern
+    /// admits and does not.
+    #[test]
+    fn a_status_details_name_is_admitted_only_within_the_key_constraint() {
+        let at_maximum = "n".repeat(MAX_STATUS_DETAIL_NAME_LEN);
+        let past_maximum = "n".repeat(MAX_STATUS_DETAIL_NAME_LEN + 1);
+        let at_the_value_ceiling = "n".repeat(MAX_STATUS_DETAIL_VALUE_LEN);
+
+        // (case, the name, admitted)
+        let rows: &[(&str, &str, bool)] = &[
+            ("one character, the declared minimum", "s", true),
+            ("every character class the pattern admits", "Step:1_a-B9", true),
+            ("the declared maximum length", &at_maximum, true),
+            ("one character past the maximum", &past_maximum, false),
+            ("the ceiling published for a value", &at_the_value_ceiling, false),
+            ("a space", "step name", false),
+            ("punctuation outside the pattern", "step.name", false),
+            ("a non-ASCII letter", "étape", false),
+            ("empty", "", false),
+        ];
+
+        for (case, name, admitted) in rows {
+            let details: HashMap<String, String> =
+                HashMap::from([((*name).to_string(), "v".to_string())]);
+            let answered = check_status_details(Some(&details));
+            assert_eq!(
+                answered.is_ok(),
+                *admitted,
+                "case {case:?} (a name of {} characters): expected admitted={admitted}, got {answered:?}",
+                name.chars().count()
+            );
+            assert_eq!(
+                is_modeled_status_detail_name(name),
+                *admitted,
+                "case {case:?}: the name test and the check must agree, got {}",
+                is_modeled_status_detail_name(name)
+            );
+        }
     }
 
     /// A created execution is pending at version 1, execution number 1, and the two

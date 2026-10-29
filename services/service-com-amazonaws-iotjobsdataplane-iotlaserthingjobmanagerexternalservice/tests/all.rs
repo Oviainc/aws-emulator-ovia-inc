@@ -29,6 +29,8 @@ mod response_document_completeness;
 mod start_next_against_a_passed_deadline;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/status_details_modeled_constraints.rs"]
+mod status_details_modeled_constraints;
 // The harness the suites above share: the emulator, its HTTP calls and the
 // stored-record helpers, declared last so the list of SUITES stays sorted.
 #[path = "all/support.rs"]
