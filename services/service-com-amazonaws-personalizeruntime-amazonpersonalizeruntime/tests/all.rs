@@ -35,6 +35,8 @@ mod promotion_share;
 mod refusal_wording;
 #[path = "all/request_only_refusal_order.rs"]
 mod request_only_refusal_order;
+#[path = "all/resolution_precedes_optional_input.rs"]
+mod resolution_precedes_optional_input;
 #[path = "all/score_denominator.rs"]
 mod score_denominator;
 #[path = "all/state_roundtrip.rs"]
