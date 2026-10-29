@@ -229,6 +229,17 @@ fn awaiting_hook(deployment: &Value, case: &str) -> (Value, String) {
     (waiting[0].clone(), stage)
 }
 
+/// A service-deployment ARN shaped exactly like `arn` whose deployment-id token names no
+/// stored rollout. The token's WIDTH is part of the ARN's shape, so the id is replaced by
+/// one of the same width rather than extended — and the counter that mints them starts at
+/// one, so the all-zero id belongs to no rollout.
+fn unrecorded_deployment_arn(arn: &str) -> String {
+    let (prefix, id) = arn
+        .rsplit_once('/')
+        .expect("a service-deployment ARN ends in its deployment-id token");
+    format!("{prefix}/{:0width$}", 0, width = id.len())
+}
+
 /// A timestamp member, as the epoch seconds an `awsJson1_1` body renders it as.
 fn seconds(body: &Value, member: &str, case: &str) -> f64 {
     body[member]
@@ -666,7 +677,7 @@ async fn requests_that_name_no_waiting_hook_are_refused() {
     let cases: Vec<(&str, String, String, Option<&str>, &str)> = vec![
         (
             "an ARN no rollout was ever recorded under",
-            format!("{plain}-absent"),
+            unrecorded_deployment_arn(&plain),
             waiting_hook_id.clone(),
             None,
             "ServiceDeploymentNotFoundException",

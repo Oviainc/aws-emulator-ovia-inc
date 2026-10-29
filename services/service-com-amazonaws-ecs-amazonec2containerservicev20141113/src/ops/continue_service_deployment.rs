@@ -6,9 +6,11 @@
 //! The rule: the action a request names is taken on the ONE `PAUSE` lifecycle hook the
 //! rollout the ARN names is currently waiting at, and only there — `CONTINUE` takes the
 //! rollout on to its next hooked stage, or to its end when it has none left, `ROLLBACK`
-//! puts the service back onto the revision the rollout before it released; a request that
-//! names a rollout nothing recorded, or a hook that is not the one waiting for an action,
-//! is refused and changes nothing. The state it reads and writes is the service deployment
+//! puts the service back onto the revision the rollout before it released; a request whose
+//! `serviceDeploymentArn` or `hookId` is not SHAPED like one this service mints is refused
+//! for its syntax before any state is read, and one that names a rollout nothing recorded,
+//! or a hook that is not the one waiting for an action, is refused and changes nothing. The
+//! state it reads and writes is the service deployment
 //! in [`crate::state`]; the waits themselves are the clock's
 //! (`state::ServiceDeploymentRecord`).
 //!
@@ -177,6 +179,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let deployment_arn = input.service_deployment_arn.trim().to_string();
         let hook_id = input.hook_id.trim().to_string();
+        // The SHAPE of each parameter is settled before any state is consulted, so a value
+        // that could name no deployment and no hook at all is refused for what it IS and
+        // not for what the store happens to hold. The ARN goes first: it is what says which
+        // rollout a hook would belong to.
+        if !crate::state::is_service_deployment_arn(&deployment_arn) {
+            return Err(
+                ContinueServiceDeploymentErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::invalid_service_deployment_arn_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+        if !crate::state::is_lifecycle_hook_id(&hook_id) {
+            return Err(
+                ContinueServiceDeploymentErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::invalid_lifecycle_hook_id_message()),
+                    },
+                )
+                .into(),
+            );
+        }
         // "The action to take on the paused lifecycle hook. ... If no value is specified,
         // the default action is CONTINUE."
         let action = input

@@ -5021,7 +5021,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             region,
             cluster_name,
             service_name,
-            &format!("{:019}", self.next_service_deployment_seq),
+            &format!(
+                "{:0width$}",
+                self.next_service_deployment_seq,
+                width = SERVICE_DEPLOYMENT_ID_WIDTH
+            ),
         )
     }
 
@@ -5261,11 +5265,17 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// Mint the id of one PAUSE lifecycle hook of a rollout.
     ///
     /// `DeploymentLifecycleHookDetail$hookId` is the id `ContinueServiceDeployment` acts
-    /// on; Amazon ECS spells an id of this kind as a UUID ([`uuid_from_sequence`]), and the
-    /// counter is what makes every hook of every rollout distinct.
+    /// on, and it carries the hook's type beside an id of its own
+    /// ([`LIFECYCLE_HOOK_ID_FORMAT`]). Every hook this service reaches is a
+    /// [`LIFECYCLE_HOOK_TARGET_PAUSE`] hook; Amazon ECS spells an id of this kind as a UUID
+    /// ([`uuid_from_sequence`]), and the counter is what makes every hook of every rollout
+    /// distinct.
     fn next_lifecycle_hook_id(&mut self) -> String {
         self.next_lifecycle_hook_seq += 1;
-        uuid_from_sequence(self.next_lifecycle_hook_seq)
+        lifecycle_hook_id(
+            LIFECYCLE_HOOK_TARGET_PAUSE,
+            &uuid_from_sequence(self.next_lifecycle_hook_seq),
+        )
     }
 
     /// Materialise the SERVICE-DEPLOYMENT transitions the clock owes, as of `now`: the
@@ -8804,6 +8814,46 @@ pub fn lifecycle_hook_not_awaiting_message(hook_id: &str, arn: &str) -> String {
     )
 }
 
+/// The literal first segment of every lifecycle hook id, as the format
+/// [`LIFECYCLE_HOOK_ID_FORMAT`] spells it.
+const LIFECYCLE_HOOK_ID_PREFIX: &str = "ecs";
+
+/// The form of a `DeploymentLifecycleHookDetail$hookId`: the literal `ecs`, the type of the
+/// hook, and the id that makes one hook of that type distinct from another, joined by
+/// hyphens. A refusal states this format rather than the value it was given.
+pub const LIFECYCLE_HOOK_ID_FORMAT: &str = "ecs-{hookType}-{id}";
+
+/// The id of ONE lifecycle hook of `hook_type`: the [`LIFECYCLE_HOOK_ID_FORMAT`] form, whose
+/// hook-type segment is the hook's `DeploymentLifecycleHookTargetType` spelled the way an id
+/// spells it.
+///
+/// Minting and checking ([`is_lifecycle_hook_id`]) read the same format, so an id this
+/// service hands a client back is always one it accepts again.
+pub fn lifecycle_hook_id(hook_type: &str, id: &str) -> String {
+    format!(
+        "{LIFECYCLE_HOOK_ID_PREFIX}-{}-{id}",
+        hook_type.to_ascii_lowercase()
+    )
+}
+
+/// Whether `hook_id` has the [`LIFECYCLE_HOOK_ID_FORMAT`] form: the `ecs` segment, then a
+/// non-empty hook type, then a non-empty id. The id segment keeps any hyphen of its own, so
+/// an id spelled as a UUID is one value and not three.
+pub fn is_lifecycle_hook_id(hook_id: &str) -> bool {
+    hook_id
+        .strip_prefix(LIFECYCLE_HOOK_ID_PREFIX)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(hook_type, id)| !hook_type.is_empty() && !id.is_empty())
+}
+
+/// The `InvalidParameterException` message for a `hookId` that is not of the form
+/// [`LIFECYCLE_HOOK_ID_FORMAT`]: the whole sentence is fixed text, stating the format the
+/// value has to take and echoing nothing the request carried.
+pub fn invalid_lifecycle_hook_id_message() -> String {
+    format!("Invalid hookId: hookId must follow the format: {LIFECYCLE_HOOK_ID_FORMAT}")
+}
+
 /// The `InvalidParameterException` message for a ROLLBACK asked for on a rollout that has
 /// no earlier service revision to roll back to.
 pub fn no_previous_service_revision_message(arn: &str) -> String {
@@ -8975,6 +9025,15 @@ pub fn service_revision_arn(
     )
 }
 
+/// The ARN resource type a service deployment is named under, as the resource segment of
+/// [`service_deployment_arn`] and the one [`is_service_deployment_arn`] reads back.
+pub const SERVICE_DEPLOYMENT_RESOURCE_TYPE: &str = "service-deployment";
+
+/// The width of the deployment-id token that ends a service-deployment ARN: the fixed-width
+/// counter the store mints it with, so sorting two of these ARNs orders the deployments they
+/// name oldest first.
+pub const SERVICE_DEPLOYMENT_ID_WIDTH: usize = 19;
+
 /// The ARN of a service deployment:
 /// `arn:aws:ecs:<region>:<account>:service-deployment/<cluster>/<service>/<id>`.
 pub fn service_deployment_arn(
@@ -8986,8 +9045,61 @@ pub fn service_deployment_arn(
     ::engine::emulator_arn(
         ARN_NAMESPACE,
         region,
-        &format!("service-deployment/{cluster_name}/{service_name}/{deployment_id}"),
+        &format!(
+            "{SERVICE_DEPLOYMENT_RESOURCE_TYPE}/{cluster_name}/{service_name}/{deployment_id}"
+        ),
     )
+}
+
+/// Whether `token` is a deployment-id token of a service-deployment ARN: the fixed-width
+/// decimal id [`service_deployment_arn`]'s last segment carries
+/// ([`SERVICE_DEPLOYMENT_ID_WIDTH`]).
+pub fn is_service_deployment_id(token: &str) -> bool {
+    token.len() == SERVICE_DEPLOYMENT_ID_WIDTH && token.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Whether `arn` is SHAPED like a service-deployment ARN —
+/// `arn:<partition>:ecs:<region>:<account>:service-deployment/<cluster>/<service>/<id>`,
+/// with names a cluster and a service may carry ([`is_valid_name`]) and a deployment-id
+/// token ([`is_service_deployment_id`]).
+///
+/// This is a SYNTAX question, not a lookup: the partition, Region and account are part of a
+/// deployment's identity, not of its shape, so an ARN of another Region names a deployment
+/// this store does not hold rather than a malformed one.
+pub fn is_service_deployment_arn(arn: &str) -> bool {
+    // `arn:<partition>:ecs:<region>:<account>:<resource>`. The resource is the LAST field,
+    // so it keeps any colon of its own.
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    if fields.len() != 6
+        || fields[0] != "arn"
+        || fields[1].is_empty()
+        || fields[2] != ARN_NAMESPACE
+        || fields[3].is_empty()
+        || fields[4].is_empty()
+    {
+        return false;
+    }
+    let Some(resource) = fields[5].strip_prefix(SERVICE_DEPLOYMENT_RESOURCE_TYPE) else {
+        return false;
+    };
+    let Some(resource) = resource.strip_prefix('/') else {
+        return false;
+    };
+    let segments: Vec<&str> = resource.split('/').collect();
+    matches!(
+        segments.as_slice(),
+        [cluster_name, service_name, deployment_id]
+            if is_valid_name(cluster_name)
+                && is_valid_name(service_name)
+                && is_service_deployment_id(deployment_id)
+    )
+}
+
+/// The `InvalidParameterException` message for a `serviceDeploymentArn` that is not shaped
+/// like one ([`is_service_deployment_arn`]): the whole sentence is fixed text, naming the
+/// parameter whose syntax is wrong and echoing nothing the request carried.
+pub fn invalid_service_deployment_arn_message() -> String {
+    "The ServiceDeployment ARN is invalid.".to_string()
 }
 
 /// Why a rollout is in the state it is in, for the deployment that rolls it out.
