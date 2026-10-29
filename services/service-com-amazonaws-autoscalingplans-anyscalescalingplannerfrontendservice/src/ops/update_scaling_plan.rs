@@ -6,10 +6,11 @@
 //!
 //! `ScalingInstructions` the request carries are MERGED with the ones in force rather
 //! than written straight over them: an update does not re-point a target tracking
-//! policy a resource already has, so the target value in force for a metric the
-//! resource already tracks is kept while the rest of the instruction — including the
-//! rest of that metric's configuration — is applied.
-//! `crate::state::merge_scaling_instructions` owns that rule.
+//! policy a resource already has, so the target value an APPLIED POLICY of the resource
+//! tracks to is kept for the metric that policy tracks, while the rest of the
+//! instruction — including the rest of that metric's configuration — is applied. A
+//! metric no applied policy tracks has nothing to keep and takes the update's target
+//! value. `crate::state::ScalingPlanRecord::merge_scaling_instructions` owns that rule.
 //!
 //! That rule rests on the recorded behaviour of this operation, which is the only
 //! evidence there is: the model states no replacement semantics for
@@ -233,13 +234,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Replace only what the request carries; everything else stays as stored. The
         // instructions it carries are MERGED with those in force, so an update does not
         // re-point a target tracking policy a resource already has (see
-        // `crate::state::merge_scaling_instructions`).
+        // `crate::state::ScalingPlanRecord::merge_scaling_instructions`).
         if let Some(source) = input.application_source {
             plan.application_source = source;
         }
         if let Some(instructions) = input.scaling_instructions {
-            plan.scaling_instructions =
-                crate::state::merge_scaling_instructions(&plan.scaling_instructions, instructions);
+            let merged = plan.merge_scaling_instructions(instructions);
+            plan.scaling_instructions = merged;
         }
         plan.begin(
             crate::state::STATUS_UPDATE_IN_PROGRESS,

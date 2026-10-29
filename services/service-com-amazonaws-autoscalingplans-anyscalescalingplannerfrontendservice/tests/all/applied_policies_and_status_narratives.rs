@@ -57,7 +57,10 @@ fn table_instruction(metric: &str, target: f64) -> Value {
 
 /// Create `name` over a distinct application source and let the clock apply it, so the
 /// plan is `Active` and its policies are on its resources.
-async fn applied_plan(emulator: &Emulator, name: &str, instructions: Vec<Value>) {
+///
+/// `pub(crate)` so a suite that needs an APPLIED plan starts from this one rather than
+/// building a second create-and-settle helper beside it.
+pub(crate) async fn applied_plan(emulator: &Emulator, name: &str, instructions: Vec<Value>) {
     emulator
         .ok(
             "CreateScalingPlan",
@@ -72,7 +75,9 @@ async fn applied_plan(emulator: &Emulator, name: &str, instructions: Vec<Value>)
 }
 
 /// The resources of `name`, as `DescribeScalingPlanResources` reports them.
-async fn resources(emulator: &Emulator, name: &str) -> Vec<Value> {
+///
+/// `pub(crate)` for the same reason: one reader of the resource envelope.
+pub(crate) async fn resources(emulator: &Emulator, name: &str) -> Vec<Value> {
     let body = emulator
         .ok(
             "DescribeScalingPlanResources",
@@ -86,7 +91,9 @@ async fn resources(emulator: &Emulator, name: &str) -> Vec<Value> {
 }
 
 /// The one plan `name`, as `DescribeScalingPlans` reports it.
-async fn described(emulator: &Emulator, name: &str) -> Value {
+///
+/// `pub(crate)` for the same reason: one reader of the plan envelope.
+pub(crate) async fn described(emulator: &Emulator, name: &str) -> Value {
     let body = emulator
         .ok(
             "DescribeScalingPlans",

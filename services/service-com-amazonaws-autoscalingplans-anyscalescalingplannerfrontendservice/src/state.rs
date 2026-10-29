@@ -321,6 +321,100 @@ impl ScalingPlanRecord {
             })
             .collect()
     }
+
+    /// The scaling instructions in force after an update of this plan that asks for
+    /// `requested`.
+    ///
+    /// An update does not re-point a target tracking policy a resource already has: for
+    /// a resource the plan already covers, the TARGET VALUE an applied policy of that
+    /// resource tracks to is kept for the metric that policy tracks, because re-pointing
+    /// it is what the update would otherwise do. Which policies a resource has is
+    /// [`Self::applied_policies`], the one answer this crate gives that question, so a
+    /// metric no applied policy tracks has no tracked value to keep and takes the target
+    /// value the update supplies — a resource whose instruction in force turned dynamic
+    /// scaling off carries no policy at all, so every target value it reports afterwards
+    /// is the update's.
+    ///
+    /// Not even `ScalingInstruction$ScalingPolicyUpdateBehavior`
+    /// (`ReplaceExternalPolicies`, "any scaling policies that are external to AWS Auto
+    /// Scaling are deleted and new target tracking scaling policies created") re-points a
+    /// policy the plan applied: those policies are not external to AWS Auto Scaling, and
+    /// the recorded response to an update carrying that behaviour still reports the target
+    /// value established earlier in the plan's lifecycle.
+    ///
+    /// Everything else the update carries IS applied: an instruction for a resource the
+    /// plan did not cover, the disappearance of one it did, an instruction's capacity
+    /// bounds and predictive-scaling members, the rest of a tracked metric's configuration
+    /// (its cooldowns, its warmup, whether scale-in is disabled), and a whole
+    /// configuration for a metric no policy of the resource tracks — a metric being what
+    /// [`target_metric_identity`] renders, so a configuration re-pointed at another
+    /// resource tracks a metric no policy is in force for and takes the target value
+    /// requested.
+    pub fn merge_scaling_instructions(
+        &self,
+        requested: Vec<ScalingInstruction>,
+    ) -> Vec<ScalingInstruction> {
+        // The instructions in force are INDEXED by the resource each applies to before
+        // the merge, so the work is one lookup per requested instruction rather than a
+        // scan of everything in force per requested instruction — neither list's length
+        // is bounded by the model, so their product must not drive the work.
+        let in_force: BTreeMap<ResourceIdentity<'_>, &ScalingInstruction> = self
+            .scaling_instructions
+            .iter()
+            .map(|instruction| (resource_identity(instruction), instruction))
+            .collect();
+        requested
+            .into_iter()
+            .map(|instruction| {
+                match in_force.get(&resource_identity(&instruction)) {
+                    Some(in_force) => self.keep_policy_target_values(in_force, instruction),
+                    None => instruction,
+                }
+            })
+            .collect()
+    }
+
+    /// `requested` with the target value of every metric an applied policy of the
+    /// resource tracks taken from that policy, and every other member as `requested`
+    /// words it.
+    ///
+    /// The policies come from [`Self::applied_policies`] of the instruction `in_force`,
+    /// so the values kept here are exactly the ones a caller can read back off the
+    /// resource, and an instruction that applied no policy keeps nothing.
+    ///
+    /// Both configuration lists are bounded by [`MAX_TARGET_TRACKING_CONFIGURATIONS`],
+    /// the documented "(up to 10)" that [`validate_scaling_instructions`] enforces on the
+    /// way in, so this inner work is bounded whatever a caller sends.
+    fn keep_policy_target_values(
+        &self,
+        in_force: &ScalingInstruction,
+        mut requested: ScalingInstruction,
+    ) -> ScalingInstruction {
+        let tracked: BTreeMap<String, f64> = self
+            .applied_policies(in_force)
+            .into_iter()
+            .filter_map(|policy| {
+                let configuration = policy.target_tracking_configuration?;
+                Some((
+                    target_metric_identity(&configuration)?,
+                    configuration.target_value,
+                ))
+            })
+            .collect();
+        requested.target_tracking_configurations = requested
+            .target_tracking_configurations
+            .into_iter()
+            .map(|mut configuration| {
+                let tracked_value = target_metric_identity(&configuration)
+                    .and_then(|metric| tracked.get(&metric).copied());
+                if let Some(tracked_value) = tracked_value {
+                    configuration.target_value = tracked_value;
+                }
+                configuration
+            })
+            .collect();
+        requested
+    }
 }
 
 /// What a request is about to do to the plan it names — the ONLY thing the two write
@@ -966,76 +1060,6 @@ pub const UNSUPPORTED_RESOURCE: &str =
 /// doc: "the resource type is `index` and the unique identifier is the resource ID.
 /// Example: `table/my-table/index/my-table-index`".
 const INDEX_SEGMENT: &str = "/index/";
-
-/// The scaling instructions in force after an update that asks for `requested`.
-///
-/// An update does not re-point a target tracking policy a resource already has: for a
-/// resource the plan already covers, the TARGET VALUE in force for a scaling metric the
-/// resource already tracks is kept, because that value is what the applied policy tracks
-/// to. Not even `ScalingInstruction$ScalingPolicyUpdateBehavior`
-/// (`ReplaceExternalPolicies`, "any scaling policies that are external to AWS Auto
-/// Scaling are deleted and new target tracking scaling policies created") re-points it:
-/// the policies the plan itself applied are not external to AWS Auto Scaling, and the
-/// recorded response to an update carrying that behaviour still reports the target value
-/// established earlier in the plan's lifecycle.
-///
-/// Everything else the update carries IS applied: an instruction for a resource the plan
-/// did not cover, the disappearance of one it did, an instruction's capacity bounds and
-/// predictive-scaling members, the rest of a tracked metric's configuration (its
-/// cooldowns, its warmup, whether scale-in is disabled), and a whole configuration for a
-/// metric the resource does not track yet — a metric being what
-/// [`target_metric_identity`] renders, so a configuration re-pointed at another resource
-/// tracks a metric no policy is in force for and takes the target value requested.
-pub fn merge_scaling_instructions(
-    in_force: &[ScalingInstruction],
-    requested: Vec<ScalingInstruction>,
-) -> Vec<ScalingInstruction> {
-    // The instructions in force are INDEXED by the resource each applies to before the
-    // merge, so the work is one lookup per requested instruction rather than a scan of
-    // everything in force per requested instruction — neither list's length is bounded
-    // by the model, so their product must not drive the work.
-    let applied: BTreeMap<ResourceIdentity<'_>, &ScalingInstruction> = in_force
-        .iter()
-        .map(|instruction| (resource_identity(instruction), instruction))
-        .collect();
-    requested
-        .into_iter()
-        .map(|instruction| {
-            match applied.get(&resource_identity(&instruction)) {
-                Some(applied) => keep_tracked_target_values(applied, instruction),
-                None => instruction,
-            }
-        })
-        .collect()
-}
-
-/// `requested` with the target value of every metric `applied` already tracks taken
-/// from the configuration in force, and every other member as `requested` words it.
-///
-/// Both configuration lists are bounded by [`MAX_TARGET_TRACKING_CONFIGURATIONS`], the
-/// documented "(up to 10)" that [`validate_scaling_instructions`] enforces on the way
-/// in, so this inner scan is bounded whatever a caller sends.
-fn keep_tracked_target_values(
-    applied: &ScalingInstruction,
-    mut requested: ScalingInstruction,
-) -> ScalingInstruction {
-    requested.target_tracking_configurations = requested
-        .target_tracking_configurations
-        .into_iter()
-        .map(|mut configuration| {
-            let metric = target_metric_identity(&configuration);
-            let in_force = applied
-                .target_tracking_configurations
-                .iter()
-                .find(|in_force| metric.is_some() && target_metric_identity(in_force) == metric);
-            if let Some(in_force) = in_force {
-                configuration.target_value = in_force.target_value;
-            }
-            configuration
-        })
-        .collect();
-    requested
-}
 
 /// The identity of the one scalable resource a scaling instruction applies to.
 ///
