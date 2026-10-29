@@ -22,6 +22,10 @@
 //!   documentation, so resuming is not this call's business — a caller whose
 //!   session has expired resumes it there, and this call then reports the
 //!   session that start created.
+//! * a caller terminated the session — `stopping` while the close is still in
+//!   flight and `stopped` after it, with no URLs, on the same ground: a session
+//!   that was closed is brought back by `StartGUISession`, not silently by this
+//!   call;
 //! * the instance is still coming up — `settingUpInstance`, with
 //!   `percentageComplete` tracking the transition the clock owes it;
 //! * the instance is stopping or stopped — `notStarted`: no session is up and
@@ -30,10 +34,9 @@
 //!   (`state::advance_clock`), so a stop and a start always lead to a new
 //!   session rather than to URLs that reach nothing.
 //!
-//! The modelled `Status` members this never answers — `stopping`, `stopped` and
-//! the three `failed*` ones — belong to `StopGUISession` and to failures this
-//! store does not produce; `failureReason` is therefore absent, because nothing
-//! here fails a session.
+//! The modelled `Status` members this never answers are the three `failed*`
+//! ones, which describe failures this store does not produce; `failureReason` is
+//! therefore absent, because nothing here fails a session.
 //!
 //! ## Shape of an operation
 //!
@@ -224,11 +227,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (crate::state::GUI_SESSION_STATUS_NOT_STARTED, 0, None)
             } else {
                 match stored {
-                    // The session's documented active hour has run out, so its
-                    // URLs reach nothing and are not reported. Resuming the
-                    // session is `StartGUISession`'s business.
+                    // A session nothing can serve any more: its documented
+                    // active hour has run out, or a caller terminated it. Either
+                    // way its URLs reach nothing and are not reported, and the
+                    // status is the session's own — `startExpired` for the hour
+                    // that ran out, `stopping` or `stopped` for a close.
+                    // Bringing a session back on the computer is
+                    // `StartGUISession`'s business.
                     Some(session) if !session.is_live_at(now) => (
-                        crate::state::GUI_SESSION_STATUS_START_EXPIRED,
+                        session.status_at(now),
                         session.percentage_complete_at(now),
                         None,
                     ),

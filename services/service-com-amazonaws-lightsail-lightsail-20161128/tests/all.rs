@@ -175,6 +175,8 @@ mod export_snapshot_source_kinds;
 mod gui_session_access_details;
 #[path = "all/gui_session_start.rs"]
 mod gui_session_start;
+#[path = "all/gui_session_stop.rs"]
+mod gui_session_stop;
 #[path = "all/instance_delete_attachments.rs"]
 mod instance_delete_attachments;
 #[path = "all/instance_delete_bucket_access.rs"]

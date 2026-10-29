@@ -54,7 +54,10 @@ const OPERATION_TYPE: &str = "StartGUISession";
 
 /// The endpoint the suite pretends to have reached the emulator on, so the
 /// session URLs the read-back reports are addresses the caller could reach.
-const HOST: &str = "lightsail.emulator.test";
+///
+/// `pub(crate)` so the sibling suite about terminating a session drives the same
+/// front door at the same endpoint rather than standing up its own helpers.
+pub(crate) const HOST: &str = "lightsail.emulator.test";
 
 /// The body member `code` Lightsail sets on a rejection whose cause is that what
 /// the request names does not exist, and the wire error code that carries it.
@@ -67,23 +70,26 @@ const INVALID_INPUT: &str = "InvalidInputException";
 
 /// One virtual computer to start a GUI session on. The rows differ in blueprint
 /// platform, bundle size, Region and IP address type.
+///
+/// `pub(crate)` so the sibling suite about terminating a session spans the same
+/// computers rather than repeating the table.
 #[derive(Debug)]
-struct Row {
-    case: &'static str,
-    name: &'static str,
-    availability_zone: &'static str,
-    region: &'static str,
-    blueprint_id: &'static str,
-    bundle_id: &'static str,
+pub(crate) struct Row {
+    pub(crate) case: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) availability_zone: &'static str,
+    pub(crate) region: &'static str,
+    pub(crate) blueprint_id: &'static str,
+    pub(crate) bundle_id: &'static str,
     /// `None` leaves `ipAddressType` out of the request, which the service
     /// defaults to `dualstack`.
-    ip_address_type: Option<&'static str>,
+    pub(crate) ip_address_type: Option<&'static str>,
 }
 
 /// The table every wire case here runs. Blueprint ids and bundle ids are the
 /// catalogs `GetBlueprints` and `GetBundles` publish (`crate::state::BLUEPRINTS`
 /// and `crate::state::BUNDLE_SPECS`).
-const ROWS: &[Row] = &[
+pub(crate) const ROWS: &[Row] = &[
     Row {
         case: "amazon linux, no ipAddressType (dualstack by default)",
         name: "start-gui-amazon-linux",
@@ -133,7 +139,7 @@ const MISSING_NAMES: &[&str] = &[
 ];
 
 /// The `CreateInstances` body for `row`, naming one computer.
-fn create_body(row: &Row, name: &str) -> Value {
+pub(crate) fn create_body(row: &Row, name: &str) -> Value {
     let mut body = json!({
         "instanceNames": [name],
         "availabilityZone": row.availability_zone,
@@ -147,7 +153,7 @@ fn create_body(row: &Row, name: &str) -> Value {
 }
 
 /// Start the GUI session of `name` in `region`, requiring success.
-async fn start_session(emulator: &Emulator, region: &str, name: &str) -> Value {
+pub(crate) async fn start_session(emulator: &Emulator, region: &str, name: &str) -> Value {
     emulator
         .ok_at(
             Some(HOST),
@@ -160,7 +166,7 @@ async fn start_session(emulator: &Emulator, region: &str, name: &str) -> Value {
 
 /// The `CreateGUISessionAccessDetails` answer for `name` in `region` — the read
 /// this suite proves a start through.
-async fn access_details(emulator: &Emulator, region: &str, name: &str) -> Value {
+pub(crate) async fn access_details(emulator: &Emulator, region: &str, name: &str) -> Value {
     emulator
         .ok_at(
             Some(HOST),
@@ -173,7 +179,7 @@ async fn access_details(emulator: &Emulator, region: &str, name: &str) -> Value 
 
 /// The token both URLs of the session `name` holds address it by, as the access
 /// details report them — `None` when no session is reported at all.
-fn reported_token(case: &str, body: &Value) -> Option<String> {
+pub(crate) fn reported_token(case: &str, body: &Value) -> Option<String> {
     let entries = body["sessions"].as_array()?;
     let mut tokens: Vec<String> = Vec::new();
     for entry in entries {
@@ -205,7 +211,12 @@ fn reported_token(case: &str, body: &Value) -> Option<String> {
 
 /// The modelled `Status` the access details report for `name`, checked against
 /// the modelled `Status` enum.
-async fn reported_status(case: &str, emulator: &Emulator, region: &str, name: &str) -> String {
+pub(crate) async fn reported_status(
+    case: &str,
+    emulator: &Emulator,
+    region: &str,
+    name: &str,
+) -> String {
     let body = access_details(emulator, region, name).await;
     let status = body["status"]
         .as_str()
@@ -280,7 +291,11 @@ fn assert_start_operation(
 
 /// Poll the access details of `name` until they report `started`, answering the
 /// body they reported it in.
-async fn wait_until_session_started(emulator: &Emulator, region: &str, name: &str) -> Value {
+pub(crate) async fn wait_until_session_started(
+    emulator: &Emulator,
+    region: &str,
+    name: &str,
+) -> Value {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let body = access_details(emulator, region, name).await;
@@ -297,7 +312,7 @@ async fn wait_until_session_started(emulator: &Emulator, region: &str, name: &st
 }
 
 /// Poll `GetOperation` for `id` until the entry is terminal, answering it.
-async fn wait_until_operation_terminal(emulator: &Emulator, id: &str) -> Value {
+pub(crate) async fn wait_until_operation_terminal(emulator: &Emulator, id: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let entry = emulator
@@ -320,7 +335,7 @@ async fn wait_until_operation_terminal(emulator: &Emulator, id: &str) -> Value {
 /// public state API a handler uses — so a case can assert the window AWS
 /// documents a session stays active for was not restarted, which no reported
 /// member carries.
-fn stored_session(emulator: &Emulator, name: &str) -> Option<StoredGuiSession> {
+pub(crate) fn stored_session(emulator: &Emulator, name: &str) -> Option<StoredGuiSession> {
     lightsail_state::with_state(emulator.engine(), |store| {
         store.instance(name).and_then(|instance| instance.gui_session.clone())
     })
@@ -328,7 +343,11 @@ fn stored_session(emulator: &Emulator, name: &str) -> Option<StoredGuiSession> {
 }
 
 /// Every `operationType` the operation log reports for the resource `name`.
-async fn logged_types_for(emulator: &Emulator, region: &str, name: &str) -> Vec<String> {
+pub(crate) async fn logged_types_for(
+    emulator: &Emulator,
+    region: &str,
+    name: &str,
+) -> Vec<String> {
     let body = emulator
         .ok_at(
             Some(HOST),

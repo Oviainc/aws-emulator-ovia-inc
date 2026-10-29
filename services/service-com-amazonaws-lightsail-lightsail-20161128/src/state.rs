@@ -808,6 +808,9 @@ pub const OPERATION_TYPE_UPDATE_INSTANCE_METADATA_OPTIONS: &str = "UpdateInstanc
 /// The `operationType` the log entry of a `StartGUISession` call carries, the
 /// modelled `OperationType` enum's own `StartGUISession` member.
 pub const OPERATION_TYPE_START_GUI_SESSION: &str = "StartGUISession";
+/// The `operationType` the log entry of a `StopGUISession` call carries, the
+/// modelled `OperationType` enum's own `StopGUISession` member.
+pub const OPERATION_TYPE_STOP_GUI_SESSION: &str = "StopGUISession";
 
 // ---------------------------------------------------------------------------
 // Store bounds
@@ -5406,6 +5409,14 @@ pub const GUI_SESSION_STATUS_SETTING_UP_INSTANCE: &str = "settingUpInstance";
 pub const GUI_SESSION_STATUS_STARTING: &str = "starting";
 /// The session is serving: its two URLs reach a session that is up.
 pub const GUI_SESSION_STATUS_STARTED: &str = "started";
+/// The session is being terminated: the close a `StopGUISession` call asked for
+/// is still in flight, so the session is on its way down.
+pub const GUI_SESSION_STATUS_STOPPING: &str = "stopping";
+/// The session has been terminated — "The session will close and any unsaved
+/// data will be lost" (the modelled `StopGUISession` documentation) — so the
+/// URLs it was published under reach nothing and only a start brings a session
+/// back on that virtual computer.
+pub const GUI_SESSION_STATUS_STOPPED: &str = "stopped";
 /// The session's active window ([`GUI_SESSION_ACTIVE_MILLIS`]) has run out. The
 /// caller resumes it with `StartGUISession` — "Use this action to resume the
 /// session after it expires" (the modelled `StartGUISession` documentation) —
@@ -5484,10 +5495,49 @@ pub fn elapsed_percentage(start_ms: i64, end_ms: i64, now_ms: i64) -> i32 {
     i32::try_from(elapsed.saturating_mul(100) / span).unwrap_or(100)
 }
 
+/// The termination of one GUI session a caller asked for: when the close was
+/// asked for, and the instant the clock owes the session its `stopped` status.
+///
+/// A close is not instantaneous — `stopping` is a modelled `Status` member, so a
+/// session on its way down is a state AWS reports — and it takes
+/// [`STATE_TRANSITION_MILLIS`], the same span every other transition in this
+/// store takes, so a caller that reads straight after the call still observes it.
+#[derive(Debug, Clone, Copy)]
+pub struct GuiSessionStop {
+    /// The instant the close was asked for, which the progress of the close is
+    /// measured from.
+    pub requested_at_ms: i64,
+    /// The instant the clock owes the session its `stopped` status.
+    pub at_ms: i64,
+}
+
+impl GuiSessionStop {
+    /// A close asked for at `now_ms`, due [`STATE_TRANSITION_MILLIS`] later.
+    pub fn after(now_ms: i64) -> Self {
+        Self {
+            requested_at_ms: now_ms,
+            at_ms: now_ms.saturating_add(STATE_TRANSITION_MILLIS),
+        }
+    }
+
+    /// Whether the session this close belongs to has reached `stopped` by
+    /// `now_ms`.
+    pub fn is_complete_at(&self, now_ms: i64) -> bool {
+        self.at_ms <= now_ms
+    }
+
+    /// How far through this close the instant `now_ms` is, as a whole
+    /// percentage — what `percentageComplete` reports while a session is on its
+    /// way down, and 100 once it is down.
+    pub fn percentage_complete_at(&self, now_ms: i64) -> i32 {
+        elapsed_percentage(self.requested_at_ms, self.at_ms, now_ms)
+    }
+}
+
 /// The GUI (Amazon DCV) session access this store has created for one virtual
-/// computer: the token its URLs are addressed by, and the two instants that
-/// decide the session's status — when it finishes coming up, and when its active
-/// window runs out.
+/// computer: the token its URLs are addressed by, and the instants that decide
+/// the session's status — when it finishes coming up, when its active window runs
+/// out, and, once a caller has terminated it, when it finishes closing.
 ///
 /// The URLs themselves are NOT stored: they are built per request from the
 /// endpoint that request arrived at (see [`gui_session_url`]), so a caller that
@@ -5501,6 +5551,9 @@ pub struct StoredGuiSession {
     pub created_at_ms: i64,
     /// The instant the clock owes the session its `started` status.
     pub starts_at_ms: i64,
+    /// The close a caller asked for on this session, once one has been asked
+    /// for: `None` for a session nothing has terminated.
+    pub stop: Option<GuiSessionStop>,
 }
 
 impl StoredGuiSession {
@@ -5529,6 +5582,7 @@ impl StoredGuiSession {
             starts_at_ms: ready_at_ms
                 .max(now_ms)
                 .saturating_add(STATE_TRANSITION_MILLIS),
+            stop: None,
         }
     }
 
@@ -5538,29 +5592,46 @@ impl StoredGuiSession {
         self.starts_at_ms.saturating_add(GUI_SESSION_ACTIVE_MILLIS)
     }
 
-    /// Whether this session is still within its active window at `now_ms`.
+    /// Whether this session is serving, or still on its way to serving, at
+    /// `now_ms`.
+    ///
+    /// A session a caller has terminated is NOT live however much of its active
+    /// window is left: the close is what ended it, so the next start resumes the
+    /// computer's session as a new one rather than handing back this address.
     pub fn is_live_at(&self, now_ms: i64) -> bool {
-        now_ms < self.expires_at_ms()
+        self.stop.is_none() && now_ms < self.expires_at_ms()
     }
 
     /// The modelled `Status` this session is in at `now_ms`: `starting` until it
     /// has come up, `started` for its active hour, and `startExpired` once that
-    /// hour has run out.
+    /// hour has run out — or, for a session a caller has terminated, `stopping`
+    /// until the close is through and `stopped` after it, because the close is
+    /// what the session's status is about from the instant it was asked for.
     pub fn status_at(&self, now_ms: i64) -> &'static str {
-        if !self.is_live_at(now_ms) {
-            GUI_SESSION_STATUS_START_EXPIRED
+        if let Some(stop) = self.stop {
+            if stop.is_complete_at(now_ms) {
+                GUI_SESSION_STATUS_STOPPED
+            } else {
+                GUI_SESSION_STATUS_STOPPING
+            }
         } else if now_ms < self.starts_at_ms {
             GUI_SESSION_STATUS_STARTING
-        } else {
+        } else if now_ms < self.expires_at_ms() {
             GUI_SESSION_STATUS_STARTED
+        } else {
+            GUI_SESSION_STATUS_START_EXPIRED
         }
     }
 
     /// `percentageComplete` for this session at `now_ms`: how far it is through
     /// coming up, and 100 once it is up — the start it reports the completion of
-    /// is over, whether the session is still serving or its hour has run out.
+    /// is over, whether the session is still serving or its hour has run out. For
+    /// a session a caller has terminated it is how far that close has got, which
+    /// is the work the call reporting it started.
     pub fn percentage_complete_at(&self, now_ms: i64) -> i32 {
-        if now_ms < self.starts_at_ms {
+        if let Some(stop) = self.stop {
+            stop.percentage_complete_at(now_ms)
+        } else if now_ms < self.starts_at_ms {
             elapsed_percentage(self.created_at_ms, self.starts_at_ms, now_ms)
         } else {
             100

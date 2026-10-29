@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopGUISession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopGUISession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Terminates the Amazon DCV graphical user interface session of a stored virtual
+//! computer, and answers the operation-log entry that records the termination.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopGUISession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! ## What this operation does
+//!
+//! The session is the resource this call acts on, and it runs ON the virtual
+//! computer the request names, so what the call does depends on what that stored
+//! computer holds:
+//!
+//! * the computer holds a session nothing has terminated yet — the session is
+//!   closed: it is `stopping` until the clock owes it `stopped`, so the URLs it
+//!   was published under stop reaching a session that serves, and "any unsaved
+//!   data will be lost" because nothing of the session is kept;
+//! * the computer holds a session whose close was already asked for — the close
+//!   already under way is left exactly where it is, so a second terminate
+//!   neither restarts it nor pushes the instant it completes further out;
+//! * the computer holds no session at all — there is nothing to close, so the
+//!   end state the request asks for already holds and the call is accepted
+//!   rather than refused, with nothing written.
+//!
+//! A terminated session is NOT resumed by reading its access details: bringing a
+//! session back on the computer is `StartGUISession`'s business ("Use this action
+//! to resume the session after it expires"), which mints a new session under a
+//! new token.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +171,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopGUISession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopGUISessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopGUISession"))
+        // `ctx` carries request metadata only, and nothing this call stores comes
+        // from it: the session runs on a virtual computer that already exists, so
+        // the close is recorded where that computer is rather than where the
+        // request signed for.
+        let _ = ctx;
+
+        // `resourceName` is a modelled `@required` member carrying the modelled
+        // `ResourceName` pattern, so the centralized walk refused anything
+        // outside it before this body ran.
+        let name = input.resource_name;
+
+        let stopped = crate::state::with_state(&*self.engine, |store| {
+            // Read after the store is held, so the instant this call records is
+            // never earlier than the one the clock has already been advanced to:
+            // a record cannot be created already due.
+            let now = crate::state::now_ms();
+            let (location, status, settles_at_ms) = {
+                // The session runs on the named virtual computer, so a name this
+                // account holds no computer under is refused rather than a close
+                // being recorded against nothing.
+                let Some(instance) = store.instance_mut(&name) else {
+                    return Err(not_found(&name));
+                };
+                let location = instance.location.clone();
+                let (status, settles_at_ms) = match instance.gui_session.as_mut() {
+                    Some(session) => {
+                        // A close the caller already asked for keeps the instant
+                        // the clock owes it: terminating a session that is
+                        // already on its way down does not restart the close or
+                        // push its completion further out.
+                        let stop = *session
+                            .stop
+                            .get_or_insert_with(|| crate::state::GuiSessionStop::after(now));
+                        (
+                            session.status_at(now),
+                            // Still closing: the clock owes the entry its
+                            // terminal status at the instant the session is
+                            // down. A session that is already down leaves
+                            // nothing outstanding.
+                            (!stop.is_complete_at(now)).then_some(stop.at_ms),
+                        )
+                    }
+                    // Nothing is up on this computer, so there is nothing to
+                    // close: the end state the request asks for already holds,
+                    // which is a served call with nothing written rather than a
+                    // refusal.
+                    None => (crate::state::GUI_SESSION_STATUS_NOT_STARTED, None),
+                };
+                (location, status, settles_at_ms)
+            };
+
+            // `operations` is a list because other Lightsail calls act on several
+            // resources at once; this one acts on exactly one virtual computer,
+            // so it answers exactly one entry, located where that computer is.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_STOP_GUI_SESSION,
+                crate::state::RESOURCE_TYPE_INSTANCE,
+                &name,
+                &location,
+                settles_at_ms,
+            );
+            Ok((
+                StopGUISessionOutput {
+                    operations: Some(vec![operation.view()]),
+                },
+                operation.id.clone(),
+                status,
+            ))
+        })
+        .ok_or_else(unavailable)?;
+
+        let (output, operation_id, session_status) = stopped?;
+        // Audit record for a call that closes access to a virtual computer: the
+        // operation, the computer it acted on, how far the session has got and
+        // the log entry it wrote. The token the session was addressed by is NOT
+        // logged — it is what an access URL carries — and neither is any
+        // credential.
+        ::tracing::info!(
+            audit = true,
+            operation = "StopGUISession",
+            outcome = "stopped",
+            resource_name = %name,
+            session_status,
+            operation_id = %operation_id,
+            "GUI session terminated on a Lightsail virtual computer"
+        );
+        Ok(output)
     }
+}
+
+/// No virtual computer of that name is stored: Lightsail's `DoesNotExist`
+/// rejection — HTTP 400, wire error `NotFoundException`, body `code`
+/// `DoesNotExist` and a message naming the resource type and the requested name.
+fn not_found(name: &str) -> StopGUISessionError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_INSTANCE,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> StopGUISessionError {
+    StopGUISessionErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail instance store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
