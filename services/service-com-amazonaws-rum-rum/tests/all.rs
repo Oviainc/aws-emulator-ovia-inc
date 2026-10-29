@@ -67,6 +67,8 @@ mod metrics_destination_removal;
 mod metrics_destinations;
 #[path = "all/not_found_and_conflict_bodies.rs"]
 mod not_found_and_conflict_bodies;
+#[path = "all/pagination_token_check_precedence.rs"]
+mod pagination_token_check_precedence;
 #[path = "all/platform_domain_authority.rs"]
 mod platform_domain_authority;
 #[path = "all/put_rum_events_unresolvable_id.rs"]

@@ -150,6 +150,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // No token starts at the beginning; a token resumes strictly after the last
+        // summary the page that produced it returned. A token this operation never
+        // issued is refused rather than read as some other resume point. Judged FIRST,
+        // like every other handler's checks on the request's OWN members, because they
+        // stand in for constraints the boundary walk cannot apply and that walk runs in
+        // front of everything a handler judges — this check reads neither the store nor
+        // the caller's identity, so it does not wait on the authorization decision below.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_next_token(token).ok_or_else(|| {
+                ListAppMonitorsErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "NextToken {token} is not a pagination token this service issued."
+                    ),
+                })
+            })?),
+        };
+
         // May this caller list the account's app monitors? The action is taken on the
         // account's whole collection rather than on one monitor, so there is no resource
         // policy to consult and the resource is the collection's ARN.
@@ -165,20 +183,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-
-        // No token starts at the beginning; a token resumes strictly after the last
-        // summary the page that produced it returned. A token this operation never
-        // issued is refused rather than read as some other resume point.
-        let resume_after = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => Some(decode_next_token(token).ok_or_else(|| {
-                ListAppMonitorsErrorModeled::ValidationException(ValidationException {
-                    message: format!(
-                        "NextToken {token} is not a pagination token this service issued."
-                    ),
-                })
-            })?),
-        };
 
         // The page-size rule is the service's, not this operation's: every
         // `MaxResultsInteger`-paged listing applies the same one
