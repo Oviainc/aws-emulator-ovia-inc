@@ -153,10 +153,7 @@ pub(crate) fn is_registered_resource_type(resource_type: &str) -> bool {
 /// CloudFormation registry holds no type for.
 ///
 /// BUILT FROM THE REQUEST: the fixed sentence pair carries the `ResourceType` the caller
-/// sent, verbatim, as its one variable part. ONE template for the two operations that
-/// record the configuration state of a resource — `PutResourceConfig` and
-/// `DeleteResourceConfig` — so the two halves of that lifecycle cannot report the one
-/// precondition two ways.
+/// sent, verbatim, as its one variable part.
 pub(crate) fn unregistered_resource_type_message(resource_type: &str) -> String {
     format!(
         "Cannot find registered Resource Type with name {resource_type}. Please register the \

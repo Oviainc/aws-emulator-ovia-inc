@@ -5,8 +5,11 @@
 //! Reports the CURRENT configuration item each requested resource key names, out of the
 //! discovered-resource inventory this service's store holds (`discovered_resources` in
 //! [`crate::state::ComAmazonawsConfigserviceStarlingdoveserviceState`]), for this
-//! account in the Region the request is signed for. Every key the inventory holds no
-//! current configuration item for comes back in `unprocessedResourceKeys`.
+//! account in the Region the request is signed for. A key the inventory holds no current
+//! configuration item for — a resource it never recorded, and a deleted one — is
+//! ANSWERED with nothing: it appears in neither list, because
+//! `unprocessedResourceKeys` carries the keys this read could not process, which is a
+//! retry signal and not a way of saying there is nothing to report.
 //!
 //! It is a REPORT: it writes nothing, so the inventory a later caller sees is the one
 //! this call saw.
@@ -220,30 +223,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut items = Vec::new();
-        let mut unprocessed = Vec::new();
         for key in requested {
             // Which resource a `(resourceType, resourceId)` pair names, and whether the
             // inventory holds a current configuration item for it, is the same question
             // every configuration-item read asks, so it is asked in one place
-            // (`state::current_resource`) for all of them.
-            match store.current_resource(&key.resource_type, &key.resource_id) {
-                Some(entry) => items.push(entry.to_base_configuration_item(
+            // (`state::current_resource`) for all of them. A pair it holds no current
+            // configuration item for — nothing of the resource at all, or a resource
+            // whose deletion it recorded ("The API does not return results for deleted
+            // resources") — contributes no item, and the key is not carried over into
+            // the unprocessed list either: this read processed it and had nothing to
+            // report for it.
+            if let Some(entry) = store.current_resource(&key.resource_type, &key.resource_id) {
+                items.push(entry.to_base_configuration_item(
                     &region,
                     store.recording_frequency_of(&entry.resource_type),
-                )),
-                // "A list of resource keys that were not processed with the current
-                // response": the inventory holds no current configuration item for this
-                // one, because it holds nothing of the resource or because the resource
-                // was deleted ("The API does not return results for deleted resources").
-                None => unprocessed.push(key),
+                ));
             }
         }
 
         Ok(BatchGetResourceConfigOutput {
             base_configuration_items: Some(items),
-            // "If there are no unprocessed resource keys, the response contains an empty
-            // unprocessedResourceKeys list."
-            unprocessed_resource_keys: Some(unprocessed),
+            // "A list of resource keys that were NOT PROCESSED with the current
+            // response... the value can be directly provided to a subsequent
+            // BatchGetResourceConfig operation": a key belongs here only while asking
+            // for it again could answer more than this call did. Every key this read is
+            // handed is looked up against the inventory in this one call, so none is
+            // ever left for a later request, and "if there are no unprocessed resource
+            // keys, the response contains an empty unprocessedResourceKeys list".
+            unprocessed_resource_keys: Some(Vec::new()),
         })
     }
 }

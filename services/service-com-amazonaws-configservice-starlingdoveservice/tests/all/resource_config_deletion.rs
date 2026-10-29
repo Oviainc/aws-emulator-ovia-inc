@@ -13,12 +13,12 @@
 //!    status for a resource Config holds a configuration item for, so the
 //!    resource keeps its inventory entry — carrying the instant it went away and the
 //!    states it has left — and stops being one of the resources Config reports as
-//!    discovered; it refuses a resource type the CloudFormation registry holds no
-//!    registration for with `ValidationException` and any call made while no
-//!    configuration recorder is recording with
-//!    `NoRunningConfigurationRecorderException`, recording nothing either way; and a
-//!    resource Config holds nothing for leaves the inventory exactly as it was, because
-//!    this operation models no error for one.
+//!    discovered; it refuses any call made while no configuration recorder is recording
+//!    with `NoRunningConfigurationRecorderException`, recording nothing; and a resource
+//!    Config holds nothing for — of a resource type the CloudFormation registry holds a
+//!    registration for or of one it does not — leaves the inventory exactly as it was,
+//!    because recording a disappearance reads no configuration document and this
+//!    operation models no error for a resource that was never recorded.
 //!
 //! Every case drives the emulator the way a client does — an `awsJson1_1` `POST /`
 //! through the same `MultiServiceRouter` the production router builds — using the
@@ -409,15 +409,16 @@ async fn deleting_a_resource_config_holds_nothing_for_changes_nothing() {
 }
 
 #[tokio::test]
-async fn delete_resource_config_records_only_a_registered_resource_type() {
-    // A deletion is recorded only for a resource type the CloudFormation registry holds
-    // a registration for, as the recording half of the lifecycle requires. Rows differ
-    // along WHY the type named has none: an organization nothing registered a type
-    // under, an organization reserved against custom types (in the spellings the
-    // reservation covers, since an organization name is matched case-insensitively), a
-    // name that is not a registry type name at all, a registry MODULE name and a
-    // misspelled AWS type.
-    let cases: [(&str, &str); 8] = [
+async fn delete_resource_config_accepts_a_type_with_no_registration_and_records_nothing() {
+    // Recording that a resource went away reads no configuration document, so it needs
+    // no registered schema: the call is accepted whatever resource type it names, and
+    // records nothing for a resource the inventory holds nothing for. Rows differ along
+    // WHY the CloudFormation registry holds no registration for the type named: an
+    // organization nothing registered a type under, an organization reserved against
+    // custom types (in the spellings the reservation covers, since an organization name
+    // is matched case-insensitively), a name that is not a registry type name at all, a
+    // registry MODULE name and a misspelled AWS type.
+    let cases: [(&str, &str); 9] = [
         ("an organization nothing registered", "Acme::Network::Switch"),
         ("the reserved organization Amazon", "Amazon::Thing::Widget"),
         ("the reserved organization AMZN", "AMZN::Thing::Widget"),
@@ -425,6 +426,7 @@ async fn delete_resource_config_records_only_a_registered_resource_type() {
         ("the reserved organization Custom", "Custom::Thing::Widget"),
         ("a type name of one segment", "Switch"),
         ("a type name of two segments", "Acme::Switch"),
+        ("a registry module name", "Acme::Network::Switch::MODULE"),
         ("a misspelled AWS resource type", "AWS::EC2::Volumes"),
     ];
 
@@ -437,20 +439,31 @@ async fn delete_resource_config_records_only_a_registered_resource_type() {
             )
             .await;
 
-        let (status, code) = emulator
-            .refused("DeleteResourceConfig", &resource_key(resource_type, "vol-0001"))
+        let deleted = emulator
+            .ok(
+                "DeleteResourceConfig",
+                &resource_key(resource_type, "vol-0001"),
+            )
             .await;
         assert_eq!(
-            (status, code.as_str()),
-            (400, "ValidationException"),
-            "case {case:?}: deleting {resource_type:?} must be refused with a 400 \
-             ValidationException, got {status} with {code}"
+            deleted,
+            json!({}),
+            "case {case:?}: deleting {resource_type:?} is accepted with an empty body, got \
+             {deleted}"
+        );
+
+        // Nothing was recorded for it: the inventory holds the one resource it held, in
+        // the state it was recorded in.
+        assert!(
+            held(&emulator, resource_type, "vol-0001").is_none(),
+            "case {case:?}: a resource Config holds nothing for must gain no entry"
         );
         let reported = counts(case, &emulator).await;
         assert_eq!(
             reported,
             vec![("AWS::EC2::Volume".to_string(), 1)],
-            "case {case:?}: a refused DeleteResourceConfig records nothing, got {reported:?}"
+            "case {case:?}: the call records nothing, so the recorded resource is still the \
+             one discovered resource, got {reported:?}"
         );
     }
 }

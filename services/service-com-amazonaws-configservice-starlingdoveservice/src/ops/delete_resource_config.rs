@@ -7,6 +7,13 @@
 //! it went through stay readable through `GetResourceConfigHistory` while the reads
 //! that report only live resources stop reporting it.
 //!
+//! It records only the DISAPPEARANCE of a resource, never a configuration document, so
+//! it needs no registered schema to interpret one: any `ResourceType` is accepted, and a
+//! resource the inventory holds nothing for is an accepted call that records nothing.
+//! The CloudFormation registration precondition belongs to the half of the lifecycle
+//! that records a configuration item FROM a document
+//! ([`crate::ops::put_resource_config`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -182,23 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // This API records the deletion of a resource whose configuration state Config
-        // records, named the way the operation that recorded it names one, so the
-        // registration precondition of the two halves of that lifecycle is decided in
-        // ONE place. Judged after the recorder, as the recording half judges it.
-        if !crate::ops::put_resource_config::is_registered_resource_type(&input.resource_type) {
-            return Err(DeleteResourceConfigErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(
-                        crate::ops::put_resource_config::unregistered_resource_type_message(
-                            &input.resource_type,
-                        ),
-                    ),
-                },
-            )
-            .into());
-        }
-
+        // No registration precondition is judged here: recording that a resource went
+        // away takes no schema to read a configuration document against, so this half of
+        // the lifecycle accepts the resource type it is handed and answers out of what
+        // the inventory holds for it.
         let key = (input.resource_type.clone(), input.resource_id.clone());
         let Some(held) = store.discovered_resources.get(&key) else {
             // Config holds no configuration state for this resource, so there is none

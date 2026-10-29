@@ -5,13 +5,13 @@
 //! The rule pinned here: `BatchGetResourceConfig` answers each requested resource key —
 //! a `(resourceType, resourceId)` pair — with the CURRENT configuration item this
 //! account's discovered-resource inventory holds for it in the Region the request is
-//! signed for, reports every key it holds no such configuration item for (a resource the
-//! inventory does not hold, and a deleted one, since "The API does not return results
-//! for deleted resources") in `unprocessedResourceKeys`, and refuses the whole request
-//! when the account holds no customer managed configuration recorder
-//! (`NoAvailableConfigurationRecorderException`) or when the batch carries fewer than
-//! one or more than a hundred keys (`ValidationException`). Every key sent is accounted
-//! for exactly once, in the order it was sent.
+//! signed for, in the order the keys were sent; a key it holds no such configuration
+//! item for (a resource the inventory does not hold, and a deleted one, since "The API
+//! does not return results for deleted resources") is absent from BOTH lists, because
+//! `unprocessedResourceKeys` carries only keys this read could not process; and the
+//! whole request is refused when the account holds no customer managed configuration
+//! recorder (`NoAvailableConfigurationRecorderException`) or when the batch carries
+//! fewer than one or more than a hundred keys (`ValidationException`).
 //!
 //! Two further properties of a reported item are pinned with it: it is the SAME
 //! configuration item the resource's own history reports as current, member for member
@@ -93,12 +93,13 @@ fn captured_at() -> SystemTime {
 }
 
 /// A `(resourceType, resourceId)` pair, as a row names a resource and as the response
-/// readers below report one.
-type Pair = (&'static str, &'static str);
+/// readers below report one. Shared with the suites that read the same two lists.
+pub(crate) type Pair = (&'static str, &'static str);
 
-/// One row of the lookup table: the case name, the keys the batch carries, the
-/// configuration items expected for them and the keys expected back unprocessed.
-type LookupCase = (&'static str, Vec<Value>, &'static [Pair], &'static [Pair]);
+/// One row of the lookup table: the case name, the keys the batch carries and the
+/// configuration items expected for them. No row expects a key back unprocessed: a key
+/// the inventory holds no current configuration item for is reported in neither list.
+type LookupCase = (&'static str, Vec<Value>, &'static [Pair]);
 
 /// One resource the inventory holds: its type, its id, the custom name it carries if
 /// any, the configuration document recorded for it if any, and whether its deletion was
@@ -212,18 +213,18 @@ async fn emulator_holding(resources: &[Recorded]) -> Emulator {
 }
 
 /// One resource key.
-fn key(resource_type: &str, resource_id: &str) -> Value {
+pub(crate) fn key(resource_type: &str, resource_id: &str) -> Value {
     json!({ "resourceType": resource_type, "resourceId": resource_id })
 }
 
 /// The `BatchGetResourceConfig` body for `keys`.
-fn batch(keys: &[Value]) -> Value {
+pub(crate) fn batch(keys: &[Value]) -> Value {
     json!({ "resourceKeys": keys })
 }
 
 /// The `(resourceType, resourceId)` of every configuration item in a response, in the
 /// order reported.
-fn reported_items(case: &str, body: &Value) -> Vec<(String, String)> {
+pub(crate) fn reported_items(case: &str, body: &Value) -> Vec<(String, String)> {
     body["baseConfigurationItems"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected baseConfigurationItems, got {body}"))
@@ -238,8 +239,9 @@ fn reported_items(case: &str, body: &Value) -> Vec<(String, String)> {
 }
 
 /// The `(resourceType, resourceId)` of every unprocessed key in a response, in the order
-/// reported.
-fn reported_unprocessed(case: &str, body: &Value) -> Vec<(String, String)> {
+/// reported. A response carrying none must still carry the list, which a client reads
+/// unconditionally, so this panics when the member is missing.
+pub(crate) fn reported_unprocessed(case: &str, body: &Value) -> Vec<(String, String)> {
     body["unprocessedResourceKeys"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected unprocessedResourceKeys, got {body}"))
@@ -254,7 +256,7 @@ fn reported_unprocessed(case: &str, body: &Value) -> Vec<(String, String)> {
 }
 
 /// `expected` as the pairs [`reported_items`] and [`reported_unprocessed`] return.
-fn pairs(expected: &[Pair]) -> Vec<(String, String)> {
+pub(crate) fn pairs(expected: &[Pair]) -> Vec<(String, String)> {
     expected
         .iter()
         .map(|(resource_type, resource_id)| (resource_type.to_string(), resource_id.to_string()))
@@ -312,7 +314,6 @@ async fn a_batch_answers_the_keys_the_inventory_holds_a_configuration_item_for()
             "one recorded resource",
             vec![key(EC2_VOLUME, "vol-0001")],
             &[(EC2_VOLUME, "vol-0001")],
-            &[],
         ),
         (
             "several recorded resources of different types",
@@ -326,7 +327,6 @@ async fn a_batch_answers_the_keys_the_inventory_holds_a_configuration_item_for()
                 (DYNAMODB_TABLE, "orders"),
                 (S3_BUCKET, "config-bucket"),
             ],
-            &[],
         ),
         (
             "the same resources in another order",
@@ -340,37 +340,31 @@ async fn a_batch_answers_the_keys_the_inventory_holds_a_configuration_item_for()
                 (EC2_VOLUME, "vol-0001"),
                 (DYNAMODB_TABLE, "orders"),
             ],
-            &[],
         ),
         (
             "a resource of a type nothing was recorded for",
             vec![key(IAM_ROLE, "config-role")],
             &[],
-            &[(IAM_ROLE, "config-role")],
         ),
         (
             "a resource id the inventory does not hold",
             vec![key(EC2_VOLUME, "vol-0404")],
             &[],
-            &[(EC2_VOLUME, "vol-0404")],
         ),
         (
             "an id recorded under another type",
             vec![key(DYNAMODB_TABLE, "vol-0001")],
             &[],
-            &[(DYNAMODB_TABLE, "vol-0001")],
         ),
         (
             "a deleted resource, which the API does not return",
             vec![key(EC2_VOLUME, "vol-0009")],
             &[],
-            &[(EC2_VOLUME, "vol-0009")],
         ),
         (
             "a resource discovered with no configuration recorded",
             vec![key(LAMBDA_FUNCTION, "evaluate")],
             &[(LAMBDA_FUNCTION, "evaluate")],
-            &[],
         ),
         (
             "a batch mixing resources the inventory holds and ones it does not",
@@ -381,11 +375,10 @@ async fn a_batch_answers_the_keys_the_inventory_holds_a_configuration_item_for()
                 key(EC2_VOLUME, "vol-0001"),
             ],
             &[(DYNAMODB_TABLE, "orders"), (EC2_VOLUME, "vol-0001")],
-            &[(EC2_VOLUME, "vol-0404"), (EC2_VOLUME, "vol-0009")],
         ),
     ];
 
-    for (case, keys, expected_items, expected_unprocessed) in cases {
+    for (case, keys, expected_items) in cases {
         let emulator = emulator_holding(&inventory()).await;
         let held = inventory_size(&emulator);
         let request = batch(&keys);
@@ -396,18 +389,38 @@ async fn a_batch_answers_the_keys_the_inventory_holds_a_configuration_item_for()
             pairs(expected_items),
             "case {case:?}: expected the configuration items {expected_items:?}, got {body}"
         );
+        // A key the inventory holds no current configuration item for is answered with
+        // nothing, not handed back as a key to ask for again.
         assert_eq!(
             reported_unprocessed(case, &body),
-            pairs(expected_unprocessed),
-            "case {case:?}: expected the unprocessed keys {expected_unprocessed:?}, got {body}"
+            Vec::<(String, String)>::new(),
+            "case {case:?}: no key is reported unprocessed, got {body}"
         );
-        // Every key sent is accounted for exactly once: answered with an item or
-        // reported unprocessed.
+        // Every item answered is one of the keys sent, and no resource is answered
+        // twice: the read reports what the inventory holds for the keys it was handed
+        // and nothing beside it.
+        let answered = reported_items(case, &body);
+        let mut once = answered.clone();
+        once.sort();
+        once.dedup();
         assert_eq!(
-            reported_items(case, &body).len() + reported_unprocessed(case, &body).len(),
-            keys.len(),
-            "case {case:?}: every one of the {} keys sent is accounted for once, got {body}",
-            keys.len()
+            once.len(),
+            answered.len(),
+            "case {case:?}: no resource is answered twice, got {body}"
+        );
+        let requested = keys
+            .iter()
+            .map(|sent| {
+                (
+                    sent["resourceType"].as_str().unwrap_or_default().to_string(),
+                    sent["resourceId"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect::<Vec<(String, String)>>();
+        assert!(
+            answered.iter().all(|pair| requested.contains(pair)),
+            "case {case:?}: every item answered must be one of the keys sent \
+             {requested:?}, got {body}"
         );
 
         // The read is a report: it writes nothing, so the inventory a later caller sees
@@ -552,16 +565,25 @@ async fn a_batch_outside_the_key_count_the_operation_accepts_is_refused() {
         );
     }
 
-    // At each bound the same batch is served, and accounts for every key it carries.
+    // At each bound the same batch is served, answering the keys the inventory holds a
+    // configuration item for — `vol-0001` in both, since `vol-0009` is deleted and the
+    // rest of the padding was never recorded — and reporting nothing unprocessed.
     for (case, keys) in [
         ("one key", &at_minimum),
         ("keys at the maximum", &at_maximum),
     ] {
         let body = emulator.ok(BATCH, &batch(keys)).await;
         assert_eq!(
-            reported_items(case, &body).len() + reported_unprocessed(case, &body).len(),
-            keys.len(),
-            "case {case:?}: a batch at the bound accounts for all {} keys, got {body}",
+            (
+                reported_items(case, &body),
+                reported_unprocessed(case, &body)
+            ),
+            (
+                pairs(&[(EC2_VOLUME, "vol-0001")]),
+                Vec::<(String, String)>::new()
+            ),
+            "case {case:?}: a batch of {} keys at the bound answers the one recorded \
+             resource it names and reports nothing unprocessed, got {body}",
             keys.len()
         );
     }
@@ -571,20 +593,22 @@ async fn a_batch_outside_the_key_count_the_operation_accepts_is_refused() {
 async fn a_batch_read_needs_a_customer_managed_configuration_recorder() {
     // Rows differ along the batch sent, so the refusal is about the account holding no
     // customer managed recorder rather than about what the batch asked for.
-    let requests: [(&str, Vec<Value>); 4] = [
-        ("one recorded resource", vec![key(EC2_VOLUME, "vol-0001")]),
+    let requests: [(&str, Vec<Value>, usize); 4] = [
+        ("one recorded resource", vec![key(EC2_VOLUME, "vol-0001")], 1),
         (
             "several resources",
             vec![key(EC2_VOLUME, "vol-0001"), key(DYNAMODB_TABLE, "orders")],
+            2,
         ),
         (
             "a resource the inventory does not hold",
             vec![key(IAM_ROLE, "config-role")],
+            0,
         ),
-        ("a deleted resource", vec![key(EC2_VOLUME, "vol-0009")]),
+        ("a deleted resource", vec![key(EC2_VOLUME, "vol-0009")], 0),
     ];
 
-    for (case, keys) in requests {
+    for (case, keys, held) in requests {
         let emulator = Emulator::new();
         seed(&emulator, &inventory());
 
@@ -622,9 +646,13 @@ async fn a_batch_read_needs_a_customer_managed_configuration_recorder() {
             .await;
         let body = emulator.ok(BATCH, &batch(&keys)).await;
         assert_eq!(
-            reported_items(case, &body).len() + reported_unprocessed(case, &body).len(),
-            keys.len(),
-            "case {case:?}: with a recorder every key sent is accounted for, got {body}"
+            (
+                reported_items(case, &body).len(),
+                reported_unprocessed(case, &body)
+            ),
+            (held, Vec::<(String, String)>::new()),
+            "case {case:?}: with a recorder the read answers the {held} key(s) the \
+             inventory holds a configuration item for, got {body}"
         );
     }
 }

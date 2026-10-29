@@ -58,8 +58,9 @@ const REGISTERED_TYPES: [&str; 6] = [
 ];
 
 /// An emulator with a configuration recorder that is recording, which Config needs
-/// before it records any configuration item.
-async fn recording_emulator() -> Emulator {
+/// before it records any configuration item. Shared with the suites that pin what the
+/// other reads report for a resource this one's writes recorded or refused.
+pub(crate) async fn recording_emulator() -> Emulator {
     let emulator = Emulator::new();
     with_recorder_and_channel(&emulator).await;
     emulator
@@ -71,8 +72,9 @@ async fn recording_emulator() -> Emulator {
     emulator
 }
 
-/// The `PutResourceConfig` body recording `configuration` for one resource.
-fn resource_config(resource_type: &str, resource_id: &str, configuration: &str) -> Value {
+/// The `PutResourceConfig` body recording `configuration` for one resource. Shared with
+/// the suites that record a resource through this write path.
+pub(crate) fn resource_config(resource_type: &str, resource_id: &str, configuration: &str) -> Value {
     json!({
         "ResourceType": resource_type,
         "SchemaVersionId": "00000000-0000-0000-0000-000000000001",
