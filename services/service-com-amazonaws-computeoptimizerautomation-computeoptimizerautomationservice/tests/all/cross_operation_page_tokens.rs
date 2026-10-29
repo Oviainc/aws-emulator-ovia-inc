@@ -21,11 +21,15 @@
 //! table of listings and queries: a cursor carrying the digest of the query
 //! members ALONE — the fingerprint a listing that bound no operation identity
 //! would have issued — is refused, while the same cursor with the issuing
-//! operation bound in is served.
+//! operation bound in is served. That table names EVERY paginated operation of
+//! the service (asserted below against the one table of them), so no listing can
+//! bind its query alone without a case here failing — whichever shape of query it
+//! pages under, and whether it digests that query itself or through
+//! `state::preview_selection_fingerprint`.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::ops::types::{
-    AutomationEventFilter, Filter, RecommendedActionFilter,
+    AutomationEventFilter, Criteria, Filter, RecommendedActionFilter,
 };
 use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::state::{
     self, PageCursor,
@@ -102,6 +106,26 @@ impl Row {
             operation_bound: state::page_fingerprint(operation, query),
         }
     }
+
+    /// A row whose operation-bound digest the SERVICE computed, for a listing
+    /// that digests a derived selection through its own fingerprint helper
+    /// rather than a query value it was handed: only the operation-free digest —
+    /// the one no helper of this service mints — is reconstructed here.
+    fn with_operation_bound<T: std::fmt::Debug + ?Sized>(
+        case: &'static str,
+        operation: &'static str,
+        request: Value,
+        query: &T,
+        operation_bound: String,
+    ) -> Self {
+        Self {
+            case,
+            operation,
+            request,
+            query_only: state::fingerprint(&query),
+            operation_bound,
+        }
+    }
 }
 
 /// A cursor resuming after the first item under `fingerprint`, as the opaque
@@ -115,8 +139,13 @@ fn token_for(fingerprint: &str) -> String {
 
 /// The query members each listing of the table pages under, spanning the shapes
 /// of query this service's listings have: none at all, a filter list (absent and
-/// present), a filter list with a time window, and the id of the single resource
-/// whose children are paged.
+/// present), a filter list with a time window, the id of the single resource
+/// whose children are paged, and the derived selection of a rule preview.
+///
+/// Every paginated operation of the service has a row
+/// (`the_fingerprint_table_names_every_paginated_operation` pins that), so the
+/// fingerprint rule is asserted on all of them and not only on the listings whose
+/// query is a filter list.
 fn fingerprint_rows(event_id: &str) -> Vec<Row> {
     let rule_filters = vec![Filter {
         name: "Status".to_string(),
@@ -129,7 +158,36 @@ fn fingerprint_rows(event_id: &str) -> Vec<Row> {
     // The window bounds of an unbounded event query, as the handlers digest
     // them: `crate::state::instant_key` of each bound the caller sent.
     let no_window = (None::<(i64, u32)>, None::<(i64, u32)>);
+    // A preview of one action type for an `AccountRule`, whose selection both
+    // preview listings page: the accounts the rule type covers and the requested
+    // action types as the SETS the selection tests membership of, and the
+    // criteria after defaulting — which, for a request carrying no `criteria`,
+    // is the empty one. The operation-bound digest of that selection is the
+    // service's own (`crate::state::preview_selection_fingerprint`); what the
+    // rows reconstruct is only the operation-free digest of the same members.
+    let preview_scope = state::preview_account_scope("AccountRule", None);
+    let preview_types = vec![UPGRADE.to_string()];
+    let preview_criteria = Criteria::default();
+    let preview_selection = (
+        preview_scope.as_deref().map(state::canonical_membership),
+        state::canonical_membership(&preview_types),
+        preview_criteria.clone(),
+    );
+    let preview_bound = |operation: &str| {
+        state::preview_selection_fingerprint(
+            operation,
+            preview_scope.as_deref(),
+            &preview_types,
+            &preview_criteria,
+        )
+    };
+    let preview_request = json!({"ruleType": "AccountRule", "recommendedActionTypes": [UPGRADE]});
     vec![
+        // `ListAccounts` pages the enrollment of the organization's accounts and
+        // takes no query member at all, so the issuing operation is the WHOLE
+        // fingerprint its token carries: the unit its handler digests is what a
+        // listing binding no operation identity would have bound.
+        Row::new("accounts", "ListAccounts", json!({}), &()),
         Row::new(
             "rules-unfiltered",
             "ListAutomationRules",
@@ -177,6 +235,20 @@ fn fingerprint_rows(event_id: &str) -> Vec<Row> {
             "ListRecommendedActionSummaries",
             json!({}),
             &Vec::<RecommendedActionFilter>::new(),
+        ),
+        Row::with_operation_bound(
+            "preview-of-one-action-type",
+            "ListAutomationRulePreview",
+            preview_request.clone(),
+            &preview_selection,
+            preview_bound("ListAutomationRulePreview"),
+        ),
+        Row::with_operation_bound(
+            "preview-summaries-of-one-action-type",
+            "ListAutomationRulePreviewSummaries",
+            preview_request,
+            &preview_selection,
+            preview_bound("ListAutomationRulePreviewSummaries"),
         ),
     ]
 }
@@ -316,6 +388,10 @@ fn listings_over_one_query_are_separated_by_the_issuing_operation() {
             "recommended-actions-unfiltered",
             "recommended-action-summaries-unfiltered",
         ),
+        (
+            "preview-of-one-action-type",
+            "preview-summaries-of-one-action-type",
+        ),
     ] {
         let find = |case: &str| {
             rows.iter()
@@ -334,6 +410,27 @@ fn listings_over_one_query_are_separated_by_the_issuing_operation() {
             "cases {:?} and {:?}: the issuing operation must separate their tokens, got {:?} for \
              both",
             left.case, right.case, left.operation_bound
+        );
+    }
+}
+
+/// The fingerprint table above names every paginated operation of this service,
+/// so each one's token check is asserted to need the issuing operation in the
+/// fingerprint — a listing added later, or one that went back to binding its
+/// query alone, cannot escape the cases above by being absent from the table.
+#[test]
+fn the_fingerprint_table_names_every_paginated_operation() {
+    // An event id of the modelled `EventId` form (`^[0-9A-Za-z]{16}$`): the
+    // tables are keyed by operation here, so which event it names is immaterial.
+    const AN_EVENT_ID: &str = "Ev0000000000000b";
+    let rows = fingerprint_rows(AN_EVENT_ID);
+
+    for (operation, _, _) in paginated_operations(AN_EVENT_ID) {
+        assert!(
+            rows.iter().any(|row| row.operation == operation),
+            "case {operation:?}: every paginated operation needs a fingerprint row, and the table \
+             holds only {:?}",
+            rows.iter().map(|row| row.operation).collect::<Vec<_>>()
         );
     }
 }
