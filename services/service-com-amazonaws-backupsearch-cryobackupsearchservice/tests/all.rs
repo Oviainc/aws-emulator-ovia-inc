@@ -71,6 +71,8 @@ mod tag_admission_rule;
 mod tag_arn_resolution;
 #[path = "all/tag_character_set.rs"]
 mod tag_character_set;
+#[path = "all/tag_not_found_refusal.rs"]
+mod tag_not_found_refusal;
 #[path = "all/tag_removal.rs"]
 mod tag_removal;
 #[path = "all/transition_span_schedule.rs"]

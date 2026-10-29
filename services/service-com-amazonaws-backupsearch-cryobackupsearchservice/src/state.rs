@@ -66,9 +66,9 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     BackupCreationTimeFilter, ConflictException, CurrentSearchProgress, EBSItemFilter,
-    EBSResultItem, ExportSpecification, ItemFilters, LongCondition, ResultItem, S3ItemFilter,
-    S3ResultItem, SearchJobBackupsResult, SearchScope, SearchScopeSummary,
-    ServiceQuotaExceededException, StringCondition, TimeCondition,
+    EBSResultItem, ExportSpecification, ItemFilters, LongCondition, ResourceNotFoundException,
+    ResultItem, S3ItemFilter, S3ResultItem, SearchJobBackupsResult, SearchScope,
+    SearchScopeSummary, ServiceQuotaExceededException, StringCondition, TimeCondition,
 };
 
 /// The HTTP status a successful call of this service that has NO content to report
@@ -780,6 +780,30 @@ pub fn arn_resource_type(arn: &str) -> String {
         .and_then(|resource| resource.split_once(['/', ':']))
         .map(|(resource_type, _)| resource_type.to_string())
         .unwrap_or_default()
+}
+
+/// The REFUSAL an unresolvable `ResourceArn` is answered with: a
+/// `ResourceNotFoundException` (HTTP 404) naming the submitted ARN as the resource that
+/// was not found and, as its hypothetical type, the type that ARN claims
+/// ([`arn_resource_type`]).
+///
+/// One refusal behind all three tag operations of this service — the read
+/// `ListTagsForResource` and the writes `TagResource` and `UntagResource` — the same way
+/// [`ComAmazonawsBackupsearchCryobackupsearchserviceState::taggable_record`] is the one
+/// resolution behind them: the lookup answers `None` for the same ARNs on every path, so
+/// the sentence it is reported with, which member carries the ARN and which type the
+/// refusal names are decided here once instead of per handler. Each caller lifts it into
+/// its own modelled error channel, which is the only part that is per operation.
+///
+/// The text is the one the service's recordings carry for an ARN-resolved lookup, which
+/// is why it echoes the submitted ARN rather than taking the request-independent
+/// [`RESOURCE_NOT_FOUND`] sentence the job-identifier lookups answer with.
+pub fn tag_arn_not_found(resource_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("no resource with ARN '{resource_arn}' exists"),
+        resource_id: resource_arn.to_string(),
+        resource_type: arn_resource_type(resource_arn),
+    }
 }
 
 /// Whether `arn` is a well-formed ARN at all — the `arn` scheme followed by the six

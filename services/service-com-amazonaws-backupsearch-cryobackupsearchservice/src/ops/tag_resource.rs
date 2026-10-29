@@ -164,15 +164,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Resolved against every taggable record this store holds, not only the search
         // jobs: `ResourceArn` is documented as "the resource that will have the
         // indicated tags", and both of this service's resources carry a tag set.
+        // A miss is refused through the one refusal all three tag operations answer an
+        // unresolvable ARN with (`crate::state::tag_arn_not_found`), so the sentence, the
+        // reported resource id and the type the refusal names cannot differ between the
+        // read path and the two write paths. Only lifting it into THIS operation's error
+        // channel is per handler.
         let stored = state.tags_by_arn_mut(&input.resource_arn).ok_or_else(|| {
             TagResourceError::from(TagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no resource with ARN '{}' exists", input.resource_arn),
-                    resource_id: input.resource_arn.clone(),
-                    // The type the submitted ARN claims; the lookup spans more than one,
-                    // so the refusal cannot name a fixed one.
-                    resource_type: crate::state::arn_resource_type(&input.resource_arn),
-                },
+                crate::state::tag_arn_not_found(&input.resource_arn),
             ))
         })?;
 
