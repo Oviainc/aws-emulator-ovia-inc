@@ -9,7 +9,9 @@
 //! This is the service-wide counterpart of
 //! [`super::list_requested_service_quota_change_history_by_quota`], which lists one
 //! quota's requests: the same records, the same order and the same filters, with the
-//! quota narrowing dropped and `ServiceCode` optional.
+//! quota narrowing dropped and `ServiceCode` optional. Both report the requests made
+//! on a plane this endpoint serves: every request of the ACCOUNT for a quota the
+//! catalog counts account-wide, and this endpoint's own for a quota counted per region.
 //!
 //! * `ServiceCode` is OPTIONAL here, so a caller that names none is served every
 //!   service's requests; a code the catalog does not know is `NoSuchResourceException`
@@ -208,10 +210,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The token names a position in the listing THIS request selected — the
-        // region's requests, narrowed by the `ServiceCode`, `Status` and level the
-        // caller asked for — so a token cut from another selection cannot resume
-        // here. A caller that names no level is served the ACCOUNT one, so the two
-        // label the same listing.
+        // requests this endpoint serves, narrowed by the `ServiceCode`, `Status` and
+        // level the caller asked for — so a token cut from another selection cannot
+        // resume here. A caller that names no level is served the ACCOUNT one, so the
+        // two label the same listing.
         let listing = crate::state::listing_label(
             Self::NAME,
             &[

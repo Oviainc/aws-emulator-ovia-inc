@@ -96,7 +96,10 @@ async fn raise(caller: &Client, row: &CaseRow) -> String {
 }
 
 /// The stored request `id`, as `GetRequestedServiceQuotaChange` reports it.
-async fn read_request(caller: &Client, id: &str) -> Value {
+///
+/// `pub(crate)` so the suite that reads one request back at several endpoints shares
+/// this reader instead of growing a copy of it.
+pub(crate) async fn read_request(caller: &Client, id: &str) -> Value {
     caller
         .ok("GetRequestedServiceQuotaChange", json!({"RequestId": id}))
         .await["RequestedQuota"]

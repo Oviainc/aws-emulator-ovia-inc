@@ -37,10 +37,12 @@
 //! only `OptInLevel` is `ACCOUNT` — so it is stored once for the account and reads
 //! the same at every regional endpoint.
 //!
-//! The overlay and the requests are per region (Service Quotas is a regional service:
-//! an increase applied in one region does not change another's value), while the
-//! catalog and the defaults are the same everywhere. The account is the emulator's
-//! single [`engine::emulator_account_id`].
+//! The overlay and the requests are kept on the PLANE the quota's own value lives on
+//! (Service Quotas is a regional service, so an increase applied in one region does not
+//! change another's value — except on a quota AWS counts account-wide, which has one
+//! value, and so one request plane, for the whole account), while the catalog and the
+//! defaults are the same everywhere. The account is the emulator's single
+//! [`engine::emulator_account_id`].
 //!
 //! The quota rows in [`seed_quota_catalog`] are a CATALOG rather than a sample: for
 //! a service such as EC2 the list runs to hundreds of entries, the way AWS's
@@ -675,7 +677,7 @@ impl ExclusionRefusal {
 /// each to the error shape that states it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupportCaseRefusal {
-    /// This region holds no quota increase request with that `RequestId`:
+    /// No quota increase request this endpoint resolves carries that `RequestId`:
     /// `NoSuchResourceException`.
     NoSuchRequest,
     /// The request already has a support case, carrying this `CaseId`:
@@ -1175,9 +1177,26 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         }
     }
 
-    /// One stored request by `Id`, within the caller's region.
+    /// One stored request by `Id`, as the endpoint at `region` resolves it: every
+    /// request on a plane that endpoint serves ([`Self::request_on_plane_of`]), so a
+    /// request on an account-wide quota resolves at every regional endpoint and one on a
+    /// per-region quota only at its own.
+    ///
+    /// Ids are unique across the account ([`request_id`] derives them from the minting
+    /// region's own counter), so at most one stored request answers to one `Id`.
     pub fn request(&self, region: &str, id: &str) -> Option<&QuotaRequest> {
-        self.regions.get(region)?.quota_requests.get(id)
+        self.regions
+            .values()
+            .filter_map(|state| state.quota_requests.get(id))
+            .find(|request| self.request_on_plane_of(region, request))
+    }
+
+    /// The region whose store holds the request `id` the endpoint at `region` resolves —
+    /// the key a WRITE to that request has to reach for, which is the request's own
+    /// region and not necessarily the caller's.
+    fn request_holder(&self, region: &str, id: &str) -> Option<String> {
+        self.request(region, id)
+            .map(|request| request.region.clone())
     }
 
     /// Open a support case for the stored quota increase request `id` and return the
@@ -1198,9 +1217,15 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         id: &str,
         now: SystemTime,
     ) -> Result<QuotaRequest, SupportCaseRefusal> {
+        // The case is opened ON the stored request, wherever it is recorded: an endpoint
+        // that resolves the request is an endpoint that can open its case, so the two
+        // never disagree about which ids exist.
+        let Some(holder) = self.request_holder(region, id) else {
+            return Err(SupportCaseRefusal::NoSuchRequest);
+        };
         let Some(request) = self
             .regions
-            .get_mut(region)
+            .get_mut(&holder)
             .and_then(|state| state.quota_requests.get_mut(id))
         else {
             return Err(SupportCaseRefusal::NoSuchRequest);
@@ -1232,7 +1257,10 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     /// one resource does not block another resource's.
     ///
     /// Scoping this the same way [`Self::applied_entry`] scopes the overlay is what
-    /// keeps two open requests from ever landing on one applied value.
+    /// keeps two open requests from ever landing on one applied value, and it is the
+    /// SAME scope every read of a request resolves at
+    /// ([`Self::request_on_plane_of`]) — so the id this refusal names is an id the
+    /// endpoint that answered it can also read back.
     pub fn open_request_on_plane(
         &self,
         region: &str,
@@ -1240,57 +1268,76 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         quota_code: &str,
         context_id: Option<&str>,
     ) -> Option<QuotaRequest> {
-        let account_wide = self
-            .default_quota(service_code, quota_code)
-            .is_some_and(|quota| quota.global_quota);
-        let stores: Vec<&RegionState> = if account_wide {
-            self.regions.values().collect()
-        } else {
-            self.regions.get(region).into_iter().collect()
-        };
-        stores
-            .into_iter()
-            .flat_map(|state| {
-                state
-                    .request_order
-                    .iter()
-                    .filter_map(|id| state.quota_requests.get(id))
-            })
+        self.stored_requests()
             .filter(|request| {
                 request.service_code == service_code
                     && request.quota_code == quota_code
                     && request.context_id.as_deref() == context_id
                     && is_open_request_status(&request.status)
             })
+            .filter(|request| self.request_on_plane_of(region, request))
             .max_by_key(|request| request.created)
             .cloned()
     }
 
-    /// Every stored request for one quota, NEWEST FIRST.
+    /// Whether a stored request is on a plane the endpoint at `region` serves, which is
+    /// the one rule deciding what that endpoint can resolve, refuse against and list.
+    ///
+    /// A request belongs to the plane an approved increase on it would put its value in
+    /// force on: the whole ACCOUNT for a quota the catalog publishes as counted
+    /// account-wide ([`DefaultQuota::global_quota`]), whose applied value is kept
+    /// regionless and read back at every regional endpoint, and the region it was made
+    /// at for any other quota, whose applied value is kept per region. So an
+    /// account-wide quota's request is one request for the account — every endpoint
+    /// reports it, by the `Id` any endpoint handed out — while a per-region quota's
+    /// belongs to its own endpoint alone.
+    fn request_on_plane_of(&self, region: &str, request: &QuotaRequest) -> bool {
+        request.region == region
+            || self
+                .default_quota(&request.service_code, &request.quota_code)
+                .is_some_and(|quota| quota.global_quota)
+    }
+
+    /// Every stored request of the account, each region's in the order it minted them.
+    ///
+    /// The account's requests live in per-region stores, so this is what the selections
+    /// over them start from; each narrows by [`Self::request_on_plane_of`] to the ones
+    /// the calling endpoint serves.
+    fn stored_requests(&self) -> impl Iterator<Item = &QuotaRequest> {
+        self.regions.values().flat_map(|state| {
+            state
+                .request_order
+                .iter()
+                .filter_map(|id| state.quota_requests.get(id))
+        })
+    }
+
+    /// Every stored request for one quota that the endpoint at `region` serves, NEWEST
+    /// FIRST.
     pub fn requests_for_quota(
         &self,
         region: &str,
         service_code: &str,
         quota_code: &str,
     ) -> Vec<QuotaRequest> {
-        let Some(state) = self.regions.get(region) else {
-            return Vec::new();
-        };
-        state
-            .request_order
-            .iter()
-            .rev()
-            .filter_map(|id| state.quota_requests.get(id))
-            .filter(|request| request.service_code == service_code && request.quota_code == quota_code)
+        let mut requests: Vec<QuotaRequest> = self
+            .stored_requests()
+            .filter(|request| {
+                request.service_code == service_code && request.quota_code == quota_code
+            })
+            .filter(|request| self.request_on_plane_of(region, request))
             .cloned()
-            .collect()
+            .collect();
+        sort_newest_first(&mut requests);
+        requests
     }
 
-    /// Every stored request of a region that the history window still covers, NEWEST
-    /// FIRST, narrowed to one `ServiceCode` when `service_code` names one.
+    /// Every stored request the endpoint at `region` serves that the history window
+    /// still covers, NEWEST FIRST, narrowed to one `ServiceCode` when `service_code`
+    /// names one.
     ///
     /// This is the service-wide half of the history: `None` spans every service the
-    /// region holds requests for. Requests created longer ago than
+    /// endpoint holds requests for. Requests created longer ago than
     /// [`REQUEST_HISTORY_WINDOW`] are left out, which is the window the listing
     /// documents.
     pub fn requests_in_history(
@@ -1299,19 +1346,16 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         service_code: Option<&str>,
         now: SystemTime,
     ) -> Vec<QuotaRequest> {
-        let Some(state) = self.regions.get(region) else {
-            return Vec::new();
-        };
         let cutoff = now.checked_sub(REQUEST_HISTORY_WINDOW);
-        state
-            .request_order
-            .iter()
-            .rev()
-            .filter_map(|id| state.quota_requests.get(id))
+        let mut requests: Vec<QuotaRequest> = self
+            .stored_requests()
             .filter(|request| service_code.is_none_or(|code| request.service_code == code))
             .filter(|request| cutoff.is_none_or(|cutoff| request.created >= cutoff))
+            .filter(|request| self.request_on_plane_of(region, request))
             .cloned()
-            .collect()
+            .collect();
+        sort_newest_first(&mut requests);
+        requests
     }
 
     /// A stored request as `RequestedServiceQuotaChange` on the wire.
@@ -1699,6 +1743,23 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
             description: default.description.clone(),
         }
     }
+}
+
+/// Report order for the quota increase requests of one listing: NEWEST FIRST, with the
+/// `Id` ascending as the tie-break.
+///
+/// A listing can draw on more than one region's store — an account-wide quota's plane
+/// is the whole account — so the order has to be a property of the RECORDS rather than
+/// of the store they were read out of, and it has to be TOTAL: a page token names an
+/// offset, so two requests created in the same instant must not swap between two pages
+/// of one listing.
+fn sort_newest_first(requests: &mut [QuotaRequest]) {
+    requests.sort_by(|left, right| {
+        right
+            .created
+            .cmp(&left.created)
+            .then_with(|| left.id.cmp(&right.id))
+    });
 }
 
 /// The overlay contexts that cover `context`, most specific first: the resource's own

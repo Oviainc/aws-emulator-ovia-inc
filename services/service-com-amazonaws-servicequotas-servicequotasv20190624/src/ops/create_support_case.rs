@@ -22,7 +22,11 @@
 //!
 //! Refusals:
 //!
-//! * a `RequestId` this region holds no request for -> `NoSuchResourceException` (404);
+//! * a `RequestId` no request this endpoint resolves carries ->
+//!   `NoSuchResourceException` (404): a request is reached on the plane it was made on,
+//!   so a request for a quota the catalog counts account-wide is reachable at every
+//!   regional endpoint and one for a quota counted per region at the endpoint it was
+//!   made at;
 //! * a request that is no longer awaiting a decision ->
 //!   `InvalidResourceStateException` (405): the operation "only creates a Support case
 //!   if the request has a Pending status", and a decided request has nothing left for a

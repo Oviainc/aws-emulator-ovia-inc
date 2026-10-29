@@ -47,6 +47,8 @@ mod quota_utilization_usage;
 mod quota_workflow;
 #[path = "all/quotas_catalog.rs"]
 mod quotas_catalog;
+#[path = "all/request_id_resolution_scope.rs"]
+mod request_id_resolution_scope;
 #[path = "all/requested_change_history.rs"]
 mod requested_change_history;
 #[path = "all/resource_quota_context.rs"]

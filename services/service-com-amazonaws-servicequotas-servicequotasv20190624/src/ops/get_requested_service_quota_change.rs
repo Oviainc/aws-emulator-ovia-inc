@@ -12,7 +12,11 @@
 //! `CaseId`, and one read past its decision reports the status it settled to. Nothing
 //! else moves a status: reading does not decide a request.
 //!
-//! An id this region holds no request for is `NoSuchResourceException` (404).
+//! A request is read back on the plane it was made on: one for a quota the catalog
+//! counts account-wide is one request for the ACCOUNT, so every regional endpoint
+//! reports it — by the `Id` any endpoint handed out — while one for a quota counted per
+//! region is read at the endpoint it was made at. An id no request this endpoint
+//! resolves carries is `NoSuchResourceException` (404).
 //!
 //! ---
 //!

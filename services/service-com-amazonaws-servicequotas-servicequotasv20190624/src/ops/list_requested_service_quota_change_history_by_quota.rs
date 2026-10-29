@@ -5,6 +5,11 @@
 //! Lists the stored quota increase requests for one quota, NEWEST FIRST, filtered by
 //! `Status` and `QuotaRequestedAtLevel` when given, and paginated.
 //!
+//! The requests it reports are the ones made on a plane this endpoint serves: for a
+//! quota the catalog counts account-wide that is every request of the ACCOUNT, since
+//! such a quota has one value and so one request history account-wide, and for a quota
+//! counted per region the requests made at this endpoint.
+//!
 //! * an unknown `(ServiceCode, QuotaCode)` pair is `NoSuchResourceException` (404);
 //! * `Status` keeps the requests that now carry that `RequestStatus`;
 //! * `QuotaRequestedAtLevel` keeps the requests made at that level — `ALL` keeps
@@ -154,10 +159,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The token names a position in the listing THIS request selected — the
-        // region's requests for one quota, narrowed by the `Status` and level the
-        // caller asked for — so a token cut from another selection cannot resume
-        // here. A caller that names no level is served the ACCOUNT one, so the two
-        // label the same listing.
+        // requests for one quota this endpoint serves, narrowed by the `Status` and
+        // level the caller asked for — so a token cut from another selection cannot
+        // resume here. A caller that names no level is served the ACCOUNT one, so the
+        // two label the same listing.
         let listing = crate::state::listing_label(
             Self::NAME,
             &[

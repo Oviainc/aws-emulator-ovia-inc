@@ -33,7 +33,9 @@ use crate::quota_workflow::{client, emulator, walk_pages, Client};
 /// Comfortably past BOTH steps the clock owes a quota increase request that allows a
 /// support case: the case opens at `SUPPORT_CASE_OPEN_DELAY`, and the decision the
 /// case reviews falls due `REQUEST_DECISION_DELAY` after that.
-fn past_decision() -> Duration {
+///
+/// `pub(crate)` so the suites that share this file's helpers wait by the same span.
+pub(crate) fn past_decision() -> Duration {
     SUPPORT_CASE_OPEN_DELAY + REQUEST_DECISION_DELAY + Duration::from_millis(600)
 }
 
@@ -138,7 +140,10 @@ async fn catalog(caller: &Client, service_code: &str) -> Vec<Value> {
 
 /// The catalog entry of one quota, by the name it publishes: its `QuotaCode`, its AWS
 /// default `Value` and its `GlobalQuota`.
-async fn catalog_entry(
+///
+/// `pub(crate)` so another suite reads the catalog through this one lookup rather than
+/// growing a copy of it.
+pub(crate) async fn catalog_entry(
     caller: &Client,
     service_code: &str,
     quota_name: &str,
@@ -181,7 +186,14 @@ async fn another_adjustable_quota(
 }
 
 /// Request an increase that must be accepted, and return the stored record.
-async fn accepted(caller: &Client, service_code: &str, quota_code: &str, desired: f64) -> Value {
+///
+/// `pub(crate)`: shared with the suite that reads a minted request back.
+pub(crate) async fn accepted(
+    caller: &Client,
+    service_code: &str,
+    quota_code: &str,
+    desired: f64,
+) -> Value {
     let response = caller
         .ok(
             "RequestServiceQuotaIncrease",
@@ -204,7 +216,9 @@ async fn accepted(caller: &Client, service_code: &str, quota_code: &str, desired
 
 /// The status and error code of a request that must be refused, with the refusal's
 /// message member.
-async fn refusal(
+///
+/// `pub(crate)`: shared with the suite that reads the request a refusal names.
+pub(crate) async fn refusal(
     caller: &Client,
     service_code: &str,
     quota_code: &str,
