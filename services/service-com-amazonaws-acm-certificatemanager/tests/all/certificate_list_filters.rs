@@ -22,8 +22,8 @@ use crate::certificate_lifecycle::{
     router, router_with_engine, KEY_ALGORITHMS, REGION,
 };
 
-/// The `KeyAlgorithm` values `ListCertificates` reports to a request that names no
-/// `Includes.keyTypes`: "Default filtering returns only RSA_1024 and RSA_2048
+/// The `KeyAlgorithm` values `ListCertificates` reports to a request that supplied no
+/// `Includes` structure at all: "Default filtering returns only RSA_1024 and RSA_2048
 /// certificates that have at least one domain"
 /// (`smithy_query(query="doc", shape="com.amazonaws.acm#Filters", member="keyTypes")`).
 const DEFAULT_LISTED_KEY_ALGORITHMS: &[&str] = &["RSA_1024", "RSA_2048"];
@@ -704,4 +704,143 @@ async fn dns_validation_records_are_per_certificate_and_per_domain() {
         wildcard.1.ends_with(".shared.example.com."),
         "expected a wildcard name to be validated through shared.example.com, got {wildcard:?}"
     );
+}
+
+/// RULE: a documented default filter is the fallback only for a filter the request
+/// did not SUPPLY, and a filter nested in an optional filter structure is supplied
+/// through that structure — so a `ListCertificates` request that sent an `Includes`
+/// selects on exactly the members it named there, and only a request that sent no
+/// `Includes` at all reaches the documented default key-algorithm set.
+#[tokio::test]
+async fn a_supplied_includes_filters_only_on_the_members_it_names() {
+    let (router, engine) = router_with_engine();
+
+    // One certificate per modelled key algorithm, plus one that another service
+    // manages and that was opted into export — so a row naming only a member other
+    // than `keyTypes` selects a certificate whose key algorithm is outside the
+    // default set.
+    let managed_algorithm = "RSA_4096";
+    let mut created: Vec<(&str, String)> = Vec::new();
+    for algorithm in KEY_ALGORITHMS {
+        let domain = format!(
+            "{}.includes.example.com",
+            algorithm.to_lowercase().replace('_', "-")
+        );
+        let arn = request_certificate(
+            &router,
+            &json!({
+                "DomainName": domain,
+                "ValidationMethod": "DNS",
+                "KeyAlgorithm": algorithm,
+            }),
+        )
+        .await;
+        created.push((algorithm, arn));
+    }
+    let managed = request_certificate(
+        &router,
+        &json!({
+            "DomainName": "cdn.includes.example.com",
+            "ValidationMethod": "DNS",
+            "KeyAlgorithm": managed_algorithm,
+            "Options": { "Export": "ENABLED" },
+            "ManagedBy": "CLOUDFRONT",
+        }),
+    )
+    .await;
+    // Every certificate stays in the status its request created it in, so the rows
+    // that name a `CertificateStatuses` filter cannot race the validation outcome.
+    hold_pending_validations(&engine);
+
+    let arn_of = |wanted: &str| -> String {
+        created
+            .iter()
+            .find(|(algorithm, _)| *algorithm == wanted)
+            .map(|(_, arn)| arn.clone())
+            .unwrap_or_else(|| panic!("no certificate was created for {wanted}"))
+    };
+    let unmanaged: Vec<String> = created.iter().map(|(_, arn)| arn.clone()).collect();
+    let every_arn: Vec<String> = unmanaged
+        .iter()
+        .cloned()
+        .chain([managed.clone()])
+        .collect();
+    let defaulted: Vec<String> = created
+        .iter()
+        .filter(|(algorithm, _)| DEFAULT_LISTED_KEY_ALGORITHMS.contains(algorithm))
+        .map(|(_, arn)| arn.clone())
+        .collect();
+
+    // The rows differ in whether `Includes` was supplied at all, in which of its
+    // members a supplied structure names, and in how many values each of them names.
+    let cases: Vec<(&str, Value, Vec<String>)> = vec![
+        ("no Includes at all", json!({}), defaulted.clone()),
+        (
+            "Includes supplied, naming no member",
+            json!({ "Includes": {} }),
+            every_arn.clone(),
+        ),
+        (
+            "Includes naming only exportOption=DISABLED",
+            json!({ "Includes": { "exportOption": "DISABLED" } }),
+            unmanaged.clone(),
+        ),
+        (
+            "Includes naming only exportOption=ENABLED",
+            json!({ "Includes": { "exportOption": "ENABLED" } }),
+            vec![managed.clone()],
+        ),
+        (
+            "Includes naming only managedBy",
+            json!({ "Includes": { "managedBy": "CLOUDFRONT" } }),
+            vec![managed.clone()],
+        ),
+        (
+            "Includes naming one keyTypes value outside the default set",
+            json!({ "Includes": { "keyTypes": [managed_algorithm] } }),
+            vec![arn_of(managed_algorithm), managed.clone()],
+        ),
+        (
+            "Includes naming keyTypes beside exportOption",
+            json!({ "Includes": { "keyTypes": [managed_algorithm], "exportOption": "ENABLED" } }),
+            vec![managed.clone()],
+        ),
+        (
+            "Includes naming two keyTypes values",
+            json!({ "Includes": { "keyTypes": ["RSA_1024", "EC_secp521r1"] } }),
+            vec![arn_of("RSA_1024"), arn_of("EC_secp521r1")],
+        ),
+        (
+            "Includes naming every keyTypes value",
+            json!({ "Includes": { "keyTypes": KEY_ALGORITHMS } }),
+            every_arn.clone(),
+        ),
+        // A supplied `Includes` changes nothing about the filters outside it: the
+        // status filter still keeps the statuses it names, and the key-pair-origin
+        // filter still keeps the origins it names.
+        (
+            "Includes supplied beside a status filter that names the stored status",
+            json!({ "Includes": {}, "CertificateStatuses": ["PENDING_VALIDATION"] }),
+            every_arn.clone(),
+        ),
+        (
+            "Includes supplied beside a status filter that names another status",
+            json!({ "Includes": {}, "CertificateStatuses": ["ISSUED"] }),
+            Vec::new(),
+        ),
+        (
+            "Includes supplied beside an origin filter that names another origin",
+            json!({ "Includes": {}, "CertificateKeyPairOrigins": ["ACME"] }),
+            Vec::new(),
+        ),
+    ];
+
+    for (case, filters, expected) in cases {
+        let listed = filtered_arns(&router, &filters).await;
+        let expected = sorted(expected);
+        assert_eq!(
+            listed, expected,
+            "case {case} ({filters}): expected {expected:?}, got {listed:?}"
+        );
+    }
 }

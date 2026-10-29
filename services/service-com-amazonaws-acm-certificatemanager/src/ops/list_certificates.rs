@@ -3,8 +3,9 @@
 //! @op ListCertificates
 //! IMPLEMENTED: enumerates the stored certificate records as `CertificateSummary`
 //! values, honouring `CertificateStatuses`, `CertificateKeyPairOrigins` and
-//! `Includes` filtering — including the default key-algorithm and key-pair-origin
-//! filters the operation documents for a request that names neither —
+//! `Includes` filtering — including the default key-pair-origin filter the operation
+//! documents for a request that names none, and the default key-algorithm filter it
+//! documents for a request that supplied no `Includes` structure at all —
 //! `SortBy`/`SortOrder` ordering, and `MaxItems` paging with a `NextToken` that
 //! resumes where the previous page stopped.
 //!
@@ -304,6 +305,12 @@ const SORT_PAIR_REQUIRED: &str = "Request contains either SortBy or SortOrder. B
 /// everything, EXCEPT where the operation documents a default filter — the key
 /// algorithm and the key-pair origin both have one, so an omitted filter there falls
 /// back to the documented default set rather than to "everything".
+///
+/// A documented default is the fallback for a filter the request did not SUPPLY, and
+/// a filter nested in an optional filter structure is supplied through that
+/// structure: a request that sent the structure chose its filters, so the members it
+/// left out of it filter nothing. Only a request that sent no structure at all left
+/// the nested filter unsupplied and gets the default.
 fn matches_filters(cert: &crate::state::Certificate, input: &ListCertificatesInput) -> bool {
     let includes = input.includes.as_ref();
 
@@ -318,11 +325,17 @@ fn matches_filters(cert: &crate::state::Certificate, input: &ListCertificatesInp
         crate::state::DEFAULT_LISTED_KEY_PAIR_ORIGINS,
         &cert.key_pair_origin,
     );
-    let excluded_by_key_type = !selects(
-        includes.and_then(|includes| includes.key_types.as_deref()),
-        crate::state::DEFAULT_LISTED_KEY_ALGORITHMS,
-        &cert.key_algorithm,
-    );
+    // `keyTypes` is nested in `Includes`, so the documented default key-algorithm set
+    // is reached by a request that supplied no `Includes` at all. An `Includes` that
+    // names other members, or no members, selects on those members alone and leaves
+    // every key algorithm listed.
+    let excluded_by_key_type = match includes {
+        Some(includes) => includes
+            .key_types
+            .as_deref()
+            .is_some_and(|wanted| !names(wanted, &cert.key_algorithm)),
+        None => !crate::state::DEFAULT_LISTED_KEY_ALGORITHMS.contains(&cert.key_algorithm.as_str()),
+    };
     if excluded_by_status || excluded_by_origin || excluded_by_key_type {
         return false;
     }
@@ -367,9 +380,15 @@ fn matches_filters(cert: &crate::state::Certificate, input: &ListCertificatesInp
 /// filter, else the values the operation documents as its default filter.
 fn selects(requested: Option<&[String]>, default: &[&str], value: &str) -> bool {
     match requested {
-        Some(values) => values.iter().any(|requested| requested == value),
+        Some(values) => names(values, value),
         None => default.contains(&value),
     }
+}
+
+/// Whether a filter the request SET names `value` — so a filter that names no value
+/// at all keeps no certificate, the way every other list filter here reads.
+fn names(requested: &[String], value: &str) -> bool {
+    requested.iter().any(|requested| requested == value)
 }
 
 /// The order one `ListCertificates` response is built in, and therefore the order a

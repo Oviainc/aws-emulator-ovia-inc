@@ -465,9 +465,12 @@ pub const ACM_VALIDATIONS_ZONE: &str = "acm-validations.aws";
 /// requirements define, which is where `HttpRedirect$RedirectFrom` points.
 pub const HTTP_VALIDATION_PATH: &str = "/.well-known/pki-validation/";
 
-/// The `KeyAlgorithm` values `ListCertificates` reports when the request names no
-/// `Includes.keyTypes`. A certificate of any other key algorithm is listed only when
-/// the request asks for that algorithm by name.
+/// The `KeyAlgorithm` values `ListCertificates` reports when the request supplied no
+/// `Includes` structure, which is the only way the nested `keyTypes` filter goes
+/// unsupplied: a request that sent an `Includes` chose its filters, so one that left
+/// `keyTypes` out of it filters on no key algorithm at all. A certificate of an
+/// algorithm outside this set is therefore listed to a request that asks for that
+/// algorithm by name, and to one that supplied an `Includes` naming no `keyTypes`.
 ///
 /// Two sentences in this service's model describe the default, and they disagree on
 /// `RSA_1024`. The member describing this very filter is the wider one and is what is
