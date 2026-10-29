@@ -16414,6 +16414,42 @@ pub fn domain_region_refusal(parts: &::http::request::Parts) -> Option<String> {
     (signed != DOMAIN_REGION_NAME).then(|| DOMAIN_REGION_ONLY_MESSAGE.to_string())
 }
 
+/// The kinds of record the restriction [`domain_region_refusal`] carries covers:
+/// the DNS zone, the CDN distribution, and the SSL/TLS certificate a
+/// distribution is served with — the records whose own operations all ask that
+/// helper, each held under its name alone because it is addressed from the one
+/// Region its API is served in (see [`DISTRIBUTION_REGION_NAME`]).
+///
+/// A load balancer's SSL/TLS certificate is NOT one of them: it is a record of
+/// the Region its load balancer lives in, and the load balancer API is served in
+/// every Region.
+pub const DOMAIN_REGION_ONLY_RESOURCE_TYPES: [&str; 3] = [
+    RESOURCE_TYPE_DOMAIN,
+    RESOURCE_TYPE_DISTRIBUTION,
+    RESOURCE_TYPE_CERTIFICATE,
+];
+
+/// The refusal for a call onto a record of `resource_type` this request cannot
+/// be served by, and `None` when the kind is not one the restriction covers or
+/// the request is made in the Region those APIs are served from.
+///
+/// For a door that admits every kind of record and so learns WHICH kind a name
+/// addresses only once it has resolved it — a tag change, which reaches every
+/// record whose modelled shape carries a `tags` member
+/// ([`ComAmazonawsLightsailLightsail20161128State::with_tagged_record`]). It
+/// asks [`domain_region_refusal`], the one owner of the rule, so such a door
+/// admits exactly the Regions the record's own operations do rather than
+/// re-deriving the restriction.
+pub fn domain_region_refusal_for_resource_type(
+    parts: &::http::request::Parts,
+    resource_type: &str,
+) -> Option<String> {
+    if !DOMAIN_REGION_ONLY_RESOURCE_TYPES.contains(&resource_type) {
+        return None;
+    }
+    domain_region_refusal(parts)
+}
+
 /// The endpoint this emulator was reached on for this request: its `Host`
 /// header, or the `:authority` an HTTP/2 request carries on the URI instead of a
 /// `Host` header.

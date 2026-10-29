@@ -29,14 +29,21 @@ use super::instance_lifecycle::{error_code, Emulator};
 /// The only Region Lightsail serves the domain API from, from the modelled
 /// `InvalidInputException` documentation
 /// (`smithy_query(query="doc",shape="InvalidInputException")`).
-const DOMAIN_REGION: &str = "us-east-1";
+///
+/// `pub(crate)` so the tagging suite (`tag_region_restriction.rs`), which pins
+/// the same rule for the two doors a tag change opens onto these records, drives
+/// the same Region rather than keeping a second copy of it.
+pub(crate) const DOMAIN_REGION: &str = "us-east-1";
 
 /// The refusal the documentation states verbatim, so its text is a requirement
 /// and not an example: `smithy_query(query="doc",shape="InvalidInputException")`
 /// reads "Domain and distribution APIs are only available in the N. Virginia
 /// (us-east-1) Amazon Web Services Region. Please set your Amazon Web Services
 /// Region configuration to us-east-1 to create, view, or edit these resources."
-const REFUSAL: &str = "Domain and distribution APIs are only available in the N. Virginia \
+///
+/// `pub(crate)` for the same reason as [`DOMAIN_REGION`].
+pub(crate) const REFUSAL: &str =
+    "Domain and distribution APIs are only available in the N. Virginia \
                        (us-east-1) Amazon Web Services Region. Please set your Amazon Web \
                        Services Region configuration to us-east-1 to create, view, or edit \
                        these resources.";
@@ -53,7 +60,9 @@ const OFF_ENUM_REGION: &str = "il-central-1";
 /// enum's values (`smithy_query(query="shape",shape="RegionName")`) — minus the
 /// domain Region, so the table cannot drift from the model as the catalog grows,
 /// plus [`OFF_ENUM_REGION`].
-fn other_regions() -> Vec<&'static str> {
+///
+/// `pub(crate)` for the same reason as [`DOMAIN_REGION`].
+pub(crate) fn other_regions() -> Vec<&'static str> {
     assert!(
         REGION_NAME_VALUES.contains(&DOMAIN_REGION),
         "case the Region catalog: expected the modelled RegionName enum to list the domain \

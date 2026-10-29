@@ -175,6 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolution `UntagResource` makes, through the same store helper.
         let region = crate::state::request_region(ctx.parts());
         let now = crate::state::now_ms();
+        // Some of the records a tag change reaches are served by the N. Virginia
+        // endpoint ALONE — the modelled `InvalidInputException` this operation
+        // declares carries that restriction, and says to set the Region to
+        // us-east-1 "to create, view, or EDIT these resources" — so a tag change
+        // onto one of them is as restricted as every other door onto it. Which
+        // kind a name addresses is known only once the record is resolved, so the
+        // request's own `Parts` go into the resolution below and the question is
+        // put to the crate's one owner of that rule there, before anything is
+        // written.
+        let parts = ctx.parts();
 
         // `resourceName` and `tags` are modelled `@required` members and the name
         // carries the modelled `ResourceName` pattern, so the centralized walk
@@ -211,6 +221,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         crate::state::with_state(&*self.engine, |store| {
             let resolved = store.with_tagged_record(&region, &name, |record, resource_type| {
+                // A record of a kind the documented restriction covers is
+                // edited only through the Region its own API is served in, so
+                // the tag write is refused here exactly as that record's own
+                // create, read and delete refuse — before a single tag moves.
+                if let Some(message) =
+                    crate::state::domain_region_refusal_for_resource_type(parts, resource_type)
+                {
+                    return Err(invalid(message));
+                }
                 // `resourceArn` is the ARN of the resource "to which you want to
                 // add a tag" — the SAME resource `resourceName` names — so a
                 // request carrying both is served only when they agree, rather

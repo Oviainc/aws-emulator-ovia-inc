@@ -311,6 +311,8 @@ mod static_ip_detach;
 mod static_ip_listing;
 #[path = "all/static_ip_release.rs"]
 mod static_ip_release;
+#[path = "all/tag_region_restriction.rs"]
+mod tag_region_restriction;
 #[path = "all/tagged_resource_coverage.rs"]
 mod tagged_resource_coverage;
 #[path = "all/vpc_peering.rs"]
