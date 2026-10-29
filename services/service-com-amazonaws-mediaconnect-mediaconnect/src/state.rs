@@ -250,12 +250,12 @@ pub fn is_bridge_retirement_state(bridge_state: &str) -> bool {
 /// terminal [`BRIDGE_STATE_DELETED`], and from the instant that move is accepted the record
 /// is RETIRED — kept readable, but no longer a bridge a later call can act on, because the
 /// deletion it is settling into is irreversible. So every operation that WRITES to a stored
-/// bridge — its own settings, its sources, its outputs — refuses once the bridge is in such
-/// a state or headed for one ([`StoredBridge::settling_state`]), through this one function,
-/// with `ConflictException` (HTTP 409): the request "would cause a conflict with the current
-/// state of a service resource associated with the request", which is the same refusal
-/// UpdateBridgeState already answers such a bridge with. DeleteBridge is the one call a
-/// retired bridge still admits, because it removes the record rather than changing it.
+/// bridge — its own settings, its sources, its outputs, and the state it is asked for —
+/// refuses once the bridge is in such a state or headed for one
+/// ([`StoredBridge::settling_state`]), through this one function, with `ConflictException`
+/// (HTTP 409): the request "would cause a conflict with the current state of a service
+/// resource associated with the request". DeleteBridge is the one call a retired bridge
+/// still admits, because it removes the record rather than changing it.
 pub fn retired_bridge_rejection(bridge: &StoredBridge) -> Option<String> {
     let retired = is_bridge_retirement_state(&bridge.bridge_state)
         || is_bridge_retirement_state(bridge.settling_state());

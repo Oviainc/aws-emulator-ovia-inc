@@ -18,12 +18,16 @@
 //! already settling into it, is left exactly as it is — no new transient state and no new
 //! due instant — so repeating the call changes nothing and answers the same thing.
 //!
-//! A bridge that has reached, or is reaching, the terminal `DELETED` state is the one
-//! thing this operation refuses: that transition is irreversible, so asking such a bridge
-//! for any other state is answered with `ConflictException` (HTTP 409), "the requested
-//! operation would cause a conflict with the current state of a service resource
-//! associated with the request". Nothing else about a bridge's current state refuses a
-//! desired state: the member states what the caller WANTS the bridge to converge to.
+//! A bridge whose deletion has been accepted — one sitting in a retirement state, or one
+//! the clock is still settling into the terminal `DELETED` — is the one thing this operation
+//! refuses: that transition is irreversible, so asking such a bridge for any other state is
+//! answered with `ConflictException` (HTTP 409), "the requested operation would cause a
+//! conflict with the current state of a service resource associated with the request". That
+//! precondition is read from [`crate::state::retired_bridge_rejection`], the one place this
+//! crate decides a bridge is past being changed, so this operation refuses exactly the
+//! bridges every operation that writes to a stored bridge refuses. Nothing else about a
+//! bridge's current state refuses a desired state: the member states what the caller WANTS
+//! the bridge to converge to.
 //!
 //! A bridge asked for `DELETED` stays a readable resource in that state rather than being
 //! evicted — `BridgeState` declares `DELETED`, which is the model's own statement that a
@@ -113,6 +117,18 @@ use super::types::*;
 fn bad_request(detail: impl Into<String>) -> UpdateBridgeStateError {
     UpdateBridgeStateErrorModeled::BadRequestException(BadRequestException {
         message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse the request with `ConflictException` (HTTP 409): the request "would cause a
+/// conflict with the current state of a service resource associated with the request.
+/// Resolve the conflict before retrying this request" — the state the addressed bridge is
+/// already in rather than the request's content, so the sentence carries neither of this
+/// service's request-content envelopes.
+fn conflict(detail: impl Into<String>) -> UpdateBridgeStateError {
+    UpdateBridgeStateErrorModeled::ConflictException(ConflictException {
+        message: detail.into(),
     })
     .into()
 }
@@ -243,24 +259,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // transition is in flight, and the one it is in otherwise.
         let settling = bridge.settling_state().to_string();
 
-        // A bridge that has reached, or is reaching, the terminal `DELETED` state cannot be
-        // asked for another state: the deletion is irreversible, which is the conflict
-        // `ConflictException` describes ("would cause a conflict with the current state of a
-        // service resource associated with the request", 409 and retryable). The status and
-        // the error code are the contract; the sentence states the precondition and carries
-        // neither of this service's `BadRequestException` / `NotFoundException` envelopes.
-        if settling == crate::state::BRIDGE_STATE_DELETED
-            && settled != crate::state::BRIDGE_STATE_DELETED
-        {
-            return Err(UpdateBridgeStateErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "Bridge {} is {} and cannot be returned to {settled}.",
-                        bridge.bridge_arn, bridge.bridge_state
-                    ),
-                },
-            )
-            .into());
+        // A bridge whose deletion has been accepted is retired and cannot be asked for
+        // another state: the deletion is irreversible. That is the one precondition every
+        // operation that writes to a stored bridge applies
+        // (`crate::state::retired_bridge_rejection`), read here through the same function
+        // rather than restated, so this operation cannot disagree with the rest about which
+        // bridges still accept a change — a bridge sitting in a retirement state included,
+        // not only one the clock is still settling into it. Asking a retired bridge for
+        // `DELETED` again is the `@idempotent` no-op rather than a change, so it is not
+        // refused.
+        if settled != crate::state::BRIDGE_STATE_DELETED {
+            if let Some(rejection) = crate::state::retired_bridge_rejection(bridge) {
+                return Err(conflict(rejection));
+            }
         }
 
         // `@idempotent`: a bridge already in the asked-for state, or already settling into
