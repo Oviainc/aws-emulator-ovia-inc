@@ -31,6 +31,9 @@
 //!    stores nothing, and describing twice reports the same lists.
 //! 7. The ACCOUNT SEGMENT of a reported ARN names whoever owns the list: this account for
 //!    one it created, and the literal `aws` for one Amazon Web Services owns itself.
+//! 8. A reported ARN is a fact of the LIST, not of the request that read it: the same list
+//!    carries the same ARN whichever narrowing path reports it, and the id in that ARN is the
+//!    id `DescribePrefixLists` reports for the same list.
 //!
 //! The entries a create stores are asserted through the engine's own store: the operation
 //! that reports them, `GetManagedPrefixListEntries`, is still a scaffold stub with its own
@@ -830,14 +833,16 @@ fn clone_case(case: &CreateCase) -> CreateCase {
 // DescribeManagedPrefixLists: what the caller can see
 // ---------------------------------------------------------------------------
 
-/// The ids `DescribePrefixLists` reports for the prefix lists `region` publishes.
+/// The ids `DescribePrefixLists` reports for the prefix lists `region` publishes, sorted.
+///
+/// The id half of [`published_names_and_ids`], so this suite reads the legacy projection in
+/// one place and the two readers cannot drift on what they assert about that call.
 async fn published_ids(router: &MultiServiceRouter, region: &str) -> Vec<String> {
-    let (status, body) = super::ec2_query::call(router, region, "DescribePrefixLists", &[]).await;
-    assert_eq!(
-        status, 200,
-        "DescribePrefixLists in {region}: expected HTTP 200, got {status} with body {body}"
-    );
-    let mut ids = elements(&body, "prefixListId");
+    let mut ids: Vec<String> = published_names_and_ids(router, region)
+        .await
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect();
     ids.sort();
     ids
 }
@@ -1133,21 +1138,37 @@ const SERVICE_OWNED_ACCOUNT_SEGMENT: &str = "aws";
 /// rest of this suite uses, and the other two are further Regions the issue did not cite.
 const ARN_REGIONS: [&str; 4] = [REGION, OTHER_REGION, "us-west-2", "ap-southeast-1"];
 
-/// Every prefix list a describe reported, as `(prefixListId, ownerId, prefixListArn)` — read
-/// off the document tree, so each member is paired with the list it belongs to rather than
-/// with the one at the same position in a flat list of elements.
-fn reported_lists(case: &str, body: &str) -> Vec<(String, String, String)> {
-    let document = super::wire::document(case, body);
+/// Every element of `document` that is a reported prefix list: the one carrying a
+/// `prefixListId` child, whichever projection of a list wrote it. Reading the TREE is what
+/// pairs a member with the list it belongs to rather than with the one at the same position in
+/// a flat list of elements, so every reader of a reported list goes through this.
+fn reported_list_nodes<'a, 'i>(
+    document: &'a roxmltree::Document<'i>,
+) -> Vec<roxmltree::Node<'a, 'i>> {
     document
         .descendants()
         .filter(|node| node.is_element() && super::wire::child(*node, "prefixListId").is_some())
+        .collect()
+}
+
+/// The text of the `name` member of one reported prefix list, or a panic naming the case: a
+/// member the projection under test reports is a member every one of its lists carries.
+fn list_member(case: &str, body: &str, list: roxmltree::Node<'_, '_>, name: &str) -> String {
+    super::wire::child_text(list, name)
+        .unwrap_or_else(|| panic!("case {case:?}: a reported list carries no <{name}> in {body}"))
+}
+
+/// Every prefix list a describe reported, as `(prefixListId, ownerId, prefixListArn)`.
+fn reported_lists(case: &str, body: &str) -> Vec<(String, String, String)> {
+    let document = super::wire::document(case, body);
+    reported_list_nodes(&document)
+        .into_iter()
         .map(|list| {
-            let text = |name: &str| {
-                super::wire::child_text(list, name).unwrap_or_else(|| {
-                    panic!("case {case:?}: a reported list carries no <{name}> in {body}")
-                })
-            };
-            (text("prefixListId"), text("ownerId"), text("prefixListArn"))
+            (
+                list_member(case, body, list, "prefixListId"),
+                list_member(case, body, list, "ownerId"),
+                list_member(case, body, list, "prefixListArn"),
+            )
         })
         .collect()
 }
@@ -1256,6 +1277,226 @@ async fn the_account_segment_of_a_reported_arn_names_whoever_owns_the_list() {
         assert!(
             arn.starts_with("arn:aws:ec2:") && arn.contains(&owned_segment),
             "list {id}: expected an ARN carrying the account {account}, got {arn}"
+        );
+    }
+}
+
+/// The prefix lists Region `region` publishes as `DescribePrefixLists` reports them, as
+/// `(prefixListName, prefixListId)` in name order — the LEGACY projection of the same lists,
+/// read off the document tree so a name is paired with the id of its own list rather than
+/// with the one at the same position in a flat list of elements.
+async fn published_names_and_ids(
+    router: &MultiServiceRouter,
+    region: &str,
+) -> Vec<(String, String)> {
+    let case = format!("DescribePrefixLists in {region}");
+    let (status, body) = super::ec2_query::call(router, region, "DescribePrefixLists", &[]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} with body {body}"
+    );
+    let document = super::wire::document(&case, &body);
+    let mut pairs: Vec<(String, String)> = reported_list_nodes(&document)
+        .into_iter()
+        .map(|list| {
+            (
+                list_member(&case, &body, list, "prefixListName"),
+                list_member(&case, &body, list, "prefixListId"),
+            )
+        })
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+/// Every prefix list a describe signed for `region` reports for `params`, as
+/// `(prefixListId, ownerId, prefixListArn)`, walking `NextToken` to the end — so a request
+/// that pages still yields every list it matched.
+async fn reported_via(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    params: &[(String, String)],
+) -> Vec<(String, String, String)> {
+    let mut collected: Vec<(String, String, String)> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut page = 0usize;
+    loop {
+        page += 1;
+        let mut page_params = params.to_vec();
+        if let Some(token) = &token {
+            page_params.push(param("NextToken", token));
+        }
+        let (status, body) = describe_in(router, region, &page_params).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}, page {page}: expected HTTP 200, got {status} with body {body}"
+        );
+        for list in reported_lists(case, &body) {
+            // A token names the list the next page starts at, so each page reports lists the
+            // earlier ones did not. Asserting that is also what bounds this walk: a token
+            // standing still fails here instead of looping forever.
+            assert!(
+                !collected.iter().any(|(id, _, _)| id == &list.0),
+                "case {case:?}, page {page}: the list {id} was reported twice, so the walk \
+                 does not advance; got {collected:?}",
+                id = list.0
+            );
+            collected.push(list);
+        }
+        // An absent token and an empty one both mean "no more results to return".
+        token = member(&body, "nextToken").filter(|token| !token.is_empty());
+        if token.is_none() {
+            return collected;
+        }
+    }
+}
+
+/// The paths that name NO single list, as the describe parameters each sends: the whole
+/// report, the owner every published list shares, and a page size that forces the answer to be
+/// walked rather than read in one go. One answer per path covers every published list of the
+/// Region, so these are read once per Region rather than once per list.
+fn whole_answer_paths() -> Vec<(String, Vec<(String, String)>)> {
+    vec![
+        ("no narrowing at all".to_string(), Vec::new()),
+        (
+            "narrowed by the owner-id filter".to_string(),
+            filters(&[("owner-id", &[AWS_MANAGED_PREFIX_LIST_OWNER])]),
+        ),
+        (
+            "one list per page".to_string(),
+            vec![param("MaxResults", "1")],
+        ),
+    ]
+}
+
+/// The paths that ask for ONE list, as the describe parameters each sends for the list `name`
+/// with the id `id`: every documented way of naming a single list, by id and by name, alone and
+/// combined with the owner filter.
+fn one_list_paths(name: &str, id: &str) -> Vec<(String, Vec<(String, String)>)> {
+    vec![
+        (
+            "narrowed by PrefixListIds".to_string(),
+            indexed("PrefixListId", &[id]),
+        ),
+        (
+            "narrowed by the prefix-list-id filter".to_string(),
+            filters(&[("prefix-list-id", &[id])]),
+        ),
+        (
+            "narrowed by the prefix-list-name filter".to_string(),
+            filters(&[("prefix-list-name", &[name])]),
+        ),
+        (
+            "narrowed by name and owner together".to_string(),
+            filters(&[
+                ("prefix-list-name", &[name]),
+                ("owner-id", &[AWS_MANAGED_PREFIX_LIST_OWNER]),
+            ]),
+        ),
+    ]
+}
+
+/// Asserts that `reported` — what one describe signed for `region` answered — reports the
+/// published list `id` as one Amazon Web Services owns, under the ARN the rule gives it: the
+/// service's account segment, the Region's own name and the list's own id, naming `account`
+/// nowhere.
+fn assert_published_arn(
+    case: &str,
+    reported: &[(String, String, String)],
+    region: &str,
+    id: &str,
+    account: &str,
+) {
+    let expected = format!("arn:aws:ec2:{region}:{SERVICE_OWNED_ACCOUNT_SEGMENT}:prefix-list/{id}");
+    let (_, owner, arn) = reported
+        .iter()
+        .find(|(reported_id, _, _)| reported_id.as_str() == id)
+        .unwrap_or_else(|| panic!("case {case:?}: expected the list {id}, got {reported:?}"));
+    assert_eq!(
+        owner, AWS_MANAGED_PREFIX_LIST_OWNER,
+        "case {case:?}: expected a list Amazon Web Services owns, got owner {owner:?}"
+    );
+    assert_eq!(
+        arn, &expected,
+        "case {case:?}: expected {expected}, got {arn:?}"
+    );
+    assert!(
+        !arn.contains(account),
+        "case {case:?}: a published list's ARN must not name the caller's account {account}, \
+         got {arn:?}"
+    );
+}
+
+/// RULE: a reported prefix list's ARN is a fact OF THE LIST — its partition, service, the
+/// Region it belongs to, the account segment its owner decides and its own id — so it does
+/// not depend on how the request asked for the list, and the id segment is the same id the
+/// other report of that list carries. For a list Amazon Web Services publishes that means
+/// `arn:aws:ec2:<region>:aws:prefix-list/<id>` through every narrowing path, with `<id>` the
+/// id `DescribePrefixLists` reports for the same name; a list the account created keeps its
+/// account id in that segment in the SAME answer.
+///
+/// The rows differ along the Region the describe is signed for, which published list of that
+/// Region is read, and which path reports it.
+#[tokio::test]
+async fn a_published_lists_arn_is_the_same_whichever_path_reports_it() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let account = engine::emulator_account_id().to_string();
+    // The account segment as it reads in a prefix list's ARN, with the resource that follows
+    // it: the partition is `aws` too, so the segment on its own would match every ARN.
+    let service_owned_segment = format!(":{SERVICE_OWNED_ACCOUNT_SEGMENT}:prefix-list/");
+
+    for region in ARN_REGIONS {
+        // One list of the account's own in the same Region, so every unnarrowed answer below
+        // reports a customer-owned list beside the published ones and the account segment has
+        // to tell them apart within one response.
+        let (own_id, own_arn) = create_own_in(&router, region).await;
+
+        let published = published_names_and_ids(&router, region).await;
+        assert!(
+            !published.is_empty(),
+            "case {region:?}: a Region publishes at least one prefix list, got {published:?}"
+        );
+
+        for (name, id) in &published {
+            for (path, params) in one_list_paths(name, id) {
+                let case = format!("{region}, {name}, {path}");
+                let reported = reported_via(&router, region, &case, &params).await;
+                assert_published_arn(&case, &reported, region, id, &account);
+            }
+        }
+
+        // The paths that name no list: one answer each, every published list of the Region
+        // looked up in it.
+        for (path, params) in whole_answer_paths() {
+            let case = format!("{region}, {path}");
+            let reported = reported_via(&router, region, &case, &params).await;
+            for (_, id) in &published {
+                assert_published_arn(&case, &reported, region, id, &account);
+            }
+        }
+
+        // The account's own list, read out of an answer that reported the published ones too:
+        // its ARN is the one its create answered, and it carries the account where a
+        // published list carries the service's segment.
+        let case = format!("{region}, the account's own list");
+        let reported = reported_via(&router, region, &case, &[]).await;
+        let (_, owner, arn) = reported
+            .iter()
+            .find(|(reported_id, _, _)| reported_id == &own_id)
+            .unwrap_or_else(|| panic!("case {case:?}: expected the list {own_id}, got {reported:?}"));
+        assert_eq!(
+            owner, &account,
+            "case {case:?}: expected the list to be owned by {account}, got {owner:?}"
+        );
+        assert_eq!(
+            arn, &own_arn,
+            "case {case:?}: expected the ARN the create answered, {own_arn}, got {arn:?}"
+        );
+        assert!(
+            !arn.contains(&service_owned_segment),
+            "case {case:?}: a list the account created must not carry the service's account \
+             segment, got {arn:?}"
         );
     }
 }
