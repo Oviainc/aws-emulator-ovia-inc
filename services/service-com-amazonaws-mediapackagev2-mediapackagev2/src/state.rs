@@ -1197,9 +1197,11 @@ pub struct OriginEndpoint {
     /// Materialised at create time: the service reports the separator it applied on
     /// every projection of the endpoint, the list projection included.
     pub uri_separator: String,
-    /// Materialised at create time, for the same reason as
-    /// [`OriginEndpoint::uri_separator`].
-    pub stream_name_output_mode: String,
+    /// Materialised at create time like [`OriginEndpoint::uri_separator`], but only when
+    /// the parent channel's input type may carry the member at all: an endpoint of a
+    /// channel that may not has no mode and reports none. See
+    /// [`materialized_stream_name_output_mode`].
+    pub stream_name_output_mode: Option<String>,
     pub created_at: ::aws_smithy_types::DateTime,
     pub modified_at: ::aws_smithy_types::DateTime,
     pub reset_at: Option<::aws_smithy_types::DateTime>,
@@ -1526,10 +1528,25 @@ pub fn materialized_uri_separator(submitted: Option<String>) -> String {
     submitted.unwrap_or_else(|| DEFAULT_URI_SEPARATOR.to_string())
 }
 
-/// The stream-name output mode an origin endpoint is stored with — the submitted one,
-/// else [`DEFAULT_STREAM_NAME_OUTPUT_MODE`].
-pub fn materialized_stream_name_output_mode(submitted: Option<String>) -> String {
-    submitted.unwrap_or_else(|| DEFAULT_STREAM_NAME_OUTPUT_MODE.to_string())
+/// The stream-name output mode an origin endpoint is stored with.
+///
+/// The model documents a service-applied default for the member ("If you don't specify a
+/// value, the default is `INDEX`") AND restricts which channel input types may carry it at
+/// all ("valid only when the associated channel's `InputType` is `HLS`"), so the default is
+/// materialised only under a channel whose input type may carry the member; an endpoint of
+/// a channel that may not has no mode and reports none. The restriction is read off the
+/// same place a SUBMITTED mode is refused by
+/// ([`stream_name_output_mode_input_type_violation`]), so a stored mode and a refused one
+/// can never disagree about which channels carry the member — exactly as
+/// [`materialized_output_locking_mode`] does for the channel member documented this way.
+pub fn materialized_stream_name_output_mode(
+    submitted: Option<String>,
+    input_type: &str,
+) -> Option<String> {
+    if !input_type_carries_stream_name_output_mode(input_type) {
+        return None;
+    }
+    Some(submitted.unwrap_or_else(|| DEFAULT_STREAM_NAME_OUTPUT_MODE.to_string()))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -3075,6 +3092,59 @@ pub fn channel_required_member_violation(
         })
 }
 
+/// The `InputType` values whose channels may carry an origin endpoint's stream-name
+/// output mode.
+///
+/// An endpoint member can be restricted by its PARENT channel's input type rather than by
+/// the endpoint's own members, which is why this restriction is stated here rather than in
+/// [`CHANNEL_INPUT_TYPE_RULES`]: the member's own doc says the setting "is valid only when
+/// the associated channel's `InputType` is `HLS`". The ONE place that restriction is
+/// written, read both by the mode an endpoint is STORED with
+/// ([`materialized_stream_name_output_mode`]) and by the refusal a submitted mode earns
+/// ([`stream_name_output_mode_input_type_violation`]).
+const STREAM_NAME_OUTPUT_MODE_INPUT_TYPES: &[&str] = &["HLS"];
+
+/// The member path a refused stream-name output mode is named at, as a validation message
+/// names it (lowerCamel, as on the wire).
+const STREAM_NAME_OUTPUT_MODE_MEMBER: &str = "streamNameOutputMode";
+
+/// What the stream-name output mode is called in the sentence a refusal states.
+const STREAM_NAME_OUTPUT_MODE_LABEL: &str = "StreamNameOutputMode";
+
+/// Whether a channel of this input type may carry an origin endpoint's stream-name output
+/// mode at all.
+pub fn input_type_carries_stream_name_output_mode(input_type: &str) -> bool {
+    STREAM_NAME_OUTPUT_MODE_INPUT_TYPES.contains(&input_type)
+}
+
+/// The refusal a SUBMITTED stream-name output mode earns under a channel whose input type
+/// may not carry the member, or `None` when the request names no mode or the channel may
+/// carry one.
+///
+/// The model's `ValidationExceptionType` names
+/// `ONLY_HLS_INPUT_TYPE_ALLOW_STREAM_NAME_OUTPUT_MODE` for exactly this combination, and
+/// the sentence is the one every other input-type restriction of this service states
+/// ([`channel_input_type_violation`]), off the same allowed-input-type list the stored
+/// mode is materialised from. Shared by the create and the update so the two cannot
+/// disagree about which channels carry the member.
+pub fn stream_name_output_mode_input_type_violation(
+    submitted: Option<&str>,
+    input_type: &str,
+) -> Option<ValidationException> {
+    (submitted.is_some() && !input_type_carries_stream_name_output_mode(input_type)).then(|| {
+        let allowed = STREAM_NAME_OUTPUT_MODE_INPUT_TYPES.join(" or ");
+        validation_failed(
+            STREAM_NAME_OUTPUT_MODE_MEMBER,
+            &format!(
+                "{STREAM_NAME_OUTPUT_MODE_LABEL} can only be configured when the channel \
+                 InputType is {allowed}. To use {STREAM_NAME_OUTPUT_MODE_LABEL}, create a \
+                 channel with {allowed} input type"
+            ),
+            "ONLY_HLS_INPUT_TYPE_ALLOW_STREAM_NAME_OUTPUT_MODE",
+        )
+    })
+}
+
 /// The `InputType` a multiview channel's source channels must have, from
 /// `MultiviewConfiguration$AvailableSources`' doc ("must have an `InputType` of `CMAF`").
 pub const MULTIVIEW_SOURCE_INPUT_TYPE: &str = "CMAF";
@@ -3418,7 +3488,9 @@ pub fn origin_endpoint_etag(endpoint: &OriginEndpoint) -> String {
         ),
         format!("{:?}", endpoint.force_endpoint_error_configuration),
         endpoint.uri_separator.clone(),
-        endpoint.stream_name_output_mode.clone(),
+        // Rendered so that an ABSENT mode and a present one stay apart: an endpoint of a
+        // channel that may not carry the member has none at all.
+        format!("{:?}", endpoint.stream_name_output_mode),
         tag_fingerprint(&endpoint.tags),
         // The commit count, so a commit that writes the same values still rotates the
         // tag — which is what a conditional update that lost a race needs. See
@@ -4314,6 +4386,57 @@ mod tests {
         }
     }
 
+    /// An endpoint member the model restricts to particular parent-channel input types is
+    /// materialised only under a channel whose input type may carry it: the documented
+    /// default is applied there and withheld everywhere else, and a SUBMITTED value is
+    /// refused where the member may not be carried — both read off the one allowed-input-type
+    /// list, so they cannot disagree.
+    ///
+    /// The input-type catalogue is the model's own `InputType` enum
+    /// (`smithy_query(query="shape", shape="InputType")` — HLS | CMAF | MULTIVIEW), and the
+    /// submitted modes are the whole `StreamNameOutputMode` enum.
+    #[test]
+    fn a_restricted_endpoint_member_is_materialised_only_where_it_may_be_carried() {
+        for input_type in ["HLS", "CMAF", "MULTIVIEW"] {
+            let carries = input_type_carries_stream_name_output_mode(input_type);
+            for submitted in [None, Some("INDEX"), Some("PASSTHROUGH_NAME")] {
+                let label = format!("{input_type} with {submitted:?}");
+                let stored = materialized_stream_name_output_mode(
+                    submitted.map(str::to_string),
+                    input_type,
+                );
+                let expected = if carries {
+                    Some(submitted.unwrap_or(DEFAULT_STREAM_NAME_OUTPUT_MODE).to_string())
+                } else {
+                    None
+                };
+                assert_eq!(
+                    stored, expected,
+                    "case {label:?}: expected {expected:?}, got {stored:?}"
+                );
+
+                let violation = stream_name_output_mode_input_type_violation(submitted, input_type);
+                match (submitted, carries) {
+                    (Some(_), false) => {
+                        let violation = violation.unwrap_or_else(|| {
+                            panic!("case {label:?}: expected a refusal, got none")
+                        });
+                        assert_eq!(
+                            violation.validation_exception_type.as_deref(),
+                            Some("ONLY_HLS_INPUT_TYPE_ALLOW_STREAM_NAME_OUTPUT_MODE"),
+                            "case {label:?}: expected the input-type discriminator, got \
+                             {violation:?}"
+                        );
+                    }
+                    _ => assert!(
+                        violation.is_none(),
+                        "case {label:?}: expected no refusal, got {violation:?}"
+                    ),
+                }
+            }
+        }
+    }
+
     /// A stored origin-endpoint record, as the baseline of the table below.
     fn sample_endpoint() -> OriginEndpoint {
         let at = now();
@@ -4332,7 +4455,10 @@ mod tests {
             mss_manifests: Vec::new(),
             force_endpoint_error_configuration: None,
             uri_separator: materialized_uri_separator(None),
-            stream_name_output_mode: materialized_stream_name_output_mode(None),
+            stream_name_output_mode: materialized_stream_name_output_mode(
+                None,
+                DEFAULT_INPUT_TYPE,
+            ),
             created_at: at,
             modified_at: at,
             reset_at: None,
@@ -4355,7 +4481,7 @@ mod tests {
     #[test]
     fn a_change_to_any_member_of_an_origin_endpoint_moves_its_entity_tag() {
         let baseline = sample_endpoint();
-        let mutations: [EndpointMutation; 11] = [
+        let mutations: [EndpointMutation; 12] = [
             ("container_type", |e| {
                 e.container_type = "CMAF".to_string()
             }),
@@ -4410,7 +4536,12 @@ mod tests {
                 e.uri_separator = "HYPHEN".to_string()
             }),
             ("stream_name_output_mode", |e| {
-                e.stream_name_output_mode = "PASSTHROUGH_NAME".to_string()
+                e.stream_name_output_mode = Some("PASSTHROUGH_NAME".to_string())
+            }),
+            // An endpoint under a channel that may not carry the member has no mode at
+            // all, which is a different record from one that carries the default.
+            ("stream_name_output_mode absent", |e| {
+                e.stream_name_output_mode = None
             }),
         ];
         for (member, mutate) in mutations {

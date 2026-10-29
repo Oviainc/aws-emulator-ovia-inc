@@ -23,6 +23,10 @@
 //! * a manifest set the new `ContainerType` cannot serve, no manifest at all, or more
 //!   manifests than [`crate::state::MAX_MANIFESTS_PER_ORIGIN_ENDPOINT`] — the same rules
 //!   `CreateOriginEndpoint` applies, because an update carries the whole manifest set;
+//! * a `StreamNameOutputMode` named for an endpoint whose parent channel's `InputType` may
+//!   not carry the member at all
+//!   (`ONLY_HLS_INPUT_TYPE_ALLOW_STREAM_NAME_OUTPUT_MODE`), off the same rule the create
+//!   reads ([`crate::state::stream_name_output_mode_input_type_violation`]);
 //! * an `ETag` precondition (`x-amzn-update-if-match`) that is not the endpoint's current
 //!   tag, which the model's doc says rejects the request.
 //!
@@ -300,7 +304,7 @@ fn endpoint_output(
             .force_endpoint_error_configuration
             .clone(),
         uri_separator: Some(endpoint.uri_separator.clone()),
-        stream_name_output_mode: Some(endpoint.stream_name_output_mode.clone()),
+        stream_name_output_mode: endpoint.stream_name_output_mode.clone(),
         e_tag: Some(endpoint.etag.clone()),
         tags: Some(endpoint.tags.clone()),
     }
@@ -406,6 +410,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let channel_name = channel.name.clone();
+        // The parent channel's input type decides which of the endpoint's members may be
+        // carried at all, and it is immutable, so it is the same one the create read.
+        let input_type = channel.input_type.clone();
         let channel_output_locking_mode = channel.output_locking_mode.clone();
         let Some(endpoint) = channel
             .origin_endpoints
@@ -420,23 +427,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The immutable members: `ContainerType` is required on every update, so it is
         // compared always; `StreamNameOutputMode` and `Segment.OutputTimestampMode` only
         // when the request provides one, because an absent request value means "keep what
-        // is there". Every endpoint HAS a stored stream-name output mode, and every
-        // endpoint whose channel carries an output-timestamp mode has one of those too —
-        // the service applies both at create whether or not the request named them — so a
-        // request naming a different value is asking to change an immutable member, while
-        // a mode named where the channel carries none is refused as not configurable at
-        // all rather than as a change. All are refused BEFORE a single field is written,
-        // so a rejected update leaves the endpoint — and its ETag — exactly as it was.
+        // is there". An endpoint under a channel whose input type may carry a stream-name
+        // output mode HAS one, and every endpoint whose channel carries an output-timestamp
+        // mode has one of those too — the service applies both at create whether or not the
+        // request named them — so a request naming a different value is asking to change an
+        // immutable member, while a mode named where the channel carries none at all is
+        // refused as not configurable rather than as a change, through the same rules the
+        // create reads. All are refused BEFORE a single field is written, so a rejected
+        // update leaves the endpoint — and its ETag — exactly as it was.
         if input.container_type != endpoint.container_type {
             return Err(UpdateOriginEndpointErrorModeled::ValidationException(
                 immutable_violation(&CONTAINER_TYPE),
             )
             .into());
         }
+        if let Some(rejection) = crate::state::stream_name_output_mode_input_type_violation(
+            input.stream_name_output_mode.as_deref(),
+            &input_type,
+        ) {
+            return Err(UpdateOriginEndpointErrorModeled::ValidationException(rejection).into());
+        }
         if input
             .stream_name_output_mode
-            .as_ref()
-            .is_some_and(|requested| requested != &endpoint.stream_name_output_mode)
+            .as_deref()
+            .is_some_and(|requested| Some(requested) != endpoint.stream_name_output_mode.as_deref())
         {
             return Err(UpdateOriginEndpointErrorModeled::ValidationException(
                 immutable_violation(&STREAM_NAME_OUTPUT_MODE),
@@ -540,7 +554,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The immutability check above has already established that a provided mode equals
         // the stored one, so this assignment keeps the endpoint's mode as it was.
         if let Some(mode) = input.stream_name_output_mode {
-            endpoint.stream_name_output_mode = mode;
+            endpoint.stream_name_output_mode = Some(mode);
         }
         // A write that CHANGED the endpoint commits a new version of it, and the ETag is
         // a function of that version as well as of the endpoint's content: the tag this

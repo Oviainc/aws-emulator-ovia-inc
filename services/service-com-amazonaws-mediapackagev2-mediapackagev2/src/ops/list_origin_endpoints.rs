@@ -182,7 +182,7 @@ fn list_configuration(
         ),
         force_endpoint_error_configuration: endpoint.force_endpoint_error_configuration.clone(),
         uri_separator: Some(endpoint.uri_separator.clone()),
-        stream_name_output_mode: Some(endpoint.stream_name_output_mode.clone()),
+        stream_name_output_mode: endpoint.stream_name_output_mode.clone(),
     }
 }
 

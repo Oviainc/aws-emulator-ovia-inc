@@ -251,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .force_endpoint_error_configuration
                 .clone(),
             uri_separator: Some(endpoint.uri_separator.clone()),
-            stream_name_output_mode: Some(endpoint.stream_name_output_mode.clone()),
+            stream_name_output_mode: endpoint.stream_name_output_mode.clone(),
             e_tag: Some(endpoint.etag.clone()),
             tags: Some(endpoint.tags.clone()),
         })

@@ -8,7 +8,10 @@
 //! configuration, the startover window, the URI separator, the stream-name output mode
 //! and each manifest's window, URI path type and child-manifest URL encoding — are
 //! materialised here and stored, so they are reported on this response and on every
-//! later read. An unknown group or channel is a `ResourceNotFoundException`; an
+//! later read — except that a member the model restricts to particular parent-channel
+//! input types is materialised only under a channel whose `InputType` may carry it, which
+//! for the stream-name output mode means an endpoint of any other channel has no mode and
+//! reports none. An unknown group or channel is a `ResourceNotFoundException`; an
 //! endpoint name already used on that channel is a `ConflictException`.
 //!
 //! The rules the model states but cannot express as a member constraint are enforced
@@ -17,7 +20,11 @@
 //! `NUM_MANIFESTS_HIGH`), and no manifest family its `ContainerType` cannot serve. A
 //! `Segment.OutputTimestampMode` is refused on a channel whose output locking mode may
 //! not carry the member ([`crate::state::output_timestamp_mode_violation`], a 400
-//! `ValidationException` / `ONLY_NON_EPOCH_LOCKED_ALLOW_OUTPUT_TIMESTAMP_MODE`). The
+//! `ValidationException` / `ONLY_NON_EPOCH_LOCKED_ALLOW_OUTPUT_TIMESTAMP_MODE`), and a
+//! submitted stream-name output mode is refused on a channel whose `InputType` may not
+//! carry THAT member
+//! ([`crate::state::stream_name_output_mode_input_type_violation`], a 400
+//! `ValidationException` / `ONLY_HLS_INPUT_TYPE_ALLOW_STREAM_NAME_OUTPUT_MODE`). The
 //! operation is also `@idempotent` and binds
 //! `ClientToken` with `@idempotencyToken`: an unchanged repeat under the same token
 //! replays the endpoint it created, and a changed one is a `ConflictException` /
@@ -248,7 +255,7 @@ fn endpoint_output(
             .force_endpoint_error_configuration
             .clone(),
         uri_separator: Some(endpoint.uri_separator.clone()),
-        stream_name_output_mode: Some(endpoint.stream_name_output_mode.clone()),
+        stream_name_output_mode: endpoint.stream_name_output_mode.clone(),
         e_tag: Some(endpoint.etag.clone()),
         tags: Some(endpoint.tags.clone()),
     }
@@ -352,6 +359,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The parent channel decides which of the endpoint's members may be carried at
+        // all: the stream-name output mode is "valid only when the associated channel's
+        // `InputType` is `HLS`", so a submitted one is refused here rather than stored on a
+        // channel that may not carry it — and nothing is written before the refusal.
+        let input_type = channel.input_type.clone();
+        if let Some(rejection) = crate::state::stream_name_output_mode_input_type_violation(
+            input.stream_name_output_mode.as_deref(),
+            &input_type,
+        ) {
+            return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
+        }
         // A segment output-timestamp mode is only configurable under a channel whose
         // output locking mode carries the member, so a mode this request names is judged
         // against the channel the endpoint is being created under — before the endpoint
@@ -516,10 +534,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             mss_manifests,
             force_endpoint_error_configuration: input.force_endpoint_error_configuration,
             // The URI separator and the stream-name output mode are server-applied too:
-            // every endpoint has one, whether or not the request named it.
+            // every endpoint has a separator, whether or not the request named it, and one
+            // under a channel whose input type may carry a stream-name output mode has a
+            // mode — while an endpoint of a channel that may not carry the member has none.
             uri_separator: crate::state::materialized_uri_separator(input.uri_separator),
             stream_name_output_mode: crate::state::materialized_stream_name_output_mode(
                 input.stream_name_output_mode,
+                &input_type,
             ),
             created_at,
             modified_at: created_at,

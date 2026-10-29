@@ -110,3 +110,5 @@ mod inverted_deny_statements;
 mod pagination_token_scope;
 #[path = "all/segment_output_timestamp_mode.rs"]
 mod segment_output_timestamp_mode;
+#[path = "all/endpoint_member_input_type_restriction.rs"]
+mod endpoint_member_input_type_restriction;
