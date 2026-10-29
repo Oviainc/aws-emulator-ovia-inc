@@ -44,7 +44,11 @@
 //!   `ValidationException` (400) carrying the modelled `reason` and one `fieldList`
 //!   entry per offending member, built from [`Violation`]s by
 //!   [`field_validation_failed`] — the same rendering whether the offending member
-//!   was found at the constraint boundary (see `crate::service`) or here.
+//!   was found at the constraint boundary (see `crate::service`) or here. A request
+//!   the service could not READ carries the other reason: it is stated by
+//!   [`cannot_parse_input`] as `cannotParse`, naming each member whose value could
+//!   not be read. Which of the two reasons a refusal states never depends on WHERE
+//!   the offending value was found, only on whether the service read it.
 //! * **Pagination.** Records are reported in store (insertion) order, so a page
 //!   boundary is stable. `nextToken` is opaque: a 128-bit fingerprint of the
 //!   SELECTION the token was issued over (the filter) followed by the offset to
@@ -233,6 +237,41 @@ pub fn field_validation_failed(violations: &[Violation]) -> ListRecommendedActio
                 })
                 .collect(),
         ),
+    })
+}
+
+/// A 400 `ValidationException` for a request this service could not READ —
+/// `ValidationExceptionReason$cannotParse`.
+///
+/// The counterpart of [`field_validation_failed`] for the OTHER class of refusal
+/// the modelled reason distinguishes: a value that was read and refused versus one
+/// that could not be read at all. `detail` is the reading failure's own
+/// explanation, which the codec already words for a caller, and `members` names
+/// each input member whose value could not be read, so a client is told WHERE the
+/// request could not be read and not merely that it could not.
+///
+/// A reading failure that names no member — a body that is not this input's object
+/// at all — carries no `fieldList`, which the model permits: `fieldList` is
+/// optional where `reason` is REQUIRED.
+pub fn cannot_parse_input(
+    detail: &str,
+    members: &[(String, String)],
+) -> ListRecommendedActionsErrorModeled {
+    // BOUNDED the way [`field_validation_failed`] is bounded: each entry renders a
+    // member name and a clause about a request-chosen value, so both the count and
+    // each string are capped before they reach the body.
+    let field_list: Vec<ValidationExceptionField> = members
+        .iter()
+        .take(MAX_VIOLATIONS)
+        .map(|(name, message)| ValidationExceptionField {
+            name: echoed(name),
+            message: echoed(message),
+        })
+        .collect();
+    ListRecommendedActionsErrorModeled::ValidationException(ValidationException {
+        message: echoed(detail),
+        reason: REASON_CANNOT_PARSE.to_string(),
+        field_list: (!field_list.is_empty()).then_some(field_list),
     })
 }
 

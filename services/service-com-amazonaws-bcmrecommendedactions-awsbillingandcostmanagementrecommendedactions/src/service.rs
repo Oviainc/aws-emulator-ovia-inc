@@ -97,21 +97,52 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
 /// handler's own refusals use; a request with no violation is handed to the
 /// generated walk unchanged.
 ///
+/// That covers EVERY way this input can be refused, not only the member-level
+/// ways: a request the codec cannot read at all — a member present with a value of
+/// the wrong JSON type, a body that is not the input object — is refused here too,
+/// as the modelled `cannotParse`
+/// ([`crate::ops::list_recommended_actions::cannot_parse_input`]). Handing that
+/// class to the generated walk would render exactly the generic body described
+/// above, so the one class of input this service calls unreadable would be the one
+/// whose refusal states no `reason`.
+///
 /// Generic over the engine type for the same reason the rest of this file is: the
 /// operation whose schema and routing key it reads is, so naming a concrete engine
 /// here would let this seam drift from the service the router mounts.
 struct ModelledValidation<Eng>(::std::marker::PhantomData<Eng>);
 
+/// Why this operation refuses the request's input, in the two classes the modelled
+/// `ValidationExceptionReason` distinguishes.
+///
+/// Both are stated in the operation's own `ValidationException`, which is what this
+/// seam exists for: neither class may reach the framework's generic refusal body,
+/// where the REQUIRED `reason` cannot travel.
+enum InputRefusal {
+    /// Values the service READ and does not accept — an absent required member, a
+    /// value outside a modelled constraint, a value outside an enum's set. Stated
+    /// as `fieldValidationFailed`, one `fieldList` entry per violation.
+    Refused(Vec<smithy_server_runtime::Violation>),
+    /// A value the service could not READ at all. Stated as `cannotParse`, with the
+    /// codec's own explanation as the message and one `fieldList` entry per input
+    /// member whose value could not be read — empty when the body names none, as a
+    /// body that is not even an object does not.
+    Unreadable {
+        detail: String,
+        members: Vec<(String, String)>,
+    },
+}
+
 impl<Eng: Send + Sync + 'static> ModelledValidation<Eng> {
-    /// The violations in `req`, read the way the framework's own walk reads them:
+    /// How `req`'s input is refused, read the way the framework's own walk reads it:
     /// deserialize the input against the operation's schema, then validate the built
-    /// value against it. `None` means the request carries no structured refusal —
-    /// either it is valid, or it failed in a way that has no member-level form (a
-    /// body the codec cannot read at all), which the generated walk renders itself.
-    fn violations(
+    /// value against it. `None` means this operation has nothing to restate — either
+    /// the input is valid, or the boundary refused the request for a reason that is
+    /// not this input's content (an authentication refusal, a body the transport
+    /// could not read), whose status and envelope the framework owns.
+    fn refusal(
         protocol: &dyn smithy_server_runtime::ServerHttpProtocol,
         req: &aws_smithy_runtime_api::http::Request,
-    ) -> Option<Vec<smithy_server_runtime::Violation>> {
+    ) -> Option<InputRefusal> {
         let schema = Self::input_schema();
         let error = match protocol.deserialize_input(req, schema) {
             Ok(mut deser) => {
@@ -123,7 +154,8 @@ impl<Eng: Send + Sync + 'static> ModelledValidation<Eng> {
                         let violations = aws_smithy_schema_server::constraints::validate(
                             &input, schema,
                         );
-                        return (!violations.is_empty()).then_some(violations);
+                        return (!violations.is_empty())
+                            .then_some(InputRefusal::Refused(violations));
                     }
                     // Absence is found while READING the request, so it arrives as a
                     // codec error; `refusal_of` gives it the same structured form a
@@ -134,9 +166,98 @@ impl<Eng: Send + Sync + 'static> ModelledValidation<Eng> {
             Err(e) => e,
         };
         match smithy_server_runtime::refusal_of(&error) {
-            Some(Refusal::Invalid(violations)) if !violations.is_empty() => Some(violations),
-            _ => None,
+            Some(Refusal::Invalid(violations)) if !violations.is_empty() => {
+                Some(InputRefusal::Refused(violations))
+            }
+            // A codec failure with no member-level form, which is the rest of
+            // `ProtocolError::Serde`: a member whose value is of the wrong JSON
+            // type, a body that is not the input object, JSON that does not parse.
+            // The service could not READ the request, so it is refused as
+            // `cannotParse` rather than handed on to the generated walk, which would
+            // re-read the same body, fail the same way and render the generic body.
+            _ => match error {
+                aws_smithy_schema_server::ProtocolError::Serde(serde_error) => {
+                    Some(InputRefusal::Unreadable {
+                        // The codec words its failures for the CALLER (`expected
+                        // number, got string`), so its explanation is the message —
+                        // the same one this refusal carried before it also carried a
+                        // reason.
+                        detail: serde_error.to_string(),
+                        members: Self::unreadable_members(protocol, req),
+                    })
+                }
+                _ => None,
+            },
         }
+    }
+
+    /// Each input member whose own value the codec could not read, named the way the
+    /// boundary validator names a member, with the codec's explanation for it.
+    ///
+    /// Found by reading each member of the body ON ITS OWN through the SAME codec
+    /// that failed on the whole body: a member that reads in isolation is not one the
+    /// codec choked on, and one that does not read is reported with the clause it
+    /// failed with. Only keys the MODEL declares as members of this input are read
+    /// back, so the work is bounded by the input shape rather than by how many keys a
+    /// request carries, and a key the codec skips as unknown is never reported.
+    ///
+    /// An empty answer is the honest one for a body with no member to name — one that
+    /// is not an object, or does not parse as JSON at all — and the model allows it:
+    /// `fieldList` is optional where `reason` is not.
+    fn unreadable_members(
+        protocol: &dyn smithy_server_runtime::ServerHttpProtocol,
+        req: &aws_smithy_runtime_api::http::Request,
+    ) -> Vec<(String, String)> {
+        let schema = Self::input_schema();
+        let Some(body) = req.body().bytes() else {
+            return Vec::new();
+        };
+        let Ok(serde_json::Value::Object(members)) =
+            serde_json::from_slice::<serde_json::Value>(body)
+        else {
+            return Vec::new();
+        };
+        members
+            .iter()
+            .filter(|(key, _)| Self::declares_member(schema, key))
+            .filter_map(|(key, value)| {
+                let mut only = serde_json::Map::new();
+                only.insert(key.clone(), value.clone());
+                let probe = aws_smithy_runtime_api::http::Request::new(
+                    aws_smithy_types::body::SdkBody::from(
+                        serde_json::Value::Object(only).to_string(),
+                    ),
+                );
+                let mut deser = protocol.deserialize_input(&probe, schema).ok()?;
+                let error = <crate::ops::types::ListRecommendedActionsInput as DeserializableStruct>::deserialize(
+                    &mut *deser,
+                )
+                .err()?;
+                // A member ABSENT from a one-member body is not a member that could
+                // not be read: that is what the whole-body read reports, and it
+                // already has a member-level form of its own.
+                if matches!(
+                    error,
+                    aws_smithy_schema::serde::SerdeError::MissingMember { .. }
+                ) {
+                    return None;
+                }
+                Some((
+                    aws_smithy_schema_server::constraints::path::member(key),
+                    error.to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Whether the model declares `key` as a member of this operation's input, by the
+    /// name the WIRE carries — a member's `jsonName` when it declares one, its member
+    /// name otherwise, which is how the codec itself looks a key up.
+    fn declares_member(schema: &aws_smithy_schema::Schema, key: &str) -> bool {
+        schema.members().iter().any(|member| {
+            member.json_name().map(|name| name.value()) == Some(key)
+                || member.member_name() == Some(key)
+        })
     }
 
     /// The operation's input schema — read off the operation itself, never spelled
@@ -165,9 +286,15 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for ModelledValidation<Eng> {
             // (see the module docs on the media type). The codec is the same JSON
             // either way, so the request reads identically.
             let protocol = svc.definition().protocol();
-            if let Some(violations) = Self::violations(protocol, req) {
-                let modeled =
-                    crate::ops::list_recommended_actions::field_validation_failed(&violations);
+            if let Some(refusal) = Self::refusal(protocol, req) {
+                let modeled = match refusal {
+                    InputRefusal::Refused(violations) => {
+                        crate::ops::list_recommended_actions::field_validation_failed(&violations)
+                    }
+                    InputRefusal::Unreadable { detail, members } => {
+                        crate::ops::list_recommended_actions::cannot_parse_input(&detail, &members)
+                    }
+                };
                 return protocol
                     .serialize_error(
                         modeled.as_serializable(),

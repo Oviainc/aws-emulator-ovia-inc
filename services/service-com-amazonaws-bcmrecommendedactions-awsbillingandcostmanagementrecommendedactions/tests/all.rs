@@ -17,3 +17,5 @@ mod context_map_order;
 mod list_recommended_actions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/unreadable_input.rs"]
+mod unreadable_input;
