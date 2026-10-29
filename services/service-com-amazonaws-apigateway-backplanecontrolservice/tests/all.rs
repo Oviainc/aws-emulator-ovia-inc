@@ -285,3 +285,6 @@ mod vpc_link_records;
 mod stage_arn_names_the_creation_region;
 #[path = "all/vpc_link_collection.rs"]
 mod vpc_link_collection;
+// Appended for the reason the note above gives.
+#[path = "all/rest_api_import_integrations.rs"]
+mod rest_api_import_integrations;

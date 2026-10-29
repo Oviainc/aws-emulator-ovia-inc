@@ -92,7 +92,10 @@ fn yaml_definition(title: &str, paths: &[(&str, &[&str])]) -> String {
 }
 
 /// `PutRestApi` with `body` sent verbatim as the definition payload.
-async fn put_definition(
+///
+/// `pub(crate)` so the sibling `rest_api_import_integrations` suite drives the same one
+/// call rather than writing the mode/`failonwarnings` query string a second time.
+pub(crate) async fn put_definition(
     gateway: &Gateway,
     api: &str,
     mode: Option<&str>,
@@ -132,7 +135,9 @@ async fn import_definition(
 }
 
 /// Every listed resource of `api`, keyed by its full path.
-async fn resources_by_path(gateway: &Gateway, api: &str, case: &str) -> Vec<(String, Value)> {
+///
+/// `pub(crate)` for the reason [`put_definition`] gives.
+pub(crate) async fn resources_by_path(gateway: &Gateway, api: &str, case: &str) -> Vec<(String, Value)> {
     let answer = gateway
         .call("GET", &format!("/restapis/{api}/resources"), None)
         .await;
