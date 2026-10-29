@@ -138,6 +138,18 @@ const DENY_EFFECT: &str = "Deny";
 /// The `Principal` wildcard: a statement naming it applies to every principal.
 const EVERY_PRINCIPAL: &str = "*";
 
+/// What ECR answers a lock-out policy submitted without `force` with: the warning and the
+/// remediation, in the operation's own documented terms ("If the policy you are
+/// attempting to set on a repository policy would prevent you from setting another policy
+/// in the future, you must force the SetRepositoryPolicy operation").
+///
+/// The sentence carries NO value from the request — not the repository, not the statement
+/// — because what a caller has to do about it is the same whichever repository and
+/// whichever statement it was: send the call again with `force`.
+const LOCK_OUT_MESSAGE: &str = "You are about to set a repository policy that will \
+     prevent you from setting another one in the future. Use the force parameter to \
+     override this exception.";
+
 /// Map a shared-state failure onto this operation's own modelled errors.
 fn fault_error(fault: crate::state::Fault) -> SetRepositoryPolicyErrorModeled {
     let message = Some(fault.message().to_string());
@@ -258,12 +270,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if input.force || !denies_setting_policy(statement) {
                     return Ok(());
                 }
-                Err(crate::state::Fault::InvalidParameter(format!(
-                    "the policy denies 'ecr:SetRepositoryPolicy' to every principal, \
-                     which would prevent another policy from being set on repository \
-                     '{}'; set force to true to apply it anyway",
-                    input.repository_name
-                )))
+                Err(crate::state::Fault::InvalidParameter(
+                    LOCK_OUT_MESSAGE.to_string(),
+                ))
             },
         )
         .map_err(fault_error)?;

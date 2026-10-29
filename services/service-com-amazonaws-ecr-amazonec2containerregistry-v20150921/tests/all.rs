@@ -77,6 +77,8 @@ mod pull_time_update_exclusion_quota;
 mod pull_time_update_exclusion_removal;
 #[path = "all/pull_time_update_exclusions.rs"]
 mod pull_time_update_exclusions;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/registry_policy.rs"]
 mod registry_policy;
 #[path = "all/registry_replication_configuration.rs"]

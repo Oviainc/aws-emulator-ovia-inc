@@ -109,6 +109,17 @@ impl From<PutReplicationConfigurationErrorModeled> for PutReplicationConfigurati
     }
 }
 
+/// The API label of the input member every refusal of this operation is stated against:
+/// the configuration the request carries, which is the one parameter it takes.
+const CONFIGURATION_PARAMETER: &str = "replicationConfiguration";
+
+/// The constraint a configuration fails when one of its destinations IS the source
+/// registry. The phrase states the constraint itself and carries no value from the
+/// request: which rule named it, and which registry and Region it named, do not change
+/// what the caller has to do about it.
+const SOURCE_DESTINATION_CONSTRAINT: &str =
+    "Replication destination cannot be the same as the source registry";
+
 /// The first destination of `configuration` whose `region` is not a Region AWS has, with
 /// the index of the rule carrying it.
 ///
@@ -132,24 +143,20 @@ fn unknown_region(
         })
 }
 
-/// The first destination of `configuration` that names the source registry itself —
-/// this account's registry in `region` — with the index of the rule carrying it.
+/// Whether any destination of `configuration` names the source registry itself — this
+/// account's registry in `region`.
 ///
 /// A destination is ANOTHER registry: this account's registry in a different Region
 /// (cross-Region replication), or another account's registry in any Region
 /// (cross-account replication). One naming this account's registry in the Region the
 /// call was made against names the source, so there is nothing to replicate to. The
 /// model cannot express the pairing, so it is checked here.
-fn source_destination<'a>(
-    configuration: &'a ReplicationConfiguration,
-    region: &str,
-) -> Option<(usize, &'a ReplicationDestination)> {
+fn replicates_to_source(configuration: &ReplicationConfiguration, region: &str) -> bool {
     configuration
         .rules
         .iter()
-        .enumerate()
-        .flat_map(|(index, rule)| rule.destinations.iter().map(move |dest| (index, dest)))
-        .find(|(_, destination)| {
+        .flat_map(|rule| rule.destinations.iter())
+        .any(|destination| {
             destination.registry_id == crate::state::registry_id() && destination.region == region
         })
 }
@@ -211,10 +218,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PutReplicationConfigurationErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(format!(
-                            "Invalid parameter at 'replicationConfiguration' failed to \
-                             satisfy constraint: 'Invalid region '{}''",
-                            destination.region
+                        message: Some(crate::state::parameter_constraint(
+                            CONFIGURATION_PARAMETER,
+                            &format!("Invalid region '{}'", destination.region),
                         )),
                     },
                 )
@@ -223,16 +229,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Replication from a registry to itself is not a destination: see
-        // [`source_destination`].
-        if let Some((index, destination)) = source_destination(&configuration, &region) {
+        // [`replicates_to_source`].
+        if replicates_to_source(&configuration, &region) {
             return Err(
                 PutReplicationConfigurationErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(format!(
-                            "replicationConfiguration.rules[{index}] names destination \
-                             registry '{}' in region '{}', which is the source registry of \
-                             this request; a registry cannot replicate to itself",
-                            destination.registry_id, destination.region
+                        message: Some(crate::state::parameter_constraint(
+                            CONFIGURATION_PARAMETER,
+                            SOURCE_DESTINATION_CONSTRAINT,
                         )),
                     },
                 )

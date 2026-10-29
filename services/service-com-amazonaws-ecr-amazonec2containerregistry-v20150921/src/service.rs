@@ -180,10 +180,16 @@ fn requirement(kind: &ViolationKind, by_ecr: bool) -> Option<String> {
         // itself has its expression stated the way ECR publishes it. Deliberate — do not
         // "align" it with the arms around it.
         ViolationKind::Pattern(pattern) if by_ecr => {
-            format!("must satisfy regular expression '{}'", as_stated(pattern))
+            format!(
+                "must satisfy regular expression '{}'",
+                as_stated(policed(pattern))
+            )
         }
         ViolationKind::Pattern(pattern) => {
-            format!("Member must satisfy regular expression pattern: {pattern}")
+            format!(
+                "Member must satisfy regular expression pattern: {}",
+                policed(pattern)
+            )
         }
         ViolationKind::EnumValue(allowed) => {
             format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
@@ -270,6 +276,36 @@ fn named_member(path: &str) -> &str {
         remaining = collection;
     }
     remaining
+}
+
+/// The expression ECR POLICES for a repository-name GLOB — the value a repository filter
+/// carries.
+///
+/// This model spells that one value class twice:
+/// `smithy_query(query="shape", shape="SigningRepositoryFilterValue")` gives this
+/// expression, while `ScanningRepositoryFilterValue` gives
+/// [`SEPARATOR_CLASS_GLOB_SPELLING`] — two writings of the same language (a run of
+/// `[a-z0-9*]` with single `.`, `_`, `-` or `/` separators between runs), differing only
+/// in whether the separators are one character class or a group. ECR validates a
+/// repository filter against the expression it publishes, so a refusal quotes this
+/// spelling for either member.
+const REPOSITORY_GLOB_EXPRESSION: &str =
+    "^(?:[a-z0-9*]+(?:[._-][a-z0-9*]+)*/)*[a-z0-9*]+(?:[._-][a-z0-9*]+)*$";
+
+/// The other spelling of [`REPOSITORY_GLOB_EXPRESSION`] this model carries, which ECR's
+/// validator does not state back to a caller.
+const SEPARATOR_CLASS_GLOB_SPELLING: &str = r"^[a-z0-9*](?:[._\-/a-z0-9*]?[a-z0-9*]+)*$";
+
+/// The expression ECR polices for the value class `pattern` constrains: `pattern` itself
+/// for all but the one class this model spells twice, where the spelling ECR publishes
+/// stands in for the equivalent one. Keyed on the expression, so it holds for every
+/// member targeting that shape rather than for one operation's member.
+fn policed(pattern: &str) -> &str {
+    if pattern == SEPARATOR_CLASS_GLOB_SPELLING {
+        REPOSITORY_GLOB_EXPRESSION
+    } else {
+        pattern
+    }
 }
 
 /// A `@pattern` expression as ECR'S OWN validation states it, which differs from how the

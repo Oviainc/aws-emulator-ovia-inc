@@ -1863,9 +1863,14 @@ pub fn normalize_lifecycle_policy(text: &str) -> String {
 /// `constraint` a phrase naming what it failed; neither half ever carries a detail of how
 /// this emulator read the value.
 pub fn invalid_parameter_at(parameter: &str, constraint: &str) -> Fault {
-    Fault::InvalidParameter(format!(
-        "Invalid parameter at '{parameter}' failed to satisfy constraint: '{constraint}'"
-    ))
+    Fault::InvalidParameter(parameter_constraint(parameter, constraint))
+}
+
+/// The clause [`invalid_parameter_at`] states, as TEXT: the one place the template is
+/// written, for a caller that carries it on a modelled error of its own rather than on a
+/// [`Fault`].
+pub fn parameter_constraint(parameter: &str, constraint: &str) -> String {
+    format!("Invalid parameter at '{parameter}' failed to satisfy constraint: '{constraint}'")
 }
 
 /// [`invalid_parameter_at`] for a DOCUMENT-valued parameter: `parameter` is the
@@ -1885,6 +1890,16 @@ pub const POLICY_TEXT_PARAMETER: &str = "PolicyText";
 /// The API-documented label of the `lifecyclePolicyText` parameter, as a lifecycle
 /// policy refusal names it.
 pub const LIFECYCLE_POLICY_TEXT_PARAMETER: &str = "LifecyclePolicyText";
+
+/// The API-documented label of the `nextToken` parameter, as a pagination refusal names
+/// it: `NextToken` is how the API reference spells the parameter, which is the label a
+/// refusal states rather than the lower-camel wire member.
+pub const NEXT_TOKEN_PARAMETER: &str = "NextToken";
+
+/// The constraint a continuation token this service never minted fails. One phrase for
+/// the class — a token is opaque, so a caller learns only that the one it sent is not a
+/// token of this listing, never how this service reads it or what it contained.
+pub const NEXT_TOKEN_CONSTRAINT: &str = "Invalid next token provided";
 
 /// The constraint a lifecycle document that cannot be MAPPED onto the lifecycle policy
 /// shape fails: JSON that does not parse, or a member whose JSON type the shape cannot
@@ -2503,12 +2518,10 @@ impl Repo {
             Err(
                 ImageLookupFailure::ImageNotFound
                 | ImageLookupFailure::ImageTagDoesNotMatchDigest,
-            ) => Err(Fault::ImageNotFound(format!(
-                "The image with {} does not exist within the repository with name '{}' in \
-                 the registry with id '{}'",
-                identifier_description(id),
-                self.name,
-                self.registry_id
+            ) => Err(Fault::ImageNotFound(not_within_repository(
+                &format!("image with {}", identifier_description(id)),
+                &self.name,
+                &self.registry_id,
             ))),
         }
     }
@@ -3603,23 +3616,58 @@ pub fn repository_not_found_message(name: &str) -> String {
 /// repository". One wording for every operation that addresses an upload, naming the
 /// three things the request gave: the upload id, the repository and the registry.
 pub fn upload_not_found_message(upload_id: &str, repository_name: &str) -> String {
+    upload_message(upload_id, repository_name, "does not exist")
+}
+
+/// The wording ECR uses when an upload a request asks to close accepted no part — the
+/// state `EmptyUploadException` documents: "the specified layer upload does not contain
+/// any layer parts". The same frame every upload refusal is stated in
+/// ([`upload_message`]), with this verdict.
+pub fn empty_upload_message(upload_id: &str, repository_name: &str) -> String {
+    upload_message(
+        upload_id,
+        repository_name,
+        "cannot be completed because it does not have any parts",
+    )
+}
+
+/// The frame ECR states a refusal ABOUT ONE UPLOAD in: the three things the request
+/// addressed it by — the upload id, the repository it was opened against and the registry
+/// holding it — and then the verdict. The one place that frame is written, so every
+/// operation that refuses an upload words it the same way and only the verdict differs.
+fn upload_message(upload_id: &str, repository_name: &str, verdict: &str) -> String {
     format!(
         "The upload with id '{upload_id}' in the repository with name \
-         '{repository_name}' in registry with id '{}' does not exist",
+         '{repository_name}' in registry with id '{}' {verdict}",
         registry_id()
     )
 }
 
 /// The wording ECR uses when a repository holds no layer of the digest a request named
 /// — the state `LayersNotFoundException` documents: "the specified layers could not be
-/// found, or the specified layer is not valid for this repository". Worded in the shape
-/// this service states every other missing resource in, naming the three things the
-/// request gave: the digest, the repository and the registry.
+/// found, or the specified layer is not valid for this repository". The frame every
+/// resource held INSIDE a repository is reported missing in ([`not_within_repository`]),
+/// naming the three things the request gave: the digest, the repository and the registry.
 pub fn layer_not_found_message(layer_digest: &str, repository_name: &str) -> String {
+    not_within_repository(
+        &format!("layer with digest '{layer_digest}'"),
+        repository_name,
+        registry_id(),
+    )
+}
+
+/// The frame ECR states a resource HELD INSIDE a repository is missing in: what the
+/// request addressed the resource by (`subject`, the kind of record and the identifier),
+/// then the repository and the registry it was looked for in. The one place that frame is
+/// written, so a layer and an image are reported missing by the same sentence.
+pub(crate) fn not_within_repository(
+    subject: &str,
+    repository_name: &str,
+    registry_id: &str,
+) -> String {
     format!(
-        "The layer with digest '{layer_digest}' does not exist in the repository with \
-         name '{repository_name}' in the registry with id '{}'",
-        registry_id()
+        "The {subject} does not exist within the repository with name \
+         '{repository_name}' in the registry with id '{registry_id}'"
     )
 }
 
@@ -4797,8 +4845,14 @@ pub fn encode_token(key: &str) -> String {
 }
 
 /// The key a pagination token was built from, or [`Fault::InvalidParameter`].
+///
+/// A token this service did not mint is refused in the parameter-and-constraint form ECR
+/// states a refused parameter in ([`invalid_parameter_at`]), naming the API label of the
+/// parameter that carried it and the constraint it failed. The token itself is NOT
+/// echoed: a continuation token is opaque, so the refusal states what failed rather than
+/// the value a caller already holds.
 pub fn decode_token(token: &str) -> Result<String, Fault> {
-    let bad = || Fault::InvalidParameter(format!("nextToken '{token}' is not a valid token"));
+    let bad = || invalid_parameter_at(NEXT_TOKEN_PARAMETER, NEXT_TOKEN_CONSTRAINT);
     let bytes = hex::decode(token).map_err(|_| bad())?;
     String::from_utf8(bytes).map_err(|_| bad())
 }

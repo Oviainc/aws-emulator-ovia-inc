@@ -276,12 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "upload carries no layer part",
                 &caller_akid,
                 CompleteLayerUploadErrorModeled::EmptyUploadException(EmptyUploadException {
-                    message: Some(format!(
-                        "The layer upload with ID '{}' for the repository with name '{}' in \
-                         the registry with id '{}' does not contain any layer parts",
-                        input.upload_id,
-                        repository_name,
-                        crate::state::registry_id()
+                    message: Some(crate::state::empty_upload_message(
+                        &input.upload_id,
+                        &repository_name,
                     )),
                 }),
             )
