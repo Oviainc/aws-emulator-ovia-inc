@@ -21,7 +21,10 @@
 //! Deleting a stack also DELETES THE RESOURCES it created, newest first, through the
 //! services that own them ([`crate::state::provisioning`]); a resource one of those
 //! services refuses to delete leaves the stack in `DELETE_FAILED` with that refusal as
-//! the reason, rather than reporting a deletion that did not happen.
+//! the reason, rather than reporting a deletion that did not happen — unless the request
+//! names `DeletionMode` `FORCE_DELETE_STACK`, under which such a resource is ABANDONED (it
+//! stays exactly as it is, reported `DELETE_SKIPPED`) and the deletion carries on to
+//! `DELETE_COMPLETE`, which is the documented way out of a stack stuck in `DELETE_FAILED`.
 //!
 //! ## Shape of an operation
 //!
@@ -215,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that delete the stack's resources run after it, and each of those reaches
         // another service's own handler, which takes that service's lock.
-        let (stack_id, region, resources, held) = {
+        let (stack_id, region, resources, held, deletion_mode) = {
             let mut store = state.lock();
             store.settle(now);
 
@@ -369,13 +372,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // of this emulator provisions, whose removal a client reads exactly as it
                 // reads every other resource's.
                 stack.held_resource_ids(),
+                // The mode THIS deletion runs under, which is what decides whether a
+                // resource an owning service refuses to delete fails the stack or is
+                // abandoned.
+                stack.deletion_mode.clone(),
             )
         };
 
         // "Deletes a specified stack. Once the call completes successfully, stack deletion
         // starts" — deleting a stack deletes the resources it created, in the services
-        // that own them.
-        let deleted = crate::state::provisioning::delete(ctx, &region, &resources, &held).await;
+        // that own them. What a resource one of those services REFUSES to delete does to
+        // this deletion is the deletion mode's choice
+        // ([`crate::state::on_refused_resource_deletion`]).
+        let deleted = crate::state::provisioning::delete(
+            ctx,
+            &region,
+            &resources,
+            &held,
+            crate::state::on_refused_resource_deletion(deletion_mode.as_deref()),
+        )
+        .await;
 
         let mut store = state.lock();
         if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {

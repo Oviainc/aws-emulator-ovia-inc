@@ -23,9 +23,13 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::list_imports_refusal;
 use crate::stack_lifecycle::{
     call, call_in, create_stack, list_imports_ok, member, router, wait_for_the_transition,
     xml_text, xml_texts, REGION,
+};
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    export_does_not_exist, export_is_not_imported,
 };
 
 /// The export names the exporting stack of these cases publishes, and the value each
@@ -216,11 +220,21 @@ async fn an_import_resolves_and_puts_the_importing_stack_in_the_export_index() {
             "case {export_name:?}: expected exactly the importing stacks, got {reported:?}"
         );
     }
-    // An export name nothing publishes has no importers, however many stacks named it.
-    let reported = list_imports("no-such-export", &router, "no-such-export").await;
-    assert!(
-        reported.is_empty(),
-        "case {:?}: expected no importer of an export nothing publishes, got {reported:?}",
+    // An export name nothing publishes has no importers to report, however many stacks named
+    // it: the read is refused rather than answered with an empty page.
+    assert_eq!(
+        list_imports_refusal(
+            "an export name nothing publishes",
+            &router,
+            REGION,
+            "no-such-export"
+        )
+        .await,
+        (
+            "ValidationError".to_string(),
+            export_does_not_exist("no-such-export")
+        ),
+        "case {:?}: expected the unpublished name's own refusal",
         "an export name nothing publishes"
     );
 
@@ -316,10 +330,20 @@ async fn deleting_an_exporting_stack_fails_while_an_importer_holds_its_export() 
     );
     wait_for_the_transition().await;
 
-    let reported = list_imports("after the importer is deleted", &router, "shared-queue").await;
-    assert!(
-        reported.is_empty(),
-        "case {:?}: expected the deleted importer to drop out of the index, got {reported:?}",
+    // Once the importer is gone the index drops it, so the export is published and unused.
+    assert_eq!(
+        list_imports_refusal(
+            "after the importer is deleted",
+            &router,
+            REGION,
+            "shared-queue"
+        )
+        .await,
+        (
+            "ValidationError".to_string(),
+            export_is_not_imported("shared-queue")
+        ),
+        "case {:?}: expected the deleted importer to drop out of the index",
         "after the importer is deleted"
     );
 

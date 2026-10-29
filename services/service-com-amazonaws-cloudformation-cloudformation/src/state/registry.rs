@@ -230,6 +230,84 @@ pub fn public_type_arn(region: &str, type_kind: &str, type_name: &str) -> String
     )
 }
 
+/// The kind, the publisher id and the extension name a PUBLIC extension ARN carries.
+///
+/// CloudFormation addresses a public extension by `…::type/<kind>/<publisher id>/<Type-Name>`
+/// ([`public_type_arn`] mints exactly that), so the three segments after `type/` are read
+/// back here: the kind, the id of the publisher that published it, and the extension's name.
+/// A registry ARN spells the kind in lower case and the `::` separators of a type name as `-`
+/// ([`arn_kind_segment`], [`arn_type_name`]), so both are read back into the spellings the
+/// registry keys a record by — a type name's own segments carry no `-` of their own (the
+/// modelled `TypeName` pattern admits only letters and digits in them), so that reading is
+/// unambiguous, and a kind the registry does not name is read as the extension kind it
+/// spells. `None` for an ARN carrying no such segments at all.
+///
+/// The registry PARSES this ARN itself rather than leaving it to a syntax gate, which is why
+/// this reading is shared: the refusal an unresolvable one gets is the registry's own
+/// ([`INVALID_TYPE_NAME`]).
+pub fn split_public_type_arn(arn: &str) -> Option<(String, String, String)> {
+    let (_, path) = arn.split_once(":type/")?;
+    let mut segments = path.split('/');
+    let type_kind = segments.next()?;
+    let publisher_id = segments.next()?;
+    let type_name = segments.next()?;
+    if type_kind.is_empty() || publisher_id.is_empty() || type_name.is_empty() {
+        return None;
+    }
+    let type_kind = [
+        registry_type::RESOURCE,
+        registry_type::MODULE,
+        registry_type::HOOK,
+    ]
+    .into_iter()
+    .find(|kind| arn_kind_segment(kind).eq_ignore_ascii_case(type_kind))
+    .map_or_else(|| type_kind.to_ascii_uppercase(), str::to_string);
+    Some((
+        type_kind,
+        publisher_id.to_string(),
+        type_name.replace('-', "::"),
+    ))
+}
+
+/// Whether `type_name` is a well-formed extension type name: the form the modelled `TypeName`
+/// states — two to sixty-four letters or digits per segment, three segments separated by
+/// `::`, optionally followed by `::MODULE`, within the member's declared length
+/// (`smithy_query(query="shape", shape="TypeName")`: `@length(10..204)`, `@pattern
+/// "^[A-Za-z0-9]{2,64}::[A-Za-z0-9]{2,64}::[A-Za-z0-9]{2,64}(::MODULE){0,1}$"`).
+///
+/// The registry resolves an extension BY this name, including the name it reads out of an
+/// ARN ([`split_public_type_arn`]), so a name outside this form names no extension at all and
+/// is refused with [`INVALID_TYPE_NAME`].
+pub fn is_type_name(type_name: &str) -> bool {
+    if type_name.len() < TYPE_NAME_MIN_LEN || type_name.len() > TYPE_NAME_MAX_LEN {
+        return false;
+    }
+    let mut segments: Vec<&str> = type_name.split("::").collect();
+    // "(::MODULE){0,1}": a module's name carries one further segment, which is that word.
+    if segments.len() == 4 && segments.last() == Some(&registry_type::MODULE) {
+        segments.pop();
+    }
+    segments.len() == 3
+        && segments.iter().all(|segment| {
+            (TYPE_NAME_SEGMENT_MIN_LEN..=TYPE_NAME_SEGMENT_MAX_LEN).contains(&segment.len())
+                && segment.chars().all(|character| character.is_ascii_alphanumeric())
+        })
+}
+
+/// The bounds `TypeName`'s own `@length` states.
+const TYPE_NAME_MIN_LEN: usize = 10;
+const TYPE_NAME_MAX_LEN: usize = 204;
+
+/// The bounds `TypeName`'s pattern states for ONE `::`-separated segment.
+const TYPE_NAME_SEGMENT_MIN_LEN: usize = 2;
+const TYPE_NAME_SEGMENT_MAX_LEN: usize = 64;
+
+/// The message the registry refuses a request naming an extension by a name that is no
+/// extension type name at all with — including the name an ARN carries, which CloudFormation
+/// reads out of it itself. Entirely fixed text: no part of it comes from the request or from
+/// the store.
+pub const INVALID_TYPE_NAME: &str = "TypeName is invalid";
+
 /// How many versions of ONE public extension this registry holds, oldest reclaimed first.
 ///
 /// Chosen (CloudFormation documents no ceiling on how many versions of a public extension a

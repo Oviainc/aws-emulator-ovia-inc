@@ -279,9 +279,10 @@ pub async fn list_imports_page(
 /// [`list_imports_page`] for a case that expects the read to SUCCEED: the page's stack names
 /// and its `NextToken`.
 ///
-/// `ListImports` models no error, so every well-formed read of it is a 200 — including a read
-/// of an export name nothing publishes — and that one sentence is asserted here rather than
-/// in each suite that reads the index.
+/// A read ANSWERS where the export it names has importers to report; an export name the
+/// Region publishes nothing under, and an export no stack imports, are each refused instead
+/// (`unimported_exports.rs`), so a case that expects one of those reads the refusal through
+/// [`list_imports_page`].
 pub async fn list_imports_ok(
     case: &str,
     router: &MultiServiceRouter,
@@ -296,6 +297,33 @@ pub async fn list_imports_ok(
         "case {case:?}: expected ListImports to succeed, got {status_code} {body}"
     );
     (names, next_token)
+}
+
+/// [`list_imports_page`] for a case that expects the read to be REFUSED: the `(Code, Message)`
+/// the error envelope carries.
+///
+/// The ONE refusal reader of this crate's suites, beside [`list_imports_ok`], so no suite
+/// spells the "400, then read the code and the message" sequence itself: the status and the
+/// empty page are asserted here and each suite asserts only WHICH refusal was due.
+pub async fn list_imports_refusal(
+    case: &str,
+    router: &MultiServiceRouter,
+    region: &str,
+    export_name: &str,
+) -> (String, String) {
+    let (status_code, body, names, _) = list_imports_page(router, region, export_name, None).await;
+    assert_eq!(
+        status_code, 400,
+        "case {case:?}: expected ListImports to be refused, got {status_code} {body}"
+    );
+    assert!(
+        names.is_empty(),
+        "case {case:?}: expected no importers in a refusal, got {names:?}"
+    );
+    (
+        xml_text(&body, "Code").unwrap_or_default(),
+        xml_text(&body, "Message").unwrap_or_default(),
+    )
 }
 
 /// `GetTemplate` at one stage, or at the service's default when `stage` is `None`.

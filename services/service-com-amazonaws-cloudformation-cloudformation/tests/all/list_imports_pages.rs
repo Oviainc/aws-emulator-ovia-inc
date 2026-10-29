@@ -11,20 +11,22 @@
 //! not an empty page, and the read itself changes nothing a later caller sees.
 //!
 //! `cross_stack_imports.rs` is the suite that pins how a stack ENTERS and LEAVES that index
-//! (a deployed `Fn::ImportValue`, and the delete that drops it). This one spans the sizes
-//! the paging rule generalises over, which a wire-created stack per importer could not reach
-//! inside a test: the rows are seeded straight into the store, exactly as
+//! (a deployed `Fn::ImportValue`, and the delete that drops it), and `unimported_exports.rs`
+//! the two refusals an export with no importers to report answers with. This one spans the
+//! sizes the paging rule generalises over, which a wire-created stack per importer could not
+//! reach inside a test: the rows are seeded straight into the store, exactly as
 //! `stack_lifecycle.rs` seeds past a bound.
 
 use std::time::SystemTime;
 
 use service_com_amazonaws_cloudformation_cloudformation::state::{
-    self, status, StoredStack, PAGE_SIZE,
+    self, export_is_not_imported, status, StoredOutput, StoredStack, PAGE_SIZE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    list_imports_ok, list_imports_page, router_with_engine, store, xml_blocks, xml_text, REGION,
+    list_imports_ok, list_imports_page, list_imports_refusal, router_with_engine, store, xml_blocks,
+    xml_text, REGION,
 };
 use crate::stack_lifecycle::ACCOUNT_ID;
 
@@ -33,6 +35,9 @@ const EXPORT: &str = "paged-shared-export";
 
 /// An export name seeded beside it that the cases must never confuse with [`EXPORT`].
 const OTHER_EXPORT: &str = "paged-other-export";
+
+/// An export name the seeded exporter publishes and no seeded stack imports.
+const UNIMPORTED_EXPORT: &str = "paged-unimported-export";
 
 /// The stack names one `ListImports` page of this Region reports, with the page's
 /// `NextToken`. The 200 every well-formed read answers is asserted by the shared reader.
@@ -45,14 +50,48 @@ async fn page(
     list_imports_ok(case, router, REGION, export_name, token).await
 }
 
+/// The `Message` of a `ListImports` read refused because the export has no importers to
+/// report: the code is `ValidationError` on both of this operation's refusals, which the
+/// shared reader asserts, so a row here names which message was due.
+async fn refused_message(case: &str, router: &MultiServiceRouter, export_name: &str) -> String {
+    let (code, message) = list_imports_refusal(case, router, REGION, export_name).await;
+    assert_eq!(
+        code, "ValidationError",
+        "case {case:?}: expected the code CloudFormation refuses a bad request with"
+    );
+    message
+}
+
 /// Seed `importers` live stacks importing [`EXPORT`], in creation order, beside records the
 /// index must leave out: a live stack importing another export, and a stack that imported
 /// [`EXPORT`] before its deletion completed.
+///
+/// A live stack PUBLISHING each of those export names is seeded first, because an export name
+/// this Region publishes nothing under is a refusal of its own (`unimported_exports.rs`):
+/// what these rows are about is the PAGING of an index that exists.
 fn seed(engine: &std::sync::Arc<engine::InMemoryEngine>, importers: usize) -> Vec<String> {
     let now = SystemTime::now();
     let state = store(engine);
     let mut held = state.lock();
     let mut expected = Vec::with_capacity(importers);
+
+    let mut exporter = StoredStack::new(
+        format!("arn:aws:cloudformation:{REGION}:{ACCOUNT_ID}:stack/paged-exporter/99997"),
+        "paged-exporter".to_string(),
+        Some("{}".to_string()),
+        now,
+    );
+    exporter.status = status::CREATE_COMPLETE.to_string();
+    for (index, export_name) in [EXPORT, OTHER_EXPORT, UNIMPORTED_EXPORT].iter().enumerate() {
+        exporter.outputs.push(StoredOutput {
+            key: format!("O{index}"),
+            value: Some("exported-value".to_string()),
+            description: None,
+            export_name: Some((*export_name).to_string()),
+        });
+    }
+    held.stacks.push(exporter);
+
     for index in 0..importers {
         let name = format!("importer-{index:05}");
         let mut stack = StoredStack::new(
@@ -142,6 +181,17 @@ async fn the_import_index_is_reported_one_bounded_page_at_a_time() {
         let (router, engine) = router_with_engine();
         let expected = seed(&engine, importers);
 
+        // No importers at all is not a page: the published export reports none, which is its
+        // own refusal, and there is nothing to walk.
+        if importers == 0 {
+            assert_eq!(
+                refused_message(&case, &router, EXPORT).await,
+                export_is_not_imported(EXPORT),
+                "case {case:?}: expected the unimported export's own refusal"
+            );
+            continue;
+        }
+
         let (first, next) = page(&case, &router, EXPORT, None).await;
         assert_eq!(
             next.is_some(),
@@ -177,28 +227,26 @@ async fn each_export_name_is_reported_its_own_importers_on_one_page() {
     let (router, engine) = router_with_engine();
     seed(&engine, 3);
 
-    for (case, export_name, expected) in [
-        (
-            "an export another stack imports",
-            OTHER_EXPORT,
-            vec!["other-importer".to_string()],
-        ),
-        (
-            "an export name nothing imports",
-            "paged-unimported-export",
-            Vec::new(),
-        ),
-    ] {
-        let (names, next) = page(case, &router, export_name, None).await;
-        assert_eq!(
-            names, expected,
-            "case {case:?}: expected exactly that export's importers, got {names:?}"
-        );
-        assert!(
-            next.is_none(),
-            "case {case:?}: expected no NextToken on a single page, got {next:?}"
-        );
-    }
+    let case = "an export another stack imports";
+    let (names, next) = page(case, &router, OTHER_EXPORT, None).await;
+    assert_eq!(
+        names,
+        vec!["other-importer".to_string()],
+        "case {case:?}: expected exactly that export's importers, got {names:?}"
+    );
+    assert!(
+        next.is_none(),
+        "case {case:?}: expected no NextToken on a single page, got {next:?}"
+    );
+
+    // An export the same account publishes and nothing imports has no page of its own: it is
+    // the refusal that says so, not an empty list that reads like a safe-to-change export.
+    let case = "an export name nothing imports";
+    assert_eq!(
+        refused_message(case, &router, UNIMPORTED_EXPORT).await,
+        export_is_not_imported(UNIMPORTED_EXPORT),
+        "case {case:?}: expected the unimported export's own refusal"
+    );
 }
 
 #[tokio::test]

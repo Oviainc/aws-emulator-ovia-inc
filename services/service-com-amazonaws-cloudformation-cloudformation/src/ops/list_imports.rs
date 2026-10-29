@@ -7,6 +7,12 @@
 //! stack enters this list when its deployment completes and leaves it when the stack
 //! goes.
 //!
+//! The read is of ONE export, so it answers only where that export has importers to report:
+//! an export name this Region publishes nothing under, and an export no stack imports, are
+//! each refused `ValidationError` in their own words
+//! ([`crate::state::export_does_not_exist`], [`crate::state::export_is_not_imported`])
+//! rather than reported as an empty page.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -150,10 +156,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Lists all stacks that are importing an exported output value": an export name
         // names an export within one account and Region, so the importers are the live
         // stacks OF THAT REGION whose deployed template resolved a `Fn::ImportValue` for
-        // it. This operation models NO error, so an export name nothing publishes and one
-        // nothing imports are both the empty list rather than a refusal.
+        // it. The lookup is the EXPORT's first — the operation reports who uses one
+        // particular export — so a name this Region publishes no export under is refused,
+        // and so is an export nothing imports: neither is an empty page, which a client
+        // deciding whether an export is safe to change could not tell from a live export
+        // with no importers. The model declares no error for either, so both ride the
+        // service-common `ValidationError`.
         let region = crate::state::request_region(ctx.parts());
+        if !store
+            .exported_values(&region)
+            .contains_key(&input.export_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::export_does_not_exist(&input.export_name),
+            ));
+        }
         let imports = store.importing_stacks(&region, &input.export_name);
+        if imports.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::export_is_not_imported(&input.export_name),
+            ));
+        }
         // `@paginated(inputToken: NextToken, outputToken: NextToken, items: Imports)`: one
         // response carries one bounded page, and `NextToken` identifies the next.
         let (page, next_token) = crate::state::paginate(
@@ -164,8 +187,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         Ok(ListImportsOutput {
-            // Always present, as an empty element where no stack imports that export: a
-            // client reading the list sees the same shape either way.
+            // Non-empty wherever the read succeeds: an export with no importer at all is a
+            // refusal above rather than an empty element.
             imports: Some(page),
             next_token,
         })

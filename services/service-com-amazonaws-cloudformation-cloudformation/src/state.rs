@@ -842,6 +842,36 @@ pub mod resource_status {
     pub const DELETE_COMPLETE: &str = "DELETE_COMPLETE";
     /// The status of a resource the service that owns it refused to delete.
     pub const DELETE_FAILED: &str = "DELETE_FAILED";
+    /// The status of a resource a deletion left in place rather than deleting: the one a
+    /// FORCE deletion ABANDONED after its owning service refused to delete it
+    /// ([`provisioning::OnRefusal::Abandon`](super::provisioning::OnRefusal)). The resource
+    /// is still there, which is what distinguishes this from [`DELETE_COMPLETE`].
+    pub const DELETE_SKIPPED: &str = "DELETE_SKIPPED";
+}
+
+/// `DeletionMode` values (the model's `DeletionMode` enum): "specifies the deletion mode for
+/// the stack" (`DeleteStackInput$DeletionMode`).
+pub mod deletion_mode {
+    /// "Use the standard behavior. Specifying this value is the same as not specifying this
+    /// parameter."
+    pub const STANDARD: &str = "STANDARD";
+    /// "Delete the stack if it's stuck in a DELETE_FAILED state due to resource deletion
+    /// failure."
+    pub const FORCE_DELETE_STACK: &str = "FORCE_DELETE_STACK";
+}
+
+/// What the teardown of a stack deleted under `deletion_mode` does with a resource its
+/// owning service refuses to delete.
+///
+/// `FORCE_DELETE_STACK` is the documented escape hatch for a stack "stuck in a DELETE_FAILED
+/// state due to resource deletion failure", so under it such a resource is ABANDONED and the
+/// stack's deletion still completes; every other mode — including the absent one, which
+/// "is the same as not specifying this parameter" — keeps the refusal as the stack's failure.
+pub fn on_refused_resource_deletion(deletion_mode: Option<&str>) -> provisioning::OnRefusal {
+    match deletion_mode {
+        Some(deletion_mode::FORCE_DELETE_STACK) => provisioning::OnRefusal::Abandon,
+        _ => provisioning::OnRefusal::Stop,
+    }
 }
 
 /// `ResourceSignalStatus` values (the model's `ResourceSignalStatus` enum): "The status of
@@ -6116,6 +6146,28 @@ pub const HOOK_RESULT_NOT_FOUND: &str = "The hook result was not found.";
 /// is not addressable is the stack the resource would belong to.
 pub fn stack_for_physical_resource_does_not_exist(physical_resource_id: &str) -> String {
     format!("Stack for {physical_resource_id} does not exist")
+}
+
+/// The message CloudFormation answers a read of the importers of an export name this account
+/// and Region publishes NO export under — a name nothing ever exported, and one whose
+/// exporting stack is gone.
+///
+/// The quoted name is the `ExportName` the request named and the rest is fixed text, the way
+/// [`stack_does_not_exist`] is built from what the request named.
+pub fn export_does_not_exist(export_name: &str) -> String {
+    format!("Export '{export_name}' does not exist.")
+}
+
+/// The message CloudFormation answers a read of the importers of an export that EXISTS and
+/// no stack imports.
+///
+/// A different refusal from [`export_does_not_exist`], because the two are what the
+/// documented workflow asks apart: "to modify or remove an exported output value, first use
+/// this action to see which stacks are using it" is answerable for an export that is there
+/// and unused, and unanswerable for a name that is not there at all. The quoted name is the
+/// `ExportName` the request named and the rest is fixed text.
+pub fn export_is_not_imported(export_name: &str) -> String {
+    format!("Export '{export_name}' is not imported by any stack.")
 }
 
 /// `Some(list)` unless the list is empty, which the wire shapes spell as an absent

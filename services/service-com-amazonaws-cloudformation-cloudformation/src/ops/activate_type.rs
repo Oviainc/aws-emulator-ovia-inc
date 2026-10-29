@@ -12,6 +12,12 @@
 //! `TypeNameAlias`, else the extension's own name), which is the ARN it answers and the name
 //! `SetTypeConfiguration` and `DescribeType` then address it by.
 //!
+//! The extension is resolved by the NAME the request names it by — including the name a
+//! `PublicTypeArn` carries, which CloudFormation reads out of the ARN itself
+//! ([`crate::state::registry::split_public_type_arn`]) rather than leaving the ARN to a
+//! syntax gate. An ARN carrying no extension type name resolves no extension, so it is
+//! refused with the registry's own modelled `CFNRegistryException` (400) and writes nothing.
+//!
 //! What the activation installs comes from the PUBLIC extension it activates, where this
 //! Region's registry holds the publication it was published by
 //! ([`crate::state::ComAmazonawsCloudformationCloudformationState::published_extension`]), so
@@ -351,10 +357,13 @@ impl PublicExtension {
     /// What the request names, or `Err(message)` for a request that identifies no public
     /// extension at all.
     ///
-    /// Every modelled constraint (each member's length, pattern and range) is already
-    /// enforced before the handler runs; what is left are the conditional rules the model
-    /// states in prose: "You must specify PublicTypeArn, or TypeName, Type, and PublisherId"
-    /// and "You can specify MajorVersion or VersionBump, but not both".
+    /// What is left for this reading are the rules the model states in prose rather than in a
+    /// constraint: "You must specify PublicTypeArn, or TypeName, Type, and PublisherId" and
+    /// "You can specify MajorVersion or VersionBump, but not both" — plus the one rule the
+    /// registry owns itself, that the ARN must carry an extension type name
+    /// ([`registry::is_type_name`]), since CloudFormation reads the name out of the ARN
+    /// instead of leaving the ARN to a syntax gate (see [`crate::service`], which states the
+    /// same refusal for an ARN the modelled pattern stops ahead of this handler).
     ///
     /// The first of those is a rule about what must be IDENTIFIED, not about which members
     /// may appear: a `PublicTypeArn` carries the kind, the publisher and the name itself, so
@@ -373,13 +382,15 @@ impl PublicExtension {
         let type_name_alias = input.type_name_alias.clone();
         let named = match input.public_type_arn.as_deref() {
             Some(public_type_arn) => {
-                let (type_kind, publisher_id, type_name) = split_public_type_arn(public_type_arn)
-                    .ok_or_else(|| {
-                        format!(
-                            "PublicTypeArn {public_type_arn} does not name the kind, the \
-                             publisher and the name of a public extension"
-                        )
-                    })?;
+                // CloudFormation parses the ARN itself and resolves the extension by the
+                // NAME it carries, so an ARN that carries no extension type name — one whose
+                // segments say nothing, and one whose name segment is not a type name at all
+                // ([`registry::is_type_name`]) — names no extension and is refused as the
+                // registry refuses every unresolvable name.
+                let (type_kind, publisher_id, type_name) =
+                    registry::split_public_type_arn(public_type_arn)
+                        .filter(|(_, _, type_name)| registry::is_type_name(type_name))
+                        .ok_or_else(|| registry::INVALID_TYPE_NAME.to_string())?;
                 for (member, spelled, carried) in [
                     ("Type", input.r#type.as_deref(), type_kind.as_str()),
                     (
@@ -428,40 +439,6 @@ impl PublicExtension {
     fn local_name(&self) -> &str {
         self.type_name_alias.as_deref().unwrap_or(&self.type_name)
     }
-}
-
-/// The kind, the publisher id and the extension name a `PublicTypeArn` carries.
-///
-/// The modelled pattern is `…::type/.+/[0-9a-zA-Z]{12,40}/.+$`, so the segments after
-/// `type/` are the extension's KIND, the id of the publisher that published it and the
-/// extension's name. A registry ARN spells the kind in lower case and the `::` separators of
-/// a type name as `-` ([`registry::arn_kind_segment`], [`registry::arn_type_name`]), so both
-/// are read back here into the spellings the registry keys a record by — a type name's own
-/// segments carry no `-` of their own (`TypeName`'s pattern admits only letters and digits in
-/// them), so that reading is unambiguous, and a kind the registry does not name is read as
-/// the extension kind it spells. `None` for an ARN carrying no such segments at all.
-fn split_public_type_arn(arn: &str) -> Option<(String, String, String)> {
-    let (_, path) = arn.split_once(":type/")?;
-    let mut segments = path.split('/');
-    let type_kind = segments.next()?;
-    let publisher_id = segments.next()?;
-    let type_name = segments.next()?;
-    if type_kind.is_empty() || publisher_id.is_empty() || type_name.is_empty() {
-        return None;
-    }
-    let type_kind = [
-        registry::registry_type::RESOURCE,
-        registry::registry_type::MODULE,
-        registry::registry_type::HOOK,
-    ]
-    .into_iter()
-    .find(|kind| registry::arn_kind_segment(kind).eq_ignore_ascii_case(type_kind))
-    .map_or_else(|| type_kind.to_ascii_uppercase(), str::to_string);
-    Some((
-        type_kind,
-        publisher_id.to_string(),
-        type_name.replace('-', "::"),
-    ))
 }
 
 /// The refusal AWS answers an activation of a public RESOURCE extension that names no

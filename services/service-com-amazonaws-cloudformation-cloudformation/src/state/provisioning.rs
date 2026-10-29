@@ -1088,7 +1088,9 @@ pub async fn reconcile(
         .iter()
         .map(|resource| resource.logical_id.clone())
         .collect();
-    let deleted = delete(ctx, region, &replaced, &held).await;
+    // A deployment is not a `DeleteStack`, so no `DeletionMode` chose for it: a resource an
+    // owning service refuses to delete is this deployment's failure.
+    let deleted = delete(ctx, region, &replaced, &held, OnRefusal::Stop).await;
     // A resource an owning service refused to delete still exists there, so the stack
     // keeps its record: the deployment failed, and a later deletion is what has to delete
     // it. The ones that were deleted carry `materialised = false` and are not kept.
@@ -1300,6 +1302,23 @@ pub struct Deleted {
     pub transitions: Vec<ResourceTransition>,
 }
 
+/// What a teardown does with a resource the service that owns it REFUSES to delete.
+///
+/// `DeleteStackInput$DeletionMode` is what chooses: "STANDARD — use the standard behavior",
+/// under which the refusal is the stack's failure, and "FORCE_DELETE_STACK — delete the stack
+/// if it's stuck in a DELETE_FAILED state due to resource deletion failure", under which the
+/// refused resource is left where it is and the stack's deletion goes on without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnRefusal {
+    /// The refusal STOPS the teardown and is the stack's own failure: nothing after the
+    /// refused resource is asked about ([`Deleted::failure`] names it).
+    Stop,
+    /// The refused resource is ABANDONED — nothing more is asked of its owning service, so
+    /// it stays exactly as it is — and the walk carries on with the rest, so the teardown
+    /// reports no failure of its own.
+    Abandon,
+}
+
 /// Delete the resources a stack created, newest first — the reverse of the order they were
 /// created in, so a resource is deleted before whatever it depends on.
 ///
@@ -1307,7 +1326,9 @@ pub struct Deleted {
 /// it; the stack's deletion cannot be reported as complete then, and the resources it had
 /// already deleted are reported as deleted so a retry does not ask for them again. A
 /// resource the service no longer has is a success: the request asks for a state the
-/// service is already in.
+/// service is already in. Under [`OnRefusal::Abandon`] a refusal is not a failure at all:
+/// that resource is left alone and the walk goes on, so the teardown answers no failure and
+/// the stack's deletion completes around what could not be deleted.
 ///
 /// `held` is the logical ids the stack HOLDS a record of
 /// ([`super::StoredStack::held_resource_ids`]) — the resources this teardown is responsible
@@ -1324,8 +1345,9 @@ pub async fn delete(
     region: &str,
     resources: &[StoredResource],
     held: &BTreeSet<String>,
+    on_refusal: OnRefusal,
 ) -> Deleted {
-    delete_pass(ctx, region, resources, held, &mut BTreeSet::new()).await
+    delete_pass(ctx, region, resources, held, &mut BTreeSet::new(), on_refusal).await
 }
 
 /// One pass of [`delete`] over the set, recording what it transitioned.
@@ -1342,6 +1364,7 @@ async fn delete_pass(
     resources: &[StoredResource],
     held: &BTreeSet<String>,
     opened: &mut BTreeSet<String>,
+    on_refusal: OnRefusal,
 ) -> Deleted {
     let mut outcome = Deleted {
         resources: resources.to_vec(),
@@ -1391,14 +1414,28 @@ async fn delete_pass(
                 ));
             }
             Err(refusal) => {
-                outcome.failure = Some(super::resource_failure_summary(
-                    super::failed_action::DELETE,
-                    [outcome.resources[index].logical_id.as_str()],
-                ));
                 let reason = handler_failure_reason(
                     provisioner_for(&outcome.resources[index].resource_type),
                     &refusal,
                 );
+                if on_refusal == OnRefusal::Abandon {
+                    // ABANDONED: nothing more is asked of the owning service, so the
+                    // resource stays exactly as it is and goes on serving its own clients.
+                    // The record reports that its deletion was SKIPPED, carrying why, and
+                    // the walk carries on with the resources declared before it — the
+                    // teardown has no failure of its own, so the stack's deletion completes.
+                    let resource = &outcome.resources[index];
+                    outcome.transitions.push(ResourceTransition::finished(
+                        resource,
+                        super::resource_status::DELETE_SKIPPED,
+                        Some(reason),
+                    ));
+                    continue;
+                }
+                outcome.failure = Some(super::resource_failure_summary(
+                    super::failed_action::DELETE,
+                    [outcome.resources[index].logical_id.as_str()],
+                ));
                 let resource = &outcome.resources[index];
                 outcome.transitions.push(ResourceTransition::finished(
                     resource,
@@ -1450,7 +1487,10 @@ pub async fn unwind(
     // flight does not open it again, and one a stopped pass never reached is opened by the
     // pass that does reach it.
     let mut opened = BTreeSet::new();
-    let mut outcome = delete_pass(ctx, region, resources, held, &mut opened).await;
+    // An unwind is not a `DeleteStack`, so no `DeletionMode` chose for it: a refusal that
+    // outlives the retries is the rollback's own failure.
+    let mut outcome =
+        delete_pass(ctx, region, resources, held, &mut opened, OnRefusal::Stop).await;
     for _ in 1..UNWIND_ATTEMPTS {
         if outcome.failure.is_none() {
             break;
@@ -1469,7 +1509,8 @@ pub async fn unwind(
                     transition.status != super::resource_status::DELETE_FAILED
                 })
                 .collect();
-        outcome = delete_pass(ctx, region, &remaining, held, &mut opened).await;
+        outcome =
+            delete_pass(ctx, region, &remaining, held, &mut opened, OnRefusal::Stop).await;
         transitioned.append(&mut outcome.transitions);
         outcome.transitions = transitioned;
     }

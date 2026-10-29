@@ -40,7 +40,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
-//! Two of those seams are taken here, both for the one reason named in
+//! Two of those seams are taken for the one reason named in
 //! [`query_error_envelope`]: an awsQuery error response carries a `<RequestId>` element
 //! in its `<ErrorResponse>` envelope, which the framework's renderers omit.
 //! `override_operation` wraps the operation the routing table names, so the element
@@ -48,14 +48,62 @@
 //! [`CloudFormationDefinition`] this file hands back from `definition` adds it to a
 //! routing failure, a transport failure and a pre-dispatch refusal. Everything else about
 //! those paths — status, `<Type>`, `<Code>`, `<Message>` — stays with the framework.
+//!
+//! `override_refusal` is taken for one class as well: a refusal of the member that names a
+//! PUBLIC EXTENSION BY ARN, which CloudFormation's registry parses itself, is stated as the
+//! registry states it rather than as a generic request-validation failure — see
+//! [`registry_refusal_of_a_public_extension_arn`].
 
 pub mod query_error_envelope;
 
+use crate::state::registry;
+use aws_smithy_schema_server::{Violation, ViolationKind};
 use query_error_envelope::{CloudFormationDefinition, RequestIdEnvelopeOperation};
 use smithy_server_runtime::{
     http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The dotted path the validating walk names the member that identifies a public extension
+/// BY ARN at — `ActivateTypeInput$PublicTypeArn`, the one member of this service's model
+/// targeting `ThirdPartyTypeArn`
+/// (`smithy_query(query="operation", operation="ActivateType")`), in the lowerCamel spelling
+/// every violation path takes.
+const PUBLIC_EXTENSION_ARN_PATH: &str = "publicTypeArn";
+
+/// The error code of the registry's own modelled refusal, `CFNRegistryException` — the wire
+/// code its `awsQueryError` trait declares, which is what a client activating a third-party
+/// extension branches on.
+const REGISTRY_REFUSAL_CODE: &str = "CFNRegistryException";
+
+/// The registry's own refusal for a public-extension ARN this service's registry parses and
+/// resolves nothing from, in place of the generic request-validation wording.
+///
+/// CloudFormation reads the extension's kind, publisher and NAME out of that ARN itself and
+/// refuses what the lookup cannot resolve with the registry's modelled error — the ARN is not
+/// gated on syntax ahead of the registry, so the modelled `ThirdPartyTypeArn` pattern (which
+/// is narrower than the ARNs CloudFormation parses) must not pre-empt that refusal with a
+/// different error class. This restates exactly the one refusal the registry owns: a value
+/// whose name segment is no extension type name ([`registry::is_type_name`]), which is the
+/// same refusal `ActivateType`'s handler answers for an ARN the pattern let through. Every
+/// other refusal of that member, and every other member's, keeps the framework's wording:
+/// this service has no evidence that CloudFormation words those as registry failures.
+fn registry_refusal_of_a_public_extension_arn(violations: &[Violation]) -> Option<Refused> {
+    violations.iter().find_map(|violation| {
+        if violation.path != PUBLIC_EXTENSION_ARN_PATH
+            || !matches!(violation.kind, ViolationKind::Pattern(_))
+        {
+            return None;
+        }
+        let arn = violation.value.as_deref()?;
+        let resolves = registry::split_public_type_arn(arn)
+            .is_some_and(|(_, _, type_name)| registry::is_type_name(&type_name));
+        (!resolves).then(|| Refused {
+            code: REGISTRY_REFUSAL_CODE.to_string(),
+            message: registry::INVALID_TYPE_NAME.to_string(),
+        })
+    })
+}
 
 /// The `com-amazonaws-cloudformation-cloudformation` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -116,14 +164,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // wording. The one class reworded here is a refusal of the member that names a
+        // PUBLIC EXTENSION BY ARN, which the registry parses itself: see
+        // [`registry_refusal_of_a_public_extension_arn`].
+        match refusal {
+            Refusal::Invalid(violations) => {
+                registry_refusal_of_a_public_extension_arn(violations)
+            }
+            _ => None,
+        }
     }
 
     fn override_routing_error(

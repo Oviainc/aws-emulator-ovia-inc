@@ -83,6 +83,8 @@ mod estimate_template_cost;
 mod extension_registry;
 #[path = "all/failed_create_rollback.rs"]
 mod failed_create_rollback;
+#[path = "all/forced_stack_deletion.rs"]
+mod forced_stack_deletion;
 #[path = "all/generated_physical_names.rs"]
 mod generated_physical_names;
 #[path = "all/generated_template_body.rs"]
@@ -145,6 +147,8 @@ mod no_echo_parameters;
 mod operation_events;
 #[path = "all/provisioned_resources.rs"]
 mod provisioned_resources;
+#[path = "all/public_extension_arns.rs"]
+mod public_extension_arns;
 #[path = "all/publish_type.rs"]
 mod publish_type;
 #[path = "all/published_type_schema.rs"]
@@ -267,6 +271,8 @@ mod type_deactivation;
 mod type_deregistration;
 #[path = "all/type_testing.rs"]
 mod type_testing;
+#[path = "all/unimported_exports.rs"]
+mod unimported_exports;
 #[path = "all/unprovisioned_resources.rs"]
 mod unprovisioned_resources;
 #[path = "all/unrecognized_resource_types.rs"]
