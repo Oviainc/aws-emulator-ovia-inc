@@ -1,22 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one result per requested identifier: the job it names when this service holds
+//! that job under that farm and queue, otherwise a per-identifier error entry. The call
+//! answers HTTP 200 even when every identifier failed, so a caller reads `errors` as well
+//! as `jobs`.
 //!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
 //! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
 //! `BatchGetJob::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! deserialize -> validate -> `handle` -> serialize. You write ONLY the `handle` body.
 //!
 //! ## Reaching this service's state
 //!
@@ -113,6 +108,28 @@ impl From<BatchGetJobErrorModeled> for BatchGetJobError {
     }
 }
 
+/// The per-identifier entry for a job this service does not hold.
+///
+/// `code` is the modeled `BatchGetJobErrorCode` member for a missing resource
+/// (`smithy_query(query="shape", shape="BatchGetJobErrorCode")`: InternalServerErrorException,
+/// ResourceNotFoundException, ValidationException, AccessDeniedException,
+/// ThrottlingException), and the text is the same 404 wording this service answers when the
+/// resource is read on its own — the entry reports WHICH level of `farm -> queue -> job`
+/// is missing.
+fn not_found_entry(
+    identifier: &BatchGetJobIdentifier,
+    resource_type: &str,
+    resource_id: &str,
+) -> BatchGetJobError2 {
+    BatchGetJobError2 {
+        farm_id: identifier.farm_id.clone(),
+        queue_id: identifier.queue_id.clone(),
+        job_id: identifier.job_id.clone(),
+        code: "ResourceNotFoundException".to_string(),
+        message: crate::state::not_found(resource_type, resource_id).message,
+    }
+}
+
 /// The `BatchGetJob` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -149,18 +166,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetJob"))
+        // A report, exactly as `GetJob` is: the only write it makes is materialising the
+        // lifecycle transition the clock already made due on each job it reports (see
+        // `crate::state::Job::settle_lifecycle`).
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchGetJobErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        let mut jobs = Vec::new();
+        let mut errors = Vec::new();
+
+        // One result per identifier, in the order asked for: the outcome of each element
+        // is reported on its own, so a missing resource never hides the jobs that are
+        // there and never fails the whole call.
+        for identifier in &input.identifiers {
+            let missing = if store.farm(&identifier.farm_id).is_none() {
+                Some((
+                    crate::state::RESOURCE_TYPE_FARM,
+                    identifier.farm_id.as_str(),
+                ))
+            } else if store
+                .queue(&identifier.farm_id, &identifier.queue_id)
+                .is_none()
+            {
+                Some((
+                    crate::state::RESOURCE_TYPE_QUEUE,
+                    identifier.queue_id.as_str(),
+                ))
+            } else {
+                None
+            };
+            if let Some((resource_type, resource_id)) = missing {
+                errors.push(not_found_entry(identifier, resource_type, resource_id));
+                continue;
+            }
+
+            let Some(job) =
+                store.settled_job(&identifier.farm_id, &identifier.queue_id, &identifier.job_id)
+            else {
+                errors.push(not_found_entry(
+                    identifier,
+                    crate::state::RESOURCE_TYPE_JOB,
+                    &identifier.job_id,
+                ));
+                continue;
+            };
+
+            jobs.push(BatchGetJobItem {
+                farm_id: identifier.farm_id.clone(),
+                queue_id: identifier.queue_id.clone(),
+                job_id: job.job_id.clone(),
+                name: job.name.clone(),
+                lifecycle_status: job.lifecycle_status.clone(),
+                lifecycle_status_message: job.lifecycle_status_message.clone(),
+                priority: job.priority,
+                created_at: crate::state::timestamp(job.created_at),
+                created_by: job.created_by.clone(),
+                updated_at: job.updated_at.map(crate::state::timestamp),
+                updated_by: job.updated_by.clone(),
+                started_at: job.started_at.map(crate::state::timestamp),
+                ended_at: job.ended_at.map(crate::state::timestamp),
+                // This slice persists no steps or tasks, so the job has no task run status
+                // to aggregate and these stay absent — the same note as in `get_job`.
+                task_run_status: None,
+                target_task_run_status: Some(job.target_task_run_status.clone()),
+                task_run_status_counts: None,
+                task_failure_retry_count: None,
+                storage_profile_id: job.storage_profile_id.clone(),
+                max_failed_tasks_count: Some(job.max_failed_tasks_count),
+                max_retries_per_task: Some(job.max_retries_per_task),
+                parameters: job.parameters.clone(),
+                attachments: job.attachments.clone(),
+                description: job.description.clone(),
+                max_worker_count: job.max_worker_count,
+                source_job_id: job.source_job_id.clone(),
+            });
+        }
+
+        Ok(BatchGetJobOutput { jobs, errors })
     }
 }

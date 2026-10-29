@@ -31,12 +31,15 @@ fn yaml_template(name: &str) -> String {
 }
 
 /// One emulator: the shared engine plus the deadline service mounted on a router.
-struct Emulator {
+///
+/// `pub(crate)` so the other suites in this test target drive the service the same way
+/// instead of each building a second copy of this harness.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These tests sign nothing, so they assert behaviour, not signatures.
@@ -49,7 +52,7 @@ impl Emulator {
 
     /// Dispatch one request and return its status and parsed JSON body (`Value::Null` for
     /// an empty body).
-    async fn call(
+    pub(crate) async fn call(
         &self,
         method: &str,
         path: &str,
@@ -90,11 +93,11 @@ impl Emulator {
         (status, parsed)
     }
 
-    async fn get(&self, path: &str) -> (u16, Value) {
+    pub(crate) async fn get(&self, path: &str) -> (u16, Value) {
         self.call("GET", path, None, None).await
     }
 
-    async fn post(&self, path: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn post(&self, path: &str, body: Value) -> (u16, Value) {
         self.call("POST", path, Some(body), None).await
     }
 
@@ -103,7 +106,7 @@ impl Emulator {
     }
 
     /// Create a farm and return its id, failing the test if the create did not succeed.
-    async fn farm(&self, display_name: &str) -> String {
+    pub(crate) async fn farm(&self, display_name: &str) -> String {
         let (status, body) = self
             .post("/2023-10-12/farms", json!({"displayName": display_name}))
             .await;
@@ -115,7 +118,7 @@ impl Emulator {
     }
 
     /// Create a queue under `farm_id` and return its id.
-    async fn queue(&self, farm_id: &str, display_name: &str) -> String {
+    pub(crate) async fn queue(&self, farm_id: &str, display_name: &str) -> String {
         let (status, body) = self
             .post(
                 &format!("/2023-10-12/farms/{farm_id}/queues"),
@@ -130,7 +133,13 @@ impl Emulator {
     }
 
     /// Create a job under `farm_id`/`queue_id` from a JSON template and return its id.
-    async fn job(&self, farm_id: &str, queue_id: &str, name: &str, priority: i64) -> String {
+    pub(crate) async fn job(
+        &self,
+        farm_id: &str,
+        queue_id: &str,
+        name: &str,
+        priority: i64,
+    ) -> String {
         let (status, body) = self
             .post(
                 &format!("/2023-10-12/farms/{farm_id}/queues/{queue_id}/jobs"),
@@ -149,14 +158,14 @@ impl Emulator {
     }
 }
 
-fn id_of(body: &Value, member: &str) -> String {
+pub(crate) fn id_of(body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("expected member {member} in {body}"))
         .to_string()
 }
 
-fn string_at(body: &Value, member: &str) -> String {
+pub(crate) fn string_at(body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("expected string member {member} in {body}"))
@@ -164,7 +173,7 @@ fn string_at(body: &Value, member: &str) -> String {
 }
 
 /// The error code a modeled failure carries on restJson1: the body's `__type`.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
