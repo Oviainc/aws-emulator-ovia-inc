@@ -5,7 +5,9 @@
 //! Mints an Apache Airflow CLI token for the STORED environment the request names, and
 //! reports it with the web-server host that environment's record carries. A name that
 //! resolves to no stored environment is refused with the operation's one modeled error,
-//! `ResourceNotFoundException` (HTTP 404).
+//! `ResourceNotFoundException` (HTTP 404), and a fault on this side of the wire with the
+//! modelled server error `InternalServerException` (HTTP 500), the same answer every other
+//! handler of this service gives it.
 //!
 //! The token is minted by the emulator's credential store and removed from it again (see
 //! [`crate::state::mint_airflow_token`]): it is a secret for the environment's Apache
@@ -69,6 +71,9 @@
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — ResourceNotFoundException: The resource is not
 //!   available.
+//! * `InternalServerException` (HTTP 500) — InternalServerException: An internal error has
+//!   occurred. Widened in through `extra_errors` (see below): the shape is one this SERVICE
+//!   models, which this operation's own `errors` list does not repeat.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -84,10 +89,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mwaa-amazonmwaa.json");
 // here — hence the `CreateCliTokenError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mwaa#CreateCliToken")]
+// `InternalServerException` — a shape the SERVICE models, which this operation does not
+// list — is widened in through `extra_errors`, so a fault on this side of the wire has a
+// modelled server failure to answer with instead of the scaffold's 501, which states that
+// nobody has written the operation.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mwaa#CreateCliToken",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateCliTokenErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -103,6 +116,27 @@ impl From<CreateCliTokenErrorModeled> for CreateCliTokenError {
     fn from(modeled: CreateCliTokenErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The shared store being unreachable is a fault on this side of the wire, which this
+/// operation reports as the server error the service models for exactly that class. Never
+/// the scaffold's 501: that signal claims the operation has no implementation.
+fn store_unavailable() -> CreateCliTokenError {
+    CreateCliTokenErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the Amazon MWAA environment store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// The credential store minting no secret is the other fault of this kind: there is no
+/// token to report and this operation will not invent one. See [`store_unavailable`].
+fn token_not_minted() -> CreateCliTokenError {
+    CreateCliTokenErrorModeled::InternalServerException(InternalServerException {
+        message: Some(
+            "the emulator minted no Apache Airflow CLI token for this request".to_string(),
+        ),
+    })
+    .into()
 }
 
 /// The `CreateCliToken` operation.
@@ -146,14 +180,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the Region this request was signed for and nowhere else.
         let region = crate::state::request_region(ctx);
 
-        // This operation models ONE error (`ResourceNotFoundException`), so there is no
-        // modeled server fault to report a missing store with: an engine this service was
-        // not mounted on cannot serve the operation at all, which is what the scaffold's
-        // 501 states. The router builds the one engine that does carry the store, so this
-        // is unreachable there.
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateCliToken"));
-        };
+        // An unreachable store is a fault on this side of the wire, not a missing
+        // implementation: this handler IS written, so it answers the modelled server error.
+        // The router builds the one engine that does carry the store, so this is
+        // unreachable there.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
         // The transition the clock already owes, materialised before anything is read.
         store.settle(now);
@@ -174,11 +205,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let web_server_hostname = crate::state::webserver_hostname(&stored.webserver_url).to_string();
         drop(store);
 
-        let Some(cli_token) = crate::state::mint_airflow_token(ctx.credential_store()) else {
-            // No secret was minted, and this operation will not invent one; it models no
-            // server fault, so the honest answer is "this emulator did not serve it".
-            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateCliToken"));
-        };
+        let cli_token =
+            crate::state::mint_airflow_token(ctx.credential_store()).ok_or_else(token_not_minted)?;
         Ok(CreateCliTokenOutput {
             cli_token: Some(cli_token),
             web_server_hostname: Some(web_server_hostname),

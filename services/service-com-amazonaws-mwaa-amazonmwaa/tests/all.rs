@@ -51,6 +51,8 @@ mod published_metrics;
 mod rejection_contract;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
+#[path = "all/server_fault_error_channel.rs"]
+mod server_fault_error_channel;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tags_member_single_rule.rs"]
