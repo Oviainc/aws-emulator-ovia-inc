@@ -171,9 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled constraints — the boundary validator enforces the LIST's bounds and
         // each element's `@length`, but never the pattern (its negative lookahead does
         // not compile). A list element is reported at the position the framework spells
-        // it with, `<member>.<1-based index>.member`.
+        // it with (`crate::state::list_element_path`).
         for (position, key) in input.tag_keys.iter().enumerate() {
-            let path = format!("tagKeys.{}.member", position + 1);
+            let path = crate::state::list_element_path("tagKeys", position);
             if let Some(violation) = crate::state::tag_key_violation(&path, key) {
                 return Err(UntagResourceErrorModeled::ValidationException(ValidationException {
                     message: crate::state::one_validation_error(&violation),

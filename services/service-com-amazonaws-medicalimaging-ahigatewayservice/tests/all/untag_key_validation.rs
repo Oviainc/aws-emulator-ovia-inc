@@ -58,7 +58,10 @@ fn assert_refused(case: &str, answer: &Answer, expected_path: &str) {
 }
 
 /// A data store this emulator holds, and its ARN as the store itself reports it.
-async fn held_datastore_arn(emulator: &Emulator, name: &str, token: &str) -> String {
+///
+/// `pub(crate)`, like the route helpers it is built from: the sibling suite that pins how
+/// a refusal NAMES a list element needs the same held resource.
+pub(crate) async fn held_datastore_arn(emulator: &Emulator, name: &str, token: &str) -> String {
     let datastore_id = emulator.active_datastore(name, token).await;
     let read = emulator.get_datastore(&datastore_id).await;
     assert_eq!(

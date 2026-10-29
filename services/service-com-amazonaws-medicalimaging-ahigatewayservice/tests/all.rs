@@ -61,6 +61,8 @@ mod image_set_tombstone_content;
 mod image_set_version_listing;
 #[path = "all/import_job_listing.rs"]
 mod import_job_listing;
+#[path = "all/list_element_refusal_paths.rs"]
+mod list_element_refusal_paths;
 #[path = "all/metadata_document_structure.rs"]
 mod metadata_document_structure;
 #[path = "all/regional_isolation.rs"]

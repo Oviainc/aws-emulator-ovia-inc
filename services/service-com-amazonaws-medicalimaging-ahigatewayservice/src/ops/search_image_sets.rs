@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_default()
             .iter()
             .enumerate()
-            .map(|(index, filter)| Predicate::from_filter(index, filter))
+            .map(|(position, filter)| Predicate::from_filter(position, filter))
             .collect::<Result<Vec<Predicate>, String>>()
             .map_err(invalid_request)?;
         let sort = EffectiveSort::from_criteria(criteria.and_then(|criteria| criteria.sort.as_ref()))
@@ -569,9 +569,16 @@ enum Predicate {
 }
 
 impl Predicate {
-    /// Read the filter at `index` of the criteria, or state why it cannot be evaluated.
-    fn from_filter(index: usize, filter: &SearchFilter) -> Result<Self, String> {
-        let values_path = format!("searchCriteria.filters[{index}].values");
+    /// Read the filter at `position` of the criteria, or state why it cannot be
+    /// evaluated.
+    ///
+    /// `position` is the 0-based offset of the filter in `searchCriteria.filters`; a
+    /// refusal names it the way every refusal about a list element in this service names
+    /// one (`crate::state::list_element_path`), with the faulting member of the filter
+    /// appended.
+    fn from_filter(position: usize, filter: &SearchFilter) -> Result<Self, String> {
+        let element_path = crate::state::list_element_path("searchCriteria.filters", position);
+        let values_path = format!("{element_path}.values");
         match filter.operator.as_str() {
             "EQUAL" => {
                 // "filters by applying a maximum of 1 item to SearchByAttribute": an
@@ -611,7 +618,7 @@ impl Predicate {
                 Ok(Self::Between(range))
             }
             other => Err(crate::state::handler_requirement_error(
-                &format!("searchCriteria.filters[{index}].operator"),
+                &format!("{element_path}.operator"),
                 Some(other),
                 "Member must satisfy enum value set [EQUAL, BETWEEN]",
             )),

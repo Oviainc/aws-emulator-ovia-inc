@@ -596,6 +596,22 @@ pub fn handler_requirement_error(path: &str, value: Option<&str>, requirement: &
     format!("1 validation error detected: {clause}")
 }
 
+/// The validation path of ONE ELEMENT of an input list, for a refusal a handler raises
+/// about that element.
+///
+/// A list element is named by its enclosing member, its position in the list and the
+/// literal `member` segment the element's own schema contributes — and the position is
+/// 1-BASED, counting from the first element, which is how the boundary validator's
+/// walk spells it (`names.2.member`, `keySchema.1.member.keyType`). `position` is the
+/// 0-based offset `Iterator::enumerate` yields, so one caller does the `+ 1` for all of
+/// them and no handler can report the element before the one it refused.
+///
+/// A member of a STRUCTURE element is named by appending that member's own segment to
+/// this path, exactly as the nested paths above do.
+pub fn list_element_path(list_member: &str, position: usize) -> String {
+    format!("{list_member}.{}.member", position + 1)
+}
+
 /// The `@pattern` of `com.amazonaws.medicalimaging#Arn`
 /// (`smithy_query(query="shape",shape="Arn")`), the shape every `resourceArn` path
 /// label targets, copied verbatim.
