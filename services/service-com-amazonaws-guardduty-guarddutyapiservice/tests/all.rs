@@ -131,6 +131,8 @@ mod master_account_disassociation;
 mod member_accounts;
 #[path = "all/member_association.rs"]
 mod member_association;
+#[path = "all/member_batch_no_op_clock.rs"]
+mod member_batch_no_op_clock;
 #[path = "all/member_creation.rs"]
 mod member_creation;
 #[path = "all/member_deletion.rs"]

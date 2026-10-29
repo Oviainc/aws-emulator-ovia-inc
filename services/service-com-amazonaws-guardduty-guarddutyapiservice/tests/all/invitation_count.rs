@@ -224,7 +224,11 @@ async fn counting_changes_nothing_and_an_accepted_invitation_is_excluded() {
 /// (`smithy_query(operation="GetInvitationsCount")`) — returning the
 /// `invitationsCount` it reported and failing the test if it did not succeed or
 /// reported no count at all.
-async fn invitations_count(router: &Router, region: &str, case: &str) -> i64 {
+///
+/// `pub(crate)` because the inbox is one store read through one call: a suite that
+/// has to show a call left the inbox where it was reads it here rather than keeping
+/// its own copy of this request.
+pub(crate) async fn invitations_count(router: &Router, region: &str, case: &str) -> i64 {
     let (status, body) = call_in(router, region, "GET", "/invitation/count", None).await;
     assert_eq!(
         status, 200,
