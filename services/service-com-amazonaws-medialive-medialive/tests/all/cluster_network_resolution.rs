@@ -26,6 +26,17 @@
 //! one network, one interface per network) — because that is what the rule
 //! generalises over. Which outcome each row expects is read off the ROW, not off
 //! the emulator.
+//!
+//! The third suite asserts the OTHER side of the same reference, the side a
+//! dangling id is invisible from: `DescribeNetwork` reports the
+//! `AssociatedClusterIds` of a network (`smithy_query(query="operation",
+//! operation="DescribeNetwork")`), and the only association this service knows
+//! is the one a cluster's own `InterfaceMapping` entries carry — so the list a
+//! network reports must follow the mappings an accepted `UpdateCluster` stored,
+//! and must be left exactly as it was by a refused one. Its rows span the SET
+//! the update asks for (the other network, both of them, the same one named
+//! twice, none at all, the one already stored) and a refused remap, because that
+//! is what the association generalises over.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -506,5 +517,152 @@ async fn an_updated_cluster_is_mapped_only_onto_networks_the_account_holds() {
             "case {case:?}: expected the accepted mappings to be stored, got {:?}",
             read["networkSettings"]
         );
+    }
+}
+
+/// One row of the remap table: the mappings the cluster is created with, the
+/// mappings the update asks for, and the networks that must report the cluster
+/// once the call has been answered.
+struct Remap {
+    case: &'static str,
+    created: &'static [Mapped],
+    asked: &'static [Mapped],
+    /// The positions in [`Fixture::held`] that must report the cluster after the
+    /// call — read off the ROW, not off the emulator.
+    associated: &'static [usize],
+}
+
+/// The remap table, spanning the sets an update may ask a cluster to be mapped
+/// onto and the refusals that leave the stored set alone.
+const REMAPS: &[Remap] = &[
+    Remap {
+        case: "a remap onto the other held network moves the association",
+        created: &[Mapped::Held(0)],
+        asked: &[Mapped::Held(1)],
+        associated: &[1],
+    },
+    Remap {
+        case: "a remap onto both held networks associates both",
+        created: &[Mapped::Held(0)],
+        asked: &[Mapped::Held(0), Mapped::Held(1)],
+        associated: &[0, 1],
+    },
+    Remap {
+        case: "two interfaces on one held network associate that network once",
+        created: &[Mapped::Held(0), Mapped::Held(1)],
+        asked: &[Mapped::Held(1), Mapped::Held(1)],
+        associated: &[1],
+    },
+    Remap {
+        case: "an emptied mapping list drops every association",
+        created: &[Mapped::Held(0), Mapped::Held(1)],
+        asked: &[],
+        associated: &[],
+    },
+    Remap {
+        case: "re-sending the mappings the cluster already carries keeps them",
+        created: &[Mapped::Held(0)],
+        asked: &[Mapped::Held(0)],
+        associated: &[0],
+    },
+    Remap {
+        case: "a refused remap leaves the association the cluster already had",
+        created: &[Mapped::Held(0)],
+        asked: &[Mapped::Unresolvable(Unresolvable::NeverMinted)],
+        associated: &[0],
+    },
+    Remap {
+        case: "a refused remap naming a network on its way out keeps both associations",
+        created: &[Mapped::Held(0), Mapped::Held(1)],
+        asked: &[
+            Mapped::Held(1),
+            Mapped::Unresolvable(Unresolvable::OnItsWayOut),
+        ],
+        associated: &[0, 1],
+    },
+];
+
+/// Rule: the clusters a network reports are derived from the mappings the
+/// clusters currently carry, so an accepted `UpdateCluster` moves the
+/// association onto exactly the networks its new `InterfaceMappings` name — once
+/// each, however many interfaces name one network — and a refused one leaves
+/// both the stored mappings and the network side of the association exactly as
+/// they were.
+#[tokio::test]
+async fn the_network_side_association_follows_the_mappings_an_update_stored() {
+    let router = medialive();
+    let fixture = Fixture::new(&router).await;
+
+    for (index, row) in REMAPS.iter().enumerate() {
+        let case = row.case;
+        let created_mappings = fixture.mappings(row.created);
+        let (status, created) = call(
+            &router,
+            "POST",
+            CLUSTERS,
+            Some(json!({
+                "name": format!("remapped-{index}"),
+                "clusterType": ON_PREMISES,
+                "networkSettings": { "interfaceMappings": created_mappings.clone() },
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected CreateCluster to answer 201, got {status}: {created}"
+        );
+        let id = created["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a minted cluster id, got {created}"))
+            .to_string();
+
+        let asked = fixture.mappings(row.asked);
+        let (status, answer) = call(
+            &router,
+            "PUT",
+            &format!("{CLUSTERS}/{id}"),
+            Some(json!({ "networkSettings": { "interfaceMappings": asked.clone() } })),
+        )
+        .await;
+
+        // What the cluster is left carrying is the list the ROW implies: the one
+        // the update asked for when the row resolves, and the one the create
+        // stored when it does not.
+        let left_carrying = match first_unresolvable(row.asked) {
+            Some(position) => {
+                let spelled = fixture.spelling(row.asked[position]);
+                refusal_is_about(case, status, &answer, position, &spelled);
+                created_mappings
+            }
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected UpdateCluster to answer 200, got {status}: {answer}"
+                );
+                asked
+            }
+        };
+        let read = described(&router, case, &id).await;
+        assert_eq!(
+            reported_mappings(&read),
+            left_carrying,
+            "case {case:?}: expected the cluster to carry the mappings the call left it with, \
+             got {:?}",
+            read["networkSettings"]
+        );
+
+        // And the network side agrees with that stored list, network by network:
+        // a network the mappings name reports the cluster exactly once, and one
+        // they do not name does not report it at all.
+        for (slot, network_id) in fixture.held.iter().enumerate() {
+            let expected = usize::from(row.associated.contains(&slot));
+            let associated = associated_cluster_ids(&router, case, network_id).await;
+            let times = associated.iter().filter(|other| **other == id).count();
+            assert_eq!(
+                times, expected,
+                "case {case:?}: expected network {network_id} to report cluster {id} \
+                 {expected} time(s), got {associated:?}"
+            );
+        }
     }
 }
