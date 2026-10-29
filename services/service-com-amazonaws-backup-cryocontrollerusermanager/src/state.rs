@@ -2,9 +2,9 @@
 
 //! Engine state for the com-amazonaws-backup-cryocontrollerusermanager service.
 //!
-//! The vault / backup-job slice of AWS Backup is modelled here as four records
-//! plus one index, so every operation computes its answer from the SAME stored
-//! resource:
+//! The vault / backup-job slice of AWS Backup is modelled here as the records
+//! below plus one index, so every operation computes its answer from the SAME
+//! stored resource:
 //!
 //! * [`BackupVault`] — what `CreateBackupVault` inserts and `DeleteBackupVault`
 //!   removes, carrying the [`VaultLock`] `PutBackupVaultLockConfiguration`
@@ -13,6 +13,9 @@
 //! * [`BackupJob`] — the job that produced that recovery point.
 //! * [`BackupPlanRecord`] — the plan `CreateBackupPlan` inserts, whose body
 //!   every plan read projects through [`BackupPlanRecord::backup_plan`].
+//! * [`BackupSelectionRecord`] — one resource selection of such a plan.
+//! * [`FrameworkRecord`] — the audit framework `CreateFramework` inserts, whose
+//!   controls and deployment status every framework read answers from.
 //!
 //! `recovery_points_by_vault` is the ONLY per-vault list: both
 //! `ListRecoveryPointsByBackupVault`'s page and `DescribeBackupVault`'s
@@ -32,8 +35,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupRule, BackupRuleInput,
-    BackupSelection, InvalidParameterValueException, Lifecycle, ResourceNotFoundException,
-    ScanSetting,
+    BackupSelection, FrameworkControl, InvalidParameterValueException, Lifecycle,
+    ResourceNotFoundException, ScanSetting,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -173,6 +176,21 @@ pub const MAX_RULES_PER_PLAN: usize = 100;
 /// create past it.
 pub const MAX_SELECTIONS_PER_PLAN: usize = 100;
 
+/// The most frameworks this emulator keeps. An EMULATOR-CHOSEN ceiling, for the
+/// reason given on [`MAX_VAULTS`]; AWS caps the frameworks an account may hold
+/// per Region too, and answers `LimitExceededException` for a create past it.
+pub const MAX_FRAMEWORKS: usize = 500;
+
+/// The most controls this emulator keeps in ONE framework. An EMULATOR-CHOSEN
+/// ceiling, for the reason given on [`MAX_RULES_PER_PLAN`]: the list is sized by
+/// the request and stored verbatim.
+pub const MAX_CONTROLS_PER_FRAMEWORK: usize = 100;
+
+/// The most key-value pairs a control scope's tag selector admits, as the model
+/// documents for `ControlScope$Tags`: "A maximum of one key-value pair can be
+/// provided."
+pub const MAX_CONTROL_SCOPE_TAGS: usize = 1;
+
 /// The most `IdempotencyToken` records this emulator keeps. An EMULATOR-CHOSEN
 /// ceiling: the key is a string the CALLER picks, so this is one of the two
 /// stores whose keys a caller controls (the other is
@@ -223,6 +241,38 @@ pub const BACKUP_JOB_LIST_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 
 /// for it.
 pub const VAULT_SETTLE_AFTER: Duration = Duration::from_millis(500);
 
+/// How long after a create the framework settles from `CREATE_IN_PROGRESS` to
+/// `COMPLETED`.
+///
+/// A CHOSEN span, not a documented one: AWS takes as long as deploying the
+/// framework's controls needs. It is deliberately non-zero so a caller that
+/// describes or deletes the framework straight after creating it still observes
+/// the transient `CREATE_IN_PROGRESS` deployment status and the refusals that go
+/// with it, and the due instant is stored on the framework
+/// ([`FrameworkRecord::settles_at`]) so no handler ever sleeps for it.
+pub const FRAMEWORK_SETTLE_AFTER: Duration = Duration::from_secs(3);
+
+/// `DeploymentStatus` of a framework whose deployment has not settled yet, as
+/// the model lists the statuses for `Framework$DeploymentStatus`
+/// (`CREATE_IN_PROGRESS | UPDATE_IN_PROGRESS | DELETE_IN_PROGRESS | COMPLETED |
+/// FAILED`).
+pub const FRAMEWORK_DEPLOYMENT_STATUS_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+
+/// `DeploymentStatus` of a framework whose deployment has settled (same list).
+pub const FRAMEWORK_DEPLOYMENT_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// `FrameworkStatus` of a deployed framework: "ACTIVE when recording is turned
+/// on for all resources governed by the framework" (model doc for
+/// `DescribeFrameworkOutput$FrameworkStatus`) — which is what this emulator
+/// does, since nothing here turns recording off for a resource type.
+pub const FRAMEWORK_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `FrameworkStatus` of a framework whose deployment has not settled yet:
+/// "UNAVAILABLE when Backup is unable to validate recording status at this
+/// time" (same doc) — until the controls are deployed there is nothing whose
+/// recording status can be validated.
+pub const FRAMEWORK_STATUS_UNAVAILABLE: &str = "UNAVAILABLE";
+
 /// The smallest `MinRetentionDays` a logically air-gapped vault accepts, as the
 /// model documents for the member ("This setting specifies the minimum
 /// retention period that the vault retains its recovery points. The minimum
@@ -260,6 +310,21 @@ pub fn recovery_point_arn(region: &str, id: &str) -> String {
 /// example for the member abbreviates it.
 pub fn backup_plan_arn(region: &str, plan_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("backup-plan:{plan_id}"))
+}
+
+/// The ARN of a framework:
+/// `arn:aws:backup:<region>:<account>:framework:<name>-<uniquifier>`.
+///
+/// A framework is addressed by NAME, and the name alone is not unique over time
+/// — a deleted framework's name can be taken again — so the ARN AWS mints for
+/// one carries a uniquifier after the name; `uniquifier` is a value only this
+/// service mints ([`ComAmazonawsBackupCryocontrollerusermanagerState::next_id`]).
+pub fn framework_arn(region: &str, name: &str, uniquifier: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("framework:{name}-{uniquifier}"),
+    )
 }
 
 /// The region this request's ARNs carry: the one the caller signed for, from the
@@ -409,6 +474,17 @@ pub const MESSAGE_PLAN_ALREADY_EXISTS: &str = "Backup plan with the same name al
 pub const MESSAGE_SELECTION_ALREADY_EXISTS: &str =
     "Backup selection with the same name already exists";
 
+/// The sentence AWS states for "the framework asked about is not one this
+/// account holds" — fixed, and worded as this service words the same condition
+/// for a backup plan ([`MESSAGE_BACKUP_PLAN_NOT_FOUND`]): it names no part of
+/// the request. No `Code`: this condition has no observed token.
+pub const MESSAGE_FRAMEWORK_NOT_FOUND: &str = "Cannot find Framework";
+
+/// The sentence AWS states for "a framework of this name already exists",
+/// worded as this service words the same condition for a vault
+/// ([`MESSAGE_VAULT_ALREADY_EXISTS`]) — fixed, and with no observed `Code`.
+pub const MESSAGE_FRAMEWORK_ALREADY_EXISTS: &str = "Framework with the same name already exists";
+
 /// `Code` for "`MaxResults` is outside the range the model declares".
 pub const ERROR_CODE_MAX_RESULTS_INVALID: &str = "ERROR_3607";
 /// The sentence AWS states for that condition — fixed, like the ones above.
@@ -482,6 +558,81 @@ pub fn selection_already_exists() -> AlreadyExistsException {
         message: Some(MESSAGE_SELECTION_ALREADY_EXISTS.to_string()),
         ..Default::default()
     }
+}
+
+/// The modelled refusal for a framework name this account does not hold.
+pub fn framework_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(MESSAGE_FRAMEWORK_NOT_FOUND.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a create naming a framework that already exists.
+///
+/// `Arn` and `CreatorRequestId` are left UNSET for the reason given on
+/// [`vault_already_exists`].
+pub fn framework_already_exists() -> AlreadyExistsException {
+    AlreadyExistsException {
+        message: Some(MESSAGE_FRAMEWORK_ALREADY_EXISTS.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a `FrameworkControls` list carrying a value AWS does
+/// not accept, or `None` when every control in it is one it does.
+///
+/// ONE check for every operation that takes a framework's controls — the create
+/// and the update carry the same shape — so the two cannot drift in rules or in
+/// wording. Each rule is the model's own: "Each framework must contain at least
+/// one control" (`FrameworkControl` doc), a control is named by its
+/// `ControlName` so no two controls of one framework may share one, and a
+/// control scope's tag selector takes "a maximum of one key-value pair"
+/// ([`MAX_CONTROL_SCOPE_TAGS`], `ControlScope$Tags` doc).
+///
+/// The size of the list is NOT checked here: a list past
+/// [`MAX_CONTROLS_PER_FRAMEWORK`] is a quota condition, which AWS answers with a
+/// different modelled exception than a value it refuses.
+pub fn rejected_framework_controls(
+    controls: &[FrameworkControl],
+) -> Option<InvalidParameterValueException> {
+    let message = framework_controls_refusal(controls)?;
+    Some(InvalidParameterValueException {
+        message: Some(message),
+        ..Default::default()
+    })
+}
+
+/// Why `controls` is not a framework's control list, or `None` when it is.
+fn framework_controls_refusal(controls: &[FrameworkControl]) -> Option<String> {
+    if controls.is_empty() {
+        return Some("FrameworkControls must contain at least one control".to_string());
+    }
+    for (index, control) in controls.iter().enumerate() {
+        if controls[..index]
+            .iter()
+            .any(|earlier| earlier.control_name == control.control_name)
+        {
+            return Some(format!(
+                "ControlName {} is used by more than one control; control names must be \
+                 unique within a framework",
+                control.control_name
+            ));
+        }
+        let scope_tags = control
+            .control_scope
+            .as_ref()
+            .and_then(|scope| scope.tags.as_ref())
+            .map_or(0, ::std::collections::HashMap::len);
+        if scope_tags > MAX_CONTROL_SCOPE_TAGS {
+            return Some(format!(
+                "ControlScope of control {} carries {scope_tags} Tags entries; at most \
+                 {MAX_CONTROL_SCOPE_TAGS} key-value pair can be provided",
+                control.control_name
+            ));
+        }
+    }
+    None
 }
 
 /// The modelled refusal for a backup window outside the span the model
@@ -974,6 +1125,48 @@ pub struct BackupSelectionRecord {
     pub creation_date: SystemTime,
 }
 
+/// A framework as `CreateFramework` stored it: the controls the caller gave,
+/// plus the ARN this service minted, the instant it recorded and the deployment
+/// status its own clock moves.
+///
+/// A framework is addressed by `FrameworkName` (the `@httpLabel` of every
+/// framework-scoped operation), so that name is the key this record is stored
+/// under, and the control list is kept verbatim: a control has no member the
+/// service fills, so a read reports what was stored.
+#[derive(Debug, Clone)]
+pub struct FrameworkRecord {
+    pub name: String,
+    pub arn: String,
+    pub description: Option<String>,
+    /// The framework's controls in the order the caller gave them.
+    pub controls: Vec<FrameworkControl>,
+    pub creation_time: SystemTime,
+    /// The `IdempotencyToken` the create carried, which every later read of the
+    /// framework reports and which a repeated create replays.
+    pub idempotency_token: Option<String>,
+    /// The tags `FrameworkTags` assigned to the framework.
+    pub tags: BTreeMap<String, String>,
+    /// Where the framework is in its deployment: one of the statuses the model
+    /// lists for `Framework$DeploymentStatus`.
+    pub deployment_status: String,
+    /// When the deployment this record is in becomes due to settle.
+    pub settles_at: SystemTime,
+}
+
+impl FrameworkRecord {
+    /// The `FrameworkStatus` a read reports, which follows the deployment: a
+    /// framework whose controls are deployed has its recording status validated
+    /// ([`FRAMEWORK_STATUS_ACTIVE`]), and one still deploying has nothing to
+    /// validate yet ([`FRAMEWORK_STATUS_UNAVAILABLE`]).
+    pub fn framework_status(&self) -> &'static str {
+        if self.deployment_status == FRAMEWORK_DEPLOYMENT_STATUS_COMPLETED {
+            FRAMEWORK_STATUS_ACTIVE
+        } else {
+            FRAMEWORK_STATUS_UNAVAILABLE
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-backup-cryocontrollerusermanager. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
@@ -994,6 +1187,8 @@ pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
     /// contiguous and a read of them is a range of this one map rather than a
     /// second index beside it. Bounded by [`MAX_SELECTIONS_PER_PLAN`] per plan.
     pub backup_selections: BTreeMap<(String, String), BackupSelectionRecord>,
+    /// Frameworks by `FrameworkName`. Bounded by [`MAX_FRAMEWORKS`].
+    pub frameworks: BTreeMap<String, FrameworkRecord>,
     /// `StartBackupJob`'s `IdempotencyToken` -> what it replays. Bounded by
     /// [`MAX_IDEMPOTENCY_TOKENS`] and [`IDEMPOTENCY_TOKEN_TTL`].
     pub idempotency_tokens: BTreeMap<String, IdempotencyRecord>,
@@ -1131,6 +1326,38 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         self.backup_selections_of(plan_id)
             .into_iter()
             .any(|selection| selection.selection.selection_name == name)
+    }
+
+    /// Resolve a framework for a read, by the name it is stored under.
+    pub fn framework(&self, name: &str) -> Result<&FrameworkRecord, ResourceNotFoundException> {
+        self.frameworks.get(name).ok_or_else(framework_not_found)
+    }
+
+    /// The framework an `IdempotencyToken` created, if this account still holds
+    /// one: "Retrying a successful request with the same idempotency token
+    /// results in a success message with no action taken" (model doc for the
+    /// member), so a create that repeats a token answers with the framework it
+    /// already made rather than making a second one.
+    pub fn framework_by_idempotency_token(&self, token: &str) -> Option<&FrameworkRecord> {
+        self.frameworks
+            .values()
+            .find(|framework| framework.idempotency_token.as_deref() == Some(token))
+    }
+
+    /// Materialise the transition the clock has already made due for every
+    /// framework: the `CREATE_IN_PROGRESS` -> `COMPLETED` deployment a create
+    /// that reports a non-terminal status owes. Like [`Self::settle_vaults`]
+    /// this is the only write a reporting operation performs — each framework
+    /// was owed its deployment at its own `settles_at` whether or not anybody
+    /// called.
+    pub fn settle_frameworks(&mut self, now: SystemTime) {
+        for framework in self.frameworks.values_mut() {
+            if framework.deployment_status == FRAMEWORK_DEPLOYMENT_STATUS_CREATE_IN_PROGRESS
+                && now >= framework.settles_at
+            {
+                framework.deployment_status = FRAMEWORK_DEPLOYMENT_STATUS_COMPLETED.to_string();
+            }
+        }
     }
 
     /// Materialise the transition the clock has already made due, for ONE

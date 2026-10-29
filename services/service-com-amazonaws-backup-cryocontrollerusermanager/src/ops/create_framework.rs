@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFramework
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFramework`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFramework::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts an audit framework into [`crate::state`] and answers from it: the
+//! name it is stored under and the ARN this service mints for it. Every later
+//! read of the framework reports the controls stored here, the creation instant
+//! recorded here and the deployment status this record's own clock moves.
+//!
+//! A framework is addressed by name, so the control list is stored verbatim. A
+//! create that repeats an `IdempotencyToken` already recorded answers with the
+//! framework that token made and makes no second one — the model documents that
+//! retrying with the same token "results in a success message with no action
+//! taken"; any OTHER create naming a framework this account already holds is
+//! refused with `AlreadyExistsException`.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +168,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFramework` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFrameworkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFramework"))
+        // `FrameworkName` and `FrameworkControls` are `@required`, as is each
+        // control's `ControlName`, and the name targets a patterned,
+        // length-bound shape: an absent or malformed one is refused before this
+        // handler runs, and `crate::service` words that refusal as this
+        // service's own `MissingParameterValueException` /
+        // `InvalidParameterValueException`.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateFrameworkErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // The control list is sized by the request, so it is capped BEFORE the
+        // per-control checks walk it and before any of it is stored.
+        if input.framework_controls.len() > crate::state::MAX_CONTROLS_PER_FRAMEWORK {
+            return Err(CreateFrameworkErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "a framework may hold at most {} controls",
+                        crate::state::MAX_CONTROLS_PER_FRAMEWORK
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // The control rules are `crate::state`'s, shared with every other
+        // operation that takes a framework's controls, so the two cannot drift.
+        if let Some(refusal) = crate::state::rejected_framework_controls(&input.framework_controls)
+        {
+            return Err(
+                CreateFrameworkErrorModeled::InvalidParameterValueException(refusal).into(),
+            );
+        }
+
+        let mut store = state.lock();
+        // Materialise the deployments the clock has already made due, so a
+        // replayed token answers from the framework's current state rather than
+        // from the status it carried when it was made.
+        store.settle_frameworks(now);
+
+        // A repeated `IdempotencyToken` replays the framework that token
+        // created: no second framework, and the same identifiers the first call
+        // answered with. Resolved BEFORE the name check, since a replay
+        // necessarily repeats the name of the framework it created.
+        if let Some(existing) = input
+            .idempotency_token
+            .as_deref()
+            .and_then(|token| store.framework_by_idempotency_token(token))
+        {
+            return Ok(framework_created(existing));
+        }
+
+        // A create that is not the replay above and names a framework this
+        // account already holds is refused, and the refusal discloses nothing
+        // about the stored framework.
+        if store.frameworks.contains_key(&input.framework_name) {
+            return Err(CreateFrameworkErrorModeled::AlreadyExistsException(
+                crate::state::framework_already_exists(),
+            )
+            .into());
+        }
+
+        // The store is in memory and every request can add to it, so the number
+        // of frameworks it keeps is bounded. AWS answers the same modelled error
+        // once an account reaches its own framework quota.
+        if store.frameworks.len() >= crate::state::MAX_FRAMEWORKS {
+            return Err(CreateFrameworkErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator keeps at most {} frameworks",
+                        crate::state::MAX_FRAMEWORKS
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let uniquifier = store.next_id(now);
+        let record = crate::state::FrameworkRecord {
+            arn: crate::state::framework_arn(&region, &input.framework_name, &uniquifier),
+            name: input.framework_name,
+            description: input.framework_description,
+            controls: input.framework_controls,
+            creation_time: now,
+            idempotency_token: input.idempotency_token,
+            tags: input
+                .framework_tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            // The controls are not deployed the instant the create answers, so
+            // the framework starts in the non-terminal status AWS reports for
+            // one and settles when the clock makes that due.
+            deployment_status: crate::state::FRAMEWORK_DEPLOYMENT_STATUS_CREATE_IN_PROGRESS
+                .to_string(),
+            settles_at: now
+                .checked_add(crate::state::FRAMEWORK_SETTLE_AFTER)
+                .unwrap_or(now),
+        };
+        let output = framework_created(&record);
+        store.frameworks.insert(record.name.clone(), record);
+        Ok(output)
     }
 }
+
+/// What this operation answers for the framework it stored — the same answer a
+/// replayed `IdempotencyToken` gets, so a retry cannot report identifiers that
+/// differ from the ones the first call reported.
+fn framework_created(record: &crate::state::FrameworkRecord) -> CreateFrameworkOutput {
+    CreateFrameworkOutput {
+        framework_name: Some(record.name.clone()),
+        framework_arn: Some(record.arn.clone()),
+    }
+}
+

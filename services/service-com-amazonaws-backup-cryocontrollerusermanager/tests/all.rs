@@ -19,6 +19,8 @@ mod backup_plan;
 mod backup_selection;
 #[path = "all/error_bodies.rs"]
 mod error_bodies;
+#[path = "all/framework.rs"]
+mod framework;
 #[path = "all/logically_air_gapped_vault.rs"]
 mod logically_air_gapped_vault;
 #[path = "all/scheduled_runs_preview.rs"]
