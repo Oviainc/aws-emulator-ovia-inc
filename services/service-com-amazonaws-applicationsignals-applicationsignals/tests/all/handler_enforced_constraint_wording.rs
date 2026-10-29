@@ -176,6 +176,9 @@ struct Refused {
     label: String,
     uri: &'static str,
     body: Value,
+    /// `ExpiresAt`, as a number of seconds after the TIME OF THE REQUEST, for a row about the
+    /// lifetime rule. Rendered by [`body_at_call_time`] rather than stored in `body`.
+    expires_in: Option<i64>,
     member_path: &'static str,
     requirement: String,
     rejected: Vec<String>,
@@ -187,6 +190,31 @@ struct Served {
     label: String,
     uri: &'static str,
     body: Value,
+    /// See [`Refused::expires_in`].
+    expires_in: Option<i64>,
+}
+
+/// The body a row is actually sent with.
+///
+/// A lifetime the service measures from the TIME OF THE REQUEST is rendered here, against a
+/// clock read immediately before that request goes out, because that is the instant the rule is
+/// measured from: an absolute instant computed when the table was built drifts by however long
+/// the rows before it took, so a row one second inside a bound would land outside it.
+fn body_at_call_time(body: &Value, expires_in: Option<i64>) -> Value {
+    match expires_in {
+        Some(offset) => with_members(body, json!({ "ExpiresAt": now_seconds() + offset })),
+        None => body.clone(),
+    }
+}
+
+/// The values a row's message must not echo: the ones the table named, plus the `ExpiresAt` the
+/// row was rendered with, which is only known once [`body_at_call_time`] has read the clock.
+fn rejected_values(case: &Refused, sent: &Value) -> Vec<String> {
+    let mut rejected = case.rejected.clone();
+    if let Some(expires_at) = sent["ExpiresAt"].as_i64() {
+        rejected.push(expires_at.to_string());
+    }
+    rejected
 }
 
 /// Create one BREAKPOINT configuration and answer the `LocationHash` it was stored under.
@@ -208,9 +236,10 @@ fn refused_rows(now: i64, hash: &str) -> Vec<Refused> {
     let status = status_body(json!({ "LocationHash": hash }));
     // `ExpiresAt`'s published window for BREAKPOINT ("must be between 5 min and 24 hours"),
     // taken from the crate's own constants so the bound the message states and the bound it is
-    // measured against cannot differ. Each bound is probed one second OUTSIDE it: the lifetime
-    // is measured from the instant the create is served, a fraction of a second after the row
-    // reads the clock, so a row exactly on the bound would race with that drift.
+    // measured against cannot differ. Each bound is probed one second OUTSIDE it, as a number of
+    // seconds after the time of the request: the lifetime is measured from the instant the create
+    // is served, so the instant is read where the request goes out ([`body_at_call_time`]) and a
+    // row exactly on the bound would still race with the fraction of a second that takes.
     let floor = BREAKPOINT_MIN_EXPIRY.as_secs() as i64;
     let ceiling = BREAKPOINT_MAX_EXPIRY.as_secs() as i64;
     vec![
@@ -218,6 +247,7 @@ fn refused_rows(now: i64, hash: &str) -> Vec<Refused> {
             label: "status read, only StartTime".to_string(),
             uri: GET_STATUS,
             body: with_members(&status, json!({ "StartTime": now - 60 })),
+            expires_in: None,
             member_path: "endTime",
             requirement: "Member must not be null when startTime is provided".to_string(),
             rejected: vec![(now - 60).to_string()],
@@ -226,6 +256,7 @@ fn refused_rows(now: i64, hash: &str) -> Vec<Refused> {
             label: "status read, only StartTime, a window a week wide".to_string(),
             uri: GET_STATUS,
             body: with_members(&status, json!({ "StartTime": now - 7 * 24 * 3_600 })),
+            expires_in: None,
             member_path: "endTime",
             requirement: "Member must not be null when startTime is provided".to_string(),
             rejected: vec![(now - 7 * 24 * 3_600).to_string()],
@@ -234,6 +265,7 @@ fn refused_rows(now: i64, hash: &str) -> Vec<Refused> {
             label: "status read, only EndTime".to_string(),
             uri: GET_STATUS,
             body: with_members(&status, json!({ "EndTime": now })),
+            expires_in: None,
             member_path: "startTime",
             requirement: "Member must not be null when endTime is provided".to_string(),
             rejected: vec![now.to_string()],
@@ -242,6 +274,7 @@ fn refused_rows(now: i64, hash: &str) -> Vec<Refused> {
             label: "status read, only EndTime, at the epoch".to_string(),
             uri: GET_STATUS,
             body: with_members(&status, json!({ "EndTime": 0 })),
+            expires_in: None,
             member_path: "startTime",
             requirement: "Member must not be null when endTime is provided".to_string(),
             rejected: Vec::new(),
@@ -250,6 +283,7 @@ fn refused_rows(now: i64, hash: &str) -> Vec<Refused> {
             label: "status read, a window that ends a minute before it begins".to_string(),
             uri: GET_STATUS,
             body: with_members(&status, json!({ "StartTime": now, "EndTime": now - 60 })),
+            expires_in: None,
             member_path: "endTime",
             requirement: "Member must have value greater than or equal to the value of startTime"
                 .to_string(),
@@ -262,6 +296,7 @@ fn refused_rows(now: i64, hash: &str) -> Vec<Refused> {
                 &status,
                 json!({ "StartTime": now, "EndTime": now - 24 * 3_600 }),
             ),
+            expires_in: None,
             member_path: "endTime",
             requirement: "Member must have value greater than or equal to the value of startTime"
                 .to_string(),
@@ -274,6 +309,7 @@ fn refused_rows(now: i64, hash: &str) -> Vec<Refused> {
                 &status,
                 json!({ "StartTime": now as f64 + 0.5, "EndTime": now }),
             ),
+            expires_in: None,
             member_path: "endTime",
             requirement: "Member must have value greater than or equal to the value of startTime"
                 .to_string(),
@@ -285,6 +321,7 @@ fn refused_rows(now: i64, hash: &str) -> Vec<Refused> {
             body: status_body(json!({
                 "CodeLocation": { "Language": JAVA, "FilePath": "src/Cart.java" },
             })),
+            expires_in: None,
             member_path: "locationIdentifier.codeLocation.className",
             requirement: format!("Member must not be null for a {JAVA} code location"),
             rejected: vec!["src/Cart.java".to_string()],
@@ -296,6 +333,7 @@ fn refused_rows(now: i64, hash: &str) -> Vec<Refused> {
                 BREAKPOINT,
                 json!({ "Language": JAVA, "FilePath": "src/Cart.java" }),
             ),
+            expires_in: None,
             member_path: "location.codeLocation.className",
             requirement: format!("Member must not be null for a {JAVA} code location"),
             rejected: vec!["src/Cart.java".to_string()],
@@ -303,71 +341,61 @@ fn refused_rows(now: i64, hash: &str) -> Vec<Refused> {
         Refused {
             label: "create, an ExpiresAt on a PROBE configuration".to_string(),
             uri: CREATE,
-            body: with_members(
-                &create_body(PROBE, java_location(10)),
-                json!({ "ExpiresAt": now + 3_600 }),
-            ),
+            body: create_body(PROBE, java_location(10)),
+            expires_in: Some(3_600),
             member_path: "expiresAt",
             requirement: format!(
                 "Member must be null for a {PROBE} instrumentation configuration"
             ),
-            rejected: vec![(now + 3_600).to_string()],
+            rejected: Vec::new(),
         },
         Refused {
             label: "create, an ExpiresAt one second under the floor".to_string(),
             uri: CREATE,
-            body: with_members(
-                &create_body(BREAKPOINT, java_location(11)),
-                json!({ "ExpiresAt": now + floor - 1 }),
-            ),
+            body: create_body(BREAKPOINT, java_location(11)),
+            expires_in: Some(floor - 1),
             member_path: "expiresAt",
             requirement: format!(
                 "Member must have value greater than or equal to {floor} seconds after the time \
                  of the request"
             ),
-            rejected: vec![(now + floor - 1).to_string()],
+            rejected: Vec::new(),
         },
         Refused {
             label: "create, an ExpiresAt already in the past".to_string(),
             uri: CREATE,
-            body: with_members(
-                &create_body(BREAKPOINT, java_location(12)),
-                json!({ "ExpiresAt": now - 1 }),
-            ),
+            body: create_body(BREAKPOINT, java_location(12)),
+            expires_in: Some(-1),
             member_path: "expiresAt",
             requirement: format!(
                 "Member must have value greater than or equal to {floor} seconds after the time \
                  of the request"
             ),
-            rejected: vec![(now - 1).to_string()],
+            rejected: Vec::new(),
         },
         Refused {
             label: "create, an ExpiresAt one second over the ceiling".to_string(),
             uri: CREATE,
-            body: with_members(
-                &create_body(BREAKPOINT, java_location(13)),
-                json!({ "ExpiresAt": now + ceiling + 1 }),
-            ),
+            body: create_body(BREAKPOINT, java_location(13)),
+            expires_in: Some(ceiling + 1),
             member_path: "expiresAt",
             requirement: format!(
                 "Member must have value less than or equal to {ceiling} seconds after the time \
                  of the request"
             ),
-            rejected: vec![(now + ceiling + 1).to_string()],
+            rejected: Vec::new(),
         },
         Refused {
             label: "create, an ExpiresAt a year out".to_string(),
             uri: CREATE,
-            body: with_members(
-                &create_body(BREAKPOINT, java_location(14)),
-                json!({ "ExpiresAt": now + 365 * 24 * 3_600 }),
-            ),
+            body: create_body(BREAKPOINT, java_location(14)),
+            expires_in: Some(365 * 24 * 3_600),
             member_path: "expiresAt",
             requirement: format!(
                 "Member must have value less than or equal to {ceiling} seconds after the time \
                  of the request"
             ),
-            rejected: vec![(now + 365 * 24 * 3_600).to_string()],
+            rejected: Vec::new(),
         },
         // The page bound of a list whose model declares only its maximum: the same class of
         // handler-enforced rule, already worded by the builder, and the wording the rows above
@@ -380,6 +408,7 @@ fn refused_rows(now: i64, hash: &str) -> Vec<Refused> {
                 "EndTime": now,
                 "MaxResults": 0,
             }),
+            expires_in: None,
             member_path: "maxResults",
             requirement: "Member must have value greater than or equal to 1".to_string(),
             rejected: Vec::new(),
@@ -395,6 +424,7 @@ fn refused_rows(now: i64, hash: &str) -> Vec<Refused> {
                 &create_body(BREAKPOINT, java_location(20)),
                 json!({ "Service": "s".repeat(SERVICE_NAME_MAX + 1) }),
             ),
+            expires_in: None,
             member_path: "service",
             requirement: format!(
                 "Member must have length less than or equal to {SERVICE_NAME_MAX}"
@@ -414,42 +444,43 @@ fn served_rows(now: i64, hash: &str) -> Vec<Served> {
             label: "status read, neither end of the window".to_string(),
             uri: GET_STATUS,
             body: status.clone(),
+            expires_in: None,
         },
         Served {
             label: "status read, a window that runs forwards".to_string(),
             uri: GET_STATUS,
             body: with_members(&status, json!({ "StartTime": now - 3_600, "EndTime": now })),
+            expires_in: None,
         },
         Served {
             label: "status read, a window whose ends are one instant".to_string(),
             uri: GET_STATUS,
             body: with_members(&status, json!({ "StartTime": now, "EndTime": now })),
+            expires_in: None,
         },
         Served {
             label: "create, no ExpiresAt on a PROBE configuration".to_string(),
             uri: CREATE,
             body: create_body(PROBE, java_location(30)),
+            expires_in: None,
         },
         Served {
             label: "create, an ExpiresAt one second inside the floor".to_string(),
             uri: CREATE,
-            body: with_members(
-                &create_body(BREAKPOINT, java_location(31)),
-                json!({ "ExpiresAt": now + floor + 1 }),
-            ),
+            body: create_body(BREAKPOINT, java_location(31)),
+            expires_in: Some(floor + 1),
         },
         Served {
             label: "create, an ExpiresAt one second inside the ceiling".to_string(),
             uri: CREATE,
-            body: with_members(
-                &create_body(BREAKPOINT, java_location(32)),
-                json!({ "ExpiresAt": now + ceiling - 1 }),
-            ),
+            body: create_body(BREAKPOINT, java_location(32)),
+            expires_in: Some(ceiling - 1),
         },
         Served {
             label: "list service states, the smallest page bound the service serves".to_string(),
             uri: LIST_SERVICE_STATES,
             body: json!({ "StartTime": now - 3_600, "EndTime": now, "MaxResults": 1 }),
+            expires_in: None,
         },
     ]
 }
@@ -465,7 +496,8 @@ async fn every_handler_enforced_constraint_states_its_member_and_requirement() {
 
     for case in refused_rows(now, &hash) {
         let label = &case.label;
-        let (status, answer) = call(&router, case.uri, &case.body).await;
+        let sent = body_at_call_time(&case.body, case.expires_in);
+        let (status, answer) = call(&router, case.uri, &sent).await;
         assert_eq!(
             status, 400,
             "case {label:?}: expected HTTP 400, got {status} with {answer:?}"
@@ -482,7 +514,7 @@ async fn every_handler_enforced_constraint_states_its_member_and_requirement() {
             "case {label:?}: expected the one envelope and clause this service words a \
              constraint violation with, got {message:?}"
         );
-        for rejected in &case.rejected {
+        for rejected in &rejected_values(&case, &sent) {
             assert!(
                 !message.contains(rejected),
                 "case {label:?}: the message must not echo the rejected value {rejected:?}, got \
@@ -493,7 +525,8 @@ async fn every_handler_enforced_constraint_states_its_member_and_requirement() {
 
     for case in served_rows(now, &hash) {
         let label = &case.label;
-        let (status, answer) = call(&router, case.uri, &case.body).await;
+        let sent = body_at_call_time(&case.body, case.expires_in);
+        let (status, answer) = call(&router, case.uri, &sent).await;
         assert_eq!(
             status, 200,
             "case {label:?}: expected the request to be served, got {status} with {answer:?}"
@@ -512,7 +545,8 @@ async fn every_refusal_spells_its_member_path_the_one_way() {
 
     for case in refused_rows(now, &hash) {
         let label = &case.label;
-        let (_, answer) = call(&router, case.uri, &case.body).await;
+        let sent = body_at_call_time(&case.body, case.expires_in);
+        let (_, answer) = call(&router, case.uri, &sent).await;
         let message = answer["message"].as_str().unwrap_or_default().to_string();
         let path = member_path_of(&message)
             .unwrap_or_else(|| panic!("case {label:?}: no member path in {message:?}"));

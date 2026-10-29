@@ -13,10 +13,12 @@
 //! equal to it, is `ValidationException` (400) with `END_TIME_EARLIER_THAN_START_TIME` /
 //! `INVALID_HARVEST_JOB_DURATION`; an unresolved parent chain is
 //! `ResourceNotFoundException` (404) with the service's fixed per-resource sentence; a
-//! name already taken anywhere in that CHANNEL is `ConflictException` (409); a harvested manifest
-//! the endpoint does not publish is `HARVESTED_MANIFEST_NOT_FOUND_ON_ENDPOINT`; an
-//! endpoint already holding as many jobs as it may is `ServiceQuotaExceededException`
-//! (402), worded by the crate's one quota refusal builder like every sibling create's.
+//! channel that receives no ingest of its own has no content to export, so a job against
+//! one of its endpoints is `MULTIVIEW_INPUT_TYPE_WITH_HARVEST_JOB`; a name already taken
+//! anywhere in that CHANNEL is `ConflictException` (409); a harvested manifest the endpoint
+//! does not publish is `HARVESTED_MANIFEST_NOT_FOUND_ON_ENDPOINT`; an endpoint already
+//! holding as many jobs as it may is `ServiceQuotaExceededException` (402), worded by the
+//! crate's one quota refusal builder like every sibling create's.
 //!
 //! The job is created `QUEUED` and the CLOCK owes it `IN_PROGRESS` (see
 //! `state::HarvestJobRecord::materialise_due_transitions`). This emulator runs no
@@ -166,6 +168,20 @@ const UNPUBLISHED_MANIFEST_REQUIREMENT: &str = "A harvest job can harvest only t
     manifests its origin endpoint publishes. Verify the manifest names against the \
     manifests of the origin endpoint and then try again";
 
+/// The member path a harvest job refused for the channel it addresses names: the channel
+/// the request addressed, in lowerCamel as the wire names it.
+const CHANNEL_NAME_MEMBER: &str = "channelName";
+
+/// Why a harvest job was refused on a channel that receives no ingest of its own — the
+/// requirement the addressed channel failed. A harvest job exports the content the
+/// channel ingested, and a multiview channel ingests none: it composites the channels in
+/// its multiview configuration, so the content to export is theirs. This is the case the
+/// model's `MULTIVIEW_INPUT_TYPE_WITH_HARVEST_JOB` validation type names.
+const MULTIVIEW_HARVEST_NOT_ALLOWED_REQUIREMENT: &str = "You can't create a harvest job \
+    for an origin endpoint of a multiview channel, because the channel receives no ingest \
+    of its own. Harvest the origin endpoints of its source channels instead and then try \
+    again";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -311,6 +327,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // A channel that composites other channels receives no ingest of its own, so
+        // there is no content of its own for a harvest job to export — the case the
+        // model's `MULTIVIEW_INPUT_TYPE_WITH_HARVEST_JOB` validation type names. The
+        // refusal is a property of the channel the request addressed, so it is judged as
+        // soon as that channel resolves and cannot depend on which endpoint is named.
+        // Which channels those are is decided in ONE place,
+        // `crate::state::Channel::is_multiview`, so every operation that has nothing to
+        // do on such a channel agrees on it.
+        if channel.is_multiview() {
+            return Err(CreateHarvestJobErrorModeled::ValidationException(
+                crate::state::validation_failed(
+                    CHANNEL_NAME_MEMBER,
+                    MULTIVIEW_HARVEST_NOT_ALLOWED_REQUIREMENT,
+                    crate::state::VALIDATION_MULTIVIEW_INPUT_TYPE_WITH_HARVEST_JOB,
+                ),
+            )
+            .into());
+        }
+
         // The endpoint is read, not yet held mutably: the checks below are scoped to the
         // whole CHANNEL, which cannot be borrowed again while one of its endpoints is
         // held for writing. The write re-acquires it once every refusal has been judged.

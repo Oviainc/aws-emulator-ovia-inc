@@ -102,3 +102,5 @@ mod create_idempotency_optional_members;
 mod default_child_manifest_name;
 #[path = "all/harvest_job_name_namespace.rs"]
 mod harvest_job_name_namespace;
+#[path = "all/harvest_job_multiview_refusal.rs"]
+mod harvest_job_multiview_refusal;
