@@ -151,20 +151,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
 
-        // Read-only: take the guard, copy what is stored for this region, release it.
-        // No branch of this handler writes.
-        let stored = state
-            .lock()
-            .service_settings
-            .get(&region)
-            .map(crate::state::ServiceSettingsRecord::to_service_settings);
+        // Read-only: take the guard, copy what this region's settings are, release it.
+        // No branch of this handler writes. What a region no update has configured
+        // answers is decided in one place, `service_settings_in`, which this delegates
+        // to rather than restating: every region HAS settings, so the answer is always
+        // the structure, carrying only the members an update wrote.
+        let service_settings = state.lock().service_settings_in(&region);
 
         Ok(GetServiceSettingsOutput {
-            // Always present. A region no update has configured still HAS settings —
-            // the model gives the operation no way to report them missing — so its
-            // answer is the structure with every member it has nothing for left unset,
-            // which is exactly `ServiceSettings::default()`.
-            service_settings: Some(stored.unwrap_or_default()),
+            service_settings: Some(service_settings),
         })
     }
 }

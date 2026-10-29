@@ -43,6 +43,8 @@ mod reserved_tag_keys;
 mod resource_tags;
 #[path = "all/service_settings_and_types.rs"]
 mod service_settings_and_types;
+#[path = "all/service_settings_read_path.rs"]
+mod service_settings_read_path;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/status_summaries.rs"]

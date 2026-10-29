@@ -1203,8 +1203,9 @@ pub struct ComAmazonawsSsmquicksetupQuicksetupState {
     /// Quick Setup's settings are per-account and per-Region, and this emulator
     /// serves one account, so the region the request was signed for
     /// ([`request_region`]) is the key. A region with no entry has never been
-    /// configured, which `GetServiceSettings` reports by carrying no
-    /// `ServiceSettings` at all. Bounded by [`MAX_SETTINGS_REGIONS`].
+    /// configured; what a read answers for such a region is
+    /// [`Self::service_settings_in`], the one place that rule lives. Bounded by
+    /// [`MAX_SETTINGS_REGIONS`].
     pub service_settings: BTreeMap<String, ServiceSettingsRecord>,
     /// Monotonic counter backing configuration-definition id assignment.
     next_definition_id: u64,
@@ -1293,6 +1294,22 @@ impl ComAmazonawsSsmquicksetupQuicksetupState {
         self.configurations
             .get(id)
             .filter(|configuration| self.serves_configuration(region, configuration))
+    }
+
+    /// The modelled `ServiceSettings` the endpoint of `region` reports.
+    ///
+    /// Settings are not a creatable resource — the read binds no not-found and no
+    /// validation error, and its only output member is the structure itself — so every
+    /// region HAS settings and what a region no update has written answers is that
+    /// structure with every member nothing was written for left unset, never an absent
+    /// structure. The one place that rule lives, so the absence of an entry in
+    /// [`Self::service_settings`] means the same thing to every operation that reports
+    /// a region's settings.
+    pub fn service_settings_in(&self, region: &str) -> ServiceSettings {
+        self.service_settings
+            .get(region)
+            .map(ServiceSettingsRecord::to_service_settings)
+            .unwrap_or_default()
     }
 
     /// Deploy `definition` of the manager `manager_arn` to exactly `targets`: one
