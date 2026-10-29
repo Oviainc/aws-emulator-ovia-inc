@@ -223,7 +223,9 @@ enum Resolution {
 /// A member supplied EMPTY names nothing — `RoleARN`, `KmsKeyARN`, `S3Resource$BucketArn`,
 /// `LambdaResource$LambdaArn` and the two topic members are each modelled `length 0..`, so
 /// the empty string is a value they admit, and this service reads a member left out and a
-/// member sent empty the same way — so it is not looked up. Repeats are dropped: an order
+/// member sent empty the same way ([`crate::state::supplied_value`], the reading the
+/// presence checks on these same members use) — so it is not looked up. Repeats are
+/// dropped: an order
 /// that names one bucket in several `S3Resource` entries asks one question about it, and the
 /// number of lookups is capped at [`MAX_RESOLVED_NAMED_RESOURCES`] whatever the request
 /// sends.
@@ -266,7 +268,7 @@ fn named_values(named: NamedResources<'_>) -> Vec<(ResourceKind, &str)> {
     .chain(ec2_images)
     .chain(topics)
     {
-        let Some(value) = value.filter(|value| !value.is_empty()) else {
+        let Some(value) = crate::state::supplied_value(value) else {
             continue;
         };
         if seen.contains(&(kind, value)) {

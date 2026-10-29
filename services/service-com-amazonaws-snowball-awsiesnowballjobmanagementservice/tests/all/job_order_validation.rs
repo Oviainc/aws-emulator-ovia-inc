@@ -13,7 +13,8 @@
 //! 2. the device type and the job type have to be a pair the device serves, over the
 //!    WHOLE cross product of the two modelled enums;
 //! 3. an order that moves data between Amazon S3 and the device names the buckets it
-//!    transfers and the role it transfers them under;
+//!    transfers and the role it transfers them under — each read by the VALUE of the member
+//!    that names it, so a bucket entry carrying no `BucketArn` names no bucket;
 //! 4. a `LongTermPricingId` on an order has to name a long-term pricing contract this
 //!    service holds, exactly as an `AddressId` and a `ClusterId` do — and one it does
 //!    hold, bought through `CreateLongTermPricing`, is accepted;
@@ -322,6 +323,179 @@ async fn create_job_accepts_exactly_the_job_types_the_device_serves() {
     }
 }
 
+/// `S3Resources` lists whose entries name NO Amazon S3 bucket at all.
+///
+/// Source: `smithy_query(query="shape", shape="S3Resource")` — the entry has NO required
+/// member, so an entry may leave `BucketArn` out altogether, and its other two members
+/// (`KeyRange`, `TargetOnDeviceServices`) name no bucket. Each of these is therefore a
+/// well-formed bucket list that names nothing, and the rows differ along entry count and
+/// along which member of the entry is carried.
+fn buckets_naming_no_bucket() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "one bucket entry carrying no BucketArn",
+            json!([{}]),
+        ),
+        (
+            "one bucket entry carrying only a KeyRange",
+            json!([{ "KeyRange": { "BeginMarker": "a", "EndMarker": "m" } }]),
+        ),
+        (
+            "one bucket entry carrying only its on-device services",
+            json!([{
+                "TargetOnDeviceServices": [
+                    { "ServiceName": "NFS_ON_DEVICE_SERVICE", "TransferOption": "IMPORT" },
+                ],
+            }]),
+        ),
+        (
+            "three bucket entries that each name nothing",
+            json!([
+                {},
+                { "KeyRange": { "BeginMarker": "a" } },
+                {
+                    "TargetOnDeviceServices": [
+                        { "ServiceName": "S3_ON_DEVICE_SERVICE", "TransferOption": "EXPORT" },
+                    ],
+                },
+            ]),
+        ),
+    ]
+}
+
+/// `S3Resources` lists that DO name at least one bucket, each paired with the buckets it
+/// names: one entry, an entry that names nothing beside one that does (in either order),
+/// and several named buckets among entries that name none.
+fn buckets_naming_a_bucket() -> Vec<(&'static str, Value, Vec<&'static str>)> {
+    vec![
+        (
+            "one named bucket",
+            json!([{ "BucketArn": "arn:aws:s3:::transfer-source" }]),
+            vec!["arn:aws:s3:::transfer-source"],
+        ),
+        (
+            "a named bucket behind an entry that names none",
+            json!([{}, { "BucketArn": "arn:aws:s3:::transfer-second" }]),
+            vec!["arn:aws:s3:::transfer-second"],
+        ),
+        (
+            "a named bucket ahead of an entry that names none",
+            json!([
+                { "BucketArn": "arn:aws:s3:::transfer-third" },
+                { "KeyRange": { "BeginMarker": "a" } },
+            ]),
+            vec!["arn:aws:s3:::transfer-third"],
+        ),
+        (
+            "two named buckets among entries that name none",
+            json!([
+                {},
+                { "BucketArn": "arn:aws:s3:::transfer-fourth" },
+                { "KeyRange": { "BeginMarker": "a" } },
+                {
+                    "BucketArn": "arn:aws:s3:::transfer-fifth",
+                    "KeyRange": { "BeginMarker": "a", "EndMarker": "m" },
+                },
+            ]),
+            vec![
+                "arn:aws:s3:::transfer-fourth",
+                "arn:aws:s3:::transfer-fifth",
+            ],
+        ),
+    ]
+}
+
+/// The bucket ARNs a stored order reports, in the order they are reported, reading an entry
+/// that names no bucket as naming none.
+fn reported_buckets(metadata: &Value) -> Vec<String> {
+    metadata["Resources"]["S3Resources"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| entry.get("BucketArn").and_then(Value::as_str))
+        .filter(|bucket_arn| !bucket_arn.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+async fn create_job_reads_a_named_bucket_by_its_value_not_by_the_entry_carrying_it() {
+    let router = router();
+    let address_id = order_address(&router).await;
+
+    // A transfer order names the buckets it moves by the VALUE of each entry's `BucketArn`,
+    // so a bucket list whose entries carry no value for it names nothing and is refused
+    // exactly as an empty list is — however many such entries it carries — while a list
+    // carrying one value is accepted however many entries name nothing beside it.
+    for job_type in TRANSFER_JOB_TYPES {
+        let before = stored_jobs(&router, "before the refused transfer orders").await;
+        for (what, s3_resources) in buckets_naming_no_bucket() {
+            let case = format!("a {job_type} order with {what}");
+            let mut body = order(&address_id, job_type, "EDGE");
+            body["Resources"] = json!({ "S3Resources": s3_resources });
+            refused(
+                &router,
+                "CreateJob",
+                body,
+                "InvalidInputCombinationException",
+                &case,
+            )
+            .await;
+            assert_eq!(
+                stored_jobs(&router, &case).await,
+                before,
+                "case {case:?}: a refused CreateJob stored a job anyway"
+            );
+        }
+
+        for (what, s3_resources, named) in buckets_naming_a_bucket() {
+            let case = format!("a {job_type} order with {what}");
+            let mut body = order(&address_id, job_type, "EDGE");
+            body["Resources"] = json!({ "S3Resources": s3_resources });
+            let created = ok(&router, "CreateJob", body, &case).await;
+            let job_id = string(&created, "JobId", &case);
+            let metadata = job_metadata(&router, &job_id, &case).await;
+            let reported = reported_buckets(&metadata);
+            assert_eq!(
+                reported, named,
+                "case {case:?}: expected the stored order to name {named:?}, got {reported:?} \
+                 in {metadata}"
+            );
+        }
+    }
+
+    // The one bucket value the modelled member does NOT admit is the empty string: the
+    // member's pattern (`^arn:aws.*:*$`, `smithy_query(query="shape", shape="S3Resource")`)
+    // matches no empty value, so such an entry is turned away by the request walk before any
+    // order is read — a different refusal from the one above, asserted here so the rule's
+    // boundary is pinned rather than assumed.
+    for job_type in TRANSFER_JOB_TYPES {
+        let case = format!("a {job_type} order with a bucket entry whose BucketArn is empty");
+        let mut body = order(&address_id, job_type, "EDGE");
+        body["Resources"] = json!({ "S3Resources": [{ "BucketArn": "" }] });
+        refused(&router, "CreateJob", body, "ValidationException", &case).await;
+    }
+
+    // The rule belongs to an order that transfers S3 data: a local-use order moves nothing
+    // to or from Amazon S3, so the same bucket list that names nothing is no reason to
+    // refuse it, and it is stored as submitted.
+    for (what, s3_resources) in buckets_naming_no_bucket() {
+        let case = format!("a LOCAL_USE order with {what}");
+        let mut body = order(&address_id, "LOCAL_USE", "EDGE");
+        body["Resources"] = json!({ "S3Resources": s3_resources });
+        let created = ok(&router, "CreateJob", body, &case).await;
+        let job_id = string(&created, "JobId", &case);
+        let metadata = job_metadata(&router, &job_id, &case).await;
+        let reported = reported_buckets(&metadata);
+        assert!(
+            reported.is_empty(),
+            "case {case:?}: expected the stored order to name no bucket, got {reported:?} \
+             in {metadata}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn create_job_refuses_a_transfer_order_that_names_no_bucket_or_no_role() {
     let router = router();
@@ -329,7 +503,8 @@ async fn create_job_refuses_a_transfer_order_that_names_no_bucket_or_no_role() {
 
     // One row per way an order can fail to name what a transfer needs, for each job type
     // that transfers S3 data: no resources at all, resources that carry no bucket list, an
-    // empty bucket list, resources of another kind only, and buckets with no role.
+    // empty bucket list, resources of another kind only, a bucket list whose entries name
+    // no bucket, and buckets with no role.
     for job_type in TRANSFER_JOB_TYPES {
         let mut rows: Vec<(String, Value)> = Vec::new();
         for (missing, resources) in [
@@ -343,7 +518,13 @@ async fn create_job_refuses_a_transfer_order_that_names_no_bucket_or_no_role() {
                 "resources of another kind only",
                 Some(json!({ "LambdaResources": [] })),
             ),
-        ] {
+        ]
+        .into_iter()
+        .chain(
+            buckets_naming_no_bucket()
+                .into_iter()
+                .map(|(what, s3_resources)| (what, Some(json!({ "S3Resources": s3_resources })))),
+        ) {
             let mut body = order(&address_id, job_type, "EDGE");
             match resources {
                 Some(resources) => body["Resources"] = resources,

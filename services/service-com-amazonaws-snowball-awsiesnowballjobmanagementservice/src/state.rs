@@ -212,15 +212,23 @@ pub fn transfers_s3_data(job_type: &str) -> bool {
 
 /// Whether `resources` names at least one Amazon S3 bucket for a transfer to move.
 ///
-/// An absent `Resources`, one carrying no `S3Resources` list and one carrying an empty
-/// list all name no bucket, so all three read the same way here.
+/// A bucket is named by the VALUE of an `S3Resource`'s `BucketArn`, never by the presence
+/// of the entry that would carry one: `S3Resource` models no required member and
+/// `BucketArn` is modelled `length 0..255`
+/// (`smithy_query(query="shape", shape="S3Resource")`), so an entry that leaves the member
+/// out and an entry that sends it empty each name nothing — read here through
+/// [`supplied_value`], the one reading of an optional string member this crate has, and the
+/// same reading [`named_resources`] uses when it resolves the buckets an order names. So an
+/// absent `Resources`, one carrying no `S3Resources` list, one carrying an empty list and
+/// one whose entries all name nothing read the same way here.
 pub fn names_s3_bucket(resources: Option<&JobResource>) -> bool {
-    resources.is_some_and(|resources| {
-        resources
-            .s3_resources
-            .as_ref()
-            .is_some_and(|buckets| !buckets.is_empty())
-    })
+    resources
+        .and_then(|resources| resources.s3_resources.as_deref())
+        .is_some_and(|buckets| {
+            buckets
+                .iter()
+                .any(|bucket| supplied_value(bucket.bucket_arn.as_deref()).is_some())
+        })
 }
 
 /// The lifecycle states a cluster can be in: the whole `ClusterState` enum
@@ -1204,7 +1212,7 @@ impl StoredCluster {
 /// a member the caller sent empty both name nothing, so each counts as not supplied.
 ///
 /// `RoleARN` is modelled `length 0..255`, so an empty string does reach a handler.
-fn supplied_value(value: Option<&str>) -> Option<&str> {
+pub(crate) fn supplied_value(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.is_empty())
 }
 

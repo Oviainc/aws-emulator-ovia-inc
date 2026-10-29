@@ -628,12 +628,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateJob<Eng> {
         // named buckets under a named role (`crate::state::S3_TRANSFER_JOB_TYPES`), so it
         // cannot be placed without either: with no bucket there is nothing to transfer,
         // and with no role the service has no identity to read or write one under. An
-        // order for local use transfers nothing to or from S3 and needs neither.
+        // order for local use transfers nothing to or from S3 and needs neither. Both
+        // halves read what the request SUPPLIED for the member that names the resource —
+        // `crate::state::names_s3_bucket` over each `S3Resource$BucketArn`, and
+        // `crate::state::supplied_value` over `RoleARN` — so neither is satisfied by a
+        // member left out or sent empty, nor by a wrapper entry carrying no value.
         if crate::state::transfers_s3_data(&job_type) {
             let missing_transfer_member = if !crate::state::names_s3_bucket(input.resources.as_ref())
             {
                 Some("the Amazon S3 buckets it transfers, in Resources")
-            } else if input.role_arn.as_deref().is_none_or(str::is_empty) {
+            } else if crate::state::supplied_value(input.role_arn.as_deref()).is_none() {
                 Some("the RoleARN the transfer is performed under")
             } else {
                 None
