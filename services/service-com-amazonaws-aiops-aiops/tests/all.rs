@@ -29,6 +29,8 @@ mod investigation_groups;
 mod map_member_refusal_paths;
 #[path = "all/modelled_map_key_constraints.rs"]
 mod modelled_map_key_constraints;
+#[path = "all/page_token_refusal_is_modelled.rs"]
+mod page_token_refusal_is_modelled;
 #[path = "all/policy_resource_two_step.rs"]
 mod policy_resource_two_step;
 #[path = "all/regional_identifier_resolution.rs"]

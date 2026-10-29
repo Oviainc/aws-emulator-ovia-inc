@@ -71,6 +71,10 @@
 //!   again later.
 //! * `ThrottlingException` (HTTP 429) — The request was throttled because of quota limits.
 //!   You can try again later.
+//! * `ValidationException` (HTTP 400) — This operation or its parameters aren't formatted
+//!   correctly. Widened onto the error enum through `extra_errors` (see below): the
+//!   SERVICE models this shape and binds it to this operation as a common error, and it
+//!   is what refuses a `nextToken` this operation never issued.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -86,12 +90,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-aiops-aiops.json");
 // here — hence the `ListInvestigationGroupsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.aiops#ListInvestigationGroups")]
+// `ValidationException` — a shape this SERVICE models (`@error client`, `@httpError`
+// 400) and binds to this operation as a service-common error, which the operation's own
+// `errors` list does not repeat — is widened in through `extra_errors`, so the refusal of
+// a bad `nextToken` below is answered from the model rather than from a shape outside it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.aiops#ListInvestigationGroups",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum ListInvestigationGroupsErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     ThrottlingException(ThrottlingException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -137,10 +149,12 @@ fn encode_page_token(id: &str) -> String {
 }
 
 /// The group id a page token names, or a 400 refusal when the token is not one this
-/// operation issued. The token's own text is never echoed back: it is `@sensitive` —
-/// and the refusal is worded through [`crate::state::validation_message`], so a token
-/// this operation rejects reads like every other refusal this service makes (the
-/// member and the requirement, with no value).
+/// operation issued. The refusal is this service's OWN modelled `ValidationException`,
+/// the shape the model declares for a bad client input, as every other refusal in this
+/// crate is. The token's own text is never echoed back: it is `@sensitive` — and the
+/// refusal is worded through [`crate::state::validation_message`], so a token this
+/// operation rejects reads like every other refusal this service makes (the member and
+/// the requirement, with no value).
 ///
 /// What a group id looks like is [`crate::state::is_group_id`]'s to decide — the same
 /// rule that judges the id segment of an ARN — so a token carries a group id here
@@ -151,10 +165,13 @@ fn decode_page_token(token: &str) -> Result<String, ListInvestigationGroupsError
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .filter(|id| crate::state::is_group_id(id))
         .ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation(crate::state::validation_message(
-                "nextToken",
-                NEXT_TOKEN_REQUIREMENT,
-            ))
+            ListInvestigationGroupsErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::validation_message(
+                    "nextToken",
+                    NEXT_TOKEN_REQUIREMENT,
+                )),
+            })
+            .into()
         })
 }
 
