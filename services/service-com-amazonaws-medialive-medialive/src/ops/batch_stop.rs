@@ -88,6 +88,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The per-resource outcome machinery and the id-count bound every Batch
+// operation of this service answers by, held once in `crate::state` so
+// `BatchDelete`, `BatchStart` and `BatchStop` cannot drift into three readings
+// of one rule. What is below is this operation's own part: which resource kinds
+// it walks and the state rule each kind's single-resource stop follows.
+use crate::state::batch_results::{
+    accepted, failure_code, not_found, refused, within_id_cap, Outcome, Results, State,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -168,18 +177,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The request's two id lists carry no modelled length constraint, and
         // each id costs a lookup and a projection plus one result entry, so the
         // batch is bounded BEFORE the state guard is taken: the guard is never
-        // held for an amount of work the caller chose.
-        let named = input.channel_ids.as_ref().map_or(0, Vec::len)
-            + input.multiplex_ids.as_ref().map_or(0, Vec::len);
-        if named > crate::state::MAX_BATCH_STOP_IDS {
-            return Err(BatchStopErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "BatchStop names {named} resources, more than the {} one call may name",
-                    crate::state::MAX_BATCH_STOP_IDS
-                )),
+        // held for an amount of work the caller chose. The shared bound answers
+        // the message; this operation lifts it into the modelled client error IT
+        // declares.
+        within_id_cap(
+            Self::NAME,
+            crate::state::MAX_BATCH_STOP_IDS,
+            &[&input.channel_ids, &input.multiplex_ids],
+        )
+        .map_err(|message| {
+            BatchStopErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
             })
-            .into());
-        }
+        })?;
 
         let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
         let now = ::std::time::SystemTime::now();
@@ -207,88 +217,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             successful: Some(results.successful),
         })
     }
-}
-
-/// This service's state, named once so the per-resource helpers below read.
-type State = crate::state::ComAmazonawsMedialiveMedialiveState;
-
-/// The two output lists, filled in the order the request listed the resources.
-#[derive(Debug, Default)]
-struct Results {
-    failed: Vec<BatchFailedResultModel>,
-    successful: Vec<BatchSuccessfulResultModel>,
-}
-
-impl Results {
-    fn push(&mut self, outcome: Outcome) {
-        match outcome {
-            Outcome::Successful(result) => self.successful.push(result),
-            Outcome::Failed(result) => self.failed.push(result),
-        }
-    }
-}
-
-/// What attempting one resource's stop produced.
-#[derive(Debug)]
-enum Outcome {
-    Successful(BatchSuccessfulResultModel),
-    Failed(BatchFailedResultModel),
-}
-
-/// The `Code` a failed entry carries ("Error code for the failed operation"):
-/// the wire error code of the refusal the single-resource stop of that resource
-/// answers with, which on this service is the modelled exception's shape name
-/// (`smithy_query(query="operation", operation="StopChannel")`).
-mod failure_code {
-    /// Neither an existing resource nor one a caller may still act on —
-    /// `NotFoundException` (404), which both single-resource stops in this
-    /// service model: no resource of that kind has that id, or the one it had
-    /// has been deleted.
-    pub const NOT_FOUND: &str = "NotFoundException";
-    /// The resource exists but its current state does not allow a stop —
-    /// `ConflictException` (409), which `StopChannel` answers for a channel that
-    /// is not running.
-    pub const CONFLICT: &str = "ConflictException";
-}
-
-/// A failed entry for an id no resource of that kind has. No `Arn`: there is no
-/// resource to name one for.
-fn not_found(resource_type: &str, id: &str) -> Outcome {
-    Outcome::Failed(BatchFailedResultModel {
-        arn: None,
-        code: Some(failure_code::NOT_FOUND.to_string()),
-        id: Some(id.to_string()),
-        message: Some(crate::state::not_found_message(resource_type, id)),
-    })
-}
-
-/// A failed entry for a resource whose record the account still holds: it
-/// carries that record's own ARN beside the code and the message of the refusal.
-fn refused(id: &str, arn: Option<String>, code: &str, message: String) -> Outcome {
-    Outcome::Failed(BatchFailedResultModel {
-        arn,
-        code: Some(code.to_string()),
-        id: Some(id.to_string()),
-        message: Some(message),
-    })
-}
-
-/// A successful entry: the resource's id and ARN, and the state the accepted
-/// stop left it in, both read back out of the store.
-///
-/// The read-back is the operation's own view of what it wrote, so a description
-/// that is suddenly missing is a server fault, not an accepted stop with empty
-/// members — the same `unavailable()` `StopChannel` answers for it.
-fn accepted(
-    id: &str,
-    description: Option<(Option<String>, Option<String>)>,
-) -> Result<Outcome, BatchStopError> {
-    let (arn, state) = description.ok_or_else(unavailable)?;
-    Ok(Outcome::Successful(BatchSuccessfulResultModel {
-        arn,
-        id: Some(id.to_string()),
-        state,
-    }))
 }
 
 /// One channel's stop, under exactly `StopChannel`'s rule: an id whose delete
@@ -323,13 +251,16 @@ fn stop_channel(
     crate::state::begin_stop(channel, now);
 
     // Read the result back out of the store, so the entry reports what was
-    // written rather than what this handler meant to write.
+    // written rather than what this handler meant to write. A description that
+    // is suddenly missing is a server fault, not an accepted stop with empty
+    // members — the same `unavailable()` `StopChannel` answers for it.
     accepted(
         id,
         state
             .channel_description(id)
             .map(|channel| (channel.arn, channel.state)),
     )
+    .ok_or_else(unavailable)
 }
 
 /// One multiplex's stop, under exactly `StopMultiplex`'s rule: a running
@@ -349,7 +280,8 @@ fn stop_multiplex(
             state
                 .multiplex_description(id)
                 .map(|multiplex| (multiplex.arn, multiplex.state)),
-        ),
+        )
+        .ok_or_else(unavailable),
         Err(crate::state::MultiplexStopRefusal::NotFound) => Ok(not_found("Multiplex", id)),
     }
 }

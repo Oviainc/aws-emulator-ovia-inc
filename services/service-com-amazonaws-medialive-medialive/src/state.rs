@@ -1186,6 +1186,13 @@ pub fn list_page_size(max_results: Option<i32>) -> Result<usize, String> {
     }))
 }
 
+/// The BATCH slice: the per-resource outcome machinery and the id-count bound
+/// every Batch operation of this service answers by, in one module of its own so
+/// the three of them cannot drift into three readings of one rule. What stays in
+/// this file is the part the rest of the state needs: the per-operation caps
+/// below, which [`batch_results::within_id_cap`] is handed.
+pub mod batch_results;
+
 /// The most resource ids ONE `BatchDelete` call may name, counting its
 /// `ChannelIds`, `InputIds`, `InputSecurityGroupIds` and `MultiplexIds`
 /// together.
