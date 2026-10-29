@@ -49,7 +49,9 @@ pub(crate) const CLIENT_ERROR_STATUS: u16 = 400;
 /// The listings paged by a creation sequence: every one but the Call Analytics
 /// categories, whose records carry no sequence and whose cursor is a name
 /// (`crate::state::name_page_cursor`).
-fn sequence_paged() -> Vec<Listing> {
+///
+/// `pub(crate)`: `crate::list_cursor_spelling_rule` drives the same set of listings.
+pub(crate) fn sequence_paged() -> Vec<Listing> {
     listings()
         .into_iter()
         .filter(|listing| listing.order == Order::NewestFirst)
@@ -74,7 +76,10 @@ struct Forged {
 /// A token carrying `position` behind the scope `listing` mints its cursors in: that
 /// operation and the Region its endpoint serves (these calls carry no SigV4 credential
 /// scope, so they are served in `DEFAULT_REGION`).
-fn scoped(listing: &Listing, position: &str) -> String {
+///
+/// `pub(crate)`, with [`minted_cursor`]: `crate::list_cursor_spelling_rule` forges the
+/// POSITION behind this very scope rather than writing a second copy of the format.
+pub(crate) fn scoped(listing: &Listing, position: &str) -> String {
     format!("{}|{DEFAULT_REGION}|{position}", listing.operation)
 }
 

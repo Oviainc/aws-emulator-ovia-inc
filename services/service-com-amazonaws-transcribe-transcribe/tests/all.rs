@@ -73,6 +73,8 @@ mod language_models;
 mod list_cursor_rule;
 #[path = "all/list_cursor_scope_rule.rs"]
 mod list_cursor_scope_rule;
+#[path = "all/list_cursor_spelling_rule.rs"]
+mod list_cursor_spelling_rule;
 #[path = "all/list_paging_rule.rs"]
 mod list_paging_rule;
 #[path = "all/media_object_resolution.rs"]

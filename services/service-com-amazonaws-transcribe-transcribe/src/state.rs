@@ -3323,6 +3323,13 @@ pub fn page_cursor(scope: CursorScope<'_>, sequence: u64, name: &str) -> String 
 /// has minted for it ([`ComAmazonawsTranscribeTranscribeState::minted_sequences`]), and
 /// a sequence of 0, or one past it, belongs to no record any page of that listing ever
 /// reported.
+///
+/// Carrying the WHOLE of what [`page_cursor`] hands out is decided by re-minting it: a
+/// token is one this listing wrote only when [`page_cursor`] applied to the position the
+/// token decodes to writes that very token back, byte for byte. A sequence is written
+/// by `u64`'s `Display`, so the one spelling the encoder ever writes is the canonical
+/// decimal one, and any other spelling of the same number (a leading `+`, leading
+/// zeros) is a position this listing never handed out, however well it parses.
 pub fn parse_page_cursor(
     token: &str,
     scope: CursorScope<'_>,
@@ -3338,6 +3345,7 @@ pub fn parse_page_cursor(
         .parse::<u64>()
         .ok()
         .filter(|sequence| (1..=minted_through).contains(sequence))
+        .filter(|sequence| page_cursor(scope, *sequence, name) == token)
 }
 
 /// The `NextToken` a listing of records keyed by NAME ALONE hands out to resume
