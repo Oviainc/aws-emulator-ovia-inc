@@ -55,7 +55,7 @@ const MINUTE: Duration = Duration::from_secs(60);
 /// one out in real time. No handler ever sleeps for a due instant — it is stored, and
 /// `settle` applies exactly the changes owed at the instant it is handed — so giving it an
 /// instant `ahead` from now materialises precisely what a reader arriving then would see.
-fn advance(emulator: &Emulator, ahead: Duration) {
+pub(crate) fn advance(emulator: &Emulator, ahead: Duration) {
     emulator
         .engine
         .state::<ComAmazonawsMediaconvertMediaconvertState>()
@@ -65,7 +65,7 @@ fn advance(emulator: &Emulator, ahead: Duration) {
 
 /// `(sourceQueue, destinationQueue, timestamp)` of every entry of a job's
 /// `queueTransitions`, in the order reported.
-fn transitions(reply: &Reply) -> Vec<(String, String, i64)> {
+pub(crate) fn transitions(reply: &Reply) -> Vec<(String, String, i64)> {
     reply
         .at("/job/queueTransitions")
         .as_array()
@@ -91,7 +91,7 @@ fn transitions(reply: &Reply) -> Vec<(String, String, i64)> {
 }
 
 /// Create the queues a case needs, each `(name, paused)`.
-async fn seed_queues(emulator: &Emulator, queues: &[(&str, bool)]) {
+pub(crate) async fn seed_queues(emulator: &Emulator, queues: &[(&str, bool)]) {
     for (name, paused) in queues {
         let mut request = json!({ "name": name });
         if *paused {

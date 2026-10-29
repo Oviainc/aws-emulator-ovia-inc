@@ -39,6 +39,8 @@ mod error_envelope;
 mod idempotent_repeats;
 #[path = "all/input_probe.rs"]
 mod input_probe;
+#[path = "all/job_clock_consistency.rs"]
+mod job_clock_consistency;
 #[path = "all/job_engine_version_resolution.rs"]
 mod job_engine_version_resolution;
 #[path = "all/job_engine_versions.rs"]
