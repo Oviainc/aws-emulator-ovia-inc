@@ -779,6 +779,24 @@ impl ConnectorRecord {
         self.current_version = next_connector_version(&self.current_version);
     }
 
+    /// The message a call that only a running connector can serve is refused
+    /// with, or `None` when this connector is running and the call may proceed.
+    ///
+    /// The ONE state gate every operation that starts work on a connector runs
+    /// (a restart and an update), so neither can differ from the other on which
+    /// `ConnectorState` admits such a call, on the member the refusal blames, or
+    /// on how it is worded: a connector still being created, already restarting
+    /// or updating, or being deleted has no running workers for the call to act
+    /// on. Only the modelled error VARIANT stays with the handler, since the
+    /// error enum is per-operation — the same shape as
+    /// [`capacity_refusal`] and
+    /// [`ComAmazonawsKafkaconnectKafkaconnectState::start_connector_operation`], the
+    /// other two rules these handlers share.
+    pub fn not_running_refusal(&self) -> Option<String> {
+        (self.state != CONNECTOR_RUNNING)
+            .then(|| invalid_parameter_because("connectorArn", &connector_is_not_running()))
+    }
+
     /// This connector's stored capacity, as the read operations report it.
     pub fn capacity_description(&self) -> CapacityDescription {
         capacity_description(&self.capacity)

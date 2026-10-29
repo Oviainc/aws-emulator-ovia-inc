@@ -204,14 +204,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // connector that is running HAS tasks to restart — one still being
         // created, one already restarting, one updating, or one being deleted
         // has none — so the request is refused rather than recorded against
-        // work that cannot happen. The same shape of refusal `CreateConnector`
-        // answers for a custom plugin that is not `ACTIVE` yet.
-        if connector.state != crate::state::CONNECTOR_RUNNING {
+        // work that cannot happen. The ONE state gate both handlers that start
+        // work on a connector run, so only the modelled variant it is answered
+        // with is this operation's own.
+        if let Some(message) = connector.not_running_refusal() {
             return Err(RestartConnectorErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::invalid_parameter_because(
-                    "connectorArn",
-                    &crate::state::connector_is_not_running(),
-                )),
+                message: Some(message),
             })
             .into());
         }

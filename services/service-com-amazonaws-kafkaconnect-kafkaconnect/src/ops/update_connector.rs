@@ -266,13 +266,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only a running connector has workers to move onto new settings; one
         // still being created, already updating or restarting, or being
-        // deleted, has none — the same refusal a restart answers with.
-        if connector.state != crate::state::CONNECTOR_RUNNING {
+        // deleted, has none. The ONE state gate both handlers that start work
+        // on a connector run, so only the modelled variant it is answered with
+        // is this operation's own.
+        if let Some(message) = connector.not_running_refusal() {
             return Err(UpdateConnectorErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::invalid_parameter_because(
-                    "connectorArn",
-                    &crate::state::connector_is_not_running(),
-                )),
+                message: Some(message),
             })
             .into());
         }
