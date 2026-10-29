@@ -565,8 +565,31 @@ pub fn validation_envelope(clauses: &[String]) -> String {
 /// requirement, for a rule a handler enforces itself (one the model does not express,
 /// so the boundary walk passed it through). Worded through the same builders as a
 /// boundary refusal, so the two cannot drift.
+///
+/// The path it is handed is the one the boundary walk would have built for that member,
+/// which for a member inside a list element is [`list_element_member_path`]. A rule
+/// broken at more than one path states one clause per path instead
+/// ([`validation_envelope`] over [`constraint_clause`]), which is what the walk does.
 pub fn validation_message(member_path: &str, requirement: &str) -> String {
     validation_envelope(&[constraint_clause(member_path, requirement)])
+}
+
+/// The path a clause names a member INSIDE a LIST ELEMENT at: the list member, the
+/// element's own position and the step into the collection, then the member of the
+/// element that failed (`<member>.<n>.member.<element member>`).
+///
+/// `element_index` is the element's 0-based index in the list the request carried; the
+/// path states the 1-based position, spelled through the framework's own path builders
+/// ([`path::element`], [`path::member`], [`path::join`]) — the very ones the boundary
+/// walk builds a violation's path with. So a rule a handler enforces on a member of an
+/// element names exactly the element a modelled constraint on that same member would be
+/// refused at, and the two path grammars cannot drift.
+fn list_element_member_path(member: &str, element_index: usize, element_member: &str) -> String {
+    path::join(&[
+        path::member(member),
+        path::element(element_index + 1),
+        path::member(element_member),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -1184,26 +1207,50 @@ pub fn stored_encryption_configuration(
 /// that stores the list applies it, each rendering the refusal as its own modelled
 /// `ValidationException`.
 ///
-/// Worded through [`validation_message`]: the member path and the requirement, with
-/// the offending ARN withheld. The account named is the service's own, not anything
-/// the request carried.
+/// Worded through [`constraint_clause`] inside [`validation_envelope`] — the builders a
+/// boundary refusal is worded through: the member path and the requirement, with the
+/// offending ARN withheld. The path keeps the refused ENTRY's position
+/// ([`list_element_member_path`]), which is a fact about the request's shape rather than
+/// anything it sent, so a caller that sent many configurations is told WHICH one was
+/// refused exactly as a modelled constraint on the same member would tell it. A request
+/// whose entries break the rule more than once states one clause per entry, in list
+/// order, and the envelope counts them — again as the boundary walk does. The account
+/// named is the service's own, not anything the request carried.
 pub fn cross_account_configurations_rejection(
     configurations: Option<&[CrossAccountConfiguration]>,
 ) -> Option<String> {
     let own_account = ::engine::EMULATOR_ACCOUNT_ID;
-    configurations?
+    let requirement =
+        format!("Member must name an account other than the investigation account {own_account}");
+    let clauses: Vec<String> = configurations?
         .iter()
-        .filter_map(|configuration| configuration.source_role_arn.as_deref())
-        .any(|arn| arn_account_id(arn) == Some(own_account))
-        .then(|| {
-            validation_message(
-                "crossAccountConfigurations.sourceRoleArn",
-                &format!(
-                    "Member must name an account other than the investigation account {own_account}"
+        .enumerate()
+        .filter(|(_, configuration)| {
+            configuration
+                .source_role_arn
+                .as_deref()
+                .and_then(arn_account_id)
+                == Some(own_account)
+        })
+        .map(|(index, _)| {
+            constraint_clause(
+                &list_element_member_path(
+                    CROSS_ACCOUNT_CONFIGURATIONS_MEMBER,
+                    index,
+                    SOURCE_ROLE_ARN_MEMBER,
                 ),
+                &requirement,
             )
         })
+        .collect();
+    (!clauses.is_empty()).then(|| validation_envelope(&clauses))
 }
+
+/// The list member a cross-account configuration arrives on, as a clause spells it.
+const CROSS_ACCOUNT_CONFIGURATIONS_MEMBER: &str = "crossAccountConfigurations";
+
+/// The member of a cross-account configuration this rule judges.
+const SOURCE_ROLE_ARN_MEMBER: &str = "sourceRoleArn";
 
 /// Why the configuration a write would store is unacceptable, or `None` when every
 /// rule accepts it — the WHOLE chain a request that stores an investigation group's

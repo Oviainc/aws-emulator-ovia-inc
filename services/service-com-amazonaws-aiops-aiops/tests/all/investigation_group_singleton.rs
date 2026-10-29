@@ -894,7 +894,8 @@ async fn a_resource_policy_must_be_a_json_document() {
 
 /// A cross-account configuration must name an account OTHER than the investigation
 /// account: a `sourceRoleArn` in the account that owns the group is refused with
-/// `ValidationException` (400) and the stored configuration is left untouched.
+/// `ValidationException` (400), naming the refused ENTRY's own position, and the stored
+/// configuration is left untouched.
 ///
 /// Rows differ along the operation (create and update), the position of the offending
 /// entry in the list, and the list's size — with the foreign-account rows as the
@@ -912,29 +913,39 @@ async fn a_cross_account_source_role_must_name_another_account() {
         )
     };
 
-    // (case, the list, whether it must be accepted)
-    let cases: Vec<(&str, Value, bool)> = vec![
-        ("an empty list", entries(&[]), true),
-        ("one foreign account", entries(&[foreign(1)]), true),
+    // (case, the list, whether it must be accepted, the 1-based positions a refusal
+    // must name — the refused entries, which a refusal states as
+    // `crossAccountConfigurations.<n>.member.sourceRoleArn`)
+    let cases: Vec<(&str, Value, bool, Vec<usize>)> = vec![
+        ("an empty list", entries(&[]), true, vec![]),
+        ("one foreign account", entries(&[foreign(1)]), true, vec![]),
         (
             "several foreign accounts",
             entries(&[foreign(1), foreign(2), foreign(3)]),
             true,
+            vec![],
         ),
-        ("the investigation account alone", entries(&[own(1)]), false),
+        (
+            "the investigation account alone",
+            entries(&[own(1)]),
+            false,
+            vec![1],
+        ),
         (
             "the investigation account first",
             entries(&[own(1), foreign(1)]),
             false,
+            vec![1],
         ),
         (
             "the investigation account last",
             entries(&[foreign(1), foreign(2), own(1)]),
             false,
+            vec![3],
         ),
     ];
 
-    for (index, (case, list, accepted)) in cases.iter().enumerate() {
+    for (index, (case, list, accepted, positions)) in cases.iter().enumerate() {
         // A create carrying the list.
         let region = REGIONS[index % REGIONS.len()];
         let body = json!({
@@ -979,10 +990,14 @@ async fn a_cross_account_source_role_must_name_another_account() {
                 "ValidationException",
                 "case {case:?} on create: expected ValidationException, got {answer:?}"
             );
-            assert!(
-                message(&answer).contains("crossAccountConfigurations.sourceRoleArn"),
-                "case {case:?} on create: the refusal must name the member, got {answer:?}"
-            );
+            for position in positions {
+                let member =
+                    format!("crossAccountConfigurations.{position}.member.sourceRoleArn");
+                assert!(
+                    message(&answer).contains(&member),
+                    "case {case:?} on create: the refusal must name {member}, got {answer:?}"
+                );
+            }
             let left = listed(&router, region).await;
             assert!(
                 left.is_empty(),
@@ -1006,7 +1021,7 @@ async fn a_cross_account_source_role_must_name_another_account() {
     .await;
     let stored = entries(&[foreign(9)]);
 
-    for (case, list, accepted) in &cases {
+    for (case, list, accepted, positions) in &cases {
         let (status, answer) = update_in(
             &router,
             region,
@@ -1037,6 +1052,14 @@ async fn a_cross_account_source_role_must_name_another_account() {
                 "ValidationException",
                 "case {case:?} on update: expected ValidationException, got {answer:?}"
             );
+            for position in positions {
+                let member =
+                    format!("crossAccountConfigurations.{position}.member.sourceRoleArn");
+                assert!(
+                    message(&answer).contains(&member),
+                    "case {case:?} on update: the refusal must name {member}, got {answer:?}"
+                );
+            }
             let group = get_ok(&router, region, &arn, case).await;
             assert_eq!(
                 group.get("crossAccountConfigurations"),

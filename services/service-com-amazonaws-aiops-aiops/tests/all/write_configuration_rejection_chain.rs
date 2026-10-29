@@ -293,7 +293,7 @@ fn rows() -> Vec<Row> {
             configuration: json!({
                 "crossAccountConfigurations": cross_account_configurations(ACCOUNT),
             }),
-            refused_member: Some("crossAccountConfigurations.sourceRoleArn"),
+            refused_member: Some("crossAccountConfigurations.1.member.sourceRoleArn"),
         },
         Row {
             case: "tagKeyBoundaries one entry past the bound",
@@ -330,7 +330,7 @@ fn rows() -> Vec<Row> {
                 "crossAccountConfigurations": cross_account_configurations(ACCOUNT),
                 "tagKeyBoundaries": tag_key_boundaries(MAX_COLLECTION_ENTRIES + 2),
             }),
-            refused_member: Some("crossAccountConfigurations.sourceRoleArn"),
+            refused_member: Some("crossAccountConfigurations.1.member.sourceRoleArn"),
         },
         // Both collections oversized: the one the bounds rule judges first reports.
         Row {

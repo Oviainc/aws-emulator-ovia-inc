@@ -27,6 +27,8 @@ mod investigation_group_policy_delete;
 mod investigation_group_singleton;
 #[path = "all/investigation_groups.rs"]
 mod investigation_groups;
+#[path = "all/list_element_refusal_positions.rs"]
+mod list_element_refusal_positions;
 #[path = "all/map_member_refusal_paths.rs"]
 mod map_member_refusal_paths;
 #[path = "all/modelled_map_key_constraints.rs"]

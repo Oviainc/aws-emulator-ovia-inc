@@ -459,7 +459,7 @@ async fn a_validation_refusal_names_the_member_and_its_constraint_and_echoes_no_
             })),
             format!("arn:aws:iam::{}:role/Own", engine::EMULATOR_ACCOUNT_ID),
             envelope(&[clause(
-                "crossAccountConfigurations.sourceRoleArn",
+                "crossAccountConfigurations.1.member.sourceRoleArn",
                 &format!(
                     "Member must name an account other than the investigation account {}",
                     engine::EMULATOR_ACCOUNT_ID
