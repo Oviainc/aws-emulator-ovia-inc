@@ -167,20 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let filters = input.filters.unwrap_or_default();
         // `AutomationEventFilter$name` is typed as the `AutomationEventFilterName`
-        // value set, but a name outside it is refused here too so a filter is
-        // never silently ignored. The refusal echoes no request value, like
-        // every other refusal of this service.
-        if crate::state::unknown_event_filter_name(&filters).is_some() {
-            return Err(invalid_parameter(crate::state::constraint_report(
-                "filters.member.name",
-                &format!(
-                    "Member must satisfy enum value set: [{}]",
-                    AUTOMATION_EVENT_FILTER_NAME_VALUES.join(", ")
-                ),
-            )));
-        }
+        // value set, so the generated request walk has already refused a name
+        // outside it — naming the offending filter by its position in the list —
+        // and every name that gets here is one
+        // `crate::state::event_matches_filters` selects on.
+        let filters = input.filters.unwrap_or_default();
 
         // `endTimeExclusive` is exclusive, so a range whose end does not come
         // after its start can hold no event at all: refuse it rather than report

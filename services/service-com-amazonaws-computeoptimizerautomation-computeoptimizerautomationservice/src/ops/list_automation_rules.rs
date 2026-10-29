@@ -164,15 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `Filter$name` is typed as the `AutomationRuleFilterName` value set, so
+        // the generated request walk has already refused a name outside it —
+        // naming the offending filter by its position in the list — and every
+        // name that gets here is one `crate::state::rule_matches_filters`
+        // selects on.
         let filters = input.filters.unwrap_or_default();
-        // `Filter$name` is typed as the `AutomationRuleFilterName` value set, but
-        // a name outside it is refused here too so a filter is never silently
-        // ignored.
-        if crate::state::unknown_filter_name(&filters).is_some() {
-            return Err(invalid_parameter(
-                crate::state::unknown_filter_name_message(),
-            ));
-        }
 
         // The page token carries the filters it was taken with, so resuming a
         // walk with different filters is refused rather than answered with a

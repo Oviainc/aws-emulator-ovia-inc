@@ -193,21 +193,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        let filters = input.filters.unwrap_or_default();
         // `AutomationEventFilter$name` is typed as the `AutomationEventFilterName`
-        // value set, but a name outside it is refused here too so a filter is
-        // never silently ignored — the same refusal `ListAutomationEvents` gives
-        // for the same filter list, since both operations narrow the same events
-        // with it.
-        if crate::state::unknown_event_filter_name(&filters).is_some() {
-            return Err(invalid_parameter(crate::state::constraint_report(
-                "filters.member.name",
-                &format!(
-                    "Member must satisfy enum value set: [{}]",
-                    AUTOMATION_EVENT_FILTER_NAME_VALUES.join(", ")
-                ),
-            )));
-        }
+        // value set, so the generated request walk has already refused a name
+        // outside it — the same refusal `ListAutomationEvents` gives for the same
+        // filter list, since both operations narrow the same events with it.
+        let filters = input.filters.unwrap_or_default();
 
         // The window bounds are modelled as plain STRINGS, so the framework
         // hands them over unparsed: each is read into the instant it names, and

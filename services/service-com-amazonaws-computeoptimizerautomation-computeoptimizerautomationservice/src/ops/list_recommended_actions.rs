@@ -176,20 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let filters = input.filters.unwrap_or_default();
         // `RecommendedActionFilter$name` is typed as the
-        // `RecommendedActionFilterName` value set, but a name outside it is
-        // refused here too so a filter is never silently ignored. The refusal
-        // echoes no request value, like every other refusal of this service.
-        if crate::state::unknown_recommended_action_filter_name(&filters).is_some() {
-            return Err(invalid_parameter(crate::state::constraint_report(
-                "filters.member.name",
-                &format!(
-                    "Member must satisfy enum value set: [{}]",
-                    RECOMMENDED_ACTION_FILTER_NAME_VALUES.join(", ")
-                ),
-            )));
-        }
+        // `RecommendedActionFilterName` value set, so the generated request walk
+        // has already refused a name outside it — naming the offending filter by
+        // its position in the list — and every name that gets here is one
+        // `crate::state::recommended_action_matches_filters` selects on.
+        let filters = input.filters.unwrap_or_default();
 
         // The page token carries this operation's name and the filters it was
         // taken with, so resuming a walk with different filters, or with a token

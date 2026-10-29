@@ -20,10 +20,9 @@
 //!
 //! A filter `name` is typed on its value set, so the generated request walk
 //! refuses a name outside it before the handler runs, and the body asserted here
-//! is that walk's report, which names the offending filter by its position. Each
-//! handler keeps its own check behind that, so a filter is never silently
-//! ignored; it reports through the same reporter, for the list member rather
-//! than one position of it.
+//! is that walk's report, which names the offending filter by its position. That
+//! walk is the only thing that decides a filter name: no handler re-checks it,
+//! so a name that gets through is one the listing selects on.
 //!
 //! The `nextToken` refusals of the same operations are asserted in
 //! [`crate::page_token_refusals`], and their refused time ranges in

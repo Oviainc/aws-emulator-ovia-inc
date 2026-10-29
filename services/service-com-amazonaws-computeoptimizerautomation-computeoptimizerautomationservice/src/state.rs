@@ -24,9 +24,8 @@ use crate::ops::types::{
     IntegerCriteriaCondition,
     OptInRequiredException, OrganizationConfiguration, OrganizationScope, PreviewResult,
     RecommendedAction, RecommendedActionFilter, ResourceDetails, ResourceTagsCriteriaCondition,
-    Schedule, StringCriteriaCondition, Tag, AUTOMATION_EVENT_FILTER_NAME_VALUES,
-    COMPARISON_OPERATOR_VALUES, ENROLLMENT_STATUS_VALUES,
-    RECOMMENDED_ACTION_FILTER_NAME_VALUES, RECOMMENDED_ACTION_TYPE_VALUES, RULE_APPLY_ORDER_VALUES,
+    Schedule, StringCriteriaCondition, Tag, COMPARISON_OPERATOR_VALUES, ENROLLMENT_STATUS_VALUES,
+    RECOMMENDED_ACTION_TYPE_VALUES, RULE_APPLY_ORDER_VALUES,
     RULE_STATUS_VALUES, RULE_TYPE_VALUES, SAVINGS_ESTIMATION_MODE_VALUES,
 };
 
@@ -2937,8 +2936,8 @@ pub const DATE_MEMBER_REQUIREMENT: &str =
 /// Same rule as [`rule_matches_filters`]: a filter matches when the event's
 /// corresponding field equals any of that filter's values, and several filters
 /// are ANDed. The names are the model's `AutomationEventFilterName` value set,
-/// and an unrecognised one is reported by [`unknown_event_filter_name`] rather
-/// than silently ignored.
+/// and a name outside it never gets this far: the member is typed on that set,
+/// so the generated request walk refuses the request before the handler runs.
 pub fn event_matches_filters(event: &StoredEvent, filters: &[AutomationEventFilter]) -> bool {
     filters.iter().all(|filter| {
         let field: Option<&str> = match filter.name.as_str() {
@@ -2946,20 +2945,11 @@ pub fn event_matches_filters(event: &StoredEvent, filters: &[AutomationEventFilt
             "ResourceType" => Some(event.resource_type.as_str()),
             "EventType" => Some(event.event_type.as_str()),
             "EventStatus" => Some(event.event_status.as_str()),
-            // An unknown name never reaches here: the caller refuses it first.
+            // An unknown name never reaches here: the request walk refuses it.
             _ => None,
         };
         field.is_some_and(|value| filter.values.iter().any(|candidate| candidate == value))
     })
-}
-
-/// The first filter name that is not one of the model's
-/// `AutomationEventFilterName` values, if any.
-pub fn unknown_event_filter_name(filters: &[AutomationEventFilter]) -> Option<&str> {
-    filters
-        .iter()
-        .map(|filter| filter.name.as_str())
-        .find(|name| !AUTOMATION_EVENT_FILTER_NAME_VALUES.contains(name))
 }
 
 /// What a client token already in the ledger says about the request carrying it.
@@ -3474,8 +3464,9 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
 ///
 /// A filter matches when the rule's corresponding field equals any of the
 /// filter's values; several filters are ANDed. The filter names are the model's
-/// `AutomationRuleFilterName` value set, and an unrecognised one is reported by
-/// [`unknown_filter_name`] rather than silently ignored.
+/// `AutomationRuleFilterName` value set, and a name outside it never gets this
+/// far: the member is typed on that set, so the generated request walk refuses
+/// the request before the handler runs.
 pub fn rule_matches_filters(rule: &StoredRule, filters: &[Filter]) -> bool {
     filters.iter().all(|filter| {
         let field: Option<String> = match filter.name.as_str() {
@@ -3495,20 +3486,11 @@ pub fn rule_matches_filters(rule: &StoredRule, filters: &[Filter]) -> bool {
                 .as_ref()
                 .and_then(|c| c.rule_apply_order.clone()),
             "AccountId" => Some(rule.account_id.clone()),
-            // An unknown name never reaches here: the caller refuses it first.
+            // An unknown name never reaches here: the request walk refuses it.
             _ => None,
         };
         field.is_some_and(|value| filter.values.contains(&value))
     })
-}
-
-/// The first filter name that is not one of the model's
-/// `AutomationRuleFilterName` values, if any.
-pub fn unknown_filter_name(filters: &[Filter]) -> Option<&str> {
-    filters
-        .iter()
-        .map(|f| f.name.as_str())
-        .find(|name| !AUTOMATION_RULE_FILTER_NAMES.contains(name))
 }
 
 /// Does `action` satisfy every `ListRecommendedActions` filter?
@@ -3516,10 +3498,9 @@ pub fn unknown_filter_name(filters: &[Filter]) -> Option<&str> {
 /// A filter matches when the action's corresponding member equals any of the
 /// filter's values; several filters are ANDed, exactly as for
 /// [`rule_matches_filters`]. A member the stored action does not carry matches
-/// nothing. The names are the model's `RecommendedActionFilterName` value set
-/// ([`RECOMMENDED_ACTION_FILTER_NAME_VALUES`]), and an unrecognised one is
-/// reported by [`unknown_recommended_action_filter_name`] rather than silently
-/// ignored.
+/// nothing. The names are the model's `RecommendedActionFilterName` value set,
+/// and a name outside it never gets this far: the member is typed on that set,
+/// so the generated request walk refuses the request before the handler runs.
 pub fn recommended_action_matches_filters(
     action: &RecommendedAction,
     filters: &[RecommendedActionFilter],
@@ -3570,45 +3551,12 @@ pub fn recommended_action_matches_filters(
                     filter.values.contains(&tag.value)
                 });
             }
-            // An unknown name never reaches here: the caller refuses it first.
+            // An unknown name never reaches here: the request walk refuses it.
             _ => None,
         };
         field.is_some_and(|value| filter.values.contains(&value))
     })
 }
-
-/// The first filter name that is not one of the model's
-/// `RecommendedActionFilterName` values, if any.
-pub fn unknown_recommended_action_filter_name(filters: &[RecommendedActionFilter]) -> Option<&str> {
-    filters
-        .iter()
-        .map(|f| f.name.as_str())
-        .find(|name| !RECOMMENDED_ACTION_FILTER_NAME_VALUES.contains(name))
-}
-
-/// The refusal for a filter name outside the model's value set. The set is
-/// enumerated from [`AUTOMATION_RULE_FILTER_NAMES`], so the message cannot
-/// drift from the names the service actually accepts.
-pub fn unknown_filter_name_message() -> String {
-    constraint_report(
-        "filters.member.name",
-        &format!(
-            "Member must satisfy enum value set: [{}]",
-            AUTOMATION_RULE_FILTER_NAMES.join(", ")
-        ),
-    )
-}
-
-/// The `AutomationRuleFilterName` value set, from the Smithy model
-/// (`smithy_query(query="shape",shape="AutomationRuleFilterName")`).
-const AUTOMATION_RULE_FILTER_NAMES: &[&str] = &[
-    "Name",
-    "RecommendedActionType",
-    "Status",
-    "RuleType",
-    "OrganizationConfigurationRuleApplyOrder",
-    "AccountId",
-];
 
 /// Is `priority` the form the member documents?
 ///

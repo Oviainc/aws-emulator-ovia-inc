@@ -51,6 +51,8 @@ mod enrollment_rule_mode;
 mod enum_parameter_rejection;
 #[path = "all/error_payloads.rs"]
 mod error_payloads;
+#[path = "all/filter_name_enum_boundary.rs"]
+mod filter_name_enum_boundary;
 #[path = "all/filter_name_refusals.rs"]
 mod filter_name_refusals;
 #[path = "all/member_account_association_gate.rs"]
