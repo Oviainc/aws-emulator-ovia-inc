@@ -169,10 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carrying the modelled `ResourceName` pattern, so the centralized walk
         // refused an absent or malformed one before this body ran. What is left is
         // what the model cannot express: both resources have to be ones this
-        // account holds, neither may already hold another attachment, and the
-        // instance has to have the kind of address a static IP is. Every one of
-        // those is decided BEFORE the first write, so a refused request attaches
-        // nothing.
+        // account holds, neither may already hold another attachment, the
+        // instance has to have the kind of address a static IP is, and the two
+        // records have to be in the same Region. Every one of those is decided
+        // BEFORE the first write, so a refused request attaches nothing.
         let static_ip_name = input.static_ip_name;
         let instance_name = input.instance_name;
         let now = crate::state::now_ms();
@@ -194,6 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 not_found(crate::state::RESOURCE_TYPE_INSTANCE, &instance_name)
             })?;
             let instance_ip_address_type = instance.ip_address_type.clone();
+            // Where the instance runs. An instance is held by name alone, so its
+            // own record's location is what says which Region it is in — the same
+            // way `AttachInstancesToLoadBalancer` and `SetResourceAccessForBucket`
+            // decide it.
+            let instance_region = instance.location.region_name.clone();
             // The static IP this instance already holds, when it holds one. The
             // attachment lives on the STATIC IP record, so the one way to find it
             // is to ask the static IPs — which is why that walk is the store's
@@ -240,6 +245,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "The instance {instance_name} is {instance_ip_address_type}: a static IP \
                      is a public IPv4 address, so it can be attached only to an instance \
                      whose IP address type gives it one."
+                )));
+            }
+            // A static IP is reserved in ONE Region — the modelled
+            // `StaticIp$location` is "the region and Availability Zone where the
+            // static IP was created" — and an instance runs in one zone of one
+            // Region, so a reservation held by another Region is not an address
+            // this instance can be reached at.
+            if location.region_name != instance_region {
+                return Err(operation_failure(format!(
+                    "The static IP {static_ip_name} is in {} and the instance \
+                     {instance_name} is in {instance_region}: a static IP can be attached \
+                     only to an instance in the same Amazon Web Services Region.",
+                    location.region_name
                 )));
             }
             // The attachment itself: the static IP names the instance it is

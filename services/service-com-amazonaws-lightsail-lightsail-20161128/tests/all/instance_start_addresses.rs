@@ -475,8 +475,20 @@ async fn an_instance_with_a_static_ip_attached_keeps_its_public_ipv4_address() {
         .ok("CreateInstances", create_body(row, name))
         .await;
     wait_for_state(&emulator, name, "running").await;
+    // A static IP is reserved in one Region and attaches only within it, so the
+    // reservation is made in the Region this row's instance runs in — read off the
+    // instance's own record rather than spelled out a second time.
+    let instance_region = instance(&emulator, name).await["location"]["regionName"]
+        .as_str()
+        .expect("an instance reports the Region it runs in")
+        .to_string();
     emulator
-        .ok("AllocateStaticIp", json!({"staticIpName": "reserved"}))
+        .ok_at(
+            None,
+            Some(&instance_region),
+            "AllocateStaticIp",
+            json!({"staticIpName": "reserved"}),
+        )
         .await;
 
     let reserved = attach_static_ip(&emulator, "reserved", name).await;

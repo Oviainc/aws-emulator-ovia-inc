@@ -608,7 +608,7 @@ async fn detaching_one_static_ip_leaves_every_other_attachment_alone() {
     let detached = &ROWS[0];
     let kept = &ROWS[1];
     for row in [detached, kept] {
-        allocate(&emulator, None, row.static_ip_name).await;
+        allocate(&emulator, row.region, row.static_ip_name).await;
         create_instance(&emulator, row).await;
         attach_static_ip(&emulator, row.static_ip_name, row.instance_name).await;
     }
