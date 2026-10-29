@@ -608,11 +608,12 @@ async fn a_gateway_already_associated_with_another_server_is_refused() {
 /// The link is a fact about the GATEWAY, not about the pair: removing the other end does
 /// not clear it.
 ///
-/// `PutHypervisorPropertyMappings` resolves the gateway that serves a hypervisor through
-/// this link (`State::gateway_for_hypervisor`), which is how it tells a hypervisor the
-/// store no longer holds from one no gateway serves — so a gateway keeps naming the server
-/// it was associated with after `DeleteHypervisor`, and `DisassociateGatewayFromServer` is
-/// the operation that clears it (`gateway_server_disassociation`).
+/// The link belongs to the gateway and is reported as the gateway's own `HypervisorId`, so
+/// a gateway keeps naming the server it was associated with after `DeleteHypervisor`, and
+/// `DisassociateGatewayFromServer` is the operation that clears it
+/// (`gateway_server_disassociation`). The leftover link resolves no hypervisor: a request
+/// naming that ARN is refused as a missing hypervisor like any other
+/// (`put_property_mappings_one_answer_for_a_missing_hypervisor`).
 #[tokio::test]
 async fn deleting_a_server_leaves_the_association_on_the_gateway() {
     let engine = build_engine();

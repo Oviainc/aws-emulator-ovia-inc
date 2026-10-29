@@ -109,11 +109,14 @@
 //! to report ([`MissingResource::PropertyMappings`]).
 //! `PutHypervisorPropertyMappings` is what writes them
 //! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::set_property_mappings`]),
-//! and only for a hypervisor a GATEWAY is associated with
+//! and only for a hypervisor this store HOLDS
+//! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::hypervisor`]) that a GATEWAY
+//! is associated with
 //! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::gateway_for_hypervisor`]):
-//! the appliance that serves the hypervisor is what applies the mappings to it, so with
-//! none associated the request is refused ([`GATEWAY_OUT_OF_DATE`]) and nothing is
-//! written.
+//! an ARN naming no record is refused as a missing hypervisor like any other
+//! ([`MissingResource::Hypervisor`]), and for a record this store does hold, the appliance
+//! that serves it is what applies the mappings, so with none associated the request is
+//! refused ([`GATEWAY_OUT_OF_DATE`]) and nothing is written.
 //!
 //! The gateway's APPLIANCE SOFTWARE UPDATE ([`StoredGateway::software_update`]) is
 //! written by `UpdateGatewaySoftwareNow` and by nothing else
@@ -320,6 +323,11 @@ pub const MAPPINGS_NOT_CONFIGURED_MESSAGE: &str =
 /// gateway is associated with a hypervisor by `AssociateGatewayToServer` — so with no
 /// such gateway there is no appliance that can apply them, which is what AWS is recorded
 /// refusing with `ValidationException` and [`GATEWAY_OUT_OF_DATE_MESSAGE`].
+///
+/// It says nothing about whether the hypervisor EXISTS: this is the refusal for a record
+/// the service holds and no appliance serves, so an ARN naming no record is resolved and
+/// refused as a missing hypervisor ([`HYPERVISOR_NOT_FOUND`]) before an appliance is looked
+/// for at all.
 ///
 /// `ValidationException$ErrorCode` is documented as "A description of what caused the
 /// validation error" (`smithy_query(query="shape",shape="ValidationException")`) and AWS
@@ -1910,11 +1918,14 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// The ASSOCIATION a gateway holds to it does NOT go with it: the link is a fact about
     /// the GATEWAY ([`Self::associate_gateway_to_server`]), which stays its own resource,
     /// and `DisassociateGatewayFromServer` is the operation that clears it. So a gateway
-    /// still names the server it was associated with, which is what
-    /// [`Self::gateway_for_hypervisor`] resolves and why
-    /// `PutHypervisorPropertyMappings` can tell a hypervisor the store no longer holds
-    /// ([`MissingResource::Hypervisor`]) from one no gateway serves
-    /// ([`GATEWAY_OUT_OF_DATE`]).
+    /// still names the server it was associated with, and a read of that gateway still
+    /// reports the id it recorded.
+    ///
+    /// That leftover link resolves no hypervisor: the record is gone from this map, so
+    /// [`Self::hypervisor`] answers `None` for its ARN and every operation that resolves a
+    /// hypervisor refuses it as a missing one ([`MissingResource::Hypervisor`]) — the same
+    /// answer an ARN that was never imported takes, so which other resources still point at
+    /// a deleted record never decides how a request naming it is refused.
     pub fn remove_hypervisor(&mut self, arn: &str) -> Option<StoredHypervisor> {
         let removed = self.hypervisors.remove(arn)?;
         self.virtual_machines
@@ -1993,11 +2004,16 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     ///
     /// A gateway records the hypervisor it serves in [`StoredGateway::hypervisor_arn`], so
     /// the association is read off the gateway records rather than kept a second time on
-    /// the hypervisor record. `None` both for a hypervisor no gateway is associated with
-    /// and for an ARN this store holds no hypervisor under — nothing can be associated
-    /// with a hypervisor the service does not hold — which is the ONE question an
-    /// operation only the serving gateway can carry out is gated on
+    /// the hypervisor record. `None` for a hypervisor no gateway is associated with, which
+    /// is the ONE question an operation only the serving gateway can carry out is gated on
     /// ([`GATEWAY_OUT_OF_DATE`]).
+    ///
+    /// This asks about the gateway records and nothing else: a link [`Self::remove_hypervisor`]
+    /// left behind names an ARN this store holds no hypervisor under, so a `Some` here is no
+    /// evidence that the record exists. Whether the store HOLDS the hypervisor is
+    /// [`Self::hypervisor`]'s question, and a caller that resolves both asks that one first
+    /// — an ARN naming no record is refused as a missing hypervisor
+    /// ([`MissingResource::Hypervisor`]) rather than as a gateway that is out of date.
     pub fn gateway_for_hypervisor(&self, hypervisor_arn: &str) -> Option<&StoredGateway> {
         self.gateways
             .values()

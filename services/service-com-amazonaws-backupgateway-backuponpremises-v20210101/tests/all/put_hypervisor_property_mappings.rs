@@ -13,7 +13,9 @@
 //! the record carried — on the hypervisor its `ServerArn` resolves to and answers with
 //! that record's stored ARN ONLY when a gateway is associated with it; with none it
 //! refuses with HTTP 400 `ValidationException` carrying `ErrorCode` `GatewayOutOfDate`
-//! and writes nothing, however often the call is repeated.
+//! and writes nothing, however often the call is repeated. An ARN the store holds no
+//! hypervisor under never reaches that gate: it is refused as this service's one missing
+//! hypervisor (`put_property_mappings_one_answer_for_a_missing_hypervisor`).
 //!
 //! The tables below span that class rather than one recorded request: mapping sets
 //! differing in count, in order, in whether a category or a key repeats, and at each
@@ -38,7 +40,8 @@ use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gat
 
 use backup_gateway::state::{
     arn_resource_id, service_state, VmwareToAwsTagMapping, GATEWAY_OUT_OF_DATE,
-    GATEWAY_OUT_OF_DATE_MESSAGE, HYPERVISOR_NOT_FOUND, MAPPINGS_NOT_FOUND,
+    GATEWAY_OUT_OF_DATE_MESSAGE, HYPERVISOR_NOT_FOUND, HYPERVISOR_NOT_FOUND_MESSAGE,
+    MAPPINGS_NOT_FOUND,
 };
 
 use crate::gateway_lifecycle::{build_engine, build_router, call, create, Reply, REGION};
@@ -354,10 +357,15 @@ async fn a_later_put_replaces_the_mappings_and_repeating_one_changes_nothing() {
     );
 }
 
-/// With no gateway associated with the hypervisor there is no appliance that can apply
-/// the mappings, so the put is refused with HTTP 400 `ValidationException` / `ErrorCode`
-/// `GatewayOutOfDate` — the same answer however often it is repeated — and nothing is
-/// written.
+/// With no gateway associated with a hypervisor the store HOLDS there is no appliance that
+/// can apply the mappings, so the put is refused with HTTP 400 `ValidationException` /
+/// `ErrorCode` `GatewayOutOfDate` — the same answer however often it is repeated — and
+/// nothing is written.
+///
+/// An ARN the store holds no hypervisor under is a different condition and takes this
+/// service's one answer for it instead (HTTP 400 `ResourceNotFoundException` / `ErrorCode`
+/// `HypervisorNotFound`), whatever a gateway record still names: the rows below carry both,
+/// and `put_property_mappings_one_answer_for_a_missing_hypervisor` spans that class.
 #[tokio::test]
 async fn a_put_with_no_gateway_associated_is_refused_deterministically() {
     let engine = build_engine();
@@ -430,6 +438,25 @@ async fn a_put_with_no_gateway_associated_is_refused_deterministically() {
         let mappings = vec![mapping("department", "finance", "Department", "Finance")];
         let role = role_arn("aws", "refused");
 
+        // Which condition the row states decides the answer: a record the store holds and
+        // no appliance serves is the gateway refusal; an ARN naming no record is the
+        // missing hypervisor every operation of this service refuses the one way.
+        let expected = if *stored {
+            (
+                400,
+                Some("ValidationException"),
+                Some(GATEWAY_OUT_OF_DATE),
+                Some(GATEWAY_OUT_OF_DATE_MESSAGE),
+            )
+        } else {
+            (
+                400,
+                Some("ResourceNotFoundException"),
+                Some(HYPERVISOR_NOT_FOUND),
+                Some(HYPERVISOR_NOT_FOUND_MESSAGE),
+            )
+        };
+
         let mut answers = Vec::new();
         for attempt in 0..2 {
             let reply = put(&router, arn, &role, &mappings).await;
@@ -440,14 +467,9 @@ async fn a_put_with_no_gateway_associated_is_refused_deterministically() {
                     reply.str_at("/ErrorCode"),
                     reply.str_at("/Message")
                 ),
-                (
-                    400,
-                    Some("ValidationException"),
-                    Some(GATEWAY_OUT_OF_DATE),
-                    Some(GATEWAY_OUT_OF_DATE_MESSAGE)
-                ),
-                "case {case:?}, attempt {attempt}: a put with no gateway associated must be \
-                 refused as out of date, got {} {:?}",
+                expected,
+                "case {case:?}, attempt {attempt}: a put no appliance can carry out must be \
+                 refused with {expected:?}, got {} {:?}",
                 reply.status,
                 reply.body
             );
@@ -475,8 +497,8 @@ async fn a_put_with_no_gateway_associated_is_refused_deterministically() {
         }
     }
 
-    // The gate keys on the association alone: the hypervisor a gateway IS associated with
-    // takes the very same request.
+    // The gate keys on the association for a record the store holds: the hypervisor a
+    // gateway IS associated with takes the very same request.
     let accepted = put(
         &router,
         &served,

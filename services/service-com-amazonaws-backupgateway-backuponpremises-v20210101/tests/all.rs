@@ -69,6 +69,8 @@ mod page_token_query_identity;
 mod put_bandwidth_rate_limit_schedule;
 #[path = "all/put_hypervisor_property_mappings.rs"]
 mod put_hypervisor_property_mappings;
+#[path = "all/put_property_mappings_one_answer_for_a_missing_hypervisor.rs"]
+mod put_property_mappings_one_answer_for_a_missing_hypervisor;
 #[path = "all/refusal_names_the_member_one_way.rs"]
 mod refusal_names_the_member_one_way;
 #[path = "all/regional_listing_scope.rs"]

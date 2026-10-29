@@ -6,8 +6,13 @@
 //! hypervisor's record in [`crate::state`], and answers with the ARN read back off the
 //! stored record. This is the ONLY file to touch for this operation.
 //!
-//! The mappings are applied to the hypervisor's entities by the backup GATEWAY that
-//! serves it, so a put for a hypervisor no gateway is associated with
+//! The `HypervisorArn` is resolved to a stored record FIRST: an ARN this service holds no
+//! hypervisor under is refused as the missing hypervisor every operation of this service
+//! that resolves one refuses ([`crate::state::MissingResource::Hypervisor`]), whatever a
+//! gateway record happens to still name.
+//!
+//! For a hypervisor the store DOES hold, the mappings are applied to its entities by the
+//! backup GATEWAY that serves it, so a put for one no gateway is associated with
 //! ([`crate::state::ComAmazonawsBackupgatewayBackuponpremisesV20210101State::gateway_for_hypervisor`])
 //! is refused with HTTP 400 `ValidationException` carrying
 //! [`crate::state::GATEWAY_OUT_OF_DATE`] and nothing is written — the same answer however
@@ -89,14 +94,13 @@
 //! * `ConflictException` (HTTP 409) — The operation cannot proceed because it is not
 //!   supported.
 //! * `ResourceNotFoundException` (HTTP 404) — A resource that is required for the action
-//!   wasn't found. Answered at HTTP 400 for a missing HYPERVISOR, with `ErrorCode`
-//!   `HypervisorNotFound` (`crate::state::MissingResource`) — reached when a gateway is
-//!   associated with a hypervisor record the store no longer holds. An ARN that names no
-//!   hypervisor at all takes the gateway refusal below instead: nothing is associated with
-//!   a record this service does not hold, so there is no appliance for the request either
-//!   way, and that is the answer AWS is recorded giving.
-//! * `ValidationException` (HTTP 400) — the refusal for a hypervisor no gateway is
-//!   associated with, `ErrorCode` [`crate::state::GATEWAY_OUT_OF_DATE`]. One of the errors
+//!   wasn't found. The hypervisor the `HypervisorArn` names IS that resource, so EVERY ARN
+//!   this store holds no hypervisor under takes this refusal — never imported, imported and
+//!   deleted, or deleted while a gateway was associated with it. Answered at HTTP 400 with
+//!   `ErrorCode` `HypervisorNotFound` (`crate::state::MissingResource`), the status and code
+//!   this service answers a missing hypervisor with on every operation that resolves one.
+//! * `ValidationException` (HTTP 400) — the refusal for a hypervisor this store HOLDS that
+//!   no gateway is associated with, `ErrorCode` [`crate::state::GATEWAY_OUT_OF_DATE`]. One of the errors
 //!   this SERVICE models for every operation, which
 //!   `smithy_query(query="operation",operation="PutHypervisorPropertyMappings")` therefore
 //!   lists for this one (beside `InternalServerException` and `ThrottlingException`) even
@@ -146,6 +150,26 @@ pub type PutHypervisorPropertyMappingsError = crate::scaffolded::Scaffolded<PutH
 impl From<PutHypervisorPropertyMappingsErrorModeled> for PutHypervisorPropertyMappingsError {
     fn from(modeled: PutHypervisorPropertyMappingsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// The refusal for a `HypervisorArn` this store holds no hypervisor under: the status, the
+/// `ErrorCode` and the sentence this service answers that ONE condition with wherever it
+/// resolves a hypervisor ([`crate::state::MissingResource`]).
+///
+/// Stated once and returned from every place this operation can reach the condition, so the
+/// answer cannot depend on which lookup noticed it.
+fn hypervisor_not_found(hypervisor_arn: &str) -> PutHypervisorPropertyMappingsError {
+    let missing = crate::state::MissingResource::Hypervisor;
+    let error = PutHypervisorPropertyMappingsErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            error_code: missing.error_code().map(str::to_string),
+            message: Some(missing.message(hypervisor_arn)),
+        },
+    );
+    match missing.status_override() {
+        Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
+        None => error.into(),
     }
 }
 
@@ -219,20 +243,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         )?;
 
-        // What is left is a fact of the STORE: which appliance would apply these mappings.
+        // What is left are two facts of the STORE, asked in this order: does this service
+        // hold the hypervisor the request names, and — only then — which appliance would
+        // apply these mappings.
         //
-        // One guard spans the gate and the write, so the record the gate passed is the
+        // One guard spans both gates and the write, so the record the gates passed is the
         // record the mappings are written to.
         let mut store = state.lock();
 
-        // The GATEWAY gate comes first. A property mapping is applied to the hypervisor's
-        // entities by the backup gateway appliance that serves it, so a put for a
-        // hypervisor no gateway is associated with reaches no appliance that could carry
-        // it out: the refusal is about the GATEWAY and not about the mappings or the
-        // hypervisor, which is why it is answered the same way for an ARN this store holds
-        // no hypervisor under — nothing is associated with a hypervisor the service does
-        // not hold either. Nothing is written before this gate passes, so the answer is
-        // the same however often the call is repeated.
+        // The RESOURCE the request names is resolved first. The hypervisor is the resource
+        // required for this action, so an ARN this store holds no hypervisor under — never
+        // imported, or imported and since deleted — is refused as that missing hypervisor,
+        // the one way this service answers the condition wherever it resolves one. A link a
+        // gateway record keeps to a server that was deleted names no record either, so what
+        // some OTHER resource still points at cannot change this answer. Nothing is written
+        // before either gate passes, so the refusal is the same however often it is
+        // repeated.
+        if store.hypervisor(&input.hypervisor_arn).is_none() {
+            return Err(hypervisor_not_found(&input.hypervisor_arn));
+        }
+
+        // Only for a hypervisor this store HOLDS is there an appliance to ask about. A
+        // property mapping is applied to the hypervisor's entities by the backup gateway
+        // appliance associated with it, so a put for a stored hypervisor no gateway is
+        // associated with reaches no appliance that could carry it out: that refusal is
+        // about the GATEWAY, and it is reached only once the hypervisor itself resolved.
         if store.gateway_for_hypervisor(&input.hypervisor_arn).is_none() {
             return Err(PutHypervisorPropertyMappingsErrorModeled::ValidationException(
                 ValidationException {
@@ -243,27 +278,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Past the gate a gateway names this hypervisor. The record it names can still be
-        // absent — a hypervisor the store once held and no longer does — and a put cannot
-        // set mappings on a record that is not there, so that is refused through the same
-        // `crate::state::MissingResource` choice of status and `ErrorCode` every other
-        // operation of this service refuses a missing hypervisor with.
+        // Past both gates the store holds the record and a gateway serves it, so the write
+        // lands on the record the first gate resolved — the same guard has been held since.
         let mappings = crate::state::StoredPropertyMappings {
             iam_role_arn: input.iam_role_arn.clone(),
             vmware_to_aws_tag_mappings: input.vmware_to_aws_tag_mappings.clone(),
         };
         let Some(updated) = store.set_property_mappings(&input.hypervisor_arn, mappings) else {
-            let missing = crate::state::MissingResource::Hypervisor;
-            let error = PutHypervisorPropertyMappingsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    error_code: missing.error_code().map(str::to_string),
-                    message: Some(missing.message(&input.hypervisor_arn)),
-                },
-            );
-            return Err(match missing.status_override() {
-                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
-                None => error.into(),
-            });
+            // Unreachable while that guard is held; were the record ever absent here, the
+            // condition is the one the first gate answers, answered identically.
+            return Err(hypervisor_not_found(&input.hypervisor_arn));
         };
 
         // The ARN comes back off the record the store now holds, not off the request.
