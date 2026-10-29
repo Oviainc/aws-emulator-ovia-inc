@@ -15,6 +15,8 @@
 mod account_scoped_reads;
 #[path = "all/cost_optimization_hub.rs"]
 mod cost_optimization_hub;
+#[path = "all/enrollment_read_scope_gate.rs"]
+mod enrollment_read_scope_gate;
 #[path = "all/management_account_gating.rs"]
 mod management_account_gating;
 #[path = "all/max_results_bounds.rs"]

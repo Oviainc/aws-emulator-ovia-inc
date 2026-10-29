@@ -1057,10 +1057,10 @@ impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
     /// the recommendation readers' `filter.accountIds`) addresses exactly those
     /// accounts; naming none it addresses the calling account, widened to every
     /// account of the organization where the request asks for the
-    /// organization's view (`includeOrganizationInfo`). Written once here
-    /// because it is the same set the permission gates judge — whether the read
-    /// reaches past the caller's own account — so the rows a reader then scopes
-    /// to cannot disagree with what its gate admitted.
+    /// organization's view (`includeOrganizationInfo`). The precedence between
+    /// those members lives in [`ReadScope`], so the accounts resolved here and
+    /// the question a permission gate asks of the same request
+    /// ([`Self::addressed_accounts_for_read`]) are answers about one scope.
     ///
     /// The result is sorted and carries each account once, so a paginated
     /// reader resumes at the row the previous page stopped at.
@@ -1070,12 +1070,39 @@ impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
         named: &[String],
         whole_organization: bool,
     ) -> Vec<String> {
-        let mut accounts: Vec<String> = if !named.is_empty() {
-            named.to_vec()
-        } else if whole_organization {
-            self.enrollments.keys().cloned().collect()
-        } else {
-            vec![caller.to_string()]
+        self.accounts_in(ReadScope::of(named, whole_organization), caller)
+    }
+
+    /// The accounts a read addresses, or the refusal the caller's permissions
+    /// earn it: a read whose scope reaches past the caller's own account is the
+    /// organization's view, which only the organization's management account
+    /// has, so any other caller is refused ([`OrganizationViewRequired`], which
+    /// the reader maps into the modelled error its own operation declares).
+    ///
+    /// Gate and scoping are decided from the ONE [`ReadScope`] the request
+    /// resolves to, so a request admitted as reaching no further than the
+    /// caller's own record cannot then be scoped to another account's, and a
+    /// request whose scope is confined to the caller's own record cannot be
+    /// refused as an organization view.
+    pub fn addressed_accounts_for_read(
+        &self,
+        caller: &str,
+        named: &[String],
+        whole_organization: bool,
+    ) -> Result<Vec<String>, OrganizationViewRequired> {
+        let scope = ReadScope::of(named, whole_organization);
+        if scope.reaches_past(caller) && !self.is_management_account(caller) {
+            return Err(OrganizationViewRequired);
+        }
+        Ok(self.accounts_in(scope, caller))
+    }
+
+    /// The accounts `scope` resolves to, sorted and each carried once.
+    fn accounts_in(&self, scope: ReadScope<'_>, caller: &str) -> Vec<String> {
+        let mut accounts: Vec<String> = match scope {
+            ReadScope::Named(named) => named.to_vec(),
+            ReadScope::WholeOrganization => self.enrollments.keys().cloned().collect(),
+            ReadScope::CallerOnly => vec![caller.to_string()],
         };
         accounts.sort();
         accounts.dedup();
@@ -1211,12 +1238,62 @@ pub struct RecommendationView {
     pub rows: Vec<StoredRecommendation>,
 }
 
-/// The refusal
-/// [`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::recommendation_view`]
-/// answers a request for the recommendations of accounts other than the
-/// caller's: the caller is not the organization's management account, so it has
-/// no organization view. Each reader maps it into the modelled error its own
-/// operation declares for it.
+/// What one read of this service's data is scoped to, before the accounts it
+/// resolves to are looked up in the store.
+///
+/// A request that NAMES accounts is scoped to exactly those; naming none it is
+/// scoped to the whole organization where it asks for the organization's view,
+/// else to the calling account alone. That precedence — a named account beats
+/// the organization's view, so naming the caller's own account is a read of
+/// that one record however the organization member is set — is written once
+/// here, because both the accounts a reader scopes its rows to
+/// ([`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::addressed_accounts`])
+/// and whether its caller needs the organization's view at all
+/// ([`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::addressed_accounts_for_read`])
+/// are questions about this one scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadScope<'a> {
+    /// Exactly the accounts the request named.
+    Named(&'a [String]),
+    /// Every account of the organization the store records.
+    WholeOrganization,
+    /// The calling account alone.
+    CallerOnly,
+}
+
+impl<'a> ReadScope<'a> {
+    /// The scope a request's account-naming and organization-view members
+    /// resolve to.
+    fn of(named: &'a [String], whole_organization: bool) -> Self {
+        if !named.is_empty() {
+            Self::Named(named)
+        } else if whole_organization {
+            Self::WholeOrganization
+        } else {
+            Self::CallerOnly
+        }
+    }
+
+    /// Whether this scope reaches any account other than the caller's: a named
+    /// scope only when it names one, the organization's view always (it is the
+    /// organization's member accounts that view is for, whichever of them the
+    /// store happens to hold a record for), and the caller's own scope never.
+    fn reaches_past(&self, caller: &str) -> bool {
+        match self {
+            Self::Named(named) => named.iter().any(|wanted| wanted != caller),
+            Self::WholeOrganization => true,
+            Self::CallerOnly => false,
+        }
+    }
+}
+
+/// The refusal a read of accounts other than the caller's earns a caller that
+/// is not the organization's management account, and so has no organization
+/// view
+/// ([`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::addressed_accounts_for_read`],
+/// [`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::recommendation_view`]).
+/// Each reader maps it into the modelled error its own operation declares for
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OrganizationViewRequired;
 

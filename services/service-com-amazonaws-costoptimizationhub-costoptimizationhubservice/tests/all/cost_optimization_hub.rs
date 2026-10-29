@@ -63,19 +63,27 @@ pub(crate) type Store = engine::ServiceState<
     cost_optimization_hub::state::ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState,
 >;
 
+/// A [`router`] together with the store behind it, for a suite that has to
+/// record what no operation creates — the organization's MEMBER accounts, this
+/// emulator having no Organizations control plane — while leaving the caller a
+/// member account itself (no organization recorded), which is the arm of an
+/// organization rule that refuses.
+pub(crate) fn router_with_store() -> (MultiServiceRouter, Store) {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let store = cost_optimization_hub::state::service_state(&*engine)
+        .expect("the Cost Optimization Hub store");
+    (router_over(engine), store)
+}
+
 /// A [`management_account_router`] together with the store behind it, for a
 /// suite that has to record the organization's MEMBER accounts: this emulator
 /// has no Organizations control plane, so no operation CREATES a second
 /// account's enrollment record or its rows in the catalog.
 pub(crate) fn management_account_router_with_store() -> (MultiServiceRouter, Store) {
-    let engine = Arc::new(engine::InMemoryEngine::new());
-    let state = cost_optimization_hub::state::service_state(&*engine)
-        .expect("the Cost Optimization Hub store");
-    state.lock().organization_management_account_id =
+    let (router, store) = router_with_store();
+    store.lock().organization_management_account_id =
         Some(engine::emulator_account_id().to_string());
-    let store = cost_optimization_hub::state::service_state(&*engine)
-        .expect("the Cost Optimization Hub store");
-    (router_over(engine), store)
+    (router, store)
 }
 
 /// Enable the organization-wide member-account discount visibility over the

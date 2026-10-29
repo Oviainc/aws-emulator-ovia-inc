@@ -6,7 +6,7 @@
 //! account — one per account it knows, `Inactive` until `UpdateEnrollmentStatus`
 //! opts in — paged by `maxResults`/`nextToken`.
 //!
-//! `includeOrganizationInfo` and an `accountId` naming another account both ask
+//! `includeOrganizationInfo`, and an `accountId` naming another account, ask
 //! for the enrollment of the organization's member accounts, which only the
 //! organization's management account may read, so either from any other caller
 //! is refused with the modelled `AccessDeniedException`.
@@ -14,8 +14,11 @@
 //! The records the answer carries are the ones the request ADDRESSES — the
 //! account `accountId` names, else the caller's own, widened by
 //! `includeOrganizationInfo` to every account of the organization
-//! (`crate::state::...::addressed_accounts`) — so a request admitted as a read
-//! of a named account answers that account's record.
+//! (`crate::state::...::addressed_accounts_for_read`) — and that same scope is
+//! what the refusal above is decided from, so a request naming the caller's
+//! own account reads that one record whatever `includeOrganizationInfo` is set
+//! to, and a request admitted as a read of a named account answers that
+//! account's record.
 //!
 //! ## Shape of an operation
 //!
@@ -182,27 +185,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (include_member_accounts, mut enrollments) = {
             let store = state.lock();
 
-            // Both of these ask for accounts other than the caller's — the
-            // organization's enrollment, and one named member account — which
-            // is a view only the organization's management account has.
+            // The accounts this read addresses, and the permission it needs,
+            // both from the ONE scope the request resolves to: an `accountId`
+            // selects that account's record, naming none the answer covers the
+            // calling account only, or — with `includeOrganizationInfo` —
+            // every account enrolled in the organization. A scope that reaches
+            // past the caller's own account is the organization's view, which
+            // only the organization's management account has, so any other
+            // caller is refused before the records are read.
             let named: &[String] = input.account_id.as_slice();
-            let asks_for_other_accounts = input.include_organization_info
-                || named.iter().any(|wanted| wanted != caller);
-            if asks_for_other_accounts && !store.is_management_account(caller) {
-                return Err(not_an_organization_view());
-            }
+            let addressed =
+                match store.addressed_accounts_for_read(caller, named, input.include_organization_info)
+                {
+                    Ok(addressed) => addressed,
+                    Err(crate::state::OrganizationViewRequired) => {
+                        return Err(not_an_organization_view())
+                    }
+                };
 
             let include_member_accounts = store
                 .enrollments
                 .get(caller)
                 .and_then(|enrollment| enrollment.include_member_accounts);
-            // An `accountId` selects that account's record; naming none, the
-            // answer covers the calling account only, or — with
-            // `includeOrganizationInfo` — every account enrolled in the
-            // organization. An addressed account Cost Optimization Hub holds no
-            // record for contributes nothing.
-            let scoped: Vec<crate::state::Enrollment> = store
-                .addressed_accounts(caller, named, input.include_organization_info)
+            // An addressed account Cost Optimization Hub holds no record for
+            // contributes nothing.
+            let scoped: Vec<crate::state::Enrollment> = addressed
                 .iter()
                 .filter_map(|account| store.enrollments.get(account))
                 .cloned()
