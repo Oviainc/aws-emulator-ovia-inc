@@ -2710,6 +2710,219 @@ pub const COUNTRY_RULES: &[CountryRule] = &[
     },
 ];
 
+/// One country block of an `additionalTaxInformation` object: the member the wire
+/// spells it with, the jurisdiction whose TRN it carries additional information
+/// for, and whether a submitted object carries it.
+///
+/// The jurisdiction of a block is the country its own documentation names
+/// ("Additional tax information associated with your TRN in Poland"), as the
+/// `Address$countryCode` of that country — the ISO 3166-1 alpha-2 code that
+/// member carries.
+#[derive(Debug, Clone, Copy)]
+pub struct AdditionalInfoBlock {
+    /// The member of `AdditionalInfoRequest` that carries the block, as the wire
+    /// spells it. The parameter a refusal about the block names — see
+    /// [`parameter_name`].
+    pub member: &'static str,
+    /// The `Address$countryCode` of the country the block belongs to.
+    pub country_code: &'static str,
+    /// Whether a submitted object carries this block.
+    pub submitted: fn(&AdditionalInfoRequest) -> bool,
+}
+
+/// Every country block `AdditionalInfoRequest` declares, in the order the model
+/// declares them
+/// (`smithy_query(query="shape",shape="com.amazonaws.taxsettings#AdditionalInfoRequest")`).
+///
+/// One row per member of that shape, so counting the blocks an object carries and
+/// placing the one it carries are read off the model rather than off the countries
+/// some rule happens to mention. `brazilAdditionalInfo` and `indiaAdditionalInfo`
+/// are deliberately NOT rows: they exist only on the RESPONSE shape, so no request
+/// can carry either (see [`additional_info_response`]).
+pub const ADDITIONAL_INFO_BLOCKS: &[AdditionalInfoBlock] = &[
+    AdditionalInfoBlock {
+        member: "malaysiaAdditionalInfo",
+        country_code: "MY",
+        submitted: |info: &AdditionalInfoRequest| info.malaysia_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "israelAdditionalInfo",
+        country_code: "IL",
+        submitted: |info: &AdditionalInfoRequest| info.israel_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "estoniaAdditionalInfo",
+        country_code: "EE",
+        submitted: |info: &AdditionalInfoRequest| info.estonia_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "canadaAdditionalInfo",
+        country_code: "CA",
+        submitted: |info: &AdditionalInfoRequest| info.canada_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "spainAdditionalInfo",
+        country_code: "ES",
+        submitted: |info: &AdditionalInfoRequest| info.spain_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "kenyaAdditionalInfo",
+        country_code: "KE",
+        submitted: |info: &AdditionalInfoRequest| info.kenya_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "southKoreaAdditionalInfo",
+        country_code: "KR",
+        submitted: |info: &AdditionalInfoRequest| info.south_korea_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "turkeyAdditionalInfo",
+        country_code: "TR",
+        submitted: |info: &AdditionalInfoRequest| info.turkey_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "georgiaAdditionalInfo",
+        country_code: "GE",
+        submitted: |info: &AdditionalInfoRequest| info.georgia_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "italyAdditionalInfo",
+        country_code: "IT",
+        submitted: |info: &AdditionalInfoRequest| info.italy_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "romaniaAdditionalInfo",
+        country_code: "RO",
+        submitted: |info: &AdditionalInfoRequest| info.romania_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "ukraineAdditionalInfo",
+        country_code: "UA",
+        submitted: |info: &AdditionalInfoRequest| info.ukraine_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "polandAdditionalInfo",
+        country_code: "PL",
+        submitted: |info: &AdditionalInfoRequest| info.poland_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "saudiArabiaAdditionalInfo",
+        country_code: "SA",
+        submitted: |info: &AdditionalInfoRequest| info.saudi_arabia_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "indonesiaAdditionalInfo",
+        country_code: "ID",
+        submitted: |info: &AdditionalInfoRequest| info.indonesia_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "vietnamAdditionalInfo",
+        country_code: "VN",
+        submitted: |info: &AdditionalInfoRequest| info.vietnam_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "egyptAdditionalInfo",
+        country_code: "EG",
+        submitted: |info: &AdditionalInfoRequest| info.egypt_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "greeceAdditionalInfo",
+        country_code: "GR",
+        submitted: |info: &AdditionalInfoRequest| info.greece_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "uzbekistanAdditionalInfo",
+        country_code: "UZ",
+        submitted: |info: &AdditionalInfoRequest| info.uzbekistan_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "philippinesAdditionalInfo",
+        country_code: "PH",
+        submitted: |info: &AdditionalInfoRequest| info.philippines_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "belgiumAdditionalInfo",
+        country_code: "BE",
+        submitted: |info: &AdditionalInfoRequest| info.belgium_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "chileAdditionalInfo",
+        country_code: "CL",
+        submitted: |info: &AdditionalInfoRequest| info.chile_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "franceAdditionalInfo",
+        country_code: "FR",
+        submitted: |info: &AdditionalInfoRequest| info.france_additional_info.is_some(),
+    },
+    AdditionalInfoBlock {
+        member: "monacoAdditionalInfo",
+        country_code: "MC",
+        submitted: |info: &AdditionalInfoRequest| info.monaco_additional_info.is_some(),
+    },
+];
+
+/// The country blocks `info` carries, in the order [`ADDITIONAL_INFO_BLOCKS`]
+/// declares them.
+pub fn submitted_additional_info_blocks(
+    info: &AdditionalInfoRequest,
+) -> Vec<&'static AdditionalInfoBlock> {
+    ADDITIONAL_INFO_BLOCKS
+        .iter()
+        .filter(|block| (block.submitted)(info))
+        .collect()
+}
+
+/// Refuse an `additionalTaxInformation` object that is not exactly ONE country
+/// block, for the jurisdiction the entry itself identifies.
+///
+/// The shape states this about the object rather than about any one country —
+/// "You can only specify one of the following parameters and the value can't be
+/// empty", and "The parameter that you specify must match the country for the
+/// TRN"
+/// (`smithy_query(query="shape",shape="com.amazonaws.taxsettings#AdditionalInfoRequest")`)
+/// — so it is checked here rather than as a row of [`COUNTRY_RULES`], whose rows
+/// each say something about their own country alone and therefore cannot see a
+/// block belonging to another one.
+///
+/// Every one of the three ways an object can break the rule — no block, more than
+/// one block, a block of another jurisdiction — is a value the shape does not
+/// admit rather than a member the caller left out, hence
+/// [`ERROR_CODE_FIELD_VALIDATION_FAILED`] and [`ADDITIONAL_INFO_INVALID`], the
+/// refusal every other rule about this object carries. The parameter named is the
+/// object itself where the fault is HOW MANY blocks it carries, and the offending
+/// block where the fault is which country that block belongs to.
+///
+/// An entry whose jurisdiction nothing states ([`entry_country_code`]) is already
+/// refused for the address its country would have come from, so only the count is
+/// judged for it.
+pub fn check_additional_info_blocks(
+    entry: &TaxRegistrationEntry,
+) -> Result<(), ValidationException> {
+    let Some(info) = entry.additional_tax_information.as_ref() else {
+        return Ok(());
+    };
+    let submitted = submitted_additional_info_blocks(info);
+    let [block] = submitted.as_slice() else {
+        return Err(validation(
+            ERROR_CODE_FIELD_VALIDATION_FAILED,
+            "additionalTaxInformation",
+            ADDITIONAL_INFO_INVALID,
+        ));
+    };
+    let Some(country_code) = entry_country_code(entry) else {
+        return Ok(());
+    };
+    if block.country_code.eq_ignore_ascii_case(country_code) {
+        return Ok(());
+    }
+    Err(validation(
+        ERROR_CODE_FIELD_VALIDATION_FAILED,
+        &format!("additionalTaxInformation.{}", block.member),
+        ADDITIONAL_INFO_INVALID,
+    ))
+}
+
 /// Refuse an entry that does not satisfy the per-country business rules
 /// `PutTaxRegistration` documents for the country of its legal address.
 ///
@@ -2744,9 +2957,10 @@ pub fn check_country_requirements(
 /// address submitted for a type AWS derives it from, a registration type set for
 /// a jurisdiction it does not belong to, a legal name or address the
 /// entry's own jurisdiction requires and it omits, a blank value the boundary
-/// validator's regex engine could not refuse) and then the per-country business
-/// rules [`COUNTRY_RULES`] carries. Why each is not left to the boundary
-/// validator is spelled out on the helpers this calls and in
+/// validator's regex engine could not refuse, an `additionalTaxInformation`
+/// object that is not one country block for the entry's own jurisdiction) and
+/// then the per-country business rules [`COUNTRY_RULES`] carries. Why each is not
+/// left to the boundary validator is spelled out on the helpers this calls and in
 /// `ops/put_tax_registration.rs`.
 ///
 /// Everything judged here is a fact about the ENTRY alone. The refusals that
@@ -2817,6 +3031,12 @@ pub fn check_tax_registration_entry(
     if let Some(legal_address) = entry.legal_address.as_ref() {
         check_address("taxRegistrationEntry.legalAddress", legal_address)?;
     }
+
+    // The `additionalTaxInformation` object's OWN rule — one country block, and
+    // the one belonging to this entry's jurisdiction — which the shape states for
+    // every country rather than for any one of them, so it is judged before the
+    // per-country set whose rows each speak only for their own country.
+    check_additional_info_blocks(entry)?;
 
     // The per-country business rules the model documents for a
     // `TaxRegistrationEntry`, keyed off the jurisdiction it identifies. They run

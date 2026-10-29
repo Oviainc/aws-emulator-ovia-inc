@@ -70,6 +70,15 @@
 //! * a write that would take the resident store past
 //!   [`crate::state::MAX_STORED_REGISTRATIONS`] is refused with the modelled
 //!   `ConflictException`; see that constant for why the store is bounded.
+//! * an `additionalTaxInformation` object that is not exactly ONE country block
+//!   for the entry's own jurisdiction is refused. The shape states this about
+//!   itself rather than about any country — "You can only specify one of the
+//!   following parameters and the value can't be empty", and "The parameter that
+//!   you specify must match the country for the TRN" — so no block, several
+//!   blocks, or a block belonging to another jurisdiction is a field violation;
+//!   the blocks the shape declares and the country each belongs to are
+//!   `crate::state::ADDITIONAL_INFO_BLOCKS`, applied by
+//!   [`crate::state::check_additional_info_blocks`].
 //! * the `additionalTaxInformation` and the other members the entry's country
 //!   requires, which are the per-country business rules
 //!   [`crate::state::COUNTRY_RULES`] carries and

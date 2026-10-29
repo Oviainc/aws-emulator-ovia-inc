@@ -15,6 +15,8 @@
 mod accepted_registration_verifies;
 #[path = "all/account_meta_data.rs"]
 mod account_meta_data;
+#[path = "all/additional_info_blocks.rs"]
+mod additional_info_blocks;
 #[path = "all/address_country_requirements.rs"]
 mod address_country_requirements;
 #[path = "all/batch_get_tax_exemptions_failed_accounts.rs"]
