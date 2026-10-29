@@ -556,10 +556,10 @@ pub const PROVISIONING_STATUS_LATEST_NOT_PROVISIONED: &str =
 /// The provisioning status a provisioned copy of a permission set is in: the revision that
 /// copy was provisioned at, against the permission set's revision now.
 ///
-/// The ONE place that comparison is made, so the two projections of the same rows —
-/// [`ComAmazonawsSsoadminSwbexternalserviceState::provisioned_accounts`] and
-/// [`ComAmazonawsSsoadminSwbexternalserviceState::provisioned_permission_sets`] — cannot
-/// drift apart about which copy is up to date.
+/// The ONE place that comparison is made, called from the ONE pass over the records that
+/// decides which copy an account holds
+/// ([`ComAmazonawsSsoadminSwbexternalserviceState::provisioned_copies_held`]), so the two
+/// projections of that pass cannot drift apart about which copy is up to date.
 fn provisioning_status_of(provisioned_revision: &str, current_revision: &str) -> &'static str {
     if provisioned_revision == current_revision {
         PROVISIONING_STATUS_LATEST_PROVISIONED
@@ -2560,6 +2560,23 @@ pub struct ProvisionedCopyRecord {
     pub revision: String,
 }
 
+/// One COPY of a permission set an account holds, as the single pass over the records
+/// yields it: which permission set, in which account, and the provisioning status that
+/// copy is in.
+///
+/// Borrows the ARNs and the account id from the records themselves, because the pass is a
+/// read over state the caller already holds; a projection clones only the key its own
+/// answer is keyed by.
+#[derive(Debug, Clone, Copy)]
+struct HeldCopy<'a> {
+    /// The permission set the copy is a copy OF.
+    permission_set_arn: &'a str,
+    /// The account that holds it.
+    account_id: &'a str,
+    /// The status that copy is in ([`provisioning_status_of`]).
+    status: &'static str,
+}
+
 /// Per-service state for com-amazonaws-ssoadmin-swbexternalservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSsoadminSwbexternalserviceState {
@@ -3471,129 +3488,110 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// Every account the permission set `permission_set_arn` names is PROVISIONED into,
     /// with the provisioning status each of them is in, keyed by account id.
     ///
-    /// An account holds a permission set once it has been provisioned there — which both
-    /// granting an account assignment on that account and provisioning the permission set
-    /// into it do — however many principals were assigned through it, so an account
-    /// appears at most once. The copy in place is the one the LAST provisioning put there,
-    /// so a provisioning that followed a change to the permission set brings the account
-    /// back up to date.
-    ///
-    /// Both ways a copy reaches an account are read here: the copies a provisioning
-    /// delivered to the accounts it targeted ([`Self::provisioned_copies`]) and the
-    /// revision each assignment granted on an account recorded
-    /// ([`AccountAssignmentRecord::provisioned_revision`]), which a provisioning of that
-    /// account refreshes too — so an assigned account's row carries the later of the two
-    /// and is the one that counts.
-    ///
-    /// The status is COMPUTED, by comparing the revision the copy carries against the
-    /// permission set's revision now: equal means the account holds the latest definition
-    /// ([`PROVISIONING_STATUS_LATEST_PROVISIONED`]), and anything else means the
-    /// permission set has changed since
-    /// ([`PROVISIONING_STATUS_LATEST_NOT_PROVISIONED`]). A permission set no instance
-    /// holds under `instance_arn` is provisioned nowhere, so the answer is empty.
+    /// ONE projection of the relation [`Self::provisioned_copies_held`] expresses — the
+    /// accounts axis — so an account appears at most once, whatever reached a copy to it
+    /// and however many principals were assigned through it, and the copy reported is the
+    /// one the LAST provisioning put there. A permission set no instance holds under
+    /// `instance_arn` is provisioned nowhere, so the answer is empty.
     pub fn provisioned_accounts(
         &self,
         instance_arn: &str,
         permission_set_arn: &str,
     ) -> BTreeMap<String, &'static str> {
-        let Some(permission_set) = self.permission_set(instance_arn, permission_set_arn) else {
-            return BTreeMap::new();
-        };
-        let revision = permission_set.definition_revision();
-        let mut provisioned: BTreeMap<String, &'static str> = BTreeMap::new();
-        for copy in &self.provisioned_copies {
-            if copy.instance_arn != instance_arn || copy.permission_set_arn != permission_set_arn {
-                continue;
-            }
-            let status = provisioning_status_of(&copy.revision, &revision);
-            provisioned.insert(copy.account_id.clone(), status);
-        }
-        for row in &self.account_assignments {
-            if row.instance_arn != instance_arn || row.permission_set_arn != permission_set_arn {
-                continue;
-            }
-            let status = provisioning_status_of(&row.provisioned_revision, &revision);
-            // Later rows were provisioned later, so the copy in place is the last one's.
-            provisioned.insert(row.account_id.clone(), status);
-        }
-        provisioned
+        self.provisioned_copies_held(instance_arn)
+            .into_iter()
+            .filter(|held| held.permission_set_arn == permission_set_arn)
+            .map(|held| (held.account_id.to_string(), held.status))
+            .collect()
     }
 
     /// Every permission set PROVISIONED into the account `account_id` names under
     /// `instance_arn`, with the provisioning status each of them is in, keyed by the
     /// permission set's ARN.
     ///
-    /// The MIRROR of [`Self::provisioned_accounts`], over the same records and with the
-    /// same rule: an account holds a permission set once that permission set has been
-    /// provisioned there — which both granting an account assignment on the account and
-    /// provisioning the permission set into it do — however many principals were assigned
-    /// through it, so a permission set appears at most once. The copy in place is the one
-    /// the LAST provisioning put there.
-    ///
-    /// The status is COMPUTED the same way, against the revision of EACH permission set as
-    /// it stands now: equal to the revision the provisioning recorded means the account
-    /// holds that permission set's latest definition
-    /// ([`PROVISIONING_STATUS_LATEST_PROVISIONED`]), and anything else means the permission
-    /// set has changed since ([`PROVISIONING_STATUS_LATEST_NOT_PROVISIONED`]). A row whose
-    /// permission set this instance no longer holds is provisioned nowhere, so it is left
-    /// out.
+    /// The OTHER projection of the relation [`Self::provisioned_copies_held`] expresses,
+    /// by the axis this caller asked for: the same records, in the same order, under the
+    /// same rule and with the status computed in the same one place, so the two readers
+    /// cannot disagree about a copy. A row whose permission set this instance no longer
+    /// holds is provisioned nowhere, so it is left out.
     pub fn provisioned_permission_sets(
         &self,
         instance_arn: &str,
         account_id: &str,
     ) -> BTreeMap<String, &'static str> {
-        let mut provisioned: BTreeMap<String, &'static str> = BTreeMap::new();
-        // Each permission set's current revision, derived at most once however many rows
-        // provisioned it into the account.
-        let mut revisions: BTreeMap<&str, String> = BTreeMap::new();
-        for copy in &self.provisioned_copies {
-            if copy.instance_arn != instance_arn || copy.account_id != account_id {
-                continue;
-            }
-            if !revisions.contains_key(copy.permission_set_arn.as_str()) {
-                // A copy of a permission set this instance no longer holds is a copy of
-                // nothing, so it is left out.
-                let Some(permission_set) =
-                    self.permission_set(instance_arn, &copy.permission_set_arn)
-                else {
-                    continue;
-                };
-                revisions.insert(
+        self.provisioned_copies_held(instance_arn)
+            .into_iter()
+            .filter(|held| held.account_id == account_id)
+            .map(|held| (held.permission_set_arn.to_string(), held.status))
+            .collect()
+    }
+
+    /// The ONE expression of "which copy of a permission set an account holds" under
+    /// `instance_arn`: every (permission set, account) pair a provisioning has put a copy
+    /// into, with the status that copy is in, yielded in the order the records put it
+    /// there.
+    ///
+    /// An account holds a permission set once it has been provisioned there — which both
+    /// granting an account assignment on that account and provisioning the permission set
+    /// into it do — however many principals were assigned through it. Both ways a copy
+    /// reaches an account are walked here, the copies a provisioning delivered to the
+    /// accounts it targeted ([`Self::provisioned_copies`]) before the revision each
+    /// assignment granted on an account recorded
+    /// ([`AccountAssignmentRecord::provisioned_revision`]), so a pair reached both ways
+    /// is yielded LAST as its assignment row, which is the later of the two and the copy
+    /// in place. A projection collecting by one axis therefore keeps the last yield for a
+    /// pair, and a provisioning that followed a change to the permission set brings the
+    /// account back up to date.
+    ///
+    /// The status is COMPUTED, in the one place that comparison is made
+    /// ([`provisioning_status_of`]), against the revision of each permission set as it
+    /// stands now: equal means the account holds the latest definition
+    /// ([`PROVISIONING_STATUS_LATEST_PROVISIONED`]), and anything else means the
+    /// permission set has changed since
+    /// ([`PROVISIONING_STATUS_LATEST_NOT_PROVISIONED`]). A copy of a permission set this
+    /// instance no longer holds is a copy of nothing, so it is left out — which is what
+    /// makes both projections empty for a permission set, or an account, the instance
+    /// holds nothing for.
+    fn provisioned_copies_held(&self, instance_arn: &str) -> Vec<HeldCopy<'_>> {
+        let copies = self
+            .provisioned_copies
+            .iter()
+            .filter(|copy| copy.instance_arn == instance_arn)
+            .map(|copy| {
+                (
                     copy.permission_set_arn.as_str(),
-                    permission_set.definition_revision(),
-                );
-            }
-            let Some(revision) = revisions.get(copy.permission_set_arn.as_str()) else {
-                continue;
-            };
-            let status = provisioning_status_of(&copy.revision, revision);
-            provisioned.insert(copy.permission_set_arn.clone(), status);
-        }
-        for row in &self.account_assignments {
-            if row.instance_arn != instance_arn || row.account_id != account_id {
-                continue;
-            }
-            if !revisions.contains_key(row.permission_set_arn.as_str()) {
-                // A row whose permission set this instance no longer holds is provisioned
-                // nowhere, so it is left out.
-                let Some(permission_set) =
-                    self.permission_set(instance_arn, &row.permission_set_arn)
-                else {
-                    continue;
-                };
-                revisions.insert(
+                    copy.account_id.as_str(),
+                    copy.revision.as_str(),
+                )
+            });
+        let rows = self
+            .account_assignments
+            .iter()
+            .filter(|row| row.instance_arn == instance_arn)
+            .map(|row| {
+                (
                     row.permission_set_arn.as_str(),
-                    permission_set.definition_revision(),
-                );
-            }
-            let Some(revision) = revisions.get(row.permission_set_arn.as_str()) else {
-                continue;
-            };
-            let status = provisioning_status_of(&row.provisioned_revision, revision);
-            // Later rows were provisioned later, so the copy in place is the last one's.
-            provisioned.insert(row.permission_set_arn.clone(), status);
-        }
-        provisioned
+                    row.account_id.as_str(),
+                    row.provisioned_revision.as_str(),
+                )
+            });
+        // Each permission set's current revision, derived at most once however many
+        // records provisioned it, and absent for one this instance no longer holds.
+        let mut revisions: BTreeMap<&str, Option<String>> = BTreeMap::new();
+        copies
+            .chain(rows)
+            .filter_map(|(permission_set_arn, account_id, recorded_revision)| {
+                let current = revisions.entry(permission_set_arn).or_insert_with(|| {
+                    self.permission_set(instance_arn, permission_set_arn)
+                        .map(|permission_set| permission_set.definition_revision())
+                });
+                Some(HeldCopy {
+                    permission_set_arn,
+                    account_id,
+                    status: provisioning_status_of(recorded_revision, current.as_deref()?),
+                })
+            })
+            .collect()
     }
 
     /// The status record of the assignment operation `request_id` names, WITHIN
