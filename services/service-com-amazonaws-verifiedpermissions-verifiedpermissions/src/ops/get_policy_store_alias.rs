@@ -12,8 +12,11 @@
 //! ## Input
 //!
 //! * `aliasName` (Alias, len 0..150, pattern ^[a-zA-Z0-9-/_]*$) **required** — the
-//!   alias name, prefixed with `policy-store-alias/`
-//!   ([`crate::state::ALIAS_PREFIX`]).
+//!   alias name, which "must always be prefixed with `policy-store-alias/`"
+//!   ([`crate::state::ALIAS_PREFIX`]). A value without that prefix is refused as
+//!   a malformed member, exactly as the writers of the same member refuse it
+//!   ([`crate::ops::invalid_alias_name`]), rather than being looked up as a name
+//!   no alias could ever carry.
 //!
 //! ## Output
 //!
@@ -22,6 +25,8 @@
 //!
 //! ## Errors
 //!
+//! * `ValidationException` (HTTP 400) — the name does not carry the documented
+//!   prefix, so it is not a well-formed alias name.
 //! * `ResourceNotFoundException` (HTTP 404) — no alias of that name exists.
 
 #[allow(unused_imports)]
@@ -34,12 +39,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-verifiedpermissions-ver
 /// through `extra_errors`.
 #[smithy_macros::operation_error(
     "com.amazonaws.verifiedpermissions#GetPolicyStoreAlias",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum GetPolicyStoreAliasErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -88,6 +94,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The member's own documented prefix is a request-SHAPE rule, so it is
+        // answered before state is consulted: an unprefixed name is not a name
+        // this service could hold, and reporting it as an absent alias would say
+        // the alias was deleted rather than that the name is malformed.
+        if let Some(invalid) = crate::ops::invalid_alias_name(&input.alias_name) {
+            return Err(GetPolicyStoreAliasErrorModeled::ValidationException(invalid).into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetPolicyStoreAliasErrorModeled::InternalServerException(InternalServerException {
                 message: "the service state store is unavailable".to_string(),

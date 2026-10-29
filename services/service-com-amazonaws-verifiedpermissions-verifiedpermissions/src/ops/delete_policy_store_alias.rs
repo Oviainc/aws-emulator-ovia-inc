@@ -25,7 +25,12 @@
 //!
 //! ## Input
 //!
-//! * `aliasName` (Alias, len 0..150, pattern ^[a-zA-Z0-9-/_]*$) **required**.
+//! * `aliasName` (Alias, len 0..150, pattern ^[a-zA-Z0-9-/_]*$) **required** — the
+//!   alias name, which "must always be prefixed with `policy-store-alias/`"
+//!   ([`crate::state::ALIAS_PREFIX`]). A value without that prefix is refused as
+//!   a malformed member ([`crate::ops::invalid_alias_name`]): the documented
+//!   idempotent success is for a name that is well formed and names nothing, not
+//!   for one no alias could carry.
 //! * `deletionMode` (DeletionMode, one of: SoftDelete | HardDelete) — absent
 //!   means `SoftDelete`.
 //!
@@ -35,6 +40,8 @@
 //!
 //! ## Errors
 //!
+//! * `ValidationException` (HTTP 400) — the name does not carry the documented
+//!   prefix, so it is not a well-formed alias name.
 //! * `InvalidStateException` (HTTP 406) is modeled, and this handler answers it
 //!   for no request: the model documents it as the deletion-protection refusal,
 //!   which is a property of a policy store (`DeletePolicyStore` answers it), and
@@ -50,12 +57,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-verifiedpermissions-ver
 /// through `extra_errors`.
 #[smithy_macros::operation_error(
     "com.amazonaws.verifiedpermissions#DeletePolicyStoreAlias",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum DeletePolicyStoreAliasErrorModeled {
     InvalidStateException(InvalidStateException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -104,6 +112,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The member's own documented prefix is a request-SHAPE rule, so it is
+        // answered before state is consulted — and before the documented
+        // idempotent success, which is about an alias that is absent, not about a
+        // name that could never be one.
+        if let Some(invalid) = crate::ops::invalid_alias_name(&input.alias_name) {
+            return Err(DeletePolicyStoreAliasErrorModeled::ValidationException(invalid).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeletePolicyStoreAliasErrorModeled::InternalServerException(
                 InternalServerException {

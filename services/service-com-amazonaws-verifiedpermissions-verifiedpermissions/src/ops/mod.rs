@@ -127,6 +127,31 @@ pub fn schema_validation_exception(
     )
 }
 
+/// The modelled `ValidationException` for an `aliasName` member whose value does
+/// not carry the prefix every policy store alias name has — `None` when it does,
+/// so a caller reads it as `if let Some(invalid) = …`.
+///
+/// The prefix is a rule the member's `pattern` cannot express — it admits any
+/// `[a-zA-Z0-9-/_]*` — and it is documented on the member itself, for every
+/// operation that takes one, so every one of them refuses an unprefixed value
+/// here instead of letting it reach [`crate::state`], whose alias table is keyed
+/// by the FULL name and could only ever report such a value as a resource that
+/// does not exist. Keeping the check in one place keeps the status, the error
+/// code and the `fieldList` entry naming [`paths::ALIAS_NAME`] identical
+/// whichever operation read the member.
+pub fn invalid_alias_name(alias_name: &str) -> Option<types::ValidationException> {
+    if alias_name.starts_with(crate::state::ALIAS_PREFIX) {
+        return None;
+    }
+    Some(validation_exception([InvalidInput::new(
+        paths::ALIAS_NAME,
+        format!(
+            "it must be prefixed with {}",
+            crate::state::ALIAS_PREFIX
+        ),
+    )]))
+}
+
 /// The JSON-pointer path of every request member this service's own input checks
 /// can refuse — ONE home for the paths rule (b) names, so a member is spelled the
 /// same way wherever it is refused from. Each is the member's location in the
@@ -161,7 +186,9 @@ pub mod paths {
     /// The pagination cursor a `@paginated` list operation of this service takes
     /// (`ListPolicies`, `ListIdentitySources`, `ListPolicyStoreAliases`).
     pub const NEXT_TOKEN: &str = "/nextToken";
-    /// `CreatePolicyStoreAlias`' alias name.
+    /// The `aliasName` every policy-store-alias operation takes
+    /// (`CreatePolicyStoreAlias`, `GetPolicyStoreAlias`,
+    /// `DeletePolicyStoreAlias`).
     pub const ALIAS_NAME: &str = "/aliasName";
     /// `CreateIdentitySource`/`UpdateIdentitySource`'s principal entity type.
     pub const PRINCIPAL_ENTITY_TYPE: &str = "/principalEntityType";

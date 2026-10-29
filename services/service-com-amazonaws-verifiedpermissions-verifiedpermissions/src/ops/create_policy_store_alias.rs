@@ -161,18 +161,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The documented prefix is a rule the model's `pattern` cannot express —
         // it admits any `[a-zA-Z0-9-/_]*` — and a name without it could never be
         // referenced through a `policyStoreId` member, so the request is refused
-        // rather than persisted as unreachable.
-        if !input.alias_name.starts_with(crate::state::ALIAS_PREFIX) {
-            return Err(CreatePolicyStoreAliasErrorModeled::ValidationException(
-                crate::ops::validation_exception([crate::ops::InvalidInput::new(
-                    crate::ops::paths::ALIAS_NAME,
-                    format!(
-                        "it must be prefixed with {}",
-                        crate::state::ALIAS_PREFIX
-                    ),
-                )]),
-            )
-            .into());
+        // rather than persisted as unreachable. The check is the one every
+        // operation taking this member shares.
+        if let Some(invalid) = crate::ops::invalid_alias_name(&input.alias_name) {
+            return Err(CreatePolicyStoreAliasErrorModeled::ValidationException(invalid).into());
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;

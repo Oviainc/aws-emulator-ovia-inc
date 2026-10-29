@@ -217,10 +217,14 @@ async fn an_alias_arn_names_the_region_the_request_was_signed_for() {
 ///
 /// The rows differ along the IDENTIFIER MEMBER and the FORM the reference takes:
 /// a `policyStoreId` as a bare store id and as `policy-store-alias/<name>`, an
-/// `aliasName` with and without its documented prefix, and a `policyId` as a bare
+/// `aliasName` carrying its documented prefix, and a `policyId` as a bare
 /// id and as `name/<policyName>` — across every implemented operation that takes
 /// one. The alias rows also cover a reference whose alias EXISTS but is
 /// `PendingDeletion`, which the model says must fail as not-found.
+///
+/// An `aliasName` WITHOUT that prefix is not a row here: it names no resource to
+/// report as missing, so it is refused as a malformed member instead — see
+/// `tests/all/alias_name_prefix.rs`.
 #[tokio::test]
 async fn a_not_found_error_names_the_referenced_resource_and_its_bare_id() {
     let router = router();
@@ -382,13 +386,6 @@ async fn a_not_found_error_names_the_referenced_resource_and_its_bare_id() {
             json!({ "aliasName": format!("{ALIAS_PREFIX}eu/prod/photos") }),
             "POLICY_STORE_ALIAS",
             "eu/prod/photos".to_string(),
-        ),
-        (
-            "GetPolicyStoreAlias, name without the prefix",
-            "GetPolicyStoreAlias",
-            json!({ "aliasName": "bare-name" }),
-            "POLICY_STORE_ALIAS",
-            "bare-name".to_string(),
         ),
         // A `policyId` names a policy either way; a `name/` reference drops it.
         (
