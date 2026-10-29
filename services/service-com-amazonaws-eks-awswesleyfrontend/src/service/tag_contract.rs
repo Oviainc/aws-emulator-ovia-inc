@@ -28,18 +28,28 @@
 //!   `aws_smithy_schema_server::constraints::validate` and the same generated input
 //!   schema the dispatch sequence runs, so this layer cannot disagree with the walk
 //!   that would otherwise follow it;
-//! * the ones that walk deliberately does not reach: a map KEY is "not a constrained
-//!   leaf" to it and a scalar map value or list element carries the COLLECTION
-//!   member's traits, so the per-entry bounds of `TagKey` (1..128) and `TagValue`
-//!   (0..256) go unchecked (`vendor/smithy-schema-server/src/constraints.rs`). They
-//!   are checked here, against the same bounds the model declares.
+//! * the ones that walk cannot word correctly, and the one it does not reach at all:
+//!   a map KEY is not captured by it, so the `TagKey` bound (1..128) goes unchecked,
+//!   and a map VALUE it does check it words as one more constrained leaf
+//!   (`vendor/smithy-schema-server/src/constraints.rs`). Both halves are checked
+//!   here, against the same bounds the model declares — `TagKey` (1..128) and
+//!   `TagValue` (0..256) — so the two legs read alike.
 //!
-//! The entry-count ceiling is the one refusal this service states in its own
-//! sentence rather than the generic constraint report
-//! ([`crate::state::tag_ceiling_message`]): the limit is its only variable part, and
-//! it echoes nothing the request carried. Every other refusal keeps the constraint
-//! report the framework already words, which names the member and the bound it
-//! broke, so a caller reads the same clause here as everywhere else.
+//! Three wordings answer those refusals, and which one a refusal earns follows
+//! WHAT was broken:
+//!
+//! * the entry-count ceiling of the tag map is stated in this service's own tagging
+//!   sentence ([`crate::state::tag_ceiling_message`]): the limit is its only variable
+//!   part, and it echoes nothing the request carried;
+//! * a per-entry bound of the tag map being ADDED — a key against `TagKey`, a value
+//!   against `TagValue` — is stated in the tagging front end's map-constraint
+//!   wording ([`added_tags_refusal`]), which the recorded service answers: the
+//!   validation envelope carried as a JSON DOCUMENT in the message, the offending
+//!   ENTRY rendered `{key=value}`, the front end's own member name for the tags being
+//!   added, and the broken bound stated as a map constraint carrying BOTH the
+//!   modelled maximum and minimum;
+//! * every other refusal keeps the constraint report the framework already words,
+//!   which names the member and the bound it broke.
 
 use std::collections::HashMap;
 
@@ -80,7 +90,18 @@ const MAX_TAG_KEY_LENGTH: i64 = 128;
 /// `@length {min: 0, max: 256}` (`smithy_query(query="shape",shape="TagValue",…)`).
 /// The low bound is zero — an empty value is a tag with no descriptor, which the
 /// model allows — so only the high bound can be broken.
+const MIN_TAG_VALUE_LENGTH: i64 = 0;
+/// See [`MIN_TAG_VALUE_LENGTH`].
 const MAX_TAG_VALUE_LENGTH: i64 = 256;
+
+/// The member name the tagging front end reports a `TagResource` request's tag map
+/// under.
+///
+/// It is the front end's own name for the tags being ADDED, not the input member
+/// `tags` the model declares — a per-entry refusal of this map names this member, and
+/// a client that reads the member out of the refusal reads this name. RECORDED
+/// BEHAVIOUR of the tagging front end; the model names no path for it.
+const ADDED_TAGS_MEMBER: &str = "addedTags";
 
 /// How much of a caller-supplied key or value one clause echoes.
 ///
@@ -89,14 +110,19 @@ const MAX_TAG_VALUE_LENGTH: i64 = 256;
 /// The framework bounds its own echo the same way and at the same length.
 const MAX_ECHOED_VALUE: usize = 256;
 
-/// `value` as a clause may echo it: elided at [`MAX_ECHOED_VALUE`] characters, on a
-/// character boundary, with the elision marked.
-fn echoed(value: &str) -> String {
-    if value.chars().count() <= MAX_ECHOED_VALUE {
+/// `value` elided at `limit` characters, on a character boundary, with the elision
+/// marked.
+fn elided(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
         return value.to_string();
     }
-    let kept: String = value.chars().take(MAX_ECHOED_VALUE).collect();
+    let kept: String = value.chars().take(limit).collect();
     format!("{kept}…")
+}
+
+/// `value` as a clause may echo it: elided at [`MAX_ECHOED_VALUE`] characters.
+fn echoed(value: &str) -> String {
+    elided(value, MAX_ECHOED_VALUE)
 }
 
 /// One refused tag request: what it broke, and how this service states it.
@@ -191,24 +217,136 @@ fn tag_count_ceiling(violations: &[Violation]) -> Option<usize> {
     })
 }
 
+/// Which bound of the modelled `@length` a caller-supplied string broke, or `None`
+/// when it broke neither.
+///
+/// `@length` on a string counts CHARACTERS, not bytes ("Maximum key length – 128
+/// Unicode characters in UTF-8", `TagMap`), which is also how the framework's own
+/// walk counts them. The ONE place this comparison lives, so the per-element and the
+/// per-entry checks cannot judge the same string differently.
+fn broken_bound(shown: &str, min: i64, max: i64) -> Option<ViolationKind> {
+    let length = i64::try_from(shown.chars().count()).unwrap_or(i64::MAX);
+    if length < min {
+        Some(ViolationKind::MinLength(min))
+    } else if length > max {
+        Some(ViolationKind::MaxLength(max))
+    } else {
+        None
+    }
+}
+
 /// The clause a caller-supplied string earns when its character count falls outside
 /// the modelled `@length` of the shape it is bound to, or `None` when it is inside.
-///
-/// `@length` on a string counts CHARACTERS, not bytes, which is also how the
-/// framework's own walk counts them.
 fn length_clause(member_path: String, shown: &str, min: i64, max: i64) -> Option<Violation> {
-    let length = i64::try_from(shown.chars().count()).unwrap_or(i64::MAX);
-    let kind = if length < min {
-        ViolationKind::MinLength(min)
-    } else if length > max {
-        ViolationKind::MaxLength(max)
-    } else {
-        return None;
-    };
+    let kind = broken_bound(shown, min, max)?;
     Some(Violation {
         path: member_path,
         kind,
         value: Some(echoed(shown)),
+    })
+}
+
+/// Which half of a map entry a clause is about.
+///
+/// The two halves are bound to DIFFERENT shapes — a key to `TagKey`, a value to
+/// `TagValue` — so each carries its own modelled bounds, and the map-constraint
+/// wording names the half it is about. Both travel with the half rather than with
+/// each call site, so the bounds a clause states cannot drift from the shape it
+/// checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryHalf {
+    /// The key an entry is filed under, bound to `TagKey`.
+    Key,
+    /// The value an entry holds, bound to `TagValue`.
+    Value,
+}
+
+impl EntryHalf {
+    /// The modelled `@length` of the shape this half is bound to, as (min, max).
+    const fn bounds(self) -> (i64, i64) {
+        match self {
+            Self::Key => (MIN_TAG_KEY_LENGTH, MAX_TAG_KEY_LENGTH),
+            Self::Value => (MIN_TAG_VALUE_LENGTH, MAX_TAG_VALUE_LENGTH),
+        }
+    }
+
+    /// How much of this half a rendered entry carries: TWICE the maximum its shape
+    /// allows.
+    ///
+    /// A clause shows the caller the entry that was refused, so a half that overran
+    /// its bound has to be readable as sent — a limit AT the bound would elide every
+    /// refused value there is. Twice it is model-derived rather than chosen, and it
+    /// bounds the document by the MODEL instead of by how much the caller sent, which
+    /// is what keeps one request from being amplified into an arbitrarily long
+    /// response.
+    fn echo_limit(self) -> usize {
+        let (_, max) = self.bounds();
+        usize::try_from(max.saturating_mul(2)).unwrap_or(usize::MAX)
+    }
+
+    /// How a map-constraint clause names this half.
+    const fn subject(self) -> &'static str {
+        match self {
+            Self::Key => "Map keys",
+            Self::Value => "Map value",
+        }
+    }
+}
+
+/// One clause the tagging front end states about one entry of the tag map.
+///
+/// The structured [`Violation`] and the sentence travel together because they answer
+/// different questions: the violation is the model-level fact that decides the STATUS
+/// and the envelope, and the clause is what the caller reads.
+#[derive(Debug)]
+struct EntryClause {
+    violation: Violation,
+    clause: String,
+}
+
+/// One half of an entry as the refusal DOCUMENT carries it: elided at that half's
+/// own [`EntryHalf::echo_limit`], with the two characters a JSON string cannot hold
+/// raw escaped so the document a caller parses stays well formed whatever the request
+/// put in the map, and with the quote this document escapes everywhere escaped too.
+fn in_document(value: &str, half: EntryHalf) -> String {
+    elided(value, half.echo_limit())
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\'', "\\'")
+}
+
+/// The clause one entry earns when `half` falls outside the modelled `@length` of the
+/// shape that half is bound to, or `None` when it is inside.
+///
+/// The clause states the whole offending ENTRY and BOTH modelled bounds, whichever of
+/// the two was broken — that pair is fixed text in this wording, and only the entry and
+/// the bounds vary.
+fn entry_clause(key: &str, value: &str, half: EntryHalf) -> Option<EntryClause> {
+    let (min, max) = half.bounds();
+    let shown = match half {
+        EntryHalf::Key => key,
+        EntryHalf::Value => value,
+    };
+    let kind = broken_bound(shown, min, max)?;
+    let entry = format!(
+        "{{{}={}}}",
+        in_document(key, EntryHalf::Key),
+        in_document(value, EntryHalf::Value)
+    );
+    let subject = half.subject();
+    let clause = format!(
+        "Value \\'{entry}\\' at \\'{ADDED_TAGS_MEMBER}\\' failed to satisfy constraint: \
+         {subject} must satisfy constraint: \
+         [Member must have length less than or equal to {max}, \
+         Member must have length greater than or equal to {min}]"
+    );
+    Some(EntryClause {
+        violation: Violation {
+            path: path::member(TAGS_MEMBER),
+            kind,
+            value: Some(echoed(shown)),
+        },
+        clause,
     })
 }
 
@@ -217,29 +355,50 @@ fn length_clause(member_path: String, shown: &str, min: i64, max: i64) -> Option
 ///
 /// The keys are walked in sorted order so one request always earns the same clauses
 /// in the same order, whatever order the map happens to iterate in.
-fn tag_map_clauses(tags: &HashMap<String, String>) -> Vec<Violation> {
+fn tag_map_clauses(tags: &HashMap<String, String>) -> Vec<EntryClause> {
     let mut keys: Vec<&String> = tags.keys().collect();
     keys.sort();
     let mut clauses = Vec::new();
     for key in keys {
-        clauses.extend(length_clause(
-            path::member(TAGS_MEMBER),
-            key,
-            MIN_TAG_KEY_LENGTH,
-            MAX_TAG_KEY_LENGTH,
-        ));
-        if let Some(value) = tags.get(key) {
-            // A map VALUE reports under the entry's own key, which is the segment
-            // the framework's walk names it with.
-            clauses.extend(length_clause(
-                path::join(&[path::member(TAGS_MEMBER), key.to_string()]),
-                value,
-                0,
-                MAX_TAG_VALUE_LENGTH,
-            ));
-        }
+        let Some(value) = tags.get(key) else { continue };
+        clauses.extend(entry_clause(key, value, EntryHalf::Key));
+        clauses.extend(entry_clause(key, value, EntryHalf::Value));
     }
     clauses
+}
+
+/// The validation envelope as the tagging front end CARRIES it: a JSON document in
+/// the message, with every quote inside it escaped.
+///
+/// The count prefix is the envelope's own
+/// (`aws_smithy_schema_server::constraints::envelope`), restated here because that
+/// renderer words each clause in the scalar-member form and this wording states a map
+/// constraint instead — the prefix is all the two share.
+fn validation_document(clauses: &[String]) -> Option<String> {
+    let detected = match clauses.len() {
+        0 => return None,
+        1 => format!("1 validation error detected: {}", clauses[0]),
+        n => format!("{n} validation errors detected: {}", clauses.join("; ")),
+    };
+    Some(format!("{{\"message\": \"{detected}\"}}"))
+}
+
+/// How this service refuses a tag map whose entries break the per-entry bounds the
+/// model declares, or `None` when none of them do.
+fn added_tags_refusal(tags: &HashMap<String, String>) -> Option<TagRefusal> {
+    let clauses = tag_map_clauses(tags);
+    let sentences: Vec<String> = clauses
+        .iter()
+        .map(|clause| clause.clause.clone())
+        .collect();
+    let message = validation_document(&sentences)?;
+    Some(TagRefusal {
+        violations: clauses
+            .into_iter()
+            .map(|clause| clause.violation)
+            .collect(),
+        message,
+    })
 }
 
 /// Every per-element bound a list of tag keys breaks: each element against `TagKey`.
@@ -287,8 +446,19 @@ pub fn refusal_for(
                     Read::Refused(refusal) => return Some(refusal),
                     Read::Unreadable => return None,
                 };
-            declared(&input, TAG_RESOURCE_INPUT_SCHEMA)
-                .or_else(|| reported_refusal(tag_map_clauses(&input.tags)))
+            // The walk over the whole input runs FIRST, as it does for the other
+            // operation: it is the only thing that can reach the tag map's
+            // entry-count ceiling, which outranks a per-entry bound.
+            let walked = validate(&input, TAG_RESOURCE_INPUT_SCHEMA);
+            if tag_count_ceiling(&walked).is_some() {
+                return declared_refusal(walked);
+            }
+            // A per-entry bound of the map being added is worded by the tagging
+            // front end's map-constraint renderer, not by the walk's scalar-member
+            // clause: the walk sees a map value as one more constrained leaf and
+            // does not see a map key at all. Checking both halves here is what makes
+            // the two legs read alike, and it is the same bound either way.
+            added_tags_refusal(&input.tags).or_else(|| reported_refusal(walked))
         }
         "UntagResource" => {
             let input: UntagResourceInput =
@@ -408,12 +578,40 @@ mod tests {
             for clause in &clauses {
                 assert!(
                     clause
+                        .violation
                         .value
                         .as_deref()
                         .is_some_and(|shown| shown.chars().count() <= MAX_ECHOED_VALUE + 1),
                     "case {case:?}: a clause must not echo an unbounded value, got {clause:?}"
                 );
             }
+        }
+    }
+
+    /// A caller-supplied key or value cannot break the DOCUMENT the refusal carries:
+    /// the two characters a JSON string cannot hold raw are escaped, so what a client
+    /// parses out of the message stays a document.
+    #[test]
+    fn a_quote_in_a_tag_cannot_break_the_document() {
+        // (case, the characters the key ends with, how the entry must render them)
+        let rows: [(&str, &str, &str); 3] = [
+            ("a double quote in the key", "\"", "\\\""),
+            ("a backslash in the key", "\\", "\\\\"),
+            ("both in the key", "\"\\", "\\\"\\\\"),
+        ];
+        for (case, injected, rendered) in rows {
+            // The key is over its bound by the characters injected into it, so the
+            // entry is rendered.
+            let stem = "k".repeat(MAX_TAG_KEY_LENGTH as usize);
+            let mut tags = HashMap::new();
+            tags.insert(format!("{stem}{injected}"), "v".to_string());
+            let refusal = added_tags_refusal(&tags).expect("a refusal");
+            let entry = format!("{{{stem}{rendered}=v}}");
+            assert!(
+                refusal.message.contains(&entry),
+                "case {case:?}: expected the escaped entry {entry:?}, got {:?}",
+                refusal.message
+            );
         }
     }
 

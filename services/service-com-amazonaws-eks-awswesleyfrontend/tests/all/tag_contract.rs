@@ -33,7 +33,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::cluster_lifecycle::{create, minimal_request, REGION};
 use crate::wire::{call, emulator, encode_label, error_code, Answer};
 
-type Tags = BTreeMap<String, String>;
+pub(crate) type Tags = BTreeMap<String, String>;
 
 /// The published character bounds of one tag key and one tag value:
 /// `TagKey` is `@length {min: 1, max: 128}` and `TagValue` is
@@ -67,7 +67,7 @@ async fn tag(router: &MultiServiceRouter, arn: &str, body: &serde_json::Value) -
     .await
 }
 
-async fn tag_map(router: &MultiServiceRouter, arn: &str, map: &Tags) -> Answer {
+pub(crate) async fn tag_map(router: &MultiServiceRouter, arn: &str, map: &Tags) -> Answer {
     tag(router, arn, &serde_json::json!({ "tags": map })).await
 }
 
@@ -97,7 +97,7 @@ async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Answer {
 }
 
 /// A cluster to tag, and its ARN.
-async fn taggable(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn taggable(router: &MultiServiceRouter, name: &str) -> String {
     let created = create(router, &minimal_request(name)).await;
     assert_eq!(
         created.status, 200,
@@ -111,7 +111,7 @@ async fn taggable(router: &MultiServiceRouter, name: &str) -> String {
 
 /// The tag map a resource currently carries, read back through
 /// `ListTagsForResource`.
-async fn stored(router: &MultiServiceRouter, arn: &str) -> serde_json::Value {
+pub(crate) async fn stored(router: &MultiServiceRouter, arn: &str) -> serde_json::Value {
     let listed = list_tags(router, arn).await;
     assert_eq!(
         listed.status, 200,
@@ -346,9 +346,13 @@ async fn the_key_and_value_bounds_are_refused_as_a_bad_request() {
             BAD_REQUEST,
             "case {case:?}: expected {BAD_REQUEST}, got {answer:?}"
         );
+        // The WORDING of a per-entry refusal is the tagging front end's
+        // map-constraint document, pinned entry by entry in
+        // `tests/all/tag_map_constraint_message.rs`; here it only has to be that
+        // document, naming the member the front end reports the added tags under.
         let message = answer.body["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains("validation error") && message.contains("tags"),
+            message.contains("validation error") && message.contains("addedTags"),
             "case {case:?}: expected a constraint report naming the member, got {message:?}"
         );
         assert_eq!(

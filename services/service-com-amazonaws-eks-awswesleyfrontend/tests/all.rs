@@ -101,6 +101,8 @@ mod pod_identity_associations;
 mod state_roundtrip;
 #[path = "all/tag_contract.rs"]
 mod tag_contract;
+#[path = "all/tag_map_constraint_message.rs"]
+mod tag_map_constraint_message;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
 #[path = "all/update_listing.rs"]
