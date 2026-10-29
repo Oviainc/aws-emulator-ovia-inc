@@ -6,8 +6,8 @@
 //! `.deviceadvisor.iot.<region>.amazonaws.com`, where the region is the one the request
 //! was signed for, the label is the account's when the request names no device and a
 //! stable per-device one when it names a device, and a device identity whose ARN is not
-//! one for the member carrying it — or that the named authentication method cannot use —
-//! is refused with the modelled `ValidationException`. The host is a function of the
+//! one for the member carrying it is refused with the modelled `ValidationException`. The
+//! host is a function of the
 //! account, the region and the device identity ALONE, so every operation that reports one —
 //! `GetEndpoint` and the suite-run start that reports the host its primary device connects
 //! to — answers the same host for one device.
@@ -601,15 +601,14 @@ async fn a_device_endpoint_is_scoped_to_the_requests_region() {
     }
 }
 
-/// An ARN that is not one for the member carrying it, and an authentication method with no
-/// identity it can use, are refused with the operation's modelled client-input error —
-/// never a 501 and never a host.
+/// An ARN that is not one for the member carrying it is refused with the operation's
+/// modelled client-input error — never a 501 and never a host.
 #[tokio::test]
-async fn a_malformed_or_contradictory_request_is_refused() {
+async fn a_malformed_request_is_refused() {
     let emulator = Emulator::new();
 
     // (case, query) — every ARN here is at least the modelled 20 characters, so what is
-    // under test is the ARN form and the member/method agreement, not the length bound.
+    // under test is the ARN form, not the length bound.
     let rows: Vec<(&str, Vec<(&str, String)>)> = vec![
         (
             "thingArn is not an ARN at all",
@@ -640,17 +639,10 @@ async fn a_malformed_or_contradictory_request_is_refused() {
             vec![("thingArn", "arn:aws:iot:thing/my-thing-name".to_string())],
         ),
         (
-            "SigV4 with no device role",
+            "thingArn is an IAM role ARN, beside an authentication method",
             vec![
-                ("thingArn", thing_arn("sigv4-device")),
+                ("thingArn", role_arn("NotAThing")),
                 ("authenticationMethod", "SignatureVersion4".to_string()),
-            ],
-        ),
-        (
-            "X.509 with only a device role",
-            vec![
-                ("deviceRoleArn", role_arn("X509Role")),
-                ("authenticationMethod", "X509ClientCertificate".to_string()),
             ],
         ),
     ];
@@ -725,5 +717,99 @@ async fn an_authentication_method_alone_still_asks_for_the_account_endpoint() {
             account_level,
             "case {method:?}: a request naming no device must get the account-level endpoint"
         );
+    }
+}
+
+/// `authenticationMethod` is an OPTIONAL member the model couples to no other member, so
+/// adding it to a request that is otherwise answered cannot change the answer: not its
+/// status and not the host. Asserted over every way a request can name its device — none of
+/// the three members, each one alone, each pair and all three — crossed with the method
+/// absent and with each of the two values the model enumerates (source:
+/// `smithy_query(query="operation",operation="GetEndpoint")`, where every identity member
+/// is optional and `authenticationMethod` targets the two-value `AuthenticationMethod`
+/// enum). Every row's three answers must be the one host the identity alone determines.
+#[tokio::test]
+async fn an_optional_authentication_method_never_changes_the_answer() {
+    let emulator = Emulator::new();
+    let region = "us-east-1";
+
+    let thing = thing_arn("independent-device");
+    let certificate = certificate_arn("independent-cert");
+    let role = role_arn("IndependentRole");
+
+    // (case, the identity members the request carries) — the full subset lattice of the
+    // three optional identity members.
+    let identities: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        ("no device", vec![]),
+        ("thing only", vec![("thingArn", thing.as_str())]),
+        (
+            "certificate only",
+            vec![("certificateArn", certificate.as_str())],
+        ),
+        ("device role only", vec![("deviceRoleArn", role.as_str())]),
+        (
+            "thing and certificate",
+            vec![
+                ("thingArn", thing.as_str()),
+                ("certificateArn", certificate.as_str()),
+            ],
+        ),
+        (
+            "thing and device role",
+            vec![
+                ("thingArn", thing.as_str()),
+                ("deviceRoleArn", role.as_str()),
+            ],
+        ),
+        (
+            "certificate and device role",
+            vec![
+                ("certificateArn", certificate.as_str()),
+                ("deviceRoleArn", role.as_str()),
+            ],
+        ),
+        (
+            "every identity member",
+            vec![
+                ("thingArn", thing.as_str()),
+                ("certificateArn", certificate.as_str()),
+                ("deviceRoleArn", role.as_str()),
+            ],
+        ),
+    ];
+
+    for (identity_case, identity) in identities {
+        let baseline = emulator.get_endpoint(&identity, region).await;
+        assert_eq!(
+            baseline.status, 200,
+            "case {identity_case:?}: an identity of optional members alone is answered, got \
+             {} {}",
+            baseline.status, baseline.body
+        );
+        let expected = baseline.string("endpoint");
+        assert_host_shape(identity_case, &expected, region);
+
+        for method in ["SignatureVersion4", "X509ClientCertificate"] {
+            let case = format!("{identity_case} with {method}");
+            let mut query = identity.clone();
+            query.push(("authenticationMethod", method));
+            let answer = emulator.get_endpoint(&query, region).await;
+            assert_eq!(
+                (answer.status, answer.error_code.as_deref()),
+                (200, None),
+                "case {case:?}: adding the optional authenticationMethod must not refuse a \
+                 request the same identity is answered for, got {} {:?} {}",
+                answer.status,
+                answer.error_code,
+                answer.body
+            );
+            assert_eq!(
+                answer.string("endpoint"),
+                expected,
+                "case {case:?}: the host is a function of the identity alone, so it must \
+                 equal the host for case {identity_case:?} ({expected:?}), got {:?}",
+                answer.string("endpoint")
+            );
+        }
     }
 }

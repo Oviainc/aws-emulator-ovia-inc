@@ -108,16 +108,6 @@ impl From<GetEndpointErrorModeled> for GetEndpointError {
     }
 }
 
-/// `AuthenticationMethod$SignatureVersion4`: the device signs its connection with SigV4,
-/// using the role `deviceRoleArn` names. The wire tokens come from the model
-/// (`smithy_query(query="shape",shape="AuthenticationMethod")` -> `X509ClientCertificate`,
-/// `SignatureVersion4`), and a value outside the enum is refused before this handler runs.
-const SIGNATURE_VERSION_4: &str = "SignatureVersion4";
-
-/// `AuthenticationMethod$X509ClientCertificate`: the device presents the client
-/// certificate `certificateArn` names, attached to the thing `thingArn` names.
-const X509_CLIENT_CERTIFICATE: &str = "X509ClientCertificate";
-
 /// Refuse the request with this operation's own modelled client-input error (HTTP 400
 /// `ValidationException`), naming the member and what it must satisfy.
 fn validation(message: String) -> GetEndpointError {
@@ -194,32 +184,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(validation(violation));
         }
 
-        // A device-level endpoint is asked for by naming the device the way the
-        // authentication method identifies it: SigV4 by the role the device assumes, an
-        // X.509 client certificate by the thing or by the certificate itself. A request
-        // that names a method but no identity that method can use is contradictory, so it
-        // is refused rather than answered with some other device's host. A request that
-        // names no device at all asks for the account-level endpoint, whatever
-        // authentication method it carries.
-        if !device.names_no_device() {
-            match input.authentication_method.as_deref() {
-                Some(SIGNATURE_VERSION_4) if device.device_role_arn.is_none() => {
-                    return Err(validation(format!(
-                        "authenticationMethod {SIGNATURE_VERSION_4} identifies the device by \
-                         deviceRoleArn, which this request does not carry"
-                    )));
-                }
-                Some(X509_CLIENT_CERTIFICATE)
-                    if device.thing_arn.is_none() && device.certificate_arn.is_none() =>
-                {
-                    return Err(validation(format!(
-                        "authenticationMethod {X509_CLIENT_CERTIFICATE} identifies the device by \
-                         thingArn or certificateArn, neither of which this request carries"
-                    )));
-                }
-                _ => {}
-            }
-        }
+        // `authenticationMethod` says HOW the device connects, not WHICH device it is: the
+        // model documents it as "the authentication method used during the device
+        // connection" and couples it to none of the three identity members, each of which is
+        // "an optional parameter" on its own. It therefore takes no part in the host this
+        // reports and imposes no requirement on the members the request carries — the only
+        // values validated here are the device ARNs above, whose modelled length bounds and
+        // enum membership the framework already enforced.
 
         // The region the host names is the one the request was signed for, the same region
         // this service scopes a minted ARN to.
