@@ -17,11 +17,15 @@
 //! and they differ along the kind of resource, the members its update takes (one, several,
 //! a nested structure, a numeric one, a reference) and the reader it is read back through.
 //! Each row also makes ONE request that DOES ask for a change, so a row cannot pass by an
-//! updater that never records a transition at all.
+//! updater that never records a transition at all, and the same rows are driven again with
+//! a reconfiguration already outstanding, where writing nothing also means not restarting
+//! the span the clock owes.
 //!
 //! Nothing reaches into `crate::state`: every resource is created, updated and read back
 //! through operations. The harness is the one `global_network_lifecycle` defines, and the
 //! readers are `crate::resource_state_machine`'s.
+
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -34,6 +38,15 @@ use crate::resource_state_machine::{read_back, state_of, Reader, AVAILABLE, UPDA
 
 /// The state a resource reads while the create's own transition is still outstanding.
 const PENDING: &str = "PENDING";
+
+/// Short of the span the clock owes an accepted change, so a request made after waiting
+/// this long reaches a resource that is still reconfiguring.
+const WITHIN_SPAN: Duration = Duration::from_millis(250);
+
+/// Waited from inside that span, this carries the clock past the instant the accepted
+/// change's own transition fell due while staying short of where restarting the span would
+/// have pushed it — so a resource read here says which of the two happened.
+const PAST_ORIGINAL_SPAN: Duration = Duration::from_millis(400);
 
 /// The `Description` every seeded resource of this suite starts with, so a request can
 /// supply the value the record already holds.
@@ -435,6 +448,87 @@ async fn an_update_that_asks_for_no_change_writes_nothing_and_moves_no_state() {
         assert_eq!(
             reread[*member], *expected,
             "case {case:?} / the changing request: expected the written {member} {expected} to survive, got {reread}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_change_free_update_neither_restarts_nor_extends_an_outstanding_transition() {
+    let emulator = Emulator::new();
+    let rows = no_op_cases(&emulator).await;
+
+    // Every create's own transition is past, so the only transition outstanding below is
+    // the one the changing request on each row starts.
+    tokio::time::sleep(PAST_SETTLE).await;
+
+    // One timeline covers every row: each gets its reconfiguration started here, so the
+    // instant the clock owes its transition at is the same distance away for all of them.
+    let mut outstanding = Vec::new();
+    for row in &rows {
+        let case = row.case;
+        let (changing_body, member, expected) = &row.change;
+        let (status, answer) = emulator.patch(&row.uri, changing_body.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the changing request expected 200, got {status} with {answer}"
+        );
+        let resource = answer[row.answer_member].clone();
+        assert_eq!(
+            state_of(case, &resource),
+            UPDATING,
+            "case {case:?}: an accepted change owes the transition out of {UPDATING}, got {resource}"
+        );
+        assert_eq!(
+            resource[*member], *expected,
+            "case {case:?}: expected the changing request to write {member} {expected}, got {resource}"
+        );
+        outstanding.push(resource);
+    }
+
+    // Still inside the span, so the change-free requests below reach a resource that is
+    // reconfiguring. Each row asks for the state it is in NOW: nothing at all, and the
+    // value its own outstanding change wrote.
+    tokio::time::sleep(WITHIN_SPAN).await;
+    for (row, started) in rows.iter().zip(&outstanding) {
+        let case = row.case;
+        let (_, member, expected) = &row.change;
+        let change_free = [
+            ("no mutable member at all".to_string(), json!({})),
+            (
+                format!("the {member} the outstanding change wrote"),
+                json!({ *member: expected.clone() }),
+            ),
+        ];
+        for (label, body) in &change_free {
+            let (status, answer) = emulator.patch(&row.uri, body.clone()).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} / {label:?}: expected 200, got {status} with {answer}"
+            );
+            let resource = &answer[row.answer_member];
+            assert_eq!(
+                *resource, *started,
+                "case {case:?} / {label:?}: expected the record the outstanding change left ({started}), got {resource}"
+            );
+        }
+    }
+
+    // Past the instant the ORIGINAL change's transition fell due, but short of where a
+    // restarted span would have pushed it: a resource still reconfiguring here was moved
+    // by a request that asked for nothing.
+    tokio::time::sleep(PAST_ORIGINAL_SPAN).await;
+    for row in &rows {
+        let case = row.case;
+        let (_, member, expected) = &row.change;
+        let reread = read_back(&emulator, case, &row.id, &row.reader).await;
+        assert_eq!(
+            state_of(case, &reread),
+            AVAILABLE,
+            "case {case:?}: a change-free update must not restart the span the accepted change owed, got {reread}"
+        );
+        assert_eq!(
+            reread[*member], *expected,
+            "case {case:?}: expected the written {member} {expected} to survive, got {reread}"
         );
     }
 }
