@@ -33,7 +33,10 @@ use crate::registry_schema_lifecycle::{
 };
 
 /// The version-scoped URI `DeleteSchemaVersion` is bound to.
-fn version_uri(registry: &str, schema: &str, version: &str) -> String {
+///
+/// Shared with the sibling suite in `schema_version_label_spellings`, so both spell the
+/// route the same way.
+pub(crate) fn version_uri(registry: &str, schema: &str, version: &str) -> String {
     format!("{}/version/{version}", schema_uri(registry, schema))
 }
 
@@ -99,7 +102,14 @@ async fn schema_with_versions(
 
 /// The version numbers `ListSchemaVersions` reports for one schema, read through the
 /// shared harness's reducer.
-async fn stored_versions(emulator: &Emulator, registry: &str, schema: &str) -> BTreeSet<String> {
+///
+/// Shared with the sibling suite in `schema_version_label_spellings`, so no two suites
+/// can disagree about which versions a schema still holds.
+pub(crate) async fn stored_versions(
+    emulator: &Emulator,
+    registry: &str,
+    schema: &str,
+) -> BTreeSet<String> {
     let listed = emulator
         .call("GET", &versions_uri(registry, schema), None)
         .await;

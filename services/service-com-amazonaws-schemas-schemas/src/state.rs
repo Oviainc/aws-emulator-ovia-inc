@@ -1390,8 +1390,9 @@ impl Schema {
     ///
     /// `None` means the request named a version this schema does not hold — including
     /// a value that is not a decimal version number at all, which no stored version
-    /// can match. The raw label is parsed as given: a version number is the whole
-    /// value, so surrounding space is not a version number.
+    /// can match. The raw label is read as given, by [`Schema::version_number`]: only
+    /// a version's own decimal rendering names it, so a spelling that merely parses
+    /// as that number (surrounding space, a sign, zero padding) names nothing.
     pub fn version_for(&self, requested: Option<&str>) -> Option<&SchemaVersion> {
         match requested {
             // The newest version the schema still HOLDS: a deleted version is gone
@@ -1406,10 +1407,23 @@ impl Schema {
     /// The version number a `SchemaVersion` label names, if it names one at all.
     ///
     /// The ONE definition of how a request's version label is read, so every reader
-    /// and the delete resolve it the same way: a version number is the whole decimal
-    /// value, so anything else — surrounding space, a sign, a decimal point, a word —
-    /// names no version.
+    /// and the delete resolve it the same way: a label names a version only when it is
+    /// exactly how this service RENDERS that version — the decimal digits of the
+    /// number and nothing else — so any other spelling (surrounding space, a sign,
+    /// zero padding, a decimal point, a word, a number too large to be a version)
+    /// names no version at all.
     fn version_number(requested: &str) -> Option<u64> {
+        // Screen the spelling before handing the digits to `u64: FromStr`, which on its
+        // own accepts a leading `+` and so would let a signed label name a version.
+        if requested.is_empty() || !requested.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        // Zero padding is the only way an all-digit label can still differ from the
+        // rendering, which is why the rendering itself need not be built to compare.
+        if requested.len() > 1 && requested.starts_with('0') {
+            return None;
+        }
+        // A value wider than the counter is no version the store can ever hold.
         requested.parse::<u64>().ok()
     }
 

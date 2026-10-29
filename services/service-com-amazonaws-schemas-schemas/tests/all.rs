@@ -75,6 +75,8 @@ mod schema_name_collation;
 mod schema_read_resolution;
 #[path = "all/schema_version_deletion.rs"]
 mod schema_version_deletion;
+#[path = "all/schema_version_label_spellings.rs"]
+mod schema_version_label_spellings;
 #[path = "all/search_keyword_index.rs"]
 mod search_keyword_index;
 #[path = "all/search_schemas.rs"]
