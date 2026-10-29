@@ -105,6 +105,8 @@ mod portal_product_sharing_policy;
 mod portal_product_update;
 #[path = "all/portal_publication.rs"]
 mod portal_publication;
+#[path = "all/portal_publication_revocation.rs"]
+mod portal_publication_revocation;
 #[path = "all/portal_update.rs"]
 mod portal_update;
 #[path = "all/probe.rs"]

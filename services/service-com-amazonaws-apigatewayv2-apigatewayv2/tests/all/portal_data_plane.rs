@@ -54,9 +54,10 @@ const REGION: &str = "eu-west-1";
 const LOCAL_ENDPOINT: &str = "127.0.0.1:9297";
 
 /// The status and sentence a domain that serves nothing answers — a portal with no live
-/// publication.
-const FORBIDDEN: u16 = 403;
-const FORBIDDEN_MESSAGE: &str = "Forbidden";
+/// publication. Shared with `portal_publication_revocation`, which asserts the same class
+/// of answer over the publish → revoke flow.
+pub(crate) const FORBIDDEN: u16 = 403;
+pub(crate) const FORBIDDEN_MESSAGE: &str = "Forbidden";
 
 /// The status and sentence for a path the portal serves no page at.
 const NOT_FOUND: u16 = 404;
@@ -78,7 +79,7 @@ fn past_the_build() -> Duration {
 /// One answer from a portal's domain. The harness is the one every data-plane suite of this
 /// crate uses (`websocket_handshake_data_plane::send`), which carries both readings of the
 /// body: the `{"message": …}` envelope a refusal answers in, and the document a page is.
-async fn fetch(emulator: &MultiServiceRouter, host: &str, path: &str) -> Answer {
+pub(crate) async fn fetch(emulator: &MultiServiceRouter, host: &str, path: &str) -> Answer {
     send(emulator, host, "GET", path, &[]).await
 }
 
@@ -172,7 +173,7 @@ impl Build {
 
 /// Assert one answer from a portal's domain is the status and `{"message": …}` body the
 /// class maps to — and is not one of the answers that would mean no data plane decided it.
-fn refused(case: &str, page: &Answer, status: u16, sentence: &str) {
+pub(crate) fn refused(case: &str, page: &Answer, status: u16, sentence: &str) {
     assert_ne!(
         page.error_type.as_deref(),
         Some(UNKNOWN_SERVICE),
@@ -194,7 +195,7 @@ fn refused(case: &str, page: &Answer, status: u16, sentence: &str) {
 }
 
 /// Assert one answer is the portal's own page.
-fn served(case: &str, page: &Answer, portal_id: &str) {
+pub(crate) fn served(case: &str, page: &Answer, portal_id: &str) {
     assert_eq!(
         page.status,
         200,

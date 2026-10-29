@@ -4,15 +4,21 @@
 //! IMPLEMENTED: starts the SERVER-managed take-down of a persisted
 //! [`crate::state::Portal`]'s publication and answers 204 with no body. The portal
 //! reports [`crate::state::PUBLISH_STATUS_DISABLE_IN_PROGRESS`] until the build this
-//! call started comes due and [`crate::state::PUBLISH_STATUS_DISABLED`] after it, from
-//! when it serves nothing. This is the ONLY file to touch for this operation.
+//! call started comes due and [`crate::state::PUBLISH_STATUS_DISABLED`] after it. This
+//! is the ONLY file to touch for this operation.
+//!
+//! PUBLIC ACCESS, though, is revoked when this call is ACCEPTED, not when that status
+//! settles: the portal's domain stops serving the build it was serving from this instant
+//! (`crate::state::Portal::live_site`), so a caller that disables a portal and probes it
+//! straight away is not served the site it just revoked. The `PublishStatus` meanwhile
+//! reports what the service has left to do, not that the site is still up.
 //!
 //! A disable takes a publication down rather than making one, so the portal keeps what
 //! it reports for `LastPublished` and `LastPublishedDescription`: those name the last
-//! publication there WAS. A disable changes what the portal publishes, so it is refused
-//! 409 `ConflictException` while another change to the publication — a publish or
-//! another disable — is still in flight; it builds no content of its own, so a preview
-//! being built does not hold it up (see [`crate::state::Portal::start_build`]).
+//! publication there WAS. It needs nothing of the portal to be free — revoking what the
+//! portal serves supersedes a publish the service is still building (which then
+//! publishes nothing) rather than queueing behind it, and a preview being built does not
+//! hold it up (see [`crate::state::Portal::start_build`]).
 //!
 //! ## Shape of an operation
 //!
@@ -187,10 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Taking the publication down is the SERVICE's work: this call only starts it,
-        // which is why the operation answers 204 with no body. Access is revoked when
-        // the portal settles in `DISABLED`, a span from now, and until then the portal
-        // reports `DISABLE_IN_PROGRESS`.
+        // Taking the publication down is the SERVICE's work, which is why the operation
+        // answers 204 with no body and the portal reports `DISABLE_IN_PROGRESS` until
+        // that work comes due. What the portal's domain SERVES does not wait for it: the
+        // revocation applies from this instant (`Portal::live_site`).
         let now = ::std::time::SystemTime::now();
         if let Err(in_flight) = record.start_build(now, crate::state::PortalBuild::Disable) {
             return Err(DisablePortalErrorModeled::ConflictException(ConflictException {

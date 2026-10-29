@@ -2699,6 +2699,10 @@ pub const PUBLISH_STATUS_PUBLISH_IN_PROGRESS: &str = "PUBLISH_IN_PROGRESS";
 /// down is still being removed, out of `PUBLISH_STATUS_VALUES`. Not a terminal value:
 /// the portal leaves it for [`PUBLISH_STATUS_DISABLED`] once [`PORTAL_BUILD`] has
 /// passed.
+///
+/// It reports the service's remaining work, NOT whether public access is still granted:
+/// the take-down revokes what the portal's domain serves the moment `DisablePortal` is
+/// accepted (see [`PortalTransition::revokes_publication`] and [`Portal::live_site`]).
 pub const PUBLISH_STATUS_DISABLE_IN_PROGRESS: &str = "DISABLE_IN_PROGRESS";
 
 /// The `PreviewStatus` a portal's preview reports while it is still being built, out of
@@ -2744,6 +2748,23 @@ pub struct PortalTransition {
     /// not. Decided by [`PortalBuild::builds_content`] and carried here so
     /// [`Portal::content_build_in_flight`] can answer it off the build in flight.
     pub builds_content: bool,
+}
+
+impl PortalTransition {
+    /// Whether this build TAKES a publication down rather than making one, which is what
+    /// a disable does: it makes no publication, so there is none to report when it
+    /// settles.
+    ///
+    /// What the portal's domain serves turns on this from the instant the build starts
+    /// rather than from the instant it settles ([`Portal::live_site`]): a take-down is a
+    /// revocation of PUBLIC ACCESS, and access the service has been told to revoke is not
+    /// still granted while the service finishes tearing the publication down. The
+    /// `PublishStatus` the portal reports meanwhile
+    /// ([`PUBLISH_STATUS_DISABLE_IN_PROGRESS`]) says what the service has left to do, not
+    /// that the site is still up.
+    pub fn revokes_publication(&self) -> bool {
+        self.published.is_none()
+    }
 }
 
 /// What a settled publish reports as the portal's last publication.
@@ -2992,6 +3013,11 @@ impl Portal {
                 });
             }
             PortalBuild::Disable => {
+                // The take-down the service then carries out: the portal reports
+                // `DISABLE_IN_PROGRESS` until it comes due. What the portal's domain
+                // SERVES does not wait for that — see
+                // [`PortalTransition::revokes_publication`] — and a publish this disable
+                // superseded publishes nothing, because this transition replaces it.
                 self.transition = Some(PortalTransition {
                     in_progress: PUBLISH_STATUS_DISABLE_IN_PROGRESS,
                     settled: PUBLISH_STATUS_DISABLED,
@@ -3064,13 +3090,24 @@ impl Portal {
     /// due is live here while the stored record is left for the next writer to settle. Only
     /// the publication is cloned — the answer itself — so one visit costs the bytes it
     /// serves rather than a copy of the whole record.
+    ///
+    /// The two builds that can be in flight are READ DIFFERENTLY, because one grants access
+    /// and the other revokes it. A publish still being built has put nothing live yet, so
+    /// what is served is whatever the last settled build left. A take-down is a revocation
+    /// of public access, and access the service has been told to revoke is not still granted
+    /// while the service finishes removing the publication: the domain stops serving from
+    /// the instant `DisablePortal` is accepted, and the `PublishStatus` the portal reports
+    /// until that build comes due says what the service has left to do rather than that the
+    /// site is still up. So a caller that revokes a portal and probes it straight away
+    /// cannot be served the build it just revoked.
     pub fn live_site(&self, now: SystemTime) -> Option<PublishedSite> {
         match self.transition.as_ref() {
-            // A build still in flight changes nothing yet: what is live is whatever the
-            // last settled build left live.
+            // A revocation, in flight or already due: nothing is served either way.
+            Some(transition) if transition.revokes_publication() => None,
+            // A build still in flight that makes a publication changes nothing yet: what
+            // is live is whatever the last settled build left live.
             Some(transition) if now < transition.due_at => self.published_site.clone(),
-            // A build the clock has made due: the site that build made, and nothing at all
-            // for a build that publishes nothing (a disable).
+            // A build the clock has made due: the site that build made.
             Some(transition) => transition
                 .published
                 .as_ref()

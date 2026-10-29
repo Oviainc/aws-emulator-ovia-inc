@@ -35,8 +35,10 @@
 //!    held when it was called and that build goes live when the publish settles, so a
 //!    portal nothing has published yet serves nothing, a write to the portal's content
 //!    changes nothing that is already live, and a `DisablePortal` takes the live build
-//!    down. A domain serving nothing is `403` `{"message":"Forbidden"}` — the answer this
-//!    service's other data planes give for an endpoint that serves nothing;
+//!    down from the instant it is ACCEPTED — a revocation of public access does not wait
+//!    for its `PublishStatus` to settle, so the site cannot be served to a caller who has
+//!    already revoked it. A domain serving nothing is `403` `{"message":"Forbidden"}` — the
+//!    answer this service's other data planes give for an endpoint that serves nothing;
 //! 3. the live build is rendered as the portal's page ([`site_page`]): its `PortalContent`
 //!    — display name, description and the theme's own colours — over the portal products
 //!    the build included, each with the product pages and product REST endpoint pages that

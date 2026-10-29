@@ -15,9 +15,13 @@
 //!   instant it published as `LastPublished` and the description the publish request
 //!   carried as `LastPublishedDescription` ("When the portal is published, this
 //!   description becomes the last published description"), and a republish replaces it.
-//! * **A disable takes the publication down but not its history**: the portal settles in
+//! * **A disable takes the publication down but not its history**: the portal reports
+//!   `DISABLE_IN_PROGRESS` while the service removes the publication and settles in
 //!   `DISABLED`, from where it serves nothing, and still reports the last publication
-//!   there WAS.
+//!   there WAS — a publish the disable superseded publishes nothing when its own span
+//!   passes. (That the portal's DOMAIN stops serving from the instant the disable is
+//!   accepted, rather than when that status settles, is asserted in
+//!   `portal_publication_revocation`.)
 //! * **A preview changes nothing about what the portal publishes**: its `PublishStatus`
 //!   is left exactly as it was, and the portal reports a `Preview` whose status moves
 //!   from `PREVIEW_IN_PROGRESS` to `PREVIEW_READY` and whose URL names this portal.
@@ -34,9 +38,10 @@
 //!
 //! The rows vary what the rules generalise over: WHICH of the three builds runs first
 //! and which runs second (every ordered pair of them), the publication state the portal
-//! is in when a build starts (never published, published, disabled), and the description
-//! a publish carries (none, the empty string, a typical one, the maximum 1024 characters
-//! the modelled `__stringMin0Max1024` allows, and one replacing an earlier one).
+//! is in when a build starts (never published, published, a publish still in flight,
+//! disabled), how many times a disable is called, and the description a publish carries
+//! (none, the empty string, a typical one, the maximum 1024 characters the modelled
+//! `__stringMin0Max1024` allows, and one replacing an earlier one).
 
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -393,10 +398,18 @@ async fn publish_portal_is_server_managed_and_settles_in_published() {
     }
 }
 
-/// One disable row: whether the portal was published before it was disabled.
+/// One disable row: what the portal's publication was doing when the disable arrived,
+/// and how many times the disable was called.
 struct DisableRow {
     case: &'static str,
+    /// The description of a publish SETTLED before the disable, if any.
     published_description: Option<&'static str>,
+    /// Whether a further publish is started, and left in flight, when the disable
+    /// arrives: that publish is superseded and publishes nothing.
+    publish_in_flight: bool,
+    /// How many times the disable is called: a publication already taken down is taken
+    /// down again just the same.
+    disables: usize,
 }
 
 #[tokio::test]
@@ -407,10 +420,32 @@ async fn disable_portal_takes_the_publication_down_and_keeps_its_history() {
         DisableRow {
             case: "a published portal is taken back down",
             published_description: Some("the version being taken down"),
+            publish_in_flight: false,
+            disables: 1,
         },
         DisableRow {
             case: "a portal nothing ever published is disabled too",
             published_description: Option::None,
+            publish_in_flight: false,
+            disables: 1,
+        },
+        DisableRow {
+            case: "a disable arriving while the first publish is still being built",
+            published_description: Option::None,
+            publish_in_flight: true,
+            disables: 1,
+        },
+        DisableRow {
+            case: "a disable arriving while a republish is still being built",
+            published_description: Some("the version being taken down"),
+            publish_in_flight: true,
+            disables: 1,
+        },
+        DisableRow {
+            case: "a publication taken down twice",
+            published_description: Some("the version being taken down"),
+            publish_in_flight: false,
+            disables: 2,
         },
     ] {
         let case = row.case;
@@ -427,16 +462,36 @@ async fn disable_portal_takes_the_publication_down_and_keeps_its_history() {
             .await;
             sleep(past_the_build());
         }
+        if row.publish_in_flight {
+            accepted(
+                &emulator,
+                case,
+                Build::Publish,
+                &portal_id,
+                Some(json!({ "description": "superseded by the disable" })),
+            )
+            .await;
+        }
 
-        accepted(&emulator, case, Build::Disable, &portal_id, Option::None).await;
+        for call_number in 1..=row.disables {
+            accepted(&emulator, case, Build::Disable, &portal_id, Option::None).await;
 
-        let building = get_portal(&emulator, case, &portal_id).await;
-        assert_eq!(
-            publish_status(case, &building),
-            PUBLISH_STATUS_DISABLE_IN_PROGRESS,
-            "case {case:?}: expected the started disable to be in progress, got {building}"
-        );
+            // Removing the publication is the SERVICE's work, so the portal reports it
+            // in progress until the build this call started comes due. (That the
+            // portal's DOMAIN stops serving from the instant the disable is accepted,
+            // rather than when this status settles, is asserted in
+            // `portal_publication_revocation`.)
+            let building = get_portal(&emulator, case, &portal_id).await;
+            assert_eq!(
+                publish_status(case, &building),
+                PUBLISH_STATUS_DISABLE_IN_PROGRESS,
+                "case {case:?}: expected disable {call_number} to be in progress, got \
+                 {building}"
+            );
+        }
 
+        // The transition is owed by the CLOCK, and once it has passed nothing has put
+        // the publication back: a publish this disable superseded publishes nothing.
         sleep(past_the_build());
         let settled = get_portal(&emulator, case, &portal_id).await;
         assert_eq!(
@@ -446,7 +501,8 @@ async fn disable_portal_takes_the_publication_down_and_keeps_its_history() {
              {PUBLISH_STATUS_DISABLED}, got {settled}"
         );
 
-        // A disable removes the publication, not the record of the last one there was.
+        // A disable removes the publication, not the record of the last one there was —
+        // and a publish it superseded made none, so it adds nothing to that record.
         match row.published_description {
             Some(description) => {
                 assert_eq!(
@@ -639,7 +695,8 @@ async fn a_portal_refuses_only_a_build_that_needs_what_another_is_already_doing(
             }
 
             // Whatever ran, the CLOCK settles it: nothing is left in an
-            // `..._IN_PROGRESS` status once the span has passed.
+            // `..._IN_PROGRESS` status once the span has passed, and the portal's
+            // publication is in one of its terminal values.
             sleep(past_the_build());
             let settled = get_portal(&emulator, case, &portal_id).await;
             for build in [first, second] {
@@ -650,6 +707,12 @@ async fn a_portal_refuses_only_a_build_that_needs_what_another_is_already_doing(
                     build.in_progress()
                 );
             }
+            assert!(
+                [PUBLISH_STATUS_PUBLISHED, PUBLISH_STATUS_DISABLED]
+                    .contains(&publish_status(case, &settled).as_str()),
+                "case {case:?}: expected a terminal PublishStatus once every span has \
+                 passed, got {settled}"
+            );
         }
     }
 }

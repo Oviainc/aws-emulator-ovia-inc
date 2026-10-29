@@ -42,3 +42,47 @@ Actual (emulator replay of apigatewayv2.disable-portal-revokes-access-server-sid
 4. DisablePortal(PortalId) and poll GetPortal(PortalId).PublishStatus until it reads DISABLED.
 5. GET the same URL again → expect a non-200, and re-probe on a 10s cadence for 30s → every read must stay non-200.
 Against this emulator the whole sequence does not complete inside the 60s replay budget (behavioral check apigatewayv2.disable-portal-revokes-access-server-side).
+
+## Status note (resolved: the flow is served and pinned end to end; the revocation now applies when it is accepted)
+
+**What the flow does now.** A revocation takes effect when the call asking for it is ACCEPTED: the
+address the portal announced stops serving from the instant `DisablePortal` answers its `204`, and
+keeps refusing (`403` `{"message":"Forbidden"}`) on every later probe — through the take-down's own
+span and past the span of a publish the disable superseded, which publishes nothing. What
+`PublishStatus` reports meanwhile (`DISABLE_IN_PROGRESS` until the take-down comes due) is the work
+the SERVICE has left to do, not whether public access is still granted
+(`services/service-com-amazonaws-apigatewayv2-apigatewayv2/src/state.rs`: `Portal::live_site` and
+`PortalTransition::revokes_publication`; `src/ops/disable_portal.rs`;
+`src/service/portal.rs`). Before this change the domain went on serving the revoked build for the
+whole take-down window, so a caller probing straight after the 204 was served the site it had just
+revoked — the "blip" this report asks not to happen — and the only evidence of the revocation was
+the status member the report says not to trust. A grant is the other way round and unchanged: the
+`202` of `PublishPortal` means the service has only accepted the build, so it goes live when that
+build comes due and until then the domain serves whatever the last settled publish left.
+
+**The check's remaining timeout is its own cadence against the harness cap, not an emulator wait.**
+Nothing in this emulator is waited on: both builds settle in `crate::state::PORTAL_BUILD` (500 ms).
+The check polls `PublishStatus` on a 15 s cadence, and a caller's immediate read-back after each of
+`PublishPortal` and `DisablePortal` reports that build in progress, so each poll costs it one 15 s
+interval; with its mandatory ~30 s "revocation holds" window that is ~60 s against the suite's 60 s
+cap. Those two windows cannot be removed: the recorded units
+`apigatewayv2.disabled-portal-publish-accepted` and `apigatewayv2.disabled-portal-preview-accepted`
+assert `PublishStatus == DISABLE_IN_PROGRESS` on the read immediately after `DisablePortal` ("the
+race window this check probes never opened"), and `apigatewayv2.publish-portal-server-managed-status-transition`,
+`apigatewayv2.portal-publish-server-managed-build` and
+`apigatewayv2.portal-concurrent-publish-preview-conflict` depend on the publish's. An attempt to
+settle the take-down inside the answering call was therefore reverted after the merge gate's
+fidelity-regression reviewer caught the first two of those units failing on it.
+
+**The report's alternative hypothesis — the announced `PortalDefaultDomainName` naming an address
+the client cannot reach — is not the cause.** `state::announced_portal_default_domain_name` already
+announces the emulator's own endpoint for a create addressed there and the generated AWS host
+otherwise, and this report's replay key sits in the check's own 30 s hold window (`run#15`,
+`time.sleep(10)`), past both of its probe polls.
+
+Pinned by `tests/all/portal_publication_revocation.rs`: the whole publish → serve → disable →
+stop-serving flow over six rows (both announced addressings; never published, published, a publish
+still being built, a republish still being built, published twice; one and two disables; one to four
+re-probes), plus a two-row table asserting the grant/revocation asymmetry against the domain and the
+status at the same instant. `tests/all/portal_publication.rs` keeps the status windows and now also
+covers a disable that supersedes a publish and a publication taken down twice.
