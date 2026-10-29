@@ -49,6 +49,8 @@ mod export_preference_gated_columns;
 mod export_recommendation_preferences;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/idle_recommendation_summaries.rs"]
+mod idle_recommendation_summaries;
 #[path = "all/idle_recommendations.rs"]
 mod idle_recommendations;
 #[path = "all/idle_recommendations_export.rs"]

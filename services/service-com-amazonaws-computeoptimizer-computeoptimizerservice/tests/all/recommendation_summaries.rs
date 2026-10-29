@@ -69,6 +69,28 @@ const FINDINGS_BY_RESOURCE_TYPE: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// The `RecommendationSourceType` values this service summarises WITHOUT a `Finding`
+/// vocabulary: the resource kinds Compute Optimizer reports only as idle resources, so a
+/// summary of one counts what was found idle and no rightsizing finding at all.
+///
+/// Source: the model's `IdleRecommendationResourceType` enum
+/// (`crate::ops::types::IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES`) less the resource types
+/// the `GetRecommendationSummaries` documentation above names a finding vocabulary for.
+/// What a summary of one reports is asserted in `tests/all/idle_recommendation_summaries.rs`.
+const IDLE_ONLY_RESOURCE_TYPES: &[&str] = &[
+    "NatGateway",
+    "DynamoDBTable",
+    "ElastiCacheCluster",
+    "MemoryDBCluster",
+    "DocumentDBCluster",
+    "WorkSpaces",
+    "SageMakerEndpoint",
+];
+
+/// The model's `IdleFinding` enum (`crate::ops::types::IDLE_FINDING_VALUES`), the only
+/// values `IdleSummary$name` can carry.
+const IDLE_FINDINGS: &[&str] = &["Idle", "Unattached", "Unused"];
+
 /// The model's `FindingReasonCode` enum (`crate::ops::types::FINDING_REASON_CODE_VALUES`),
 /// the only values `ReasonCodeSummary$name` can carry.
 const FINDING_REASON_CODES: &[&str] = &["MemoryOverprovisioned", "MemoryUnderprovisioned"];
@@ -171,7 +193,10 @@ async fn summaries_need_the_account_to_be_opted_in_and_report_the_caller_account
         assert!(
             FINDINGS_BY_RESOURCE_TYPE
                 .iter()
-                .any(|(resource_type, _)| summary["recommendationResourceType"] == *resource_type),
+                .any(|(resource_type, _)| summary["recommendationResourceType"] == *resource_type)
+                || IDLE_ONLY_RESOURCE_TYPES
+                    .iter()
+                    .any(|resource_type| summary["recommendationResourceType"] == *resource_type),
             "case {case:?}: recommendationResourceType must be a resource type the service \
              summarises, got {summary}"
         );
@@ -223,15 +248,34 @@ async fn every_summary_is_its_resource_type_s_resources_counted_and_costed() {
             .unwrap_or_default()
             .to_string();
         let case = resource_type.clone();
-        let (_, expected_findings) = FINDINGS_BY_RESOURCE_TYPE
+        let expected_findings: &[&str] = FINDINGS_BY_RESOURCE_TYPE
             .iter()
             .find(|(name, _)| *name == resource_type)
-            .unwrap_or_else(|| panic!("case {case:?}: unknown resource type in {summary}"));
+            .map(|(_, findings)| *findings)
+            .unwrap_or_else(|| {
+                // A resource type the service names no `Finding` vocabulary for carries no
+                // rightsizing counts at all; it is summarised because resources of it were
+                // found idle.
+                assert!(
+                    IDLE_ONLY_RESOURCE_TYPES.contains(&resource_type.as_str()),
+                    "case {case:?}: unknown resource type in {summary}"
+                );
+                &[]
+            });
 
-        let finding_summaries = summary["summaries"]
-            .as_array()
-            .unwrap_or_else(|| panic!("case {case:?}: summaries must be a list, got {summary}"))
-            .clone();
+        let finding_summaries = if expected_findings.is_empty() {
+            assert!(
+                summary["summaries"].is_null(),
+                "case {case:?}: the service names no Finding vocabulary for this resource \
+                 type, so it reports no rightsizing counts, got {summary}"
+            );
+            Vec::new()
+        } else {
+            summary["summaries"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: summaries must be a list, got {summary}"))
+                .clone()
+        };
         let reported: Vec<&str> = finding_summaries
             .iter()
             .map(|entry| entry["name"].as_str().unwrap_or_default())
@@ -270,10 +314,12 @@ async fn every_summary_is_its_resource_type_s_resources_counted_and_costed() {
                 }
             }
         }
+        let mut idle_resources = 0.0;
+        let idle_counts = summary["idleSummaries"].as_array().cloned();
         assert!(
-            resources > 0.0,
+            resources > 0.0 || idle_counts.is_some(),
             "case {case:?}: a resource type is summarised only where the account has analysed \
-             resources of it, got {summary}"
+             resources of it or resources of it were found idle, got {summary}"
         );
 
         let ratings = &summary["currentPerformanceRiskRatings"];
@@ -287,27 +333,55 @@ async fn every_summary_is_its_resource_type_s_resources_counted_and_costed() {
              ratings must total the {resources} resources counted by finding, got {ratings}"
         );
 
-        // An idle resource is a record of its own — what `GetIdleRecommendations` reports.
-        // This reader aggregates the findings CATALOG, and summarising that record is its
-        // own work, which the handler's header states it does not do yet, so neither idle
-        // member is reported and the aggregated saving is the rightsizing one.
-        assert!(
-            summary["idleSummaries"].is_null(),
-            "case {case:?}: idleSummaries is reported only where resources were found idle, \
-             got {summary}"
-        );
-        assert!(
-            summary["idleSavingsOpportunity"].is_null(),
-            "case {case:?}: idleSavingsOpportunity is reported only where resources were found \
-             idle, got {summary}"
-        );
+        // An idle resource is a record of its own — the analysis `GetIdleRecommendations`
+        // reports — and a summary describes it beside the rightsizing findings: a count at
+        // each `IdleFinding` where resources of this type were found idle, with what
+        // dropping them saves, and nothing where none was.
+        match idle_counts {
+            Some(idle_counts) => {
+                let names: Vec<&str> = idle_counts
+                    .iter()
+                    .map(|entry| entry["name"].as_str().unwrap_or_default())
+                    .collect();
+                assert_eq!(
+                    names, *IDLE_FINDINGS,
+                    "case {case:?}: expected a count at each IdleFinding {IDLE_FINDINGS:?}, got \
+                     {names:?}"
+                );
+                for entry in &idle_counts {
+                    let finding = entry["name"].as_str().unwrap_or_default().to_string();
+                    let count = number(&entry["value"], &format!("{case}/{finding}"));
+                    assert!(
+                        count >= 0.0 && count.fract() == 0.0,
+                        "case {case:?}/{finding:?}: an idle count is a whole number of \
+                         resources, got {count}"
+                    );
+                    idle_resources += count;
+                }
+                assert!(
+                    idle_resources > 0.0,
+                    "case {case:?}: idleSummaries is reported only where resources were found \
+                     idle, got {summary}"
+                );
+            }
+            None => assert!(
+                summary["idleSavingsOpportunity"].is_null(),
+                "case {case:?}: a resource type none of whose resources were found idle has no \
+                 idle saving to report either, got {summary}"
+            ),
+        }
 
         let rightsizing = savings_value(summary, "savingsOpportunity", &case);
+        let idle = if idle_resources > 0.0 {
+            savings_value(summary, "idleSavingsOpportunity", &case)
+        } else {
+            0.0
+        };
         let aggregated = savings_value(summary, "aggregatedSavingsOpportunity", &case);
-        assert_eq!(
-            aggregated, rightsizing,
-            "case {case:?}: with no idle count reported the aggregated saving is the \
-             rightsizing saving {rightsizing}, got {aggregated}"
+        assert!(
+            (aggregated - (rightsizing + idle)).abs() < 0.01,
+            "case {case:?}: the aggregated saving is the rightsizing saving {rightsizing} plus \
+             the idle one {idle}, got {aggregated}"
         );
 
         if let Some(inferred) = summary["inferredWorkloadSavings"].as_array() {

@@ -2411,6 +2411,25 @@ pub const SOURCE_TYPE_RDS_DB_INSTANCE: &str = "RdsDBInstance";
 /// See [`SOURCE_TYPE_EC2_INSTANCE`].
 pub const SOURCE_TYPE_LICENSE: &str = "License";
 
+/// The `RecommendationSourceType` values this service holds resources of ONLY as idle
+/// resources (`crate::ops::types::RECOMMENDATION_SOURCE_TYPE_VALUES`): a resource kind
+/// Compute Optimizer reports an idle recommendation for and no rightsizing finding, so a
+/// summary of one counts what was found idle and no `Finding` at all
+/// ([`findings_reported_for`]).
+pub const SOURCE_TYPE_NAT_GATEWAY: &str = "NatGateway";
+/// See [`SOURCE_TYPE_NAT_GATEWAY`].
+pub const SOURCE_TYPE_DYNAMODB_TABLE: &str = "DynamoDBTable";
+/// See [`SOURCE_TYPE_NAT_GATEWAY`].
+pub const SOURCE_TYPE_ELASTICACHE_CLUSTER: &str = "ElastiCacheCluster";
+/// See [`SOURCE_TYPE_NAT_GATEWAY`].
+pub const SOURCE_TYPE_MEMORYDB_CLUSTER: &str = "MemoryDBCluster";
+/// See [`SOURCE_TYPE_NAT_GATEWAY`].
+pub const SOURCE_TYPE_DOCUMENTDB_CLUSTER: &str = "DocumentDBCluster";
+/// See [`SOURCE_TYPE_NAT_GATEWAY`].
+pub const SOURCE_TYPE_WORKSPACES: &str = "WorkSpaces";
+/// See [`SOURCE_TYPE_NAT_GATEWAY`].
+pub const SOURCE_TYPE_SAGEMAKER_ENDPOINT: &str = "SageMakerEndpoint";
+
 /// The `Finding` values a summary of `resource_type` reports a count for, from the
 /// `GetRecommendationSummaries` documentation: "It returns the number of: Amazon EC2
 /// instances in an account that are Underprovisioned, Overprovisioned, or Optimized.
@@ -2995,6 +3014,41 @@ pub fn idle_resource_type_of(service: &str, resource_kind: &str) -> Option<&'sta
         "the catalog may only name modelled IdleRecommendationResourceType values"
     );
     Some(resource_type)
+}
+
+/// The `RecommendationSourceType` a resource of `idle_resource_type` is SUMMARISED under,
+/// or `None` for a type outside the idle vocabulary.
+///
+/// A recommendation summary names its group with a `RecommendationSourceType`
+/// (`RecommendationSummary$recommendationResourceType`) while an idle record names its
+/// resource with an `IdleRecommendationResourceType`
+/// (`crate::ops::types::IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES`), and the two enums spell
+/// several of the same resources differently (`EC2Instance` against `Ec2Instance`,
+/// `EBSVolume` against `EbsVolume`, `ECSService` against `EcsService`, `RDSDBInstance`
+/// against `RdsDBInstance`); the rest spell them identically. Stated once here, so the idle
+/// analysis of one resource is summarised under the same group the rightsizing analysis of
+/// that resource is.
+pub fn source_type_of_idle_resource_type(idle_resource_type: &str) -> Option<&'static str> {
+    let source_type = match idle_resource_type {
+        "EC2Instance" => SOURCE_TYPE_EC2_INSTANCE,
+        "EBSVolume" => SOURCE_TYPE_EBS_VOLUME,
+        "ECSService" => SOURCE_TYPE_ECS_SERVICE,
+        "RDSDBInstance" => SOURCE_TYPE_RDS_DB_INSTANCE,
+        "AutoScalingGroup" => SOURCE_TYPE_AUTO_SCALING_GROUP,
+        "NatGateway" => SOURCE_TYPE_NAT_GATEWAY,
+        "DynamoDBTable" => SOURCE_TYPE_DYNAMODB_TABLE,
+        "ElastiCacheCluster" => SOURCE_TYPE_ELASTICACHE_CLUSTER,
+        "MemoryDBCluster" => SOURCE_TYPE_MEMORYDB_CLUSTER,
+        "DocumentDBCluster" => SOURCE_TYPE_DOCUMENTDB_CLUSTER,
+        "WorkSpaces" => SOURCE_TYPE_WORKSPACES,
+        "SageMakerEndpoint" => SOURCE_TYPE_SAGEMAKER_ENDPOINT,
+        _ => return None,
+    };
+    debug_assert!(
+        RECOMMENDATION_SOURCE_TYPE_VALUES.contains(&source_type),
+        "a summary group may only name a modelled RecommendationSourceType value"
+    );
+    Some(source_type)
 }
 
 /// Check an `IdleRecommendationFilters` list against the vocabulary the model declares for
@@ -7350,6 +7404,38 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
                 .entry(resource.resource_type.as_str())
                 .or_default()
                 .push(resource);
+        }
+        grouped
+    }
+
+    /// The idle resource analysis `account_id` owns, grouped by the
+    /// `RecommendationSourceType` a summary of it is reported under
+    /// ([`source_type_of_idle_resource_type`]) and keyed by it, so the summary reader walks
+    /// the idle groups in the SAME order it walks the findings catalog's
+    /// ([`Self::analysed_resources_by_type`]) and the two agree on which group a resource
+    /// belongs to.
+    ///
+    /// The records are the ones a caller can read ([`visible_idle_recommendations`]), so a
+    /// group an account has no analysis for yet is absent rather than summarised, and a
+    /// record of a resource kind the idle vocabulary does not cover is in no group at all.
+    ///
+    /// [`visible_idle_recommendations`]: Self::visible_idle_recommendations
+    pub fn idle_analyses_by_source_type(
+        &self,
+        account_id: &str,
+    ) -> BTreeMap<&'static str, Vec<&IdleResourceAnalysis>> {
+        let mut grouped: BTreeMap<&'static str, Vec<&IdleResourceAnalysis>> = BTreeMap::new();
+        for analysis in self.visible_idle_recommendations() {
+            if analysis.account_id != account_id {
+                continue;
+            }
+            let Some(source_type) = analysis
+                .resource_type()
+                .and_then(source_type_of_idle_resource_type)
+            else {
+                continue;
+            };
+            grouped.entry(source_type).or_default().push(analysis);
         }
         grouped
     }

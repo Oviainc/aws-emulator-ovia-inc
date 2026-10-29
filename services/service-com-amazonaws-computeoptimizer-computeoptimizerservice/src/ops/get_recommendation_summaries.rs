@@ -2,26 +2,20 @@
 
 //! @op GetRecommendationSummaries
 //!
-//! IMPLEMENTED: aggregates the account's FINDINGS CATALOG (`crate::state::AnalysedResource`)
-//! into one summary per `RecommendationSourceType` the account has analysed resources of —
-//! how many of them carry each `Finding` the service reports for that resource type and
-//! why, how many run each `CurrentPerformanceRisk`, and what adopting the recommendations
-//! would save per month — one page at a time: at most `maxResults` summaries plus an
-//! opaque `nextToken` while summaries remain.
+//! IMPLEMENTED: aggregates EVERYTHING the service holds for the account — its FINDINGS
+//! CATALOG (`crate::state::AnalysedResource`) and its IDLE resource analysis
+//! (`crate::state::IdleResourceAnalysis`, what `GetIdleRecommendations` reports) — into one
+//! summary per `RecommendationSourceType` the account has a record of either kind for: how
+//! many of its rightsized resources carry each `Finding` the service reports for that
+//! resource type and why, how many of its resources the analysis found idle at each
+//! `IdleFinding`, how many run each `CurrentPerformanceRisk`, and what adopting the
+//! rightsizing recommendations, the idle ones, and both together would save per month — one
+//! page at a time: at most `maxResults` summaries plus an opaque `nextToken` while summaries
+//! remain.
 //!
 //! Every number is computed from the stored rows, so a count, a saving and a percentage
 //! can never disagree with each other or with the per-resource findings those same rows
 //! describe. This operation only reads: nothing it answers writes to the store.
-//!
-//! `idleSummaries` and `idleSavingsOpportunity` describe a resource the analysis found
-//! IDLE, which is a record of its own (`crate::state::IdleRecommendationStore`, what
-//! `GetIdleRecommendations` reports). Summarising that record is NOT IMPLEMENTED here yet:
-//! this operation aggregates the findings catalog, so the summaries it builds carry neither
-//! member and `aggregatedSavingsOpportunity` aggregates the rightsizing opportunity alone,
-//! even though the service does hold idle resources. Reporting them is this operation's own
-//! work — it has to group the idle record by resource type and account the way it groups the
-//! catalog — and the two members stay absent until then rather than carrying a figure nothing
-//! computed.
 //!
 //! ## Shape of an operation
 //!
@@ -254,15 +248,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut recommendation_summaries: Vec<RecommendationSummary> = Vec::new();
         let mut next_token = None;
-        // The catalog rows a caller can read, grouped by resource type: a caller sees them
-        // only once the analysis its enrollment started is due
+        // The records a caller can read, grouped by resource type: the rightsizing catalog
+        // and the idle analysis. A caller sees either only once the analysis its enrollment
+        // started is due
         // ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::visible_analysed_resources`]),
         // so a just-enrolled account is summarised over no rows rather than over an analysis
         // nothing has produced yet — the same gate the per-resource readers apply.
-        for (resource_type, resources) in guard.analysed_resources_by_type(&account_id) {
-            // A resource type this service names no `Finding` vocabulary for is not
-            // summarised, rather than summarised with an invented one.
-            if crate::state::findings_reported_for(resource_type).is_empty() {
+        let analysed = guard.analysed_resources_by_type(&account_id);
+        let idle = guard.idle_analyses_by_source_type(&account_id);
+        // One summary per resource type the account has a record of EITHER kind for, in one
+        // stable order: a resource type the service holds only idle resources of is
+        // summarised too, because the idle finding is as much a recommendation for it as a
+        // rightsizing finding is for a catalogued one.
+        let resource_types: ::std::collections::BTreeSet<&str> = analysed
+            .keys()
+            .copied()
+            .chain(idle.keys().copied())
+            .collect();
+        for resource_type in resource_types {
+            let resources = analysed
+                .get(resource_type)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let idle_resources = idle
+                .get(resource_type)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            // A resource type this service names no `Finding` vocabulary for and holds no
+            // idle resource of is not summarised, rather than summarised with an invented
+            // vocabulary or over nothing.
+            if crate::state::findings_reported_for(resource_type).is_empty()
+                && idle_resources.is_empty()
+            {
                 continue;
             }
             if resume_at.as_deref().is_some_and(|start| resource_type < start) {
@@ -273,7 +290,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 next_token = Some(crate::state::encode_summary_page_token(resource_type));
                 break;
             }
-            recommendation_summaries.push(summarise(resource_type, &account_id, &resources));
+            recommendation_summaries.push(summarise(
+                resource_type,
+                &account_id,
+                resources,
+                idle_resources,
+            ));
         }
 
         Ok(GetRecommendationSummariesOutput {
@@ -299,13 +321,15 @@ fn invalid_parameter(message: String) -> GetRecommendationSummariesError {
 /// workload types."
 const TOP_INFERRED_WORKLOAD_SAVINGS: usize = 5;
 
-/// One resource type's summary, computed from the account's analysed resources OF THAT
-/// TYPE: nothing here is stored as a summary, so a count, a saving and a percentage are
-/// always the same rows seen three ways.
+/// One resource type's summary, computed from the account's records OF THAT TYPE: the
+/// analysed resources the service rightsizes and the ones it found idle. Nothing here is
+/// stored as a summary, so a count, a saving and a percentage are always the same rows seen
+/// several ways.
 fn summarise(
     resource_type: &str,
     account_id: &str,
     resources: &[&crate::state::AnalysedResource],
+    idle_resources: &[&crate::state::IdleResourceAnalysis],
 ) -> RecommendationSummary {
     let current_monthly_cost: f64 = resources
         .iter()
@@ -315,25 +339,62 @@ fn summarise(
         .iter()
         .map(|resource| resource.monthly_savings())
         .sum();
+    // What the idle resources of this type cost their account per month, and so what
+    // adopting their recommendations would save: the recommendation for a resource nothing
+    // is using is to stop paying for it, so the two are ONE figure, summed from the same
+    // per-row cost the per-resource idle reader reports each one by
+    // ([`crate::state::IdleResourceAnalysis::savings`]) — so this group saves exactly the
+    // whole of what it costs, as each of its rows does.
+    let idle_monthly_cost: f64 = idle_resources
+        .iter()
+        .map(|analysis| analysis.savings().1)
+        .sum();
+    let idle_savings = idle_monthly_cost;
 
+    let finding_summaries = finding_summaries(resource_type, resources);
     let inferred_workload_savings = inferred_workload_savings(resources);
     RecommendationSummary {
-        summaries: Some(finding_summaries(resource_type, resources)),
-        // Summarising the idle record is not implemented here yet: see this module's
-        // header. The members stay absent rather than carrying a figure nothing computed.
-        idle_summaries: None,
+        // A resource type this service names no `Finding` vocabulary for carries no
+        // rightsizing counts at all, rather than an empty list of them.
+        summaries: (!finding_summaries.is_empty()).then_some(finding_summaries),
+        // "Describes the findings summary of the idle resources" — reported for a resource
+        // type the analysis found resources of idle, and absent for one it found none of.
+        idle_summaries: (!idle_resources.is_empty()).then(|| idle_summaries(idle_resources)),
         recommendation_resource_type: Some(resource_type.to_string()),
         account_id: Some(account_id.to_string()),
         savings_opportunity: Some(savings_opportunity(rightsizing_savings, current_monthly_cost)),
-        idle_savings_opportunity: None,
+        idle_savings_opportunity: (!idle_resources.is_empty())
+            .then(|| savings_opportunity(idle_savings, idle_monthly_cost)),
+        // "The savings opportunity for recommendations of a given resource type": every
+        // recommendation the service holds for this resource type, so the rightsizing
+        // opportunity and the idle one together, as a percentage of what all of those
+        // resources cost.
         aggregated_savings_opportunity: Some(savings_opportunity(
-            rightsizing_savings,
-            current_monthly_cost,
+            rightsizing_savings + idle_savings,
+            current_monthly_cost + idle_monthly_cost,
         )),
         current_performance_risk_ratings: Some(performance_risk_ratings(resources)),
         inferred_workload_savings: (!inferred_workload_savings.is_empty())
             .then_some(inferred_workload_savings),
     }
+}
+
+/// How many of the account's resources of this type the analysis found idle at each
+/// `IdleFinding` — "the count of idle resources in the finding group" — including a finding
+/// group none of them is in, whose count is then zero, because a summary states the number
+/// of resources AT each finding rather than only the findings that occurred, the rule
+/// [`finding_summaries`] reports the rightsizing counts by.
+fn idle_summaries(idle_resources: &[&crate::state::IdleResourceAnalysis]) -> Vec<IdleSummary> {
+    IDLE_FINDING_VALUES
+        .iter()
+        .map(|finding| IdleSummary {
+            name: Some((*finding).to_string()),
+            value: idle_resources
+                .iter()
+                .filter(|analysis| analysis.finding == *finding)
+                .count() as f64,
+        })
+        .collect()
 }
 
 /// How many of `resources` carry each `Finding` this resource type's summary reports, in
