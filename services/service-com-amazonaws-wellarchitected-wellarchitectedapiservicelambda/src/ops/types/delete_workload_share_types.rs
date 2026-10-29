@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-wellarchitected-wellarchitectedapiservicelambda.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.wellarchitected#DeleteWorkloadShareInput")]
+// `WorkloadId` is a path label this operation RESOLVES; see the note in
+// `get_workload_types.rs`. `ShareId` and `ClientRequestToken` keep their constraint
+// traits, so the share id's `@pattern` and the token's `@length`/`@pattern` are still
+// refused at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.wellarchitected#DeleteWorkloadShareInput",
+    skip_validation = ["WorkloadId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DeleteWorkloadShareInput {
     pub share_id: String,

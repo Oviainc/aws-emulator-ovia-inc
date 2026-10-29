@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-wellarchitected-wellarchitectedapiservicelambda.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.wellarchitected#DisassociateProfilesInput")]
+// `WorkloadId` is a path label this operation RESOLVES; see the note in
+// `get_workload_types.rs`. `ProfileArns` keeps its constraint traits: an ARN the modelled
+// `ProfileArn` pattern refuses never reaches the lookup, and an empty list is refused at
+// the boundary too.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.wellarchitected#DisassociateProfilesInput",
+    skip_validation = ["WorkloadId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DisassociateProfilesInput {
     pub workload_id: String,

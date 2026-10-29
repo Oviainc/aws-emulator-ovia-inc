@@ -11,7 +11,13 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-wellarchitected-wellarchitectedapiservicelambda.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.wellarchitected#UpdateLensReviewInput")]
+// `WorkloadId` is a path label this operation RESOLVES; see the note in
+// `get_workload_types.rs`. `LensAlias` and the body members keep their constraint traits,
+// so `LensNotes`'s and `PillarNotes`'s `@length` are still refused at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.wellarchitected#UpdateLensReviewInput",
+    skip_validation = ["WorkloadId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct UpdateLensReviewInput {
     pub workload_id: String,

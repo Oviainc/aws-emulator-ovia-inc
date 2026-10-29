@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-wellarchitected-wellarchitectedapiservicelambda.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.wellarchitected#UpdateIntegrationInput")]
+// `WorkloadId` is a path label this operation RESOLVES; see the note in
+// `get_workload_types.rs`. `ClientRequestToken` and `IntegratingService` are request BODY
+// members, so the token's `@length`/`@pattern` and the service enum set are still enforced
+// at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.wellarchitected#UpdateIntegrationInput",
+    skip_validation = ["WorkloadId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct UpdateIntegrationInput {
     pub workload_id: String,

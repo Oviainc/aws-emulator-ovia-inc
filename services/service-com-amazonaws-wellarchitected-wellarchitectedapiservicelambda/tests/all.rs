@@ -431,3 +431,8 @@ mod lens_token_alias_spelling;
 // for a workload suite falls in a crowded run of this list.
 #[path = "all/workload_pillar_order.rs"]
 mod workload_pillar_order;
+
+// Appended at the end of this list for the reason the notes above give: modules are appended
+// here so a new suite does not collide with another insertion.
+#[path = "all/workload_path_id_resolution.rs"]
+mod workload_path_id_resolution;
