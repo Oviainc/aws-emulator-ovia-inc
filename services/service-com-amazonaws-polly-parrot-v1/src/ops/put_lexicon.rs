@@ -21,8 +21,8 @@
 //! makes `LanguageCode` a value every stored lexicon has rather than an optional one.
 //!
 //! The error channel is the model's: a document that is not a PLS lexicon — including
-//! one declaring an `alphabet` Amazon Polly does not support — is
-//! `InvalidLexiconException`, an `xml:lang` naming no language this service's
+//! one declaring, ANYWHERE PLS admits the attribute, an `alphabet` Amazon Polly does
+//! not support — is `InvalidLexiconException`, an `xml:lang` naming no language this service's
 //! `LanguageCode` enum carries is `UnsupportedPlsLanguageException`, and a `<lexeme>`
 //! whose replacement is longer than [`MAX_LEXEME_CHARACTERS`] is
 //! `MaxLexemeLengthExceededException`.
@@ -186,6 +186,10 @@ pub const PLS_VERSION: &str = "1.0";
 /// the Smithy model, which lists them: "Valid values are `ipa`, `x-sampa`,
 /// `x-amazon-pinyin`, `x-amazon-jyutping`, `x-amazon-pron-kana`, and
 /// `x-amazon-yomigana`."
+///
+/// The set belongs to the SERVICE — an alphabet it can read a pronunciation in — not
+/// to one element of a document, so it bounds every `alphabet` declaration a document
+/// carries ([`unsupported_alphabet`]).
 pub const SUPPORTED_PLS_ALPHABETS: &[&str] = &[
     "ipa",
     "x-sampa",
@@ -200,7 +204,8 @@ pub const SUPPORTED_PLS_ALPHABETS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedLexicon {
     /// The `<lexicon alphabet="...">` attribute, absent when the document omits it
-    /// (PLS allows a per-phoneme alphabet instead).
+    /// (PLS allows a per-phoneme alphabet instead, which is checked the same way but
+    /// is a property of that one pronunciation rather than of the lexicon).
     pub alphabet: Option<String>,
     /// The language the `<lexicon xml:lang="...">` attribute names, spelled as the
     /// model's `LanguageCode` catalog spells it rather than as the document did — the
@@ -277,7 +282,8 @@ struct DocumentElement {
 /// whole rather than stored with the corresponding attributes missing.
 ///
 /// `alphabet` is the one attribute PLS leaves optional here, because a `<phoneme>`
-/// may name its own; it is read when present and checked by the caller.
+/// may name its own; it is read when present and checked by the caller, which checks
+/// a `<phoneme>`'s declaration against the same set.
 fn read_document_element(
     element: &quick_xml::events::BytesStart<'_>,
     in_pls_namespace: bool,
@@ -297,7 +303,7 @@ fn read_document_element(
         ));
     }
 
-    let mut alphabet: Option<String> = None;
+    let alphabet = read_declared_alphabet(element)?;
     let mut version: Option<String> = None;
     let mut language_code: Option<String> = None;
     for attribute in element.attributes() {
@@ -305,7 +311,6 @@ fn read_document_element(
         let raw = String::from_utf8_lossy(attribute.value.as_ref()).to_string();
         let value = resolve_character_data(&raw)?;
         match attribute.key.as_ref() {
-            b"alphabet" => alphabet = Some(value),
             b"version" => version = Some(value),
             // PLS and XML define only the prefixed form, so a bare `lang=` is a
             // different attribute and is not read as the language.
@@ -378,6 +383,37 @@ fn check_attribute_values(
     Ok(())
 }
 
+/// The phonetic alphabet one element DECLARES, or `None` when it declares none.
+///
+/// PLS defines the `alphabet` attribute in two places — on the document element, where
+/// it names the alphabet the lexicon's pronunciations are written in, and on a
+/// `<phoneme>`, where it names the alphabet THAT pronunciation is written in — and the
+/// attribute means the same thing in both, so reading it is one operation whatever
+/// element carries it. The value is character data like any other attribute value, so
+/// it is resolved before it is compared with anything.
+fn read_declared_alphabet(
+    element: &quick_xml::events::BytesStart<'_>,
+) -> Result<Option<String>, PlsRejection> {
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|e| PlsRejection::NotALexicon(e.to_string()))?;
+        if attribute.key.as_ref() == b"alphabet" {
+            return Ok(Some(resolve_character_data(&String::from_utf8_lossy(
+                attribute.value.as_ref(),
+            ))?));
+        }
+    }
+    Ok(None)
+}
+
+/// The declared alphabet when it is one Amazon Polly cannot read a pronunciation in.
+///
+/// Which alphabets are usable is a property of the SERVICE
+/// ([`SUPPORTED_PLS_ALPHABETS`]), not of the element the declaration sits on, so this
+/// is the one test every declaration in a document goes through.
+fn unsupported_alphabet(declared: Option<&str>) -> Option<&str> {
+    declared.filter(|alphabet| !SUPPORTED_PLS_ALPHABETS.contains(alphabet))
+}
+
 /// Read a PLS lexicon document.
 ///
 /// The reader is a real, NAMESPACE-AWARE XML parser, so any well-formed PLS document
@@ -401,6 +437,12 @@ fn check_attribute_values(
 /// ([`crate::service::xml::character_data_length`]) or in an attribute value
 /// ([`resolve_character_data`]) — and not only where a replacement is
 /// open to count its characters.
+///
+/// The phonetic alphabet is read the same way wherever PLS admits it: the document
+/// element names the lexicon's and a `<phoneme>` may name its own for one
+/// pronunciation, and either way the value has to be an alphabet this service can read
+/// a pronunciation in ([`SUPPORTED_PLS_ALPHABETS`]), so a document declaring an
+/// alphabet outside that set is refused whichever of the two declares it.
 ///
 /// Each `<lexeme>`'s replacement elements are measured as they
 /// close, so an oversized one is refused without the document being stored; what is
@@ -438,6 +480,12 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
     // is OUTSIDE every element, where XML admits no character data and — once the
     // document element has been seen — no further element either.
     let mut open_elements: usize = 0;
+    // The first alphabet a `<phoneme>` declares that Amazon Polly does not support,
+    // kept rather than refused on the spot so that WHERE in the document a
+    // declaration sits does not decide which refusal the document gets: the
+    // supported-alphabet test runs beside the document element's own, after the whole
+    // document has been read.
+    let mut unsupported_phoneme_alphabet: Option<String> = None;
 
     loop {
         let (resolved, event) = reader
@@ -476,6 +524,18 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
                 // Whatever the element is to PLS, its attribute values are character
                 // data of this document and have to resolve for it to be one.
                 check_attribute_values(element)?;
+                // A `<phoneme>` is the other place PLS admits an `alphabet`
+                // declaration, so the service's supported set bounds it there too —
+                // including on an EMPTY `<phoneme/>`, which declares an alphabet just
+                // as an open one does.
+                if local_name == "phoneme" && in_pls_namespace {
+                    let declared = read_declared_alphabet(element)?;
+                    if unsupported_phoneme_alphabet.is_none()
+                        && unsupported_alphabet(declared.as_deref()).is_some()
+                    {
+                        unsupported_phoneme_alphabet = declared;
+                    }
+                }
                 // PLS's vocabulary is the one bound to its namespace, so an element
                 // borrowed from another vocabulary is not a lexeme and is not
                 // counted or measured as one.
@@ -575,10 +635,13 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
             "the content leaves an element unclosed".to_string(),
         ));
     }
-    if let Some(alphabet) = &document_element.alphabet {
-        if !SUPPORTED_PLS_ALPHABETS.contains(&alphabet.as_str()) {
-            return Err(PlsRejection::UnsupportedAlphabet(alphabet.clone()));
-        }
+    // Every `alphabet` the document declares has to name an alphabet Amazon Polly can
+    // read: the lexicon's own, and any a `<phoneme>` names for its one pronunciation.
+    if let Some(alphabet) = unsupported_alphabet(document_element.alphabet.as_deref()) {
+        return Err(PlsRejection::UnsupportedAlphabet(alphabet.to_string()));
+    }
+    if let Some(alphabet) = unsupported_phoneme_alphabet {
+        return Err(PlsRejection::UnsupportedAlphabet(alphabet));
     }
     let Some(language_code) = supported_language(&document_element.language_code) else {
         return Err(PlsRejection::UnsupportedLanguage(
@@ -956,6 +1019,78 @@ mod tests {
         assert!(
             matches!(bad_language, Err(PlsRejection::UnsupportedLanguage(ref l)) if l == "xx-ZZ"),
             "expected UnsupportedLanguage, got {bad_language:?}"
+        );
+    }
+
+    /// RULE: the supported set bounds every `alphabet` the document declares, so a
+    /// `<phoneme>` naming its own is checked against the same set as the lexicon's.
+    #[test]
+    fn a_phoneme_alphabet_is_checked_against_the_same_set() {
+        for alphabet in SUPPORTED_PLS_ALPHABETS {
+            let content = pls(
+                "",
+                &format!(
+                    "<lexeme><grapheme>G</grapheme>\
+                     <phoneme alphabet=\"{alphabet}\">g</phoneme></lexeme>"
+                ),
+            );
+            let parsed = parse_pls(&content);
+            assert!(
+                parsed.is_ok(),
+                "alphabet {alphabet:?} on a <phoneme>: expected acceptance, got {parsed:?}"
+            );
+            assert_eq!(
+                parsed.as_ref().ok().and_then(|p| p.alphabet.clone()),
+                None,
+                "alphabet {alphabet:?}: a phoneme's alphabet is not the lexicon's, got \
+                 {parsed:?}"
+            );
+        }
+        // One row per form of a `<phoneme>` carrying the declaration.
+        for (case, body) in [
+            (
+                "an open phoneme",
+                "<lexeme><grapheme>G</grapheme>\
+                 <phoneme alphabet=\"x-klingon\">g</phoneme></lexeme>"
+                    .to_string(),
+            ),
+            (
+                "an empty phoneme",
+                "<lexeme><grapheme>G</grapheme>\
+                 <phoneme alphabet=\"x-klingon\" ph=\"g\"/></lexeme>"
+                    .to_string(),
+            ),
+            (
+                "a phoneme nested in a replacement",
+                "<lexeme><grapheme>G</grapheme><alias>a\
+                 <phoneme alphabet=\"x-klingon\">g</phoneme></alias></lexeme>"
+                    .to_string(),
+            ),
+            (
+                "a later phoneme",
+                "<lexeme><grapheme>G</grapheme><phoneme>g</phoneme></lexeme>\
+                 <lexeme><grapheme>H</grapheme>\
+                 <phoneme alphabet=\"x-klingon\">h</phoneme></lexeme>"
+                    .to_string(),
+            ),
+        ] {
+            let outcome = parse_pls(&pls("", &body));
+            assert!(
+                matches!(outcome, Err(PlsRejection::UnsupportedAlphabet(ref a)) if a == "x-klingon"),
+                "case {case:?}: expected UnsupportedAlphabet, got {outcome:?}"
+            );
+        }
+        // An element of another vocabulary that happens to be named `phoneme` is not
+        // a PLS phoneme and declares no PLS alphabet.
+        let foreign = parse_pls(&pls(
+            "",
+            "<lexeme><grapheme>G</grapheme><other:phoneme \
+             xmlns:other=\"http://example.invalid/lexicon\" alphabet=\"x-klingon\"/>\
+             </lexeme>",
+        ));
+        assert!(
+            foreign.is_ok(),
+            "another vocabulary's element declares no PLS alphabet, got {foreign:?}"
         );
     }
 

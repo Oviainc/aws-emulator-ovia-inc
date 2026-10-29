@@ -31,6 +31,8 @@ mod lexicons_and_speech;
 mod pls_alphabet_support;
 #[path = "all/pls_document_validity.rs"]
 mod pls_document_validity;
+#[path = "all/pls_phoneme_alphabet.rs"]
+mod pls_phoneme_alphabet;
 #[path = "all/pls_replacement_measurement.rs"]
 mod pls_replacement_measurement;
 #[path = "all/pls_replacement_whitespace.rs"]
