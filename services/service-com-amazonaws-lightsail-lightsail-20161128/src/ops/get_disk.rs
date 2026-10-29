@@ -165,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::with_state(&*self.engine, |store| {
             store
                 .disk(&name)
-                .map(crate::state::StoredDisk::view)
+                .map(|disk| store.disk_view(disk))
                 .ok_or_else(|| not_found(&name))
         })
         .ok_or_else(unavailable)?

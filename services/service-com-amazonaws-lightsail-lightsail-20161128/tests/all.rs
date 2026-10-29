@@ -17,6 +17,8 @@ mod account_profile;
 mod active_names;
 #[path = "all/add_on_disable.rs"]
 mod add_on_disable;
+#[path = "all/add_on_next_snapshot_time.rs"]
+mod add_on_next_snapshot_time;
 #[path = "all/add_on_resource_resolution.rs"]
 mod add_on_resource_resolution;
 #[path = "all/add_on_snapshot_hour.rs"]

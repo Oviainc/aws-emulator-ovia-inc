@@ -174,7 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let (instances, next_page_token) = crate::state::resource_page(
                 crate::state::records_from(&store.instances, &page_token),
                 crate::state::INSTANCE_PAGE_SIZE,
-                |name, instance| instance.view(store.attached_disk_views(name)),
+                // The SAME view `GetInstance` reports: one stored record read by
+                // two operations, never a second rendering of an instance.
+                |_, instance| store.instance_view_of(instance),
             );
             GetInstancesOutput {
                 // An account with no instances reports an empty list, not an

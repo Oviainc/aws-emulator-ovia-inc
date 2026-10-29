@@ -5167,7 +5167,16 @@ impl StoredInstance {
     /// are passed in because an attachment lives on the DISK record (the disk
     /// names the instance it is attached to), so only the store can resolve
     /// them — see [`ComAmazonawsLightsailLightsail20161128State::instance_view`].
-    pub fn view(&self, attached_disks: Vec<crate::ops::types::Disk>) -> Instance {
+    ///
+    /// `next_auto_snapshot_time_of_day` is when the next automatic copy of this
+    /// instance is due, which lives on the SCHEDULE its add-on runs on rather
+    /// than on this record, so it too is passed in by the store
+    /// ([`ComAmazonawsLightsailLightsail20161128State::next_auto_snapshot_time_of_day`]).
+    pub fn view(
+        &self,
+        attached_disks: Vec<crate::ops::types::Disk>,
+        next_auto_snapshot_time_of_day: Option<String>,
+    ) -> Instance {
         Instance {
             name: Some(self.name.clone()),
             arn: Some(self.arn.clone()),
@@ -5179,7 +5188,7 @@ impl StoredInstance {
             blueprint_id: Some(self.blueprint_id.clone()),
             blueprint_name: Some(blueprint_name(&self.blueprint_id)),
             bundle_id: Some(self.bundle_id.clone()),
-            add_ons: Some(self.add_ons.clone()),
+            add_ons: Some(add_ons_view(&self.add_ons, next_auto_snapshot_time_of_day)),
             is_static_ip: Some(self.is_static_ip),
             private_ip_address: self.private_ip_address.clone(),
             public_ip_address: self.public_ip_address.clone(),
@@ -5732,7 +5741,12 @@ pub struct StoredDisk {
 
 impl StoredDisk {
     /// This record as the modelled `Disk`.
-    pub fn view(&self) -> crate::ops::types::Disk {
+    ///
+    /// `next_auto_snapshot_time_of_day` is when the next automatic copy of this
+    /// disk is due. It lives on the SCHEDULE the disk's add-on runs on rather
+    /// than on this record, so the store passes it in
+    /// ([`ComAmazonawsLightsailLightsail20161128State::next_auto_snapshot_time_of_day`]).
+    pub fn view(&self, next_auto_snapshot_time_of_day: Option<String>) -> crate::ops::types::Disk {
         let attached = self.attached_to.is_some();
         crate::ops::types::Disk {
             name: Some(self.name.clone()),
@@ -5742,7 +5756,7 @@ impl StoredDisk {
             location: Some(self.location.view()),
             resource_type: Some(RESOURCE_TYPE_DISK.to_string()),
             tags: Some(self.tags.clone()),
-            add_ons: Some(self.add_ons.clone()),
+            add_ons: Some(add_ons_view(&self.add_ons, next_auto_snapshot_time_of_day)),
             size_in_gb: Some(self.size_in_gb),
             // A disk `CreateDisk` created is additional block storage: the only
             // system disk is the one an instance's bundle provides, which is not
@@ -5968,7 +5982,13 @@ impl StoredInstanceSnapshot {
             from_attached_disks: Some(
                 self.from_attached_disks
                     .iter()
-                    .map(StoredDisk::view)
+                    // What this snapshot CAPTURED of each disk, as it was then.
+                    // When a further automatic copy of one of those disks falls
+                    // due is a live fact about the disk itself — the schedule its
+                    // own add-on runs on — and not something a capture taken in
+                    // the past can report, so the captured add-on carries no next
+                    // daily time.
+                    .map(|disk| disk.view(None))
                     .collect(),
             ),
             from_instance_name: Some(self.from_instance_name.clone()),
@@ -13423,8 +13443,27 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// lives on the DISK record, so assembling the view needs the whole store,
     /// not just the instance.
     pub fn instance_view(&self, name: &str) -> Option<Instance> {
-        let instance = self.instances.get(name)?;
-        Some(instance.view(self.attached_disk_views(name)))
+        Some(self.instance_view_of(self.instances.get(name)?))
+    }
+
+    /// The same view for an instance record a caller already holds — the listing
+    /// walk, which has the record in hand and renders it exactly as `GetInstance`
+    /// does rather than keeping a second rendering of an instance.
+    pub fn instance_view_of(&self, instance: &StoredInstance) -> Instance {
+        instance.view(
+            self.attached_disk_views(&instance.name),
+            self.next_auto_snapshot_time_of_day(RESOURCE_TYPE_INSTANCE, &instance.name),
+        )
+    }
+
+    /// The disk record `disk` as the modelled `Disk`, with the daily time its
+    /// next automatic copy is due at.
+    ///
+    /// The one way a reporting operation renders a disk: that time lives on the
+    /// schedule the disk's add-on runs on, so rendering a disk needs the store
+    /// and not just the disk record.
+    pub fn disk_view(&self, disk: &StoredDisk) -> crate::ops::types::Disk {
+        disk.view(self.next_auto_snapshot_time_of_day(RESOURCE_TYPE_DISK, &disk.name))
     }
 
     /// Every block storage disk attached to the instance `instance_name` names,
@@ -13440,8 +13479,30 @@ impl ComAmazonawsLightsailLightsail20161128State {
     pub fn attached_disk_views(&self, instance_name: &str) -> Vec<crate::ops::types::Disk> {
         self.disks_attached_to(instance_name)
             .into_iter()
-            .map(StoredDisk::view)
+            .map(|disk| self.disk_view(disk))
             .collect()
+    }
+
+    /// The daily time the next automatic snapshot of the resource `name` of kind
+    /// `resource_type` is due at, in the `HH:00` UTC form the modelled
+    /// `AddOn$nextSnapshotTimeOfDay` reports ("the next daily time an automatic
+    /// snapshot will be created"), and `None` when the store owes that resource
+    /// no further copy.
+    ///
+    /// READ from the schedule the resource's `AutoSnapshot` add-on runs on
+    /// ([`StoredAutoSnapshots::due_at_ms`]), which is the instant the clock takes
+    /// the next copy at — so the time reported is the hour that copy lands in,
+    /// and it follows the schedule as the clock re-arms it after each copy. A
+    /// resource whose add-on is disabled is owed nothing and reports nothing.
+    fn next_auto_snapshot_time_of_day(
+        &self,
+        resource_type: &'static str,
+        name: &str,
+    ) -> Option<String> {
+        self.auto_snapshots
+            .get(&(resource_type, name.to_string()))?
+            .due_at_ms
+            .map(utc_hour_of_day)
     }
 
     /// The same disks as [`Self::disks_attached_to`], captured whole for an
@@ -13587,9 +13648,11 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// schedule. Enabling the add-on makes the service owe the resource a copy:
     /// the first one falls due a short interval later
     /// ([`AUTO_SNAPSHOT_FIRST_MILLIS`]), and from then on the copies follow the
-    /// add-on's own daily hour. Disabling it stops the schedule and keeps the
-    /// copies already taken, which are the account's until something deletes
-    /// them.
+    /// add-on's own daily hour. An ENABLED add-on therefore always has its next
+    /// copy outstanding, which is also what
+    /// [`Self::next_auto_snapshot_time_of_day`] reports. Disabling it stops the
+    /// schedule and keeps the copies already taken, which are the account's
+    /// until something deletes them.
     fn reconcile_auto_snapshots(
         &mut self,
         now_ms: i64,
@@ -13598,7 +13661,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
         hour: Option<&str>,
     ) {
         let key = (resource_type, name.to_string());
-        if hour.is_none() {
+        let Some(hour) = hour else {
             if let Some(schedule) = self.auto_snapshots.get_mut(&key) {
                 schedule.due_at_ms = None;
                 if schedule.taken.is_empty() {
@@ -13606,21 +13669,29 @@ impl ComAmazonawsLightsailLightsail20161128State {
                 }
             }
             return;
-        }
+        };
         let schedule = self.auto_snapshots.entry(key).or_default();
         // An add-on already taking copies keeps the schedule it is on, so
-        // modifying it does not restart the wait; and a resource that already
-        // holds the copy for the day the first one would fall on is not copied
-        // twice because the add-on was switched off and on again.
+        // modifying it does not restart the wait.
+        if schedule.due_at_ms.is_some() {
+            return;
+        }
         let first_due_ms = now_ms.saturating_add(AUTO_SNAPSHOT_FIRST_MILLIS);
-        if schedule.due_at_ms.is_none()
-            && schedule
+        schedule.due_at_ms = Some(
+            if schedule
                 .taken
                 .last()
                 .is_none_or(|taken| taken.date != utc_date(first_due_ms))
-        {
-            schedule.due_at_ms = Some(first_due_ms);
-        }
+            {
+                first_due_ms
+            } else {
+                // A resource that already holds the copy for the day the first
+                // one would fall on is not copied twice because the add-on was
+                // switched off and on again: the copy it is owed is the next one
+                // the add-on's own daily hour comes round for.
+                next_auto_snapshot_due_ms(first_due_ms, hour)
+            },
+        );
     }
 
     /// The daily hour the enabled `AutoSnapshot` add-on of the resource `name`
@@ -16212,11 +16283,57 @@ fn enabled_auto_snapshot_hour(add_ons: &[AddOn]) -> Option<String> {
         .and_then(|add_on| add_on.snapshot_time_of_day.clone())
 }
 
+/// `add_ons` as a read of the resource carrying them reports them: the enabled
+/// `AutoSnapshot` add-on also says when its NEXT daily copy is due
+/// (`next_auto_snapshot_time_of_day`, `None` when the store owes the resource no
+/// further copy); every other add-on is reported exactly as it is stored.
+///
+/// The modelled `AddOn$nextSnapshotTimeOfDay` is a fact about the SCHEDULE the
+/// resource's add-on runs on — the instant the next copy falls due, which the
+/// clock re-arms after each one — and not about the request that enabled the
+/// add-on, so it is read from that schedule at every read
+/// ([`ComAmazonawsLightsailLightsail20161128State::next_auto_snapshot_time_of_day`])
+/// rather than stored a second time on the record, where it could disagree with
+/// the copy the clock actually takes next.
+fn add_ons_view(add_ons: &[AddOn], next_auto_snapshot_time_of_day: Option<String>) -> Vec<AddOn> {
+    add_ons
+        .iter()
+        .map(|add_on| AddOn {
+            next_snapshot_time_of_day: (add_on.name.as_deref()
+                == Some(ADD_ON_TYPE_AUTO_SNAPSHOT))
+                .then(|| next_auto_snapshot_time_of_day.clone())
+                .flatten(),
+            ..add_on.clone()
+        })
+        .collect()
+}
+
+/// How many milliseconds one hour of Unix time counts — the unit the automatic
+/// snapshot hour is reported in, since its times are hourly increments.
+const MILLIS_PER_HOUR: i64 = 60 * 60 * 1_000;
+
 /// How many milliseconds one day of Unix time counts. Unix time has no leap
 /// second, so every UTC day in it is exactly this long — which is what lets the
 /// daily automatic snapshot hour below be found by arithmetic rather than by a
 /// calendar.
-const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
+const MILLIS_PER_DAY: i64 = 24 * MILLIS_PER_HOUR;
+
+/// The UTC hour the instant `epoch_millis` falls in, in the `HH:00` form the
+/// modelled `TimeOfDay` pattern `^(0[0-9]|1[0-9]|2[0-3]):[0-5][0-9]$` admits and
+/// the automatic snapshot members report ("in `HH:00` format, and in Coordinated
+/// Universal Time (UTC)").
+///
+/// Unix time has no leap second, so the hour of a UTC day an instant falls in is
+/// arithmetic on that instant rather than a calendar lookup — the same reasoning
+/// [`MILLIS_PER_DAY`] rests on. The division floors, so an instant anywhere
+/// inside an hour reports that hour, which is what the member's "between the
+/// time shown and up to 45 minutes after" describes.
+fn utc_hour_of_day(epoch_millis: i64) -> String {
+    format!(
+        "{:02}:00",
+        epoch_millis.div_euclid(MILLIS_PER_HOUR).rem_euclid(24)
+    )
+}
 
 /// The instant the daily automatic snapshot hour `hour` next comes round after
 /// `after_ms`.

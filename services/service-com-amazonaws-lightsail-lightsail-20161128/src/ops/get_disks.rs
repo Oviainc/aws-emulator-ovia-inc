@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::DISK_PAGE_SIZE,
                 // The SAME view `GetDisk` reports: one stored record read by two
                 // operations, never a second rendering of a disk.
-                |_, disk| disk.view(),
+                |_, disk| store.disk_view(disk),
             );
             GetDisksOutput {
                 // An account with no disks reports an empty list, not an absent
