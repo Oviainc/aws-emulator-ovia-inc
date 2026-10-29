@@ -2363,8 +2363,8 @@ pub fn decode_next_token(token: &str) -> Option<String> {
 }
 
 /// The modelled `ValidationException` (HTTP 400) for a `NextToken` this service did
-/// not issue: one that does not decode, or that decodes to a resume point this
-/// service's pagination cannot name.
+/// not issue: one that does not decode, that decodes to a resume point this
+/// service's pagination cannot name, or one sent to a list that mints no token at all.
 ///
 /// Shared by every paginated operation here, so one bad token is refused the same way
 /// whichever list produced it. `Reason` is the modelled enum value for a single bad

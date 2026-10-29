@@ -171,12 +171,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `MaxResults` does not truncate the answer and no `NextToken` is ever minted.
         // Nothing a caller can hold is therefore a token this service issued, and a
         // request that carries one is a bad request — a 400, never a guessed-at page.
+        // That failure is the same one the service's other lists refuse, so it is
+        // refused through the crate's single builder
+        // ([`crate::state::invalid_next_token`]) rather than worded again here: the
+        // sentence it states names the member and the constraint and nothing
+        // operation-specific on purpose, so one bad token cannot come back worded one
+        // way from this list and another way from a sibling.
         if input.next_token.is_some() {
-            const WHY: &str = "NextToken is not a token this service issued: ListRegions \
-                               reports every supported Region in one response and returns \
-                               no pagination token";
             return Err(ListRegionsErrorModeled::ValidationException(
-                crate::state::field_validation_failed("NextToken", WHY),
+                crate::state::invalid_next_token(),
             )
             .into());
         }

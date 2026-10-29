@@ -33,6 +33,8 @@ mod instance_token_parameter_mismatch;
 mod instance_type_catalog;
 #[path = "all/list_pagination_resume_points.rs"]
 mod list_pagination_resume_points;
+#[path = "all/next_token_rule_sharing.rs"]
+mod next_token_rule_sharing;
 #[path = "all/region_catalog.rs"]
 mod region_catalog;
 #[path = "all/regional_scoping.rs"]
