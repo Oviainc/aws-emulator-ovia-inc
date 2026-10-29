@@ -23,6 +23,8 @@ mod action_order_is_acyclic;
 mod control_plane_rules;
 #[path = "all/delete_target_account_configuration.rs"]
 mod delete_target_account_configuration;
+#[path = "all/execution_role_is_one_lookup.rs"]
+mod execution_role_is_one_lookup;
 #[path = "all/experiment_lifecycle.rs"]
 mod experiment_lifecycle;
 #[path = "all/experiment_logging.rs"]

@@ -162,6 +162,12 @@ pub mod experiment_logs;
 pub type IamState =
     ::service_com_amazonaws_iam_awsidentitymanagementv20100508::ComAmazonawsIamAwsidentitymanagementv20100508State;
 
+/// A role as the account's IAM store holds it — the record `CreateRole` wrote — which is
+/// what [`role_by_arn`] hands back. It is IAM's OWN shape, so this service reads the
+/// stored record rather than a copy of it.
+pub type IamRole =
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::Role;
+
 /// What a handler reports when the engine it was built on carries no store for this
 /// service — a server fault, never a bad request.
 pub const STORE_UNAVAILABLE: &str = "the fis experiment store is unavailable";
@@ -4481,6 +4487,23 @@ pub fn iso8601_span(value: &str) -> Option<Duration> {
     ::service_common::iso8601_span::iso8601_span(value)
 }
 
+/// The role the account's IAM store holds under the ARN `role_arn`, or `None` when it
+/// holds none.
+///
+/// The ONE reading of "which stored role does this ARN name" in this service. Both
+/// halves of the execution-role gate — whether the role's trust policy lets FIS assume it
+/// ([`role_trust_refusal`]) and which policy documents are in force on it
+/// ([`action_permissions::role_documents`]) — resolve the same `roleArn` through here, so
+/// one ARN can never answer those two questions from two different records: whatever this
+/// lookup comes to learn about matching an ARN, both halves learn at once.
+///
+/// The store keys its roles by the role NAME, so an ARN is resolved by the ARN each
+/// record carries, and `None` means the account holds no such role — which every caller
+/// reads as "nothing can be shown about this role" rather than as a refusal.
+pub fn role_by_arn<'iam>(iam: &'iam IamState, role_arn: &str) -> Option<&'iam IamRole> {
+    iam.roles.values().find(|role| role.arn == role_arn)
+}
+
 /// `None` when this emulator has no reason to think FIS could not assume `role_arn`;
 /// otherwise the `ValidationException` that refuses the call.
 ///
@@ -4492,7 +4515,7 @@ pub fn iso8601_span(value: &str) -> Option<Duration> {
 /// told this emulator about it), so the start goes ahead; only a role this emulator holds
 /// and whose trust policy withholds the grant is refused.
 pub fn role_trust_refusal(role_arn: &str, iam: &IamState) -> Option<ValidationException> {
-    let role = iam.roles.values().find(|role| role.arn == role_arn)?;
+    let role = role_by_arn(iam, role_arn)?;
     let document = role.assume_role_policy_document.as_deref()?;
     match policy_grants_service(document, FIS_SERVICE_PRINCIPAL) {
         // A document this emulator cannot read as a policy is no evidence either way.

@@ -110,12 +110,16 @@ pub const MAX_PERMISSION_DECISIONS: usize = 32;
 /// ([`permission_failure`]) holds no IAM guard: the store is not locked while this gate
 /// thinks.
 ///
+/// Which role the ARN names is [`super::role_by_arn`], the one reading of that question in
+/// this service, so this half of the gate and the trust half ([`super::role_trust_refusal`])
+/// always answer about the same record.
+///
 /// `None` when nothing can be SHOWN about the role's permissions — the store holds no such
 /// role, one of its attachments is an AWS-managed policy whose document this account does
 /// not hold, or it carries more documents than [`MAX_ROLE_DOCUMENTS`] (see the module
 /// docs) — which is what makes the caller refuse nothing.
 pub fn role_documents(role_arn: &str, iam: &IamState) -> Option<Vec<String>> {
-    let role = iam.roles.values().find(|role| role.arn == role_arn)?;
+    let role = super::role_by_arn(iam, role_arn)?;
     let role_key = iam::name_key(&role.role_name);
     let mut documents: Vec<String> = iam
         .role_inline_policies
