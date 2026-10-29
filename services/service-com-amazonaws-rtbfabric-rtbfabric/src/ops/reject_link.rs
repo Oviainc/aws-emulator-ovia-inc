@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RejectLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RejectLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RejectLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Declines an outstanding link request: the stored link moves to the terminal
+//! `REJECTED` status, so every later reader reports `REJECTED` and no further
+//! transition is owed on it. A link whose request is no longer outstanding cannot
+//! be declined -> `ConflictException` (409), except a repeat of this same call,
+//! which this `@idempotent` operation answers with the record it already left in
+//! `REJECTED`. An id that names no link on the addressed gateway ->
+//! `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +171,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RejectLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RejectLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RejectLink"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RejectLinkErrorModeled::InternalServerException(InternalServerException {
+                message: "the rtbfabric emulator has no state store for this request".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        let gateway_id = input.gateway_id.clone();
+        let Some(link) = store.find_link_mut(&input.gateway_id, &input.link_id) else {
+            return Err(RejectLinkErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no link with id {} exists on gateway {}",
+                        input.link_id, input.gateway_id
+                    ),
+                },
+            )
+            .into());
+        };
+
+        if link.request_outstanding() {
+            // Declining is the end of the link's life: terminal, so nothing
+            // further is owed on it and the settle instant is dropped.
+            link.status = crate::state::LINK_STATUS_REJECTED.to_string();
+            link.settles_at = None;
+            link.updated_at = now;
+        } else if link.status != crate::state::LINK_STATUS_REJECTED {
+            // Anything other than an outstanding request, or the rejection this
+            // operation already recorded, is a status this call cannot move.
+            return Err(RejectLinkErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "link {} on gateway {} is {} and cannot be rejected",
+                    link.link_id, gateway_id, link.status
+                ),
+            })
+            .into());
+        }
+
+        Ok(RejectLinkOutput {
+            // The response describes the link as addressed: the gateway in the
+            // URI, and the link's other end as its peer.
+            gateway_id,
+            peer_gateway_id: link.other_end(&input.gateway_id).to_string(),
+            status: link.status.clone(),
+            created_at: crate::state::timestamp(link.created_at),
+            updated_at: crate::state::timestamp(link.updated_at),
+            direction: Some(link.direction.clone()),
+            flow_modules: Some(link.flow_modules.clone()),
+            pending_flow_modules: Some(link.pending_flow_modules.clone()),
+            attributes: link.attributes.clone(),
+            log_settings: Some(link.log_settings.clone()),
+            connectivity_type: Some(link.connectivity_type.clone()),
+            link_id: link.link_id.clone(),
+        })
     }
 }

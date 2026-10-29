@@ -75,6 +75,8 @@ pub const LINK_STATUS_PENDING_REQUEST: &str = "PENDING_REQUEST";
 pub const LINK_STATUS_REQUESTED: &str = "REQUESTED";
 /// `LinkStatus` member: the link carries traffic.
 pub const LINK_STATUS_ACTIVE: &str = "ACTIVE";
+/// `LinkStatus` member: terminal, the peer declined the link request.
+pub const LINK_STATUS_REJECTED: &str = "REJECTED";
 /// `LinkStatus` member: terminal, the link is gone.
 pub const LINK_STATUS_DELETED: &str = "DELETED";
 
@@ -203,6 +205,25 @@ impl Link {
     pub fn has_end(&self, gateway_id: &str) -> bool {
         self.gateway_id == gateway_id || self.peer_gateway_id == gateway_id
     }
+
+    /// This link's OTHER end, seen from `gateway_id`: a link is one record with
+    /// two ends, so a response addressed to one of them reports the other as its
+    /// `peerGatewayId`. An id that is neither end never reaches here, because the
+    /// link is resolved by [`has_end`](Self::has_end) first.
+    pub fn other_end(&self, gateway_id: &str) -> &str {
+        if self.gateway_id == gateway_id {
+            &self.peer_gateway_id
+        } else {
+            &self.gateway_id
+        }
+    }
+
+    /// Whether the link request is still outstanding — accepted by this service
+    /// but not yet answered by the peer. These are the only statuses from which
+    /// the peer can still accept or decline the request.
+    pub fn request_outstanding(&self) -> bool {
+        self.status == LINK_STATUS_PENDING_REQUEST || self.status == LINK_STATUS_REQUESTED
+    }
 }
 
 /// What the first call carrying an `@idempotencyToken` minted, so a retry with
@@ -306,6 +327,14 @@ impl ComAmazonawsRtbfabricRtbfabricState {
             .find(|link| link.link_id == link_id && link.has_end(gateway_id))
     }
 
+    /// [`find_link`](Self::find_link)'s link, for an operation that moves it to
+    /// another status.
+    pub fn find_link_mut(&mut self, gateway_id: &str, link_id: &str) -> Option<&mut Link> {
+        self.links
+            .values_mut()
+            .find(|link| link.link_id == link_id && link.has_end(gateway_id))
+    }
+
     /// The map key of [`find_link`](Self::find_link)'s link, for removing it.
     pub fn find_link_key(&self, gateway_id: &str, link_id: &str) -> Option<(String, String)> {
         self.links
@@ -332,7 +361,7 @@ impl ComAmazonawsRtbfabricRtbfabricState {
             if link.status == LINK_STATUS_ACTIVE {
                 counts.active = counts.active.saturating_add(1);
             }
-            if link.status == LINK_STATUS_REQUESTED || link.status == LINK_STATUS_PENDING_REQUEST {
+            if link.request_outstanding() {
                 counts.requested = counts.requested.saturating_add(1);
             }
         }
