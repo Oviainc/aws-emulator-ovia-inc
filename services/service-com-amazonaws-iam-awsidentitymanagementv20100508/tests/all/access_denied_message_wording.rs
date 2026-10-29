@@ -29,6 +29,7 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::identity_policy_enforcement::{principal, statement};
+use crate::role_lifecycle::borrowed;
 use crate::user_lifecycle::{
     account_id, assert_access_denied_message, authorization_details_id, call, call_signed_by,
     call_signed_in_region, element, error_code, router,
@@ -45,6 +46,40 @@ const EXPLICIT_DENY: &str = "with an explicit deny in an identity-based policy";
 /// An `Allow` for every IAM action on every resource: what a row about an explicit `Deny`
 /// is layered on top of, so the row demonstrates the `Deny` and not a missing grant.
 const ALLOW_EVERYTHING: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:*","Resource":"*"}]}"#;
+
+/// An instant no call this suite makes is made after, so a `DateGreaterThan` clause over
+/// it does not hold at the time of the call.
+const FUTURE_INSTANT: &str = "2099-01-01T00:00:00Z";
+
+/// An instant every call this suite makes is made after, so a `DateGreaterThan` clause
+/// over it holds at the time of the call.
+const PAST_INSTANT: &str = "2020-01-01T00:00:00Z";
+
+/// A document whose statements each `Allow` one action on every resource from the instant
+/// beside it: a statement whose instant has not arrived IS in force and does NOT apply,
+/// because a date clause is decided against the instant of the call
+/// (`tests/all/request_condition_context.rs` is the table for the operators themselves).
+/// A refusal reached through one of those is the same withholding a caller holding no
+/// document at all reaches.
+fn grants_after(clauses: &[(&str, &str)]) -> String {
+    let statements: Vec<String> = clauses
+        .iter()
+        .map(|(action, instant)| {
+            format!(
+                r#"{{"Effect":"Allow","Action":"{action}","Resource":"*","Condition":{{"DateGreaterThan":{{"aws:CurrentTime":"{instant}"}}}}}}"#
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
+        statements.join(",")
+    )
+}
+
+/// [`grants_after`] with one clause: a grant for `action` that becomes true at `instant`.
+fn grant_after(action: &str, instant: &str) -> String {
+    grants_after(&[(action, instant)])
+}
 
 /// The user the rows that address ONE entity are refused on, created once as a fixture:
 /// the refusals in this suite are about the caller's own permissions, so the entity they
@@ -213,6 +248,16 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             details: true,
         },
         Case {
+            case: "implicit deny listing one user's tags",
+            policies: Vec::new(),
+            action: "ListUserTags",
+            params: vec![("UserName".to_string(), TARGET.to_string())],
+            iam_action: "iam:ListUserTags",
+            named_as: target.clone(),
+            reason: no_allow("iam:ListUserTags"),
+            details: true,
+        },
+        Case {
             case: "implicit deny writing an account property",
             policies: Vec::new(),
             action: "PutAccountProperties",
@@ -257,6 +302,36 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             named_as: target.clone(),
             reason: no_allow("iam:ListAccessKeys"),
             details: true,
+        },
+        // A grant for the refused action itself whose CONDITION does not hold at the
+        // instant of the call: the statement was read and does not apply, which is again
+        // the withholding — so these two rows are worded exactly as their no-document
+        // twins above are, each as its own action is.
+        Case {
+            case: "withheld tag listing, the caller's grant not yet in effect",
+            policies: vec![(
+                "allow-listusertags-later".to_string(),
+                grant_after("iam:ListUserTags", FUTURE_INSTANT),
+            )],
+            action: "ListUserTags",
+            params: vec![("UserName".to_string(), TARGET.to_string())],
+            iam_action: "iam:ListUserTags",
+            named_as: target.clone(),
+            reason: no_allow("iam:ListUserTags"),
+            details: true,
+        },
+        Case {
+            case: "withheld collection read, the caller's grant not yet in effect",
+            policies: vec![(
+                "allow-listusers-later".to_string(),
+                grant_after("iam:ListUsers", FUTURE_INSTANT),
+            )],
+            action: "ListUsers",
+            params: Vec::new(),
+            iam_action: "iam:ListUsers",
+            named_as: format!("arn:aws:iam::{account}:user/"),
+            reason: no_allow("iam:ListUsers"),
+            details: false,
         },
         // A grant for the same action on ANOTHER resource: the statement was read and
         // does not cover the request, which is the same withholding.
@@ -326,6 +401,25 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             action: "GetUser",
             params: vec![("UserName".to_string(), TARGET.to_string())],
             iam_action: "iam:GetUser",
+            named_as: target.clone(),
+            reason: EXPLICIT_DENY.to_string(),
+            details: false,
+        },
+        // An explicit `Deny` of another action whose WITHHELD refusal carries the
+        // pointer, on a request that addresses one entity: nothing was withheld here
+        // either, so it ends at the reason.
+        Case {
+            case: "explicit deny listing one user's tags",
+            policies: vec![
+                ("allow-everything".to_string(), ALLOW_EVERYTHING.to_string()),
+                (
+                    "deny-listusertags".to_string(),
+                    statement("Deny", "iam:ListUserTags", "*"),
+                ),
+            ],
+            action: "ListUserTags",
+            params: vec![("UserName".to_string(), TARGET.to_string())],
+            iam_action: "iam:ListUserTags",
             named_as: target.clone(),
             reason: EXPLICIT_DENY.to_string(),
             details: false,
@@ -429,11 +523,7 @@ async fn a_refusal_names_the_decision_and_is_worded_as_its_action_is() {
     for (row, case) in cases(&policy_arn).into_iter().enumerate() {
         let user_name = format!("denied{row}");
         let access_key_id = principal(&router, case.case, &user_name, &case.policies).await;
-        let params: Vec<(&str, &str)> = case
-            .params
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
-            .collect();
+        let params = borrowed(&case.params);
 
         let (status, body) =
             call_signed_by(&router, Some(&access_key_id), case.action, &params).await;
@@ -647,5 +737,126 @@ async fn the_pointer_names_one_page_whichever_region_the_call_addressed() {
             "case {region:?}: expected the pointer at IAM's one authorization-details page, \
              got {clause:?}"
         );
+    }
+}
+
+/// The form parameters a call to `action` carries, for the actions the rows below drive:
+/// a request that addresses one entity names it, and a collection read names nothing.
+fn params_for(action: &str, user_name: &str) -> Vec<(String, String)> {
+    match action {
+        "ListUsers" => Vec::new(),
+        _ => vec![("UserName".to_string(), user_name.to_string())],
+    }
+}
+
+/// The resource a refusal of `action` NAMES: the entity a request addressing one names,
+/// and the collection ARN a list read is decided on.
+fn names_resource(action: &str, user_name: &str) -> String {
+    match action {
+        "ListUsers" => format!("arn:aws:iam::{}:user/", account_id()),
+        _ => format!("user {user_name}"),
+    }
+}
+
+/// RULE: a refusal reached because the only statement for the action is conditioned on an
+/// instant the call is not yet past is the same WITHHOLDING as one reached with no
+/// document at all — so it is worded as that action is: the sentence closed by the
+/// pointer at the request's authorization details for an action AWS answers that pointer
+/// for, and the sentence alone for every other — while the sibling action the same
+/// document already grants is served.
+#[tokio::test]
+async fn a_grant_not_yet_in_effect_is_withheld_and_worded_as_its_action_is() {
+    let router = router();
+
+    // (case, the action granted from a past instant and therefore served, the action
+    //  granted only from a future instant and therefore refused, whether that action's
+    //  withheld refusal carries the pointer)
+    let cases: &[(&str, &str, &str, bool)] = &[
+        (
+            "a tag listing not yet in effect",
+            "GetUser",
+            "ListUserTags",
+            true,
+        ),
+        (
+            "a user listing not yet in effect",
+            "ListUserTags",
+            "ListUsers",
+            false,
+        ),
+    ];
+
+    for (row, (case, in_effect, not_yet, details)) in cases.iter().enumerate() {
+        let user_name = format!("conditioned{row}");
+        // ONE document holding both statements, so each is decided on its own clause.
+        let access_key_id = principal(
+            &router,
+            case,
+            &user_name,
+            &[(
+                "clocked".to_string(),
+                grants_after(&[
+                    (&format!("iam:{in_effect}"), PAST_INSTANT),
+                    (&format!("iam:{not_yet}"), FUTURE_INSTANT),
+                ]),
+            )],
+        )
+        .await;
+
+        let (status, body) = call_signed_by(
+            &router,
+            Some(&access_key_id),
+            in_effect,
+            &borrowed(&params_for(in_effect, &user_name)),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the leg already in effect ({in_effect}) to be served, \
+             got {status}: {body}"
+        );
+
+        let (status, body) = call_signed_by(
+            &router,
+            Some(&access_key_id),
+            not_yet,
+            &borrowed(&params_for(not_yet, &user_name)),
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "case {case:?}: expected the leg not yet in effect ({not_yet}) to be refused, \
+             got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "AccessDenied",
+            "case {case:?}: expected the error code AccessDenied, got {:?}",
+            error_code(&body)
+        );
+
+        let iam_action = format!("iam:{not_yet}");
+        let message = element(&body, "Message");
+        let pointed_at = assert_access_denied_message(
+            case,
+            &message,
+            &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
+            &iam_action,
+            &names_resource(not_yet, &user_name),
+            &no_allow(&iam_action),
+        );
+        if *details {
+            assert!(
+                !pointed_at.is_empty(),
+                "case {case:?}: expected the refusal of {not_yet} to point at the \
+                 authorization details of the request, got {message:?}"
+            );
+        } else {
+            assert!(
+                pointed_at.is_empty(),
+                "case {case:?}: expected the refusal of {not_yet} to end at the reason, got \
+                 the authorization id {pointed_at:?} in {message:?}"
+            );
+        }
     }
 }
