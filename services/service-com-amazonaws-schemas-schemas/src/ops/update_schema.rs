@@ -210,13 +210,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?;
 
+        // The type the schema's definition carries NOW — the type of the version a
+        // version-less read of it resolves to, which is what every read reports and
+        // the only type a request can be asking for no change to. A version a delete
+        // took out is reported by nothing afterwards, so its type decides nothing
+        // either. See `crate::state::Schema::current_type`.
+        let current_type = schema.current_type().to_string();
+
         // `Type` is the type OF the content: a stored document cannot be relabelled
         // without being rewritten, or every reader of the old version would be told
         // the wrong type for the bytes it gets.
         let retyped = input
             .r#type
             .as_deref()
-            .is_some_and(|requested| requested != schema.r#type);
+            .is_some_and(|requested| requested != current_type);
         if retyped && input.content.is_none() {
             return Err(UpdateSchemaErrorModeled::BadRequestException(
                 crate::state::bad_request(
@@ -228,8 +235,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The type OF the content this request carries: the request's when it sends
-        // one, else the type the schema already carries.
-        let r#type = input.r#type.clone().unwrap_or_else(|| schema.r#type.clone());
+        // one, else the type the schema's definition carries now — so a new version
+        // written without a `Type` is stored under the type the schema reads as,
+        // never under one only a deleted definition ever had.
+        let r#type = input.r#type.clone().unwrap_or_else(|| current_type.clone());
         // Whether the content is a schema document is a property of the REQUEST, so it
         // is decided here — before the idempotency-token lookup below, so the same body
         // is refused whatever the schema's token history, and before anything is
@@ -345,15 +354,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             schema_version: version.as_ref().map(|version| version.version.to_string()),
             tags: crate::state::tags_to_output(&schema.tags),
             // The type of the definition this response reports. A schema holding no
-            // version has no definition to read it from, and the type is also the
-            // SCHEMA's own stored member (`Schema::r#type`, which `add_version` keeps
-            // at the type of the definition last written), so that is what a response
-            // reporting no version carries — the same member `DescribeSchema` answers
-            // for a schema whose versions it reports nothing of.
+            // version has no definition to read it from, so a response reporting no
+            // version carries the type the schema reads as with no definition left
+            // (`crate::state::Schema::current_type`) — the type its definitions were
+            // written with.
             r#type: Some(
                 version
                     .as_ref()
-                    .map_or_else(|| schema.r#type.clone(), |version| version.r#type.clone()),
+                    .map_or_else(|| current_type.clone(), |version| version.r#type.clone()),
             ),
             version_created_date: version.as_ref().map(|version| version.created_date.into()),
         })

@@ -1225,7 +1225,12 @@ pub struct Schema {
     /// `arn:aws:schemas:<region>:<account>:schema/<registry>/<name>`.
     pub arn: String,
     pub description: Option<String>,
-    /// One of [`crate::ops::types::TYPE_VALUES`].
+    /// The type of the definition LAST WRITTEN to this schema, one of
+    /// [`crate::ops::types::TYPE_VALUES`]: [`Schema::add_version`] is the only writer
+    /// of it, so a delete of that definition leaves it naming content the store no
+    /// longer holds. What the schema's type IS at any instant is
+    /// [`Schema::current_type`], which reads it from the definition the schema still
+    /// holds and falls back here only for a schema that holds none.
     pub r#type: String,
     pub tags: BTreeMap<String, String>,
     /// The highest version number ever minted for this schema; rendered as the
@@ -1434,6 +1439,24 @@ impl Schema {
     /// of "the latest version" answers is the newest one that survives.
     pub fn latest_stored_version(&self) -> Option<u64> {
         self.versions.keys().next_back().copied()
+    }
+
+    /// The type this schema's definition CURRENTLY carries: the type of the newest
+    /// version the schema still holds, and only when it holds none the type the last
+    /// definition written to it carried ([`Schema::r#type`]).
+    ///
+    /// `Type` names the type of the schema CONTENT, so what the schema's type is at any
+    /// instant is a property of the definition a version-less read resolves to — which
+    /// is why the version is taken from [`Schema::version_for`] with no version
+    /// requested, the one resolution every read of "the latest" makes, rather than
+    /// selected again here. [`Schema::r#type`] alone is the type of the definition last
+    /// written, which a [`Schema::remove_version`] of that definition leaves naming
+    /// content the store no longer holds; it answers only for a schema with no
+    /// definition left to read a type from, which still carries the type its
+    /// definitions were written with.
+    pub fn current_type(&self) -> &str {
+        self.version_for(None)
+            .map_or(self.r#type.as_str(), |version| version.r#type.as_str())
     }
 
     /// Remove the version numbered `version`, and with it everything derived from
