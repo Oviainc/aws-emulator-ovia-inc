@@ -1,0 +1,43 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: iot__kinesis.topic-rule-kinesis-action-missing-put-record-permission-rejected
+Issue-Key: iot__kinesis.topic-rule-kinesis-action-missing-put-record-permission-rejected|_publish_until_delivered#27|Timeout|time.sleep(2)
+Issue-Commit: 9e55f581c86f2cc2a9694ee1b8e2f61584dc3f55
+
+# iot__kinesis: a topic rule whose kinesis action role grants no kinesis:PutRecord is indistinguishable from a rule that never ran — the permission boundary is unobservable because no kinesis action is ever executed (1 cause)
+
+> _Note: this issue was identified against the code base at commit `9e55f581c86f2cc2a9694ee1b8e2f61584dc3f55`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+Publish
+
+## Description
+One net-new root cause in the iot rules-engine surface, grounded in the one surviving failing iot__kinesis check. The suite marked the sibling check (topic-rule-kinesis-action-puts-record-from-published-message) OWNED by 20261026T095451Z-iot-kinesis-iot-topic-rule-kinesis-action-never-puts-a.md, but did NOT mark this one: that issue's replay key for this check (`...missing-put-record-permission-rejected|run#27|Timeout|time.sleep(5)`) no longer matches how this check fails (it now fails inside `_publish_until_delivered`, at `time.sleep(2)`), so this check's replay key is carried by no open issue and the permission-boundary contract below is covered by none. Named here as required; a shared dispatch fix may close both, but this issue is closed only when the check in Traces replays green.
+
+=== Cause 1 of 1: the `kinesis` topic-rule action is never executed, so a role that grants no kinesis:PutRecord on the target stream cannot be shown to be refused — the denied leg and the permitted leg both deliver nothing ===
+
+AWS: a topic rule recorded by CreateTopicRule (Smithy: com.amazonaws.iot#CreateTopicRule, required input `topicRulePayload` -> com.amazonaws.iot#TopicRulePayload { sql (required), actions (ActionList, required, @length max 10), ruleDisabled, awsIotSqlVersion, errorAction }) whose `actions` contain `kinesis` (Smithy: com.amazonaws.iot#Action member `kinesis` -> com.amazonaws.iot#KinesisAction { roleArn: AwsArn required — "The ARN of the IAM role that grants access to the Amazon Kinesis stream", streamName: StreamName required, partitionKey: PartitionKey optional }; member doc "Write data to an Amazon Kinesis stream") is evaluated by the rules engine on every message published to the topic its `sql` FROM clause selects. Execution is gated on that `roleArn`: when the role grants kinesis:PutRecord on the stream ARN, the message body is written as one Kinesis record under the action's partitionKey and is read back with GetShardIterator(TRIM_HORIZON)+GetRecords; when the role grants no kinesis:PutRecord on that stream ARN, the action is REFUSED and NO record is written — the refusal is never surfaced in the publisher's response (iot-data Publish answers 200 either way; the failure is visible only as the absence of the record and on the rule's error-action/failure path). The requirement is therefore a differential: on one stream, a permitted sibling rule's record appears and the unpermitted rule's record never does. recorded behavior only for timing: the check publishes and re-polls for up to 180s. No error code or status is asserted on the publisher side, so none is quoted here; the diverging observable is the absence of any record on either leg.
+
+Emulator: the whole control plane answers — kinesis CreateStream/DescribeStream/AddTagsToStream, iam CreateRole/PutRolePolicy, iot CreateTopicRule for both the permitted and the unpermitted role, and iot-data Publish (200) — but nothing ever runs the rule's `kinesis` action on either leg. GetRecords from TRIM_HORIZON returns an empty `Records` list on every poll, so the check keeps publishing and re-polling until the harness kills it: suite verdict "[mismatch] Check timed out after 60.0s". It dies on its own POSITIVE control and never reaches the assertion it exists to make, so the emulator cannot be shown either to enforce or to ignore kinesis:PutRecord on a rule-action role.
+
+Why: a client that relies on IoT rule-action roles as a security boundary gets a boundary it cannot verify and an ingestion path that silently delivers nothing. A mis-scoped rule role behaves exactly like a correctly scoped one (both produce no record), so an IAM regression in a device-ingestion pipeline is undetectable; and a client whose logic depends on the rule firing sees every call succeed while no telemetry lands on the stream. A test asserting either leg hangs to its own deadline instead of receiving a clear answer.
+
+Fix: the iot rules-engine execution component and its hook from the iot-data Publish path (the iot service's topic-rule evaluation/state in services/service-com-amazonaws-iot-awsiotservice), extended to the `kinesis` action: match the published topic against each stored rule's sql FROM clause, skip rules with ruleDisabled=true, resolve the action's roleArn and evaluate kinesis:PutRecord against the target stream ARN — dropping the action with no record written when the grant is absent, and otherwise appending the message body to the named stream's shard under the action's partitionKey so a subsequent GetRecords returns it.
+
+Traces: iot__kinesis.topic-rule-kinesis-action-missing-put-record-permission-rejected.
+
+## Evidence
+Check: [mismatch] iot__kinesis.topic-rule-kinesis-action-missing-put-record-permission-rejected — "Error: Check timed out after 60.0s". Not marked ALREADY FILED and not marked OWNED in the suite report.
+
+Expected (AWS): on one stream created by kinesis CreateStream(ShardCount=1), with two sibling topic rules whose kinesis actions name that stream — rule A's roleArn an IAM role trusted by iot.amazonaws.com with an inline Allow of kinesis:PutRecord on the stream ARN, rule B's roleArn the same trust with NO kinesis:PutRecord grant — publishing {"marker": <marker_good>} to rule A's topic and {"marker": <marker_bad>} to rule B's topic yields, within the delivery window, exactly one record decoding to the rule-A payload and never any record carrying marker_bad, even after a later rule-A publish has already landed. iot-data Publish answers 200 for both topics.
+
+Actual (emulator): both Publish calls answer 200, and GetShardIterator(StreamName=<stream>, ShardId=<shard>, ShardIteratorType=TRIM_HORIZON) + GetRecords(Limit=100) returns an empty Records list on every poll for the whole window, for BOTH legs. The check is killed at the harness cap, failing its positive control with "positive control: no record for marker_good=<marker> appeared after repeated publishes — the correctly-permissioned sibling rule must deliver, or this check cannot distinguish 'enforced' from 'broken'" (fixed text; marker_good is a per-run uuid from the request). Its real assertion — "a kinesis action whose role grants no kinesis:PutRecord on this stream still delivered a record for marker_bad=<marker>" (fixed text; marker_bad is a per-run uuid) — is never evaluated. Stream names, role names, rule names, topics and markers are per-run values and are not part of the requirement; the requirement is the delivered/not-delivered differential.
+
+## Steps to Reproduce
+1. Boot the emulator. kinesis CreateStream(StreamName=<stream>, ShardCount=1); wait stream_exists; DescribeStream for StreamARN and Shards[0].ShardId.
+2. iam CreateRole <good> with a trust policy for Service=iot.amazonaws.com (Condition aws:SourceAccount=<account>), then PutRolePolicy allowing kinesis:PutRecord on <StreamARN>. iam CreateRole <bad> with the same trust policy and NO inline policy.
+3. iot CreateTopicRule(ruleName=<rg>, topicRulePayload={sql: "SELECT * FROM '<topic_good>'", awsIotSqlVersion: "2016-03-23", ruleDisabled: false, actions: [{kinesis: {roleArn: <good arn>, streamName: <stream>, partitionKey: "sim2real-partition"}}]}) — observe 200. Repeat for <rb> / <topic_bad> / <bad arn>.
+4. iot-data Publish(topic=<topic_good>, qos=1, payload={"marker":"<marker_good>"}) and Publish(topic=<topic_bad>, qos=1, payload={"marker":"<marker_bad>"}) — both answer 200.
+5. kinesis GetShardIterator(TRIM_HORIZON) + GetRecords(Limit=100) on <shard>, repeatedly: Records stays empty. Neither marker_good (which MUST appear) nor marker_bad (which must NOT) is ever observable, so the permission boundary cannot be distinguished from a rules engine that never ran.
+6. Replay: iot__kinesis.topic-rule-kinesis-action-missing-put-record-permission-rejected.
