@@ -21,14 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Codec for the opaque `ListGateways` pagination token (hex of the page boundary).
+# Codec for the opaque `ListGateways` pagination token (hex of the page boundary), and for
+# the hex fingerprint of a hypervisor ARN a synced machine's name carries.
 hex = { workspace = true }
+# Digest behind that fingerprint, so one hypervisor record's synced inventory is derived
+# from its whole ARN.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
 hex = { workspace = true }
 
 [lints]

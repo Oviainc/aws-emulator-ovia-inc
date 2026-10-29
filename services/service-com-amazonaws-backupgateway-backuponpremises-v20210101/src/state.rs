@@ -74,8 +74,10 @@
 //! WHICH machines an inventory holds is this emulator's own answer ([`synced_inventory`]):
 //! it stands in for the on-premises hypervisor as much as for the service, and has no
 //! VMware host to enumerate, so a sync reports a bounded set of machines derived from the
-//! identity of the hypervisor record itself. Every sync of one record reports the same
-//! machines — which is what makes a re-sync idempotent — and no two records share one.
+//! WHOLE identity of the hypervisor record — the complete ARN it is keyed under, every
+//! segment of it, and not the resource-id segment alone, which is minted per region and so
+//! repeats across regions. Every sync of one record reports the same machines — which is
+//! what makes a re-sync idempotent — and no two records share one.
 //!
 //! Every listing pages through one helper ([`page_of_where`], handing back a [`Page`]),
 //! so a page boundary and the token that encodes it mean the same thing whichever
@@ -137,6 +139,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
+
+use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     BandwidthRateLimitInterval, Gateway, GatewayDetails, Hypervisor, HypervisorDetails,
@@ -716,6 +720,19 @@ pub const SYNCED_VIRTUAL_MACHINES: usize = 3;
 /// [`synced_inventory`] reports for a machine is kept inside.
 pub const MAX_VIRTUAL_MACHINE_NAME: usize = 100;
 
+/// How many hex digits of a hypervisor record's identity FINGERPRINT the name of a machine
+/// in its inventory carries ([`hypervisor_fingerprint`], [`synced_machine_name`]).
+///
+/// A fingerprint and not the ARN itself because `VirtualMachine$Name` is
+/// `@length(min: 1, max: 100)` with pattern `^[a-zA-Z0-9-]*$`
+/// (`smithy_query(query="shape",shape="VirtualMachine")`): an ARN of this service is at
+/// least 50 characters (`ResourceArn`'s own `@length`) and separates its segments with
+/// `:`, which that pattern admits nowhere, so no name can spell one out — while joining
+/// the segments with a character the pattern does admit is not reversible, because the
+/// segments contain that character themselves. 16 hex digits are 64 bits of the digest,
+/// which keeps the name far inside [`MAX_VIRTUAL_MACHINE_NAME`] however long the ARN is.
+const HYPERVISOR_FINGERPRINT_DIGITS: usize = 16;
+
 /// The inventory folder the `VirtualMachine$Path` of a discovered machine sits in: a path
 /// "is the path of the virtual machine" in its hypervisor's inventory
 /// (`smithy_query(query="shape",shape="VirtualMachine",member="Path")`), which on a VMware
@@ -1244,11 +1261,16 @@ pub struct VirtualMachineInventory {
 ///
 /// This emulator stands in for the on-premises hypervisor as much as for the service, and
 /// it has no VMware host to enumerate — so the inventory is derived from the IDENTITY of
-/// the hypervisor record itself: the resource id of the ARN this store minted for it,
-/// which no request chose. Two consequences, both of them the point: every sync of one
-/// hypervisor reports exactly the machines the previous sync did, so a re-sync re-finds
-/// each machine by its [`StoredVirtualMachine::path`] and updates the record it already
-/// has rather than minting a second one; and no two hypervisors report the same machine.
+/// the hypervisor record itself: the WHOLE ARN this store minted for it, which no request
+/// chose. Whole, because the ARN is a record's only identity and every segment of it
+/// carries part of that identity: the resource id behind it is minted per (kind, region)
+/// ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::mint_resource`]), so the
+/// first hypervisor of every region shares one, and a derivation over that segment alone
+/// would publish one set of machines for all of them. Two consequences, both of them the
+/// point: every sync of one hypervisor reports exactly the machines the previous sync did,
+/// so a re-sync re-finds each machine by its [`StoredVirtualMachine::path`] and updates the
+/// record it already has rather than minting a second one; and no two hypervisors —
+/// whichever regions they were imported in — report the same machine.
 ///
 /// `LastBackupDate` is absent on every machine: a virtual machine is backed up by a backup
 /// plan outside this model, and no operation here records one, so a machine this service
@@ -1257,13 +1279,9 @@ pub struct VirtualMachineInventory {
 /// machine ON the hypervisor, and the hypervisor this emulator stands in for attaches
 /// none.
 pub fn synced_inventory(hypervisor_arn: &str) -> Vec<VirtualMachineInventory> {
-    // A record of this store is always keyed by an ARN minted here, so it always has a
-    // resource id; the resource type stands in for anything else, keeping the reported
-    // name inside the modelled pattern whatever the ARN spells.
-    let hypervisor_id = arn_resource_id(hypervisor_arn).unwrap_or(HYPERVISOR_RESOURCE_TYPE);
     (1..=SYNCED_VIRTUAL_MACHINES)
         .map(|ordinal| {
-            let name = synced_machine_name(hypervisor_id, ordinal);
+            let name = synced_machine_name(hypervisor_arn, ordinal);
             VirtualMachineInventory {
                 path: format!("{SYNCED_INVENTORY_FOLDER}/{name}"),
                 // `VirtualMachine$HostName` targets the same `Name` shape as the machine's
@@ -1280,19 +1298,44 @@ pub fn synced_inventory(hypervisor_arn: &str) -> Vec<VirtualMachineInventory> {
 }
 
 /// The `VirtualMachine$Name` a sync reports for the `ordinal`-th machine of the hypervisor
-/// whose ARN resource id is `hypervisor_id`.
+/// stored under `hypervisor_arn`.
+///
+/// Derived from the WHOLE ARN: the fingerprint of it ([`hypervisor_fingerprint`]) is what
+/// makes the name distinct for every distinct record, and the resource-id segment is kept
+/// in front of that fingerprint because it is the part of the identity a client sees
+/// elsewhere (`VirtualMachine$HypervisorId`), which is what makes a machine's name
+/// readable as a machine OF that hypervisor.
 ///
 /// Every character comes from that resource id, which an ARN segment restricts to
-/// `[a-zA-Z-0-9]`, or from the ordinal — exactly what the member's `^[a-zA-Z0-9-]*$`
-/// pattern accepts — and the id is clipped so the name stays inside
-/// [`MAX_VIRTUAL_MACHINE_NAME`] however long the ARN is.
-fn synced_machine_name(hypervisor_id: &str, ordinal: usize) -> String {
-    let suffix = format!("-vm-{ordinal}");
+/// `[a-zA-Z-0-9]`, from the hex fingerprint, or from the ordinal — exactly what the
+/// member's `^[a-zA-Z0-9-]*$` pattern accepts — and the id, the only unbounded part, is
+/// clipped so the name stays inside [`MAX_VIRTUAL_MACHINE_NAME`] however long the ARN is.
+/// The clip never touches the fingerprint, so clipping cannot bring two records' names
+/// back together.
+fn synced_machine_name(hypervisor_arn: &str, ordinal: usize) -> String {
+    // A record of this store is always keyed by an ARN minted here, so it always has a
+    // resource id; the resource type stands in for anything else, keeping the reported
+    // name inside the modelled pattern whatever the ARN spells.
+    let hypervisor_id = arn_resource_id(hypervisor_arn).unwrap_or(HYPERVISOR_RESOURCE_TYPE);
+    let suffix = format!("-{}-vm-{ordinal}", hypervisor_fingerprint(hypervisor_arn));
     let head: String = hypervisor_id
         .chars()
         .take(MAX_VIRTUAL_MACHINE_NAME.saturating_sub(suffix.len()))
         .collect();
     format!("{head}{suffix}")
+}
+
+/// The fingerprint of the identity of the hypervisor record stored under `hypervisor_arn`:
+/// the first [`HYPERVISOR_FINGERPRINT_DIGITS`] hex digits of the SHA-256 digest of the
+/// whole ARN.
+///
+/// A pure function of that one string, so the inventory [`synced_inventory`] derives from it
+/// is the same at every sync of one record (what makes a re-sync idempotent) and differs
+/// for any two records, which differ in at least one ARN segment — including two records of
+/// two regions, whose resource ids are minted from per-region sequences and so collide.
+fn hypervisor_fingerprint(hypervisor_arn: &str) -> String {
+    let digest = Sha256::digest(hypervisor_arn.as_bytes());
+    hex::encode(&digest[..HYPERVISOR_FINGERPRINT_DIGITS / 2])
 }
 
 /// The property mappings SET for one hypervisor.

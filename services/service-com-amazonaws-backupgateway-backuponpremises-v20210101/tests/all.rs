@@ -79,6 +79,8 @@ mod resource_tagging_spans_every_resource;
 mod resource_untagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/synced_inventory_is_per_hypervisor_record.rs"]
+mod synced_inventory_is_per_hypervisor_record;
 #[path = "all/tag_value_spaces.rs"]
 mod tag_value_spaces;
 #[path = "all/virtual_machine_inventory_sync.rs"]
