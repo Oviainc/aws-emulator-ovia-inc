@@ -2637,6 +2637,18 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// ClassicLink. Written through [`Self::set_vpc_classic_link_enabled`] and reported
     /// through [`Self::vpc_classic_link_view`]; see [`classic_link`].
     pub classic_link_enabled_vpcs: BTreeSet<String>,
+    /// The VPCs the account has enabled ClassicLink DNS SUPPORT for, by `VpcId`.
+    ///
+    /// A SECOND, independent fact of a VPC beside [`Self::classic_link_enabled_vpcs`]:
+    /// whether a linked EC2-Classic instance's DNS hostname resolves to its private address
+    /// (`ClassicLinkDnsSupport$ClassicLinkDnsSupported`), which the modelled [`Vpc`] shape
+    /// carries no member for either. A SET for the same reason — membership is the whole
+    /// fact — and a VPC it does not hold has no DNS support, which is what AWS reports for a
+    /// VPC nobody has enabled it for. A VPC's entry goes out with the VPC in
+    /// [`Self::remove_vpc`]. Starts EMPTY: a fresh account has enabled it for no VPC. Written
+    /// through [`Self::set_vpc_classic_link_dns_enabled`] and reported through
+    /// [`Self::classic_link_dns_support_view`]; see [`classic_link`].
+    pub classic_link_dns_enabled_vpcs: BTreeSet<String>,
     /// A `RunInstances` `ClientToken` and the reservation it minted, so a repeat
     /// of the same request returns that reservation instead of launching again.
     pub client_tokens: HashMap<String, String>,
@@ -3954,6 +3966,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             classic_link_instances: BTreeMap::new(),
             // A fresh account has enabled no VPC for ClassicLink either.
             classic_link_enabled_vpcs: BTreeSet::new(),
+            // Nor enabled ClassicLink DNS support for one.
+            classic_link_dns_enabled_vpcs: BTreeSet::new(),
             client_tokens: HashMap::new(),
             assigned_private_ips: ::std::collections::HashSet::new(),
             stored_bytes: 0,
@@ -19815,6 +19829,9 @@ impl ComAmazonawsEc2Amazonec2State {
         // start out not enabled for ClassicLink, never from what an enable left behind for a
         // VPC that no longer exists.
         self.classic_link_enabled_vpcs.remove(vpc_id);
+        // And so does its ClassicLink DNS support, on the same terms: the two enablements are
+        // separate facts of the VPC, and neither may outlive it.
+        self.classic_link_dns_enabled_vpcs.remove(vpc_id);
         // The Region's DHCP option set does NOT go with the VPC: one set is shared by every
         // VPC of the Region and outlives all of them, as it does on AWS, so a delete leaves
         // [`Self::dhcp_options`] alone.

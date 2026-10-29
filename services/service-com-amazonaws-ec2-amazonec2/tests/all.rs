@@ -660,6 +660,10 @@ mod vpc_block_public_access_exclusions;
 // ClassicLink enablement the store keeps per VPC, what a disable changes and what it refuses.
 #[path = "all/vpc_classic_link.rs"]
 mod vpc_classic_link;
+// `DescribeVpcClassicLinkDnsSupport`: the ClassicLink DNS support the store keeps per VPC,
+// what the describe reports for each VPC it resolves, how it pages, and what it refuses.
+#[path = "all/vpc_classic_link_dns_support.rs"]
+mod vpc_classic_link_dns_support;
 #[path = "all/vpc_endpoint_connection_notifications.rs"]
 mod vpc_endpoint_connection_notifications;
 #[path = "all/vpc_endpoint_connections.rs"]

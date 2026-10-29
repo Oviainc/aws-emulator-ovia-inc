@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVpcClassicLinkDnsSupport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVpcClassicLinkDnsSupport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVpcClassicLinkDnsSupport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the ClassicLink DNS support status of the VPCs this service's state holds —
+//! whether each resolves a linked EC2-Classic instance's DNS hostname to its private address
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::classic_link_dns_enabled_vpcs`], which
+//! `Enable`/`DisableVpcClassicLinkDnsSupport` write), projected through
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::classic_link_dns_support_view`] — narrowed
+//! by the `VpcIds` the request names and paged by its `MaxResults`/`NextToken`. A READ: it
+//! writes nothing at all.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +142,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVpcClassicLinkDnsSupport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVpcClassicLinkDnsSupportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVpcClassicLinkDnsSupport"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            MAX_RESOURCE_IDS, PageTokenRule, RESOURCE_TYPE_VPC, decode_page_token,
+            invalid_pagination_token_for, invalid_vpc_id_not_found, page_from_cursor,
+            prefixed_id_is_well_formed, require_service_state, vpc_id_is_not_valid,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — a VPC's
+        // ClassicLink DNS support is a fact of that VPC, not of the Region the request was
+        // signed for. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The IDs of the VPCs" (`VpcIds`): every entry is resolved against the store below,
+        // so the list is capped the way every other EC2 request's id list is, before any work
+        // proportional to it is done.
+        let requested_ids: &[String] = input.vpc_ids.as_deref().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "VpcIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // "The maximum number of items to return for this request" (`MaxResults`). The
+        // modelled `@range` of 5..255 refuses anything outside it before this handler runs,
+        // so the refusal below cannot be reached today — but a page size is REFUSED rather
+        // than silently repaired, so widening that range can never turn into a quietly
+        // truncated page. A request that names none gets the largest page this operation
+        // serves, so the `NextToken` path behaves the same either way.
+        let limit = match input.max_results {
+            None => MAX_VPCS_PER_PAGE,
+            Some(max_results) => usize::try_from(max_results)
+                .ok()
+                .filter(|page_size| (MIN_VPCS_PER_PAGE..=MAX_VPCS_PER_PAGE).contains(page_size))
+                .ok_or_else(|| {
+                    Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{max_results}' for maxResults. It must be between \
+                         {MIN_VPCS_PER_PAGE} and {MAX_VPCS_PER_PAGE}"
+                    ))
+                })?,
+        };
+
+        // "The token returned from a previous paginated request" (`NextToken`) — anything
+        // else is refused rather than read as an id, and refused against the store's contents
+        // nowhere: whether a bogus token is caught never depends on what the account holds,
+        // only on the token itself.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // Every id the request names is resolved before anything is reported, and a value
+        // that is no VPC id at all is refused before a well-formed one the account holds no
+        // VPC for: they are different client mistakes, and the service answers the first
+        // without looking the value up. Neither is an absent row — a describe that names a
+        // VPC the account does not hold is a refusal, the way every other describe of a VPC
+        // answers one.
+        for vpc_id in requested_ids {
+            if !prefixed_id_is_well_formed(RESOURCE_TYPE_VPC, vpc_id) {
+                return Err(vpc_id_is_not_valid(vpc_id));
+            }
+            if !store.vpcs.contains_key(vpc_id) {
+                return Err(invalid_vpc_id_not_found(vpc_id));
+            }
+        }
+
+        // A set, so narrowing by `VpcIds` costs one lookup per stored VPC rather than a scan
+        // of the requested list, and a repeated id cannot multiply the work or the rows.
+        let wanted: ::std::collections::HashSet<&str> =
+            requested_ids.iter().map(String::as_str).collect();
+
+        // The default is to report every VPC the account holds; the ids narrow that set to
+        // those named. A VPC nobody has enabled ClassicLink DNS support for is reported as
+        // not supporting it rather than left out: the status is a fact every VPC has.
+        let mut selected: Vec<ClassicLinkDnsSupport> = Vec::new();
+        for vpc_id in store.vpcs.keys() {
+            // The id narrowing is read off the key, so a VPC the request did not name costs
+            // no projection at all.
+            if !wanted.is_empty() && !wanted.contains(vpc_id.as_str()) {
+                continue;
+            }
+            if let Some(view) = store.classic_link_dns_support_view(vpc_id) {
+                selected.push(view);
+            }
+        }
+
+        // Page in `VpcId` order, which the cursor below names a position in. The store is an
+        // ordered map, so its iteration order already satisfies this sort; doing it here
+        // establishes the invariant the cursor depends on at the point of use rather than
+        // inheriting it from the container `crate::state` happens to hold.
+        selected.sort_by(|left, right| left.vpc_id.cmp(&right.vpc_id));
+
+        // "This value is null when there are no more items to return" (`NextToken`): a token
+        // only when a further VPC follows the page this call answered.
+        let (page, next_token) = page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            PageTokenRule::WhenAnotherItemFollows,
+            |vpc| vpc.vpc_id.as_deref().unwrap_or_default(),
+        );
+
+        Ok(DescribeVpcClassicLinkDnsSupportOutput {
+            vpcs: Some(page.to_vec()),
+            next_token,
+        })
     }
 }
+
+/// The most VPCs this operation reports in one page: the top of the modelled `@range` on
+/// `DescribeVpcClassicLinkDnsSupportMaxResults` (5..255,
+/// `smithy_query(query="operation",operation="DescribeVpcClassicLinkDnsSupport")`), which is
+/// also what a request naming no `MaxResults` gets, so one page is bounded however the
+/// request is written.
+const MAX_VPCS_PER_PAGE: usize = 255;
+
+/// The fewest VPCs a request may ask for in one page: the bottom of that same modelled
+/// `@range` (5..255).
+const MIN_VPCS_PER_PAGE: usize = 5;

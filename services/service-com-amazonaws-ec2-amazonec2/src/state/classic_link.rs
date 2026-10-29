@@ -45,6 +45,19 @@
 //! [`ComAmazonawsEc2Amazonec2State::vpc_classic_link_view`] is the one projection of it into
 //! the modelled `VpcClassicLink` shape, so a writer and a reporter cannot disagree about one
 //! VPC's status.
+//!
+//! ## DNS support is a SECOND fact of the VPC
+//!
+//! Whether a VPC resolves a linked EC2-Classic instance's DNS hostname to its private address
+//! is enablement of its own — `Enable`/`DisableVpcClassicLinkDnsSupport` set it and
+//! `DescribeVpcClassicLinkDnsSupport` reports it — so it is held in a second set keyed by the
+//! same `VpcId` ([`ComAmazonawsEc2Amazonec2State::classic_link_dns_enabled_vpcs`]) rather
+//! than inferred from the ClassicLink enablement above: a VPC may be enabled for ClassicLink
+//! with DNS support off, and the two are written by different operations.
+//! [`ComAmazonawsEc2Amazonec2State::set_vpc_classic_link_dns_enabled`] is the one way that
+//! flag is written and
+//! [`ComAmazonawsEc2Amazonec2State::classic_link_dns_support_view`] the one projection of it
+//! into the modelled `ClassicLinkDnsSupport` shape.
 
 use super::*;
 
@@ -232,4 +245,79 @@ impl ComAmazonawsEc2Amazonec2State {
             tags: Some(vpc.tags.clone().unwrap_or_default()),
         })
     }
+
+    /// Set whether the VPC `vpc_id` resolves a linked EC2-Classic instance's DNS hostname to
+    /// its private address, and answer whether the store took the change.
+    ///
+    /// `false` means NOTHING was written and the caller must refuse the request rather than
+    /// report a status it did not set, exactly as [`Self::set_vpc_classic_link_enabled`]
+    /// does: the account holds no such VPC, and the store never holds the DNS support status
+    /// of a VPC that is not there, so a describe cannot report one.
+    ///
+    /// The ONE seam a VPC's ClassicLink DNS support is written through, so the operations
+    /// that set it cannot disagree about what the flag means: `EnableVpcClassicLinkDnsSupport`
+    /// must write `true` and `DisableVpcClassicLinkDnsSupport` `false` through it rather than
+    /// touching the store itself. Both are still scaffolds, so its only caller today is this
+    /// crate's tests — the seam those operations have to write through, not dead code, the
+    /// same position [`Self::link_classic_link_vpc`] is in. Idempotent: setting the value a
+    /// VPC already holds leaves the store exactly as it was.
+    pub fn set_vpc_classic_link_dns_enabled(&mut self, vpc_id: &str, enabled: bool) -> bool {
+        if !self.vpcs.contains_key(vpc_id) {
+            return false;
+        }
+        if enabled {
+            self.classic_link_dns_enabled_vpcs.insert(vpc_id.to_string());
+        } else {
+            self.classic_link_dns_enabled_vpcs.remove(vpc_id);
+        }
+        true
+    }
+
+    /// Does the VPC `vpc_id` have ClassicLink DNS support?
+    ///
+    /// The one reading of [`Self::classic_link_dns_enabled_vpcs`]: a VPC the set does not
+    /// hold does not, so a VPC nobody has enabled it for and one it has been disabled for
+    /// again answer the same — which is what AWS reports for both.
+    pub fn vpc_has_classic_link_dns_support(&self, vpc_id: &str) -> bool {
+        self.classic_link_dns_enabled_vpcs.contains(vpc_id)
+    }
+
+    /// The modelled `ClassicLinkDnsSupport` for `vpc_id`, or `None` when the account holds no
+    /// such VPC.
+    ///
+    /// The one projection of a VPC's ClassicLink DNS support status, so every operation that
+    /// reports one reports it identically — the DNS-support counterpart of
+    /// [`Self::vpc_classic_link_view`]. The shape carries only the two members, so there is
+    /// nothing to read off the VPC record beyond its existence.
+    pub fn classic_link_dns_support_view(
+        &self,
+        vpc_id: &str,
+    ) -> Option<crate::ops::types::ClassicLinkDnsSupport> {
+        self.vpcs.get(vpc_id)?;
+        Some(crate::ops::types::ClassicLinkDnsSupport {
+            vpc_id: Some(vpc_id.to_string()),
+            classic_link_dns_supported: Some(self.vpc_has_classic_link_dns_support(vpc_id)),
+        })
+    }
+}
+
+/// Refuse a `VpcId` that is no VPC id at all on the surfaces that word it this way: HTTP 400
+/// [`INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED`] (`InvalidVpcId.Malformed`) with the sentence
+/// `<value> is not a valid VPC id`, built from the value the REQUEST sent and bounded by
+/// [`MAX_ECHOED_VPC_ID_CHARS`] the way every other echoed VPC id is.
+///
+/// The same wire code as [`invalid_vpc_id_malformed`] in a DIFFERENT wording, and a second
+/// named constructor rather than a literal at a call site for the reason
+/// [`crate::scaffolded::Scaffolded::instance_id_is_malformed`] is one: EC2's per-operation
+/// validators do not word an unreadable id the same way, WHICH wording an operation answers
+/// is a fact of that operation, and keeping both here is what stops a third call site from
+/// inventing a third. `DescribeVpcClassicLinkDnsSupport` is the operation recorded answering
+/// this one, for a `VpcIds` entry outside the `vpc-` id form.
+pub fn vpc_id_is_not_valid<E>(vpc_id: &str) -> Scaffolded<E> {
+    let echoed: String = vpc_id.chars().take(MAX_ECHOED_VPC_ID_CHARS).collect();
+    Scaffolded::service_error(
+        INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED,
+        400,
+        format!("{echoed} is not a valid VPC id"),
+    )
 }
