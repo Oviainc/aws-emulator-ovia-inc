@@ -48,6 +48,9 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 # The SDK's `RequestId`, to report the Lambda request id of a failed action-point
 # invocation in the refusal the gated call answers with.
 aws-types = { version = "1", default-features = false }
+# JSON Schema evaluator: the verdict a `JSON_SCHEMA` validator of a configuration
+# profile gives about a candidate configuration (`state::validators`).
+boon = "0.6"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

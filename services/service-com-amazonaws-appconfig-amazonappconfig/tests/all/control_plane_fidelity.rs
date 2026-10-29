@@ -433,6 +433,8 @@ async fn a_not_found_message_is_the_template_of_the_kind_that_was_looked_up() {
     // implementation. They are NOT uniform: the hosted configuration version's recorded
     // message ends WITHOUT a full stop where every other one ends with it, the
     // deployment strategy's names no account, and the extension's echoes no identifier.
+    // The deployment's labels its number by the lowerCamelCase wire spelling
+    // (`deploymentNumber`) where it labels the two resource ids title-cased.
     let rows: Vec<(&str, String, String)> = vec![
         (
             "an application nothing holds",
@@ -478,7 +480,7 @@ async fn a_not_found_message_is_the_template_of_the_kind_that_was_looked_up() {
             format!("/applications/{application}/environments/{environment}/deployments/7"),
             format!(
                 "Deployment with Application Id {application}, Environment Id {environment}, and \
-                 Deployment Number 7 could not be found for account {account}."
+                 deploymentNumber 7 could not be found for account {account}."
             ),
         ),
         (

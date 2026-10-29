@@ -4,12 +4,15 @@
 //!
 //! The rule under test, in one sentence: a delete of an application that answers its
 //! modelled 204 has taken the application record — and with it everything this service
-//! stores inside that record: its environments with the deployments started into them,
-//! its configuration profiles with the versions hosted in them, and its experiment
-//! definitions — out of the store, so every later call addressed through that application
-//! id is refused with `ResourceNotFoundException` (HTTP 404) and the hosted-content budget
-//! those versions held is given back, while an application id the account does not hold is
-//! refused the same 404 and removes nothing.
+//! still stores inside that record — out of the store, so every later call addressed
+//! through that application id is refused with `ResourceNotFoundException` (HTTP 404) and
+//! the hosted-content budget the versions under it held is given back, while an application
+//! id the account does not hold is refused the same 404 and removes nothing.
+//!
+//! An application that still holds children is not deletable at all: that gate, and the
+//! refusal it answers with, is pinned by `application_deletion_gate`, so every row here
+//! tears the children down first — bottom-up, as AppConfig's ordering contract asks — and
+//! what the delete is asserted on is the record that is left.
 //!
 //! Every case drives real HTTP requests through the router the emulator's front door
 //! uses, so what is asserted is what an AppConfig client sees on the wire. The one
@@ -368,13 +371,62 @@ fn reads(built: &Built) -> Vec<(String, String)> {
     calls
 }
 
-/// A deleted application is gone with everything stored under it: every reader of the
+/// Delete every child the row built, bottom-up — the hosted versions, then the profiles
+/// that held them, then the environments — so the application is the leaf its own delete
+/// needs it to be.
+///
+/// Each of these deletes is itself owed its modelled 204, which is what makes the teardown
+/// AppConfig's documented way out: the gate on the application's delete is child existence,
+/// so removing the children is what opens it.
+async fn teardown_children(router: &MultiServiceRouter, case: &str, built: &Built) {
+    let application = &built.application;
+    for (profile, version) in &built.hosted {
+        let answer = send(
+            router,
+            "DELETE",
+            &format!(
+                "/applications/{application}/configurationprofiles/{profile}/hostedconfigurationversions/{version}"
+            ),
+            "application/json",
+            Vec::new(),
+            &[],
+        )
+        .await;
+        assert_deleted(case, "DeleteHostedConfigurationVersion", &answer);
+    }
+    for profile in &built.profiles {
+        let answer = send(
+            router,
+            "DELETE",
+            &format!("/applications/{application}/configurationprofiles/{profile}"),
+            "application/json",
+            Vec::new(),
+            &[],
+        )
+        .await;
+        assert_deleted(case, "DeleteConfigurationProfile", &answer);
+    }
+    for environment in &built.environments {
+        let answer = send(
+            router,
+            "DELETE",
+            &format!("/applications/{application}/environments/{environment}"),
+            "application/json",
+            Vec::new(),
+            &[],
+        )
+        .await;
+        assert_deleted(case, "DeleteEnvironment", &answer);
+    }
+}
+
+/// A deleted application is gone with everything still stored under it: every reader of the
 /// application and of any resource addressed through it misses, the WRITER is refused
 /// rather than resurrecting it, the tag reader misses, the listing no longer serves it, a
 /// second delete misses, the hosted-content budget its versions held is released — and a
 /// sibling application and its own subtree are untouched.
 #[tokio::test]
-async fn a_deleted_application_is_gone_with_everything_stored_under_it() {
+async fn a_deleted_application_is_gone_with_everything_still_stored_under_it() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
     let account = account();
@@ -480,6 +532,9 @@ async fn a_deleted_application_is_gone_with_everything_stored_under_it() {
         );
         let held_before = held_bytes(&engine);
 
+        // The application is a container, so its own delete is refused while a child is
+        // still there; the children go first, bottom-up.
+        teardown_children(&router, case, &built).await;
         let deleted = delete_application(&router, &application).await;
         assert_deleted(case, "DeleteApplication", &deleted);
 

@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteApplication
-//! IMPLEMENTED: takes an application, and everything stored under it, out of this
-//! service's state, so every later reader and writer of that id misses on it.
+//! IMPLEMENTED: takes an application out of this service's state once it is a leaf, so
+//! every later reader and writer of that id misses on it, and refuses the delete while
+//! the application still holds children.
 //!
-//! Taking the children with it is deliberate, and is what "Deletes an application." is
-//! read as here: AppConfig states a prerequisite where it has one — `DeleteExtension`
-//! documents "You must delete all associations to an extension before you delete the
-//! extension", and a configuration profile's own delete is refused while it still holds
-//! hosted versions — and the application's delete states none, so no refusal is invented
-//! for it. The children are held inside the application record, so they cannot outlive
-//! it.
+//! The refusal is the gate AppConfig puts on a CONTAINER resource: while an environment or
+//! a configuration profile still exists under the application the delete is a
+//! `BadRequestException` (HTTP 400) naming the child kind in the way, and the application
+//! and its children are left exactly as they were — the same rule a configuration
+//! profile's own delete applies to the hosted versions it owns, one level down the same
+//! tree. The gate is on child EXISTENCE and not on deployment state, so a deployment in
+//! flight neither blocks this call nor excuses it.
 //!
 //! ## Shape of an operation
 //!
@@ -171,19 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        // The delete IS the removal of the stored record. An application is the root of
-        // this service's tree — its environments (with the deployments started into
-        // them), its configuration profiles (with the configuration versions hosted in
-        // them) and its experiment definitions (with their runs) are held INSIDE the
-        // application record — so taking that record out takes them with it: once this
-        // answers 204, `GetApplication`, `UpdateApplication`, `ListApplications`, the
-        // tagging operations and every operation addressed through this application id
-        // all miss on it, because each of them reads the map this took it out of.
-        //
         // `ApplicationId` is an id rather than an "ID or name" identifier, so it is
         // looked up as the stored key, exactly as `GetApplication` and
         // `UpdateApplication` look it up.
-        let Some(removed) = store.remove_application(&input.application_id) else {
+        let Some(application) = store.application(&input.application_id) else {
             // An attribution record for the refusal: which resource was addressed and
             // what this call answered, so a destructive call that changed nothing leaves
             // a trace beside the ones that did.
@@ -202,10 +194,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The configuration content those profiles were holding is no longer stored, so
-        // the account-wide budget `CreateHostedConfigurationVersion` reserved for it is
-        // given back — the same accounting `DeleteHostedConfigurationVersion` does when a
-        // single version goes, so this service is never left charged for bytes it dropped.
+        // An application OWNS the environments and the configuration profiles created
+        // under it, and AppConfig does not cascade that ownership away: while a child of
+        // either kind is still there the delete is a bad request naming that kind, and the
+        // caller is told to remove the children first — the same gate
+        // `DeleteConfigurationProfile` applies to the hosted versions it owns, one level
+        // down the same tree. The refusal is taken BEFORE anything is removed, so it
+        // changes nothing a later caller sees: the application stays readable and
+        // listable, and its children stay listed under it.
+        //
+        // The gate is on child EXISTENCE, not on deployment state: a deployment in flight
+        // neither blocks this delete nor is what blocks it, and an environment is
+        // deletable while one is running.
+        let blocking_children = if !application.environments.is_empty() {
+            Some(crate::state::ENVIRONMENTS)
+        } else if !application.profiles.is_empty() {
+            Some(crate::state::CONFIGURATION_PROFILES)
+        } else {
+            None
+        };
+        if let Some(children) = blocking_children {
+            tracing::debug!(
+                operation = "DeleteApplication",
+                outcome = "BadRequestException",
+                application_id = input.application_id.as_str(),
+                environments = application.environments.len(),
+                configuration_profiles = application.profiles.len(),
+                blocking_children = children,
+                "refused an application delete"
+            );
+            return Err(DeleteApplicationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::application_still_has_children(
+                        &input.application_id,
+                        children,
+                    )),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
+
+        // The delete IS the removal of the stored record. The application holds no
+        // environment and no configuration profile (the refusal above), so what goes with
+        // it is the record itself and the experiment definitions written under it, which
+        // are held INSIDE it: once this answers 204, `GetApplication`,
+        // `UpdateApplication`, `ListApplications`, the tagging operations and every
+        // operation addressed through this application id all miss on it, because each of
+        // them reads the map this took it out of.
+        let Some(removed) = store.remove_application(&input.application_id) else {
+            // The application was resolved under this same guard a moment ago, so this is
+            // reachable only if the store stopped holding it while the lock was held.
+            return Err(DeleteApplicationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The application could not be re-read while deleting it".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The application held no configuration profile — the gate above refuses the
+        // delete while one is there — so there is no hosted configuration content going
+        // with it and nothing to give back. The accounting is still done over what was
+        // removed, so this call cannot leave the service charged for bytes it dropped
+        // whatever the tree under the removed record held.
         let released: usize = removed
             .profiles
             .values()
@@ -213,9 +268,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .sum();
         store.release_hosted_configuration_bytes(released);
 
-        // An attribution record for the removal, so the one call that takes a whole
-        // subtree out of this service's state is observable with what went with it.
-        tracing::debug!(
+        // An attribution record for the removal, so the one call that takes a stored
+        // resource out of this service's state is observable at the level a default
+        // subscriber keeps, beside its refusals.
+        tracing::info!(
             operation = "DeleteApplication",
             outcome = "deleted",
             application_id = removed.id.as_str(),

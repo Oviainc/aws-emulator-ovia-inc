@@ -16,6 +16,10 @@
 //! produces NO verdict vetoes nothing, because a refusal reported for it would be a verdict
 //! no validator gave.
 //!
+//! A `JSON_SCHEMA` validator's verdict is the subject of `json_schema_validator_gate`; here
+//! it appears as one entry beside a `LAMBDA` one, to pin that the list is run whatever the
+//! types in it are.
+//!
 //! The suite mounts AWS Lambda beside AppConfig on one engine, because a `LAMBDA`
 //! validator's verdict comes from a function that lives in another service and is invoked
 //! over the in-process callback.
@@ -128,7 +132,7 @@ fn missing_function(name: &str) -> String {
 }
 
 /// One entry of a profile's `Validators` list.
-fn validator(validator_type: &str, content: &str) -> Value {
+pub(crate) fn validator(validator_type: &str, content: &str) -> Value {
     json!({ "Type": validator_type, "Content": content })
 }
 
@@ -287,7 +291,7 @@ async fn validate_configuration(
 }
 
 /// Assert `answer` is the modelled 400 refusal of a call a validator did not pass.
-fn assert_bad_request(case: &str, answer: &Answer) {
+pub(crate) fn assert_bad_request(case: &str, answer: &Answer) {
     assert_eq!(
         answer.status,
         400,
@@ -305,7 +309,7 @@ fn assert_bad_request(case: &str, answer: &Answer) {
 
 /// Assert `answer` is the modelled refusal of a call a validator did not pass, and that
 /// its `Message` is derived from the request rather than from any one recorded run.
-fn assert_refused(case: &str, answer: &Answer, profile: &str, version: &str, kind: &str) {
+pub(crate) fn assert_refused(case: &str, answer: &Answer, profile: &str, version: &str, kind: &str) {
     assert_bad_request(case, answer);
     let message = answer.string("Message").unwrap_or_default();
     let expected = format!(
@@ -320,17 +324,23 @@ fn assert_refused(case: &str, answer: &Answer, profile: &str, version: &str, kin
 
 /// The configuration documents every table below runs its validators against.
 ///
-/// Rows differ along what the gate must be indifferent to: the document's size, its shape,
-/// its media type and whether it is JSON at all. A validator's verdict is about the
-/// content, so the gate has to hold for every form content takes.
-fn contents() -> Vec<(&'static str, &'static [u8])> {
+/// Rows differ along what a `LAMBDA` gate must be indifferent to: the document's size, its
+/// shape, its media type and whether it is JSON at all. A validator's verdict is about the
+/// content, so the gate has to hold for every form content takes. The last column says
+/// whether the document is a JSON OBJECT, which is what the `JSON_SCHEMA` entry below is
+/// asked about.
+pub(crate) fn contents() -> Vec<(&'static str, &'static [u8], bool)> {
     vec![
-        ("a small JSON object", br#"{"allow_caching":true}"#),
-        ("a JSON array", br#"["alpha","beta"]"#),
-        ("a nested JSON object", br#"{"db":{"host":"h","port":5432}}"#),
-        ("a JSON scalar", b"42"),
-        ("text that is not JSON", b"allow_caching = true"),
-        ("an empty document", b" "),
+        ("a small JSON object", br#"{"allow_caching":true}"#, true),
+        ("a JSON array", br#"["alpha","beta"]"#, false),
+        (
+            "a nested JSON object",
+            br#"{"db":{"host":"h","port":5432}}"#,
+            true,
+        ),
+        ("a JSON scalar", b"42", false),
+        ("text that is not JSON", b"allow_caching = true", false),
+        ("an empty document", b" ", false),
     ]
 }
 
@@ -349,7 +359,7 @@ async fn a_lambda_validator_that_rejects_refuses_the_deployment_and_leaves_nothi
     let strategy = given_strategy(&router, "lambda-gate-instant").await;
     let rejecting = missing_function("nobody-created-me");
 
-    for (index, (case, content)) in contents().into_iter().enumerate() {
+    for (index, (case, content, _is_json_object)) in contents().into_iter().enumerate() {
         // One environment per row, so each row's deployment numbering starts at the same
         // place and the refusal's effect on it is readable. Resources are named by the
         // row's index, because `Name` is `length 1..64`.
@@ -433,11 +443,14 @@ async fn every_validator_in_the_list_is_run_and_the_first_rejection_decides() {
     let strategy = given_strategy(&router, "two-validators-instant").await;
     let rejecting = validator("LAMBDA", &missing_function("nobody-created-me"));
     // A function this emulator holds and cannot run yields no verdict, so it neither
-    // rejects nor shadows a validator beside it; a schema validator yields none either.
+    // rejects nor shadows a validator beside it.
     let silent = validator(
         "LAMBDA",
         &given_active_function(&router, &engine, "silent-validator").await,
     );
+    // The content every row below deploys is a JSON object, which this schema allows, so
+    // this entry is run and reports nothing — its own verdicts are pinned by
+    // `json_schema_validator_gate`.
     let schema = validator("JSON_SCHEMA", r#"{"type":"object"}"#);
 
     let rows = [
@@ -453,12 +466,12 @@ async fn every_validator_in_the_list_is_run_and_the_first_rejection_decides() {
             true,
         ),
         (
-            "a schema validator sits before the one that rejects",
+            "a schema validator the content satisfies sits before the one that rejects",
             vec![schema.clone(), rejecting.clone()],
             true,
         ),
         (
-            "neither validator gives a verdict",
+            "neither validator reports the content non-compliant",
             vec![schema.clone(), silent.clone()],
             false,
         ),
@@ -593,50 +606,72 @@ async fn validate_configuration_reports_the_verdict_and_changes_nothing() {
     let strategy = given_strategy(&router, "validated-instant").await;
     let silent = given_active_function(&router, &engine, "silent-validator").await;
 
-    // Rows differ along the validators the profile carries — none, one of each type that
-    // gives no verdict, and one that rejects — and the content they run against.
-    let rows: Vec<(&str, Vec<Value>, bool)> = vec![
-        ("no validators", Vec::new(), false),
+    // Rows differ along the validators the profile carries — none, one that gives no
+    // verdict, one whose verdict is about the content, and one that rejects — and the
+    // content they run against. `Verdict` says what the row's validators report for one
+    // content document.
+    enum Verdict {
+        /// Nothing reports the content non-compliant, whatever it is.
+        Silent,
+        /// The `LAMBDA` validator's invocation is refused, whatever the content is.
+        Lambda,
+        /// The `JSON_SCHEMA` validator allows a JSON object and nothing else, so the
+        /// verdict follows the content.
+        JsonObjectOnly,
+    }
+
+    let rows: Vec<(&str, Vec<Value>, Verdict)> = vec![
+        ("no validators", Vec::new(), Verdict::Silent),
         (
-            "a schema validator",
+            "a schema validator allowing only an object",
             vec![validator("JSON_SCHEMA", r#"{"type":"object"}"#)],
-            false,
+            Verdict::JsonObjectOnly,
         ),
         (
             "a lambda validator this emulator cannot run",
             vec![validator("LAMBDA", &silent)],
-            false,
+            Verdict::Silent,
         ),
         (
             "a lambda validator whose invocation is refused",
             vec![validator("LAMBDA", &missing_function("nobody-created-me"))],
-            true,
+            Verdict::Lambda,
         ),
     ];
 
-    for (index, (case, validators, rejects)) in rows.into_iter().enumerate() {
+    for (index, (case, validators, verdict)) in rows.into_iter().enumerate() {
         let profile =
             given_profile(&router, &application, &format!("checked-{index}"), &validators).await;
-        for (content_case, content) in contents() {
+        for (content_case, content, is_json_object) in contents() {
             let case = format!("{case}, {content_case}");
             let version = given_version(&router, &application, &profile, &case, content).await;
             let answer = validate_configuration(&router, &application, &profile, &version).await;
-            if rejects {
-                assert_refused(&case, &answer, &profile, &version, "LAMBDA");
-            } else {
-                assert_eq!(
-                    answer.status,
-                    204,
-                    "case {case:?}: no validator reported this content non-compliant, so the \
-                     modelled 204 is owed, got {} / {}",
-                    answer.status,
-                    String::from_utf8_lossy(&answer.body)
-                );
-                assert!(
-                    answer.body.is_empty(),
-                    "case {case:?}: the 204 carries no body, got {}",
-                    String::from_utf8_lossy(&answer.body)
-                );
+            let refusing_kind = match verdict {
+                Verdict::Silent => None,
+                Verdict::Lambda => Some("LAMBDA"),
+                Verdict::JsonObjectOnly => (!is_json_object).then_some("JSON_SCHEMA"),
+            };
+            match refusing_kind {
+                Some("LAMBDA") => assert_refused(&case, &answer, &profile, &version, "LAMBDA"),
+                // The schema's refusal carries AppConfig's own schema-violation template,
+                // which `json_schema_validator_gate` pins in full; here only the modelled
+                // 400 answer is asserted.
+                Some(_) => assert_bad_request(&case, &answer),
+                None => {
+                    assert_eq!(
+                        answer.status,
+                        204,
+                        "case {case:?}: no validator reported this content non-compliant, so \
+                         the modelled 204 is owed, got {} / {}",
+                        answer.status,
+                        String::from_utf8_lossy(&answer.body)
+                    );
+                    assert!(
+                        answer.body.is_empty(),
+                        "case {case:?}: the 204 carries no body, got {}",
+                        String::from_utf8_lossy(&answer.body)
+                    );
+                }
             }
         }
         // A version the profile does not hold is not found, whatever its validators are.

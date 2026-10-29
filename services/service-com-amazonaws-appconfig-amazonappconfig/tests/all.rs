@@ -15,6 +15,8 @@
 mod account_settings_document;
 #[path = "all/appconfig_workflow.rs"]
 mod appconfig_workflow;
+#[path = "all/application_deletion_gate.rs"]
+mod application_deletion_gate;
 #[path = "all/application_name_uniqueness.rs"]
 mod application_name_uniqueness;
 #[path = "all/aws_authored_extensions.rs"]
@@ -39,6 +41,8 @@ mod delete_experiment_definition;
 mod delete_extension_association;
 #[path = "all/delete_hosted_configuration_version.rs"]
 mod delete_hosted_configuration_version;
+#[path = "all/deployment_not_found_message.rs"]
+mod deployment_not_found_message;
 #[path = "all/deployment_strategy_patch_paces_deployments.rs"]
 mod deployment_strategy_patch_paces_deployments;
 #[path = "all/deployment_wire_fidelity.rs"]
@@ -65,6 +69,8 @@ mod extensions;
 mod feature_flag_metadata;
 #[path = "all/get_configuration.rs"]
 mod get_configuration;
+#[path = "all/json_schema_validator_gate.rs"]
+mod json_schema_validator_gate;
 #[path = "all/list_applications.rs"]
 mod list_applications;
 #[path = "all/list_configuration_profiles.rs"]

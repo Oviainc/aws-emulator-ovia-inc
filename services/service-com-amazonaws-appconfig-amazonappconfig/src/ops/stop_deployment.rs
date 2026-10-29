@@ -258,17 +258,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
         let mut store = state.lock();
 
-        // Resolve every resource the request names before anything is written.
-        let Some(application) = store.application_mut(&input.application_id) else {
+        // The application the stop is scoped to is resolved first, as every operation
+        // addressed through an application id resolves it. BELOW that level the resource
+        // this request addresses is the DEPLOYMENT, so an environment that no longer holds
+        // it and a number the environment never issued are both reported as the deployment
+        // that could not be found — the same way `GetDeployment` reports them, which is the
+        // refusal recorded for a deployment whose environment has since been deleted.
+        if store.application(&input.application_id).is_none() {
             return Err(not_found(
                 crate::state::application_not_found(&input.application_id),
                 input.application_id,
             ));
-        };
-        let Some(environment) = application.environments.get_mut(&input.environment_id) else {
+        }
+        let Some(environment) = store
+            .application_mut(&input.application_id)
+            .and_then(|application| application.environments.get_mut(&input.environment_id))
+        else {
             return Err(not_found(
-                crate::state::environment_not_found(&input.application_id, &input.environment_id),
-                input.environment_id,
+                crate::state::deployment_not_found(
+                    &input.application_id,
+                    &input.environment_id,
+                    input.deployment_number,
+                ),
+                input.deployment_number.to_string(),
             ));
         };
 

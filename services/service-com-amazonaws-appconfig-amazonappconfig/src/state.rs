@@ -2886,6 +2886,12 @@ pub fn configuration_version_not_hosted(
 }
 
 /// `Message` for a deployment number the named environment never issued.
+///
+/// The deployment's template labels its two resource ids as the other refusals of this
+/// service do — title-cased, one word per word — and its deployment number by the
+/// lowerCamelCase WIRE spelling of the member it came from, `deploymentNumber`: a label is
+/// the token that kind's own message carries, so this one keeps the casing asymmetry the
+/// recorded refusal has rather than re-casing every label one way.
 pub fn deployment_not_found(
     application_id: &str,
     environment_id: &str,
@@ -2896,7 +2902,7 @@ pub fn deployment_not_found(
         &[
             ("Application Id", application_id),
             ("Environment Id", environment_id),
-            ("Deployment Number", &deployment_number.to_string()),
+            ("deploymentNumber", &deployment_number.to_string()),
         ],
         AccountClause::Reported,
         NOT_FOUND_FULL_STOP,
@@ -3012,6 +3018,30 @@ pub fn configuration_profile_still_has_hosted_versions(configuration_profile_id:
     format!(
         "Cannot delete configuration profile {configuration_profile_id} because there are still \
          hosted configuration versions existing under it."
+    )
+}
+
+/// The child resources an application OWNS, in the order a delete of the application
+/// checks for them, each written as the refusal of that delete names the kind.
+///
+/// An environment is checked before a configuration profile, as the recorded refusal of an
+/// application holding one of each shows: it names the environments.
+pub const ENVIRONMENTS: &str = "environments";
+/// See [`ENVIRONMENTS`].
+pub const CONFIGURATION_PROFILES: &str = "configuration profiles";
+
+/// `Message` for a delete refused because the addressed application still holds child
+/// resources of the kind `children` names.
+///
+/// The same rule as [`configuration_profile_still_has_hosted_versions`], one level up the
+/// resource tree: AppConfig will not take a container resource out of the tree while the
+/// children it owns are still there, so the caller is told WHICH application is blocked and
+/// by which kind of child, and the sentence is derived from the request's own application id
+/// rather than stored.
+pub fn application_still_has_children(application_id: &str, children: &str) -> String {
+    format!(
+        "Cannot delete application {application_id}, because there are still {children} \
+         existing under it."
     )
 }
 

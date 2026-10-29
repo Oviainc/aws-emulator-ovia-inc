@@ -211,6 +211,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `UpdateEnvironment`, `ListEnvironments`, `GetDeployment` and the tagging
         // operations all miss on this environment, because each of them reads the map
         // this took it out of.
+        //
+        // A deployment IN FLIGHT into the environment does not hold this delete up: the
+        // gate AppConfig puts on a delete is the existence of the resources the container
+        // OWNS (`DeleteApplication`'s environments, `DeleteConfigurationProfile`'s hosted
+        // versions), and a deployment is work on the environment rather than a resource
+        // under it.
         if application
             .environments
             .remove(&input.environment_id)

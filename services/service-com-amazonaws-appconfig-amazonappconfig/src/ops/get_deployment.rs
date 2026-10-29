@@ -206,31 +206,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             let mut store = state.lock();
 
-            let Some(application) = store.application_mut(&input.application_id) else {
+            // The application the lookup is scoped to is resolved first, as every operation
+            // addressed through an application id resolves it. BELOW that level the
+            // resource this request addresses is the DEPLOYMENT, so an environment that no
+            // longer holds it — a deleted environment took its deployments with it — and a
+            // number the environment never issued are both reported as the deployment that
+            // could not be found, which is the refusal recorded for the first of those. The
+            // deployment's own template names both parent ids, so nothing a level-by-level
+            // refusal would say is withheld by reporting the miss that way.
+            if store.application(&input.application_id).is_none() {
                 return Err(not_found(
                     crate::state::application_not_found(&input.application_id),
                     input.application_id,
                 ));
-            };
-            let Some(environment) = application.environments.get_mut(&input.environment_id) else {
-                return Err(not_found(
-                    crate::state::environment_not_found(
-                        &input.application_id,
-                        &input.environment_id,
-                    ),
-                    input.environment_id,
-                ));
-            };
+            }
+            let resolved = store
+                .application_mut(&input.application_id)
+                .and_then(|application| application.environments.get_mut(&input.environment_id))
+                .is_some_and(|environment| {
+                    // Reporting a deployment materialises only what the CLOCK already made
+                    // due — the growth steps, the bake period and the completion the
+                    // strategy's own durations schedule. Nothing here depends on this call
+                    // happening.
+                    environment.materialize(now);
+                    environment
+                        .deployments
+                        .contains_key(&input.deployment_number)
+                });
 
-            // Reporting a deployment materialises only what the CLOCK already made due —
-            // the growth steps, the bake period and the completion the strategy's own
-            // durations schedule. Nothing here depends on this call happening.
-            environment.materialize(now);
-
-            if !environment
-                .deployments
-                .contains_key(&input.deployment_number)
-            {
+            if !resolved {
                 return Err(not_found(
                     crate::state::deployment_not_found(
                         &input.application_id,
