@@ -472,16 +472,28 @@ pub fn decode_page_token(token: &str) -> Option<String> {
     String::from_utf8(::hex::decode(token).ok()?).ok()
 }
 
+/// The position a request's `NextToken` names, or `None` when it names none.
+///
+/// The model admits the empty token (`NextToken` is len 0..4096) and the framework
+/// binds a bare `?NextToken=` to `Some("")`, so a read is handed an empty token by a
+/// caller that asked to continue from nowhere. An empty token names no position, so
+/// every read of this service takes it for no token at all and answers the first page
+/// rather than refusing it; only a token that names something is a token a read has to
+/// recognise or refuse. This is the one place that distinction is made, so no read can
+/// disagree with another about it.
+pub fn requested_page_token(token: Option<&str>) -> Option<&str> {
+    token.filter(|token| !token.is_empty())
+}
+
 /// Whether `token` is a continuation token an UNPAGINATED read was handed.
 ///
 /// A read the model declares no pagination for reports its whole result in one
-/// response and so mints no continuation token at all; every non-empty `NextToken`
-/// presented to one is therefore a token this service could not have issued, and the
-/// read refuses it with `InvalidNextTokenException` instead of answering a silently
-/// partial list. The empty token the model admits (`NextToken` is len 0..4096) names
-/// no position, so it reads as no token at all.
+/// response and so mints no continuation token at all; every `NextToken` that names a
+/// position ([`requested_page_token`]) presented to one is therefore a token this
+/// service could not have issued, and the read refuses it with
+/// `InvalidNextTokenException` instead of answering a silently partial list.
 pub fn is_unmintable_page_token(token: Option<&str>) -> bool {
-    token.is_some_and(|token| !token.is_empty())
+    requested_page_token(token).is_some()
 }
 
 // ---------------------------------------------------------------------------

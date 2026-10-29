@@ -14,7 +14,9 @@
 //! that names it gets at most that many tasks and a `NextToken` while a further one
 //! exists, and a request that names none gets every matching task in one response with
 //! no `NextToken`. The model declares no default page size, so the report a caller did
-//! not bound is not truncated at one.
+//! not bound is not truncated at one. A `NextToken` that names no position — the empty
+//! one the model admits — is no token at all
+//! ([`crate::state::requested_page_token`]), so it is answered with the first page.
 //!
 //! One response still materialises at most [`REPORT_MATERIALISATION_CEILING`] tasks —
 //! not a page size, but the window this handler will ever build in memory at once, so
@@ -227,11 +229,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A token must be one this service minted, for this request's filter; anything
-        // else is refused before any state is read, so a garbage or foreign token can
-        // never read as "first page". The message is the service's fixed one for this
-        // code, so it says nothing about the token the caller sent.
-        let after = match input.next_token.as_deref() {
+        // A token that names a position must be one this service minted, for this
+        // request's filter; anything else is refused before any state is read, so a
+        // garbage or foreign token can never read as "first page". The message is the
+        // service's fixed one for this code, so it says nothing about the token the
+        // caller sent. A token that names NO position — the empty one the model admits,
+        // which is what a bare `?NextToken=` binds to — is no token at all, exactly as
+        // this service's other reads take it, so it starts at the first page.
+        let after = match crate::state::requested_page_token(input.next_token.as_deref()) {
             Some(token) => Some(
                 decode_task_cursor(token, input.status.as_deref()).ok_or_else(|| {
                     ListSpeechSynthesisTasksErrorModeled::InvalidNextTokenException(
