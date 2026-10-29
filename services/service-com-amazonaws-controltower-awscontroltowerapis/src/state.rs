@@ -318,20 +318,54 @@ pub fn version_downgrade_message(deployed: &str, requested: &str) -> Option<Stri
     ))
 }
 
+/// The length window the modelled `RegionName` bounds a Region name by
+/// (`smithy_query query="shape" shape="Region,RegionName"`: `Region$name` targets
+/// `RegionName`, whose length is 1..50).
+pub const REGION_NAME_LENGTH: ::std::ops::RangeInclusive<usize> = 1..=50;
+
+/// Whether `name` is an Amazon Web Services Region name.
+///
+/// A Region name is hyphen-separated groups of lowercase ASCII letters — the Region's
+/// geography and its position within it — closed by the Region's number (`us-west-2`,
+/// `eu-central-1`, `ap-southeast-4`, `us-gov-east-1`), and it is also bounded by
+/// [`REGION_NAME_LENGTH`], the window the member this service reports a Region name
+/// through declares. A value outside either is not a Region name this service could
+/// report, so it is not a Region name it accepts.
+pub fn is_region_name(name: &str) -> bool {
+    if !REGION_NAME_LENGTH.contains(&name.len()) {
+        return false;
+    }
+    // The number closes the name, and the geography and position groups precede it.
+    let Some((position, number)) = name.rsplit_once('-') else {
+        return false;
+    };
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    position.split('-').count() >= 2
+        && position.split('-').all(|group| {
+            !group.is_empty() && group.bytes().all(|byte| byte.is_ascii_lowercase())
+        })
+}
+
 /// What one documented `Manifest` member's value must be.
 ///
 /// The manifest's full schema "is not published, by design"
 /// (`UpdateLandingZoneInput$manifest`), so a member is constrained only as far as the
-/// user guide's example manifest documents it ("Launch your landing zone"): its JSON
-/// type, and for an account id the 12-digit form every AWS account id has. Anything the
+/// user guide's example manifest documents it ("Launch your landing zone") and as far as
+/// the member this service REPORTS its value through declares: its JSON type, and for a
+/// value with a form of its own — an account id, a Region name — that form. Anything the
 /// manifest carries beyond these members is accepted and stored unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestMemberKind {
     /// A JSON object, whose own members are not constrained further.
     Object,
-    /// A JSON array of strings — AWS Region names. May be empty: a manifest that governs
-    /// no region leaves the governed-region list empty rather than omitting it.
-    StringList,
+    /// A JSON array of Amazon Web Services Region names, each one a name
+    /// [`is_region_name`] accepts: this service reports these back through a member the
+    /// model length-bounds, so a string no Region name could be is not one of them. May
+    /// be empty: a manifest that governs no region leaves the governed-region list empty
+    /// rather than omitting it.
+    RegionNameList,
     /// A 12-digit Amazon Web Services account id, as a JSON string.
     AccountId,
     /// A JSON boolean.
@@ -343,28 +377,54 @@ pub enum ManifestMemberKind {
 impl ManifestMemberKind {
     /// Whether `value` is of this kind.
     pub fn accepts(self, value: &::aws_smithy_types::Document) -> bool {
+        self.rejection(value).is_none()
+    }
+
+    /// What `value` is, when it is not of this kind — the "got …" clause of the refusal
+    /// that reports it — or `None` when `value` is of this kind.
+    ///
+    /// A list's ENTRIES are part of what the kind requires, so a list of the right JSON
+    /// type holding a value the kind does not carry is reported against that entry: the
+    /// caller is told which value to change rather than that the array it sent is an
+    /// array.
+    pub fn rejection(self, value: &::aws_smithy_types::Document) -> Option<String> {
         use ::aws_smithy_types::Document;
 
         match self {
-            Self::Object => matches!(value, Document::Object(_)),
-            Self::StringList => match value {
-                Document::Array(items) => {
-                    items.iter().all(|item| matches!(item, Document::String(_)))
-                }
-                _ => false,
+            Self::Object => match value {
+                Document::Object(_) => None,
+                other => Some(document_kind(other).to_string()),
+            },
+            Self::RegionNameList => match value {
+                Document::Array(items) => items.iter().find_map(|item| match item {
+                    Document::String(name) if is_region_name(name) => None,
+                    Document::String(name) => Some(format!(
+                        "the entry {name:?}, which is not an Amazon Web Services Region name"
+                    )),
+                    other => Some(format!("an entry that is {}", document_kind(other))),
+                }),
+                other => Some(document_kind(other).to_string()),
             },
             Self::AccountId => match value {
-                Document::String(account_id) => {
-                    account_id.len() == 12 && account_id.bytes().all(|b| b.is_ascii_digit())
+                Document::String(account_id)
+                    if account_id.len() == 12
+                        && account_id.bytes().all(|byte| byte.is_ascii_digit()) =>
+                {
+                    None
                 }
-                _ => false,
+                other => Some(document_kind(other).to_string()),
             },
-            Self::Boolean => matches!(value, Document::Bool(_)),
+            Self::Boolean => match value {
+                Document::Bool(_) => None,
+                other => Some(document_kind(other).to_string()),
+            },
             Self::NamedOrganizationalUnit => match value {
-                Document::Object(members) => {
-                    matches!(members.get("name"), Some(Document::String(_)))
+                Document::Object(members)
+                    if matches!(members.get("name"), Some(Document::String(_))) =>
+                {
+                    None
                 }
-                _ => false,
+                other => Some(document_kind(other).to_string()),
             },
         }
     }
@@ -373,7 +433,7 @@ impl ManifestMemberKind {
     pub fn requirement(self) -> &'static str {
         match self {
             Self::Object => "a JSON object",
-            Self::StringList => "a JSON array of Amazon Web Services Region names",
+            Self::RegionNameList => "a JSON array of Amazon Web Services Region names",
             Self::AccountId => "a 12-digit Amazon Web Services account id, as a string",
             Self::Boolean => "a JSON boolean",
             Self::NamedOrganizationalUnit => {
@@ -403,7 +463,7 @@ impl ManifestMemberKind {
 /// everything else the manifest carries is accepted and stored unchanged, because the
 /// schema as a whole is unpublished.
 pub const REQUIRED_MANIFEST_MEMBERS: &[(&str, ManifestMemberKind)] = &[
-    ("governedRegions", ManifestMemberKind::StringList),
+    ("governedRegions", ManifestMemberKind::RegionNameList),
     ("organizationStructure", ManifestMemberKind::Object),
     (
         "organizationStructure.security",
@@ -487,24 +547,23 @@ pub fn manifest_defect(manifest: &::aws_smithy_types::Document) -> Option<String
                     kind.requirement()
                 ))
             }
-            Some(value) if !kind.accepts(value) => {
-                return Some(format!(
-                    "manifest member {path:?} must be {}, got {}",
-                    kind.requirement(),
-                    document_kind(value)
-                ))
+            Some(value) => {
+                if let Some(rejection) = kind.rejection(value) {
+                    return Some(format!(
+                        "manifest member {path:?} must be {}, got {rejection}",
+                        kind.requirement()
+                    ));
+                }
             }
-            Some(_) => {}
         }
     }
 
     for (path, kind) in OPTIONAL_MANIFEST_MEMBERS {
         if let Some(value) = manifest_member(manifest, path) {
-            if !kind.accepts(value) {
+            if let Some(rejection) = kind.rejection(value) {
                 return Some(format!(
-                    "manifest member {path:?} must be {}, got {}",
-                    kind.requirement(),
-                    document_kind(value)
+                    "manifest member {path:?} must be {}, got {rejection}",
+                    kind.requirement()
                 ));
             }
         }
@@ -1580,6 +1639,11 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
     /// control enablement then falls back to the region its request was signed for. The
     /// account holds at most one landing zone; the ARN order makes the choice total
     /// anyway, so the answer never depends on the map's iteration order.
+    ///
+    /// Every entry of a stored manifest's list is a Region name ([`is_region_name`],
+    /// enforced by [`manifest_defect`] before the manifest is stored), so what this
+    /// answers can be reported through the length-bounded member that carries a Region
+    /// name as it stands.
     pub fn governed_regions(&self) -> Vec<String> {
         use ::aws_smithy_types::Document;
 
@@ -3799,10 +3863,16 @@ pub fn document_weight_within(document: &::aws_smithy_types::Document, cap: usiz
 }
 
 /// The region this request was signed for, or [`DEFAULT_REGION`] when it carries no
-/// SigV4 credential scope.
+/// SigV4 credential scope, or one whose region is not a Region name.
+///
+/// This value is both built into every ARN this service mints and reported back as the
+/// Region an enablement names, a member bounded by [`REGION_NAME_LENGTH`], so a
+/// credential scope whose region is no Region name ([`is_region_name`]) names no region
+/// at all and is read the same way as a request that carries no scope.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
+        .filter(|region| is_region_name(region))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
