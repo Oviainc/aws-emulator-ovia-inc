@@ -3281,10 +3281,10 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// (`CreateInput`, `UpdateInput`), applied to the record that WOULD be
     /// stored, so the two cannot accept configurations the other refuses:
     ///
-    /// * every id the configuration names must resolve to a resource this
-    ///   account holds — an input security group, an SdiSource, a claimed input
-    ///   device. Those resources are what the input ingests through, and each
-    ///   derives the inputs using it from this store
+    /// * every id the write ADDS to the configuration must resolve to a resource
+    ///   this account holds — an input security group, an SdiSource, a claimed
+    ///   input device. Those resources are what the input ingests through, and
+    ///   each derives the inputs using it from this store
     ///   ([`Self::inputs_using_security_group`], [`Self::inputs_using_sdi_source`]),
     ///   so an id nothing minted would leave the input claiming a resource no
     ///   read of the account can show.
@@ -3301,7 +3301,20 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// a VPC rather than with public Internet addresses", and the latter lives
     /// "in a customer network" (`InputNetworkLocation`), so neither is reached
     /// through an input security group of this account.
-    pub fn input_configuration_error(&self, input: &InputRecord) -> Option<String> {
+    ///
+    /// `held` is the input as the store HOLDS it — `None` for a create, which
+    /// adds every id it names. An id the held record already names is NOT
+    /// resolved again: it is part of the configuration this input already
+    /// claims, so a write that adds nothing to a reference list is never refused
+    /// for it. Only the ids a write ADDS are resolved, which is what keeps a
+    /// write that changes other members (a rename) possible after a referenced
+    /// resource whose delete this service accepts while an input still uses it
+    /// (an input security group, [`delete_input_security_group`]) has gone.
+    pub fn input_configuration_error(
+        &self,
+        input: &InputRecord,
+        held: Option<&InputRecord>,
+    ) -> Option<String> {
         if input.vpc.is_some() {
             if !input.security_groups.is_empty() {
                 return Some(VPC_WITH_SECURITY_GROUPS_MESSAGE.to_string());
@@ -3310,7 +3323,11 @@ impl ComAmazonawsMedialiveMedialiveState {
                 return Some(VPC_WITHOUT_ROLE_ARN_MESSAGE.to_string());
             }
         }
+        let held_groups: &[String] = held.map_or(&[], |held| &held.security_groups);
         for group in &input.security_groups {
+            if held_groups.contains(group) {
+                continue;
+            }
             if self.live_input_security_group(group).is_none() {
                 return Some(unknown_reference_message(
                     "inputSecurityGroups",
@@ -3319,7 +3336,11 @@ impl ComAmazonawsMedialiveMedialiveState {
                 ));
             }
         }
+        let held_sdi_sources: &[String] = held.map_or(&[], |held| &held.sdi_sources);
         for source in &input.sdi_sources {
+            if held_sdi_sources.contains(source) {
+                continue;
+            }
             if self
                 .sdi_sources
                 .get(source)
@@ -3332,6 +3353,14 @@ impl ComAmazonawsMedialiveMedialiveState {
             let Some(id) = device.id.as_deref().filter(|id| !id.is_empty()) else {
                 return Some(missing_reference_id_message("inputDevices"));
             };
+            let held_device = held.is_some_and(|held| {
+                held.input_devices
+                    .iter()
+                    .any(|device| device.id.as_deref() == Some(id))
+            });
+            if held_device {
+                continue;
+            }
             if self.input_device(id).is_none() {
                 return Some(unknown_reference_message("inputDevices", "input device", id));
             }

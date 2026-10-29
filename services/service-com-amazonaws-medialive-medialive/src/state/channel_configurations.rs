@@ -14,12 +14,13 @@
 //! * a channel configuration has to declare the encoder settings the channel
 //!   encodes through (`EncoderSettings` is "Encoder Settings"), so a request that
 //!   declares none describes no channel this service could run;
-//! * every id the configuration names has to resolve to a resource this account
-//!   holds — an `InputAttachment`'s `InputId` is "The ID of the input", a
-//!   `ChannelSecurityGroups` entry is one of the "IDs for all the Input Security
-//!   Groups attached to the channel", and `AnywhereSettings` carries "The ID of
-//!   the cluster for the channel" and "The ID of the channel placement group for
-//!   the channel" — and an id no such resource of this account answers to would
+//! * every id the write ADDS to the configuration has to resolve to a resource
+//!   this account holds — an `InputAttachment`'s `InputId` is "The ID of the
+//!   input", a `ChannelSecurityGroups` entry is one of the "IDs for all the Input
+//!   Security Groups attached to the channel", and `AnywhereSettings` carries
+//!   "The ID of the cluster for the channel" and "The ID of the channel placement
+//!   group for the channel" — and an id no such resource of this account answers
+//!   to would
 //!   leave the channel claiming a resource no read of the account can show (and
 //!   the resource-side derivation of the channels using it —
 //!   [`super::ComAmazonawsMedialiveMedialiveState::channels_using_security_group`],
@@ -43,7 +44,7 @@
 use super::{
     blank_reference_id_message, missing_reference_id_message,
     required_channel_configuration_message, unknown_reference_message, validation_problem,
-    ComAmazonawsMedialiveMedialiveState,
+    ChannelRecord, ComAmazonawsMedialiveMedialiveState,
 };
 use crate::ops::types::{AnywhereSettings, EncoderSettings, InputAttachment, ValidationError};
 
@@ -64,6 +65,38 @@ pub struct ChannelConfiguration<'a> {
     /// `AnywhereSettings` — where the channel runs: the cluster and the channel
     /// placement group inside it.
     pub anywhere_settings: Option<&'a AnywhereSettings>,
+    /// The channel as the store HOLDS it — `None` for a create, which ADDS
+    /// every reference it names.
+    ///
+    /// An id this record already names is part of the configuration the channel
+    /// already claims, so the rule resolves only the ids a write ADDS: a write
+    /// that leaves a reference list alone is never refused for it, however the
+    /// resource it names has fared since.
+    pub held: Option<&'a ChannelRecord>,
+}
+
+impl ChannelConfiguration<'_> {
+    /// Whether the stored channel already attaches the input `id`.
+    fn holds_input(&self, id: &str) -> bool {
+        self.held.is_some_and(|held| {
+            held.input_attachments
+                .iter()
+                .any(|attachment| attachment.input_id.as_deref() == Some(id))
+        })
+    }
+
+    /// Whether the stored channel already names the input security group `id`.
+    fn holds_security_group(&self, id: &str) -> bool {
+        self.held
+            .is_some_and(|held| held.channel_security_groups.iter().any(|group| group == id))
+    }
+
+    /// The `AnywhereSettings` the stored channel is already placed by, which is
+    /// what makes its cluster and its channel placement group ids ones this
+    /// write does not add.
+    fn held_placement(&self) -> Option<&AnywhereSettings> {
+        self.held.and_then(|held| held.anywhere_settings.as_ref())
+    }
 }
 
 /// The member a channel's encoder settings arrive in, as the wire spells it.
@@ -118,6 +151,11 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// `CreateChannelPlacementGroup` resolve the same two ids through) — so a
     /// resource whose delete this service has accepted is no longer one of this
     /// account a new reference can name.
+    ///
+    /// Only the ids the write ADDS are resolved: an id the stored channel
+    /// already names ([`ChannelConfiguration::held`]) is part of the
+    /// configuration that channel already claims, so a write that leaves a
+    /// reference list alone cannot be refused for it.
     pub fn channel_configuration_problems(
         &self,
         configuration: &ChannelConfiguration<'_>,
@@ -142,10 +180,12 @@ impl ComAmazonawsMedialiveMedialiveState {
                     &path,
                     &missing_reference_id_message(INPUT_ATTACHMENTS),
                 )),
-                Some(id) if self.live_input(id).is_none() => problems.push(validation_problem(
-                    &path,
-                    &unknown_reference_message(INPUT_ATTACHMENTS, INPUT, id),
-                )),
+                Some(id) if self.live_input(id).is_none() && !configuration.holds_input(id) => {
+                    problems.push(validation_problem(
+                        &path,
+                        &unknown_reference_message(INPUT_ATTACHMENTS, INPUT, id),
+                    ));
+                }
                 Some(_) => {}
             }
         }
@@ -157,7 +197,9 @@ impl ComAmazonawsMedialiveMedialiveState {
                     &path,
                     &missing_reference_id_message(CHANNEL_SECURITY_GROUPS),
                 ));
-            } else if self.live_input_security_group(group).is_none() {
+            } else if self.live_input_security_group(group).is_none()
+                && !configuration.holds_security_group(group)
+            {
                 problems.push(validation_problem(
                     &path,
                     &unknown_reference_message(
@@ -170,7 +212,7 @@ impl ComAmazonawsMedialiveMedialiveState {
         }
 
         if let Some(settings) = configuration.anywhere_settings {
-            self.collect_anywhere_problems(settings, &mut problems);
+            self.collect_anywhere_problems(configuration, settings, &mut problems);
         }
 
         problems
@@ -188,13 +230,27 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// delete this service has accepted is no longer one a new placement can
     /// name. A group id whose cluster did not resolve is not reported a second
     /// time: the cluster problem already names what the caller must change.
+    ///
+    /// Only the placement a write ADDS is resolved: the pair the stored channel
+    /// is already placed by
+    /// ([`ChannelConfiguration::held_placement`]) is part of the configuration
+    /// the channel already claims.
     fn collect_anywhere_problems(
         &self,
+        configuration: &ChannelConfiguration<'_>,
         settings: &AnywhereSettings,
         problems: &mut Vec<ValidationError>,
     ) {
         let named_cluster = settings.cluster_id.as_deref();
         let named_group = settings.channel_placement_group_id.as_deref();
+        let held = configuration.held_placement();
+        let holds_cluster =
+            |id: &str| held.and_then(|held| held.cluster_id.as_deref()) == Some(id);
+        let holds_group = |cluster_id: &str, group_id: &str| {
+            holds_cluster(cluster_id)
+                && held.and_then(|held| held.channel_placement_group_id.as_deref())
+                    == Some(group_id)
+        };
         let cluster_path = format!("{ANYWHERE_SETTINGS}/{CLUSTER_ID}");
 
         let cluster = match named_cluster.filter(|id| !id.is_empty()) {
@@ -210,7 +266,7 @@ impl ComAmazonawsMedialiveMedialiveState {
                 None
             }
             None => None,
-            Some(id) if self.live_cluster(id).is_none() => {
+            Some(id) if self.live_cluster(id).is_none() && !holds_cluster(id) => {
                 problems.push(validation_problem(
                     &cluster_path,
                     &unknown_reference_message(CLUSTER_ID, CLUSTER, id),
@@ -237,6 +293,7 @@ impl ComAmazonawsMedialiveMedialiveState {
         if self
             .channel_placement_group(cluster_id, group_id)
             .is_none_or(|group| group.is_delete_accepted())
+            && !holds_group(cluster_id, group_id)
         {
             problems.push(validation_problem(
                 &group_path,

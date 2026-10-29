@@ -269,6 +269,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_deref()
                 .unwrap_or_default(),
             anywhere_settings: input.anywhere_settings.as_ref(),
+            // A create holds no stored channel yet, so every reference it names
+            // is one it ADDS and each is resolved.
+            held: None,
         });
         if !problems.is_empty() {
             return Err(unprocessable(problems));

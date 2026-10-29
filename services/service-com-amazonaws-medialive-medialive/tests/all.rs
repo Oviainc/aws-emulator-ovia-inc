@@ -152,6 +152,9 @@ mod event_bridge_rule_template_targets;
 #[path = "all/event_bridge_rule_templates.rs"]
 mod event_bridge_rule_templates;
 
+#[path = "all/held_reference_resolution.rs"]
+mod held_reference_resolution;
+
 #[path = "all/input_configuration_validation.rs"]
 mod input_configuration_validation;
 

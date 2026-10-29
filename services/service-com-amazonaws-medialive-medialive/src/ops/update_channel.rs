@@ -300,6 +300,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .anywhere_settings
                 .as_ref()
                 .or(stored.anywhere_settings.as_ref()),
+            // The stored channel goes in beside the merged configuration, so
+            // only the references this update ADDS are resolved: an id the
+            // channel already names is part of the configuration it already
+            // claims, and a referenced resource that has gone since (an input
+            // security group, whose delete this service accepts while a channel
+            // still names it) must not turn an edit of another member into a
+            // refusal for a member the request never supplied.
+            held: Some(stored),
         });
         if !problems.is_empty() {
             return Err(unprocessable(problems));

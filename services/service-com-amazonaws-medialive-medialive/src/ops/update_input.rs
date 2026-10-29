@@ -17,7 +17,10 @@
 //! account holds, it must carry the ingest list its `Type` ingests through, and
 //! it must keep the `Vpc` member's two cross-member rules. A merged
 //! configuration that breaks it is refused with the modelled
-//! `BadRequestException` (400) before anything is written.
+//! `BadRequestException` (400) before anything is written. Only the references
+//! this request ADDS are resolved — an id the stored input already names is part
+//! of the configuration it already claims — so a referenced resource that has
+//! gone since never turns an edit of another member into a refusal.
 //!
 //! The id is resolved through the LIVE input lookup (`state::live_input`): a delete
 //! this service has accepted keeps the record readable in `DELETING` and then in the
@@ -292,7 +295,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // list its `Type` ingests through, than a create may create one.
         // Refused BEFORE the store is touched, so a rejected update leaves the
         // input exactly as it was.
-        if let Some(message) = state.input_configuration_error(&record) {
+        //
+        // The STORED record goes in beside the merged one, so only the
+        // references this update ADDS are resolved: an id the input already
+        // names is part of the configuration it already claims, and a resource
+        // whose delete this service accepts while an input still uses it (an
+        // input security group) must not turn every later edit of that input —
+        // a rename included — into a refusal for a member the request never
+        // supplied.
+        let held = state.live_input(&input.input_id).ok_or_else(unavailable)?;
+        if let Some(message) = state.input_configuration_error(&record, Some(held)) {
             return Err(UpdateInputErrorModeled::BadRequestException(BadRequestException {
                 message: Some(message),
             })

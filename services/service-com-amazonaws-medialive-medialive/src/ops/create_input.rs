@@ -262,8 +262,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names resolving to a resource this account holds, and the ingest list
         // the requested `Type` ingests through. One rule, shared with
         // `UpdateInput`, so the two cannot disagree about which configurations
-        // exist — and applied before any id is minted.
-        if let Some(message) = state.input_configuration_error(&record) {
+        // exist — and applied before any id is minted. A create holds no stored
+        // record yet, so every reference it names is one it ADDS and each is
+        // resolved.
+        if let Some(message) = state.input_configuration_error(&record, None) {
             return Err(bad_request(&message));
         }
 
