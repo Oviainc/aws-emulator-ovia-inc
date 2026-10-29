@@ -179,6 +179,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `PolicyDocument` is modelled as a bare `String`, so its size and its syntax are
+        // this handler's to refuse, each with the error the model declares for it: 4 KB
+        // is the documented ceiling, and anything that is not a well-formed IAM JSON
+        // policy is "not formatted correctly". Judged FIRST, like every other handler's
+        // checks on the request's OWN members, because they stand in for constraints the
+        // boundary walk cannot apply and that walk runs in front of everything a handler
+        // judges — neither check reads the store or the caller's identity, so neither
+        // waits on the resolution below or on the authorization decision after it.
+        if input.policy_document.len() > crate::state::MAX_POLICY_DOCUMENT_BYTES {
+            return Err(
+                PutResourcePolicyErrorModeled::PolicySizeLimitExceededException(
+                    PolicySizeLimitExceededException {
+                        message: format!(
+                            "The policy document is {} bytes; the limit is {} bytes.",
+                            input.policy_document.len(),
+                            crate::state::MAX_POLICY_DOCUMENT_BYTES
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Some(message) = crate::state::policy_document_refusal(&input.policy_document) {
+            return Err(
+                PutResourcePolicyErrorModeled::MalformedPolicyDocumentException(
+                    MalformedPolicyDocumentException { message },
+                )
+                .into(),
+            );
+        }
+
         // The policy belongs to one app monitor (the `@httpLabel` `Name`), so a name no
         // stored monitor of the region this request was signed for holds — never created,
         // created in another region, or already deleted — has nothing to attach a policy
@@ -221,33 +252,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::app_monitor_not_found(&input.name),
             )
             .into());
-        }
-
-        // `PolicyDocument` is modelled as a bare `String`, so its size and its syntax are
-        // this handler's to refuse, each with the error the model declares for it: 4 KB
-        // is the documented ceiling, and anything that is not a well-formed IAM JSON
-        // policy is "not formatted correctly".
-        if input.policy_document.len() > crate::state::MAX_POLICY_DOCUMENT_BYTES {
-            return Err(
-                PutResourcePolicyErrorModeled::PolicySizeLimitExceededException(
-                    PolicySizeLimitExceededException {
-                        message: format!(
-                            "The policy document is {} bytes; the limit is {} bytes.",
-                            input.policy_document.len(),
-                            crate::state::MAX_POLICY_DOCUMENT_BYTES
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
-        if let Some(message) = crate::state::policy_document_refusal(&input.policy_document) {
-            return Err(
-                PutResourcePolicyErrorModeled::MalformedPolicyDocumentException(
-                    MalformedPolicyDocumentException { message },
-                )
-                .into(),
-            );
         }
 
         // The put must PROVIDE the correct current `PolicyRevisionId`: a request that

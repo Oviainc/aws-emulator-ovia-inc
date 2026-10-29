@@ -45,6 +45,8 @@ mod extended_metric_dimension_entries;
 mod list_app_monitors_page_size;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/member_check_precedence.rs"]
+mod member_check_precedence;
 #[path = "all/metric_definition_declared_members.rs"]
 mod metric_definition_declared_members;
 #[path = "all/metric_definition_validation.rs"]
