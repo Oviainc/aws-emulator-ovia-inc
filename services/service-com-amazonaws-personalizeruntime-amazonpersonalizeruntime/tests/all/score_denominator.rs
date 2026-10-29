@@ -393,7 +393,9 @@ async fn a_ranking_score_does_not_change_with_the_input_list_or_the_filter() {
         }
         let response = emulator.ok(PERSONALIZE_RANKING, body).await;
 
-        // The ranking holds exactly the listed ids the filter kept.
+        // The ranking holds exactly the distinct listed ids the filter kept: an id the
+        // caller repeated names one catalog entry, whose share the ranking already
+        // reports.
         let mut expected: Vec<String> = input_list
             .iter()
             .filter(|id| {
@@ -408,9 +410,11 @@ async fn a_ranking_score_does_not_change_with_the_input_list_or_the_filter() {
         let reported = scores_by_id(&response, "personalizedRanking", "itemId");
         returned.sort();
         expected.sort();
+        expected.dedup();
         assert_eq!(
             returned, expected,
-            "case {case}: the ranking must hold exactly the listed ids its filter kept"
+            "case {case}: the ranking must hold exactly the distinct listed ids its \
+             filter kept"
         );
 
         // Every id the catalog holds keeps the score the whole-catalog call gave it;

@@ -30,10 +30,15 @@
 //!    certainty over the WHOLE stored catalog scored for this request, so an item
 //!    carries the same score however long `inputList` is and whatever `filterArn`
 //!    removed — a ranking of part of the catalog simply sums to less than 1.0.
-//! 4. With no `filterArn`, the result is therefore a PERMUTATION of `inputList`: same
-//!    cardinality, same item ids, ordered by score descending. With a `filterArn`
-//!    ("a filter you created to include items or exclude items from recommendations
-//!    for a given user") the entries the filter removes are not in the ranking.
+//! 4. With no `filterArn`, the result is therefore a PERMUTATION of the DISTINCT ids
+//!    `inputList` names, ordered by score descending. `InputList` carries no
+//!    `@uniqueItems`, so a caller may list an id twice; both occurrences name the one
+//!    catalog entry, whose share of the certainty the ranking already reports, so the
+//!    repeat adds no entry (a repeated id reported twice would report its share twice
+//!    and the reported scores would sum past the one unit of certainty the scored
+//!    catalog apportions). With a `filterArn` ("a filter you created to include items
+//!    or exclude items from recommendations for a given user") the entries the filter
+//!    removes are not in the ranking.
 //! 5. `metadataColumns` is served from the stored item attributes, for EVERY entry
 //!    the response reports: with no `metadataColumns` the `metadata` member is
 //!    omitted entirely, and with `metadataColumns` it is present on every entry,
@@ -107,7 +112,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use crate::state::{self as registry, scoring, Denied, Entity, RecipeType};
@@ -271,10 +276,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //    does not hold. An entry with no catalog record carries no stored
         //    attributes, so the request's filter decides on an empty attribute set: an
         //    INCLUDE filter cannot keep it, an EXCLUDE filter cannot remove it.
+        //
+        //    Each DISTINCT id is reported once. An id the caller listed again names the
+        //    same entry, and an entry's reported score is its share of the one unit of
+        //    certainty spread over the scored catalog, so reporting it a second time
+        //    would hand out that share twice and the ranking would sum past 1.0. The
+        //    FIRST occurrence is the one kept, so repetition changes neither which ids
+        //    come back nor the order a tie between them resolves in.
         let no_attributes: BTreeMap<String, String> = BTreeMap::new();
         let mut ranked: Vec<(usize, f64, usize)> = Vec::new();
         let mut appended: Vec<String> = Vec::new();
+        let mut reported: BTreeSet<&str> = BTreeSet::new();
         for (position, item_id) in input.input_list.iter().enumerate() {
+            if !reported.insert(item_id.as_str()) {
+                continue;
+            }
             match campaign
                 .items
                 .iter()

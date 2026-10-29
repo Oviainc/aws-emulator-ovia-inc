@@ -33,6 +33,8 @@ mod optional_input_refusal_order;
 mod promotion_share;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/repeated_input_list_ids.rs"]
+mod repeated_input_list_ids;
 #[path = "all/request_only_refusal_order.rs"]
 mod request_only_refusal_order;
 #[path = "all/resolution_precedes_optional_input.rs"]

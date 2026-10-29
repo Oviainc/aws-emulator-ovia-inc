@@ -912,7 +912,9 @@ async fn personalized_ranking_is_a_permutation_of_the_input_list() {
             vec!["item-39", "item-0", "item-20", "item-11"],
             4,
         ),
-        ("a repeated id", vec!["item-5", "item-5", "item-9"], 3),
+        // An id the caller repeats names the same catalog entry, which the ranking
+        // already reports, so the repeat adds no entry.
+        ("a repeated id", vec!["item-5", "item-5", "item-9"], 2),
         (
             "an id the training dataset never held",
             vec!["item-5", "no-such-item", "item-9"],
@@ -936,17 +938,18 @@ async fn personalized_ranking_is_a_permutation_of_the_input_list() {
         assert_eq!(
             returned.len(),
             expected_len,
-            "case {case}: the ranking is a permutation of inputList, so it must hold \
-             {expected_len} entries, got {returned:?}"
+            "case {case}: the ranking is a permutation of the distinct ids of inputList, \
+             so it must hold {expected_len} entries, got {returned:?}"
         );
         let mut sorted_returned = returned.clone();
         sorted_returned.sort();
         let mut sorted_input: Vec<String> =
             input_list.iter().map(ToString::to_string).collect();
         sorted_input.sort();
+        sorted_input.dedup();
         assert_eq!(
             sorted_returned, sorted_input,
-            "case {case}: the ranking must hold exactly the ids of inputList"
+            "case {case}: the ranking must hold exactly the distinct ids of inputList"
         );
 
         let returned_scores = scores(&response, "personalizedRanking");
