@@ -398,6 +398,207 @@ async fn create_schema_refuses_a_document_that_is_not_an_avro_record() {
     );
 }
 
+/// A row of the schema-delete table: a schema, and the datasets that reference it when
+/// the delete is attempted.
+struct SchemaDeleteRow {
+    schema: &'static str,
+    /// The dataset types created against this schema inside one group. A group holds at
+    /// most one dataset of each type, so the rows name distinct types; the spellings are
+    /// the model's own documented set for `CreateDatasetRequest$datasetType`
+    /// (`DATASET_TYPE_VALUES` in `src/state.rs`).
+    referencing_types: &'static [&'static str],
+}
+
+const SCHEMA_DELETE_CATALOG: &[SchemaDeleteRow] = &[
+    // Nothing ever referenced it, so the delete succeeds on the first call.
+    SchemaDeleteRow {
+        schema: "orphan-schema",
+        referencing_types: &[],
+    },
+    // The case the recorded unit cited: exactly one dataset references the schema.
+    SchemaDeleteRow {
+        schema: "my-interactions",
+        referencing_types: &["Interactions"],
+    },
+    // Several datasets reference one schema, so the refusal has to hold until the LAST
+    // reference goes, not just until the first is deleted.
+    SchemaDeleteRow {
+        schema: "shared_schema_3",
+        referencing_types: &["Items", "Users", "Actions"],
+    },
+];
+
+/// The `message` an awsJson error body carries, or `""`.
+fn error_message(body: &Value) -> &str {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+/// Create a dataset of `dataset_type` against `schema_arn` in `group_arn`, and return its
+/// ARN.
+async fn create_dataset(
+    emulator: &Emulator,
+    group_arn: &str,
+    schema_arn: &str,
+    dataset_type: &str,
+    case: &str,
+) -> String {
+    let (status, body) = emulator
+        .call(
+            "CreateDataset",
+            json!({
+                "name": format!("ds-{}", dataset_type.to_ascii_lowercase()),
+                "schemaArn": schema_arn,
+                "datasetGroupArn": group_arn,
+                "datasetType": dataset_type,
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected CreateDataset to answer 200, got {status} {body:?}"
+    );
+    body["datasetArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a datasetArn, got {body:?}"))
+        .to_string()
+}
+
+/// Assert `operation` on `arn` succeeds.
+async fn assert_deleted(emulator: &Emulator, operation: &str, member: &str, arn: &str, case: &str) {
+    let (status, body) = emulator.call_with_arn(operation, member, arn).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected {operation} to answer 200, got {status} {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_schema_is_deleted_only_once_no_dataset_references_it() {
+    let emulator = Emulator::new();
+
+    for row in SCHEMA_DELETE_CATALOG {
+        let case = format!(
+            "schema {} referenced by {:?}",
+            row.schema, row.referencing_types
+        );
+        let group_arn = create_active_group(&emulator, &format!("{}-dsg", row.schema), &case).await;
+        let schema_arn =
+            create_schema(&emulator, row.schema, &avro_schema("Interactions"), &case).await;
+
+        let mut outstanding: Vec<String> = Vec::new();
+        for dataset_type in row.referencing_types {
+            outstanding
+                .push(create_dataset(&emulator, &group_arn, &schema_arn, dataset_type, &case).await);
+        }
+
+        // Every reference has to go before the schema may: while any dataset names it,
+        // the delete is refused and changes nothing.
+        while let Some(dataset_arn) = outstanding.pop() {
+            let (status, body) = emulator
+                .call_with_arn("DeleteSchema", "schemaArn", &schema_arn)
+                .await;
+            assert_eq!(
+                status, 409,
+                "case {case:?}: expected DeleteSchema to answer HTTP 409 while {} dataset(s) \
+                 reference it, got {status} {body:?}",
+                outstanding.len() + 1
+            );
+            assert!(
+                error_code(&body).contains("ResourceInUseException"),
+                "case {case:?}: expected ResourceInUseException, got {body:?}"
+            );
+            let message = error_message(&body);
+            assert!(
+                message.contains(&schema_arn) && message.contains(&dataset_arn),
+                "case {case:?}: expected the message to name the schema {schema_arn} it \
+                 refused to delete and the dataset {dataset_arn} still referencing it, got \
+                 {message:?}"
+            );
+
+            // The refused delete left the schema exactly where it was.
+            let (status, body) = emulator
+                .call_with_arn("DescribeSchema", "schemaArn", &schema_arn)
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the refused DeleteSchema to leave the schema \
+                 describable, got {status} {body:?}"
+            );
+
+            assert_deleted(&emulator, "DeleteDataset", "datasetArn", &dataset_arn, &case).await;
+        }
+
+        // With the last reference gone the delete succeeds, and the schema is really gone:
+        // a read answers 404 and a second delete has nothing to find.
+        assert_deleted(&emulator, "DeleteSchema", "schemaArn", &schema_arn, &case).await;
+        assert_fails(
+            &emulator,
+            "DescribeSchema",
+            "schemaArn",
+            &schema_arn,
+            404,
+            "ResourceNotFoundException",
+            &case,
+        )
+        .await;
+        assert_fails(
+            &emulator,
+            "DeleteSchema",
+            "schemaArn",
+            &schema_arn,
+            404,
+            "ResourceNotFoundException",
+            &case,
+        )
+        .await;
+    }
+
+    // A dataset blocks only the schema IT references: another schema in the same group,
+    // referenced by nothing, still deletes.
+    let case = "another schema's dataset";
+    let group_arn = create_active_group(&emulator, "cross-reference-dsg", case).await;
+    let referenced =
+        create_schema(&emulator, "referenced-schema", &avro_schema("Items"), case).await;
+    let unreferenced = create_schema(
+        &emulator,
+        "unreferenced-schema",
+        &avro_schema("Items"),
+        case,
+    )
+    .await;
+    let dataset_arn = create_dataset(&emulator, &group_arn, &referenced, "Items", case).await;
+
+    assert_deleted(&emulator, "DeleteSchema", "schemaArn", &unreferenced, case).await;
+    assert_fails(
+        &emulator,
+        "DeleteSchema",
+        "schemaArn",
+        &referenced,
+        409,
+        "ResourceInUseException",
+        case,
+    )
+    .await;
+
+    // And a schema nobody ever created is not found, whatever datasets exist.
+    assert_fails(
+        &emulator,
+        "DeleteSchema",
+        "schemaArn",
+        &format!("arn:aws:personalize:{REGION}:{ACCOUNT}:schema/never-created"),
+        404,
+        "ResourceNotFoundException",
+        case,
+    )
+    .await;
+
+    assert_deleted(&emulator, "DeleteDataset", "datasetArn", &dataset_arn, case).await;
+    assert_deleted(&emulator, "DeleteSchema", "schemaArn", &referenced, case).await;
+}
+
 // ---------------------------------------------------------------------------
 // Dataset groups
 // ---------------------------------------------------------------------------

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSchema
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSchema`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSchema::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +144,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSchema` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSchemaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSchema"))
+        // See `create_schema.rs`: this operation models no server-side error, so a
+        // stateless mount is reported through the scaffold channel.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSchema"));
+        };
+
+        let mut state = state.lock();
+        if !state.schemas.contains_key(&input.schema_arn) {
+            return Err(DeleteSchemaErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Resource not found: {schema_arn}",
+                        schema_arn = input.schema_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A schema is REFERENCED by every dataset created against it, and "before
+        // deleting a schema, you must delete all datasets referencing the schema": a
+        // referenced schema is in use, so the delete is refused and leaves state
+        // untouched rather than leaving those datasets naming a schema nobody can
+        // describe. The refusal names the schema and the datasets still holding it, both
+        // taken from the request and the store.
+        let referencing: Vec<&str> = state
+            .datasets
+            .values()
+            .filter(|record| record.schema_arn == input.schema_arn)
+            .map(|record| record.dataset_arn.as_str())
+            .collect();
+        if !referencing.is_empty() {
+            let message = format!(
+                "Schema {schema_arn} is in use by dataset(s) {referencing}. Before deleting a \
+                 schema, you must delete all datasets referencing the schema.",
+                schema_arn = input.schema_arn,
+                referencing = referencing.join(", ")
+            );
+            return Err(DeleteSchemaErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The record goes, so a following `DescribeSchema` answers
+        // `ResourceNotFoundException` and `ListSchemas` no longer reports it.
+        state.schemas.remove(&input.schema_arn);
+
+        Ok(DeleteSchemaOutput)
     }
 }
+
