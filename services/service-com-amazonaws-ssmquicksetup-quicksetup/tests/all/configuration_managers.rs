@@ -194,6 +194,20 @@ async fn list_configurations(router: &MultiServiceRouter, body: &Value) -> (u16,
     call(router, "POST", "/listConfigurations", Some(body)).await
 }
 
+/// The token to resume a listing at, or `None` once it is exhausted.
+///
+/// Every page of a listing carries `NextToken`: the empty string is what says there is
+/// no further page, so a paging loop stops on it rather than on a missing member. The
+/// wire form of the member is pinned in its own right by
+/// `tests/all/pagination_tokens.rs`.
+fn next_page_token(case: &str, answer: &Value) -> Option<String> {
+    let token = answer
+        .get("NextToken")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case}: expected a NextToken, got {answer:?}"));
+    (!token.is_empty()).then(|| token.to_string())
+}
+
 /// Create a manager that must succeed, answering its ARN.
 async fn create_ok(router: &MultiServiceRouter, case: &str, body: &Value) -> String {
     let (status, answer) = create(router, body).await;
@@ -550,8 +564,9 @@ async fn a_created_manager_is_read_back_exactly_as_it_was_stored() {
 // ---------------------------------------------------------------------------
 
 /// Paging visits every stored manager exactly once, for any store size and any page
-/// bound: each page is at most `MaxItems` long, a `NextToken` is emitted only while
-/// more remain, and the union of the pages is exactly the set of created ARNs.
+/// bound: each page is at most `MaxItems` long, `NextToken` names a resume point only
+/// while more remain (and is the empty string otherwise), and the union of the pages is
+/// exactly the set of created ARNs.
 #[tokio::test]
 async fn paging_the_manager_list_visits_each_manager_exactly_once() {
     // (managers in the store, MaxItems asked for) — the page bound includes both
@@ -635,8 +650,8 @@ async fn paging_the_manager_list_visits_each_manager_exactly_once() {
                 pages <= manager_count + 1,
                 "case {case}: paging did not terminate after {pages} pages"
             );
-            match answer.get("NextToken").and_then(Value::as_str) {
-                Some(next) => token = Some(next.to_string()),
+            match next_page_token(&case, &answer) {
+                Some(next) => token = Some(next),
                 None => break,
             }
         }
@@ -1154,8 +1169,8 @@ async fn paging_the_configuration_list_visits_each_configuration_exactly_once() 
             for row in &page {
                 seen.push(row["Id"].as_str().unwrap_or_default().to_string());
             }
-            match answer.get("NextToken").and_then(Value::as_str) {
-                Some(next) => token = Some(next.to_string()),
+            match next_page_token(&case, &answer) {
+                Some(next) => token = Some(next),
                 None => break,
             }
         }

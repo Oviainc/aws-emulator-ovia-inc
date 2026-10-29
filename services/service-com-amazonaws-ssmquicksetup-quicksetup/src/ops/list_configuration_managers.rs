@@ -4,7 +4,8 @@
 //! Reports one `ConfigurationManagerSummary` per configuration manager the signed
 //! Region's endpoint holds, built from the store, in ARN order, one page at a time:
 //! `MaxItems` bounds the page and `NextToken` names the manager the next page starts
-//! at, so paging through N managers visits each exactly once.
+//! at — the empty string once the listing is exhausted — so paging through N managers
+//! visits each exactly once.
 //!
 //! Reporting, not mutating: the only write it makes is materialising the status
 //! changes the clock already owes (see [`crate::state::ComAmazonawsSsmquicksetupQuicksetupState::settle`]).
@@ -175,7 +176,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A token this operation did not issue is refused rather than silently read as
         // "start from the beginning", which would re-serve a page the caller already had.
-        let start = match input.starting_token.as_deref() {
+        // The empty token an exhausted listing reports names no record, so it reads as
+        // no token at all (see [`crate::state::resume_token`]).
+        let start = match crate::state::resume_token(input.starting_token.as_deref()) {
             Some(token) => Some(
                 crate::state::decode_page_token(crate::state::MANAGER_PAGE_TOKEN_KIND, token)
                     .ok_or_else(|| {
@@ -215,7 +218,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(crate::state::ConfigurationManagerRecord::to_summary)
                     .collect(),
             ),
-            next_token,
+            // Present on every page, naming the manager the next one starts at while
+            // more remain and empty once the listing is exhausted, the way the model
+            // documents the member.
+            next_token: Some(next_token),
         })
     }
 }

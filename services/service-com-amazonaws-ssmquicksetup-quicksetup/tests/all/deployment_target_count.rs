@@ -242,9 +242,11 @@ async fn deployments(
                 .unwrap_or_else(|| panic!("case {case}: expected a Region, got {row:?}"));
             rows.insert((id.to_string(), account.to_string(), region.to_string()));
         }
+        // Every page carries the token; the empty string is the one that says this page
+        // was the last.
         match page.get("NextToken").and_then(Value::as_str) {
-            Some(next) => token = Some(next.to_string()),
-            None => break,
+            Some(next) if !next.is_empty() => token = Some(next.to_string()),
+            _ => break,
         }
     }
     rows

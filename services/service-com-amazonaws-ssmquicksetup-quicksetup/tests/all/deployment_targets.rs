@@ -810,9 +810,11 @@ async fn a_definition_past_the_deployment_bound_is_refused() {
             {
                 seen.insert(row["Id"].as_str().unwrap_or_default().to_string());
             }
+            // Every page carries the token; the empty string is the one that says this
+            // page was the last.
             match page.get("NextToken").and_then(Value::as_str) {
-                Some(next) => token = Some(next.to_string()),
-                None => break,
+                Some(next) if !next.is_empty() => token = Some(next.to_string()),
+                _ => break,
             }
         }
         assert_eq!(
@@ -887,7 +889,10 @@ async fn a_create_whose_definitions_outgrow_the_store_is_refused() {
                 "case {case}: ListConfigurations must succeed, got {status} / {listed:?}"
             );
             assert!(
-                listed.get("NextToken").and_then(Value::as_str).is_some(),
+                listed
+                    .get("NextToken")
+                    .and_then(Value::as_str)
+                    .is_some_and(|token| !token.is_empty()),
                 "case {case}: this create deployed {} configurations, so a one-row page must \
                  hand back a token, got {listed:?}",
                 carried * MAX_DEPLOYMENT_TARGETS
@@ -958,9 +963,11 @@ async fn deployed_ids(
         {
             seen.insert(row["Id"].as_str().unwrap_or_default().to_string());
         }
+        // Every page carries the token; the empty string is the one that says this page
+        // was the last.
         match page.get("NextToken").and_then(Value::as_str) {
-            Some(next) => token = Some(next.to_string()),
-            None => break,
+            Some(next) if !next.is_empty() => token = Some(next.to_string()),
+            _ => break,
         }
     }
     seen

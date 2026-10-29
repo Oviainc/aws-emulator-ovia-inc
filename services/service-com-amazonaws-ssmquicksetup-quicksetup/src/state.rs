@@ -1591,8 +1591,14 @@ pub fn matches_filters<'r>(
     })
 }
 
-/// One page of a `BTreeMap`-ordered listing: the records `keep` admits, plus the key
-/// the next page starts at when more remain.
+/// One page of a `BTreeMap`-ordered listing: the records `keep` admits, plus the token
+/// the next page resumes from — the EMPTY string once the listing is exhausted.
+///
+/// Every listing of this service documents its output token as a string that is empty
+/// when there are no additional items to return, so the token is a VALUE on every page
+/// and never a missing member: a caller decides whether to ask for another page by
+/// whether the token it was handed is empty, not by whether the member is there. See
+/// [`resume_token`] for the other half of that contract on the way in.
 ///
 /// `kind` names the listing the token belongs to, so a token one listing issued is not
 /// accepted by the other (see [`encode_page_token`]).
@@ -1607,14 +1613,15 @@ pub fn paginate<'a, T>(
     entries: impl Iterator<Item = (&'a String, &'a T)>,
     page_size: usize,
     keep: impl Fn(&T) -> bool,
-) -> (Vec<&'a T>, Option<String>) {
+) -> (Vec<&'a T>, String) {
     let mut page = Vec::with_capacity(page_size);
-    let mut next_token = None;
+    let mut next_token = String::new();
     for (examined, (key, record)) in entries.enumerate() {
         // The first record that does not fit becomes the next page's start, and only
-        // then is a token emitted — the last page carries none.
+        // then does the token name a record — an exhausted listing reports the empty
+        // string it started as.
         if page.len() == page_size || examined == MAX_SCAN_ENTRIES {
-            next_token = Some(encode_page_token(kind, key));
+            next_token = encode_page_token(kind, key);
             break;
         }
         if keep(record) {
@@ -1622,6 +1629,18 @@ pub fn paginate<'a, T>(
         }
     }
     (page, next_token)
+}
+
+/// The record a request means to resume at, or `None` when it names none: an absent
+/// `StartingToken`, or the empty one.
+///
+/// The empty string is what an exhausted listing reports as its own token (see
+/// [`paginate`]), so it says "there is no next page" rather than naming a record, and a
+/// request that hands it straight back means the same as one that carries no token at
+/// all. Every other token is still resolved through [`decode_page_token`], so text this
+/// service never issued is refused rather than read as "start from the beginning".
+pub fn resume_token(starting_token: Option<&str>) -> Option<&str> {
+    starting_token.filter(|token| !token.is_empty())
 }
 
 /// The page size to serve for a requested `MaxItems`: clamped into

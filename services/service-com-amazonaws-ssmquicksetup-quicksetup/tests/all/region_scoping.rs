@@ -10,7 +10,8 @@
 //! manager (and every configuration deployed from its definitions) is held by exactly
 //! one Region — the one whose endpoint created it, the Region its `ManagerArn` carries —
 //! and is reported and mutated only through that Region. A request signed for any other
-//! Region lists none of it (and hands back no `NextToken`) and finds none of its
+//! Region lists none of it (its page is empty and its `NextToken` is the empty string
+//! that says there is no next page) and finds none of its
 //! identifiers, which `ListConfigurations` states for itself: it "returns configurations
 //! deployed by Quick Setup in the requesting Amazon Web Services account and Amazon Web
 //! Services Region" (`smithy_query(query="doc",shape="ListConfigurations")`).
@@ -242,11 +243,13 @@ fn rows_of(case: &str, key: &str, status: u16, answer: &Value) -> Vec<Value> {
         status, 200,
         "case {case}: the listing must succeed, got {status} / {answer:?}"
     );
-    // A Region holding nothing still reports the list, and reports no token: there is no
-    // next page to resume from.
-    assert!(
-        answer.get("NextToken").is_none_or(Value::is_null),
-        "case {case}: expected no NextToken, got {answer:?}"
+    // Every one of these listings fits on one page, and an exhausted listing still
+    // reports the token member: the empty string, which is what says there is no next
+    // page to resume from.
+    assert_eq!(
+        answer.get("NextToken").and_then(Value::as_str),
+        Some(""),
+        "case {case}: expected an empty NextToken, got {answer:?}"
     );
     answer
         .get(key)
