@@ -48,23 +48,23 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::harness::{base_ms, REGION};
 
 /// `X-Amz-Target` prefixes of the two services this suite drives.
-const LOGS_TARGET_PREFIX: &str = "Logs_20140328";
+pub(crate) const LOGS_TARGET_PREFIX: &str = "Logs_20140328";
 const KINESIS_TARGET_PREFIX: &str = "Kinesis_20131202";
 
 /// The `messageType` of an envelope that carries ingested log events.
-const DATA_MESSAGE: &str = "DATA_MESSAGE";
+pub(crate) const DATA_MESSAGE: &str = "DATA_MESSAGE";
 
 /// The digits a delivered log event's `id` carries.
 const EVENT_ID_DIGITS: usize = 56;
 
 /// The `distribution` values the model declares (`Distribution`, one of: ByLogStream |
 /// Random).
-const BY_LOG_STREAM: &str = "ByLogStream";
+pub(crate) const BY_LOG_STREAM: &str = "ByLogStream";
 const RANDOM: &str = "Random";
 
 /// How long a case waits before treating a freshly created Kinesis stream as ready: past
 /// the instant its create armed the `CREATING` -> `ACTIVE` transition for.
-fn past_activation() -> Duration {
+pub(crate) fn past_activation() -> Duration {
     ACTIVATION_DELAY + Duration::from_millis(400)
 }
 
@@ -72,12 +72,12 @@ fn past_activation() -> Duration {
 /// assembly `core/router` performs, with two services mounted. The in-process callback a
 /// delivery travels over is the router's own, so a record that is not written by the
 /// Kinesis service cannot be read back here.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signing is not the subject here, so requests are unauthenticated; the credential
@@ -95,7 +95,13 @@ impl Emulator {
     }
 
     /// One awsJson1_1 call, signed for [`REGION`] under `service`'s own scope.
-    async fn call(&self, service: &str, prefix: &str, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(
+        &self,
+        service: &str,
+        prefix: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -123,7 +129,7 @@ impl Emulator {
     }
 
     /// One CloudWatch Logs call that must succeed.
-    async fn logs(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn logs(&self, case: &str, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call("logs", LOGS_TARGET_PREFIX, operation, body).await;
         assert_eq!(
             status, 200,
@@ -133,7 +139,7 @@ impl Emulator {
     }
 
     /// One Kinesis call that must succeed.
-    async fn kinesis(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn kinesis(&self, case: &str, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self
             .call("kinesis", KINESIS_TARGET_PREFIX, operation, body)
             .await;
@@ -146,7 +152,7 @@ impl Emulator {
 
     /// Everything the one-shard stream `stream` holds, from its oldest retained record:
     /// each record's partition key and the envelope its gzip-framed data decodes to.
-    async fn delivered(&self, case: &str, stream: &str) -> Vec<(String, Value)> {
+    pub(crate) async fn delivered(&self, case: &str, stream: &str) -> Vec<(String, Value)> {
         let iterator = self
             .kinesis(
                 case,
@@ -192,7 +198,7 @@ impl Emulator {
     }
 
     /// A Kinesis data stream of one shard, created but not yet waited for.
-    async fn create_stream(&self, case: &str, stream: &str) {
+    pub(crate) async fn create_stream(&self, case: &str, stream: &str) {
         self.kinesis(
             case,
             "CreateStream",
@@ -217,13 +223,13 @@ fn gunzip_json(case: &str, framed: &[u8]) -> Value {
 
 /// The ARN of the Kinesis data stream `stream`, in the Region every call here is signed
 /// for and the account every ARN this emulator mints carries.
-fn stream_arn(stream: &str) -> String {
+pub(crate) fn stream_arn(stream: &str) -> String {
     engine::emulator_arn("kinesis", REGION, &format!("stream/{stream}"))
 }
 
 /// The role CloudWatch Logs assumes to deliver to a streaming destination —
 /// `PutSubscriptionFilter` requires one for every destination except a Lambda function.
-fn role_arn() -> String {
+pub(crate) fn role_arn() -> String {
     engine::emulator_arn("iam", "", "role/CWLtoKinesisRole")
 }
 
@@ -315,7 +321,7 @@ fn rows() -> Vec<Row> {
 }
 
 /// Assert one envelope against the row that produced it.
-fn assert_envelope(
+pub(crate) fn assert_envelope(
     case: &str,
     envelope: &Value,
     group: &str,

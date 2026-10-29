@@ -185,6 +185,8 @@ mod storage_tier_policy;
 mod subscription_destination_plumbing;
 #[path = "all/subscription_fan_out.rs"]
 mod subscription_fan_out;
+#[path = "all/subscription_filter_delivery.rs"]
+mod subscription_filter_delivery;
 #[path = "all/subscription_filters.rs"]
 mod subscription_filters;
 #[path = "all/syslog_configurations.rs"]
