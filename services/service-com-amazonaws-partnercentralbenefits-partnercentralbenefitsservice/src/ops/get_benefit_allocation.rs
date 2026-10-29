@@ -274,8 +274,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.expire_allocations_due(&input.catalog, now_millis);
 
         // Either form the modelled `BenefitAllocationIdentifier` admits names the same
-        // record; an ARN of another catalog, service or resource type names none.
-        let Some(allocation) = store.allocation(&input.catalog, &input.identifier) else {
+        // record; an ARN this service does not issue for an allocation of this catalog in
+        // the region the request addressed — another catalog, service or resource type,
+        // another partition, region or account — names none.
+        let Some(allocation) = store.allocation(&input.catalog, &region, &input.identifier) else {
             return Err(GetBenefitAllocationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::not_found_message(

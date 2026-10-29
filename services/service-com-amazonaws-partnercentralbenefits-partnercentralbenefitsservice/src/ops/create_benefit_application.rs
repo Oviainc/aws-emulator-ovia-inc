@@ -288,7 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (
                 "BenefitIdentifier",
                 Some(crate::state::fingerprint_value(
-                    &store.benefit_identity(&input.catalog, &input.benefit_identifier),
+                    &store.benefit_identity(&input.catalog, &region, &input.benefit_identifier),
                 )),
             ),
             (
@@ -387,10 +387,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
 
             // The application requests ONE benefit of this catalog, named either by its
-            // bare `ben-...` id or by its ARN; anything the catalog does not hold is a
-            // 404.
+            // bare `ben-...` id or by the ARN this service issues for it in the region the
+            // request addressed; anything the catalog does not hold is a 404.
             let Some(benefit) = catalog
-                .resolve_benefit_id(&input.catalog, &input.benefit_identifier)
+                .resolve_benefit_id(&input.catalog, &region, &input.benefit_identifier)
                 .and_then(|id| catalog.benefits.get(&id))
             else {
                 return Err(

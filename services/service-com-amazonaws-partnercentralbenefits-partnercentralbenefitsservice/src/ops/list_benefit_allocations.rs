@@ -235,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let benefit_filter = crate::state::supplied_filter(
             input.benefit_identifiers.as_ref(),
-            |identifier| catalog.resolve_benefit_id(&input.catalog, identifier),
+            |identifier| catalog.resolve_benefit_id(&input.catalog, &region, identifier),
         );
 
         // A `NextToken` only resumes this listing when it is a cursor this service issued

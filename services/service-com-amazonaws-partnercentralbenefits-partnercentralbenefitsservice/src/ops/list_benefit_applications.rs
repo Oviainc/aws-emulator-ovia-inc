@@ -175,7 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The region the request addressed, which is what an ARN-spelled
+        // `BenefitIdentifiers` entry is resolved against below.
+        let region = crate::state::request_region(ctx);
         // The entitlement gate, ahead of everything else this handler does — see
         // [`crate::state::entitlement_refusal`].
         if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
@@ -238,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // everything.
         let benefit_filter = crate::state::supplied_filter(
             input.benefit_identifiers.as_ref(),
-            |identifier| catalog.resolve_benefit_id(&input.catalog, identifier),
+            |identifier| catalog.resolve_benefit_id(&input.catalog, &region, identifier),
         );
         // `AssociatedResources` is `@deprecated` ("This field is no longer used") in
         // favour of `AssociatedResourceArns`, but a client may still send it, so the ARNs

@@ -189,9 +189,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetBenefitErrorModeled::ResourceNotFoundException(missing).into());
         }
 
-        // Either form the modelled `Identifier` admits names the same record; an ARN of
-        // another catalog, service or resource type names none.
-        let Some(benefit) = store.benefit(&input.catalog, &input.identifier) else {
+        // Either form the modelled `Identifier` admits names the same record; an ARN this
+        // service does not issue for a benefit of this catalog in the region the request
+        // addressed — another catalog, service or resource type, another partition, region
+        // or account — names none.
+        let Some(benefit) = store.benefit(&input.catalog, &region, &input.identifier) else {
             return Err(GetBenefitErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::not_found_message(

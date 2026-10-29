@@ -1407,37 +1407,57 @@ impl Catalog {
     }
 
     /// The id of the benefit `identifier` names, accepting either form the modelled
-    /// `BenefitId` pattern allows (`^(arn:.+|ben-[0-9a-z]{14})$`): the bare id, or a
-    /// benefit ARN of this catalog. `None` when this catalog holds no such benefit.
-    pub fn resolve_benefit_id(&self, catalog: &str, identifier: &str) -> Option<String> {
-        let id = resolve_identifier(catalog, identifier, BENEFIT_RESOURCE)?;
+    /// `BenefitId` pattern allows (`^(arn:.+|ben-[0-9a-z]{14})$`): the bare id, or the
+    /// benefit ARN this service issues in `region`. `None` when this catalog holds no
+    /// such benefit.
+    pub fn resolve_benefit_id(
+        &self,
+        catalog: &str,
+        region: &str,
+        identifier: &str,
+    ) -> Option<String> {
+        let id = resolve_identifier(catalog, region, identifier, BENEFIT_RESOURCE)?;
         self.benefits.contains_key(&id).then_some(id)
     }
 
     /// The id of the benefit allocation `identifier` names, accepting either form the
     /// modelled `BenefitAllocationIdentifier` pattern allows
-    /// (`^(arn:.+|benalloc-[0-9a-z]{14})$`): the bare id, or an allocation ARN of this
-    /// catalog. `None` when this catalog holds no such allocation — which is also the
-    /// answer for an ARN of another catalog, another service or another resource type.
-    pub fn resolve_allocation_id(&self, catalog: &str, identifier: &str) -> Option<String> {
-        let id = resolve_identifier(catalog, identifier, ALLOCATION_RESOURCE)?;
+    /// (`^(arn:.+|benalloc-[0-9a-z]{14})$`): the bare id, or the allocation ARN this
+    /// service issues in `region`. `None` when this catalog holds no such allocation —
+    /// which is also the answer for an ARN this service does not issue for the record,
+    /// one of another catalog, another partition, region or account included.
+    pub fn resolve_allocation_id(
+        &self,
+        catalog: &str,
+        region: &str,
+        identifier: &str,
+    ) -> Option<String> {
+        let id = resolve_identifier(catalog, region, identifier, ALLOCATION_RESOURCE)?;
         self.allocations.contains_key(&id).then_some(id)
     }
 }
 
 /// The resource id `identifier` names inside `catalog`, for a resource of `resource`'s
-/// type: `identifier` itself when it is a bare id, or the ARN's id segment when it is an
-/// ARN of that resource type IN that catalog.
+/// type: `identifier` itself when it is a bare id, or the ARN's id segment when it is the
+/// ARN this service issues for a resource of that type in that catalog and `region`.
 ///
 /// One construction for every identifier member whose modelled pattern admits both forms
-/// (`^(arn:.+|<prefix>-[0-9a-z]{14})$`), so an ARN naming another catalog, another service
-/// or another resource type resolves to nothing rather than to the record that happens to
-/// share its id segment. Whether a record of that id EXISTS is the caller's own check.
-fn resolve_identifier(catalog: &str, identifier: &str, resource: &str) -> Option<String> {
+/// (`^(arn:.+|<prefix>-[0-9a-z]{14})$`), so an ARN that is not one this service issues for
+/// the record — another catalog, another service, another resource type, or another
+/// partition, region or account — resolves to nothing rather than to the record that
+/// happens to share its id segment, exactly as the ARN index does for the records that
+/// keep a minted ARN ([`ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState::resolve_application_id`]).
+/// Whether a record of that id EXISTS is the caller's own check.
+fn resolve_identifier(
+    catalog: &str,
+    region: &str,
+    identifier: &str,
+    resource: &str,
+) -> Option<String> {
     if !identifier.starts_with("arn:") {
         return Some(identifier.to_string());
     }
-    let (arn_catalog, arn_id) = parse_resource_arn(identifier, resource)?;
+    let (arn_catalog, arn_id) = parse_resource_arn(identifier, region, resource)?;
     (arn_catalog == catalog).then(|| arn_id.to_string())
 }
 
@@ -1619,11 +1639,12 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
 
     /// The identity of the benefit `identifier` names, as a request fingerprint covers it:
     /// the same rule [`Self::application_identity`] states, for the member whose modelled
-    /// pattern is `^(arn:.+|ben-[0-9a-z]{14})$`.
-    pub fn benefit_identity(&self, catalog: &str, identifier: &str) -> String {
+    /// pattern is `^(arn:.+|ben-[0-9a-z]{14})$`. `region` is the one the request addressed,
+    /// which is what an ARN spelling is resolved against ([`resolve_identifier`]).
+    pub fn benefit_identity(&self, catalog: &str, region: &str, identifier: &str) -> String {
         self.catalogs
             .get(catalog)
-            .and_then(|stored| stored.resolve_benefit_id(catalog, identifier))
+            .and_then(|stored| stored.resolve_benefit_id(catalog, region, identifier))
             .unwrap_or_else(|| identifier.to_string())
     }
 
@@ -1722,11 +1743,12 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     /// Resolved as [`Catalog::resolve_benefit_id`] does, so both forms the modelled
     /// `GetBenefit$Identifier` pattern admits (`^(arn:.+|ben-[0-9a-z]{14})$`) name the same
     /// record. `None` when the catalog does not exist or holds no such benefit — which is
-    /// also the answer for an ARN of another catalog, another service or another resource
-    /// type.
-    pub fn benefit(&self, catalog: &str, identifier: &str) -> Option<&Benefit> {
+    /// also the answer for an ARN this service does not issue for the record in `region`,
+    /// one of another catalog, another service, another resource type, another partition or
+    /// another account included.
+    pub fn benefit(&self, catalog: &str, region: &str, identifier: &str) -> Option<&Benefit> {
         let stored = self.catalogs.get(catalog)?;
-        let id = stored.resolve_benefit_id(catalog, identifier)?;
+        let id = stored.resolve_benefit_id(catalog, region, identifier)?;
         stored.benefits.get(&id)
     }
 
@@ -1736,13 +1758,19 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     ///
     /// `None` when no such application is stored, or when its benefit declares no schema:
     /// neither constrains the document at all (see [`benefit_schema_refusal`]).
+    ///
+    /// The benefit is reached by the id the application STORES, which is this service's own
+    /// `ben-...` id rather than caller text, so no identifier resolution is involved.
     pub fn benefit_schema_for_application(
         &self,
         catalog: &str,
         identifier: &str,
     ) -> Option<Document> {
         let benefit_id = self.application(catalog, identifier)?.benefit_id.clone();
-        self.benefit(catalog, &benefit_id)?
+        self.catalogs
+            .get(catalog)?
+            .benefits
+            .get(&benefit_id)?
             .benefit_request_schema
             .clone()
     }
@@ -1752,9 +1780,14 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     /// Resolved as [`Catalog::resolve_allocation_id`] does, so both forms the modelled
     /// `BenefitAllocationIdentifier` admits name the same record. `None` when the catalog
     /// does not exist or holds no such allocation.
-    pub fn allocation(&self, catalog: &str, identifier: &str) -> Option<&BenefitAllocation> {
+    pub fn allocation(
+        &self,
+        catalog: &str,
+        region: &str,
+        identifier: &str,
+    ) -> Option<&BenefitAllocation> {
         let stored = self.catalogs.get(catalog)?;
-        let id = stored.resolve_allocation_id(catalog, identifier)?;
+        let id = stored.resolve_allocation_id(catalog, region, identifier)?;
         stored.allocations.get(&id)
     }
 
@@ -1814,7 +1847,9 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     /// names, when `application_identifier` names no application of it, or when the catalog
     /// already holds [`MAX_ALLOCATIONS_PER_CATALOG`] allocations. Both identifiers accept
     /// either form their modelled patterns allow (a bare id or an ARN), resolved exactly as
-    /// every operation resolves them.
+    /// every operation resolves them — and since a grant arrives on no request, an ARN is
+    /// resolved against [`DEFAULT_REGION`], which is the region an ARN carries when no
+    /// request names one ([`request_region`]).
     ///
     /// No modelled operation reaches this, and deliberately so: granting an allocation is
     /// what AWS's own fulfillment workflow does once it approves a partner's application,
@@ -1840,7 +1875,7 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
         let benefit_id = self
             .catalogs
             .get(catalog)?
-            .resolve_benefit_id(catalog, benefit_identifier)?;
+            .resolve_benefit_id(catalog, DEFAULT_REGION, benefit_identifier)?;
         let benefit_application_id = match application_identifier {
             Some(identifier) => Some(self.resolve_application_id(catalog, identifier)?),
             None => None,
@@ -2715,21 +2750,22 @@ fn resource_arn(region: &str, catalog: &str, resource: &str, id: &str) -> String
     )
 }
 
-/// The `(catalog, id)` an ARN of this service's `resource` type names, or `None` when
-/// `arn` is not one.
-pub fn parse_resource_arn<'a>(arn: &'a str, resource: &str) -> Option<(&'a str, &'a str)> {
-    let mut fields = arn.splitn(6, ':');
-    let (prefix, _partition, service, _region, _account, tail) = (
-        fields.next()?,
-        fields.next()?,
-        fields.next()?,
-        fields.next()?,
-        fields.next()?,
-        fields.next()?,
-    );
-    if prefix != "arn" || service != ARN_SERVICE {
-        return None;
-    }
+/// The `(catalog, id)` the ARN this service issues for a `resource` of `region` names, or
+/// `None` when `arn` is not one.
+///
+/// An ARN names a resource only when it is the ARN this service GIVES that resource
+/// ([`resource_arn`]) — compared whole, so every field is a field this service minted: an
+/// ARN naming another partition, another region or another account names no resource here,
+/// just as one naming another service, another resource type or another catalog does not.
+pub fn parse_resource_arn<'a>(
+    arn: &'a str,
+    region: &str,
+    resource: &str,
+) -> Option<(&'a str, &'a str)> {
+    // The `catalog/<catalog>/<resource>/<id>` tail an ARN of this service carries, read
+    // off the sixth colon-separated field; the equality below is what checks the five
+    // fields ahead of it.
+    let tail = arn.splitn(6, ':').nth(5)?;
     let mut segments = tail.split('/');
     if segments.next()? != "catalog" {
         return None;
@@ -2739,7 +2775,7 @@ pub fn parse_resource_arn<'a>(arn: &'a str, resource: &str) -> Option<(&'a str, 
         return None;
     }
     let id = segments.next()?;
-    (segments.next().is_none()).then_some((catalog, id))
+    (arn == resource_arn(region, catalog, resource, id)).then_some((catalog, id))
 }
 
 /// AWS's "not found" message: the resource that was looked up, then the identifier the
