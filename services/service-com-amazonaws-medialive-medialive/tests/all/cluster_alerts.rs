@@ -543,14 +543,16 @@ async fn a_created_cluster_round_trips_through_describe_cluster() {
         );
 
         // A channel whose AnywhereSettings name this cluster is what ChannelIds
-        // reports: derived from the channel store on every read.
+        // reports: derived from the channel store on every read. The settings
+        // name the cluster alone — every id a channel configuration names has to
+        // resolve, and this assertion is about the cluster's own derivation.
         let (status, channel) = call(
             &router,
             "POST",
             "/prod/channels",
             Some(json!({
                 "name": format!("channel-{case}"),
-                "anywhereSettings": { "clusterId": id, "channelPlacementGroupId": "pg-1" },
+                "anywhereSettings": { "clusterId": id },
                 "encoderSettings": crate::support::channel_encoder_settings(),
             })),
         )

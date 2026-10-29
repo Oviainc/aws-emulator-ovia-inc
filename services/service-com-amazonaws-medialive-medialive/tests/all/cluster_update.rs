@@ -651,14 +651,16 @@ async fn an_update_touches_only_the_cluster_it_names() {
     let sibling_id = id_of(case, &sibling);
 
     // A channel running in the target cluster, so `ChannelIds` is non-empty and
-    // can be shown to survive the update.
+    // can be shown to survive the update. Its `anywhereSettings` names the
+    // cluster alone: every id a channel configuration names has to resolve, and
+    // this assertion is about the cluster's own derivation.
     let (status, channel) = call(
         &router,
         "POST",
         "/prod/channels",
         Some(json!({
             "name": "placed",
-            "anywhereSettings": { "clusterId": id, "channelPlacementGroupId": "7000000" },
+            "anywhereSettings": { "clusterId": id },
             "encoderSettings": crate::support::channel_encoder_settings(),
         })),
     )

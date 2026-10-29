@@ -296,6 +296,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .channel_security_groups
                 .as_deref()
                 .unwrap_or(&stored.channel_security_groups),
+            anywhere_settings: input
+                .anywhere_settings
+                .as_ref()
+                .or(stored.anywhere_settings.as_ref()),
         });
         if !problems.is_empty() {
             return Err(unprocessable(problems));

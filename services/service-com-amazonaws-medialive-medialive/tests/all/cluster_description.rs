@@ -26,7 +26,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
-use crate::channel_placement_groups::{create_channel, create_cluster as create_named_cluster, id_of};
+use crate::channel_placement_groups::{
+    create_channel, create_channel_in_cluster, create_cluster as create_named_cluster, id_of,
+};
 use crate::support::{member, resolved_network_ids};
 use crate::wire::{call, error_code, error_message, medialive, ACCOUNT, DEFAULT_REGION};
 
@@ -38,11 +40,6 @@ const CLUSTERS: &str = "/prod/clusters";
 /// The `ClusterType` the model declares (`smithy_query(query="shape",
 /// shape="ClusterType")`: ON_PREMISES — the one value, so every row carries it).
 const ON_PREMISES: &str = "ON_PREMISES";
-
-/// The channel placement group id the placed channels name. A channel's
-/// `AnywhereSettings` carries both labels; only `ClusterId` is what `ChannelIds`
-/// is derived from, so the group half is the same for every placed channel here.
-const PLACEMENT_GROUP: &str = "pg-1";
 
 /// `CreateCluster` with an arbitrary body, answering the created cluster.
 ///
@@ -366,8 +363,14 @@ async fn cluster_channel_ids_track_the_channel_store() {
     let mut expected: Vec<Vec<String>> = vec![Vec::new(), Vec::new()];
     for Placed { case, name, cluster } in &table {
         let case = *case;
-        let placement = cluster.map(|index| (clusters[index].as_str(), PLACEMENT_GROUP));
-        let channel_id = create_channel(&router, case, name, placement).await;
+        // Only `ClusterId` is what `ChannelIds` is derived from, so a placed
+        // channel names its cluster and no group inside it.
+        let channel_id = match cluster {
+            Some(index) => {
+                create_channel_in_cluster(&router, case, name, &clusters[*index]).await
+            }
+            None => create_channel(&router, case, name, None).await,
+        };
         if let Some(index) = cluster {
             expected[*index].push(channel_id);
         }

@@ -5177,6 +5177,17 @@ pub fn missing_reference_id_message(member: &str) -> String {
     format!("every entry of {member} must name the id of a resource this account holds")
 }
 
+/// The message a write refused because a SINGLE-VALUED member that names a
+/// resource carries no id the write could resolve carries: the member as the
+/// wire spells it.
+///
+/// The scalar sibling of [`missing_reference_id_message`], which words the same
+/// problem for one ENTRY of a reference list — so the two refusals say the same
+/// thing about the same kind of omission.
+pub fn blank_reference_id_message(member: &str) -> String {
+    format!("{member} must name the id of a resource this account holds")
+}
+
 /// The message a channel-configuration write refused for a member the
 /// configuration does not declare at all carries: the member as the wire spells
 /// it. One helper, so `CreateChannel` and `UpdateChannel` cannot word the same

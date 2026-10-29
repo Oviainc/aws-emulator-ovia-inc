@@ -467,7 +467,9 @@ pub async fn attachable_input(router: &MultiServiceRouter, name: &str) -> String
 /// `channelSecurityGroups` spelling that names no group this account holds.
 /// Keyed by the spelling, so one spelling resolves to the SAME resource however
 /// often a body repeats it, and a body that already names resources this account
-/// holds (or already declares its own encoder settings) is left exactly as it is.
+/// holds (or already declares its own encoder settings) is left exactly as it
+/// is, and one cluster (with one group inside it) behind an `anywhereSettings`
+/// that names no cluster this account holds.
 pub async fn resolved_channel_body(router: &MultiServiceRouter, body: Value) -> Value {
     let mut body = body;
     if body.get("encoderSettings").is_none() {
@@ -477,8 +479,9 @@ pub async fn resolved_channel_body(router: &MultiServiceRouter, body: Value) -> 
 }
 
 /// The same body with every reference it carries — an `inputAttachments`
-/// entry's `inputId`, a `channelSecurityGroups` entry — pointed at a resource
-/// this account holds, and nothing else changed.
+/// entry's `inputId`, a `channelSecurityGroups` entry, the two ids of
+/// `anywhereSettings` — pointed at a resource this account holds, and nothing
+/// else changed.
 ///
 /// What [`resolved_channel_body`] does for a CREATE's references, for a PATCH
 /// that must name only the members its own rule is about: an `UpdateChannel`
@@ -486,7 +489,72 @@ pub async fn resolved_channel_body(router: &MultiServiceRouter, body: Value) -> 
 /// declare does not turn a patch that names one member into one that names two.
 pub async fn resolved_channel_references(router: &MultiServiceRouter, body: Value) -> Value {
     let body = resolved_channel_security_groups(router, body).await;
-    resolved_channel_attachments(router, body).await
+    let body = resolved_channel_attachments(router, body).await;
+    resolved_channel_anywhere_settings(router, body).await
+}
+
+/// The same body with the `anywhereSettings` it carries — "The ID of the cluster
+/// for the channel" and "The ID of the channel placement group for the channel"
+/// — pointed at a cluster this account holds and a group of THAT cluster.
+///
+/// A placement group is named by both ids together, so the group is created
+/// inside whichever cluster the body ends up naming. A spelling the account
+/// already holds is left exactly as it is, so a row that built its own cluster
+/// and group keeps them.
+async fn resolved_channel_anywhere_settings(router: &MultiServiceRouter, body: Value) -> Value {
+    let mut body = body;
+    let Some(settings) = body.get("anywhereSettings").cloned() else {
+        return body;
+    };
+    let spelled_cluster = settings
+        .get("clusterId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let spelled_group = settings
+        .get("channelPlacementGroupId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if spelled_cluster.is_none() && spelled_group.is_none() {
+        return body;
+    }
+
+    let cluster = match spelled_cluster.filter(|id| !id.is_empty()) {
+        Some(id) if already_held(router, &format!("/prod/clusters/{id}")).await => id,
+        _ => {
+            crate::channel_placement_groups::create_cluster(router, "setup", &unique("cluster"))
+                .await
+        }
+    };
+    let mut resolved = json!({ "clusterId": cluster });
+
+    if let Some(group) = spelled_group {
+        let uri = format!("/prod/clusters/{cluster}/channelplacementgroups/{group}");
+        let group = if !group.is_empty() && already_held(router, &uri).await {
+            group
+        } else {
+            let created = crate::channel_placement_groups::created(
+                router,
+                "setup",
+                &cluster,
+                json!({ "name": unique("group") }),
+            )
+            .await;
+            crate::channel_placement_groups::id_of(&created)
+        };
+        resolved["channelPlacementGroupId"] = json!(group);
+    }
+
+    body["anywhereSettings"] = resolved;
+    body
+}
+
+/// A `Name` no other resource of the account under test carries: both a cluster's
+/// and a group's `Name` is documented unique, so a setup that mints several of
+/// them cannot spell them all the same way.
+fn unique(kind: &str) -> String {
+    static MINTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let serial = MINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{kind}-{serial}")
 }
 
 /// The same body with every `channelSecurityGroups` entry pointed at an input

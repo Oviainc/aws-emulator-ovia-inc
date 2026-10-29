@@ -147,19 +147,50 @@ fn channels_of(group: &Value) -> Vec<String> {
 /// above: the LISTING suite ([`crate::channel_placement_group_listing`]) and the
 /// DELETION suite ([`crate::channel_placement_group_deletion`]) assert the same
 /// derived `Channels` member from the same kind of channel.
+///
+/// Both halves of a placement are REFERENCES this account has to hold, so a
+/// caller passes the cluster the store minted and a group of that same cluster.
 pub(crate) async fn create_channel(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
     placement: Option<(&str, &str)>,
 ) -> String {
+    let anywhere = placement.map(|(cluster, group)| {
+        json!({ "clusterId": cluster, "channelPlacementGroupId": group })
+    });
+    placed_channel(router, case, name, anywhere).await
+}
+
+/// Create a channel that runs in `cluster` but is placed in no group of it, and
+/// answer its id.
+///
+/// What a suite about a CLUSTER's own derivation needs: `Cluster$ChannelIds` is
+/// derived from `AnywhereSettings$ClusterId` alone, and a group such a suite does
+/// not need would be one more resource inside the cluster.
+pub(crate) async fn create_channel_in_cluster(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    cluster: &str,
+) -> String {
+    placed_channel(router, case, name, Some(json!({ "clusterId": cluster }))).await
+}
+
+/// The one `CreateChannel` call both helpers above go through, so this suite
+/// spells the channel configuration and the created status once.
+async fn placed_channel(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    anywhere: Option<Value>,
+) -> String {
     let mut request = json!({
         "name": name,
         "encoderSettings": crate::support::channel_encoder_settings(),
     });
-    if let Some((cluster, group)) = placement {
-        request["anywhereSettings"] =
-            json!({ "clusterId": cluster, "channelPlacementGroupId": group });
+    if let Some(anywhere) = anywhere {
+        request["anywhereSettings"] = anywhere;
     }
     let (status, response) = call(router, "POST", "/prod/channels", Some(request)).await;
     assert_eq!(
@@ -1116,16 +1147,27 @@ async fn channels_placed_in_the_group_are_reported() {
         }
         expected.sort();
 
-        // A channel that names this group id while running on ANOTHER cluster is
-        // not placed here: both halves of its `anywhereSettings` are matched.
+        // A channel is placed by BOTH halves of its `anywhereSettings`, so a
+        // group id of this cluster names no group of another one: the create that
+        // would place a channel there is refused, and no channel of the second
+        // cluster can turn up in this group's list. (The refusal itself is the
+        // subject of `crate::channel_anywhere_placement_resolution`.)
         let elsewhere = create_cluster(&router, &case, "secondary").await;
-        create_channel(
+        let (status, refused) = call(
             &router,
-            &case,
-            "other-cluster",
-            Some((&elsewhere, &id)),
+            "POST",
+            "/prod/channels",
+            Some(json!({
+                "name": "other-cluster",
+                "anywhereSettings": { "clusterId": elsewhere, "channelPlacementGroupId": id },
+                "encoderSettings": crate::support::channel_encoder_settings(),
+            })),
         )
         .await;
+        assert_eq!(
+            status, 422,
+            "case {case:?}: CreateChannel naming a group of another cluster: expected 422, got {status}: {refused}"
+        );
 
         let read = described(&router, &case, &cluster, &id).await;
         assert_eq!(

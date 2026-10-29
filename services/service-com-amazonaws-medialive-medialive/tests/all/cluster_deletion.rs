@@ -38,7 +38,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
 use crate::channel_placement_groups::{
-    create_channel, create_cluster, create_nodes, deregister_node, group_uri, groups_uri,
+    create_channel, create_channel_in_cluster, create_cluster, create_nodes, deregister_node,
+    group_uri, groups_uri,
 };
 use crate::support::{percent_encoded, resolved_network_ids};
 use crate::wire::{call, error_code, error_message, medialive, ACCOUNT};
@@ -51,11 +52,6 @@ const CLUSTERS: &str = "/prod/clusters";
 /// The only `ClusterType` the model declares
 /// (`smithy_query(query="shape",shape="ClusterType")`: ON_PREMISES).
 const ON_PREMISES: &str = "ON_PREMISES";
-
-/// The channel placement group label a placed channel's `AnywhereSettings`
-/// carries beside the `ClusterId`. Only the cluster half is what a cluster's
-/// `ChannelIds` is derived from, so it is the same for every placed channel here.
-const PLACEMENT_GROUP: &str = "pg-1";
 
 /// An id in no MediaLive resource range this emulator mints from, so the store
 /// holds no cluster for it.
@@ -404,7 +400,7 @@ async fn a_cluster_a_resource_is_still_in_is_not_deleted() {
         // The bystander holds one of each for every row, so a refusal (or an
         // acceptance) has to be decided on the cluster the request names.
         let bystander = create_cluster(&router, case, "cluster-bystander").await;
-        create_channel(&router, case, "bystander-channel", Some((&bystander, PLACEMENT_GROUP))).await;
+        create_channel_in_cluster(&router, case, "bystander-channel", &bystander).await;
         create_group(&router, case, &bystander, "bystander-group").await;
         create_nodes(&router, case, &bystander, 1).await;
 
@@ -414,7 +410,10 @@ async fn a_cluster_a_resource_is_still_in_is_not_deleted() {
         let mut channel_ids: Vec<String> = Vec::new();
         for index in 0..channels {
             let name = format!("held-channel-{index}");
-            let channel = create_channel(&router, case, &name, Some((&id, PLACEMENT_GROUP))).await;
+            // The channel runs in the cluster under test and in no group of it:
+            // a group would be one more resource the delete has to refuse on,
+            // and this row is about the channel.
+            let channel = create_channel_in_cluster(&router, case, &name, &id).await;
             channel_ids.push(channel.clone());
             held.push(channel);
         }

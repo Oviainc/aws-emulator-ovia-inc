@@ -29,6 +29,9 @@ mod batch_stop;
 #[path = "all/channel_alerts.rs"]
 mod channel_alerts;
 
+#[path = "all/channel_anywhere_placement_resolution.rs"]
+mod channel_anywhere_placement_resolution;
+
 #[path = "all/channel_class_update.rs"]
 mod channel_class_update;
 
