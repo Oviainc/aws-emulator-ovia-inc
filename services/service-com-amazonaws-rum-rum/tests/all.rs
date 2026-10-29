@@ -87,6 +87,8 @@ mod shared_page_size_rule;
 mod state_roundtrip;
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/tag_key_clauses.rs"]
+mod tag_key_clauses;
 #[path = "all/tagging_authorization.rs"]
 mod tagging_authorization;
 #[path = "all/tagging_no_content.rs"]

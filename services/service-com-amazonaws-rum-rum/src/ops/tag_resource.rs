@@ -303,8 +303,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Sorted, so which key a multi-key refusal names is fixed by the request rather
-        // than by a `HashMap`'s iteration order.
+        // Sorted, so the order a multi-key refusal states its clauses in is fixed by the
+        // request rather than by a `HashMap`'s iteration order.
         let mut requested: Vec<(String, String)> = input.tags.into_iter().collect();
         requested.sort();
 

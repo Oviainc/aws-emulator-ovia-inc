@@ -2390,9 +2390,17 @@ pub fn tagged_resource_not_found() -> ResourceNotFoundException {
 /// own frontend uses for an invalid request.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
-/// Why the key shape of `TagMap` rejects the key at `path`, worded as the FRAMEWORK's own
-/// validation envelope — or `None` when the key satisfies every constraint `TagKey`
-/// declares.
+/// Why the key shape of `TagMap` rejects these keys, worded as the FRAMEWORK's own
+/// validation envelope — or `None` when every one of them satisfies every constraint
+/// `TagKey` declares.
+///
+/// EVERY offending key is stated: the envelope carries one clause per failing
+/// (key, requirement) pair, in the order `keyed` yields them, so a caller sending several
+/// bad keys is told about each of them in one answer instead of one per round trip. That is
+/// the rule [`validation`] states for every constraint refusal this service words, and a
+/// key carried by a map and a key carried by a list are the same kind of failure, so both
+/// callers below envelope their keys through here — only the PATH a clause reports a key at
+/// differs between them.
 ///
 /// These checks belong in the handlers rather than at the boundary: the vendored boundary
 /// validator does not validate a map KEY at all — it captures the key as the path segment
@@ -2406,18 +2414,31 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// The CHECK is [`validation`]'s, which is where this service applies a modelled `@length`
 /// and `@pattern` itself; the WORDS stay the framework's. A tag key is only ever refused by
 /// the tagging frontend, whose wording is not this service's (see that module's docs and
-/// `crate::service`), so the clause here is the one the boundary would have produced —
-/// quoting the model's pattern as written, anchors and all. `path` is the dotted member
-/// path the framework would have reported for a `TagMap` entry, and the key is echoed into
-/// the clause exactly as the caller sent it.
-fn tag_key_violation(path: &str, key: &str) -> Option<String> {
-    let violation = validation::string_violation(validation::ConstrainedString::TagKey, path, key)?;
-    // `envelope` answers `None` only for an EMPTY violation list, which the one-element
-    // slice below can never be. Fail closed anyway: a refused key stays refused, carrying
-    // the clause on its own rather than no message at all.
-    let clause = ::aws_smithy_schema_server::envelope(::std::slice::from_ref(&violation));
-    Some(clause.unwrap_or_else(|| violation.message()))
+/// `crate::service`), so the clauses here are the ones the boundary would have produced —
+/// quoting the model's pattern as written, anchors and all. Each path is the dotted member
+/// path the framework would have reported for that position, and the key is echoed into its
+/// clause exactly as the caller sent it.
+fn tag_key_refusal<'a>(keyed: impl IntoIterator<Item = (String, &'a str)>) -> Option<String> {
+    let violations: Vec<::aws_smithy_schema_server::constraints::Violation> = keyed
+        .into_iter()
+        .filter_map(|(path, key)| {
+            validation::string_violation(validation::ConstrainedString::TagKey, &path, key)
+        })
+        // The bound the framework's own walk collects to
+        // (`service_common::validation::MAX_VIOLATIONS`): a request past it is refused with
+        // the violations found so far, so the message a refusal states is not sized by how
+        // many keys a caller sent.
+        .take(service_common::validation::MAX_VIOLATIONS)
+        .collect();
+    // `envelope` answers `None` for an EMPTY violation list, which is exactly the case
+    // where every key is admitted; a non-empty list always states its clauses.
+    ::aws_smithy_schema_server::envelope(&violations)
 }
+
+/// The dotted member path a violation on the tag MAP a request carries is reported at: the
+/// lowerCamel spelling of `TagResource$Tags` and `CreateAppMonitor$Tags`, which is the
+/// member every tag map this service WRITES is carried by.
+const TAG_MAP_PATH: &str = "tags";
 
 /// Why these tag keys cannot be written, or `None` when every one of them satisfies the
 /// constraints the modelled `TagKey` declares.
@@ -2425,16 +2446,22 @@ fn tag_key_violation(path: &str, key: &str) -> Option<String> {
 /// Shared by every operation that WRITES tags — the create that seeds a resource's map and
 /// the tag call that merges onto it — because the constraints are the map's, declared once
 /// on `TagMap`'s key shape, not the property of whichever operation happens to carry it.
-/// The keys are judged in SORTED order, so which key a multi-key refusal names is fixed by
-/// the request rather than by a `HashMap`'s iteration order. A tag key carried by a LIST
-/// rather than by the map — the keys a removal NAMES — is judged by
-/// [`tag_key_list_refusal`], which applies these same constraints at the path a list
-/// element is reported at.
+/// Each offending key is reported at the path the framework's walk spells a map entry as
+/// (`<map>.<key>.member`), and the keys are judged in SORTED order, so the order a multi-key
+/// refusal states its clauses in is fixed by the request rather than by a `HashMap`'s
+/// iteration order. A tag key carried by a LIST rather than by the map — the keys a removal
+/// NAMES — is judged by [`tag_key_list_refusal`], which applies these same constraints at
+/// the path a list element is reported at.
 pub fn tag_keys_refusal<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<String> {
     let mut keys: Vec<&str> = keys.into_iter().collect();
     keys.sort_unstable();
-    keys.into_iter()
-        .find_map(|key| tag_key_violation(&format!("tags.{key}.member"), key))
+    tag_key_refusal(keys.into_iter().map(|key| {
+        let path = format!(
+            "{TAG_MAP_PATH}.{}",
+            ::aws_smithy_schema_server::constraints::path::entry(key)
+        );
+        (path, key)
+    }))
 }
 
 /// The dotted member path a violation on the tag-key LIST a request carries is reported
@@ -2454,24 +2481,17 @@ const TAG_KEY_LIST_PATH: &str = "tagKeys";
 /// What differs from the map form is only WHERE a clause reports the offending key: a key
 /// carried by a LIST is reported at the position it holds in that list, which is the path
 /// the framework's walk spells a list element as (`<list>.<1-based position>.member`), and
-/// the keys are judged in the order the request listed them. EVERY offending key is stated,
-/// because the walk accumulates one violation per element rather than stopping at the first
-/// — so a caller is told about each key it has to fix.
+/// the keys are judged in the order the request listed them. EVERY offending key is stated
+/// here as it is on the map side, because both envelope their keys through the one
+/// [`tag_key_refusal`] — so a caller is told about each key it has to fix.
 pub fn tag_key_list_refusal<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<String> {
-    let violations: Vec<::aws_smithy_schema_server::constraints::Violation> = keys
-        .into_iter()
-        .enumerate()
-        .filter_map(|(position, key)| {
-            let path = format!(
-                "{TAG_KEY_LIST_PATH}.{}",
-                ::aws_smithy_schema_server::constraints::path::element(position + 1)
-            );
-            validation::string_violation(validation::ConstrainedString::TagKey, &path, key)
-        })
-        .collect();
-    // `envelope` answers `None` for an EMPTY violation list, which is exactly the case
-    // where every key is admitted; a non-empty list always states its clauses.
-    ::aws_smithy_schema_server::envelope(&violations)
+    tag_key_refusal(keys.into_iter().enumerate().map(|(position, key)| {
+        let path = format!(
+            "{TAG_KEY_LIST_PATH}.{}",
+            ::aws_smithy_schema_server::constraints::path::element(position + 1)
+        );
+        (path, key)
+    }))
 }
 
 /// Why a tag write that would leave `resulting` tags on the resource `resource` names
