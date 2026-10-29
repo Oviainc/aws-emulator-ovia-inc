@@ -59,6 +59,7 @@ pub(crate) fn supported_retention(resource_type: &str, nth: usize) -> i64 {
 /// Published bounds of `UnlockDelay$UnlockDelayValue`.
 /// Source: smithy_query(query="shape", shape="UnlockDelay") — range {min: 7, max: 30}.
 pub(crate) const UNLOCK_DELAY_MIN: i64 = 7;
+pub(crate) const UNLOCK_DELAY_MAX: i64 = 30;
 
 pub(crate) fn router() -> MultiServiceRouter {
     // The single shared engine the production router builds and hands to every

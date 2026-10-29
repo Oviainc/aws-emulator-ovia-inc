@@ -95,16 +95,18 @@ async fn created_identifier(
 }
 
 /// Seconds since the Unix epoch, for comparing a returned `LockEndTime` against the
-/// unlock delay the lock configuration asked for.
-fn now_epoch_seconds() -> f64 {
+/// unlock delay the lock configuration asked for. `pub(crate)` so the sibling suites of
+/// this one test target bracket a lock end time the same way.
+pub(crate) fn now_epoch_seconds() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("a clock after the Unix epoch")
         .as_secs_f64()
 }
 
-/// `LockEndTime` as epoch seconds; `None` when the member is absent.
-fn lock_end_seconds(value: &serde_json::Value) -> Option<f64> {
+/// `LockEndTime` as epoch seconds; `None` when the member is absent. `pub(crate)` for
+/// the same reason as [`now_epoch_seconds`].
+pub(crate) fn lock_end_seconds(value: &serde_json::Value) -> Option<f64> {
     match value.get("LockEndTime") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(text)) => Some(

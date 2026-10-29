@@ -349,7 +349,10 @@ pub struct Rule {
     /// `locked` | `pending_unlock` | `unlocked`; `None` means never locked, a state
     /// a rule can never return to once locked.
     pub lock_state: Option<String>,
-    /// When a `pending_unlock` rule's unlock delay expires.
+    /// When a `pending_unlock` rule's unlock delay expires. `None` means no unlock
+    /// delay is running, so the rule is inside no delay period: every reader below
+    /// treats an absent end time as a delay that is already over, never as one without
+    /// an end.
     pub lock_end_time: Option<SystemTime>,
     pub created_at: SystemTime,
 }
@@ -376,7 +379,12 @@ impl Rule {
     pub fn is_lock_protected(&self, now: SystemTime) -> bool {
         match self.lock_state.as_deref() {
             Some(LOCK_STATE_LOCKED) => true,
-            Some(LOCK_STATE_PENDING_UNLOCK) => self.lock_end_time.is_none_or(|end| now < end),
+            // The protection lasts exactly as long as the delay period the end time
+            // bounds. A rule carrying NO end time is within no delay period at all —
+            // the lock end time is "only returned for retention rules that have been
+            // unlocked and that are still within the unlock delay period" — so it is
+            // not protected, rather than protected by a period that never ends.
+            Some(LOCK_STATE_PENDING_UNLOCK) => self.lock_end_time.is_some_and(|end| now < end),
             _ => false,
         }
     }
@@ -423,11 +431,15 @@ impl Rule {
     /// no longer reports a lock end time ("Only returned for retention rules that
     /// have been unlocked and that are still within the unlock delay period").
     ///
+    /// A `pending_unlock` rule carrying NO end time is inside no delay period, so the
+    /// transition is due at once: the rule leaves `pending_unlock` on the next settle
+    /// rather than staying in it for ever, which no later call could release.
+    ///
     /// Nothing else about a lock moves on its own, so a rule in any other state is
     /// left exactly as it is.
     pub fn settle_lock_state(&mut self, now: SystemTime) {
         if self.lock_state.as_deref() == Some(LOCK_STATE_PENDING_UNLOCK)
-            && self.lock_end_time.is_some_and(|end| now >= end)
+            && self.lock_end_time.is_none_or(|end| now >= end)
         {
             self.lock_state = Some(LOCK_STATE_UNLOCKED.to_string());
             self.lock_end_time = None;
@@ -485,13 +497,23 @@ impl Rule {
 ///
 /// The delay is the one the rule's lock configuration carries, so it keeps the value
 /// the lock request asked for: `UnlockDelayValue` units of `UnlockDelayUnit`, which
-/// the model bounds at 7..=30 and measures only in `DAYS`. A rule with no lock
-/// configuration has no delay to serve.
+/// the model bounds at 7..=30 and measures only in `DAYS`.
+///
+/// Every input no delay can be measured from answers `now` — a delay that is over at
+/// the instant it starts — the way [`status_transition_end`] answers the same
+/// impossibility: a rule with no lock configuration, a unit the model does not define,
+/// and a sum too far in the future to represent. Serving an END a caller can never
+/// reach would instead leave the rule inside a delay period for ever, and a rule that
+/// never leaves `pending_unlock` can never be modified or deleted again.
 pub fn unlock_delay_end(
     now: SystemTime,
     lock_configuration: Option<&LockConfiguration>,
-) -> Option<SystemTime> {
-    let delay = &lock_configuration?.unlock_delay;
+) -> SystemTime {
+    let Some(configuration) = lock_configuration else {
+        // No lock configuration carries no delay to serve.
+        return now;
+    };
+    let delay = &configuration.unlock_delay;
     // The model bounds the value at 7..=30, so a value outside `u64` cannot reach a
     // handler; treat one as no delay rather than panicking if it ever does.
     let value = u64::try_from(delay.unlock_delay_value).unwrap_or(0);
@@ -500,9 +522,11 @@ pub fn unlock_delay_end(
         // `UnlockDelayUnit` models only `DAYS`, and the boundary validator refuses an
         // unmodelled value before a handler runs, so this arm serves no delay rather
         // than guessing a scale for a unit the model does not define.
-        _ => return None,
+        _ => 0,
     };
-    now.checked_add(Duration::from_secs(seconds))
+    // `checked_add` rather than `+`: a clock far enough in the future to overflow
+    // leaves the delay immediately over, not a panic in a handler.
+    now.checked_add(Duration::from_secs(seconds)).unwrap_or(now)
 }
 
 /// A tag matches when it is the SAME resource tag pair as the filter names, as

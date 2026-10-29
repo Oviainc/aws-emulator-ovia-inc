@@ -217,10 +217,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock — not a later call — makes due.
         let lock_end_time = crate::state::unlock_delay_end(now, rule.lock_configuration.as_ref());
         rule.lock_state = Some(crate::state::LOCK_STATE_PENDING_UNLOCK.to_string());
-        rule.lock_end_time = lock_end_time;
+        rule.lock_end_time = Some(lock_end_time);
         // A delay that is already over at the instant it starts is over for every later
         // reader too, so settle it here rather than reporting a state the clock has
-        // already left.
+        // already left: the rule is then `unlocked` and reports no end time, which is
+        // what a rule inside no delay period reports.
         rule.settle_lock_state(now);
 
         // Answer out of the STORED record, so the caller sees what a later GetRule sees.

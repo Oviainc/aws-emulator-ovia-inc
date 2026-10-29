@@ -53,6 +53,8 @@ mod selection_combination_invariant;
 mod state_roundtrip;
 #[path = "all/tag_arn_label_encoding.rs"]
 mod tag_arn_label_encoding;
+#[path = "all/unlock_delay_boundedness.rs"]
+mod unlock_delay_boundedness;
 #[path = "all/update_rule_lock_invariant.rs"]
 mod update_rule_lock_invariant;
 #[path = "all/update_rule_refusal_atomicity.rs"]
