@@ -16,7 +16,9 @@
 //! fails closed — and its description is reported in `errors` on the 200.
 //! `ValidationException` is for a request that breaks this operation's own input
 //! contract: an absent member of the triple, or a `context`/`entities` payload
-//! that is unparseable or past a bound.
+//! that is unparseable or past a bound. The policy store the request names is
+//! resolved BEFORE any of that is read, so a call against a store that does not
+//! exist is the 404 whatever else the request got wrong.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -166,6 +168,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            IsAuthorizedErrorModeled::InternalServerException(InternalServerException {
+                message: "the service state store is unavailable".to_string(),
+            })
+        })?;
+        let state = state.lock();
+        // The store the request names is resolved BEFORE any of the request's own
+        // payload is read, so a reference to a store that does not exist answers
+        // `ResourceNotFoundException` rather than a refusal about the payload —
+        // the one precedence every handler of a `policyStoreId` follows, and the
+        // one `BatchIsAuthorized` states.
+        let store_id = state
+            .resolve_store_id(&input.policy_store_id)
+            .ok_or_else(not_found)?;
+        let store = state.policy_stores.get(&store_id).ok_or_else(not_found)?;
+
         // Cedar evaluates a request against a complete triple, so each of the
         // three must be present. Refused as a bad request rather than answered
         // with a deny, which would read as "evaluated and denied" — and the
@@ -187,17 +205,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let entities = crate::state::cedar::entities_to_cedar_json(input.entities.as_ref())
             .map_err(invalid)?;
-
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            IsAuthorizedErrorModeled::InternalServerException(InternalServerException {
-                message: "the service state store is unavailable".to_string(),
-            })
-        })?;
-        let state = state.lock();
-        let store_id = state
-            .resolve_store_id(&input.policy_store_id)
-            .ok_or_else(not_found)?;
-        let store = state.policy_stores.get(&store_id).ok_or_else(not_found)?;
 
         let verdict = crate::state::cedar::authorize(
             store,

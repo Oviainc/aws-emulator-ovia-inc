@@ -41,6 +41,8 @@ mod list_identity_sources;
 mod list_policy_store_aliases;
 #[path = "all/list_policy_templates.rs"]
 mod list_policy_templates;
+#[path = "all/not_found_precedes_payload_refusal.rs"]
+mod not_found_precedes_payload_refusal;
 #[path = "all/policy_store_alias.rs"]
 mod policy_store_alias;
 #[path = "all/policy_store_authorization.rs"]

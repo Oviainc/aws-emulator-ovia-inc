@@ -180,20 +180,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into()
         };
 
-        // The provider reference is resolved BEFORE any state is touched: a
-        // configuration this service cannot resolve must change nothing.
-        let region = crate::state::request_region(ctx.parts());
-        let configuration = crate::ops::persisted_identity_source_configuration(
-            &input.update_configuration,
-            &region,
-        )
-        .map_err(invalid)?;
-
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
         let mut state = state.lock();
+        // The store the request names is resolved BEFORE any of the request's own
+        // payload is read, so a reference to a store that does not exist answers
+        // `ResourceNotFoundException` rather than a refusal about the payload.
+        // Resolving is a READ, so a request refused below still changes nothing.
         let store_id = state
             .resolve_store_id(&input.policy_store_id)
             .ok_or_else(store_not_found)?;
+
         let store = state
             .policy_stores
             .get_mut(&store_id)
@@ -205,6 +201,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .identity_sources
             .get_mut(&input.identity_source_id)
             .ok_or_else(source_not_found)?;
+
+        // The provider reference is resolved once every resource the request
+        // REFERENCES has been found, and before any state is CHANGED: a
+        // configuration this service cannot resolve must change nothing.
+        let region = crate::state::request_region(ctx.parts());
+        let configuration = crate::ops::persisted_identity_source_configuration(
+            &input.update_configuration,
+            &region,
+        )
+        .map_err(invalid)?;
 
         source.configuration = configuration;
         // "Specifies the data type of principals generated for identities

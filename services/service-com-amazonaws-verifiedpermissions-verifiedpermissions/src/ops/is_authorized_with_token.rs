@@ -22,7 +22,10 @@
 //! it cannot read, a key it cannot check a signature under — is the modelled
 //! `InternalServerException`, because nothing was decided about the token. A failure
 //! raised while EVALUATING is reported in-band on the 200, in `errors`, for the reason
-//! [`crate::ops::is_authorized`] states.
+//! [`crate::ops::is_authorized`] states. The policy store the request names is resolved
+//! BEFORE any of the request's own payload — the presented tokens included — is read, so
+//! a call against a store that does not exist is the 404 whatever else the request got
+//! wrong.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -193,6 +196,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            IsAuthorizedWithTokenErrorModeled::InternalServerException(InternalServerException {
+                message: "the service state store is unavailable".to_string(),
+            })
+        })?;
+        let state = state.lock();
+        // The store the request names is resolved BEFORE any of the request's own payload
+        // is read, so a reference to a store that does not exist answers
+        // `ResourceNotFoundException` rather than a refusal about the payload — the same
+        // precedence [`crate::ops::is_authorized`] and `BatchIsAuthorized` follow.
+        let store_id = state
+            .resolve_store_id(&input.policy_store_id)
+            .ok_or_else(not_found)?;
+        let store = state.policy_stores.get(&store_id).ok_or_else(not_found)?;
+
         // "You must specify either an accessToken, an identityToken, or both": the model
         // declares both members optional, so the boundary validator cannot require one of
         // them and this is the place that does. Both members are named, because either
@@ -242,17 +260,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut entities = crate::state::cedar::entities_to_cedar_json(input.entities.as_ref())
             .map_err(invalid)?;
-
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            IsAuthorizedWithTokenErrorModeled::InternalServerException(InternalServerException {
-                message: "the service state store is unavailable".to_string(),
-            })
-        })?;
-        let state = state.lock();
-        let store_id = state
-            .resolve_store_id(&input.policy_store_id)
-            .ok_or_else(not_found)?;
-        let store = state.policy_stores.get(&store_id).ok_or_else(not_found)?;
 
         // Each presented token is verified against the store's identity sources, and a
         // call that presented two is decided for the one principal they agree on.
