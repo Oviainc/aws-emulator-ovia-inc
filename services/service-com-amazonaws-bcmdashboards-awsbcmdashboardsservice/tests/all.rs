@@ -63,6 +63,8 @@ mod scheduled_report_health_views;
 mod scheduled_report_lifecycle;
 #[path = "all/scheduled_report_listing.rs"]
 mod scheduled_report_listing;
+#[path = "all/shared_arn_cursor_parse.rs"]
+mod shared_arn_cursor_parse;
 #[path = "all/shared_media_type_rule.rs"]
 mod shared_media_type_rule;
 #[path = "all/state_roundtrip.rs"]

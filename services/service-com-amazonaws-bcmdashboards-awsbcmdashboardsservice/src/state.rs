@@ -2005,9 +2005,6 @@ pub fn encode_page_token(arn: &str) -> String {
 /// (`smithy_query(query="shape",shape="DashboardArn,ScheduledReportArn")`).
 const RESOURCE_ARN_LENGTH: ::std::ops::RangeInclusive<usize> = 20..=2048;
 
-/// The literal first field of every ARN.
-const ARN_PREFIX_FIELD: &str = "arn";
-
 /// The fixed opening of the partition field, which the ARN patterns spell
 /// `aws[-a-z0-9]*`: the literal `aws` followed by a run of [`is_arn_label`]'s characters.
 const ARN_PARTITION_PREFIX: &str = "aws";
@@ -2027,7 +2024,7 @@ fn is_arn_label(label: &str) -> bool {
         .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-')
 }
 
-/// Whether `arn` is an ARN of this service's `resource_type` resource, judged by that
+/// Whether `value` is an ARN of this service's `resource_type` resource, judged by that
 /// resource's whole modelled ARN pattern — `DashboardArn`'s
 /// `^arn:aws[-a-z0-9]*:bcm-dashboards::[0-9]{12}:dashboard/(\*|[-a-z0-9]+)$` and
 /// `ScheduledReportArn`'s, which differ only in the resource type
@@ -2039,29 +2036,34 @@ fn is_arn_label(label: &str) -> bool {
 /// partition opening with `aws`, this service's ARN namespace, an empty region, twelve
 /// digits of account, and the resource type followed by `/` and one resource id. A value
 /// that satisfies the segments in some other arrangement is not an ARN of this resource.
-pub fn names_resource_arn(arn: &str, resource_type: &str) -> bool {
-    if !RESOURCE_ARN_LENGTH.contains(&arn.len()) {
+///
+/// Splitting `value` into those fields, and the resource field into its type and its id,
+/// is not this service's business: both come from `service_common::arn`, the tree's one
+/// reader of a resource ARN, which also settles the literal `arn` prefix and the
+/// namespace. What is left here is only what THESE patterns require of each field.
+pub fn names_resource_arn(value: &str, resource_type: &str) -> bool {
+    if !RESOURCE_ARN_LENGTH.contains(&value.len()) {
         return false;
     }
-    let fields: Vec<&str> = arn.split(':').collect();
-    let &[prefix, partition, namespace, region, account, resource] = fields.as_slice() else {
+    let Some(arn) = ::service_common::arn::parse_of(value, ARN_NAMESPACE) else {
         return false;
     };
-    prefix == ARN_PREFIX_FIELD
-        && partition
-            .strip_prefix(ARN_PARTITION_PREFIX)
-            .is_some_and(is_arn_label)
-        && namespace == ARN_NAMESPACE
-        && region.is_empty()
-        && account.len() == ACCOUNT_ID_DIGITS
-        && account.chars().all(|digit| digit.is_ascii_digit())
-        && resource
-            .strip_prefix(resource_type)
-            .and_then(|rest| rest.strip_prefix('/'))
-            .is_some_and(|resource_id| {
+    arn.partition
+        .strip_prefix(ARN_PARTITION_PREFIX)
+        .is_some_and(is_arn_label)
+        && arn.region.is_empty()
+        && arn.account.len() == ACCOUNT_ID_DIGITS
+        && arn.account.chars().all(|digit| digit.is_ascii_digit())
+        // These patterns spell the resource `<type>/<id>` and nothing else, so a resource
+        // field carrying a colon — the `<type>:<id>` form AWS writes elsewhere, or a
+        // further field behind the id — names no resource of this service.
+        && !arn.resource.contains(':')
+        && ::service_common::arn::resource_id_of_type(value, resource_type).is_some_and(
+            |resource_id| {
                 resource_id == ARN_RESOURCE_WILDCARD
                     || (!resource_id.is_empty() && is_arn_label(resource_id))
-            })
+            },
+        )
 }
 
 /// The ARN a `nextToken` resumes at, or `None` when the token is not one this
