@@ -138,7 +138,9 @@ pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Val
     call_as(router, operation, body, SIGNED_FOR_US_EAST_1).await
 }
 
-async fn call_as(
+/// The same call under a credential scope the caller chooses, which is what a
+/// suite about the REGION a minted ARN names drives the service with.
+pub(crate) async fn call_as(
     router: &MultiServiceRouter,
     operation: &str,
     body: Value,

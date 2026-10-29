@@ -260,18 +260,28 @@ fn mint_registration_token() -> String {
     ::hex::encode(digest.finalize())
 }
 
-/// The region an ARN this service mints is in when the caller signed for none —
-/// `::engine::emulator_arn`'s own documented default ("emulators default to
-/// `us-east-1`").
+/// The region an ARN this service mints is in when the caller signed for none,
+/// or for text that is no Region at all — `::engine::emulator_arn`'s own
+/// documented default ("emulators default to `us-east-1`").
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// The region to mint a licence ARN in: the one the caller signed for, else
-/// [`DEFAULT_REGION`].
+/// The region to mint a licence ARN in: the one the caller signed for when that
+/// is a well-formed AWS Region LABEL, else [`DEFAULT_REGION`].
 ///
 /// Read from the SigV4 credential scope, the same signal the router routes on,
-/// so a licence is minted in the region the client addressed.
+/// so a licence is minted in the region the client addressed. The scope's region
+/// field is arbitrary text — the parser that produces it only rejects an empty
+/// field — while this value is INTERPOLATED into a minted ARN that is then
+/// persisted and reported under `AgreementEntitlement$licenseArn`, whose
+/// `AwsArn` pattern bounds that segment. So the field is read through the shared
+/// Region grammar (`service_common::arn::region_label`, non-empty, bounded,
+/// `[a-z0-9-]` only), which every model's ARN pattern admits in that position:
+/// text outside it names no Region any AWS endpoint has, and minting from it
+/// verbatim would store a value the member's own pattern cannot hold and that
+/// `SearchAgreements`' `LicenseArn` filter could never carry.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .filter(|scope| ::service_common::arn::region_label(&scope.region).is_some())
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
@@ -4621,8 +4631,13 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     /// The licence id carries License Manager's own `l-` prefix, and the ARN is
     /// built through [`::engine::emulator_arn`], so its account segment is the
     /// emulator's canonical one and its region is the one the accepting caller
-    /// signed for. Every ARN this mints satisfies `AwsArn`'s pattern, whose
-    /// resource part admits the `license:<id>` form License Manager uses.
+    /// signed for, read through [`request_region`] so that segment is a Region
+    /// label rather than whatever text the credential scope carried. Every ARN
+    /// this mints therefore satisfies `AwsArn`'s pattern, whose resource part
+    /// admits the `license:<id>` form License Manager uses — and, because that
+    /// Region grammar is a subset of it, satisfies `FilterValue`'s pattern too,
+    /// so a minted licence can always be passed to `SearchAgreements`'
+    /// `LicenseArn` filter.
     fn mint_license_arn(&mut self, region: &str) -> String {
         let license_id = format!("l-{:016x}", self.next_sequence());
         ::engine::emulator_arn(

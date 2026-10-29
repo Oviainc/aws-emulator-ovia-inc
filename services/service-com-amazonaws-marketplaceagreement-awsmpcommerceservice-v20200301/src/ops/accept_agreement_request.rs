@@ -260,8 +260,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Accepting the quote is what provisions the agreement's entitlements:
         // one licence per resource the agreement is involved with, each
         // `PENDING` until the clock owes it its `PROVISIONED` status. The
-        // licence is minted in the region this caller signed for, and reported
-        // from then on by `GetAgreementEntitlements`, `SearchAgreements` and its
+        // licence is minted in the region this caller signed for — when the
+        // credential scope's region field is a Region label at all, which
+        // `crate::state::request_region` is what decides — and reported from
+        // then on by `GetAgreementEntitlements`, `SearchAgreements` and its
         // `LicenseArn` filter.
         let region = crate::state::request_region(ctx.parts());
         let entitlements = store.provision_entitlements(&resources, &region, now);
