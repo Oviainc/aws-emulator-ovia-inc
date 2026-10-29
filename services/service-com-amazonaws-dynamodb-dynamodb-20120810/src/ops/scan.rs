@@ -989,6 +989,14 @@ fn substitution_without_expression(input: &ScanInput) -> Option<&'static str> {
     None
 }
 
+/// How a parallel scan whose `Segment` is not inside its `TotalSegments` is refused:
+/// "The value for Segment must be greater than or equal to 0, and less than the value
+/// provided for TotalSegments" (`Scan$Segment`). The sentence is FIXED — it names the
+/// two members the rule is about and reports neither value, so every client that
+/// matches this refusal matches one string whatever it sent.
+const SEGMENT_NOT_BELOW_TOTAL_SEGMENTS_MESSAGE: &str =
+    "The Segment parameter is zero-based and must be less than parameter TotalSegments";
+
 /// Which share of the table one `Scan` request evaluates.
 ///
 /// "TotalSegments represents the total number of segments into which the Scan
@@ -1029,10 +1037,7 @@ impl Segmentation {
             ),
             (Some(segment), Some(total)) => {
                 if segment >= total {
-                    return Err(format!(
-                        "The Segment parameter is zero-based and must be less than parameter \
-                         TotalSegments: Segment: {segment} is not less than TotalSegments: {total}"
-                    ));
+                    return Err(SEGMENT_NOT_BELOW_TOTAL_SEGMENTS_MESSAGE.to_string());
                 }
                 // Both members' modelled ranges are non-negative, and they are
                 // checked before this handler runs, so the conversions cannot fail.

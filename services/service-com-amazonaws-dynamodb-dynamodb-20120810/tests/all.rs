@@ -77,6 +77,8 @@ mod on_demand_backups;
 mod on_demand_throughput_capacity_mode;
 #[path = "all/paging_start_keys.rs"]
 mod paging_start_keys;
+#[path = "all/parallel_scan_segment_refusals.rs"]
+mod parallel_scan_segment_refusals;
 #[path = "all/partiql_statements.rs"]
 mod partiql_statements;
 #[path = "all/partiql_transactions.rs"]
