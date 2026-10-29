@@ -1512,6 +1512,43 @@ pub fn optional_page_bound(max_results: Option<i32>, default: i32) -> usize {
     max_results.unwrap_or(default).max(0) as usize
 }
 
+/// A decimal field of a cursor payload, read as the number it spells and only when it spells
+/// it the way this service WROTE it.
+///
+/// A payload is rendered by `Display` ([`encode_cursor`]), which spells one number one way: no
+/// sign on a value that is not negative, and no zero before its most significant digit.
+/// `FromStr` reads more than that — a leading `+`, and any number of leading zeros — so a
+/// field it accepts but `Display` would never have produced is not a field this service wrote,
+/// and the token carrying it is not a token this service issued. Rendering the parsed value
+/// back is what compares the two, so the accepted spelling is the ENCODER's rather than a
+/// second grammar maintained beside it.
+fn canonical_number<T>(field: &str) -> Option<T>
+where
+    T: ::std::str::FromStr + ::std::fmt::Display,
+{
+    let value = field.parse::<T>().ok()?;
+    (value.to_string() == field).then_some(value)
+}
+
+/// The offset `cursor` names into a projection of `len` entries, or `None` when it is not an
+/// offset [`page_of`] can have minted over that projection.
+///
+/// A page token is minted by counting PAST the page just served (`offset + page_size`, with
+/// `page_size` at least [`MIN_PAGE_BOUND`]) and only while the projection still holds entries
+/// beyond it, so every offset this service hands out is a whole number of at least one entry
+/// and strictly inside the projection: the FIRST entry is served by the request that states no
+/// cursor, and an offset at or past the end bounds no page at all. An offset outside that
+/// range, or one spelled a way the encoder does not spell it ([`canonical_number`]), is
+/// therefore a boundary no read of this service issued — and honouring it would re-serve the
+/// first page under a cursor, or report the projection as exhausted to a caller whose cursor is
+/// not one it was given.
+fn issued_offset(cursor: &str, len: usize) -> Option<usize> {
+    let offset = canonical_number::<usize>(cursor)?;
+    (MIN_PAGE_BOUND as usize..len)
+        .contains(&offset)
+        .then_some(offset)
+}
+
 /// One page of a derived projection, plus the token for the page after it.
 ///
 /// The projections the time-ranged topology reads page over are DERIVED (they are
@@ -1524,6 +1561,11 @@ pub fn optional_page_bound(max_results: Option<i32>, default: i32) -> usize {
 /// same cursor refused by a read whose cursor is a stored key. A read whose projection the
 /// REQUEST selects passes that tag with the whole selection bound into it
 /// ([`subject_token_tag`]), since the operation alone does not name the projection there.
+///
+/// The token is opaque but not authenticated, so the POSITION inside the tag is a value a
+/// caller may have written: it is honoured only when it is an offset this paging can have
+/// minted over the projection being read ([`issued_offset`]), and refused with that same ONE
+/// wording otherwise.
 pub fn page_of<T>(
     items: Vec<T>,
     tag: &str,
@@ -1540,7 +1582,7 @@ pub fn page_of<T>(
     let offset = match token {
         None => 0,
         Some(token) => decode_cursor(tag, token)
-            .and_then(|cursor| cursor.parse::<usize>().ok())
+            .and_then(|cursor| issued_offset(&cursor, items.len()))
             .ok_or_else(|| UNISSUED_NEXT_TOKEN.to_string())?,
     };
     let mut page: Vec<T> = items.into_iter().skip(offset).collect();
@@ -4215,14 +4257,16 @@ impl StatusEventCursor {
     /// A `NextToken` is opaque but not authenticated, so every field it carries is a value a
     /// caller may have written: an instant is accepted only when its subsecond part is a real
     /// one (strictly under a second, [`NANOS_PER_SECOND`]), which is the range
-    /// [`Self::window`]'s timestamps are defined over. A payload carrying anything else is not
-    /// a cursor this service issued, and is refused exactly like a token that is not hex.
+    /// [`Self::window`]'s timestamps are defined over, and only when each of its two numbers is
+    /// spelled the way [`Self::encode`] spells it ([`canonical_number`]). A payload carrying
+    /// anything else is not a cursor this service issued, and is refused exactly like a token
+    /// that is not hex.
     pub fn decode(payload: &str) -> Option<Self> {
         let mut parts = payload.split('/');
         let mut instant = || -> Option<StatusEventInstant> {
             let (secs, nanos) = parts.next()?.split_once('.')?;
-            let secs = secs.parse::<i64>().ok()?;
-            let nanos = nanos.parse::<u32>().ok().filter(|nanos| *nanos < NANOS_PER_SECOND)?;
+            let secs = canonical_number::<i64>(secs)?;
+            let nanos = canonical_number::<u32>(nanos).filter(|nanos| *nanos < NANOS_PER_SECOND)?;
             Some((secs, nanos))
         };
         let start = instant()?;
