@@ -28,7 +28,13 @@
 //! holding every member `StackSetOperationSummary` reports. An operation that is still
 //! running concludes on a clock rather than on a read:
 //! [`StoredStackSetOperation::settle`] materialises the terminal status that was owed at a
-//! given instant, the way every other in-flight record of this service does.
+//! given instant, the way every other in-flight record of this service does. What one
+//! operation did in each account and Region it acted on —
+//! [`StoredStackSet::operation_results`], which `ListStackSetOperationResults` reports — is
+//! read off the stack INSTANCE that target's work was performed on, so that read and
+//! `ListStackInstances` cannot disagree about what became of a target; the operation's
+//! conclusion freezes a copy ([`StoredStackSetOperation::results`]) so its record survives
+//! the instances a deletion removes and the operations that run after it.
 //!
 //! ## What writes it
 //!
@@ -202,6 +208,92 @@ pub mod filter_name {
     pub const LAST_OPERATION_ID: &str = "LAST_OPERATION_ID";
     /// Filters on the instance's `DriftStatus`.
     pub const DRIFT_STATUS: &str = "DRIFT_STATUS";
+}
+
+/// The model's `StackSetOperationResultStatus`: "the result status of the StackSet operation
+/// for the given account in the given Region"
+/// (`smithy_query(query="shape", shape="StackSetOperationResultStatus")`).
+pub mod result_status {
+    /// "PENDING: The operation in the specified account and Region has yet to start."
+    pub const PENDING: &str = "PENDING";
+    /// "RUNNING: The operation in the specified account and Region is currently in
+    /// progress."
+    pub const RUNNING: &str = "RUNNING";
+    /// "SUCCEEDED: The operation in the specified account and Region completed
+    /// successfully."
+    pub const SUCCEEDED: &str = "SUCCEEDED";
+    /// "FAILED: The operation in the specified account and Region failed."
+    pub const FAILED: &str = "FAILED";
+    /// "CANCELLED: The operation in the specified account and Region has been canceled.
+    /// This is either because a user has stopped the StackSet operation, or because the
+    /// failure tolerance of the StackSet operation has been exceeded."
+    pub const CANCELLED: &str = "CANCELLED";
+}
+
+/// The model's `OperationResultFilterName`: the one thing a request may filter a stack-set
+/// operation's results by (`smithy_query(query="shape", shape="OperationResultFilterName")`).
+pub mod operation_result_filter_name {
+    /// Filters on the result's `StackSetOperationResultSummary$Status`.
+    pub const OPERATION_RESULT_STATUS: &str = "OPERATION_RESULT_STATUS";
+}
+
+/// The `StackSetOperationResultStatus` a stack instance's own
+/// `StackInstanceStatus$DetailedStatus` is, for the operation that last acted on it.
+///
+/// The two enums report the SAME thing — what the operation did "in the specified account and
+/// Region" — but `StackInstanceDetailedStatus` draws finer distinctions than the five result
+/// statuses do, so each of its extra values folds onto the result status that states the same
+/// outcome: a stack left unstable or an import that did not complete is an operation that
+/// FAILED there, and an account the operation was not performed in at all is one it was
+/// CANCELLED in.
+pub fn result_status_of(detailed_status: &str) -> &'static str {
+    match detailed_status {
+        detailed_status::PENDING => result_status::PENDING,
+        detailed_status::RUNNING => result_status::RUNNING,
+        detailed_status::SUCCEEDED => result_status::SUCCEEDED,
+        detailed_status::CANCELLED | detailed_status::SKIPPED_SUSPENDED_ACCOUNT => {
+            result_status::CANCELLED
+        }
+        _ => result_status::FAILED,
+    }
+}
+
+/// ONE account-and-Region result of ONE stack-set operation, with every member
+/// `StackSetOperationResultSummary` reports.
+///
+/// "The structure that contains information about a specified operation's results for a given
+/// account in a given Region": a stack-set operation acts on one stack instance per target
+/// account and Region pair, so a result is what that operation did to that pair.
+#[derive(Debug, Clone)]
+pub struct StoredOperationResult {
+    /// `Account`: "the name of the Amazon Web Services account for this operation result".
+    pub account: String,
+    /// `Region`: "the name of the Amazon Web Services Region for this operation result".
+    pub region: String,
+    /// `Status`: [`result_status`] — what the operation did in that account and Region.
+    pub status: String,
+    /// `StatusReason`: "the reason for the assigned result status", for a result that
+    /// carries one.
+    pub status_reason: Option<String>,
+    /// `OrganizationalUnitId`: "[Service-managed permissions] The organization root ID or
+    /// organizational unit (OU) IDs" the target belongs to, absent for a self-managed stack
+    /// set.
+    pub organizational_unit_id: Option<String>,
+}
+
+impl StoredOperationResult {
+    /// Whether the filter `name` with `value` selects this result.
+    ///
+    /// `OperationResultFilter$Values` is "the value to filter by": one value, compared with
+    /// the member the filter names, so a result carrying another value is not selected. A
+    /// name outside the modelled `OperationResultFilterName` enum cannot reach here — the
+    /// boundary refuses it before a handler runs — and selects nothing if it ever did.
+    pub fn matches_filter(&self, name: &str, value: &str) -> bool {
+        match name {
+            operation_result_filter_name::OPERATION_RESULT_STATUS => self.status == value,
+            _ => false,
+        }
+    }
 }
 
 /// The model's `StackSetStatus`: "the status of the StackSet"
@@ -907,6 +999,62 @@ impl StoredStackSet {
         self.operations.iter().rev()
     }
 
+    /// What `operation` did in each account and Region it acted on, which is what
+    /// `ListStackSetOperationResults` reports.
+    ///
+    /// A stack-set operation acts on one stack INSTANCE per target account and Region pair,
+    /// and that instance is where what the operation did to the pair lives
+    /// ([`StoredStackInstance::last_operation_id`] is "the last unique ID of a StackSet
+    /// operation performed on a stack instance"), so a result is read off the instance while
+    /// that instance is still the one this operation last acted on. What its CONCLUSION
+    /// froze ([`StoredStackSetOperation::results`]) is what the operation's record of a
+    /// target falls back to once the instance is no longer that: an instance a deletion
+    /// removed, or one a later operation has since acted on. So the targets an operation
+    /// reports are the ones it acted on however many operations ran after it, and nothing
+    /// reports a success for a deployment a late failure corrected.
+    ///
+    /// The order is the order its conclusion recorded the targets in — the order the stack
+    /// set holds its instances in — so a paginated read is a stable window over the results;
+    /// the model documents no other order for them.
+    pub fn operation_results(
+        &self,
+        operation: &StoredStackSetOperation,
+    ) -> Vec<StoredOperationResult> {
+        let current = self.results_in_flight(&operation.operation_id);
+        let Some(frozen) = operation.results.as_ref() else {
+            return current;
+        };
+        let current: ::std::collections::BTreeMap<(&str, &str), &StoredOperationResult> = current
+            .iter()
+            .map(|result| ((result.account.as_str(), result.region.as_str()), result))
+            .collect();
+        frozen
+            .iter()
+            .map(
+                |held| match current.get(&(held.account.as_str(), held.region.as_str())) {
+                    Some(now) => (*now).clone(),
+                    None => held.clone(),
+                },
+            )
+            .collect()
+    }
+
+    /// One result per instance the operation `operation_id` last acted on, as those
+    /// instances stand right now.
+    fn results_in_flight(&self, operation_id: &str) -> Vec<StoredOperationResult> {
+        self.instances
+            .iter()
+            .filter(|instance| instance.last_operation_id == operation_id)
+            .map(|instance| StoredOperationResult {
+                account: instance.account.clone(),
+                region: instance.region.clone(),
+                status: result_status_of(&instance.detailed_status).to_string(),
+                status_reason: instance.status_reason.clone(),
+                organizational_unit_id: instance.organizational_unit_id.clone(),
+            })
+            .collect()
+    }
+
     /// Materialise every status transition the clock has made due on this stack set's
     /// operations, and the per-instance state each operation that CONCLUDES owes.
     ///
@@ -925,14 +1073,20 @@ impl StoredStackSet {
             // "Deletes stack instances for the specified accounts, in the specified Amazon
             // Web Services Regions": an instance the deletion carried out is no longer one
             // of the stack set's, so it leaves the stack set when the operation that deleted
-            // it concludes. An instance the deletion FAILED on is left where it is, in the
-            // INOPERABLE state that failure put it in, so a partly failed deletion reports
-            // exactly which instances it could not remove.
+            // it concludes — and the removal having been carried out there is "SUCCEEDED:
+            // The operation in the specified account and Region completed successfully",
+            // which the operation's own results keep once the instance is gone. An instance
+            // the deletion FAILED on is left where it is, in the state that failure put it
+            // in, so a partly failed deletion reports exactly which instances it could not
+            // remove.
             if concluded.action == operation_action::DELETE {
-                self.instances.retain(|instance| {
-                    instance.last_operation_id != concluded.operation_id
-                        || instance.detailed_status != detailed_status::RUNNING
-                });
+                for instance in &mut self.instances {
+                    if instance.last_operation_id == concluded.operation_id
+                        && instance.detailed_status == detailed_status::RUNNING
+                    {
+                        instance.detailed_status = detailed_status::SUCCEEDED.to_string();
+                    }
+                }
             }
             // "STOPPED: The user has canceled the drift detection operation": a detection
             // the caller stopped reports that rather than the status its own reads had
@@ -980,6 +1134,18 @@ impl StoredStackSet {
                     instance.status = instance_status::CURRENT.to_string();
                     instance.detailed_status = detailed_status::SUCCEEDED.to_string();
                 }
+            }
+            // What the operation did in each account and Region it acted on is a record of
+            // what it DID, so the conclusion is what freezes it: the results stop moving
+            // when the operation ends, and a deletion's results outlive the instances its
+            // conclusion takes out of the stack set just below.
+            let results = self.results_in_flight(&concluded.operation_id);
+            self.operations[index].results = Some(results);
+            if concluded.action == operation_action::DELETE {
+                self.instances.retain(|instance| {
+                    instance.last_operation_id != concluded.operation_id
+                        || instance.detailed_status != detailed_status::SUCCEEDED
+                });
             }
         }
     }
@@ -1077,6 +1243,20 @@ pub struct StoredStackSetOperation {
     /// What a `DETECT_DRIFT` operation found, one entry per stack instance it covered —
     /// which is what `ListStackInstanceResourceDrifts` reads back by this operation's id.
     pub instance_drifts: Vec<StoredInstanceDrift>,
+    /// What this operation did in each account and Region it acted on, FROZEN at its
+    /// conclusion — `None` while it has not concluded.
+    ///
+    /// An operation's results are a record of what it did, so they stop moving when it
+    /// ends: a later operation over the same stack instances cannot rewrite them, and a
+    /// deletion's results outlive the instances it removed. While the operation is still in
+    /// flight there is nothing to freeze — the results are the live state of the instances
+    /// it is acting on, which is what [`StoredStackSet::operation_results`] reads.
+    ///
+    /// Bounded by the instances the stack set held when the operation concluded, so at most
+    /// [`MAX_INSTANCES_PER_STACK_SET`] entries per operation and
+    /// [`MAX_OPERATIONS_PER_STACK_SET`] operations hold one: this record adds no growth site
+    /// of its own beyond the two ceilings already on them.
+    pub results: Option<Vec<StoredOperationResult>>,
     /// The terminal status the clock owes this operation, until [`Self::settle`]
     /// materialises it.
     pub pending: Option<PendingOperationOutcome>,
@@ -1105,6 +1285,7 @@ impl StoredStackSetOperation {
             retain_stacks: None,
             drift_detection_status: None,
             instance_drifts: Vec::new(),
+            results: None,
             pending: Some(PendingOperationOutcome {
                 status: operation_status::SUCCEEDED.to_string(),
                 status_reason: None,

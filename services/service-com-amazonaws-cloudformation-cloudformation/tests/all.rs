@@ -133,6 +133,8 @@ mod list_stack_instances;
 mod list_stack_resources;
 #[path = "all/list_stack_set_auto_deployment_targets.rs"]
 mod list_stack_set_auto_deployment_targets;
+#[path = "all/list_stack_set_operation_results.rs"]
+mod list_stack_set_operation_results;
 #[path = "all/list_stack_set_operations.rs"]
 mod list_stack_set_operations;
 #[path = "all/list_stack_sets.rs"]

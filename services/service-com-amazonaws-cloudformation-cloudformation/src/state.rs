@@ -6215,6 +6215,8 @@ pub enum PageOf {
     StackSetSummaries,
     /// `ListStackSetOperations`'s `Summaries`.
     StackSetOperationSummaries,
+    /// `ListStackSetOperationResults`'s `Summaries`.
+    StackSetOperationResultSummaries,
     /// `ListStackSetAutoDeploymentTargets`'s `Summaries`.
     StackSetAutoDeploymentTargetSummaries,
     /// `ListGeneratedTemplates`'s `Summaries`.
@@ -6250,6 +6252,7 @@ impl PageOf {
             Self::StackInstanceSummaries => "stack-instance-summaries",
             Self::StackSetSummaries => "stack-set-summaries",
             Self::StackSetOperationSummaries => "stack-set-operation-summaries",
+            Self::StackSetOperationResultSummaries => "stack-set-operation-result-summaries",
             Self::StackSetAutoDeploymentTargetSummaries => {
                 "stack-set-auto-deployment-target-summaries"
             }

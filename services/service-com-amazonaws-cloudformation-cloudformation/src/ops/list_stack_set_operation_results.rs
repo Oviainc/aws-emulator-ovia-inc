@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStackSetOperationResults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStackSetOperationResults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStackSetOperationResults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports what one recorded StackSet operation did in each account and Region
+//! it acted on: one `StackSetOperationResultSummary` per target, every member read off the
+//! stack instance that target's work was performed on — or off the record that operation's
+//! conclusion froze, once that instance is no longer the one it last acted on — narrowed by
+//! the modelled result-status filter and handed out one bounded page at a time. A
+//! `StackSetName` that resolves to no StackSet of this administrator account and Region is
+//! refused with the modelled `StackSetNotFoundException`, and an `OperationId` that StackSet
+//! holds no operation under with `OperationNotFoundException`, rather than answered with an
+//! empty list.
 //!
 //! ## Shape of an operation
 //!
@@ -94,6 +94,65 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::stack_sets::StoredOperationResult;
+
+/// WHICH of the operation's results the request selects.
+///
+/// `Filters` is "the filter to apply to operation results": at most one
+/// `OperationResultFilter` (`@length(0..1)`), a modelled filter name with the single value to
+/// filter by. A filter that names no `Name` or no `Values` narrows nothing — both members are
+/// optional in the model and it declares no refusal for an incomplete filter, so there is no
+/// status to compare against — and a request that names no filter selects every result.
+#[derive(Debug, Default)]
+struct Selection {
+    /// The `(name, value)` pairs the request's filters narrow by.
+    filters: Vec<(String, String)>,
+}
+
+impl Selection {
+    /// The narrowing the request asks for.
+    fn of(input: &ListStackSetOperationResultsInput) -> Self {
+        Self {
+            filters: input
+                .filters
+                .iter()
+                .flatten()
+                .filter_map(|filter| match (&filter.name, &filter.values) {
+                    (Some(name), Some(values)) => Some((name.clone(), values.clone())),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether this selection covers `result`.
+    fn selects(&self, result: &StoredOperationResult) -> bool {
+        self.filters
+            .iter()
+            .all(|(name, value)| result.matches_filter(name, value))
+    }
+}
+
+/// One stored result as the modelled `StackSetOperationResultSummary`.
+///
+/// Every member is read off the result record, so this read cannot disagree with
+/// `ListStackInstances` about what became of a target. A member the record does not carry —
+/// the reason of a result that has none, the organizational unit of a self-managed StackSet's
+/// target — is absent rather than reported empty, and `AccountGateResult` is "the results of
+/// the account gate function CloudFormation invokes, IF PRESENT": no account gate function is
+/// registered with this emulator, so no result carries one.
+fn stack_set_operation_result_summary(
+    stored: &StoredOperationResult,
+) -> StackSetOperationResultSummary {
+    StackSetOperationResultSummary {
+        account: Some(stored.account.clone()),
+        region: Some(stored.region.clone()),
+        status: Some(stored.status.clone()),
+        status_reason: stored.status_reason.clone(),
+        account_gate_result: None,
+        organizational_unit_id: stored.organizational_unit_id.clone(),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -164,18 +223,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStackSetOperationResults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStackSetOperationResultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStackSetOperationResults"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no StackSet store to read the
+            // operation's results from, so this answers 501 rather than an empty,
+            // truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListStackSetOperationResults",
+            ));
+        };
+
+        // `CallAs` chooses which administrator account the call is made from — the
+        // management account itself or a delegated administrator in a member account. This
+        // emulator holds one administrator account's StackSets, so either value reads the
+        // same store, and the operation models no error to refuse one with.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the clock
+        // had already made due — the conclusion of the operation this read reports the
+        // results of, which was owed at that instant whether or not anyone called.
+        store.settle(::std::time::SystemTime::now());
+
+        // The results belong to ONE operation of ONE StackSet, each addressed the way every
+        // read of this service addresses it: a `StackSetName` this administrator account and
+        // Region holds no StackSet for is the modelled `StackSetNotFoundException` ("The
+        // specified StackSet doesn't exist"), and an `OperationId` that StackSet holds no
+        // operation under is `OperationNotFoundException` ("The specified ID refers to an
+        // operation that doesn't exist") — never an empty list, and never another
+        // operation's results.
+        let stack_set = store
+            .resolve_stack_set(&region, &input.stack_set_name)
+            .ok_or_else(|| {
+                ListStackSetOperationResultsErrorModeled::StackSetNotFoundException(
+                    StackSetNotFoundException {
+                        message: Some(crate::state::stack_set_does_not_exist(
+                            &input.stack_set_name,
+                        )),
+                    },
+                )
+            })?;
+        let operation = stack_set.operation(&input.operation_id).ok_or_else(|| {
+            ListStackSetOperationResultsErrorModeled::OperationNotFoundException(
+                OperationNotFoundException {
+                    message: Some(crate::state::stack_set_operation_does_not_exist(
+                        &input.operation_id,
+                    )),
+                },
+            )
+        })?;
+
+        // What that operation did in each account and Region it acted on, narrowed by the
+        // filter the request named. An operation that acted on no target answers the EMPTY
+        // list, which is a different answer from one that does not exist.
+        let selection = Selection::of(&input);
+        let summaries: Vec<StackSetOperationResultSummary> = stack_set
+            .operation_results(operation)
+            .iter()
+            .filter(|result| selection.selects(result))
+            .map(stack_set_operation_result_summary)
+            .collect();
+
+        // `@paginated(inputToken: NextToken, outputToken: NextToken, items: Summaries,
+        // pageSize: MaxResults)`: one response carries at most the `MaxResults` the request
+        // asks for, and the token resumes just past that page. The cursor counts into this
+        // operation's results, as every paginated read of this service counts into the
+        // collection it answers.
+        let max_results = input.max_results.and_then(|max| usize::try_from(max).ok());
+        let (summaries, next_token) = crate::state::paginate_at_most(
+            crate::state::PageOf::StackSetOperationResultSummaries,
+            summaries,
+            input.next_token.as_deref(),
+            max_results,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(ListStackSetOperationResultsOutput {
+            // Always present, as an empty element for an operation that acted on no target:
+            // a client reading the list sees the same shape either way.
+            summaries: Some(summaries),
+            next_token,
+        })
     }
 }
