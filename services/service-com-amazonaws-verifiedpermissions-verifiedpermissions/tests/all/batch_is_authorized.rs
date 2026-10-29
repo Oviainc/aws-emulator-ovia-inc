@@ -866,3 +866,241 @@ async fn a_batch_refuses_what_it_cannot_evaluate() {
         "case \"empty requests\": expected HTTP 400, got {status} {body}"
     );
 }
+
+/// Which of the two forms the `entities` member models carries a slice.
+#[derive(Debug, Clone, Copy)]
+enum EntityForm {
+    /// The modelled `entityList`.
+    List,
+    /// Cedar's own entity JSON, in `cedarJson`.
+    CedarJson,
+}
+
+/// An `entities` member carrying `principals` principal entities — each declared
+/// a member of the group the suite's policy names — followed by `resources`
+/// resource entities, in `form`.
+fn entities_of(principals: usize, resources: usize, form: EntityForm) -> Value {
+    let uids: Vec<(&str, String, bool)> = (0..principals)
+        .map(|n| ("User", format!("u{n}"), true))
+        .chain((0..resources).map(|n| ("Photo", format!("p{n}"), false)))
+        .collect();
+    match form {
+        EntityForm::List => {
+            let items: Vec<Value> = uids
+                .iter()
+                .map(|(entity_type, entity_id, in_group)| {
+                    let mut item = json!({
+                        "identifier": { "entityType": entity_type, "entityId": entity_id },
+                    });
+                    if *in_group {
+                        item["parents"] = json!([{ "entityType": "Group", "entityId": "admins" }]);
+                    }
+                    item
+                })
+                .collect();
+            json!({ "entityList": items })
+        }
+        EntityForm::CedarJson => {
+            let items: Vec<Value> = uids
+                .iter()
+                .map(|(entity_type, entity_id, in_group)| {
+                    json!({
+                        "uid": { "type": entity_type, "id": entity_id },
+                        "attrs": {},
+                        "parents": if *in_group {
+                            json!([{ "type": "Group", "id": "admins" }])
+                        } else {
+                            json!([])
+                        },
+                    })
+                })
+                .collect();
+            json!({
+                "cedarJson": serde_json::to_string(&items).expect("an entity slice serializes"),
+            })
+        }
+    }
+}
+
+/// How many entities an authorization call's `entities` may carry is the capacity
+/// the CALLING operation documents for its own member: a batch's slice is a
+/// property of the batch — built once and evaluated against by every request in
+/// it — so `BatchIsAuthorized` carries up to 100 principals AND up to 100
+/// resources, while one `IsAuthorized` request keeps the published per-request
+/// quota of 100.
+///
+/// A slice inside the capacity is EVALUATED, and really reaches the evaluator: the
+/// principal's group membership is declared nowhere but in the slice, so the
+/// `ALLOW` could not have been decided without it. A slice past the capacity is
+/// refused with a `ValidationException` naming `/entities` and stating both the
+/// count it carried and the capacity it exceeded.
+///
+/// The rows differ along the calling operation, how many principal and resource
+/// entities the slice carries (at and past each operation's capacity) and which
+/// form of the member carries them.
+#[tokio::test]
+async fn the_entity_capacity_is_the_calling_operations_own() {
+    /// `MAX_ENTITIES_PER_REQUEST` in `src/state/cedar.rs`: the published quota
+    /// *Entities per authorization request*, which bounds ONE request — the
+    /// capacity of the single-request operations, whose own documentation states
+    /// no figure for their `entities` member.
+    const MAX_ENTITIES_PER_REQUEST: usize = 100;
+    /// From `BatchIsAuthorized`'s own model documentation
+    /// (`smithy_query(query="doc", shape="BatchIsAuthorized")`): "The entities of
+    /// a BatchIsAuthorized API request can contain up to 100 principals and up to
+    /// 100 resources."
+    const PRINCIPALS_PER_BATCH: usize = 100;
+    /// The same sentence's second figure.
+    const RESOURCES_PER_BATCH: usize = 100;
+    /// `MAX_ENTITIES_PER_BATCH` in `src/state/cedar.rs`: the two figures together.
+    const MAX_ENTITIES_PER_BATCH: usize = PRINCIPALS_PER_BATCH + RESOURCES_PER_BATCH;
+
+    let router = router();
+    let (store_id, _) = store_with(
+        &router,
+        // The principal is permitted only THROUGH the group, so the decision
+        // depends on the hierarchy the request's entity slice declares.
+        &["permit(principal in Group::\"admins\", action == Action::\"view\", resource == Photo::\"p0\");"],
+    )
+    .await;
+    let triple = json!({
+        "principal": { "entityType": "User", "entityId": "u0" },
+        "action": { "actionType": "Action", "actionId": "view" },
+        "resource": { "entityType": "Photo", "entityId": "p0" },
+    });
+
+    let cases: &[(&str, &str, usize, usize, EntityForm, u16)] = &[
+        (
+            "one request at its own quota",
+            "IsAuthorized",
+            MAX_ENTITIES_PER_REQUEST,
+            0,
+            EntityForm::List,
+            200,
+        ),
+        (
+            "one request one entity past its own quota",
+            "IsAuthorized",
+            MAX_ENTITIES_PER_REQUEST,
+            1,
+            EntityForm::List,
+            400,
+        ),
+        (
+            "one request past its own quota as cedarJson",
+            "IsAuthorized",
+            1,
+            MAX_ENTITIES_PER_REQUEST,
+            EntityForm::CedarJson,
+            400,
+        ),
+        (
+            "a batch at the single-request quota",
+            "BatchIsAuthorized",
+            MAX_ENTITIES_PER_REQUEST,
+            0,
+            EntityForm::List,
+            200,
+        ),
+        (
+            // The row the single-request quota used to refuse.
+            "a batch one entity past the single-request quota",
+            "BatchIsAuthorized",
+            MAX_ENTITIES_PER_REQUEST,
+            1,
+            EntityForm::List,
+            200,
+        ),
+        (
+            "a batch of the documented principals and resources",
+            "BatchIsAuthorized",
+            PRINCIPALS_PER_BATCH,
+            RESOURCES_PER_BATCH,
+            EntityForm::List,
+            200,
+        ),
+        (
+            "a batch at its capacity as cedarJson",
+            "BatchIsAuthorized",
+            PRINCIPALS_PER_BATCH,
+            RESOURCES_PER_BATCH,
+            EntityForm::CedarJson,
+            200,
+        ),
+        (
+            "a batch one entity past its capacity",
+            "BatchIsAuthorized",
+            PRINCIPALS_PER_BATCH + 1,
+            RESOURCES_PER_BATCH,
+            EntityForm::List,
+            400,
+        ),
+        (
+            "a batch far past its capacity as cedarJson",
+            "BatchIsAuthorized",
+            PRINCIPALS_PER_BATCH,
+            RESOURCES_PER_BATCH * 2,
+            EntityForm::CedarJson,
+            400,
+        ),
+    ];
+
+    for (case, operation, principals, resources, form, expected) in cases {
+        let batch = *operation == "BatchIsAuthorized";
+        let mut request = if batch {
+            json!({ "policyStoreId": store_id, "requests": [triple.clone()] })
+        } else {
+            let mut single = triple.clone();
+            single["policyStoreId"] = json!(store_id);
+            single
+        };
+        request["entities"] = entities_of(*principals, *resources, *form);
+
+        let (status, body) = call(&router, operation, &request).await;
+        assert_eq!(
+            status, *expected,
+            "case {case:?}: expected HTTP {expected}, got {status} {body}"
+        );
+        if *expected == 200 {
+            let decision = if batch {
+                body["results"][0]["decision"].as_str()
+            } else {
+                body["decision"].as_str()
+            };
+            assert_eq!(
+                decision,
+                Some("ALLOW"),
+                "case {case:?}: the slice's hierarchy must decide the request, got {body}"
+            );
+        } else {
+            assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case {case:?}: a slice past the capacity is a ValidationException, got {body}"
+            );
+            let fields = body["fieldList"].as_array().cloned().unwrap_or_default();
+            assert_eq!(
+                fields.len(),
+                1,
+                "case {case:?}: expected exactly one fieldList entry, got {body}"
+            );
+            assert_eq!(
+                fields[0]["path"].as_str(),
+                Some("/entities"),
+                "case {case:?}: the refusal names the member it is about, got {body}"
+            );
+            let count = principals + resources;
+            let capacity = if batch {
+                MAX_ENTITIES_PER_BATCH
+            } else {
+                MAX_ENTITIES_PER_REQUEST
+            };
+            let reason = fields[0]["message"].as_str().unwrap_or_default();
+            assert!(
+                reason.contains(&count.to_string()) && reason.contains(&capacity.to_string()),
+                "case {case:?}: the refusal must name the {count} entities it carried and the \
+                 capacity {capacity} it exceeded, got {reason:?}"
+            );
+        }
+    }
+}

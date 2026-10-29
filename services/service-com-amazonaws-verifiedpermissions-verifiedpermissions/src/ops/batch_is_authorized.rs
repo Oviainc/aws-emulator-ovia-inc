@@ -18,10 +18,13 @@
 //! operation's input contract (the two rules below, an absent member of a
 //! triple, an unparseable payload).
 //!
-//! Two rules the model cannot express are enforced here, both from this
+//! Three rules the model cannot express are enforced here, all from this
 //! operation's own documentation (quoted on the constants / helpers below): a
-//! batch carries at most [`crate::state::cedar::MAX_BATCH_REQUESTS`] requests, and
-//! either the principal or the resource must be identical across all of them.
+//! batch carries at most [`crate::state::cedar::MAX_BATCH_REQUESTS`] requests,
+//! its `entities` carries at most
+//! [`crate::state::cedar::MAX_ENTITIES_PER_BATCH`] entities — the batch's own
+//! capacity, which is larger than one request's — and either the principal or the
+//! resource must be identical across all of its requests.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -241,8 +244,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // slice is built once and every request is evaluated against it, typed by
         // the store's schema when it holds one. A refusal here names `/entities`
         // itself, with no request index, because that is where the member lives.
-        let entities = crate::state::cedar::entities_to_cedar_json(input.entities.as_ref())
-            .map_err(invalid)?;
+        //
+        // Its capacity is the one THIS operation documents for its own member —
+        // the principals and the resources its requests range over together
+        // ([`crate::state::cedar::MAX_ENTITIES_PER_BATCH`]) — and not the
+        // single-request quota.
+        let entities = crate::state::cedar::entities_to_cedar_json(
+            input.entities.as_ref(),
+            crate::state::cedar::MAX_ENTITIES_PER_BATCH,
+        )
+        .map_err(invalid)?;
 
         // Every policy of the store, parsed ONCE for the whole batch: a static
         // policy's own Cedar text and a template-linked one's link of its

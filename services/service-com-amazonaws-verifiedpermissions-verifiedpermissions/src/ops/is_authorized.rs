@@ -203,8 +203,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(invalid)?,
             path: crate::state::cedar::context_path(input.context.as_ref()),
         };
-        let entities = crate::state::cedar::entities_to_cedar_json(input.entities.as_ref())
-            .map_err(invalid)?;
+        let entities = crate::state::cedar::entities_to_cedar_json(
+            input.entities.as_ref(),
+            crate::state::cedar::MAX_ENTITIES_PER_REQUEST,
+        )
+        .map_err(invalid)?;
 
         let verdict = crate::state::cedar::authorize(
             store,

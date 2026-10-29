@@ -261,8 +261,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(invalid)?,
             path: crate::state::cedar::context_path(input.context.as_ref()),
         };
-        let mut entities = crate::state::cedar::entities_to_cedar_json(input.entities.as_ref())
-            .map_err(invalid)?;
+        let mut entities = crate::state::cedar::entities_to_cedar_json(
+            input.entities.as_ref(),
+            crate::state::cedar::MAX_ENTITIES_PER_REQUEST,
+        )
+        .map_err(invalid)?;
 
         // Each presented token is verified against the store's identity sources, and a
         // call that presented two is decided for the one principal they agree on.

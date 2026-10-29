@@ -22,7 +22,10 @@
 //!   [`crate::state::MAX_POLICY_BYTES_PER_STORE`] caps the total text one
 //!   authorization request parses (the per-request step budget).
 //!   [`MAX_CEDAR_JSON_BYTES`] caps the `cedarJson` text a request may carry.
-//! * **Count** — [`MAX_ENTITIES_PER_REQUEST`] caps the entity store,
+//! * **Count** — the entity store is capped at the capacity the CALLING
+//!   operation documents for its own `entities` member
+//!   ([`MAX_ENTITIES_PER_REQUEST`] for a single-request call,
+//!   [`MAX_ENTITIES_PER_BATCH`] for a batch one),
 //!   [`MAX_COLLECTION_LEN`] caps one set/record/attribute map,
 //!   [`crate::state::MAX_POLICIES_PER_STORE`] caps the policies walked, and
 //!   [`MAX_BATCH_REQUESTS`] caps how many authorization requests one batch call
@@ -78,9 +81,34 @@ impl From<InvalidInput> for Refusal {
     }
 }
 
-/// How many entities one `IsAuthorized` request may carry. The published
-/// Verified Permissions quota is *Entities per authorization request* — 100.
+/// How many entities ONE authorization request may carry — the capacity of the
+/// single-request operations (`IsAuthorized`, `IsAuthorizedWithToken`), whose own
+/// documentation states no figure for their `entities` member, so the published
+/// quota *Entities per authorization request* is the bound.
+///
+/// It is NOT the bound for every operation carrying an `entities` member: that
+/// capacity belongs to the OPERATION, which is why it is a parameter of
+/// [`entities_to_cedar_json`] rather than one figure read inside it. See
+/// [`MAX_ENTITIES_PER_BATCH`].
 pub const MAX_ENTITIES_PER_REQUEST: usize = 100;
+
+/// How many entities a BATCH authorization call's `entities` may carry, from
+/// `BatchIsAuthorized`'s own model documentation: "The entities of a
+/// BatchIsAuthorized API request can contain up to 100 principals and up to 100
+/// resources."
+///
+/// The slice is a property of the BATCH and not of one of its requests — it is
+/// built once and every request is evaluated against it — so its capacity is the
+/// two documented figures together, and a batch that declares the principals and
+/// the resources its requests range over is evaluated rather than refused.
+///
+/// The two figures are enforced as this one total and not per kind: whether an
+/// entity is a principal or a resource is a property of the store's schema and of
+/// the position a request puts it in, neither of which a slice alone carries (a
+/// store may hold no schema at all), so there is nothing to split the count by
+/// here. A reader should take 200 as the capacity of the whole slice, not as a
+/// per-kind rule.
+pub const MAX_ENTITIES_PER_BATCH: usize = 200;
 
 /// How many bytes of Cedar text one policy may carry. The published Verified
 /// Permissions quota for the size of a policy is 10,000 bytes; the model puts no
@@ -91,7 +119,7 @@ pub const MAX_STATEMENT_BYTES: usize = 10_000;
 /// How many bytes of `cedarJson` text one request may carry for its `context` or
 /// its `entities`. Both are parsed in the serving process, and the model puts no
 /// `@length` on either, so the size needs a bound here. Sized to hold
-/// [`MAX_ENTITIES_PER_REQUEST`] entities with room to spare.
+/// [`MAX_ENTITIES_PER_BATCH`] entities with room to spare.
 pub const MAX_CEDAR_JSON_BYTES: usize = 64 * 1024;
 
 /// How deeply a context or entity value may nest. Each conversion below recurses
@@ -1377,17 +1405,21 @@ pub fn context_path(context: Option<&ContextDefinition>) -> &'static str {
 /// `cedarJson` arm is a Cedar entity store as written, so what is a valid store
 /// there is Cedar's own question, answered by [`build_entities`].
 ///
-/// Refuses a set past [`MAX_ENTITIES_PER_REQUEST`]: an authorization request is
-/// evaluated in-process, so the entity store it carries is capped at the
-/// published quota.
+/// Refuses a set past `capacity`: an authorization call is evaluated in-process,
+/// so the entity store it carries is capped — at the capacity the CALLING
+/// operation's own documentation states for its `entities` member
+/// ([`MAX_ENTITIES_PER_REQUEST`] for a single-request call,
+/// [`MAX_ENTITIES_PER_BATCH`] for a batch one), because that capacity is a
+/// property of the operation and not of this conversion.
 pub fn entities_to_cedar_json(
     entities: Option<&EntitiesDefinition>,
+    capacity: usize,
 ) -> Result<serde_json::Value, InvalidInput> {
     let too_many = |count: usize| {
         InvalidInput::new(
             paths::ENTITIES,
             format!(
-                "it carries {count} entities, more than the {MAX_ENTITIES_PER_REQUEST} an \
+                "it carries {count} entities, more than the {capacity} an \
                  authorization request may carry"
             ),
         )
@@ -1396,7 +1428,7 @@ pub fn entities_to_cedar_json(
         None => serde_json::Value::Array(Vec::new()),
         Some(EntitiesDefinition::entityList(items)) => {
             let mut out: Vec<serde_json::Value> =
-                Vec::with_capacity(items.len().min(MAX_ENTITIES_PER_REQUEST + 1));
+                Vec::with_capacity(items.len().min(capacity + 1));
             // The list is keyed by `identifier`: repeating one identifier is a
             // SUCCESS path on which only the LAST entity given for it is processed
             // (`smithy_query(query="shape", shape="EntitiesDefinition")`, member
@@ -1405,7 +1437,7 @@ pub fn entities_to_cedar_json(
             // which is also what makes it a Cedar entity store, where one uid
             // carries one entity.
             let mut at: HashMap<(&str, &str), usize> = HashMap::new();
-            for item in items.iter().take(MAX_ENTITIES_PER_REQUEST + 1) {
+            for item in items.iter().take(capacity + 1) {
                 let entity = entity_item_to_cedar_json(item)?;
                 let identifier = (
                     item.identifier.entity_type.as_str(),
@@ -1419,7 +1451,7 @@ pub fn entities_to_cedar_json(
                     }
                 }
             }
-            if items.len() > MAX_ENTITIES_PER_REQUEST {
+            if items.len() > capacity {
                 return Err(too_many(items.len()));
             }
             serde_json::Value::Array(out)
@@ -1429,7 +1461,7 @@ pub fn entities_to_cedar_json(
         }
     };
     let count = value.as_array().map_or(0, Vec::len);
-    if count > MAX_ENTITIES_PER_REQUEST {
+    if count > capacity {
         return Err(too_many(count));
     }
     Ok(value)
