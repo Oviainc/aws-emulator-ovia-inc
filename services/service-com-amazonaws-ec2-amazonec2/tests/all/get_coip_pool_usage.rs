@@ -20,7 +20,10 @@
 //! asserted against exactly the pools `DescribeCoipPools` reports.
 
 use ec2::ops::types::Address;
-use ec2::state::ComAmazonawsEc2Amazonec2State as Ec2State;
+use ec2::state::{
+    ComAmazonawsEc2Amazonec2State as Ec2State, MAX_FILTERS, MAX_FILTER_VALUES,
+    MAX_FILTER_VALUE_BYTES,
+};
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -81,6 +84,10 @@ async fn reported_allocations(
 /// `(name, values)` pairs, and the allocation ids the response must report — the shape
 /// `coip_pools`' own filter table uses.
 type FilterCase<'a> = (&'a str, Vec<(&'a str, Vec<&'a str>)>, Vec<String>);
+
+/// One ceiling-table row: the case name, the form fields the request carries, and the
+/// allocation ids the response must report.
+type CeilingCase<'a> = (&'a str, Vec<(String, String)>, Vec<String>);
 
 /// One seeded Elastic IP address: which seeded pool it was allocated out of (`None` for an
 /// address that came from Amazon's pool, so no CoIP usage may report it), the customer-owned
@@ -617,6 +624,129 @@ async fn a_bogus_next_token_is_refused() {
     }
 }
 
+/// `MaxResults` outside the range the model publishes is refused at the boundary, and each
+/// published bound itself is answered. The rows are each published bound and one past it.
+#[tokio::test]
+async fn max_results_is_accepted_at_its_bounds_and_refused_past_them() {
+    let (router, engine) = super::ec2_query::emulator();
+    let pools = seed(&engine);
+    seed_addresses(&engine, &pools);
+
+    // The bounds `GetCoipPoolUsageRequest$MaxResults` publishes (`CoipPoolMaxResults`,
+    // `range 5..1000`), and one past each:
+    // smithy_query(query="shape",shape="CoipPoolMaxResults",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+    for (max_results, expected_status) in [(4, 400), (5, 200), (1000, 200), (1001, 400)] {
+        let (status, body) = usage(
+            &router,
+            &[
+                param("PoolId", &pools[0]),
+                param("MaxResults", &max_results.to_string()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "case MaxResults={max_results}: expected HTTP {expected_status}, got {status} with \
+             body {body}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The ceilings on one request's filtering work
+// ---------------------------------------------------------------------------
+
+/// Matching cost is the PRODUCT of how many filters a request carries, how many values each
+/// carries, how long a value is and how many addresses the store holds, and the model bounds
+/// none of them (`FilterList` and `Filter$Values` carry no `@length`). So a request AT each
+/// of this crate's ceilings is answered, and one PAST any of them is refused with
+/// `InvalidParameterValue` and reports no usage. Each row is a distinct factor of that
+/// product, named by the constant it is derived from rather than by a literal.
+#[tokio::test]
+async fn a_request_at_each_filtering_ceiling_is_answered_and_past_it_refused() {
+    let (router, engine) = super::ec2_query::emulator();
+    let pools = seed(&engine);
+    let allocations = seed_addresses(&engine, &pools);
+    let every_usage = allocations_of_pool(&allocations, 0);
+
+    // Every seeded customer-owned address of the first pool is in `10.0.0.0/24`, so the
+    // wildcard and the value list below both select all of them: a ceiling case asserts the
+    // WHOLE set comes back, not merely that the request was answered.
+    let at_filter_ceiling: Vec<(&str, &[&str])> = (0..MAX_FILTERS)
+        .map(|_| ("coip-address-usage.co-ip", &["10.0.0.*"][..]))
+        .collect();
+    let many_values: Vec<String> = (0..MAX_FILTER_VALUES).map(|n| format!("10.0.0.{n}")).collect();
+    let many_values: Vec<&str> = many_values.iter().map(String::as_str).collect();
+    let long_value = "a".repeat(MAX_FILTER_VALUE_BYTES);
+
+    let accepted: Vec<CeilingCase> = vec![
+        (
+            "MAX_FILTERS filters",
+            filters(&at_filter_ceiling),
+            every_usage.clone(),
+        ),
+        (
+            "MAX_FILTER_VALUES values in one filter",
+            filters(&[("coip-address-usage.co-ip", &many_values)]),
+            every_usage.clone(),
+        ),
+        (
+            "a value of MAX_FILTER_VALUE_BYTES bytes",
+            filters(&[("coip-address-usage.co-ip", &[long_value.as_str()])]),
+            Vec::new(),
+        ),
+    ];
+    for (case, params, expected) in accepted {
+        let reported = reported_allocations(&router, case, &pools[0], &params).await;
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected {expected:?} at the ceiling, got {reported:?}"
+        );
+    }
+
+    let past_filter_ceiling: Vec<(&str, &[&str])> = (0..=MAX_FILTERS)
+        .map(|_| ("coip-address-usage.co-ip", &["10.0.0.*"][..]))
+        .collect();
+    let past_value_ceiling: Vec<String> = (0..=MAX_FILTER_VALUES)
+        .map(|n| format!("10.0.0.{n}"))
+        .collect();
+    let past_value_ceiling: Vec<&str> = past_value_ceiling.iter().map(String::as_str).collect();
+    let past_byte_ceiling = "a".repeat(MAX_FILTER_VALUE_BYTES + 1);
+
+    let refused: Vec<(&str, Vec<(String, String)>)> = vec![
+        (
+            "one filter past MAX_FILTERS",
+            filters(&past_filter_ceiling),
+        ),
+        (
+            "one value past MAX_FILTER_VALUES",
+            filters(&[("coip-address-usage.co-ip", &past_value_ceiling)]),
+        ),
+        (
+            "one byte past MAX_FILTER_VALUE_BYTES",
+            filters(&[("coip-address-usage.co-ip", &[past_byte_ceiling.as_str()])]),
+        ),
+    ];
+    for (case, params) in refused {
+        let mut all = vec![param("PoolId", &pools[0])];
+        all.extend(params);
+        let (status, body) = usage(&router, &all).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 past the ceiling, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            ec2::state::INVALID_PARAMETER_VALUE,
+            "case {case:?}: expected InvalidParameterValue, got {body}"
+        );
+        assert!(
+            elements(&body, ALLOCATION_ELEMENT).is_empty(),
+            "case {case:?}: a refused request must report no usage, got {body}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A PoolId that resolves to no pool
 // ---------------------------------------------------------------------------
@@ -671,6 +801,26 @@ async fn a_pool_id_that_resolves_to_no_pool_is_refused() {
             );
         }
     }
+}
+
+/// A request that carries no `PoolId` at all names no pool to report on, so it is refused
+/// rather than answered with an empty usage set. The member is `@required`, so the boundary
+/// validator is what refuses it — before this operation's handler runs.
+#[tokio::test]
+async fn a_request_that_names_no_pool_is_refused() {
+    let (router, engine) = super::ec2_query::emulator();
+    let pools = seed(&engine);
+    seed_addresses(&engine, &pools);
+
+    let (status, body) = usage(&router, &[]).await;
+    assert_eq!(
+        status, 400,
+        "no PoolId: expected HTTP 400, got {status} with body {body}"
+    );
+    assert!(
+        elements(&body, ALLOCATION_ELEMENT).is_empty(),
+        "no PoolId: a refused request must report no usage, got {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
