@@ -16,8 +16,9 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     CreateRule, CrossRegionCopyTarget, DeprecateRule, Exclusions, FastRestoreRule,
-    InvalidRequestException, LifecyclePolicy, LifecyclePolicySummary, PolicyDetails,
-    ResourceNotFoundException, RetainRule, RetentionArchiveTier, Schedule, Tag,
+    InternalServerException, InvalidRequestException, LifecyclePolicy, LifecyclePolicySummary,
+    LimitExceededException, PolicyDetails, ResourceNotFoundException, RetainRule,
+    RetentionArchiveTier, Schedule, Tag,
 };
 
 /// The region a request belongs to — the policies it reaches, and the region a
@@ -49,6 +50,20 @@ pub const INVALID_PARAMETER_CODE: &str = "InvalidParameter";
 /// The `Code` every `ResourceNotFoundException` this service answers carries,
 /// by the same rule as [`INVALID_PARAMETER_CODE`].
 pub const RESOURCE_NOT_FOUND_CODE: &str = "ResourceNotFound";
+
+/// The `Code` every `LimitExceededException` this service answers carries, by
+/// the same rule as [`INVALID_PARAMETER_CODE`]: the code names the CONDITION the
+/// exception class is about, and the class is "the request failed because a limit
+/// was exceeded" (`smithy_query(query="shape",
+/// shape="LimitExceededException")`).
+pub const LIMIT_EXCEEDED_CODE: &str = "LimitExceeded";
+
+/// The `Code` every `InternalServerException` this service answers carries, by
+/// the same rule: the class is "the service failed in an unexpected way"
+/// (`smithy_query(query="shape", shape="InternalServerException")`), the
+/// condition AWS spells `InternalError` wherever it reports a server-side
+/// failure in an error code.
+pub const INTERNAL_ERROR_CODE: &str = "InternalError";
 
 /// The tag-key prefix AWS reserves for itself: a caller may not SET a tag whose
 /// key begins with it, in any case.
@@ -952,6 +967,38 @@ pub fn policy_not_found_by_arn(arn: &str) -> ResourceNotFoundException {
         // `ResourceIds` is "a list of resource IDs that were not found", and the
         // request named an ARN rather than an id that could be echoed here.
         resource_ids: None,
+    }
+}
+
+/// The `InternalServerException` payload for a request that reached a handler
+/// holding no store to serve it from — the ONE 500 this service answers, so
+/// every handler reports it through this constructor.
+///
+/// Every member the shape declares is reported: the `Code` for the exception
+/// class, and a message saying what was unavailable.
+pub fn store_unavailable() -> InternalServerException {
+    InternalServerException {
+        message: Some(STORE_UNAVAILABLE_MESSAGE.to_string()),
+        code: Some(INTERNAL_ERROR_CODE.to_string()),
+    }
+}
+
+/// How this service states the 500 [`store_unavailable`] answers.
+const STORE_UNAVAILABLE_MESSAGE: &str = "the dlm lifecycle-policy store is unavailable";
+
+/// The `LimitExceededException` payload for a create the store's own bound
+/// ([`POLICY_QUOTA`]) refuses.
+///
+/// Every member the shape declares is reported: the `Code` for the exception
+/// class, the `ResourceType` token of the resource "for which a limit was
+/// exceeded", and a message naming the limit reached.
+pub fn policy_quota_exceeded() -> LimitExceededException {
+    LimitExceededException {
+        message: Some(format!(
+            "this account already holds the maximum of {POLICY_QUOTA} lifecycle policies"
+        )),
+        code: Some(LIMIT_EXCEEDED_CODE.to_string()),
+        resource_type: Some(POLICY_RESOURCE_TYPE.to_string()),
     }
 }
 

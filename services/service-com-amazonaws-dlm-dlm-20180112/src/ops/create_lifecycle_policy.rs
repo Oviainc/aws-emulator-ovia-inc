@@ -186,10 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateLifecyclePolicyErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some("the dlm lifecycle-policy store is unavailable".to_string()),
-                    code: None,
-                },
+                crate::state::store_unavailable(),
             )
             .into());
         };
@@ -359,14 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // adding another record. `LimitExceededException` is the modelled refusal.
         if store.policy_count() >= crate::state::POLICY_QUOTA {
             return Err(CreateLifecyclePolicyErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(format!(
-                        "this account already holds the maximum of {} lifecycle policies",
-                        crate::state::POLICY_QUOTA
-                    )),
-                    code: None,
-                    resource_type: Some(crate::state::POLICY_RESOURCE_TYPE.to_string()),
-                },
+                crate::state::policy_quota_exceeded(),
             )
             .into());
         }

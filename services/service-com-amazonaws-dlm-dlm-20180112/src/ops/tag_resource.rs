@@ -136,10 +136,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some("the dlm lifecycle-policy store is unavailable".to_string()),
-                    code: None,
-                },
+                crate::state::store_unavailable(),
             )
             .into());
         };

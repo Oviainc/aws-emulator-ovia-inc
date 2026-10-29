@@ -25,6 +25,8 @@ mod default_policy_resource_type;
 mod effective_cadence_ordering;
 #[path = "all/error_paths.rs"]
 mod error_paths;
+#[path = "all/error_payload_codes.rs"]
+mod error_payload_codes;
 #[path = "all/execution_role_pass_role.rs"]
 mod execution_role_pass_role;
 #[path = "all/interval_validation.rs"]
