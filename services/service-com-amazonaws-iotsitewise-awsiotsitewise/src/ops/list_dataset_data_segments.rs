@@ -270,8 +270,7 @@ fn summary(
     let data_type = series
         .as_ref()
         .and_then(|key| store.series_data_type(key))
-        .unwrap_or_default()
-        .to_string();
+        .unwrap_or_default();
     DataSegmentSummary {
         source_dataset_id: record.source_dataset_id.clone(),
         time_series_id: record.time_series_id.clone(),

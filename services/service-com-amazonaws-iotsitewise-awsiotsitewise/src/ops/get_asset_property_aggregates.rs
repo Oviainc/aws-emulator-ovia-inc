@@ -306,8 +306,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A stream is named either by the asset and property ids of the property it
         // is associated with or by its alias; exactly one of the two forms identifies
         // it. Resolved exactly as `GetAssetPropertyValue` resolves it — the asset
-        // label through the shared `resolve_asset_id`, the property through
-        // `AssetRecord::property_position`, an alias through the shared
+        // label through the shared `resolve_asset_id`, the property through the
+        // shared `resolve_asset_property`, an alias through the shared
         // `resolve_alias_series` — so a stream is named one way across the service.
         let stream = match (
             input.asset_id.as_deref(),
@@ -321,17 +321,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         asset_label,
                     ))
                 })?;
-                let resolved = store.assets.get(&asset_id).and_then(|asset| {
-                    asset
-                        .property_position(property_label)
-                        .map(|at| asset.properties[at].id.clone())
-                });
-                let property_id = resolved.ok_or_else(|| {
-                    not_found(format!(
-                        "The asset {asset_label} has no property {property_label}."
-                    ))
-                })?;
-                crate::state::SeriesKey::Property(asset_id, property_id)
+                let resolved = store
+                    .resolve_asset_property(&asset_id, property_label)
+                    .ok_or_else(|| {
+                        not_found(format!(
+                            "The asset {asset_label} has no property {property_label}."
+                        ))
+                    })?;
+                crate::state::SeriesKey::Property(asset_id, resolved.id)
             }
             // An alias names ONE data stream, whether an asset property is associated
             // with it or not: the shared resolver reaches the property's stream, or

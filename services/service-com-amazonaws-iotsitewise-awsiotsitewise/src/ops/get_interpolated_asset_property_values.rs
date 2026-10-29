@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // assetId and propertyId of an asset property. A propertyAlias" — so exactly
         // one of the two forms names the stream, resolved through the SAME resolvers
         // every other read of this service uses: the asset label through
-        // `resolve_asset_id`, the property through `AssetRecord::property_position`,
+        // `resolve_asset_id`, the property through `resolve_asset_property`,
         // an alias through `resolve_alias_series`. An alias names ONE data stream
         // whether or not an asset property is currently associated with it, so the
         // resolver reaches the property's stream or the disassociated series standing
@@ -235,17 +235,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         asset_label,
                     ))
                 })?;
-                let resolved = store.assets.get(&asset_id).and_then(|asset| {
-                    asset
-                        .property_position(property_label)
-                        .map(|at| asset.properties[at].id.clone())
-                });
-                let property_id = resolved.ok_or_else(|| {
-                    not_found(format!(
-                        "The asset {asset_label} has no property {property_label}."
-                    ))
-                })?;
-                crate::state::SeriesKey::Property(asset_id, property_id)
+                let resolved = store
+                    .resolve_asset_property(&asset_id, property_label)
+                    .ok_or_else(|| {
+                        not_found(format!(
+                            "The asset {asset_label} has no property {property_label}."
+                        ))
+                    })?;
+                crate::state::SeriesKey::Property(asset_id, resolved.id)
             }
             (None, None, Some(alias)) => {
                 store.resolve_alias_series(alias).ok_or_else(|| {
@@ -277,8 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::SeriesKey::Property(asset_id, property_id) => not_found(format!(
                     "The asset {asset_id} has no property {property_id}."
                 )),
-            })?
-            .to_string();
+            })?;
 
         // "Valid values: LINEAR_INTERPOLATION | LOCF_INTERPOLATION". `type` is modelled
         // as a plain string, so the value is checked here rather than by the runtime's

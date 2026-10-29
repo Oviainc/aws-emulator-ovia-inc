@@ -371,19 +371,19 @@ fn resolve_entry<'a>(
                     crate::state::not_found_message(crate::state::RESOURCE_ASSET, asset_label),
                 )
             })?;
-            let has_property = store.assets.get(&asset_id).is_some_and(|asset| {
-                asset
-                    .properties
-                    .iter()
-                    .any(|property| property.id == property_id)
-            });
-            if !has_property {
-                return Err((
-                    "ResourceNotFoundException",
-                    format!("The asset {asset_label} has no property {property_id}."),
-                ));
-            }
-            crate::state::SeriesKey::Property(asset_id, property_id.to_string())
+            // The property resolves through the one definition of "the property
+            // this pair names", so an entry naming a property one of the asset
+            // model's composite models declares is answered rather than refused:
+            // it is a property of this asset, addressed by the same pair.
+            let resolved = store
+                .resolve_asset_property(&asset_id, property_id)
+                .ok_or_else(|| {
+                    (
+                        "ResourceNotFoundException",
+                        format!("The asset {asset_label} has no property {property_id}."),
+                    )
+                })?;
+            crate::state::SeriesKey::Property(asset_id, resolved.id)
         }
         // An alias names ONE data stream, whether an asset property is associated
         // with it or not: the shared resolver reaches the property's stream, or the

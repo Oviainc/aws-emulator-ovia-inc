@@ -186,18 +186,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         asset_label,
                     ))
                 })?;
-                let has_property = store.assets.get(&asset_id).is_some_and(|asset| {
-                    asset
-                        .properties
-                        .iter()
-                        .any(|property| property.id == property_id)
-                });
-                if !has_property {
-                    return Err(not_found(format!(
-                        "The asset {asset_label} has no property {property_id}."
-                    )));
-                }
-                crate::state::SeriesKey::Property(asset_id, property_id.to_string())
+                // The one definition of "the property this pair names": the asset's
+                // own properties and the ones its model's composite models declare
+                // are addressed by the same pair, so both resolve here.
+                let resolved = store
+                    .resolve_asset_property(&asset_id, property_id)
+                    .ok_or_else(|| {
+                        not_found(format!(
+                            "The asset {asset_label} has no property {property_id}."
+                        ))
+                    })?;
+                crate::state::SeriesKey::Property(asset_id, resolved.id)
             }
             // An alias names ONE data stream, whether an asset property is
             // associated with it or not: the shared resolver reaches the property's

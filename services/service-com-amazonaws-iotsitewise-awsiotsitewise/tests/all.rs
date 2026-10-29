@@ -38,6 +38,13 @@ mod asset_model_precondition_wording;
 #[path = "all/task_create_time_tags.rs"]
 mod task_create_time_tags;
 
+// `composite_model_property_streams` is declared HERE, beside the suite above, for
+// the reason its note gives: the sorted list and the END of this file are both
+// where every concurrent iotsitewise change puts a declaration of its own. Fold it
+// into the list once the churn settles.
+#[path = "all/composite_model_property_streams.rs"]
+mod composite_model_property_streams;
+
 // `client_token_spent_on_another_request` is declared HERE, beside the note
 // above, for the reason it gives: the sorted list and the END of this file are
 // both stretches every concurrent iotsitewise change puts a declaration of its

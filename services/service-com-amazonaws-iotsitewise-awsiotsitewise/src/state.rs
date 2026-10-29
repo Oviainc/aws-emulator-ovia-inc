@@ -4478,6 +4478,49 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         }
     }
 
+    /// The property of asset `asset_id` that a `CustomID` label names — a raw
+    /// property id, or `externalId:<externalId>` — over EVERY property that asset
+    /// carries: the ones materialised from its model's own definitions and the ones
+    /// the model's composite models contribute.
+    ///
+    /// A property a composite model of the asset's model declares is a property OF
+    /// THAT ASSET, addressed by the same `(assetId, propertyId)` pair as one
+    /// declared on the model directly, so this is the ONE definition of "the
+    /// property that pair names" and every operation addressed that way resolves
+    /// here. A composite model's contribution comes from
+    /// [`Self::composite_model_properties`] and is materialised through the shared
+    /// [`asset_property_from_model`], so the property a listing reports and the one
+    /// a data-plane read resolves are the same property.
+    ///
+    /// Owned rather than borrowed because an asset's instance of a composite
+    /// model's property is materialised on demand; the asset's own properties are
+    /// cloned so both cases answer the same type. An instance materialised here
+    /// carries no alias and no notification: those are written per asset property
+    /// by `UpdateAssetProperty`, which addresses the asset's own list.
+    pub fn resolve_asset_property(&self, asset_id: &str, label: &str) -> Option<AssetProperty> {
+        let asset = self.assets.get(asset_id)?;
+        if let Some(property) = asset.property(label) {
+            return Some(property.clone());
+        }
+        let model = self.asset_models.get(&asset.asset_model_id)?;
+        // `composite_models` is the FLAT list of every composite model the asset
+        // model holds, at any nesting depth, so walking it once reaches every
+        // property any of them contributes.
+        model
+            .composite_models
+            .iter()
+            .filter_map(|composite| composite.id.as_deref())
+            .flat_map(|composite_id| self.composite_model_properties(model, composite_id))
+            .filter_map(|definition| asset_property_from_model(&definition))
+            .find(|property| {
+                matches_id_label(
+                    Some(property.id.as_str()),
+                    property.external_id.as_deref(),
+                    label,
+                )
+            })
+    }
+
     /// Append `value` to the `(asset_id, property_id)` series, keeping it sorted
     /// ascending by timestamp.
     ///
@@ -4570,17 +4613,17 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// The counterpart of [`Self::series`] for a reader that needs the stream's
     /// TYPE rather than its samples: one data stream reports one data type whether
     /// an asset property is associated with it or not, so every reader takes it
-    /// from here instead of reaching only into [`Self::assets`].
-    pub fn series_data_type(&self, key: &SeriesKey) -> Option<&str> {
+    /// from here instead of reaching only into [`Self::assets`]. The property is
+    /// resolved through [`Self::resolve_asset_property`], so a stream owned by a
+    /// property one of the model's composite models declares reports its type too.
+    pub fn series_data_type(&self, key: &SeriesKey) -> Option<String> {
         match key {
             SeriesKey::Property(asset_id, property_id) => self
-                .assets
-                .get(asset_id)
-                .and_then(|asset| asset.property(property_id))
-                .map(|property| property.data_type.as_str()),
+                .resolve_asset_property(asset_id, property_id)
+                .map(|property| property.data_type),
             SeriesKey::Disassociated(alias) => self
                 .disassociated_stream_type(alias)
-                .map(|(data_type, _)| data_type),
+                .map(|(data_type, _)| data_type.to_string()),
         }
     }
 

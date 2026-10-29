@@ -560,16 +560,18 @@ fn resolve_entry(
             return Ok((stream, data_type));
         }
     };
-    let asset = store.assets.get(asset_id).ok_or_else(|| {
-        (
+    if !store.assets.contains_key(asset_id) {
+        return Err((
             "ResourceNotFoundException",
             crate::state::not_found_message(crate::state::RESOURCE_ASSET, asset_id),
-        )
-    })?;
-    let property = asset
-        .properties
-        .iter()
-        .find(|property| &property.id == property_id)
+        ));
+    }
+    // The one definition of "the property this pair names": the asset's own
+    // properties and the ones its model's composite models declare are addressed
+    // by the same pair, so a value written against either lands on that
+    // property's series.
+    let property = store
+        .resolve_asset_property(asset_id, property_id)
         .ok_or_else(|| {
             (
                 "ResourceNotFoundException",
@@ -577,7 +579,10 @@ fn resolve_entry(
             )
         })?;
     let data_type = property.data_type.clone();
-    Ok((stream, data_type))
+    Ok((
+        crate::state::SeriesKey::Property(asset_id.clone(), property.id),
+        data_type,
+    ))
 }
 
 /// The `PropertyDataType` a brand-new alias-addressed stream takes: the type of
