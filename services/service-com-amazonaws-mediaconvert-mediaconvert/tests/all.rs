@@ -63,6 +63,8 @@ mod job_template_settings_validation;
 mod job_templates;
 #[path = "all/jobs_query.rs"]
 mod jobs_query;
+#[path = "all/list_jobs_queue_filter.rs"]
+mod list_jobs_queue_filter;
 #[path = "all/optional_free_text.rs"]
 mod optional_free_text;
 #[path = "all/output_preset_reference.rs"]

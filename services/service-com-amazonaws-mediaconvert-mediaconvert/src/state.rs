@@ -963,8 +963,16 @@ pub fn account_endpoint_url(region: &str) -> String {
 
 /// The queue name a caller named, whether they gave the name or the queue's ARN.
 ///
-/// `CreateJob`'s `Queue` and `ListJobs`' `queue` both accept either form; the resource
-/// id in a MediaConvert queue ARN is `queues/<name>`.
+/// For the members that accept either form: the `Queue` a job or a template is created or
+/// updated with (read back as the referenced queue's ARN, [`queue_reference_view`]),
+/// `SearchJobs`' `queue` ("Provide a queue name, or a queue ARN, to return only jobs from
+/// that queue") and a jobs query's `queue` filter key ("Your Queue's name or ARN"). A
+/// member whose documentation offers the NAME form alone is NOT reduced here —
+/// `ListJobs`' `queue` ("Provide a queue name to get back only jobs from that queue") and
+/// `GetQueue`'s `Name` read the value as sent — because a queue's name is stored exactly
+/// as its creator wrote it, so reducing a form the member does not offer would select
+/// against a name no queue need hold. The resource id in a MediaConvert queue ARN is
+/// `queues/<name>`.
 pub fn queue_name_from_reference(reference: &str) -> &str {
     resource_name_from_reference(RESOURCE_TYPE_QUEUES, reference)
 }

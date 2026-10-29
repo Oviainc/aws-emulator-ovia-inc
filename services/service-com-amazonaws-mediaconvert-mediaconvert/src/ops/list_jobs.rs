@@ -188,12 +188,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already made due at `now`, which were owed whether or not anybody polled.
         state.settle(now);
 
-        // `queue` accepts a queue name or a queue ARN; `status` is one `JobStatus`.
-        let queue = input
-            .queue
-            .as_deref()
-            .map(crate::state::queue_name_from_reference)
-            .map(str::to_string);
+        // "Optional. Provide a queue name to get back only jobs from that queue": this
+        // member offers the NAME form only, so the value selects on the stored queue name
+        // byte for byte and no other form of reference is reduced out of it. The ARN form
+        // belongs to the members whose own documentation offers it — `SearchJobs`' `Queue`
+        // ("Provide a queue name, or a queue ARN") and the jobs query's `queue` filter key
+        // ("Your Queue's name or ARN") — and reducing it here would also make a queue
+        // whose own name is ARN-shaped unselectable, because a queue's name is stored
+        // exactly as its creator wrote it. `status` is one `JobStatus`.
+        let queue = input.queue.clone();
         let status = input.status.clone();
 
         // The ordering, the cursor, the page size and the decode-or-refuse rule for a

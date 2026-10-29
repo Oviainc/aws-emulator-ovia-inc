@@ -1153,9 +1153,13 @@ async fn list_jobs_filters_orders_and_pages_over_the_store() {
             ids_in(Some("Default"), true),
         ),
         (
-            "queue given as an ARN",
+            // "Provide a queue name to get back only jobs from that queue": this reader's
+            // member offers the name form alone, so an ARN narrows to the queue literally
+            // named by that whole value, which no queue is here.
+            // `tests/all/list_jobs_queue_filter.rs` is the suite for that rule.
+            "queue given as an ARN, a form this member does not offer",
             format!("queue={}&order=ASCENDING", arn("queues/queue-a")),
-            ids_in(Some("queue-a"), false),
+            Vec::new(),
         ),
         (
             "status SUBMITTED matches every job",

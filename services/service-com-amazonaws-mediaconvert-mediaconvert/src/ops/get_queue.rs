@@ -162,8 +162,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already made due at `now`, which were owed whether or not anybody polled.
         state.settle(now);
 
-        // `GetQueue`'s `{Name}` is a queue name; unlike `CreateJob`'s `Queue` and
-        // `ListJobs`' `queue`, it is not documented to accept an ARN.
+        // `GetQueue`'s `{Name}` is a queue name; like `ListJobs`' `queue` and unlike
+        // `SearchJobs`' `queue`, it is not documented to accept an ARN.
         let name = input.name;
         let Some(record) = state.queues.get(&name).cloned() else {
             return Err(GetQueueErrorModeled::NotFoundException(NotFoundException {
