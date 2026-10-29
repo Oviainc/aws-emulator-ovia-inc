@@ -347,6 +347,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Every identifier this request carries has to resolve to the ARN of the
+        // resource it names, which is checked BEFORE the store is read: a value that
+        // resolves to no such ARN is a bad value for the member, not a resource that
+        // is missing.
+        if let Some(refusal) = crate::state::invalid_resource_arn(
+            crate::state::IDENTIFIER_MEMBER,
+            &input.identifier,
+            crate::state::STREAM_GROUP_RESOURCE,
+        ) {
+            return Err(StartStreamSessionErrorModeled::ValidationException(refusal).into());
+        }
+        if let Some(refusal) = crate::state::invalid_resource_arn(
+            crate::state::APPLICATION_IDENTIFIER_MEMBER,
+            &input.application_identifier,
+            crate::state::APPLICATION_RESOURCE,
+        ) {
+            return Err(StartStreamSessionErrorModeled::ValidationException(refusal).into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartStreamSessionErrorModeled::InternalServerException(
                 InternalServerException {

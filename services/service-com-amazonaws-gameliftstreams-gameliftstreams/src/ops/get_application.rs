@@ -201,6 +201,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The `Identifier` has to resolve to the ARN of the resource this operation
+        // addresses, which is checked BEFORE the store is read: a value that
+        // resolves to no application ARN is a bad value for the member, not an
+        // application that is missing.
+        if let Some(refusal) = crate::state::invalid_resource_arn(
+            crate::state::IDENTIFIER_MEMBER,
+            &input.identifier,
+            crate::state::APPLICATION_RESOURCE,
+        ) {
+            return Err(GetApplicationErrorModeled::ValidationException(refusal).into());
+        }
         let region = crate::state::region_of(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetApplicationErrorModeled::InternalServerException(

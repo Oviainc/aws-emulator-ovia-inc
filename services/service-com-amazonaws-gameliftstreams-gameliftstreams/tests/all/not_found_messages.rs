@@ -383,19 +383,10 @@ async fn every_not_found_path_names_the_resolved_arn_and_a_per_request_internal_
             "Stream session",
             session_in_group.clone(),
         ),
-        (
-            "GetStreamSession with an Identifier naming another kind of resource".to_string(),
-            "GET",
-            format!(
-                "/streamgroups/{}/streamsessions/ss-gone",
-                as_label(ELSEWHERE)
-            ),
-            None,
-            "Stream session",
-            format!(
-                "arn:aws:gameliftstreams:{REGION}:{ACCOUNT}:streamsession/a-elsewhere/ss-gone"
-            ),
-        ),
+        // An `Identifier` naming another KIND of resource is not a not-found path at
+        // all: an ARN that names no stream group is a bad value for the label, so it
+        // is refused 400 `ValidationException` before the store is read. That class
+        // is tabled in `refusal_envelope.rs`, which is why no row for it is here.
     ];
 
     let mut seen: Vec<String> = Vec::new();

@@ -13,7 +13,9 @@
 //!   the advanced record's `LastUpdatedAt` is the instant the transition was DUE,
 //!   never the instant it was observed, so two reads of the same resource agree.
 //! * [`identifier_id`] resolves the model's `Identifier` shape, which accepts either
-//!   a bare resource id or a full ARN for the same resource.
+//!   a bare resource id or a full ARN for the same resource, and
+//!   [`invalid_resource_arn`] is the refusal an identifier already in ARN form gets
+//!   when that ARN names no resource of the type the operation addresses.
 //! * [`application_arn`] / [`stream_group_arn`] / [`stream_session_arn`] build ARNs
 //!   through `engine::emulator_arn`, so the account segment is the canonical one.
 //! * [`resolved_arn`] / [`resolved_stream_session_arn`] resolve the identifier a
@@ -30,7 +32,7 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     DefaultApplication, DisplayConfiguration, LocationConfiguration, LocationState,
     PerformanceStatsConfiguration, ReplicationStatus, ResourceNotFoundException,
-    RuntimeEnvironment,
+    RuntimeEnvironment, ValidationException,
 };
 
 /// This service's SigV4 signing name, and the `service` segment of its ARNs.
@@ -253,6 +255,147 @@ pub const STREAM_CLASS_PATH: &str = "streamClass";
 /// Beside [`STREAM_CLASS_PATH`], so the two spellings of "how the envelope names a
 /// member" cannot drift.
 pub const RESOURCE_ARN_PATH: &str = "resourceArn";
+
+/// The order Amazon GameLift Streams enumerates `StreamUrlStatus` in when it
+/// refuses a value outside that enum.
+///
+/// The SAME four values the model declares — not a narrowing, unlike
+/// [`SERVICE_STREAM_CLASSES`] — in the order the SERVICE lists them. The model
+/// declares its own member order (`ACTIVE, EXPIRED, REVOKED, LIMIT_REACHED`) and a
+/// Smithy enum's member order is not a wire fact, so the order a refusal
+/// enumerates is recorded behaviour: the source is the recorded refusal of
+/// `ListStreamUrls` with a `Status` outside the enum. Every other enum of this
+/// service is enumerated in its declared order, so none of them needs a list here.
+pub const SERVICE_STREAM_URL_STATUSES: &[&str] =
+    &["EXPIRED", "ACTIVE", "LIMIT_REACHED", "REVOKED"];
+
+/// One constraint violation as THIS service states it.
+///
+/// The framework's constraint walk produces the violation from the model, and for
+/// every rule this service enforces exactly as the model declares it that is also
+/// what the service says. The two enumerated sets it does NOT spell the model's way
+/// are replaced here, in the one place both refusal paths (the pre-handler check in
+/// `crate::service` and its `override_refusal` fallback) reach:
+///
+/// * `StreamClass`, whose accepted set is NARROWER than the model's enum
+///   ([`SERVICE_STREAM_CLASSES`]);
+/// * `StreamUrlStatus`, whose set is the model's but whose ORDER is the service's
+///   ([`SERVICE_STREAM_URL_STATUSES`]).
+pub fn service_violation(
+    violation: &::aws_smithy_schema_server::Violation,
+) -> ::aws_smithy_schema_server::Violation {
+    let ::aws_smithy_schema_server::ViolationKind::EnumValue(allowed) = &violation.kind else {
+        return violation.clone();
+    };
+    if violation.path == STREAM_CLASS_PATH {
+        return stream_class_violation(violation.value.as_deref());
+    }
+    // Matched on the SET the model declared for the member, not on the member's
+    // name: the two operations that bind a `Status` query member bind two
+    // different enums, and only this one is enumerated out of declared order.
+    if !same_values(allowed, SERVICE_STREAM_URL_STATUSES) {
+        return violation.clone();
+    }
+    ::aws_smithy_schema_server::Violation {
+        path: violation.path.clone(),
+        kind: ::aws_smithy_schema_server::ViolationKind::EnumValue(
+            SERVICE_STREAM_URL_STATUSES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        ),
+        value: violation.value.clone(),
+    }
+}
+
+/// Whether `stated` and `expected` hold the same values, in any order.
+fn same_values(stated: &[String], expected: &[&str]) -> bool {
+    stated.len() == expected.len()
+        && expected
+            .iter()
+            .all(|value| stated.iter().any(|held| held == value))
+}
+
+/// The id prefix each resource type's own ids carry.
+///
+/// The id prefix each resource type's own ids carry.
+///
+/// Published by the model on every identifier member that names the resource
+/// ("Example ARN: arn:aws:gameliftstreams:us-west-2:111122223333:streamgroup/sg-1AB2C3De4.
+/// Example ID: sg-1AB2C3De4", and `application/a-9ZY8X7Wv6` / `a-9ZY8X7Wv6` for an
+/// application), and the same prefixes this emulator mints its ids with. A
+/// resource type the model publishes no prefixed example for is absent from this
+/// list, and an identifier of that type only has to name a non-empty resource path
+/// — a recorded stream session id (`ABC123def4568`) carries no prefix at all.
+const RESOURCE_ID_PREFIXES: &[(&str, &str)] = &[
+    (APPLICATION_RESOURCE, "a-"),
+    (STREAM_GROUP_RESOURCE, "sg-"),
+];
+
+/// The id prefix `resource_type`'s own ids carry, if the model publishes one.
+fn resource_id_prefix(resource_type: &str) -> Option<&'static str> {
+    RESOURCE_ID_PREFIXES
+        .iter()
+        .find(|(kind, _)| *kind == resource_type)
+        .map(|(_, prefix)| *prefix)
+}
+
+/// Whether `identifier` can name a resource of `resource_type` at all — i.e.
+/// whether it resolves to an ARN of that type.
+///
+/// The model's `Identifier` shape accepts "an Amazon Resource Name (ARN) or ID" for
+/// the same resource, and BOTH forms have to resolve to the one ARN the operation
+/// addresses: an ARN only does when its resource segment is `<resource_type>/<id>`,
+/// and either form's id only does when it is of that type's own form
+/// ([`RESOURCE_ID_PREFIXES`]).
+pub fn identifier_names_resource(identifier: &str, resource_type: &str) -> bool {
+    // A bare identifier IS its own id; an ARN resolves to the id its resource path
+    // ends in, and to none at all when that path is of another resource type.
+    let Some(id) = identifier_id(identifier, resource_type) else {
+        return false;
+    };
+    match resource_id_prefix(resource_type) {
+        Some(prefix) => id.strip_prefix(prefix).is_some_and(|rest| !rest.is_empty()),
+        None => !id.is_empty(),
+    }
+}
+
+/// The refusal an identifier member carries when it resolves to no ARN of the
+/// resource type the operation addresses, or `None` when the operation may go on
+/// and resolve it.
+///
+/// A value the member cannot name a resource with is a malformed VALUE for that
+/// member, not a resource that is missing, so it is answered with the modelled
+/// `ValidationException` (400) rather than `ResourceNotFoundException` (404) — the
+/// two mean opposite things to a caller, and the check is decided from the request
+/// alone, so it comes BEFORE the store is read.
+///
+/// `member` is the input member as the MODEL spells it, which is how the message
+/// names it; `resource_type` is the ARN resource type the operation addresses. The
+/// text names the ARN rather than the id even when the request sent a bare id,
+/// because the ARN is what the identifier had to resolve to. It carries no
+/// internal-id suffix, unlike [`with_internal_id`]: it is a request-validation
+/// refusal, which this service words without one (see [`stream_class_refusal`]).
+pub fn invalid_resource_arn(
+    member: &str,
+    identifier: &str,
+    resource_type: &str,
+) -> Option<ValidationException> {
+    if identifier_names_resource(identifier, resource_type) {
+        return None;
+    }
+    Some(ValidationException {
+        message: format!("'{member}' is not a valid resource ARN of type '{resource_type}'"),
+    })
+}
+
+/// How the model spells each identifier member [`invalid_resource_arn`] checks, so
+/// a refusal naming one cannot drift from the model's spelling.
+pub const IDENTIFIER_MEMBER: &str = "Identifier";
+pub const APPLICATION_IDENTIFIER_MEMBER: &str = "ApplicationIdentifier";
+pub const APPLICATION_IDENTIFIERS_MEMBER: &str = "ApplicationIdentifiers";
+pub const DEFAULT_APPLICATION_IDENTIFIER_MEMBER: &str = "DefaultApplicationIdentifier";
+pub const STREAM_SESSION_IDENTIFIER_MEMBER: &str = "StreamSessionIdentifier";
 
 /// Every error message this service's HANDLERS produce ends with a per-request
 /// internal id, which is how Amazon GameLift Streams words its errors: the body a

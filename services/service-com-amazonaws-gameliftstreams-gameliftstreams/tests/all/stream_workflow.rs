@@ -11,6 +11,7 @@
 //! `application_body` and the resource helpers) is `pub(crate)` so the other suites
 //! in this test target reuse it instead of growing a second copy.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -73,6 +74,31 @@ pub(crate) async fn call_in_scope_region(
     body: Option<Value>,
     scope_region: &str,
 ) -> (u16, Value) {
+    let (status, _headers, parsed) =
+        dispatch(router, method, path_and_query, body, scope_region).await;
+    (status, parsed)
+}
+
+/// The same call, also returning the response HEADERS — which is where restJson1
+/// carries the error SHAPE (`x-amzn-errortype`) a client resolves an error from.
+pub(crate) async fn call_with_headers(
+    router: &MultiServiceRouter,
+    method: &str,
+    path_and_query: &str,
+    body: Option<Value>,
+) -> (u16, HashMap<String, String>, Value) {
+    dispatch(router, method, path_and_query, body, REGION).await
+}
+
+/// The one place a request is built and dispatched, so no suite grows a second
+/// copy of the wire harness.
+async fn dispatch(
+    router: &MultiServiceRouter,
+    method: &str,
+    path_and_query: &str,
+    body: Option<Value>,
+    scope_region: &str,
+) -> (u16, HashMap<String, String>, Value) {
     let payload = body
         .map(|value| serde_json::to_vec(&value).expect("a JSON request body serializes"))
         .unwrap_or_default();
@@ -94,6 +120,16 @@ pub(crate) async fn call_in_scope_region(
         .expect("a well-formed request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let headers: HashMap<String, String> = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_ascii_lowercase(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
     let bytes = response.into_body();
     let parsed = if bytes.is_empty() {
         Value::Null
@@ -102,7 +138,7 @@ pub(crate) async fn call_in_scope_region(
             Value::String(String::from_utf8_lossy(&bytes).into_owned())
         })
     };
-    (status, parsed)
+    (status, headers, parsed)
 }
 
 /// Percent-encode the `/` separators of an ARN so it survives as one URI path
@@ -780,8 +816,10 @@ async fn an_unknown_identifier_answers_not_found() {
         );
     }
 
-    // And a stream session ARN whose resource type is not `streamsession` resolves
-    // nothing, rather than resolving by its last path segment.
+    // And a stream session ARN whose resource type is not `streamsession` names no
+    // stream session at all, rather than resolving by its last path segment: that is
+    // a bad value for the label, refused 400 `ValidationException` before the store
+    // is read (the whole class is tabled in `refusal_envelope.rs`).
     let wrong_type = format!(
         "arn:aws:gameliftstreams:{REGION}:{ACCOUNT}:application%2F{app_id}"
     );
@@ -793,8 +831,8 @@ async fn an_unknown_identifier_answers_not_found() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "case \"session named by an application ARN\": expected 404, got {status} {got}"
+        status, 400,
+        "case \"session named by an application ARN\": expected 400, got {status} {got}"
     );
 }
 

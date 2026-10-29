@@ -275,6 +275,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // A `DefaultApplicationIdentifier` has to resolve to an application ARN,
+        // which is checked BEFORE the store is read: a value that resolves to no
+        // application ARN is a bad value for the member, not an application that is
+        // missing.
+        if let Some(refusal) = input
+            .default_application_identifier
+            .as_deref()
+            .and_then(|identifier| {
+                crate::state::invalid_resource_arn(
+                    crate::state::DEFAULT_APPLICATION_IDENTIFIER_MEMBER,
+                    identifier,
+                    crate::state::APPLICATION_RESOURCE,
+                )
+            })
+        {
+            return Err(CreateStreamGroupErrorModeled::ValidationException(refusal).into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateStreamGroupErrorModeled::InternalServerException(
                 InternalServerException {

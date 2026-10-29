@@ -15,6 +15,8 @@
 mod control_plane_fidelity;
 #[path = "all/not_found_messages.rs"]
 mod not_found_messages;
+#[path = "all/refusal_envelope.rs"]
+mod refusal_envelope;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
