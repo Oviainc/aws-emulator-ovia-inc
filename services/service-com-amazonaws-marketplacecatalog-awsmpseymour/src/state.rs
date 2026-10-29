@@ -26,7 +26,10 @@ use crate::ops::types::{
     ExpressPrivateOfferConfigurationSummary, Filter, FrameworkFilters, FrameworkSummary,
     MachineLearningProductSummary, OfferSetSummary, OfferSummary, ResaleAuthorizationSummary,
     ResourceInUseException, ResourceNotFoundException, SaaSProductSummary, Tag,
-    ValidationException,
+    ValidationException, AMI_PRODUCT_SORT_BY_VALUES, CONTAINER_PRODUCT_SORT_BY_VALUES,
+    DATA_PRODUCT_SORT_BY_VALUES, EXPRESS_PRIVATE_OFFER_CONFIGURATION_SORT_BY_VALUES,
+    MACHINE_LEARNING_PRODUCT_SORT_BY_VALUES, OFFER_SET_SORT_BY_VALUES, OFFER_SORT_BY_VALUES,
+    RESALE_AUTHORIZATION_SORT_BY_VALUES, SAA_S_PRODUCT_SORT_BY_VALUES,
 };
 
 /// The only catalog this service serves.
@@ -1236,64 +1239,54 @@ impl EntityCriterion {
     }
 }
 
-/// The attributes a list of `entity_type` sorts on BEYOND [`ENTITY_SORT_BY`].
+/// The sort attributes the model declares for `entity_type`: the values of that
+/// type's own `*SortBy` enum.
 ///
 /// `Sort$SortBy` documents "In addition to `LastModifiedDate` and `EntityId`,
-/// each `EntityType` might support additional fields", and the model names those
-/// fields per type in that type's own `*SortBy` enum — the same enums the
+/// each `EntityType` might support additional fields", and the model names the
+/// whole set per type in that type's own `*SortBy` enum — the enums the
 /// `EntityTypeSort` union carries (`AmiProductSortBy`, `ContainerProductSortBy`,
 /// `DataProductSortBy`, `ExpressPrivateOfferConfigurationSortBy`,
 /// `MachineLearningProductSortBy`, `OfferSortBy`, `OfferSetSortBy`,
-/// `ResaleAuthorizationSortBy`, `SaaSProductSortBy`). This is those enums with
-/// the two common attributes dropped, so a type the model declares no sort shape
-/// for (one outside [`SHAPED_ENTITY_TYPES`]) adds none and is ordered by the
-/// common attributes alone.
-pub fn entity_type_sort_fields(entity_type: &str) -> &'static [&'static str] {
+/// `ResaleAuthorizationSortBy`, `SaaSProductSortBy`), each of which is rendered
+/// from the model into the `*_SORT_BY_VALUES` constant of that name in
+/// `crate::ops::types`. This answers those constants themselves, so a value
+/// added to or dropped from one of those enums moves the set this service sorts
+/// that type on with it. A type the model declares no sort shape for (one
+/// outside [`SHAPED_ENTITY_TYPES`]) is ordered by the attributes every type
+/// carries ([`ENTITY_SORT_BY`]) alone.
+pub fn entity_type_sort_by_values(entity_type: &str) -> &'static [&'static str] {
     match entity_type {
-        "AmiProduct" | "DataProduct" | "MachineLearningProduct" => &["ProductTitle", "Visibility"],
-        "ContainerProduct" => &["CompatibleAWSServices", "ProductTitle", "Visibility"],
-        "SaaSProduct" => &["DeliveryOptionTypes", "ProductTitle", "Visibility"],
-        "Offer" => &[
-            "AvailabilityEndDate",
-            "BuyerAccounts",
-            "CreatedBySource",
-            "Name",
-            "OfferSetId",
-            "ProductId",
-            "ReleaseDate",
-            "ResaleAuthorizationId",
-            "State",
-            "TargetAgreementId",
-            "TargetAgreementIntent",
-            "Targeting",
-        ],
-        "OfferSet" => &["Name", "ReleaseDate", "SolutionId", "State"],
-        "ResaleAuthorization" => &[
-            "AvailabilityEndDate",
-            "CreatedDate",
-            "IssuerAccountId",
-            "ManufacturerAccountId",
-            "ManufacturerLegalName",
-            "Name",
-            "OfferExtendedStatus",
-            "ProductId",
-            "ProductName",
-            "ResellerAccountID",
-            "ResellerLegalName",
-            "ResellerRole",
-            "SourceAuthorization",
-            "Status",
-        ],
-        "ExpressPrivateOfferConfiguration" => &["ProductId", "State"],
-        _ => &[],
+        "AmiProduct" => AMI_PRODUCT_SORT_BY_VALUES,
+        "ContainerProduct" => CONTAINER_PRODUCT_SORT_BY_VALUES,
+        "DataProduct" => DATA_PRODUCT_SORT_BY_VALUES,
+        "ExpressPrivateOfferConfiguration" => EXPRESS_PRIVATE_OFFER_CONFIGURATION_SORT_BY_VALUES,
+        "MachineLearningProduct" => MACHINE_LEARNING_PRODUCT_SORT_BY_VALUES,
+        "Offer" => OFFER_SORT_BY_VALUES,
+        "OfferSet" => OFFER_SET_SORT_BY_VALUES,
+        "ResaleAuthorization" => RESALE_AUTHORIZATION_SORT_BY_VALUES,
+        "SaaSProduct" => SAA_S_PRODUCT_SORT_BY_VALUES,
+        _ => ENTITY_SORT_BY,
     }
+}
+
+/// The attributes a list of `entity_type` sorts on BEYOND [`ENTITY_SORT_BY`]:
+/// the attributes the model declares for that type
+/// ([`entity_type_sort_by_values`]) with the two every type carries dropped, so
+/// a type whose sort shape names nothing else adds none.
+pub fn entity_type_sort_fields(entity_type: &str) -> Vec<&'static str> {
+    entity_type_sort_by_values(entity_type)
+        .iter()
+        .copied()
+        .filter(|field| !ENTITY_SORT_BY.contains(field))
+        .collect()
 }
 
 /// Every attribute a `ListEntities` of `entity_type` sorts on: the two
 /// [`ENTITY_SORT_BY`] publishes for every type, then that type's own fields.
 pub fn entity_sort_attributes(entity_type: &str) -> Vec<&'static str> {
     let mut attributes = ENTITY_SORT_BY.to_vec();
-    attributes.extend_from_slice(entity_type_sort_fields(entity_type));
+    attributes.extend(entity_type_sort_fields(entity_type));
     attributes
 }
 
