@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTransitGatewayRouteTables
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTransitGatewayRouteTables`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the transit gateway route tables the store holds, narrowed by
+//! `TransitGatewayRouteTableIds` and by every filter, in `TransitGatewayRouteTableId` order,
+//! paged with a token naming the table the next page resumes after.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTransitGatewayRouteTables::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +78,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::borrow::Cow;
+use std::collections::BTreeSet;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -149,18 +148,291 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTransitGatewayRouteTables` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTransitGatewayRouteTablesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it — the route
+        // tables are named by id. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // Matching cost is filters x values x stored tables x value length, and the model
+        // bounds none of them (`FilterList` and `Filter$Values` carry no `@length`), so
+        // every request-controlled factor is capped HERE, before any work proportional to it
+        // is done and before the store is locked — the same ceilings the other EC2 describes
+        // of this crate enforce, from `crate::state`. Their PRODUCT is charged to one
+        // [`crate::state::MatchBudget`] below, which is the bound the per-factor caps cannot
+        // give.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > state::MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {supplied} filters, above the maximum of {maximum}",
+                supplied = filters.len(),
+                maximum = state::MAX_FILTERS,
+            )));
+        }
+        // A filter name this operation publishes none of is refused whether or not any table
+        // would have matched it, so an unsupported filter can never read as "no results".
+        // Each value is compiled into its pattern ONCE here, rather than recompiled for every
+        // candidate table.
+        let mut compiled: Vec<state::CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !is_documented_filter(name) {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > state::MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {supplied} values, above the maximum of \
+                     {maximum}",
+                    supplied = values.len(),
+                    maximum = state::MAX_FILTER_VALUES,
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > state::MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {supplied} bytes, above the \
+                     maximum of {maximum}",
+                    supplied = oversize.len(),
+                    maximum = state::MAX_FILTER_VALUE_BYTES,
+                )));
+            }
+            compiled.push(state::CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The token for the next page of results" (`NextToken`) — a token this service did
+        // not mint is refused rather than read as an id, and it is refused before the store
+        // is read, so whether a bogus token is caught never depends on what the store holds.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(state::decode_page_token(token).ok_or_else(state::invalid_pagination_token)?)
+            }
+        };
+
+        // "The IDs of the transit gateway route tables" (`TransitGatewayRouteTableIds`): the
+        // model publishes no bound on the list, so the number of ids one request may name is
+        // capped here, before any per-id work — the same ceiling the rest of this crate puts
+        // on a caller-chosen id list.
+        let requested: &[String] = input
+            .transit_gateway_route_table_ids
+            .as_deref()
+            .unwrap_or_default();
+        if requested.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "TransitGatewayRouteTableIds carries {supplied} ids, above the maximum of \
+                 {maximum}",
+                supplied = requested.len(),
+                maximum = state::MAX_RESOURCE_IDS,
+            )));
+        }
+        // A value that is not a transit gateway route table id at all is refused as
+        // malformed, so "not an id of this kind" never reads as "no such route table" and is
+        // never answered by the DryRun arm below either.
+        for route_table_id in requested {
+            state::require_well_formed_transit_gateway_route_table_id(route_table_id)?;
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // named resources, so it is answered once the request's own form has been checked
+        // and before anything is resolved; every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed moves this read is allowed to apply — the same call the other
+        // describes of this crate make: a route table a create left `pending` is `available`
+        // once its due instant has passed, whether or not anybody called, so applying it here
+        // changes nothing a later caller would not have seen anyway.
+        store.materialize_due_transitions();
+
+        // An id that names no route table of the account is an error and not an absent row —
+        // which is what lets a client tell a dangling reference from a table it simply cannot
+        // see. Also held as an ordered SET, so the per-table selection below costs one lookup
+        // per table rather than a walk of the asked-for list, and a repeated id cannot
+        // multiply the work either.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTransitGatewayRouteTables"))
+        // The refusal is chosen by walking the request's OWN list, so the id it names is the
+        // first one the caller asked for that could not be resolved rather than whichever
+        // sorts first — the same order the rest of this crate's describes refuse in.
+        let named_ids: BTreeSet<&str> = requested.iter().map(String::as_str).collect();
+        if let Some(unknown) = requested.iter().find(|route_table_id| {
+            !store
+                .transit_gateway_route_tables
+                .contains_key(route_table_id.as_str())
+        }) {
+            return Err(state::invalid_transit_gateway_route_table_id_not_found(
+                unknown,
+            ));
+        }
+
+        // "Describes one or more transit gateway route tables. By default, all transit
+        // gateway route tables are described. Alternatively, you can filter the results":
+        // every table the account holds, narrowed to the ids named, and every filter must
+        // then hold ("If you specify multiple filters, the filters are joined with an AND" —
+        // `Filter`).
+        //
+        // Every comparison is charged to ONE budget — one step per candidate even when no
+        // filter was given, so an unfiltered scan is counted too — which bounds the product
+        // of stored tables, filters, values and value length however the caller combines
+        // them, and with it how long this holds the store's lock.
+        let mut budget = state::MatchBudget::new(state::MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<&TransitGatewayRouteTable> = Vec::new();
+        for (route_table_id, route_table) in &store.transit_gateway_route_tables {
+            if budget.exhausted() {
+                break;
+            }
+            if !named_ids.is_empty() && !named_ids.contains(route_table_id.as_str()) {
+                continue;
+            }
+            // The stored record IS the modelled shape its writer stored, so every member a
+            // writer set round-trips and a member nothing recorded is reported absent rather
+            // than invented here.
+            if state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(route_table, name)
+            }) {
+                selected.push(route_table);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {steps} comparisons to \
+                     evaluate; narrow them or page with MaxResults",
+                    steps = state::MAX_FILTER_MATCH_STEPS,
+                ),
+            ));
+        }
+
+        // Page in `TransitGatewayRouteTableId` order, which the cursor below names a position
+        // in. The store is an ordered map keyed by that id, so its iteration order already
+        // satisfies this sort; doing it here establishes the invariant the cursor depends on
+        // at the point of use rather than inheriting it from the container `crate::state`
+        // happens to hold.
+        selected.sort_by(|left, right| {
+            left.transit_gateway_route_table_id
+                .cmp(&right.transit_gateway_route_table_id)
+        });
+
+        // "The maximum number of results to return with a single call" (`MaxResults`). A
+        // request that names none gets the largest page the model publishes, so the
+        // `NextToken` path below behaves the same whether or not a page size was asked for.
+        // The model's `range 5..1000` has already refused anything outside it; the floor of
+        // [`MIN_MAX_RESULTS`] is applied anyway, because a page size of zero would mint a
+        // token for a page that carried nothing and leave a paging client in a loop that
+        // never advances.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .clamp(MIN_MAX_RESULTS, DEFAULT_MAX_RESULTS);
+
+        // The page and the `NextToken` it carries, cut by the crate's own cursor pager rather
+        // than by a second hand-rolled copy of it: a token only when a table follows this
+        // page ("This value is null when there are no more results to return" —
+        // `...Result$NextToken`), naming the last table of the page so the next one resumes
+        // after it — opaquely, so a caller cannot assemble one.
+        let (page, next_token) = state::page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            state::PageTokenRule::WhenAnotherItemFollows,
+            |route_table| {
+                route_table
+                    .transit_gateway_route_table_id
+                    .as_deref()
+                    .unwrap_or_default()
+            },
+        );
+
+        Ok(DescribeTransitGatewayRouteTablesOutput {
+            transit_gateway_route_tables: Some(
+                page.iter()
+                    .map(|route_table| (*route_table).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model publishes
+/// (`TransitGatewayMaxResults`, `range 5..1000`), which is also the most EC2 returns in one
+/// page.
+const DEFAULT_MAX_RESULTS: usize = 1000;
+
+/// The smallest page this operation will serve: the minimum of the same published range
+/// (`TransitGatewayMaxResults`, `range 5..1000`). The boundary validator refuses anything
+/// below it, so this is the floor that keeps a page of zero — which would mint a token for a
+/// page carrying nothing — unreachable however the request is read.
+const MIN_MAX_RESULTS: usize = 5;
+
+/// The filter names this operation documents, from
+/// `DescribeTransitGatewayRouteTablesRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeTransitGatewayRouteTablesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// That list is the whole catalog this operation answers — unlike `DescribeTransitGateways`,
+/// whose own list publishes the `tag-key` and `tag:<key>` family, this one publishes no tag
+/// filter — and every entry must be answered by [`filter_values`].
+const ROUTE_TABLE_FILTERS: [&str; 5] = [
+    "default-association-route-table",
+    "default-propagation-route-table",
+    "state",
+    "transit-gateway-id",
+    "transit-gateway-route-table-id",
+];
+
+/// Is `name` a filter this operation documents? "Filter names are case-sensitive"
+/// (`Filter$Name`), so the comparison is exact.
+fn is_documented_filter(name: &str) -> bool {
+    ROUTE_TABLE_FILTERS.contains(&name)
+}
+
+/// The values the EC2 filter `name` compares against this route table.
+///
+/// A filter naming a member this table carries no value for compares against NO values, so
+/// it selects nothing — the same answer AWS gives for any attribute a resource holds no
+/// value for. `name` is a name [`is_documented_filter`] admitted.
+fn filter_values<'a>(route_table: &'a TransitGatewayRouteTable, name: &str) -> Vec<Cow<'a, str>> {
+    // A boolean attribute is filtered on the value a client sends for it, which is how the
+    // wire renders it: `true` or `false` — the two values the filter's own documentation
+    // publishes for both default-role filters. A table whose flag is not set carries no
+    // value for the filter to match, like any other absent attribute.
+    let flag = |set: Option<bool>| -> Vec<Cow<'a, str>> {
+        set.map(|set| Cow::Borrowed(if set { "true" } else { "false" }))
+            .into_iter()
+            .collect()
+    };
+    let text =
+        |value: Option<&'a str>| -> Vec<Cow<'a, str>> { value.map(Cow::Borrowed).into_iter().collect() };
+    match name {
+        "default-association-route-table" => flag(route_table.default_association_route_table),
+        "default-propagation-route-table" => flag(route_table.default_propagation_route_table),
+        "state" => text(route_table.state.as_deref()),
+        "transit-gateway-id" => text(route_table.transit_gateway_id.as_deref()),
+        "transit-gateway-route-table-id" => {
+            text(route_table.transit_gateway_route_table_id.as_deref())
+        }
+        // Unreachable: `is_documented_filter` has already refused every other name. An
+        // undocumented name compares against nothing, so it could never widen a result even
+        // if that check were bypassed.
+        _ => Vec::new(),
     }
 }

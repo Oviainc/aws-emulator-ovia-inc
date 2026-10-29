@@ -866,3 +866,9 @@ mod get_coip_pool_usage;
 // the documented filters and the page size narrow it.
 #[path = "all/describe_transit_gateway_connects.rs"]
 mod describe_transit_gateway_connects;
+// Appended at the END of this file, for the reason the header gives. What
+// `DescribeTransitGatewayRouteTables` reports out of the transit gateway route table store,
+// how the id list, the documented filters and the page size narrow it, and that the tables
+// the implemented creates store — with the moves the clock owes them — read back through it.
+#[path = "all/transit_gateway_route_tables.rs"]
+mod transit_gateway_route_tables;
