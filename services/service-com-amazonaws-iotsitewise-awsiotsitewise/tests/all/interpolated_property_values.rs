@@ -107,6 +107,10 @@ async fn put_readings(
 /// The query members of one `GetInterpolatedAssetPropertyValues` request, as the
 /// model binds them (every one is an `httpQuery` member of
 /// `GET /properties/interpolated`).
+///
+/// `Clone` so one request can be sent twice — once as it stands and once carrying a
+/// `nextToken` — without spelling its members out again.
+#[derive(Clone)]
 struct Request<'a> {
     asset_id: &'a str,
     property_id: &'a str,
@@ -848,6 +852,263 @@ async fn the_page_size_defaults_to_ten_and_next_token_resumes_the_intervals() {
             "InvalidRequestException",
             "token {token:?}: unexpected error code in {body}"
         );
+    }
+}
+
+#[tokio::test]
+async fn a_next_token_is_honoured_only_against_the_request_that_minted_it() {
+    let router = router();
+    let (asset_id, properties) = asset_with_properties(&router, "Turbine6b").await;
+    let temperature = property_id(&properties, "Temperature");
+    let cycles = property_id(&properties, "Cycles");
+    let (other_asset, other_properties) = asset_with_properties(&router, "Turbine6c").await;
+    let other_temperature = property_id(&other_properties, "Temperature");
+
+    // One rising series per stream this suite's rows name, so each row below is an
+    // enumeration that really holds values — what a foreign token would otherwise
+    // reposition the caller inside.
+    put_readings(
+        &router,
+        &asset_id,
+        &temperature,
+        &[
+            (1_000, 0, json!({"doubleValue": 0.0}), Some("GOOD")),
+            (1_120, 0, json!({"doubleValue": 120.0}), Some("GOOD")),
+            // A second series of BAD readings over the same window, so the row that
+            // varies `quality` alone names a served enumeration too.
+            (1_005, 0, json!({"doubleValue": 5.0}), Some("BAD")),
+            (1_115, 0, json!({"doubleValue": 115.0}), Some("BAD")),
+        ],
+    )
+    .await;
+    put_readings(
+        &router,
+        &asset_id,
+        &cycles,
+        &[
+            (1_000, 0, json!({"integerValue": 0}), Some("GOOD")),
+            (1_120, 0, json!({"integerValue": 120}), Some("GOOD")),
+        ],
+    )
+    .await;
+    put_readings(
+        &router,
+        &other_asset,
+        &other_temperature,
+        &[
+            (1_000, 0, json!({"doubleValue": 0.0}), Some("GOOD")),
+            (1_120, 0, json!({"doubleValue": 120.0}), Some("GOOD")),
+        ],
+    )
+    .await;
+
+    // 13 instants over the 120-second range, the value at each being "seconds past
+    // 1000".
+    let whole: Vec<(At, f64)> = (0..=12)
+        .map(|k| ((1_000 + k * 10, 0), (k * 10) as f64))
+        .collect();
+    // The request that MINTS the token every row below replays.
+    let minting = || Request {
+        interval: 10,
+        end: (1_120, 0),
+        max_results: Some(4),
+        ..base(&asset_id, &temperature)
+    };
+    let (status, body) = call(&router, "GET", &minting().uri(), None).await;
+    assert_eq!(status, 200, "minting page: got {status} {body}");
+    assert_doubles("minting page", &body, &whole[..4]);
+    let token = body["nextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("minting page: expected a nextToken in {body}"))
+        .to_string();
+
+    // Each row varies the minting request along ONE member that decides which
+    // instants are enumerated or what each of them reports: the stream, the grid, the
+    // range, the interpolation type, the quality, the query window.
+    let rows: Vec<(&str, Request)> = vec![
+        (
+            "another property of the same asset",
+            Request {
+                property_id: &cycles,
+                ..minting()
+            },
+        ),
+        (
+            "another asset's property",
+            Request {
+                asset_id: &other_asset,
+                property_id: &other_temperature,
+                ..minting()
+            },
+        ),
+        (
+            "a wider interval",
+            Request {
+                interval: 20,
+                ..minting()
+            },
+        ),
+        (
+            "the other interpolation type",
+            Request {
+                kind: LOCF,
+                ..minting()
+            },
+        ),
+        (
+            "an earlier start",
+            Request {
+                start: (990, 0),
+                ..minting()
+            },
+        ),
+        (
+            "a start differing only in its nanosecond offset",
+            Request {
+                start: (1_000, 1),
+                ..minting()
+            },
+        ),
+        (
+            "a later inclusive end",
+            Request {
+                end: (1_200, 0),
+                ..minting()
+            },
+        ),
+        (
+            "another quality",
+            Request {
+                quality: "BAD",
+                ..minting()
+            },
+        ),
+        (
+            "an interval window the minting request did not carry",
+            Request {
+                window: Some(30),
+                ..minting()
+            },
+        ),
+    ];
+    for (case, foreign) in rows {
+        let (status, body) = call(&router, "GET", &foreign.uri(), None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: without a token this request is served: got {status} {body}"
+        );
+        let served = points(&body);
+        assert!(
+            !served.is_empty(),
+            "case {case:?}: the row must enumerate values of its own, got {body}"
+        );
+        let (status, body) = call(
+            &router,
+            "GET",
+            &Request {
+                next_token: Some(token.clone()),
+                ..foreign
+            }
+            .uri(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a token minted for another request names no page of this \
+             one, got {status} {body} (its own first page is {served:?})"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidRequestException",
+            "case {case:?}: unexpected error code in {body}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some("The nextToken is not a token this operation issued."),
+            "case {case:?}: unexpected message in {body}"
+        );
+    }
+
+    // A bare position is not one of this operation's tokens: every in-range ordinal
+    // of the minting grid, hex-encoded on its own, names no page.
+    for ordinal in 1..=12 {
+        let forged = ::hex::encode(ordinal.to_string());
+        let (status, body) = call(
+            &router,
+            "GET",
+            &Request {
+                next_token: Some(forged.clone()),
+                ..minting()
+            }
+            .uri(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "ordinal {ordinal}: a bare position is no token, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidRequestException",
+            "ordinal {ordinal}: unexpected error code in {body}"
+        );
+    }
+
+    // Nor is a respelling of one: the minting request's own token is taken apart here
+    // only to re-write its position in a form this operation never issues.
+    let decoded = String::from_utf8(::hex::decode(&token).expect("the token is hexadecimal"))
+        .expect("the token is text");
+    let (position, rest) = decoded
+        .split_once('|')
+        .unwrap_or_else(|| panic!("a token carries more than a position: {decoded:?}"));
+    for respelling in [format!("0{position}|{rest}"), format!("+{position}|{rest}")] {
+        let (status, body) = call(
+            &router,
+            "GET",
+            &Request {
+                next_token: Some(::hex::encode(&respelling)),
+                ..minting()
+            }
+            .uri(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "respelling {respelling:?}: got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidRequestException",
+            "respelling {respelling:?}: unexpected error code in {body}"
+        );
+    }
+
+    // The PAGE SIZE is not part of what a token is bound to — it cuts an enumeration
+    // into pages rather than deciding what the enumeration holds — so the minting
+    // request honours its own token whatever number of values the next page asks for,
+    // resuming exactly where the first page stopped.
+    for (case, max_results, expected) in [
+        ("the minting page size", Some(4), &whole[4..8]),
+        ("a larger page size", Some(7), &whole[4..11]),
+        ("the default page size", None, &whole[4..]),
+    ] {
+        let (status, body) = call(
+            &router,
+            "GET",
+            &Request {
+                max_results,
+                next_token: Some(token.clone()),
+                ..minting()
+            }
+            .uri(),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "case {case:?}: got {status} {body}");
+        assert_doubles(case, &body, expected);
     }
 }
 

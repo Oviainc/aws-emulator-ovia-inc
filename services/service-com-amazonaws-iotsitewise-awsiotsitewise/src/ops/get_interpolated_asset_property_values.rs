@@ -410,14 +410,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // enforced by the runtime, so `max(1)` only keeps the arithmetic total.
         let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
 
+        // WHICH enumeration of intervals a token counts an ordinal in: everything of
+        // this request that decides which instants it walks and what each of them
+        // reports, so a token is honoured only against the request that produced it.
+        let scope = GridScope::of(
+            &stream,
+            start,
+            end,
+            interval,
+            window,
+            input.r#type.as_str(),
+            input.quality.as_str(),
+        );
+
         // `nextToken` is this enumeration's resume point: the ordinal of the interval
-        // the next page starts at, hex-encoded so it matches the modelled
-        // `^[A-Za-z0-9+/=]+$`. A token that names no interval of this range is refused
-        // rather than answered with an empty page; the first page's own ordinal (0) is
-        // not one this operation ever issues.
+        // the next page starts at, beside the enumeration that ordinal was counted in,
+        // hex-encoded so it matches the modelled `^[A-Za-z0-9+/=]+$`. Text this
+        // operation never issued as a token for THIS enumeration, and an ordinal that
+        // names no interval of this range, are refused rather than answered with an
+        // empty page or with a page of some other enumeration; the first page's own
+        // ordinal (0) is not one this operation ever issues.
         let mut cursor = match input.next_token.as_deref() {
             Some(token) => {
-                let resume = decode_token(token)?;
+                let resume = decode_token(token, &scope)?;
                 if resume < 1 || resume > last_index {
                     return Err(invalid_token());
                 }
@@ -460,9 +475,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let next_token = if produced.len() > max_results {
-            produced.pop().map(|(resume, _)| encode_token(resume))
+            produced
+                .pop()
+                .map(|(resume, _)| encode_token(resume, &scope))
         } else {
-            resume_at.map(encode_token)
+            resume_at.map(|resume| encode_token(resume, &scope))
         };
 
         Ok(GetInterpolatedAssetPropertyValuesOutput {
@@ -639,22 +656,104 @@ fn numeric(value: &Variant) -> Option<f64> {
         .or_else(|| value.integer_value.map(f64::from))
 }
 
-/// A `nextToken` for the interval the next page resumes from: its ordinal, written
-/// out and hex-encoded so the token matches the modelled `^[A-Za-z0-9+/=]+$`.
-fn encode_token(resume: u64) -> String {
-    ::hex::encode(resume.to_string().as_bytes())
+/// WHICH enumeration of interval instants a `nextToken`'s ordinal was counted in.
+///
+/// A token names a POSITION, and a position only means something in the enumeration
+/// it was counted in: interval 2 of one grid stands in no relation to interval 2 of
+/// another, so a token carries what enumeration it came from and is honoured against
+/// that one alone. What identifies one here is everything of the request that decides
+/// which instants are walked and what each of them reports — the resolved data
+/// stream, the grid (its start instant and its interval), the inclusive end that
+/// bounds it, the query window, the interpolation type and the quality the readings
+/// are filtered to. The page size is deliberately NOT part of it: it changes how an
+/// enumeration is cut into pages, not which values the enumeration holds, so a caller
+/// may ask the next page for a different number of values. Nothing can forge a scope,
+/// because what the token carries is a digest of those fields and not the fields
+/// themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GridScope(String);
+
+impl GridScope {
+    /// The enumeration one request walks, as a short digest of the fields that
+    /// identify it. Each field is terminated, so no two field lists can run together
+    /// into the same digest.
+    fn of(
+        stream: &crate::state::SeriesKey,
+        start: i128,
+        end: i128,
+        interval: i128,
+        window: Option<i128>,
+        interpolation_type: &str,
+        quality: &str,
+    ) -> Self {
+        let (stream_kind, owner, member) = match stream {
+            crate::state::SeriesKey::Property(asset_id, property_id) => {
+                ("property", asset_id.as_str(), property_id.as_str())
+            }
+            crate::state::SeriesKey::Disassociated(alias) => ("alias", alias.as_str(), ""),
+        };
+        let start = start.to_string();
+        let end = end.to_string();
+        let interval = interval.to_string();
+        let window = window.map(|window| window.to_string()).unwrap_or_default();
+        let mut digest = <::sha2::Sha256 as ::sha2::Digest>::new();
+        for field in [
+            stream_kind,
+            owner,
+            member,
+            start.as_str(),
+            end.as_str(),
+            interval.as_str(),
+            window.as_str(),
+            interpolation_type,
+            quality,
+        ] {
+            ::sha2::Digest::update(&mut digest, field.as_bytes());
+            ::sha2::Digest::update(&mut digest, b"\x1f");
+        }
+        Self(::hex::encode(
+            &<::sha2::Sha256 as ::sha2::Digest>::finalize(digest)[..8],
+        ))
+    }
 }
 
-/// Decode a `nextToken` back into the interval ordinal it resumes from.
-fn decode_token(token: &str) -> Result<u64, GetInterpolatedAssetPropertyValuesError> {
-    ::hex::decode(token)
+/// A `nextToken` for the interval the next page of `scope` resumes from: its ordinal
+/// beside the enumeration that ordinal was counted in, written out and hex-encoded so
+/// the token matches the modelled `^[A-Za-z0-9+/=]+$`.
+fn encode_token(resume: u64, scope: &GridScope) -> String {
+    ::hex::encode(format!("{resume}|{}", scope.0))
+}
+
+/// Decode a `nextToken` back into the interval ordinal it resumes `scope` from.
+///
+/// Text that is not one of this operation's tokens at all, and a token it issued for
+/// another enumeration, both name no interval of `scope` and are refused.
+fn decode_token(
+    token: &str,
+    scope: &GridScope,
+) -> Result<u64, GetInterpolatedAssetPropertyValuesError> {
+    let decoded = ::hex::decode(token)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|resume| resume.parse().ok())
-        .ok_or_else(invalid_token)
+        .ok_or_else(invalid_token)?;
+    let (resume, fingerprint) = decoded.split_once('|').ok_or_else(invalid_token)?;
+    if fingerprint != scope.0 {
+        return Err(invalid_token());
+    }
+    let ordinal: u64 = resume.parse().map_err(|_| invalid_token())?;
+    // Only the spelling [`encode_token`] writes is one of this operation's tokens:
+    // a signed or zero-padded ordinal reads as the same number but is text this
+    // operation never issued.
+    if ordinal.to_string() != resume {
+        return Err(invalid_token());
+    }
+    Ok(ordinal)
 }
 
-/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued
+/// for the enumeration it is replayed against: text that is not one of its tokens, a
+/// token issued for another request's intervals, or an ordinal this range has no
+/// interval at.
 fn invalid_token() -> GetInterpolatedAssetPropertyValuesError {
     invalid_request("The nextToken is not a token this operation issued.".to_string())
 }
