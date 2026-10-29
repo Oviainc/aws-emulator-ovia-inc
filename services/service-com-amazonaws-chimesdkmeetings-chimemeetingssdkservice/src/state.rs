@@ -597,13 +597,30 @@ pub fn media_placement(meeting_id: &str, media_region: &str) -> MediaPlacement {
         screen_sharing_url: Some(format!(
             "wss://bitpw.m3.{media_region}.app.chime.aws:443/v2/screen/{meeting_id}"
         )),
+        // The bit-hub connect URL a screen viewer is pointed at. Its query string is the
+        // whole viewer connect string the service hands out: a `passcode` and a
+        // `viewer_uuid` that no caller supplies — so both read `null` — ahead of the
+        // meeting's own call id. A client parses this string, so none of its parameters
+        // may be dropped.
         screen_viewing_url: Some(format!(
-            "wss://bitpw.m3.{media_region}.app.chime.aws:443/ws/connect?X-BitHub-Call-Id={meeting_id}"
+            "wss://bitpw.m3.{media_region}.app.chime.aws:443/ws/connect\
+             ?passcode=null&viewer_uuid=null&X-BitHub-Call-Id={meeting_id}"
         )),
         event_ingestion_url: Some(format!(
             "https://data.svc.{media_region}.ingest.chime.aws/v1/client-events"
         )),
     }
+}
+
+/// The tenant ids a stored meeting carries, given what the create asked for.
+///
+/// The member belongs to the `Meeting` projection itself, so a meeting created without
+/// tenant ids holds the EMPTY list rather than nothing: every reader of a meeting reports
+/// a list, and a client that iterates the member never meets an absent one. The modelled
+/// `@length(1..5)` on `TenantIdList` bounds what a REQUEST may supply; it says nothing
+/// about whether the projection carries the member.
+pub fn tenant_ids(requested: Option<Vec<String>>) -> Vec<String> {
+    requested.unwrap_or_default()
 }
 
 /// The 8-hex-character per-meeting label the audio host name carries.

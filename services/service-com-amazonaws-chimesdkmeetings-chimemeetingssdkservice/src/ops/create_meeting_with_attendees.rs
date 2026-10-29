@@ -275,7 +275,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             media_region: Some(input.media_region),
             meeting_features: input.meeting_features,
             primary_meeting_id: input.primary_meeting_id,
-            tenant_ids: input.tenant_ids,
+            // The projection always carries `TenantIds`: a create that named none stores
+            // the empty list, so every reader of this meeting reports a list.
+            tenant_ids: Some(crate::state::tenant_ids(input.tenant_ids)),
         };
 
         store

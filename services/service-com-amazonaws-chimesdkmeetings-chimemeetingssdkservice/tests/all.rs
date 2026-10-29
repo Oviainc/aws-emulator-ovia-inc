@@ -17,6 +17,8 @@ mod create_meeting_with_attendees;
 mod delete_meeting_idempotence;
 #[path = "all/meeting_attendee_lifecycle.rs"]
 mod meeting_attendee_lifecycle;
+#[path = "all/meeting_projection.rs"]
+mod meeting_projection;
 #[path = "all/not_found_message.rs"]
 mod not_found_message;
 #[path = "all/resource_tagging.rs"]

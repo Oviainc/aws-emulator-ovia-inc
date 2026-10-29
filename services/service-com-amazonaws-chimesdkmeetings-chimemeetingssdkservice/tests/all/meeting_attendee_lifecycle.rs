@@ -369,7 +369,6 @@ async fn create_meeting_persists_a_meeting_derived_from_its_minted_id() {
             "MediaRegion",
             "MeetingHostId",
             "PrimaryMeetingId",
-            "TenantIds",
             "MeetingFeatures",
         ] {
             assert_eq!(
@@ -380,6 +379,18 @@ async fn create_meeting_persists_a_meeting_derived_from_its_minted_id() {
                 meeting.get(member)
             );
         }
+        // `TenantIds` belongs to the projection itself: the ids supplied, or the empty
+        // list when the create named none (see `meeting_projection.rs`).
+        let expected_tenant_ids = request
+            .get("TenantIds")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        assert_eq!(
+            meeting.get("TenantIds"),
+            Some(&expected_tenant_ids),
+            "case {case:?}: expected TenantIds {expected_tenant_ids:?}, got {:?}",
+            meeting.get("TenantIds")
+        );
 
         // The round trip: GetMeeting reads back the same record, twice.
         for attempt in 1..=2u8 {
