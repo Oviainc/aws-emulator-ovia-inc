@@ -576,6 +576,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A created interface is attached to nothing: "available" until an attach
             // moves it.
             attachment: None,
+            // Nothing but the caller manages an interface the caller created itself.
+            requester: None,
             tags,
         };
         let payload_bytes = state::network_interface_spec_bytes(&spec)

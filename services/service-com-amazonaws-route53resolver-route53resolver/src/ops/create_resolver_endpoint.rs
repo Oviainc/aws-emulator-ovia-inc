@@ -278,19 +278,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // every `SubnetId` the request names has to be a subnet the account
         // holds; one that resolves to nothing is refused before the store is
         // locked, so no endpoint is created against a subnet that does not
-        // exist.
-        if let Some(unknown) = crate::state::unresolvable_subnet_id(
+        // exist. What resolving them answers is also what the endpoint's
+        // `HostVPCId` is read off and what its addresses are drawn from.
+        let placements = match crate::state::subnet_placements(
             &*self.engine,
             input
                 .ip_addresses
                 .iter()
                 .map(|requested| requested.subnet_id.as_str()),
         ) {
-            return Err(CreateResolverEndpointErrorModeled::InvalidParameterException(
-                crate::state::subnet_not_found(&unknown),
-            )
-            .into());
-        }
+            Ok(placements) => placements,
+            Err(unknown) => {
+                return Err(CreateResolverEndpointErrorModeled::InvalidParameterException(
+                    crate::state::subnet_not_found(&unknown),
+                )
+                .into());
+            }
+        };
 
         let mut store = state.lock();
         // `CreatorRequestId` exists so "failed requests [can] be retried without
@@ -334,23 +338,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("resolver-endpoint/{id}"),
         );
 
-        let subnet_ids: Vec<String> = input
-            .ip_addresses
-            .iter()
-            .map(|requested| requested.subnet_id.clone())
-            .collect();
-
         let mut ip_addresses = Vec::with_capacity(input.ip_addresses.len());
-        for requested in &input.ip_addresses {
+        for (requested, placement) in input.ip_addresses.iter().zip(&placements) {
             let ip_seq = store.next_seq();
+            // The address the endpoint answers on, and the elastic network
+            // interface of the VPC that holds it: the one the request named, or
+            // one assigned out of the subnet's own block when it named none.
+            // An address the request describes by its IPv6 address is one it HAS
+            // named, so no IPv4 address is chosen for it.
+            let placed = if requested.ip.is_none() && requested.ipv6.is_some() {
+                crate::state::PlacedAddress::default()
+            } else {
+                crate::state::place_endpoint_address(
+                    &*self.engine,
+                    placement,
+                    requested.ip.as_deref(),
+                    &region,
+                    &id,
+                    &input.security_group_ids,
+                )
+            };
             ip_addresses.push(crate::state::IpAddressRecord {
                 ip_id: crate::state::mint_ip_id(ip_seq),
                 subnet_id: requested.subnet_id.clone(),
-                // An address the request did not supply is left unset rather than
-                // invented: the service does not pick one out of the subnet's
-                // CIDR range here.
-                ip: requested.ip.clone(),
+                ip: placed.ip,
                 ipv6: requested.ipv6.clone(),
+                network_interface_id: placed.network_interface_id,
                 status: crate::state::IP_STATUS_CREATING.to_string(),
                 status_message: None,
                 creation_time: timestamp.clone(),
@@ -367,7 +380,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creator_request_id: input.creator_request_id.clone(),
             security_group_ids: input.security_group_ids.clone(),
             direction: input.direction.clone(),
-            host_vpc_id: Some(crate::state::host_vpc_id(&subnet_ids)),
+            host_vpc_id: crate::state::host_vpc_id(&placements),
             status: crate::state::ENDPOINT_STATUS_CREATING.to_string(),
             status_message: None,
             endpoint_type: input.resolver_endpoint_type.clone(),

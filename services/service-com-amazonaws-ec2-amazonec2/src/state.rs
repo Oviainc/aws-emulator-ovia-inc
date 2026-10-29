@@ -18029,6 +18029,13 @@ pub struct NetworkInterfaceSpec {
     /// stores. The `Status` the store derives follows from it, so a stored interface cannot
     /// claim to be `available` while something holds it.
     pub attachment: Option<NetworkInterfaceAttachment>,
+    /// "The alias or Amazon Web Services account ID of the principal or service that created
+    /// the network interface" (`NetworkInterface$RequesterId`), for an interface ANOTHER AWS
+    /// service created to serve a resource of the account — which is also what makes the
+    /// interface one "being managed by Amazon Web Services"
+    /// (`NetworkInterface$RequesterManaged`). `None` for an interface the caller created for
+    /// itself, which nothing but the caller manages.
+    pub requester: Option<String>,
     /// The tags the create asked for.
     pub tags: Vec<Tag>,
 }
@@ -18223,9 +18230,12 @@ impl ComAmazonawsEc2Amazonec2State {
             private_ip_addresses: Some(private_ip_addresses),
             // "The alias or Amazon Web Services account ID of the principal or service that
             // created the network interface" (`NetworkInterface$RequesterId`): reported for
-            // an interface an AWS service created, which this is not.
-            requester_id: None,
-            requester_managed: Some(false),
+            // an interface an AWS service created to serve a resource of the account, and
+            // `None` for one the caller created for itself. An interface a service created
+            // is the one that service manages, so `RequesterManaged` follows from the same
+            // member rather than being decided twice.
+            requester_id: spec.requester.clone(),
+            requester_managed: Some(spec.requester.is_some()),
             // "Indicates whether source/destination checking is enabled": on by default,
             // the value an interface has to be changed away from to do NAT.
             source_dest_check: Some(true),

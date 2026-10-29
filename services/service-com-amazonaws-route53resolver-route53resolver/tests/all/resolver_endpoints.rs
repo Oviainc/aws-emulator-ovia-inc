@@ -729,6 +729,20 @@ async fn an_endpoint_list_cursor_belongs_to_the_query_that_minted_it() {
 async fn filters_select_on_every_documented_member() {
     let router = emulator();
 
+    // Each endpoint's subnets belong to a VPC of its own, so the `HostVPCId`
+    // filter has something to select on: the id an endpoint reports is the id of
+    // the VPC the account holds its subnets in, so two endpoints in one VPC
+    // report one id.
+    let alpha_vpc_id = router.hold_vpc();
+    router.hold_subnets_in(&alpha_vpc_id, ["subnet-alpha-1", "subnet-alpha-2"]);
+    let beta_vpc_id = router.hold_vpc();
+    router.hold_subnets_in(&beta_vpc_id, ["subnet-beta-1", "subnet-beta-2"]);
+    let gamma_vpc_id = router.hold_vpc();
+    router.hold_subnets_in(
+        &gamma_vpc_id,
+        ["subnet-gamma-1", "subnet-gamma-2", "subnet-gamma-3"],
+    );
+
     let alpha = create_endpoint(
         &router,
         json!({
@@ -780,6 +794,10 @@ async fn filters_select_on_every_documented_member() {
     let beta_id = string_member(&beta, "Id");
     let gamma_id = string_member(&gamma, "Id");
     let alpha_vpc = string_member(&alpha, "HostVPCId");
+    assert_eq!(
+        alpha_vpc, alpha_vpc_id,
+        "the endpoint must report the VPC the account holds its subnets in, got {alpha:?}"
+    );
 
     let cases: Vec<(&str, Value, Vec<String>)> = vec![
         (

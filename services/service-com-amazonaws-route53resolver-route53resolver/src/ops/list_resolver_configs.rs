@@ -204,18 +204,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(page) = page else {
             // A cursor this service did not mint for this collection is refused
-            // with the `InvalidNextTokenException` this operation models ("The
-            // value that you specified for NextToken in a List request isn't
-            // valid"), rather than being read as "start from the beginning" and
-            // silently repeating page one.
+            // rather than being read as "start from the beginning" and silently
+            // repeating page one. This operation makes the token a REQUEST
+            // PARAMETER fault — `InvalidParameterException`, with the rejected
+            // value quoted in the message — and not a stale-cursor one.
             return Err(
-                ListResolverConfigsErrorModeled::InvalidNextTokenException(
-                    InvalidNextTokenException {
-                        message: Some(
-                            "The NextToken you provided was not issued by this service for this query"
-                                .to_string(),
-                        ),
-                    },
+                ListResolverConfigsErrorModeled::InvalidParameterException(
+                    crate::state::invalid_next_token_parameter(
+                        input.next_token.as_deref().unwrap_or_default(),
+                    ),
                 )
                 .into(),
             );

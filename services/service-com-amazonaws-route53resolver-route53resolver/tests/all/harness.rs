@@ -19,13 +19,8 @@ use std::sync::Arc;
 /// The region every request below is signed for; it is where the ARNs the
 /// service mints must be rooted.
 pub const REGION: &str = "us-west-2";
-
 /// The canonical placeholder account id every emulator ARN carries.
 pub const ACCOUNT: &str = "000000000000";
-
-/// The IPv4 CIDR block of the VPC [`Emulator::hold_subnets`] registers its
-/// subnets in; each subnet gets one /24 block of it.
-const VPC_CIDR_BLOCK: &str = "10.0.0.0/16";
 
 /// The IPv4 CIDR block every VPC [`Emulator::hold_vpcs`] registers carries. Two
 /// VPCs of one account may carry the same block, so one is enough for every row
@@ -65,28 +60,64 @@ impl Emulator {
     ///
     /// Each subnet is stored as the modelled shape Amazon EC2 reports, in the
     /// one VPC this account's store holds for these suites, `available`, with a
-    /// /24 block of that VPC and a zone of [`REGION`].
+    /// /24 block of that VPC and a zone of [`REGION`]. A suite that needs
+    /// subnets in a SECOND VPC racks one with [`Emulator::hold_vpc`] and names
+    /// it to [`Emulator::hold_subnets_in`].
     pub fn hold_subnets<I>(&self, subnet_ids: I)
     where
         I: IntoIterator,
         I::Item: AsRef<str>,
     {
-        let ec2_state = ec2::state::service_state(&*self.engine)
-            .expect("the in-memory engine carries the account's Amazon EC2 store");
+        let existing = self.ec2_store().lock().vpcs.keys().next().cloned();
+        let vpc_id = existing.unwrap_or_else(|| self.hold_vpc());
+        self.hold_subnets_in(&vpc_id, subnet_ids);
+    }
+
+    /// Put one VPC into the account's own Amazon EC2 store, with its own /16
+    /// block, and answer its id.
+    ///
+    /// The VPC a Resolver endpoint reports as its `HostVPCId` is the VPC that
+    /// owns the subnets its addresses sit in, so a suite that asserts the two
+    /// cannot be told apart needs an account holding more than one VPC.
+    pub fn hold_vpc(&self) -> String {
+        let ec2_state = self.ec2_store();
         let mut store = ec2_state.lock();
-        let vpc_id = store.vpcs.keys().next().cloned().unwrap_or_else(|| {
-            let vpc_id = store.next_id("vpc");
-            store.vpcs.insert(
-                vpc_id.clone(),
-                ec2::ops::types::Vpc {
-                    vpc_id: Some(vpc_id.clone()),
-                    cidr_block: Some(VPC_CIDR_BLOCK.to_string()),
-                    state: Some(ec2::state::VPC_STATE_AVAILABLE.to_string()),
-                    ..Default::default()
-                },
-            );
-            vpc_id
-        });
+        // Each VPC gets a distinct second octet, so no subnet of one VPC spans
+        // the addresses of a subnet of another.
+        let octet = store.vpcs.len() % 256;
+        let vpc_id = store.next_id("vpc");
+        store.vpcs.insert(
+            vpc_id.clone(),
+            ec2::ops::types::Vpc {
+                vpc_id: Some(vpc_id.clone()),
+                cidr_block: Some(format!("10.{octet}.0.0/16")),
+                state: Some(ec2::state::VPC_STATE_AVAILABLE.to_string()),
+                ..Default::default()
+            },
+        );
+        vpc_id
+    }
+
+    /// Put one subnet per id into the VPC `vpc_id`, each with a /24 block of
+    /// that VPC's own block and a zone of [`REGION`].
+    pub fn hold_subnets_in<I>(&self, vpc_id: &str, subnet_ids: I)
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        let ec2_state = self.ec2_store();
+        let mut store = ec2_state.lock();
+        let octet = store
+            .vpcs
+            .get(vpc_id)
+            .and_then(|vpc| vpc.cidr_block.clone())
+            .and_then(|block| {
+                block
+                    .split('.')
+                    .nth(1)
+                    .and_then(|octet| octet.parse::<usize>().ok())
+            })
+            .unwrap_or_default();
         for subnet_id in subnet_ids {
             let subnet_id = subnet_id.as_ref().to_string();
             if store.subnets.contains_key(&subnet_id) {
@@ -97,8 +128,8 @@ impl Emulator {
                 subnet_id.clone(),
                 ec2::ops::types::Subnet {
                     subnet_id: Some(subnet_id),
-                    vpc_id: Some(vpc_id.clone()),
-                    cidr_block: Some(format!("10.0.{block}.0/24")),
+                    vpc_id: Some(vpc_id.to_string()),
+                    cidr_block: Some(format!("10.{octet}.{block}.0/24")),
                     availability_zone: Some(format!("{REGION}a")),
                     state: Some(ec2::state::SUBNET_STATE_AVAILABLE.to_string()),
                     ..Default::default()
@@ -125,8 +156,7 @@ impl Emulator {
         I: IntoIterator,
         I::Item: AsRef<str>,
     {
-        let ec2_state = ec2::state::service_state(&*self.engine)
-            .expect("the in-memory engine carries the account's Amazon EC2 store");
+        let ec2_state = self.ec2_store();
         let mut store = ec2_state.lock();
         for vpc_id in vpc_ids {
             let vpc_id = vpc_id.as_ref().to_string();
@@ -145,18 +175,111 @@ impl Emulator {
     /// Take the VPC `vpc_id` names out of the account's Amazon EC2 store, so a
     /// Resolver write that names it afterwards resolves to nothing.
     pub fn release_vpc(&self, vpc_id: &str) {
-        let ec2_state = ec2::state::service_state(&*self.engine)
-            .expect("the in-memory engine carries the account's Amazon EC2 store");
-        ec2_state.lock().vpcs.remove(vpc_id);
+        self.ec2_store().lock().vpcs.remove(vpc_id);
+    }
+
+    /// The VPC the account's Amazon EC2 store holds the subnet `subnet_id` in —
+    /// what a client joining Resolver output to Amazon EC2 reads with
+    /// `DescribeSubnets`. Read out of that store, never written here.
+    pub fn vpc_of_subnet(&self, subnet_id: &str) -> Option<String> {
+        let ec2_state = self.ec2_store();
+        let store = ec2_state.lock();
+        store
+            .subnets
+            .get(subnet_id)
+            .and_then(|subnet| subnet.vpc_id.clone())
+    }
+
+    /// The IPv4 block the account's Amazon EC2 store holds the subnet
+    /// `subnet_id` with.
+    pub fn cidr_block_of_subnet(&self, subnet_id: &str) -> Option<String> {
+        let ec2_state = self.ec2_store();
+        let store = ec2_state.lock();
+        store
+            .subnets
+            .get(subnet_id)
+            .and_then(|subnet| subnet.cidr_block.clone())
+    }
+
+    /// Every elastic network interface the account's Amazon EC2 store holds, as
+    /// `DescribeNetworkInterfaces` reports them.
+    pub fn network_interfaces(&self) -> Vec<NetworkInterfaceView> {
+        let ec2_state = self.ec2_store();
+        let store = ec2_state.lock();
+        store
+            .network_interfaces
+            .values()
+            .map(|interface| NetworkInterfaceView {
+                subnet_id: interface.subnet_id.clone().unwrap_or_default(),
+                vpc_id: interface.vpc_id.clone().unwrap_or_default(),
+                description: interface.description.clone().unwrap_or_default(),
+                requester_id: interface.requester_id.clone(),
+                requester_managed: interface.requester_managed.unwrap_or_default(),
+                private_ips: interface
+                    .private_ip_addresses
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|address| address.private_ip_address.clone())
+                    .collect(),
+            })
+            .collect()
     }
 
     /// Take the subnet `subnet_id` names out of the account's Amazon EC2 store,
     /// so a Resolver write that names it afterwards resolves to nothing.
     pub fn release_subnet(&self, subnet_id: &str) {
-        let ec2_state = ec2::state::service_state(&*self.engine)
-            .expect("the in-memory engine carries the account's Amazon EC2 store");
-        ec2_state.lock().subnets.remove(subnet_id);
+        self.ec2_store().lock().subnets.remove(subnet_id);
     }
+
+    /// The account's own Amazon EC2 store on the engine this emulator shares
+    /// with it.
+    fn ec2_store(&self) -> engine::ServiceState<ec2::state::ComAmazonawsEc2Amazonec2State> {
+        ec2::state::service_state(&*self.engine)
+            .expect("the in-memory engine carries the account's Amazon EC2 store")
+    }
+}
+
+/// One elastic network interface of the account, as a suite reads it out of the
+/// Amazon EC2 store: what a caller joining Resolver's reported addresses to
+/// Amazon EC2 compares them against.
+#[derive(Debug, Clone)]
+pub struct NetworkInterfaceView {
+    pub subnet_id: String,
+    pub vpc_id: String,
+    pub description: String,
+    /// "The alias or Amazon Web Services account ID of the principal or service
+    /// that created the network interface", and whether the interface is one
+    /// Amazon Web Services manages — both reported for an interface another
+    /// service created to serve a resource of the account.
+    pub requester_id: Option<String>,
+    pub requester_managed: bool,
+    pub private_ips: Vec<String>,
+}
+
+/// Whether the IPv4 address `address` lies inside the block `cidr_block`.
+///
+/// What a suite asserts an address Resolver CHOSE by: an address of a subnet is
+/// one of the addresses that subnet spans, whatever the width of its block.
+pub fn address_inside_block(cidr_block: &str, address: &str) -> bool {
+    let Some((base, prefix)) = cidr_block.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u32>() else {
+        return false;
+    };
+    let (Ok(base), Ok(address)) = (
+        base.parse::<std::net::Ipv4Addr>(),
+        address.parse::<std::net::Ipv4Addr>(),
+    ) else {
+        return false;
+    };
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix.min(32))
+    };
+    u32::from(base) & mask == u32::from(address) & mask
 }
 
 /// A fresh emulator: one shared engine, this one service mounted on it.

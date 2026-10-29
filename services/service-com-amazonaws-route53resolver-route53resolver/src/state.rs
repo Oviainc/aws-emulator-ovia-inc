@@ -15,10 +15,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-// The account's own Amazon EC2 inventory, which `unresolvable_subnet_id` and
-// `unresolvable_vpc_id` resolve a `SubnetId` and a VPC id against: a VPC and its
-// subnets live in that service's store, so they are read through its own
-// accessors.
+// The account's own Amazon EC2 inventory, which `subnet_placements` and
+// `unresolvable_vpc_id` resolve a `SubnetId` and a VPC id against, and which
+// `place_endpoint_address` draws an endpoint's addresses out of: a VPC, its
+// subnets, and the elastic network interface holding one of a subnet's
+// addresses, live in that service's store, so they are read and written through
+// its own accessors.
+use ::service_com_amazonaws_ec2_amazonec2::ops::types as ec2_types;
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 // The account's own AWS Outposts inventory, which `account_holds_outpost`
 // resolves an `OutpostArn` against: the Outposts live in that service's store,
@@ -45,6 +48,15 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// This service's ARN namespace, from the model's `awsService.arnNamespace`
 /// (`smithy_query(query="service_info")`).
 pub const ARN_NAMESPACE: &str = "route53resolver";
+
+/// How this service names ITSELF to another service of the account: the service
+/// principal built from its own namespace.
+///
+/// It is what the account's Amazon EC2 inventory reports as the requester of an
+/// elastic network interface this service created to serve a Resolver endpoint
+/// ([`place_endpoint_address`]) — "the alias or Amazon Web Services account ID of
+/// the principal or service that created the network interface".
+pub const SERVICE_PRINCIPAL: &str = "route53resolver.amazonaws.com";
 
 /// `ResolverEndpointStatus` values this slice reports. The model's enum
 /// (`smithy_query(query="shape",shape="ResolverEndpointStatus")`) also carries
@@ -859,12 +871,31 @@ pub fn subnet_not_found(subnet_id: &str) -> InvalidParameterException {
     }
 }
 
-/// The first id in `subnet_ids`, in request order, that names no subnet of the
-/// account, or `None` when the account holds every one of them.
+/// One subnet of the account, as an endpoint address placed in it reads it: the
+/// VPC that OWNS the subnet, and the block an address of that subnet comes out
+/// of.
+///
+/// Every member but the id is optional because the account's record of a subnet
+/// is the modelled `Subnet` shape, whose members are all optional: a subnet
+/// stating no block is one no address can be drawn from, and one stating no VPC
+/// is one no `HostVPCId` can be read off.
+#[derive(Debug, Clone)]
+pub struct SubnetPlacement {
+    pub subnet_id: String,
+    pub vpc_id: Option<String>,
+    pub cidr_block: Option<String>,
+    pub availability_zone: Option<String>,
+    pub availability_zone_id: Option<String>,
+}
+
+/// Resolve each id in `subnet_ids`, in request order, against the account's own
+/// subnet inventory — or `Err` with the FIRST id that names no subnet of the
+/// account.
 ///
 /// A Resolver endpoint's IP addresses are placed IN subnets of the caller's VPC:
-/// which subnets exist is a fact of the account's own Amazon EC2 inventory — the
-/// one `DescribeSubnets` answers from — and not a value this service's caller
+/// which subnets exist, which VPC owns each one and which addresses each one
+/// spans are facts of the account's own Amazon EC2 inventory — the one
+/// `DescribeSubnets` answers from — and not values this service's caller
 /// supplies, so this is the one place that resolution happens, exactly as
 /// [`account_holds_outpost`] resolves an `OutpostArn`. The subnets live in that
 /// service's own store and are read through its own accessors, so one subnet is
@@ -877,13 +908,192 @@ pub fn subnet_not_found(subnet_id: &str) -> InvalidParameterException {
 /// before returning; a handler calls this with no lock of its own held, so the
 /// two stores are never held at once. Amazon EC2 never reaches this service, so
 /// no cycle exists.
-pub fn unresolvable_subnet_id<'a, Eng: Send + Sync + 'static>(
+pub fn subnet_placements<'a, Eng: Send + Sync + 'static>(
     engine: &Eng,
     subnet_ids: impl IntoIterator<Item = &'a str>,
-) -> Option<String> {
-    unresolvable_ec2_id(engine, subnet_ids, |store, subnet_id| {
-        store.subnets.contains_key(subnet_id)
-    })
+) -> Result<Vec<SubnetPlacement>, String> {
+    let Some(state) = ec2::service_state(engine) else {
+        // No Amazon EC2 store on this engine is no subnet inventory to resolve
+        // against, so no id can be shown to name nothing — and nothing is known
+        // about the subnets the request names.
+        return Ok(subnet_ids
+            .into_iter()
+            .map(|subnet_id| SubnetPlacement {
+                subnet_id: subnet_id.to_string(),
+                vpc_id: None,
+                cidr_block: None,
+                availability_zone: None,
+                availability_zone_id: None,
+            })
+            .collect());
+    };
+    let store = state.lock();
+    let mut placements: Vec<SubnetPlacement> = Vec::new();
+    for subnet_id in subnet_ids {
+        let Some(subnet) = store.subnets.get(subnet_id) else {
+            return Err(subnet_id.to_string());
+        };
+        placements.push(SubnetPlacement {
+            subnet_id: subnet_id.to_string(),
+            vpc_id: subnet.vpc_id.clone(),
+            cidr_block: subnet.cidr_block.clone(),
+            availability_zone: subnet.availability_zone.clone(),
+            availability_zone_id: subnet.availability_zone_id.clone(),
+        });
+    }
+    Ok(placements)
+}
+
+/// The `HostVPCId` of an endpoint whose addresses are placed in `placements`.
+///
+/// `ResolverEndpoint$HostVPCId` is "The ID of the VPC that you want to create
+/// the Resolver endpoint in", and the request says which VPC that is only
+/// through its addresses' subnets — "The subnet ID uniquely identifies a VPC"
+/// (`CreateResolverEndpoint$IpAddresses`). So the id is READ OFF the account's
+/// subnet inventory and never derived from the subnet ids themselves: a caller
+/// can join it back to a VPC the account really holds, and filtering a listing
+/// on that VPC finds the endpoint. `None` when the subnets state no VPC, which
+/// is nothing to report rather than an id naming no VPC.
+pub fn host_vpc_id(placements: &[SubnetPlacement]) -> Option<String> {
+    placements
+        .iter()
+        .find_map(|placement| placement.vpc_id.clone())
+}
+
+/// How the account's Amazon EC2 inventory describes an elastic network interface
+/// that carries the DNS queries of the Resolver endpoint `resolver_endpoint_id`,
+/// so a caller reading that inventory can tell which endpoint an interface
+/// belongs to.
+pub fn endpoint_interface_description(resolver_endpoint_id: &str) -> String {
+    format!("Route 53 Resolver: {resolver_endpoint_id}")
+}
+
+/// One address of a Resolver endpoint as the account's Amazon EC2 inventory
+/// holds it: the IPv4 address the endpoint answers on, and the elastic network
+/// interface that holds that address.
+#[derive(Debug, Clone, Default)]
+pub struct PlacedAddress {
+    pub ip: Option<String>,
+    pub network_interface_id: Option<String>,
+}
+
+/// Place one IP address of the Resolver endpoint `resolver_endpoint_id` in the
+/// subnet `placement` names, and answer the address it took and the elastic
+/// network interface holding it.
+///
+/// "If you specify a subnet ID, Resolver chooses an IP address for you from the
+/// available IPs in the specified subnet"
+/// (`IpAddressRequest`/`AssociateResolverEndpointIpAddress`): a request that
+/// names an address places THAT address, and one that names only a subnet has an
+/// address assigned out of that subnet's block. Either way the address an
+/// endpoint answers on is the address of an elastic network interface of the
+/// VPC, so the interface is created here, in the one inventory
+/// `DescribeNetworkInterfaces` answers from — which is what makes Resolver and
+/// Amazon EC2 report the same addresses instead of Resolver reporting an address
+/// that exists nowhere. [`release_endpoint_addresses`] is the exact reverse.
+///
+/// An address is reported only when one could be taken: a subnet that states no
+/// block, and one whose block has no free address left, yield none rather than
+/// an invented one. Whether an address wants an IPv4 one at all is the caller's
+/// decision: an address the request describes by its IPv6 address is one the
+/// request has already named.
+///
+/// LOCKING. The Amazon EC2 store lock is taken for this one placement and
+/// released before returning. The caller may hold this service's own store lock,
+/// so the order is always this service and then Amazon EC2; Amazon EC2 never
+/// reaches this service, so no cycle exists.
+pub fn place_endpoint_address<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    placement: &SubnetPlacement,
+    requested_ip: Option<&str>,
+    region: &str,
+    resolver_endpoint_id: &str,
+    security_group_ids: &[String],
+) -> PlacedAddress {
+    let Some(state) = ec2::service_state(engine) else {
+        // No Amazon EC2 store on this engine is no subnet to draw an address out
+        // of and no inventory to hold an interface, so the endpoint answers only
+        // on an address the request itself named.
+        return PlacedAddress {
+            ip: requested_ip.map(str::to_string),
+            network_interface_id: None,
+        };
+    };
+    let mut store = state.lock();
+    let ip = match requested_ip {
+        Some(asked) => {
+            // Recording the named address in the one in-use pool is what stops
+            // Amazon EC2 handing the endpoint's address to something else.
+            let _taken = store.reserve_private_ip(asked);
+            asked.to_string()
+        }
+        None => {
+            let Some(cidr_block) = placement.cidr_block.as_deref() else {
+                return PlacedAddress::default();
+            };
+            let Some(assigned) = store.mint_private_ip_in_cidr(cidr_block) else {
+                return PlacedAddress::default();
+            };
+            assigned
+        }
+    };
+    let network_interface_id = store.insert_network_interface(ec2::NetworkInterfaceSpec {
+        subnet_id: placement.subnet_id.clone(),
+        vpc_id: placement.vpc_id.clone().unwrap_or_default(),
+        availability_zone: placement.availability_zone.clone().unwrap_or_default(),
+        availability_zone_id: placement.availability_zone_id.clone().unwrap_or_default(),
+        region: region.to_string(),
+        description: endpoint_interface_description(resolver_endpoint_id),
+        interface_type: ec2::NETWORK_INTERFACE_TYPE_INTERFACE.to_string(),
+        private_ip_addresses: vec![ip.clone()],
+        // `CreateResolverEndpoint$SecurityGroupIds` is "The ID of one or more
+        // security groups that you want to use to control access to this VPC":
+        // the groups the endpoint was created with are the groups of the
+        // interfaces its queries pass through.
+        groups: security_group_ids
+            .iter()
+            .map(|group_id| ec2_types::GroupIdentifier {
+                group_id: Some(group_id.clone()),
+                group_name: None,
+            })
+            .collect(),
+        // A Resolver endpoint's interface is attached to no instance of the
+        // account, and the endpoint carries the request's tags; its interfaces
+        // are not the resource the request tagged. Route 53 Resolver creates and
+        // owns the interface to serve the endpoint, so the inventory reports it
+        // as one that service requested and manages, not one the caller made.
+        attachment: None,
+        requester: Some(SERVICE_PRINCIPAL.to_string()),
+        tags: Vec::new(),
+    });
+    PlacedAddress {
+        ip: Some(ip),
+        network_interface_id,
+    }
+}
+
+/// Take the elastic network interfaces of `addresses` back out of the account's
+/// Amazon EC2 inventory — the exact reverse of [`place_endpoint_address`].
+///
+/// The interfaces carry the queries of the endpoint that holds the addresses, so
+/// they do not outlive it: the operations that take one address away from an
+/// endpoint, and the one that deletes the endpoint outright, give the interfaces
+/// and the addresses they held back here.
+///
+/// LOCKING: as [`place_endpoint_address`].
+pub fn release_endpoint_addresses<'a, Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    addresses: impl IntoIterator<Item = &'a IpAddressRecord>,
+) {
+    let Some(state) = ec2::service_state(engine) else {
+        return;
+    };
+    let mut store = state.lock();
+    for address in addresses {
+        if let Some(network_interface_id) = address.network_interface_id.as_deref() {
+            let _removed = store.remove_network_interface(network_interface_id);
+        }
+    }
 }
 
 /// The `InvalidParameterException` a write answers for a VPC id that names no
@@ -928,10 +1138,10 @@ pub fn vpc_not_found_message(vpc_id: &str) -> String {
 /// VPCs exist is a fact of the account's own Amazon EC2 inventory — the one
 /// `DescribeVpcs` answers from — and not a value this service's caller supplies,
 /// so this is the one place that resolution happens, exactly as
-/// [`unresolvable_subnet_id`] resolves a `SubnetId` and
+/// [`subnet_placements`] resolves a `SubnetId` and
 /// [`account_holds_outpost`] an `OutpostArn`.
 ///
-/// LOCKING. As [`unresolvable_subnet_id`]: the Amazon EC2 store lock is taken
+/// LOCKING. As [`subnet_placements`]: the Amazon EC2 store lock is taken
 /// for this one pass and released before returning, and a handler calls this
 /// with no lock of its own held.
 pub fn unresolvable_vpc_id<'a, Eng: Send + Sync + 'static>(
@@ -2214,6 +2424,12 @@ pub struct IpAddressRecord {
     pub subnet_id: String,
     pub ip: Option<String>,
     pub ipv6: Option<String>,
+    /// The elastic network interface of the account's Amazon EC2 inventory that
+    /// holds [`Self::ip`] ([`place_endpoint_address`]), so the interface can be
+    /// given back when the endpoint gives the address up
+    /// ([`release_endpoint_addresses`]). `None` for an address no interface
+    /// could be created for.
+    pub network_interface_id: Option<String>,
     /// The transient `IpAddressStatus` this IP reports until [`Self::attached_at`]
     /// falls due.
     pub status: String,
@@ -5059,27 +5275,6 @@ pub fn resolver_config_id(resource_id: &str) -> String {
     format!("rslvr-rc-{}", hex::encode(&hasher.finalize()[..8]))
 }
 
-/// The `HostVPCId` of an endpoint placed in `subnet_ids`.
-///
-/// `Filter`'s doc for `HostVPCId` says "In a CreateResolverEndpoint request,
-/// SubnetId indirectly identifies the VPC", and the emulator holds no VPC
-/// inventory to look the subnets up in, so the id is derived from the subnets
-/// themselves: the same set of subnets always yields the same VPC id, and a
-/// second endpoint in those subnets reports the same `HostVPCId` as the first.
-pub fn host_vpc_id(subnet_ids: &[String]) -> String {
-    let mut distinct: Vec<&str> = subnet_ids.iter().map(String::as_str).collect();
-    distinct.sort_unstable();
-    distinct.dedup();
-    let mut hasher = Sha256::new();
-    hasher.update(b"route53resolver/host-vpc/v1");
-    for subnet in distinct {
-        hasher.update(b":");
-        hasher.update(subnet.as_bytes());
-    }
-    let digest = hasher.finalize();
-    format!("vpc-{}", hex::encode(&digest[..8]))
-}
-
 /// Feed a length-prefixed field into a digest, so two different sequences of
 /// fields cannot hash to the same byte stream whatever the fields contain.
 fn feed_field(hasher: &mut Sha256, field: &[u8]) {
@@ -5294,6 +5489,26 @@ pub const MAX_FIREWALL_CONFIGS_PER_PAGE: i32 = 10;
 /// — so, for the same reason as [`FIREWALL_DOMAIN_LIST_LIST_SCOPE`], the scope
 /// is a constant that names the operation.
 pub const RESOLVER_CONFIG_LIST_SCOPE: &str = "ListResolverConfigs/all/v1";
+
+/// The `InvalidParameterException` `ListResolverConfigs` answers for a
+/// `NextToken` this service did not mint for that query.
+///
+/// `ListResolverConfigs` models both `InvalidNextTokenException` and
+/// `InvalidParameterException`, and the one it answers for a token the service
+/// never issued is the PARAMETER fault: the recorded responses of that operation
+/// carry `InvalidParameterException` at HTTP 400, with the token the request sent
+/// quoted inside the message. The sentence is therefore built from the request —
+/// two different tokens give two different messages — and the parameter at fault
+/// is named in the sentence itself, so no `FieldName` is added beside it, as for
+/// [`subnet_not_found`].
+pub fn invalid_next_token_parameter(next_token: &str) -> InvalidParameterException {
+    InvalidParameterException {
+        message: format!(
+            "Value ( {next_token} ) for parameter NextToken is invalid. The token is invalid."
+        ),
+        field_name: None,
+    }
+}
 
 /// One page of a `@paginated` list operation.
 #[derive(Debug)]

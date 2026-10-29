@@ -227,12 +227,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let ready_at = now + crate::state::PROVISIONING_DELAY;
         let timestamp = crate::state::now_rfc3339();
 
-        record.ip_addresses.remove(position);
+        let removed = record.ip_addresses.remove(position);
         // Detaching an address is a change to the endpoint, so it reports the
         // transient status until the clock owes the move back to `OPERATIONAL`.
         record.status = crate::state::ENDPOINT_STATUS_UPDATING.to_string();
         record.ready_at = ready_at;
         record.modification_time = timestamp;
+
+        // The address leaves the endpoint, so the elastic network interface that
+        // held it leaves the account's Amazon EC2 inventory with it: the
+        // interface carried this endpoint's queries on that address alone.
+        crate::state::release_endpoint_addresses(&*self.engine, [&removed]);
 
         Ok(DisassociateResolverEndpointIpAddressOutput {
             resolver_endpoint: Some(record.to_endpoint(now)),

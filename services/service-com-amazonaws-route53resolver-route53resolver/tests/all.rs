@@ -17,6 +17,8 @@ mod association_vpc_references;
 mod batch_firewall_rules;
 #[path = "all/endpoint_subnet_references.rs"]
 mod endpoint_subnet_references;
+#[path = "all/endpoint_vpc_and_addresses.rs"]
+mod endpoint_vpc_and_addresses;
 #[path = "all/firewall_config_listing.rs"]
 mod firewall_config_listing;
 #[path = "all/firewall_configs.rs"]

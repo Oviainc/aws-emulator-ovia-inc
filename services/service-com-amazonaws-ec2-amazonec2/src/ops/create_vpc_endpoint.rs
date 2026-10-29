@@ -751,6 +751,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 groups: groups.clone(),
                 // An endpoint network interface is attached to nothing a caller can see.
                 attachment: None,
+                requester: None,
                 // The endpoint carries the request's tags; its interfaces are not the
                 // resource the request tagged.
                 tags: Vec::new(),

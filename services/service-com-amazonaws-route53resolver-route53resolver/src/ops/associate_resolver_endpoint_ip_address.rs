@@ -151,7 +151,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 AssociateResolverEndpointIpAddressErrorModeled::InternalServiceErrorException(
@@ -222,24 +221,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The added address is placed IN a subnet of the caller's VPC, so the
         // `SubnetId` has to be a subnet the account holds — the same resolution
-        // the create path makes for every address it places. Refused before
-        // anything is written, so the endpoint is left exactly as it was.
-        if let Some(unknown) =
-            crate::state::unresolvable_subnet_id(&*self.engine, [subnet_id.as_str()])
-        {
-            return Err(
-                AssociateResolverEndpointIpAddressErrorModeled::InvalidParameterException(
-                    crate::state::subnet_not_found(&unknown),
-                )
-                .into(),
-            );
-        }
+        // the create path makes for every address it places, and the same source
+        // of the block the address is drawn from. Refused before anything is
+        // written, so the endpoint is left exactly as it was.
+        let placement = match crate::state::subnet_placements(&*self.engine, [subnet_id.as_str()]) {
+            Ok(mut placements) if !placements.is_empty() => placements.remove(0),
+            Ok(_) => crate::state::SubnetPlacement {
+                subnet_id: subnet_id.clone(),
+                vpc_id: None,
+                cidr_block: None,
+                availability_zone: None,
+                availability_zone_id: None,
+            },
+            Err(unknown) => {
+                return Err(
+                    AssociateResolverEndpointIpAddressErrorModeled::InvalidParameterException(
+                        crate::state::subnet_not_found(&unknown),
+                    )
+                    .into(),
+                );
+            }
+        };
 
         let mut store = state.lock();
 
         // Everything this request is refused for is decided before a single member
         // is written, so a refused associate leaves the endpoint exactly as it was.
-        {
+        let security_group_ids = {
             let Some(record) = store.resolver_endpoints.get(&input.resolver_endpoint_id) else {
                 return Err(
                     AssociateResolverEndpointIpAddressErrorModeled::ResourceNotFoundException(
@@ -273,12 +281,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-        }
+
+            // The groups the endpoint controls access through are the groups of
+            // every interface its addresses are held by, including the one this
+            // call adds.
+            record.security_group_ids.clone()
+        };
 
         let now = ::std::time::Instant::now();
         let ready_at = now + crate::state::PROVISIONING_DELAY;
         let timestamp = crate::state::now_rfc3339();
         let ip_seq = store.next_seq();
+
+        // "If you specify a subnet ID, Resolver chooses an IP address for you
+        // from the available IPs in the specified subnet": the address is taken
+        // out of that subnet's block when the request names none, and the
+        // elastic network interface holding it is created in the VPC — the same
+        // placement a create makes for every address it places. An address the
+        // request describes by its IPv6 address is one it HAS named, so no IPv4
+        // address is chosen for it.
+        let placed = if requested.ip.is_none() && requested.ipv6.is_some() {
+            crate::state::PlacedAddress::default()
+        } else {
+            crate::state::place_endpoint_address(
+                &*self.engine,
+                &placement,
+                requested.ip.as_deref(),
+                &crate::state::request_region(&ctx.parts().headers),
+                &input.resolver_endpoint_id,
+                &security_group_ids,
+            )
+        };
 
         // The store is still locked, so the endpoint read above is still there; the
         // modelled refusal is repeated rather than asserted, so no path can panic.
@@ -297,11 +330,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.ip_addresses.push(crate::state::IpAddressRecord {
             ip_id: crate::state::mint_ip_id(ip_seq),
             subnet_id,
-            // An address the request did not supply is left unset rather than
-            // invented: the service does not pick one out of the subnet's CIDR
-            // range here. The same as a create.
-            ip: requested.ip.clone(),
+            ip: placed.ip,
             ipv6: requested.ipv6.clone(),
+            network_interface_id: placed.network_interface_id,
             status: crate::state::IP_STATUS_CREATING.to_string(),
             status_message: None,
             creation_time: timestamp.clone(),

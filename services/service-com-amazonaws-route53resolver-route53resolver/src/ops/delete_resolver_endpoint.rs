@@ -169,6 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .creator_request_id_index
             .remove(&record.creator_request_id);
 
+        // The endpoint's addresses go with it: the elastic network interfaces
+        // that held them carried this endpoint's queries, so they leave the
+        // account's Amazon EC2 inventory rather than outliving the endpoint.
+        crate::state::release_endpoint_addresses(&*self.engine, &record.ip_addresses);
+
         let mut endpoint = record.to_endpoint(::std::time::Instant::now());
         // "Information about the DeleteResolverEndpoint request, including the status
         // of the request": the endpoint is on its way out, so it reports `DELETING`.

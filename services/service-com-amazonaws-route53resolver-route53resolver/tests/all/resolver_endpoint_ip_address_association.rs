@@ -20,7 +20,8 @@ use service_com_amazonaws_route53resolver_route53resolver::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
-    call, emulator, error_type, expect_error, ok, parse_time, string_member, Emulator,
+    address_inside_block, call, emulator, error_type, expect_error, ok, parse_time, string_member,
+    Emulator,
 };
 
 /// A create request body with `count` IP addresses, one per subnet named
@@ -212,11 +213,37 @@ async fn an_associated_ip_address_is_read_back_from_state() {
             ip_address.get("SubnetId"),
             "case {case:?}: the stored address must keep the subnet the request named, got {added}"
         );
-        assert_eq!(
-            added.get("Ip"),
-            ip_address.get("Ip"),
-            "case {case:?}: the stored address must keep the IPv4 address the request carried, got {added}"
-        );
+        match ip_address.get("Ip") {
+            // An addition that names an IPv4 address keeps THAT address.
+            Some(named) => assert_eq!(
+                added.get("Ip"),
+                Some(named),
+                "case {case:?}: the stored address must keep the IPv4 address the request carried, got {added}"
+            ),
+            // "If you specify a subnet ID, Resolver chooses an IP address for
+            // you from the available IPs in the specified subnet": an addition
+            // that names no address at all is given one out of the subnet's own
+            // block.
+            None if ip_address.get("Ipv6").is_none() => {
+                let subnet_id = string_member(added, "SubnetId");
+                let block = router
+                    .cidr_block_of_subnet(&subnet_id)
+                    .unwrap_or_else(|| panic!("case {case:?}: the account holds {subnet_id:?}"));
+                let chosen = string_member(added, "Ip");
+                assert!(
+                    address_inside_block(&block, &chosen),
+                    "case {case:?}: Resolver must choose an address of the subnet's block \
+                     {block:?}, got {added}"
+                );
+            }
+            // An addition that describes the address by its IPv6 address has
+            // named it, so no IPv4 address is chosen for it.
+            None => assert_eq!(
+                added.get("Ip"),
+                None,
+                "case {case:?}: an IPv6-only addition must carry no IPv4 address, got {added}"
+            ),
+        }
         assert_eq!(
             added.get("Ipv6"),
             ip_address.get("Ipv6"),

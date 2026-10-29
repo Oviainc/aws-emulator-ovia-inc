@@ -161,6 +161,7 @@ fn seed(engine: &engine::InMemoryEngine) -> Fixture {
             private_ip_addresses: Vec::new(),
             interface_type: "interface".to_string(),
             attachment: None,
+            requester: None,
             tags: Vec::new(),
         })
         .expect("a seeded network interface");

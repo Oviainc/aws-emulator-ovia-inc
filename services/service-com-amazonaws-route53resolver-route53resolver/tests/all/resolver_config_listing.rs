@@ -15,6 +15,7 @@
 //! status the clock owes it — paged by the `MaxResults` range the model puts on
 //! THIS operation and resumed only by a cursor this service minted for it.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -628,8 +629,10 @@ async fn a_max_results_outside_the_modelled_range_is_refused() {
 }
 
 /// A `NextToken` this service did not mint for this collection is refused with
-/// the `InvalidNextTokenException` the operation models, rather than silently
-/// read as "start over" and answering page one again.
+/// the `InvalidParameterException` the operation models — the token is a request
+/// PARAMETER this operation rejects as invalid, not a stale cursor — rather than
+/// silently read as "start over" and answering page one again. The message is
+/// built from the request, so it names the very token that was rejected.
 #[tokio::test]
 async fn a_next_token_this_query_did_not_mint_is_refused() {
     let router = emulator();
@@ -675,7 +678,8 @@ async fn a_next_token_this_query_did_not_mint_is_refused() {
     .expect("the known VPCs leave items over at the smallest page")
     .to_string();
 
-    for (case, token) in [
+    let mut messages: Vec<String> = Vec::new();
+    let rejected = [
         ("not a cursor at all", "not-a-cursor".to_string()),
         ("an empty string", String::new()),
         ("a tampered cursor", tampered),
@@ -688,7 +692,8 @@ async fn a_next_token_this_query_did_not_mint_is_refused() {
             hex::encode("ListResolverConfigs/all/v1:5"),
         ),
         ("a cursor minted for another collection", other_collection),
-    ] {
+    ];
+    for (case, token) in &rejected {
         let (status, body) = call(
             &router,
             "ListResolverConfigs",
@@ -700,10 +705,29 @@ async fn a_next_token_this_query_did_not_mint_is_refused() {
             "case {case:?}: a cursor this query did not mint must be refused, got {status}: {body}"
         );
         assert!(
-            error_type(&body).contains("InvalidNextTokenException"),
-            "case {case:?}: the refusal must name InvalidNextTokenException, got {body}"
+            error_type(&body).contains("InvalidParameterException"),
+            "case {case:?}: the refusal must name InvalidParameterException, got {body}"
         );
+        let message = string_member(&body, "Message");
+        assert_eq!(
+            message,
+            format!(
+                "Value ( {token} ) for parameter NextToken is invalid. The token is invalid."
+            ),
+            "case {case:?}: the message must name the rejected token, got {body}"
+        );
+        messages.push(message);
     }
+
+    // The message is built from the request and not from fixed text: two
+    // different tokens give two different messages.
+    let distinct_tokens: BTreeSet<&String> = rejected.iter().map(|(_, token)| token).collect();
+    let distinct_messages: BTreeSet<&String> = messages.iter().collect();
+    assert_eq!(
+        distinct_messages.len(),
+        distinct_tokens.len(),
+        "every distinct token must give a distinct Message, got {messages:?}"
+    );
 
     // The cursor this query did mint still resumes the walk, so the refusals
     // above are about the token and not about refusing to resume.
