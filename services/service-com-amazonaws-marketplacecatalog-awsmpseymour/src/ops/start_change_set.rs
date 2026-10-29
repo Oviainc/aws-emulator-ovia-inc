@@ -671,7 +671,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 details: change.details.clone(),
                 details_document: details.filter(|_| change.details.is_none()),
                 change_name: change.change_name.clone(),
-                entity_tags: change.entity_tags.clone().unwrap_or_default(),
+                // The tags this change will put on its entity are a map from
+                // key to value, so what is recorded is the SET the submitted
+                // pairs describe rather than the list as written.
+                entity_tags: crate::state::tag_set(change.entity_tags.clone().unwrap_or_default()),
                 entity_id,
                 // What applying the change finds wrong with it, which nothing
                 // has looked for yet: the change set has not run.
@@ -697,7 +700,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             failure_code: None,
             failure_description: None,
             changes,
-            tags: input.change_set_tags.unwrap_or_default(),
+            // A tag key carries ONE value, and `TagList` has no
+            // `@uniqueItems`, so a request naming a key twice names one tag
+            // whose value is the last pair given for it: the change set is
+            // started holding that SET, never a list reporting a key twice.
+            tags: crate::state::tag_set(input.change_set_tags.unwrap_or_default()),
             region,
             schedule: vec![
                 crate::state::PendingTransition {

@@ -187,15 +187,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A tag is a key with ONE value, so tagging with a key the resource
-        // already carries replaces that value instead of adding a second entry;
-        // every other key is appended.
+        // already carries replaces that value instead of adding a second entry,
+        // a key this request names more than once is the LAST value it gave for
+        // it, and every other key is appended — the merge every tag write of
+        // this service shares, so the merged list holds each key once and its
+        // length below is a count of KEYS.
         let mut merged = held.clone();
-        for tag in input.tags {
-            match merged.iter_mut().find(|existing| existing.key == tag.key) {
-                Some(existing) => existing.value = tag.value,
-                None => merged.push(tag),
-            }
-        }
+        crate::state::merge_tags(&mut merged, input.tags);
         if merged.len() > crate::state::MAX_RESOURCE_TAGS {
             return Err(TagResourceErrorModeled::ValidationException(
                 crate::state::validation(

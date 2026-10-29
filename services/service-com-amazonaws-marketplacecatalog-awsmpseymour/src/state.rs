@@ -409,8 +409,51 @@ pub const EMPTY_RESOURCE_POLICY: &str = "{}";
 /// `TagList` is `@length(min: 1, max: 200)`, which is the bound on the tags a
 /// resource carries as much as on the tags one request names, so a
 /// `TagResource` whose merge would pass it is refused rather than storing a set
-/// no `ListTagsForResource` could report.
+/// no `ListTagsForResource` could report. A resource's tags are a map, so this
+/// bounds the KEYS it carries — the count a merged tag set
+/// ([`merge_tags`]) has, and the count of distinct keys the entity side of the
+/// same bound takes.
 pub const MAX_RESOURCE_TAGS: usize = 200;
+
+/// Merge the tag pairs `incoming` into the tag set `held`.
+///
+/// A resource's tags are a MAP from key to value — `Tag$Key` is the key "the
+/// tag" has, and `ListTagsForResource` reports that map as a `TagList` — so a
+/// key occurs at most once in a stored list: a key the set already carries
+/// takes the incoming value instead of gaining a second entry, and a key
+/// `incoming` itself names more than once keeps the LAST value given for it,
+/// since the pairs are read in order and each one is the value of its key from
+/// then on. Each merged key is (re)placed at the end, so a set reads in the
+/// order its keys were last written.
+///
+/// Every path that stores tags goes through this, so no stored list can hold
+/// one key twice, and the count of a stored list is the count of its KEYS —
+/// which is what the per-resource bound [`MAX_RESOURCE_TAGS`] is judged on,
+/// here and in
+/// [`ComAmazonawsMarketplacecatalogAwsmpseymourState::judge_change_set`].
+pub fn merge_tags<I>(held: &mut Vec<Tag>, incoming: I)
+where
+    I: IntoIterator<Item = Tag>,
+{
+    for tag in incoming {
+        held.retain(|existing| existing.key != tag.key);
+        held.push(tag);
+    }
+}
+
+/// The tag SET a submitted tag list names: [`merge_tags`] into an empty set.
+///
+/// `TagList` carries no `@uniqueItems`, so a request may name one key twice;
+/// what is STORED is the set those pairs describe rather than the list as
+/// written.
+pub fn tag_set<I>(tags: I) -> Vec<Tag>
+where
+    I: IntoIterator<Item = Tag>,
+{
+    let mut set = Vec::new();
+    merge_tags(&mut set, tags);
+    set
+}
 
 /// The tag-key namespace Amazon Web Services keeps for the tags it generates
 /// itself.
@@ -1642,7 +1685,8 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
     }
 
     /// The tags the stored record carries for the resource a resource ARN
-    /// named: the one copy `StartChangeSet` wrote and `TagResource` updates.
+    /// named: the one copy `StartChangeSet` wrote and `TagResource` updates,
+    /// held as the SET [`merge_tags`] keeps — one value per key.
     pub fn resource_tags(&self, resource: &CatalogResource) -> Option<&[Tag]> {
         match resource {
             CatalogResource::Entity { entity_type, id } => self
@@ -1864,10 +1908,7 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
                 });
                 entry.revision = entry.revision.saturating_add(1);
                 entry.last_modified_date = stamp.clone();
-                for tag in change.entity_tags {
-                    entry.tags.retain(|held| held.key != tag.key);
-                    entry.tags.push(tag);
-                }
+                merge_tags(&mut entry.tags, change.entity_tags);
                 if let Some(Value::Object(members)) = details {
                     if let Some(name) = detail_name(&members) {
                         entry.name = Some(name);

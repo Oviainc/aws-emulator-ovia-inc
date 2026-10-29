@@ -65,3 +65,5 @@ mod resource_policy_validation;
 mod sort_order_direction;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_set_uniqueness.rs"]
+mod tag_set_uniqueness;
