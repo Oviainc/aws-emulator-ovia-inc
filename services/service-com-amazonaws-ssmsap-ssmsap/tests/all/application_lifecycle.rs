@@ -180,50 +180,7 @@ impl Emulator {
         path: &str,
         body: Option<Value>,
     ) -> Reply {
-        let payload = match &body {
-            Some(value) => serde_json::to_vec(value).expect("the request body serializes"),
-            None => Vec::new(),
-        };
-        let request = http::Request::builder()
-            .method(method)
-            .uri(format!("https://ssm-sap.{region}.amazonaws.com{path}"))
-            // The SigV4 credential scope is what routes the request to this service and
-            // what names the region its ARNs carry. Signatures are not verified unless
-            // the process turns authentication on.
-            .header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/ssm-sap/aws4_request, SignedHeaders=host, Signature=0000"
-                ),
-            )
-            .header("content-type", "application/json")
-            .body(bytes::Bytes::from(payload))
-            .expect("a well-formed request");
-
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let error_code = response
-            .headers()
-            .get("x-amzn-errortype")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let body: Value = if response.body().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-        };
-        let error_type_header = error_code.clone();
-        let error_code = error_code.or_else(|| {
-            body.get("__type")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-        Reply {
-            status,
-            error_code,
-            error_type_header,
-            body,
-        }
+        dispatch(&self.router, method, region, path, body).await
     }
 
     async fn register(&self, body: Value) -> Reply {
@@ -280,6 +237,68 @@ impl Emulator {
             .to_string();
         settle().await;
         operation_id
+    }
+}
+
+/// Dispatch ONE request to `router`, signed for `region`, and reduce the response to a
+/// [`Reply`].
+///
+/// Separate from [`Emulator`] because a suite can need a router this harness does not
+/// build: the suite that drives the channel a handler answers on when it cannot reach
+/// its own store (`tests/all/tagging_error_channel.rs`) mounts the service on an engine
+/// that holds none, and must reach it over the SAME wire every other suite uses.
+/// `body: None` sends no bytes at all, which is what a client sends for an operation
+/// whose every member is bound to the URI.
+pub(crate) async fn dispatch(
+    router: &MultiServiceRouter,
+    method: &str,
+    region: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Reply {
+    let payload = match &body {
+        Some(value) => serde_json::to_vec(value).expect("the request body serializes"),
+        None => Vec::new(),
+    };
+    let request = http::Request::builder()
+        .method(method)
+        .uri(format!("https://ssm-sap.{region}.amazonaws.com{path}"))
+        // The SigV4 credential scope is what routes the request to this service and
+        // what names the region its ARNs carry. Signatures are not verified unless
+        // the process turns authentication on.
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/ssm-sap/aws4_request, SignedHeaders=host, Signature=0000"
+            ),
+        )
+        .header("content-type", "application/json")
+        .body(bytes::Bytes::from(payload))
+        .expect("a well-formed request");
+
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let error_code = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body: Value = if response.body().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+    };
+    let error_type_header = error_code.clone();
+    let error_code = error_code.or_else(|| {
+        body.get("__type")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    Reply {
+        status,
+        error_code,
+        error_type_header,
+        body,
     }
 }
 

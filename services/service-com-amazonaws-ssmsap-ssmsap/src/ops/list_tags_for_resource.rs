@@ -67,9 +67,13 @@
 //! * `ResourceNotFoundException` (HTTP 404) — The resource is not available.
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the constraints specified
 //!   by an AWS service.
-//! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see below):
-//!   this SERVICE models it, so an unreachable store has a modelled server fault to answer
-//!   with rather than a client error.
+//!
+//! That is the WHOLE set this operation can answer with: the model declares no
+//! server-fault shape here, and `ValidationException` is the service's only common
+//! error (`smithy_query(query="service_info")`), so a fault of the emulator itself is
+//! answered with the cross-service `InternalFailure` (HTTP 500) through
+//! [`crate::scaffolded::Scaffolded::internal_failure`] rather than with a modelled
+//! shape no client of this call is told to expect.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -85,19 +89,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssmsap-ssmsap.json");
 // here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error(
-    "com.amazonaws.ssmsap#ListTagsForResource",
-    extra_errors = ["InternalServerException"]
-)]
+#[smithy_macros::operation_error("com.amazonaws.ssmsap#ListTagsForResource")]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
-    /// Declared on the SERVICE rather than on this operation: the store this emulator
-    /// keeps its registrations and their tags in could not be reached, which is a
-    /// server fault and not something the caller sent wrong.
-    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -154,10 +151,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The Region this request was signed for: a read reports what is held at THIS
         // regional endpoint, and an ARN carrying another Region names nothing here.
         let region = crate::state::request_region(ctx.parts());
+        // Nothing this operation can answer with describes an unreachable store: the
+        // model declares only `ConflictException`, `ResourceNotFoundException` and
+        // `ValidationException` here, and the service's only common error is
+        // `ValidationException`. So the emulator's own failure is reported as the
+        // cross-service `InternalFailure` (HTTP 500) — not as a modelled shape this
+        // call never promised, and not as a client error.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            ListTagsForResourceErrorModeled::InternalServerException(
-                crate::state::store_unavailable(),
-            )
+            ListTagsForResourceError::internal_failure(crate::state::STORE_UNAVAILABLE_MESSAGE)
         })?;
         // A tag is not something the clock changes, but the RESOURCE it is held for is:
         // a deregistration the clock has completed takes the application with its tags,

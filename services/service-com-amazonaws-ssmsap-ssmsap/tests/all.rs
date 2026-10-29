@@ -99,6 +99,8 @@ mod sub_check_result_cursor;
 mod sub_check_results;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
+#[path = "all/tagging_error_channel.rs"]
+mod tagging_error_channel;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
 #[path = "all/update_application_settings.rs"]

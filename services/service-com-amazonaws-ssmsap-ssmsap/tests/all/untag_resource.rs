@@ -68,7 +68,12 @@ fn query_encoded(value: &str) -> String {
 /// `UntagResource`'s URI for `resource_arn` and `tag_keys`: the modelled
 /// `DELETE /tags/{resourceArn}`, whose `tagKeys` is a list bound to the query string, so
 /// each key travels as its own `tagKeys=` parameter.
-fn untag_path(resource_arn: &str, tag_keys: &[String]) -> String {
+///
+/// `pub(crate)` because the suites of this target share one harness: the suite that
+/// pins which error channel each tagging call answers on
+/// (`tests/all/tagging_error_channel.rs`) addresses this same route rather than
+/// spelling the query binding a second time.
+pub(crate) fn untag_path(resource_arn: &str, tag_keys: &[String]) -> String {
     let query: Vec<String> = tag_keys
         .iter()
         .map(|key| format!("tagKeys={}", query_encoded(key)))

@@ -3920,12 +3920,26 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// The modelled server error every handler answers with when [`service_state`] finds
-/// no store (this service mounted on an engine that holds none). The payload is shared;
-/// each operation wraps it in its OWN generated error variant.
+/// What a handler says when [`service_state`] finds no store (this service mounted on
+/// an engine that holds none): the emulator could not reach the place it keeps this
+/// service's records, which is a fault of the emulator and nothing the caller sent.
+///
+/// Shared so every operation words that one fault the same way, whichever channel its
+/// own model leaves it: [`store_unavailable`] for an operation that declares
+/// `InternalServerException`, and `crate::scaffolded::Scaffolded::internal_failure` for
+/// one that declares no server-fault shape at all.
+pub const STORE_UNAVAILABLE_MESSAGE: &str = "the ssm-sap store is unavailable";
+
+/// The modelled server error answered by a handler whose operation DECLARES
+/// `InternalServerException` when [`service_state`] finds no store. The payload is
+/// shared; each operation wraps it in its OWN generated error variant.
+///
+/// An operation whose model declares it for neither the operation nor the service — the
+/// tagging calls — must not be widened with it: it answers the cross-service
+/// `InternalFailure` through `crate::scaffolded::Scaffolded::internal_failure` instead.
 pub fn store_unavailable() -> InternalServerException {
     InternalServerException {
-        message: Some("the ssm-sap store is unavailable".to_string()),
+        message: Some(STORE_UNAVAILABLE_MESSAGE.to_string()),
     }
 }
 
