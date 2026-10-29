@@ -72,6 +72,22 @@ pub(crate) fn make_validations_due(engine: &Arc<engine::InMemoryEngine>) {
     }
 }
 
+/// Record which account, if any, this service holds as the management account of
+/// the organization the presented account belongs to — the standing an
+/// organization-level write is reserved to. `None` is the world in which this
+/// service is told of no organization at all.
+///
+/// The one place a test establishes that world, so every suite that needs it
+/// establishes the same one.
+pub(crate) fn record_management_account(
+    engine: &Arc<engine::InMemoryEngine>,
+    account_id: Option<&str>,
+) {
+    let state = engine.state::<ComAmazonawsTaxsettingsTaxsettingsState>();
+    state.lock().organization_management_account_id =
+        account_id.map(std::string::ToString::to_string);
+}
+
 /// What one TaxSettings call answered: the HTTP status, the restJson1 `__type`
 /// error code (empty on success) and the parsed JSON body.
 #[derive(Debug)]
@@ -1105,23 +1121,26 @@ async fn values_outside_the_model_are_refused_and_values_inside_it_are_served() 
             modelled_error_code: "",
         },
         // Both `HeritageStatus` values the model lists are inside the member's
-        // value set, so both are served and recorded — see
-        // `tests/all/tax_inheritance_election.rs` for what the read then reports.
+        // value set, so both clear the boundary validator — and are then refused
+        // by the standing recording an election is reserved to, because this
+        // emulator presents a standalone account that is nobody's organization
+        // management account. See `tests/all/tax_inheritance_election.rs` for
+        // what each value records in the world where the caller IS that account.
         Refusal {
             name: "heritageStatus OptIn",
             operation: "PutTaxInheritance",
             body: json!({ "heritageStatus": "OptIn" }),
-            status: 200,
-            error_code: "",
-            modelled_error_code: "",
+            status: 400,
+            error_code: "ValidationException",
+            modelled_error_code: "FieldValidationFailed",
         },
         Refusal {
             name: "heritageStatus OptOut",
             operation: "PutTaxInheritance",
             body: json!({ "heritageStatus": "OptOut" }),
-            status: 200,
-            error_code: "",
-            modelled_error_code: "",
+            status: 400,
+            error_code: "ValidationException",
+            modelled_error_code: "FieldValidationFailed",
         },
     ];
 

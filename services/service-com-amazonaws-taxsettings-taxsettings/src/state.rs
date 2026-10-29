@@ -7,12 +7,19 @@
 //! record needs. The projections live here, beside the stored record, so
 //! `GetTaxRegistration` and `ListTaxRegistrations` report one record the same
 //! way instead of each rebuilding it from the raw fields.
+//!
+//! The structures the jurisdictions publish for a tax registration number — what
+//! the TRN validation of a stored record judges it by — live in
+//! [`registration_number`], so the state struct and its projections stay about
+//! records rather than about number formats.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::time::{Duration, Instant, SystemTime};
 
 use ::aws_smithy_types::base64;
+
+pub mod registration_number;
 
 use crate::ops::types::{
     AccountMetaData, AdditionalInfoRequest, AdditionalInfoResponse, Address, Authority,
@@ -32,14 +39,16 @@ use crate::ops::types::{
 /// Rejected."
 pub const STATUS_PENDING: &str = "Pending";
 /// See [`STATUS_PENDING`]: the validation of the submitted TRN succeeded, which
-/// is what a registration the service accepted and stored reaches once that
-/// validation falls due — see [`SETTLED_REGISTRATION_STATUS`].
+/// is what a stored registration whose number satisfies its jurisdiction's
+/// published structure reaches once that validation falls due — see
+/// [`trn_validation_status`].
 pub const STATUS_VERIFIED: &str = "Verified";
-/// See [`STATUS_PENDING`]: the validation of the submitted TRN failed. No stored
-/// record reaches it, because a submission this service does not accept is
-/// refused by the write itself ([`check_tax_registration_entry`] and the
-/// per-country rules it applies) rather than stored and reported as failed; a
-/// write that answered 200 accepted the entry.
+/// See [`STATUS_PENDING`]: the validation of the submitted TRN failed, which is
+/// what a stored registration whose number does NOT satisfy that structure
+/// reaches — see [`trn_validation_status`]. Accepting the entry and failing its
+/// validation are separate facts: the write admits an entry its structural and
+/// per-country rules do not refuse ([`check_tax_registration_entry`]), and the
+/// validation that follows judges the submitted NUMBER.
 pub const STATUS_REJECTED: &str = "Rejected";
 /// See [`STATUS_PENDING`]. Never reached: `DeleteTaxRegistration` REMOVES the
 /// account's record, which is what the real service does too — a read of a
@@ -47,17 +56,38 @@ pub const STATUS_REJECTED: &str = "Rejected";
 /// in this status.
 pub const STATUS_DELETED: &str = "Deleted";
 
-/// The status a submitted TRN reaches once the validation the write started has
-/// run.
+/// The status the validation of a stored TRN reaches: what the submitted number
+/// is judged to be once the validation the write started falls due.
 ///
-/// A registration this service STORED is one it accepted: every entry it will not
-/// stand behind is refused by the write, with the `ValidationException` the
-/// structural and per-country rules state, so the validation of what did get
-/// stored succeeded and the record settles [`STATUS_VERIFIED`]. Reporting
-/// [`STATUS_REJECTED`] for a registration the write answered 200 for would
-/// contradict that 200, and nothing here inspects the submitted number further —
-/// a format test of its own would report a verification that never happened.
-pub const SETTLED_REGISTRATION_STATUS: &str = STATUS_VERIFIED;
+/// The model documents the status as the outcome of "the validation occurring on
+/// the TRN", and that validation is about the NUMBER: the jurisdiction's
+/// authority publishes how a number of that kind is built, so a submitted number
+/// that does not satisfy the published structure is one the authority never
+/// issued and its validation fails ([`STATUS_REJECTED`]), while one that does
+/// satisfy it is contradicted by nothing this service holds and its validation
+/// succeeds ([`STATUS_VERIFIED`]). See
+/// [`registration_number::satisfies_published_structure`] for the structures and
+/// where each comes from.
+///
+/// A function of what the write STORED — the number, its registration type and
+/// the jurisdiction the registration is held in — and of nothing else, so every
+/// reader of one record settles it the same way and no read can move a record
+/// the previous read did not.
+pub fn trn_validation_status(
+    country_code: &str,
+    registration_type: &str,
+    registration_id: &str,
+) -> &'static str {
+    if registration_number::satisfies_published_structure(
+        country_code,
+        registration_type,
+        registration_id,
+    ) {
+        STATUS_VERIFIED
+    } else {
+        STATUS_REJECTED
+    }
+}
 
 /// How long after a write the TRN's validation is due.
 ///
@@ -287,6 +317,16 @@ pub const SUPPLEMENTAL_COUNTRY_NOT_SUPPORTED: &str =
 /// the store; the bound is unchanged by this list.
 pub const COUNTRIES_WITH_NON_API_REGISTRATION_DELETE: &[(&str, &str)] = &[("BR", "Brazil")];
 
+/// How a write of the account's tax-inheritance election is refused when the
+/// caller is not the management account of its organization, worded as the
+/// observed refusal of that class words it.
+///
+/// The sentence is fixed text: it names no account, no election and no limit, so
+/// nothing of one request leaks into another's answer and every refused caller
+/// is told the same thing.
+pub const TAX_INHERITANCE_MANAGEMENT_ACCOUNT_ONLY: &str =
+    "Only AWS orgs management account is allowed to set tax inheritance.";
+
 /// `ValidationException.errorCode` values, from the model's
 /// `ValidationExceptionErrorCode` enum
 /// (`MalformedToken | ExpiredToken | InvalidToken | FieldValidationFailed |
@@ -493,13 +533,22 @@ pub struct ComAmazonawsTaxsettingsTaxsettingsState {
     /// the value, because the account has exactly one election.
     ///
     /// The election is an organization-level one — whether an organization's
-    /// member accounts inherit the management account's tax settings — and the
-    /// one account this emulator presents stands for the organization it is the
-    /// management account of, so the election it asks to record is one it may
-    /// make. There is nothing here to tell one caller's standing from another's:
-    /// management standing is a fact about an organization, which this service
-    /// neither models nor is told about by any request it serves.
+    /// member accounts inherit the management account's tax settings — so only
+    /// the management account of the organization may record it: see
+    /// [`Self::organization_management_account_id`], which the write consults
+    /// before it touches this field.
     pub tax_inheritance: Option<String>,
+    /// The management account of the AWS Organizations organization the account
+    /// this emulator presents belongs to, when it belongs to one.
+    ///
+    /// `None` by default: an organization is established through AWS
+    /// Organizations, which this emulator models in its own service and whose
+    /// state holds no organization until one is created, so the presented
+    /// account is a standalone account and is nobody's organization management
+    /// account. Set it to an account id to model that account as the management
+    /// account of the organization — the standing
+    /// [`Self::is_organization_management_account`] judges a caller by.
+    pub organization_management_account_id: Option<String>,
     /// The account's supplemental tax registrations, keyed by the `authorityId`
     /// this service minted for each when it was first stored.
     ///
@@ -535,6 +584,17 @@ pub struct ComAmazonawsTaxsettingsTaxsettingsState {
 }
 
 impl ComAmazonawsTaxsettingsTaxsettingsState {
+    /// Whether `account_id` is the management account of the organization the
+    /// presented account belongs to — the standing an organization-level write
+    /// is reserved to.
+    ///
+    /// False while this service is told of no organization
+    /// ([`Self::organization_management_account_id`]), because an account that
+    /// is in no organization is the management account of none.
+    pub fn is_organization_management_account(&self, account_id: &str) -> bool {
+        self.organization_management_account_id.as_deref() == Some(account_id)
+    }
+
     /// Materialise every TRN validation the clock has already made due at `now`.
     ///
     /// Each stored registration carries the instant its validation falls due,
@@ -897,9 +957,9 @@ pub struct StoredSupplementalRegistration {
     /// The registration's `TaxRegistrationStatus`.
     pub status: String,
     /// When the validation of this TRN falls due, after which [`Self::settle`]
-    /// moves [`Self::status`] to [`SETTLED_REGISTRATION_STATUS`] — the same
-    /// clock-owed transition a main TRN has, for the same reason. `None` once it
-    /// has been settled.
+    /// moves [`Self::status`] to what that validation reached
+    /// ([`Self::validation_outcome`]) — the same clock-owed transition a main
+    /// TRN has, for the same reason. `None` once it has been settled.
     pub validation_due_at: Option<Instant>,
 }
 
@@ -921,12 +981,23 @@ impl StoredSupplementalRegistration {
         }
     }
 
+    /// What the validation of this supplemental TRN reaches: the number it was
+    /// stored with, judged against the structure the jurisdiction it is held in
+    /// publishes — see [`trn_validation_status`].
+    pub fn validation_outcome(&self) -> &'static str {
+        trn_validation_status(
+            &self.address.country_code,
+            &self.registration_type,
+            &self.registration_id,
+        )
+    }
+
     /// Move this registration to the status its validation reached, if that
     /// validation was already due at `now`. Answers whether it moved.
     pub fn settle(&mut self, now: Instant) -> bool {
         match self.validation_due_at {
             Some(due) if due <= now => {
-                self.status = SETTLED_REGISTRATION_STATUS.to_string();
+                self.status = self.validation_outcome().to_string();
                 self.validation_due_at = None;
                 true
             }
@@ -985,9 +1056,9 @@ pub struct StoredTaxRegistration {
     /// The registration's `TaxRegistrationStatus`.
     pub status: String,
     /// When the validation of this TRN falls due, after which [`Self::settle`]
-    /// moves [`Self::status`] to [`SETTLED_REGISTRATION_STATUS`]. `None` once it
-    /// has been settled, so settling is idempotent and a settled record never
-    /// moves again.
+    /// moves [`Self::status`] to what that validation reached
+    /// ([`Self::validation_outcome`]). `None` once it has been settled, so
+    /// settling is idempotent and a settled record never moves again.
     pub validation_due_at: Option<Instant>,
     /// How many times `PutTaxRegistration` has written this account's TRN. The
     /// document access tokens below are derived from it, because the model
@@ -1061,12 +1132,26 @@ impl StoredTaxRegistration {
         }
     }
 
+    /// What the validation of this TRN reaches: the number it was stored with,
+    /// judged against the structure the jurisdiction it is held in publishes for
+    /// its registration type — see [`trn_validation_status`].
+    ///
+    /// Read from the stored record, so the outcome was fixed by the write and
+    /// every reader of this record settles it identically.
+    pub fn validation_outcome(&self) -> &'static str {
+        trn_validation_status(
+            &self.legal_address.country_code,
+            &self.registration_type,
+            &self.registration_id,
+        )
+    }
+
     /// Move this registration to the status its validation reached, if that
     /// validation was already due at `now`. Answers whether it moved.
     pub fn settle(&mut self, now: Instant) -> bool {
         match self.validation_due_at {
             Some(due) if due <= now => {
-                self.status = SETTLED_REGISTRATION_STATUS.to_string();
+                self.status = self.validation_outcome().to_string();
                 self.validation_due_at = None;
                 true
             }
@@ -1510,6 +1595,23 @@ pub fn validation_naming(
         field_list: Some(vec![ValidationExceptionField {
             name: parameter.to_string(),
         }]),
+    }
+}
+
+/// The same refusal as [`validation`] about the CALL rather than one of its
+/// parameters, so `fieldList` is absent.
+///
+/// For a refusal no member of the request is at fault for — the caller's
+/// standing, which no parameter carries — where naming a parameter would tell
+/// the client to repair a value that is not what was refused.
+pub fn validation_of_the_call(
+    error_code: &str,
+    message: impl Into<String>,
+) -> ValidationException {
+    ValidationException {
+        message: message.into(),
+        error_code: error_code.to_string(),
+        field_list: None,
     }
 }
 

@@ -17,9 +17,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
     parameter_name, type_with_derived_legal_address, DEFAULT_HERITAGE_STATUS,
-    DERIVED_MEMBER_UNKNOWN, HERITAGE_STATUS_OPT_IN, HERITAGE_STATUS_OPT_OUT,
-    SETTLED_REGISTRATION_STATUS, STATUS_DELETED, STATUS_PENDING, STATUS_REJECTED,
-    STATUS_VERIFIED, TRN_VALIDATION_DELAY,
+    DERIVED_MEMBER_UNKNOWN, HERITAGE_STATUS_OPT_IN, HERITAGE_STATUS_OPT_OUT, STATUS_DELETED,
+    STATUS_PENDING, STATUS_REJECTED, STATUS_VERIFIED, TRN_VALIDATION_DELAY,
 };
 
 use crate::tax_registration_lifecycle::{
@@ -258,25 +257,13 @@ async fn a_submitted_trn_is_pending_until_its_validation_is_due_then_settles() {
         (Duration::from_millis(250)..=Duration::from_millis(750)).contains(&TRN_VALIDATION_DELAY),
         "the owed validation must fall due 250-750 ms out, got {TRN_VALIDATION_DELAY:?}"
     );
-    assert!(
-        REGISTRATION_STATUSES.contains(&SETTLED_REGISTRATION_STATUS),
-        "the settled status must be one the model lists, got {SETTLED_REGISTRATION_STATUS:?}"
-    );
-    // And it is the status a successful validation reaches: the service accepted
-    // and stored this TRN, so settling it to the failed-validation status would
-    // contradict the 200 the write answered.
-    assert_eq!(
-        SETTLED_REGISTRATION_STATUS, STATUS_VERIFIED,
-        "an accepted TRN settles Verified, got {SETTLED_REGISTRATION_STATUS:?}"
-    );
-    assert_ne!(
-        SETTLED_REGISTRATION_STATUS, STATUS_REJECTED,
-        "a stored TRN never settles Rejected, got {SETTLED_REGISTRATION_STATUS:?}"
-    );
 
-    // Rows differ in the type, the sector and whether documents were submitted:
-    // the status a TRN reaches is not a function of any of them.
-    let rows: &[(&str, Value)] = &[
+    // Rows differ in the type, the sector, whether documents were submitted and
+    // whether the submitted number satisfies the structure its jurisdiction
+    // publishes for it: the TIMING is not a function of any of them, and the
+    // outcome is a function of the last. What each outcome follows from is pinned
+    // in `tests/all/trn_validation_outcome.rs`.
+    let rows: &[(&str, Value, &str)] = &[
         (
             "VAT entry",
             json!({
@@ -285,6 +272,9 @@ async fn a_submitted_trn_is_pending_until_its_validation_is_due_then_settles() {
                 "legalName": "Acme GmbH",
                 "legalAddress": { "postalCode": "10115", "countryCode": "DE" },
             }),
+            // Nine digits, but not the check digit Germany's rule computes for
+            // the eight before it, so the validation of this number fails.
+            STATUS_REJECTED,
         ),
         (
             "GST entry with a sector",
@@ -299,6 +289,7 @@ async fn a_submitted_trn_is_pending_until_its_validation_is_due_then_settles() {
                     "countryCode": "IN",
                 },
             }),
+            STATUS_VERIFIED,
         ),
         (
             "TIN entry carrying a document",
@@ -319,10 +310,11 @@ async fn a_submitted_trn_is_pending_until_its_validation_is_due_then_settles() {
                     ],
                 },
             }),
+            STATUS_VERIFIED,
         ),
     ];
 
-    for (case, entry) in rows {
+    for (case, entry, settles_to) in rows {
         let (router, engine) = emulator_with_engine();
         let account_id = "000000000001";
         let put = call(
@@ -361,7 +353,7 @@ async fn a_submitted_trn_is_pending_until_its_validation_is_due_then_settles() {
             let status = read_status(&router, reader, account_id).await;
             assert_eq!(
                 status.as_deref(),
-                Some(SETTLED_REGISTRATION_STATUS),
+                Some(*settles_to),
                 "case {case:?}: {reader} must report the settled status, got {status:?}"
             );
         }

@@ -13,6 +13,12 @@
 //! carries no members at all (the modelled output is empty), so the only way to
 //! observe the write is to read it back.
 //!
+//! Recording it is reserved to the management account of the caller's
+//! organization
+//! ([`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::is_organization_management_account`]):
+//! any other caller is refused with the modelled `ValidationException` before
+//! anything is stored.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -164,13 +170,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::state_unavailable(),
             )
         })?;
+        let mut store = state.lock();
+
+        // The election is an organization-level one — whether the
+        // organization's member accounts inherit the management account's tax
+        // settings — so recording it is reserved to the management account of
+        // that organization. A caller without that standing is refused with the
+        // modelled `ValidationException` (400) BEFORE anything is stored, so the
+        // election the account already had is the one the read still reports.
+        // The refusal is about the caller, not a parameter, so it names no field.
+        let caller = ::engine::emulator_account_id();
+        if !store.is_organization_management_account(caller) {
+            // The access record for a state-changing call that changed nothing:
+            // which operation ran and how it ended. No request value travels
+            // here.
+            ::tracing::info!(
+                operation = "PutTaxInheritance",
+                outcome = "refused",
+                error_code = crate::state::ERROR_CODE_FIELD_VALIDATION_FAILED,
+                "refused an election from a caller that is not the organization's management \
+                 account"
+            );
+            return Err(PutTaxInheritanceErrorModeled::ValidationException(
+                crate::state::validation_of_the_call(
+                    crate::state::ERROR_CODE_FIELD_VALIDATION_FAILED,
+                    crate::state::TAX_INHERITANCE_MANAGEMENT_ACCOUNT_ONLY,
+                ),
+            )
+            .into());
+        }
+
         // The account has ONE election, so the write replaces whatever it held:
         // the value recorded here is the value `GetTaxInheritance` reports until
         // the next write.
-        let replaced = state
-            .lock()
-            .tax_inheritance
-            .replace(heritage_status.clone());
+        let replaced = store.tax_inheritance.replace(heritage_status.clone());
+        drop(store);
 
         // The access record for a state-changing call: which operation ran, what
         // it changed and how it ended. Only the modelled enum values travel here;

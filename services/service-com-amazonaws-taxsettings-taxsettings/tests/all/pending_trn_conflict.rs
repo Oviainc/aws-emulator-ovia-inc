@@ -30,8 +30,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
-    ComAmazonawsTaxsettingsTaxsettingsState, StoredTaxRegistration, SETTLED_REGISTRATION_STATUS,
-    STATUS_PENDING,
+    ComAmazonawsTaxsettingsTaxsettingsState, StoredTaxRegistration, STATUS_PENDING,
+    STATUS_VERIFIED,
 };
 
 use crate::country_rules::{document, write, WRITERS};
@@ -524,7 +524,7 @@ async fn a_batch_reports_each_outstanding_account_and_stores_the_rest() {
             );
             match kind {
                 Seeded::Outstanding => hold_open(&engine, account_id),
-                _ => force_status(&engine, account_id, SETTLED_REGISTRATION_STATUS),
+                _ => force_status(&engine, account_id, STATUS_VERIFIED),
             }
         }
 

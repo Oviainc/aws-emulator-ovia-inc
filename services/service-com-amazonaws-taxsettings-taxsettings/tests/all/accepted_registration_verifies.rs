@@ -2,14 +2,17 @@
 
 //! What the validation of a STORED tax registration reaches, over the wire.
 //!
-//! ONE rule: a registration this service accepted and stored is one whose
-//! validation succeeded, so once the clock has made that validation due every
-//! read path reports it `Verified` and none reports the status of a validation
-//! that failed. The tables span the dimensions the outcome is not a function of —
-//! the registration type, the jurisdiction, the sector, whether documents were
-//! submitted, whether the entry carried its own legal address, and whether the
-//! record is the account's TRN or a supplemental one — rather than the one entry
-//! that happened to be recorded.
+//! ONE rule: the validation a write starts judges the submitted NUMBER against
+//! the structure its jurisdiction publishes for it, so a stored registration
+//! whose number satisfies that structure is reported `Verified` by every read
+//! path once the clock has made the validation due, and by none of them as a
+//! validation that failed. The tables span the dimensions the outcome is not a
+//! function of — the registration type, the jurisdiction, the sector, whether
+//! documents were submitted, whether the entry carried its own legal address,
+//! and whether the record is the account's TRN or a supplemental one — rather
+//! than the one entry that happened to be recorded. The outcome for a number
+//! that does NOT satisfy its published structure is pinned in
+//! `tests/all/trn_validation_outcome.rs`.
 //!
 //! The harness (`emulator_with_engine`, `call`, the two helpers that move a
 //! clock-owed TRN validation and the one that reads a status back) lives in
@@ -43,13 +46,17 @@ const TRN_READERS: &[&str] = &["GetTaxRegistration", "ListTaxRegistrations"];
 /// The entries the table stores: one per dimension the validation outcome is not
 /// a function of. Every row is an entry this service accepts — a submission it
 /// does not accept is refused by the write instead of stored (see
-/// `tests/all/country_rules.rs` and `tests/all/registration_type_refusals.rs`).
+/// `tests/all/country_rules.rs` and `tests/all/registration_type_refusals.rs`) —
+/// and every row's number satisfies the structure its jurisdiction publishes for
+/// it.
 fn accepted_entries() -> Vec<(&'static str, Value)> {
     vec![
         (
             "a VAT registration in Germany",
             json!({
-                "registrationId": "DE123456789",
+                // Nine digits closed by the check digit Germany's rule computes
+                // for the eight before it.
+                "registrationId": "DE136695976",
                 "registrationType": "VAT",
                 "legalName": "Acme GmbH",
                 "legalAddress": {
@@ -145,10 +152,10 @@ fn accepted_entries() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// RULE: a tax registration the service accepted and stored passed its own
-/// validation, so once the clock has made that validation due every read path
-/// reports it `Verified`, repeatedly and whoever calls — never the status of a
-/// validation that failed.
+/// RULE: a tax registration the service stored whose number satisfies the
+/// structure its jurisdiction publishes passed its validation, so once the clock
+/// has made that validation due every read path reports it `Verified`, repeatedly
+/// and whoever calls — never the status of a validation that failed.
 #[tokio::test]
 async fn an_accepted_tax_registration_settles_verified_on_every_read_path() {
     for (case, entry) in accepted_entries() {
@@ -208,7 +215,8 @@ async fn an_accepted_tax_registration_settles_verified_on_every_read_path() {
 
 /// RULE: the same for a supplemental registration — the record the listing
 /// reports for an accepted supplemental TRN is `Pending` while its validation is
-/// outstanding and `Verified` once the clock has made it due.
+/// outstanding and, where no published structure contradicts its number,
+/// `Verified` once the clock has made it due.
 #[tokio::test]
 async fn an_accepted_supplemental_registration_settles_verified_in_the_listing() {
     // The rows differ in the registration id and in how much of the address the

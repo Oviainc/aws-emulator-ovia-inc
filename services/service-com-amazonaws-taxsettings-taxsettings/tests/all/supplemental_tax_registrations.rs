@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
     ComAmazonawsTaxsettingsTaxsettingsState, ERROR_CODE_FIELD_VALIDATION_FAILED,
-    ERROR_CODE_INVALID_TOKEN, ERROR_CODE_MALFORMED_TOKEN, SETTLED_REGISTRATION_STATUS,
-    STATUS_PENDING, SUPPLEMENTAL_COUNTRY_NOT_SUPPORTED,
+    ERROR_CODE_INVALID_TOKEN, ERROR_CODE_MALFORMED_TOKEN, STATUS_PENDING, STATUS_VERIFIED,
+    SUPPLEMENTAL_COUNTRY_NOT_SUPPORTED,
     SUPPLEMENTAL_TAX_REGISTRATIONS_PAGE_BOUNDS, SUPPLEMENTAL_TRN_COUNTRIES,
 };
 
@@ -801,9 +801,9 @@ async fn listing_does_not_change_what_a_later_caller_sees() {
     for item in &settled {
         assert_eq!(
             item.get("status").and_then(Value::as_str),
-            Some(SETTLED_REGISTRATION_STATUS),
-            "once the validation is due the listing must report {SETTLED_REGISTRATION_STATUS:?}, \
-             got {item:?}"
+            Some(STATUS_VERIFIED),
+            "once the validation is due the listing must report the outcome it reached, got \
+             {item:?}"
         );
     }
     let again = list_all(&router, None).await;

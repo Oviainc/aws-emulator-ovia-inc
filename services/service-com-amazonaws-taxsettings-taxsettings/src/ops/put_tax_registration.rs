@@ -11,9 +11,11 @@
 //! documents as `Verified`, `Pending` or `Rejected`. Validating takes time, so a
 //! write stores the registration `Pending` and the validation falls due one
 //! [`crate::state::TRN_VALIDATION_DELAY`] later; every read then reports what
-//! that validation reached ([`crate::state::SETTLED_REGISTRATION_STATUS`]). An
-//! entry this handler stores is one it accepted — everything it will not stand
-//! behind is refused below — so that validation succeeded.
+//! that validation reached ([`crate::state::trn_validation_status`]). Accepting
+//! the entry and validating the NUMBER are separate facts: this handler refuses
+//! everything about the entry it will not stand behind, and the validation that
+//! follows judges the submitted number against the structure its jurisdiction
+//! publishes, which a stored registration can fail.
 //!
 //! The refusals this handler adds beyond the constraints the boundary
 //! validator enforces, spelled out here so a later fixer does not read them as

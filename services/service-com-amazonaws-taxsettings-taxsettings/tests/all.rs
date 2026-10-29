@@ -69,3 +69,5 @@ mod tax_inheritance_election;
 mod tax_registration_document;
 #[path = "all/tax_registration_lifecycle.rs"]
 mod tax_registration_lifecycle;
+#[path = "all/trn_validation_outcome.rs"]
+mod trn_validation_outcome;
