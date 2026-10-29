@@ -2583,7 +2583,7 @@ pub fn retention_period_not_shorter_message(
 pub fn shard_not_open_message(shard_id: &str, stream_identifier: &str) -> String {
     format!(
         "Shard {shard_id} in stream {stream_identifier} under account {} has already been \
-         merged or split, so it is not eligible for merging or splitting.",
+         merged or split, and thus is not eligible for merging or splitting.",
         ::engine::emulator_account_id()
     )
 }

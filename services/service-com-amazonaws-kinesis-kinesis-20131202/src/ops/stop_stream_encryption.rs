@@ -256,11 +256,10 @@ fn stop_stream_encryption(
             input.stream_arn.as_deref(),
         )
         .map_err(|failure| lookup_refusal(failure, &identifier))?;
-    let named = if identifier.is_empty() {
-        stream.name.clone()
-    } else {
-        identifier
-    };
+    // A refusal about the stream this request RESOLVED names it by its `StreamName`, which
+    // is the variable part the service's messages carry: whichever identifier addressed the
+    // stream — its name, its ARN or both — the STORED name is what the message reports.
+    let named = stream.name.clone();
 
     // "The resource is not available for this operation. For successful operation, the
     // resource must be in the ACTIVE state" (`ResourceInUseException`) — and this operation

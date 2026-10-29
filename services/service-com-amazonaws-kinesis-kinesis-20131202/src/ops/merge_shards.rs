@@ -256,11 +256,10 @@ fn merge_shards(
             input.stream_arn.as_deref(),
         )
         .map_err(|failure| lookup_refusal(failure, &identifier))?;
-    let identifier = if identifier.is_empty() {
-        stream.name.clone()
-    } else {
-        identifier
-    };
+    // A refusal about the stream this request RESOLVED names it by its `StreamName`, which
+    // is the variable part the service's messages carry: whichever identifier addressed the
+    // stream — its name, its ARN or both — the STORED name is what the message reports.
+    let identifier = stream.name.clone();
 
     // "This API is only supported for the data streams with the provisioned capacity mode":
     // an on-demand stream's shard map is the service's to re-tile, so the request is refused

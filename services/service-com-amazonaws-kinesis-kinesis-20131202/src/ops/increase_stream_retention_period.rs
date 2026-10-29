@@ -256,13 +256,11 @@ fn increase_retention_period(
     // one is left as it was — shortening it is the other operation's to serve.
     let current = stream.retention_period_hours;
     if requested <= current {
-        let identifier = if identifier.is_empty() {
-            stream.name.clone()
-        } else {
-            identifier
-        };
+        // A refusal about the stream this request RESOLVED names it by its `StreamName`,
+        // which is the variable part the service's messages carry: whichever identifier
+        // addressed the stream, the STORED name is what the message reports.
         return Err(invalid_argument(
-            crate::state::retention_period_not_longer_message(&identifier, requested, current),
+            crate::state::retention_period_not_longer_message(&stream.name, requested, current),
         ));
     }
 

@@ -398,11 +398,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.stream_arn.as_deref(),
             )
             .map_err(|failure| lookup_refusal(failure, &input))?;
-        let identifier = input
-            .stream_name
-            .as_deref()
-            .or(input.stream_arn.as_deref())
-            .unwrap_or(&stream.name);
 
         // A stream whose creation has not fallen due yet has no readable shard, and this
         // operation models no "the resource is not available yet" error: the position a
@@ -425,7 +420,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(not_found(crate::state::shard_not_found_message(
                 &input.shard_id,
-                identifier,
+                // A refusal about the stream this request RESOLVED names it by its
+                // `StreamName`, whichever identifier addressed it.
+                &stream.name,
             )));
         };
 

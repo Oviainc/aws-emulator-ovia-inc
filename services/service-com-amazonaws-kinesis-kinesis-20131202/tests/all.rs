@@ -59,6 +59,8 @@ mod shard_listing;
 mod shard_quota;
 #[path = "all/shard_scaling.rs"]
 mod shard_scaling;
+#[path = "all/split_shard_lineage.rs"]
+mod split_shard_lineage;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stream_consumers.rs"]
