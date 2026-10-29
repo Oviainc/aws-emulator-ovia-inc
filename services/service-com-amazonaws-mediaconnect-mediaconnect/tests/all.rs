@@ -207,6 +207,8 @@ mod flow_source_bridge_and_ingest_port;
 mod bridge_flow_outputs;
 #[path = "all/bridge_retirement_refuses_changes.rs"]
 mod bridge_retirement_refuses_changes;
+#[path = "all/create_bridge_references.rs"]
+mod create_bridge_references;
 #[path = "all/bridge_retirement_refuses_state_changes.rs"]
 mod bridge_retirement_refuses_state_changes;
 #[path = "all/retired_bridge_reconfiguration.rs"]

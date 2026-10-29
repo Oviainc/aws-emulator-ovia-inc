@@ -34,8 +34,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::bridge_lifecycle::{
-    cloud_flow, create_bridge, describe_bridge, gateway_with_networks, minted_flow_arn,
-    minted_gateway_arn,
+    cloud_flow, create_bridge, describe_bridge, gateway_with_networks, minted_gateway_arn,
 };
 use crate::flow_lifecycle::{Emulator, REGION};
 
@@ -107,20 +106,10 @@ pub(crate) fn network_source(name: &str, port: i64, protocol: &str) -> Value {
 /// One flow source entry, as a request configures it and as a bridge reports it.
 ///
 /// A flow source "originates in MediaConnect as an existing cloud flow", so it is the kind
-/// a cloud-to-ground (egress) bridge ingests — which is the fixture bridge below.
-pub(crate) fn flow_source(name: &str, suffix: u64) -> Value {
-    json!({ "flowSource": {
-        "flowArn": minted_flow_arn(suffix, &format!("flow-{suffix}")),
-        "name": name,
-    }})
-}
-
-/// One flow source on the cloud flow `flow_arn` the account HOLDS.
-///
-/// A source written onto a bridge the store already holds names a flow the account holds,
-/// which is `crate::bridge_add_references`' own subject, so the rows that drive
-/// AddBridgeSources below name the fixture flow rather than an ARN of the minted form.
-fn held_flow_source(name: &str, flow_arn: &str) -> Value {
+/// a cloud-to-ground (egress) bridge ingests — which is the fixture bridge below — and
+/// `flow_arn` is a cloud flow the account HOLDS, because every path that writes a source
+/// onto a bridge resolves the flow it names against the store.
+pub(crate) fn flow_source(name: &str, flow_arn: &str) -> Value {
     json!({ "flowSource": {
         "flowArn": flow_arn,
         "name": name,
@@ -207,12 +196,12 @@ fn add_cases(flow_arn: &str) -> Vec<AddCase> {
     vec![
         AddCase {
             case: "one flow source, one network output",
-            sources: vec![held_flow_source("added-flow", flow_arn)],
+            sources: vec![flow_source("added-flow", flow_arn)],
             outputs: vec![network_output("added-out", 6100, "udp", 32)],
         },
         AddCase {
             case: "a flow source and two outputs on different protocols",
-            sources: vec![held_flow_source("added-flow-2", flow_arn)],
+            sources: vec![flow_source("added-flow-2", flow_arn)],
             outputs: vec![
                 network_output("added-out-udp", 6200, "udp", 16),
                 network_output("added-out-srt", 6201, "srt-listener", 255),
@@ -251,7 +240,7 @@ async fn adding_sources_and_outputs_appends_them_to_the_stored_bridge() {
             sources,
             outputs,
         } = case;
-        let held_source = flow_source("base-src", 1);
+        let held_source = flow_source("base-src", &flow_arn);
         let held_output = network_output("base-out", 6000, "udp", 8);
         let arn = bridge_with(
             &emulator,
@@ -324,7 +313,12 @@ async fn adding_sources_and_outputs_appends_them_to_the_stored_bridge() {
 #[tokio::test]
 async fn removing_a_source_or_an_output_takes_it_out_of_the_stored_bridge() {
     let emulator = Emulator::new();
-    let placement = minted_gateway_arn(2, "gw-remove");
+    let placement = gateway_with_networks(&emulator, "gw-remove", &["net-1"]).await;
+    // The two cloud flows the failover pair of sources takes its content from.
+    let flows = [
+        cloud_flow(&emulator, "flow-remove-a").await,
+        cloud_flow(&emulator, "flow-remove-b").await,
+    ];
 
     // Which member of the bridge is removed: a source at each end of the failover pair a
     // bridge can ingest, and an output at the first, the middle and the last position of
@@ -339,7 +333,7 @@ async fn removing_a_source_or_an_output_takes_it_out_of_the_stored_bridge() {
         removal_rows.into_iter().enumerate()
     {
         let sources: Vec<Value> = (0..2)
-            .map(|offset| flow_source(&format!("src-{offset}"), 200 + offset as u64))
+            .map(|offset| flow_source(&format!("src-{offset}"), &flows[offset]))
             .collect();
         let outputs: Vec<Value> = (0..3)
             .map(|offset| {
@@ -434,12 +428,13 @@ async fn removing_a_source_or_an_output_takes_it_out_of_the_stored_bridge() {
 #[tokio::test]
 async fn the_only_source_of_a_bridge_can_be_removed() {
     let emulator = Emulator::new();
-    let placement = minted_gateway_arn(3, "gw-last-member");
+    let placement = gateway_with_networks(&emulator, "gw-last-member", &["net-1"]).await;
+    let flow_arn = cloud_flow(&emulator, "flow-last-member").await;
     let arn = bridge_with(
         &emulator,
         "bridge-last-member",
         &placement,
-        vec![flow_source("only-src", 3)],
+        vec![flow_source("only-src", &flow_arn)],
         vec![network_output("only-out", 6000, "udp", 32)],
     )
     .await;
@@ -480,13 +475,13 @@ struct RefusalCase {
 
 /// The refusal table. Every row is a request the service must refuse, and after each one
 /// the bridge must be exactly what it was.
-fn refusal_cases(bridge_arn: &str) -> Vec<RefusalCase> {
+fn refusal_cases(bridge_arn: &str, flow_arn: &str) -> Vec<RefusalCase> {
     let missing = minted_bridge_arn(9_999, "no-such-bridge");
     // One entry past each per-bridge bound, counting the one source and one output the
     // fixture bridge already holds (`mc::MAX_BRIDGE_SOURCES`, the failover pair a bridge
     // ingests, and `mc::MAX_BRIDGE_OUTPUTS`).
     let past_sources_bound: Vec<Value> = (0..mc::MAX_BRIDGE_SOURCES)
-        .map(|index| flow_source(&format!("over-src-{index}"), 700 + index as u64))
+        .map(|index| flow_source(&format!("over-src-{index}"), flow_arn))
         .collect();
     let past_outputs_bound: Vec<Value> = (0..mc::MAX_BRIDGE_OUTPUTS)
         .map(|index| {
@@ -509,7 +504,7 @@ fn refusal_cases(bridge_arn: &str) -> Vec<RefusalCase> {
             uri: format!("/v1/bridges/{bridge_arn}/sources"),
             body: Some(json!({ "sources": [{
                 "flowSource": {
-                    "flowArn": minted_flow_arn(201, "flow-both"),
+                    "flowArn": flow_arn,
                     "name": "both",
                 },
                 "networkSource": {
@@ -535,7 +530,7 @@ fn refusal_cases(bridge_arn: &str) -> Vec<RefusalCase> {
             case: "a source whose name the bridge already holds",
             method: "POST",
             uri: format!("/v1/bridges/{bridge_arn}/sources"),
-            body: Some(json!({ "sources": [flow_source("base-src", 400)] })),
+            body: Some(json!({ "sources": [flow_source("base-src", flow_arn)] })),
             status: 400,
             code: "BadRequestException",
         },
@@ -544,8 +539,8 @@ fn refusal_cases(bridge_arn: &str) -> Vec<RefusalCase> {
             method: "POST",
             uri: format!("/v1/bridges/{bridge_arn}/sources"),
             body: Some(json!({ "sources": [
-                flow_source("twice", 500),
-                flow_source("twice", 501),
+                flow_source("twice", flow_arn),
+                flow_source("twice", flow_arn),
             ] })),
             status: 400,
             code: "BadRequestException",
@@ -562,7 +557,7 @@ fn refusal_cases(bridge_arn: &str) -> Vec<RefusalCase> {
             case: "an add of sources to a bridge the store does not hold",
             method: "POST",
             uri: format!("/v1/bridges/{missing}/sources"),
-            body: Some(json!({ "sources": [flow_source("orphan", 600)] })),
+            body: Some(json!({ "sources": [flow_source("orphan", flow_arn)] })),
             status: 404,
             code: "NotFoundException",
         },
@@ -673,17 +668,18 @@ fn refusal_cases(bridge_arn: &str) -> Vec<RefusalCase> {
 #[tokio::test]
 async fn a_refused_request_names_the_modelled_error_and_leaves_the_bridge_untouched() {
     let emulator = Emulator::new();
-    let placement = minted_gateway_arn(4, "gw-refusals");
+    let placement = gateway_with_networks(&emulator, "gw-refusals", &["net-1"]).await;
+    let flow_arn = cloud_flow(&emulator, "flow-refusals").await;
     let arn = bridge_with(
         &emulator,
         "bridge-refusals",
         &placement,
-        vec![flow_source("base-src", 1)],
+        vec![flow_source("base-src", &flow_arn)],
         vec![network_output("base-out", 6000, "udp", 32)],
     )
     .await;
 
-    for case in refusal_cases(&arn) {
+    for case in refusal_cases(&arn, &flow_arn) {
         let before = bridge_of(&emulator, case.case, &arn).await;
         let (status, code, answered) = emulator.send(case.method, &case.uri, case.body).await;
         assert_eq!(
@@ -711,8 +707,9 @@ async fn a_refused_request_names_the_modelled_error_and_leaves_the_bridge_untouc
 #[tokio::test]
 async fn list_bridges_pages_every_stored_bridge_and_filters_by_placement() {
     let emulator = Emulator::new();
-    let placement_a = minted_gateway_arn(5, "gw-a");
-    let placement_b = minted_gateway_arn(6, "gw-b");
+    let placement_a = gateway_with_networks(&emulator, "gw-a", &["net-1"]).await;
+    let placement_b = gateway_with_networks(&emulator, "gw-b", &["net-1"]).await;
+    let flow_arn = cloud_flow(&emulator, "flow-listing").await;
 
     // Three bridges on one gateway and two on another, so the filter has something to
     // exclude and the paging more than one page to walk.
@@ -723,7 +720,7 @@ async fn list_bridges_pages_every_stored_bridge_and_filters_by_placement() {
                 &emulator,
                 &format!("bridge-a-{index}"),
                 &placement_a,
-                vec![flow_source("src", 300 + index as u64)],
+                vec![flow_source("src", &flow_arn)],
                 Vec::new(),
             )
             .await,
@@ -885,12 +882,13 @@ async fn list_bridges_pages_every_stored_bridge_and_filters_by_placement() {
 #[tokio::test]
 async fn delete_bridge_removes_the_bridge_from_the_store() {
     let emulator = Emulator::new();
-    let placement = minted_gateway_arn(8, "gw-delete");
+    let placement = gateway_with_networks(&emulator, "gw-delete", &["net-1"]).await;
+    let flow_arn = cloud_flow(&emulator, "flow-delete").await;
     let arn = bridge_with(
         &emulator,
         "bridge-delete",
         &placement,
-        vec![flow_source("src", 800)],
+        vec![flow_source("src", &flow_arn)],
         vec![network_output("out", 6000, "udp", 32)],
     )
     .await;
@@ -980,14 +978,15 @@ const EVERY_BRIDGE_STATE: [(&str, bool); 12] = [
 #[tokio::test]
 async fn deleting_a_bridge_that_was_not_stopped_is_refused() {
     let emulator = Emulator::new();
-    let placement = minted_gateway_arn(9, "gw-states");
+    let placement = gateway_with_networks(&emulator, "gw-states", &["net-1"]).await;
+    let flow_arn = cloud_flow(&emulator, "flow-states").await;
 
     for (index, (bridge_state, deletable)) in EVERY_BRIDGE_STATE.into_iter().enumerate() {
         let arn = bridge_with(
             &emulator,
             &format!("bridge-state-{index}"),
             &placement,
-            vec![flow_source("src", 900 + index as u64)],
+            vec![flow_source("src", &flow_arn)],
             Vec::new(),
         )
         .await;
@@ -1058,7 +1057,7 @@ async fn a_gateway_a_bridge_is_placed_on_is_deleted_only_after_the_bridge() {
         &emulator,
         "bridge-on-gateway",
         &gateway_arn,
-        vec![flow_source("src", 1_000)],
+        vec![flow_source("src", &cloud_flow(&emulator, "flow-on-gateway").await)],
         Vec::new(),
     )
     .await;

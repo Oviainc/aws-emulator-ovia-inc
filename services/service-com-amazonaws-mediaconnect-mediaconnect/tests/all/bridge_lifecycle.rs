@@ -25,18 +25,6 @@ use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::flow_lifecycle::{Emulator, REGION};
 
-/// A flow ARN of the form this service mints, built through the crate's own encoding of
-/// it, so it satisfies the pattern the model puts on
-/// `AddBridgeFlowSourceRequest$FlowArn` (`^arn:.+:mediaconnect.+:flow:.+$`) the way a
-/// real CreateFlow answer would.
-pub(crate) fn minted_flow_arn(suffix: u64, name: &str) -> String {
-    engine::emulator_arn(
-        mc::SERVICE_NAMESPACE,
-        REGION,
-        &mc::flow_resource_fragment(suffix, name),
-    )
-}
-
 /// A gateway ARN of the form this service mints — what a bridge's `PlacementArn` names
 /// (`ListedBridge$PlacementArn`: "the ARN of the gateway associated with the bridge").
 ///
@@ -210,23 +198,29 @@ struct CreateCase {
 
 /// The CreateBridge table. Every row differs from the others along what the rule
 /// generalises over, never only in a name.
-fn create_cases() -> Vec<CreateCase> {
-    let placement = minted_gateway_arn(1, "gw-placement");
-    let flow_a = minted_flow_arn(2, "flow-a");
-    let flow_b = minted_flow_arn(3, "flow-b");
+///
+/// The gateway every row is placed on, and the cloud flow every flow source names, are
+/// REAL records of this emulator: a bridge is placed on a gateway of the account, its
+/// network members name networks that gateway declares, and its flow sources name flows
+/// the account holds — CreateBridge resolves each of those references against the store.
+async fn create_cases(emulator: &Emulator) -> Vec<CreateCase> {
+    let placement =
+        gateway_with_networks(emulator, "gw-placement", &["net-1", "net-2", "net-7"]).await;
+    let flow_a = cloud_flow(emulator, "flow-a").await;
+    let flow_b = cloud_flow(emulator, "flow-b").await;
 
     // The bound row: one request carrying the most sources a bridge can ingest — the
     // failover pair `mc::MAX_BRIDGE_SOURCES` allows, which needs the failover state that
     // allows it — and the most outputs a create may carry (`mc::MAX_BRIDGE_OUTPUTS`). One
     // past each bound is in the refusal table below.
-    let full_sources: Vec<Value> = (0..mc::MAX_BRIDGE_SOURCES)
-        .map(|index| {
-            json!({ "flowSource": {
-                "flowArn": minted_flow_arn(10 + index as u64, &format!("flow-{index}")),
-                "name": format!("src-{index}"),
-            }})
-        })
-        .collect();
+    let mut full_sources: Vec<Value> = Vec::with_capacity(mc::MAX_BRIDGE_SOURCES);
+    for index in 0..mc::MAX_BRIDGE_SOURCES {
+        let flow_arn = cloud_flow(emulator, &format!("flow-full-{index}")).await;
+        full_sources.push(json!({ "flowSource": {
+            "flowArn": flow_arn,
+            "name": format!("src-{index}"),
+        }}));
+    }
     let full_outputs: Vec<Value> = (0..mc::MAX_BRIDGE_OUTPUTS)
         .map(|index| {
             json!({ "networkOutput": {
@@ -460,7 +454,7 @@ fn create_cases() -> Vec<CreateCase> {
 async fn create_bridge_stores_the_bridge_describe_bridge_reports() {
     let emulator = Emulator::new();
 
-    for case in create_cases() {
+    for case in create_cases(&emulator).await {
         let CreateCase {
             case: name_of_case,
             name,
@@ -572,7 +566,8 @@ async fn create_bridge_stores_the_bridge_describe_bridge_reports() {
 #[tokio::test]
 async fn every_modelled_protocol_is_stored_on_a_bridge_source_and_output() {
     let emulator = Emulator::new();
-    let placement = minted_gateway_arn(1, "gw-protocols");
+    let placement = gateway_with_networks(&emulator, "gw-protocols", &["net-1"]).await;
+    let flow_arn = cloud_flow(&emulator, "flow-protocols").await;
 
     for protocol in PROTOCOL_VALUES {
         // The source side, on the bridge whose sources originate at the premises: a
@@ -613,7 +608,7 @@ async fn every_modelled_protocol_is_stored_on_a_bridge_source_and_output() {
                 "placementArn": placement,
                 "egressGatewayBridge": { "maxBitrate": 10_000 },
                 "sources": [{ "flowSource": {
-                    "flowArn": minted_flow_arn(20, "flow-protocols"),
+                    "flowArn": flow_arn,
                     "name": "src",
                 }}],
                 "outputs": [{ "networkOutput": {
@@ -666,9 +661,13 @@ async fn every_modelled_protocol_is_stored_on_a_bridge_source_and_output() {
 /// One request body per way a create request can be semantically wrong, and the refusal
 /// the model names for it: `BadRequestException`, "thrown if the request contains a
 /// semantic error" (HTTP 400). Nothing is stored for any of them.
-fn refusal_cases() -> Vec<(&'static str, Value)> {
-    let placement = minted_gateway_arn(1, "gw-refusals");
-    let flow = minted_flow_arn(2, "flow-r");
+///
+/// Every row is placed on a REAL gateway and names a REAL cloud flow, so each one is
+/// refused for the cause it carries rather than for an unresolvable reference (those rows
+/// are `crate::create_bridge_placement_references`'s own table).
+async fn refusal_cases(emulator: &Emulator) -> Vec<(&'static str, Value)> {
+    let placement = gateway_with_networks(emulator, "gw-refusals", &["net-1"]).await;
+    let flow = cloud_flow(emulator, "flow-r").await;
     let source = json!({ "networkSource": {
         "multicastIp": "224.0.0.3",
         "name": "src",
@@ -843,7 +842,7 @@ fn refusal_cases() -> Vec<(&'static str, Value)> {
 async fn a_semantically_invalid_create_bridge_request_is_refused_and_stores_nothing() {
     let emulator = Emulator::new();
 
-    for (case, body) in refusal_cases() {
+    for (case, body) in refusal_cases(&emulator).await {
         let (status, code, parsed) = create_bridge(&emulator, body).await;
         assert_eq!(
             (status, code.as_deref()),
@@ -957,7 +956,7 @@ async fn the_clock_settles_a_new_bridge() {
 #[tokio::test]
 async fn same_named_bridges_are_distinct_and_an_unknown_bridge_is_not_found() {
     let emulator = Emulator::new();
-    let placement = minted_gateway_arn(1, "gw-twins");
+    let placement = gateway_with_networks(&emulator, "gw-twins", &["net-1"]).await;
     let body = |source_name: &str| {
         json!({
             "name": "twin",

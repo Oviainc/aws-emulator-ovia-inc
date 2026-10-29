@@ -29,7 +29,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_mediaconnect_mediaconnect::ops::types::DESIRED_STATE_VALUES;
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
-use crate::bridge_lifecycle::{create_bridge, describe_bridge, minted_gateway_arn};
+use crate::bridge_lifecycle::{
+    cloud_flow, create_bridge, describe_bridge, gateway_with_networks,
+};
 use crate::flow_lifecycle::{Emulator, REGION};
 
 /// Long enough for the clock to have made a transition due: the span the service holds a
@@ -69,10 +71,11 @@ fn network_source(name: &str, port: i64) -> Value {
 
 /// One flow source, the kind a cloud-to-ground bridge ingests ("the content comes from an
 /// existing MediaConnect flow"), so an egress create below carries the one source
-/// CreateBridge requires.
-fn flow_source(name: &str, suffix: u64) -> Value {
+/// CreateBridge requires. `flow_arn` is a cloud flow the account holds, because the create
+/// resolves the flow its source names against the store.
+fn flow_source(name: &str, flow_arn: &str) -> Value {
     json!({ "flowSource": {
-        "flowArn": crate::bridge_lifecycle::minted_flow_arn(suffix, "flow-bridge-state"),
+        "flowArn": flow_arn,
         "name": name,
     }})
 }
@@ -106,14 +109,19 @@ fn bridge_type_member(egress: bool) -> (&'static str, Value) {
 /// created bridge settles into.
 async fn settled_bridge(emulator: &Emulator, name: &str, egress: bool, port: i64) -> String {
     let (member, settings) = bridge_type_member(egress);
+    // The gateway the bridge is placed on, and the cloud flow a cloud-to-ground bridge's
+    // content comes from: real records of this emulator, because CreateBridge resolves both
+    // references against the store.
+    let placement = gateway_with_networks(emulator, &format!("gw-{name}"), &["net-1"]).await;
     let source = if egress {
-        flow_source("src", port as u64)
+        let flow_arn = cloud_flow(emulator, &format!("flow-{name}")).await;
+        flow_source("src", &flow_arn)
     } else {
         network_source("src", port)
     };
     let mut body = json!({
         "name": name,
-        "placementArn": minted_gateway_arn(1, "gw-bridge-state"),
+        "placementArn": placement,
         "sources": [source],
     });
     body[member] = settings;

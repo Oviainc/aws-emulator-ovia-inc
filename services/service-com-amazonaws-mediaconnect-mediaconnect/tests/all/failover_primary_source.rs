@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
-use crate::bridge_lifecycle::{create_bridge, describe_bridge, minted_gateway_arn};
+use crate::bridge_lifecycle::{create_bridge, describe_bridge, gateway_with_networks};
 use crate::flow_lifecycle::Emulator;
 
 /// The failover state a flow or a bridge needs to hold a PAIR of sources: "if the state is
@@ -430,6 +430,9 @@ async fn a_source_the_service_named_can_be_the_primary_source() {
 #[tokio::test]
 async fn create_bridge_and_update_bridge_resolve_the_primary_source_against_the_bridge_s_sources() {
     let emulator = Emulator::new();
+    // The gateway the bridges are placed on declares the network their sources ingest on:
+    // CreateBridge resolves both references against the store.
+    let placement = gateway_with_networks(&emulator, "gw-primary-source", &["net-1"]).await;
     let names = ["net-a", "net-b"];
     let sources: Vec<Value> = names
         .iter()
@@ -454,7 +457,7 @@ async fn create_bridge_and_update_bridge_resolve_the_primary_source_against_the_
             &emulator,
             json!({
                 "name": name,
-                "placementArn": minted_gateway_arn(1, "gw-primary-source"),
+                "placementArn": placement,
                 "ingressGatewayBridge": { "maxBitrate": 20_000_000, "maxOutputs": 2 },
                 "sources": sources,
                 "sourceFailoverConfig": failover(candidate.primary.as_deref()),

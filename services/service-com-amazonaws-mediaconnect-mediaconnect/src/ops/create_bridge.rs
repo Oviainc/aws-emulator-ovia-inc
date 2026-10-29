@@ -198,10 +198,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `PlacementArn` is a REQUIRED member naming "the bridge placement Amazon Resource
         // Number (ARN)" — the gateway the bridge is placed on
         // (`ListedBridge$PlacementArn`: "the ARN of the gateway associated with the
-        // bridge") — so an empty one places the bridge nowhere. The gateway it names is NOT
-        // required to be one this store holds: the model constrains the member to a plain
-        // string and CreateBridge declares no `NotFoundException`, so the placement is
-        // stored as given and resolved by the operations that address the gateway.
+        // bridge") — so an empty one places the bridge nowhere. That it names a gateway the
+        // store HOLDS is resolved below, once the store is in hand.
         if input.placement_arn.is_empty() {
             return Err(bad_request(
                 "A create bridge request must name the bridge placement ARN.",
@@ -344,6 +342,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // The state changes the clock already owes are materialised before the store is
+        // read, exactly as the reporting operations do it, so a gateway whose delete is
+        // already due resolves as the retired record it is (see
+        // `crate::state::TRANSITION_SPAN`).
+        store.settle_due_transitions(now);
+
+        // A bridge is PLACED on a gateway of the account: `Bridge$PlacementArn` /
+        // `ListedBridge$PlacementArn` is "the ARN of the gateway associated with the
+        // bridge". That gateway is a resource THIS service mints and holds, so the
+        // reference is resolved against the store before the bridge is written rather than
+        // taken on trust — a placement nothing resolves would put the bridge on a gateway
+        // the account has not got, whose networks declare nothing for its network members
+        // and against which nothing is held when the gateway is deleted (see
+        // `crate::state::unknown_gateway_rejection`).
+        if let Some(detail) = store.unknown_gateway_rejection("PlacementArn", &input.placement_arn) {
+            return Err(bad_request(detail));
+        }
+
+        // The other references the new bridge's members carry name resources of this
+        // account too: the cloud flow a flow source takes its content from
+        // (`BridgeFlowSource$FlowArn`) and the network of the placement gateway a network
+        // source ingests on / a network output is delivered over
+        // (`BridgeNetworkSource$NetworkName`, `BridgeNetworkOutput$NetworkName`). They are
+        // resolved through the same two functions AddBridgeSources and AddBridgeOutputs
+        // resolve them with, so a create stores no member those operations would refuse
+        // (see `crate::state::bridge_source_reference_rejection` and
+        // `crate::state::bridge_output_reference_rejection`).
+        for source in &sources {
+            if let Some(detail) =
+                store.bridge_source_reference_rejection(&input.placement_arn, source)
+            {
+                return Err(bad_request(detail));
+            }
+        }
+        for output in &outputs {
+            if let Some(detail) =
+                store.bridge_output_reference_rejection(&input.placement_arn, output)
+            {
+                return Err(bad_request(detail));
+            }
+        }
 
         // The bridge store is bounded: nothing evicts a bridge and DescribeBridge must
         // still answer what this operation created, so the create refuses once the store is

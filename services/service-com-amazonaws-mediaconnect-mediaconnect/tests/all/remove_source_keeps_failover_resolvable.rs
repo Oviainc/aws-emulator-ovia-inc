@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
-use crate::bridge_lifecycle::{create_bridge, describe_bridge, minted_gateway_arn};
+use crate::bridge_lifecycle::{create_bridge, describe_bridge, gateway_with_networks};
 use crate::flow_lifecycle::Emulator;
 use crate::flow_sources::{described_sources, remove_flow_source};
 
@@ -401,7 +401,7 @@ async fn bridge_state(emulator: &Emulator, case: &str, arn: &str) -> (Value, Vec
 #[tokio::test]
 async fn remove_bridge_source_refuses_to_strand_the_failover_primary_source() {
     let emulator = Emulator::new();
-    let placement = minted_gateway_arn(7, "gw-failover-removal");
+    let placement = gateway_with_networks(&emulator, "gw-failover-removal", &["net-1"]).await;
 
     for (index, row) in rows().into_iter().enumerate() {
         let case = row.case;

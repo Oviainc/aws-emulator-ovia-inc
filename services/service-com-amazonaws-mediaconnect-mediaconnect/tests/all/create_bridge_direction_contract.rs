@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
-use crate::bridge_lifecycle::{create_bridge, describe_bridge, minted_gateway_arn};
+use crate::bridge_lifecycle::{cloud_flow, create_bridge, describe_bridge, gateway_with_networks};
 use crate::bridge_members_and_deletion::{flow_source, network_output, network_source};
 use crate::flow_lifecycle::Emulator;
 
@@ -65,7 +65,9 @@ struct Row {
     accepted: bool,
 }
 
-fn rows() -> Vec<Row> {
+/// The table. `flow_arn` is the cloud flow every flow source names — a flow the account
+/// holds, because the create resolves the flow its sources name against the store.
+fn rows(flow_arn: &str) -> Vec<Row> {
     // `EgressGatewayBridge` declares a bitrate and no output count at all.
     let egress = json!({ "egressGatewayBridge": { "maxBitrate": 80_000_000 } });
     // `IngressGatewayBridge$MaxOutputs` is REQUIRED and is "the maximum number of expected
@@ -79,7 +81,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "cloud-to-ground bridge, one flow source, no output",
             bridge_type: egress.clone(),
-            sources: vec![flow_source("flow-src", 1)],
+            sources: vec![flow_source("flow-src", flow_arn)],
             outputs: Vec::new(),
             failover: None,
             accepted: true,
@@ -87,7 +89,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "cloud-to-ground bridge, one flow source, one network output",
             bridge_type: egress.clone(),
-            sources: vec![flow_source("flow-src", 2)],
+            sources: vec![flow_source("flow-src", flow_arn)],
             outputs: network_outputs(1),
             failover: None,
             accepted: true,
@@ -96,7 +98,7 @@ fn rows() -> Vec<Row> {
             case: "cloud-to-ground bridge, a failover pair of flow sources and several \
                    network outputs",
             bridge_type: egress.clone(),
-            sources: vec![flow_source("primary", 3), flow_source("backup", 4)],
+            sources: vec![flow_source("primary", flow_arn), flow_source("backup", flow_arn)],
             outputs: network_outputs(3),
             failover: Some(json!({ "state": mc::STATE_ENABLED })),
             accepted: true,
@@ -105,7 +107,7 @@ fn rows() -> Vec<Row> {
             case: "cloud-to-ground bridge, one flow source, outputs filling the bound this \
                    crate applies to every bridge",
             bridge_type: egress.clone(),
-            sources: vec![flow_source("flow-src", 5)],
+            sources: vec![flow_source("flow-src", flow_arn)],
             outputs: network_outputs(bound),
             failover: None,
             accepted: true,
@@ -113,7 +115,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "cloud-to-ground bridge, one flow source, one output past that bound",
             bridge_type: egress.clone(),
-            sources: vec![flow_source("flow-src", 6)],
+            sources: vec![flow_source("flow-src", flow_arn)],
             outputs: network_outputs(bound + 1),
             failover: None,
             accepted: false,
@@ -131,7 +133,10 @@ fn rows() -> Vec<Row> {
             case: "cloud-to-ground bridge whose failover pair mixes a flow source with a \
                    network source",
             bridge_type: egress.clone(),
-            sources: vec![flow_source("primary", 7), network_source("backup", 5_001, "udp")],
+            sources: vec![
+                flow_source("primary", flow_arn),
+                network_source("backup", 5_001, "udp"),
+            ],
             outputs: Vec::new(),
             failover: Some(json!({ "state": mc::STATE_ENABLED })),
             accepted: false,
@@ -167,7 +172,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "ground-to-cloud bridge fed by a flow source, which originates in the cloud",
             bridge_type: ingress(2),
-            sources: vec![flow_source("flow-src", 8)],
+            sources: vec![flow_source("flow-src", flow_arn)],
             outputs: Vec::new(),
             failover: None,
             accepted: false,
@@ -234,9 +239,13 @@ async fn listed_names(emulator: &Emulator, case: &str) -> Vec<String> {
 #[tokio::test]
 async fn create_bridge_admits_only_the_sources_and_outputs_the_bridge_s_direction_carries() {
     let emulator = Emulator::new();
-    let placement = minted_gateway_arn(1, "gw-direction-contract");
+    // The gateway every row is placed on, declaring the network its network members name,
+    // and the cloud flow its flow sources take their content from: CreateBridge resolves
+    // each of those references against the store.
+    let placement = gateway_with_networks(&emulator, "gw-direction-contract", &["net-1"]).await;
+    let flow_arn = cloud_flow(&emulator, "flow-direction-contract").await;
 
-    for (index, row) in rows().into_iter().enumerate() {
+    for (index, row) in rows(&flow_arn).into_iter().enumerate() {
         let Row {
             case,
             bridge_type,

@@ -5989,6 +5989,47 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         self.bridges.contains_key(arn)
     }
 
+    /// Why `arn` names no gateway this account holds, or `None` when the store holds a live
+    /// one for it. `member` is the request member that named it, for the refusal detail.
+    ///
+    /// The gateway-level counterpart of [`Self::unknown_bridge_rejection`]: a gateway ARN
+    /// names a resource THIS service mints ([`is_mintable_gateway_arn`]) and holds in
+    /// [`Self::gateways`], so a request that points at one is resolved against the store
+    /// rather than taken on trust — an ARN of the right shape for a gateway the account
+    /// never created names nothing.
+    pub fn unknown_gateway_rejection(&self, member: &str, arn: &str) -> Option<String> {
+        if self.holds_gateway(arn) {
+            return None;
+        }
+        Some(format!(
+            "{member} {arn:?} does not name a gateway this account holds."
+        ))
+    }
+
+    /// Whether the store holds a LIVE gateway for `arn` — the gateway-level counterpart of
+    /// [`Self::holds_bridge`].
+    ///
+    /// A gateway whose delete has been accepted does not count: the record is retired
+    /// ([`StoredGateway::is_retired`]) on its way to the terminal `DELETED` state, and
+    /// DeleteGateway only accepts a delete once nothing is placed on the gateway any more,
+    /// so a record stored against a retired gateway would name something the account has
+    /// already given up — the same reading [`Self::unknown_router_network_interface_rejection`]
+    /// takes of an interface whose removal is already owed.
+    pub fn holds_gateway(&self, arn: &str) -> bool {
+        self.live_gateway(arn).is_some()
+    }
+
+    /// The LIVE gateway `arn`, or `None` when the store holds no gateway for it or holds a
+    /// retired one. The crate's ONE reading of "a gateway of this account": every path that
+    /// resolves a gateway reference asks here ([`Self::unknown_gateway_rejection`],
+    /// [`Self::unknown_gateway_network_rejection`]), so they cannot disagree about which
+    /// gateways the account has.
+    pub fn live_gateway(&self, arn: &str) -> Option<&StoredGateway> {
+        self.gateways
+            .get(arn)
+            .filter(|gateway| !gateway.is_retired())
+    }
+
     /// Why the gateway bridge source a request would store on a FLOW SOURCE cannot be
     /// stored, or `None` when the reference it carries resolves — including when the request
     /// carries no bridge source, or a bridge source that names no bridge, because neither
@@ -6027,18 +6068,19 @@ impl ComAmazonawsMediaconnectMediaconnectState {
     /// the bridge is placed on (`Bridge$PlacementArn`), and those names are declared per
     /// gateway by CreateGateway: `GatewayNetwork$Name` "is used to reference the network and
     /// must be unique among networks in this gateway". The valid set is therefore the
-    /// placement gateway's own [`StoredGateway::networks`], and a name outside it references
-    /// nothing — including every name when the store holds no gateway for `placement_arn`,
-    /// which declares no network at all. The detail is the sentence the refusal's envelope
-    /// carries ([`validation_failed_message`]), as for every other reference this store
-    /// resolves.
+    /// placement gateway's own [`StoredGateway::networks`], read through the crate's one
+    /// reading of a gateway reference ([`Self::live_gateway`]), and a name outside it
+    /// references nothing — including every name when the store holds no live gateway for
+    /// `placement_arn`, which declares no network at all. The detail is the sentence the
+    /// refusal's envelope carries ([`validation_failed_message`]), as for every other
+    /// reference this store resolves.
     pub fn unknown_gateway_network_rejection(
         &self,
         member: &str,
         placement_arn: &str,
         network_name: &str,
     ) -> Option<String> {
-        let declared = self.gateways.get(placement_arn).is_some_and(|gateway| {
+        let declared = self.live_gateway(placement_arn).is_some_and(|gateway| {
             gateway
                 .networks
                 .iter()

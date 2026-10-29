@@ -27,19 +27,18 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
-use crate::bridge_lifecycle::{
-    create_bridge, describe_bridge, gateway_with_networks, minted_flow_arn,
-};
+use crate::bridge_lifecycle::{cloud_flow, create_bridge, describe_bridge, gateway_with_networks};
 use crate::bridge_members_and_deletion::{add_outputs, network_output, network_source};
 use crate::flow_lifecycle::Emulator;
 
 /// The one source every create below carries, of the kind the bridge's own direction
 /// admits: a cloud-to-ground (egress) bridge's content "comes from an existing MediaConnect
-/// flow", a ground-to-cloud (ingress) bridge's "originates at your premises".
-fn admitted_source(bridge_type: &Value) -> Value {
+/// flow" — `flow_arn`, a flow the account holds — and a ground-to-cloud (ingress) bridge's
+/// "originates at your premises".
+fn admitted_source(bridge_type: &Value, flow_arn: &str) -> Value {
     if bridge_type.get("egressGatewayBridge").is_some() {
         json!({ "flowSource": {
-            "flowArn": minted_flow_arn(1, "flow-output-admission"),
+            "flowArn": flow_arn,
             "name": "src",
         }})
     } else {
@@ -184,6 +183,9 @@ async fn only_a_cloud_to_ground_bridge_takes_the_outputs_a_request_configures() 
     // (`BridgeNetworkOutput$NetworkName`), which `crate::bridge_add_references` is the suite
     // for, so this one's rows vary only the direction and count rules it is about.
     let placement = gateway_with_networks(&emulator, "gw-output-admission", &["net-1"]).await;
+    // The cloud flow a cloud-to-ground bridge's content comes from, which the create
+    // resolves against the store.
+    let flow_arn = cloud_flow(&emulator, "flow-output-admission").await;
 
     for (index, row) in rows().into_iter().enumerate() {
         let Row {
@@ -199,7 +201,7 @@ async fn only_a_cloud_to_ground_bridge_takes_the_outputs_a_request_configures() 
         let mut body = json!({
             "name": format!("bridge-admission-{index}"),
             "placementArn": placement,
-            "sources": [admitted_source(&bridge_type)],
+            "sources": [admitted_source(&bridge_type, &flow_arn)],
         });
         for (member, settings) in bridge_type.as_object().expect("a bridge-type member") {
             body[member] = settings.clone();

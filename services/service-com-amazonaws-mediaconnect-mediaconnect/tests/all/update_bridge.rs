@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
-use crate::bridge_lifecycle::minted_gateway_arn;
+use crate::bridge_lifecycle::{cloud_flow, gateway_with_networks};
 use crate::flow_lifecycle::{Emulator, REGION};
 
 /// The members of a bridge UpdateBridge may write, and the ones it may not: the answer and
@@ -75,10 +75,11 @@ fn network_source(name: &str, port: i64) -> Value {
 
 /// One flow source, the kind a cloud-to-ground bridge ingests ("the content comes from an
 /// existing MediaConnect flow"), so an egress create below carries the one source
-/// CreateBridge requires.
-fn flow_source(name: &str, suffix: u64) -> Value {
+/// CreateBridge requires. `flow_arn` is a cloud flow the account holds, because the create
+/// resolves the flow its source names against the store.
+fn flow_source(name: &str, flow_arn: &str) -> Value {
     json!({ "flowSource": {
-        "flowArn": crate::bridge_lifecycle::minted_flow_arn(suffix, "flow-updates"),
+        "flowArn": flow_arn,
         "name": name,
     }})
 }
@@ -97,14 +98,18 @@ struct UpdateCase {
     failover: Value,
 }
 
-fn update_cases() -> Vec<UpdateCase> {
-    let placement = minted_gateway_arn(1, "gw-updates");
+/// The gateway every row is placed on and the cloud flow its egress rows take their
+/// content from are real records of this emulator: CreateBridge resolves both references
+/// against the store.
+async fn update_cases(emulator: &Emulator) -> Vec<UpdateCase> {
+    let placement = gateway_with_networks(emulator, "gw-updates", &["net-1"]).await;
+    let flow_arn = cloud_flow(emulator, "flow-updates").await;
     let egress = |name: &str, failover: Option<Value>| {
         let mut body = json!({
             "name": name,
             "placementArn": placement,
             "egressGatewayBridge": { "maxBitrate": 80_000_000 },
-            "sources": [flow_source("src", 1)],
+            "sources": [flow_source("src", &flow_arn)],
         });
         if let Some(config) = failover {
             body["sourceFailoverConfig"] = config;
@@ -280,7 +285,7 @@ fn update_cases() -> Vec<UpdateCase> {
 async fn update_bridge_applies_the_settings_it_carries_and_keeps_the_rest() {
     let emulator = Emulator::new();
 
-    for case in update_cases() {
+    for case in update_cases(&emulator).await {
         let UpdateCase {
             case,
             create,
@@ -351,7 +356,7 @@ async fn update_bridge_applies_the_settings_it_carries_and_keeps_the_rest() {
 #[tokio::test]
 async fn repeating_one_update_bridge_request_leaves_the_same_bridge() {
     let emulator = Emulator::new();
-    let placement = minted_gateway_arn(2, "gw-idempotent");
+    let placement = gateway_with_networks(&emulator, "gw-idempotent", &["net-1"]).await;
 
     let (status, _, created) = create_bridge(
         &emulator,
@@ -403,7 +408,8 @@ async fn repeating_one_update_bridge_request_leaves_the_same_bridge() {
 #[tokio::test]
 async fn an_update_bridge_request_the_bridge_cannot_satisfy_is_refused_and_writes_nothing() {
     let emulator = Emulator::new();
-    let placement = minted_gateway_arn(3, "gw-refusals");
+    let placement = gateway_with_networks(&emulator, "gw-refusals", &["net-1"]).await;
+    let flow_arn = cloud_flow(&emulator, "flow-refusals").await;
 
     let (_, _, egress_created) = create_bridge(
         &emulator,
@@ -411,7 +417,7 @@ async fn an_update_bridge_request_the_bridge_cannot_satisfy_is_refused_and_write
             "name": "bridge-egress-refusals",
             "placementArn": placement,
             "egressGatewayBridge": { "maxBitrate": 40_000_000 },
-            "sources": [flow_source("src", 2)],
+            "sources": [flow_source("src", &flow_arn)],
         }),
     )
     .await;
