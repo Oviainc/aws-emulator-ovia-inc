@@ -1750,53 +1750,26 @@ impl StoredEnvironment {
         note_modified_at(&mut self.modified_at_ms, at_ms);
     }
 
-    /// Drop the oldest host records this environment is FINISHED with, until it holds no
-    /// more than [`MAX_HOSTS_PER_ENVIRONMENT`].
+    /// Apply the retention rule ([`purge_finished_records`]) to this environment's host
+    /// map, whose cap is [`MAX_HOSTS_PER_ENVIRONMENT`].
     ///
-    /// The host counterpart of [`Self::purge_finished_connectors`], and retained on the
-    /// same terms: a `DELETED` host is kept so a later read still reports the deletion,
-    /// but only until the store needs the room, and a read of a purged host then answers
-    /// `ResourceNotFoundException`. A host that still occupies the environment
-    /// ([`Self::live_hosts`]) is never dropped, so a create/delete loop cannot grow the
-    /// map without bound.
+    /// So a `DELETED` host is kept while there is room for it and a read of a purged
+    /// host then answers `ResourceNotFoundException`, while a host that still occupies
+    /// the environment ([`Self::live_hosts`]) is never dropped — a create/delete loop
+    /// cannot grow the map without bound.
     pub fn purge_finished_hosts(&mut self) {
-        while self.hosts.len() > MAX_HOSTS_PER_ENVIRONMENT {
-            let Some(longest_deleted) = self
-                .hosts
-                .values()
-                .filter(|host| host.state == HOST_DELETED)
-                .min_by_key(|host| host.modified_at_ms)
-                .map(|host| host.host_name.clone())
-            else {
-                return;
-            };
-            self.hosts.remove(&longest_deleted);
-        }
+        purge_finished_records(&mut self.hosts, MAX_HOSTS_PER_ENVIRONMENT);
     }
 
-    /// Drop the oldest connector records this environment is FINISHED with, until it
-    /// holds no more than [`MAX_CONNECTORS_PER_ENVIRONMENT`].
+    /// Apply the retention rule ([`purge_finished_records`]) to this environment's
+    /// connector map, whose cap is [`MAX_CONNECTORS_PER_ENVIRONMENT`].
     ///
-    /// The retention rule for the one connector record kind nothing reads for its own
-    /// sake any more: a `DELETED` connector is kept so a later read still reports the
-    /// deletion, but only until the store needs the room, and a read of a purged id
-    /// then answers `ResourceNotFoundException`, which that error's own doc sanctions
-    /// ("The resource might not be specified correctly, or it may have a `state` of
-    /// `DELETED`"). A live record is never dropped, so a create/delete loop cannot grow
-    /// the map without bound.
+    /// So a `DELETED` connector is kept while there is room for it and a read of a
+    /// purged id then answers `ResourceNotFoundException`, which that error's own doc
+    /// sanctions ("The resource might not be specified correctly, or it may have a
+    /// `state` of `DELETED`"), while a live connector is never dropped.
     pub fn purge_finished_connectors(&mut self) {
-        while self.connectors.len() > MAX_CONNECTORS_PER_ENVIRONMENT {
-            let Some(longest_deleted) = self
-                .connectors
-                .values()
-                .filter(|connector| connector.state == CONNECTOR_DELETED)
-                .min_by_key(|connector| connector.modified_at_ms)
-                .map(|connector| connector.connector_id.clone())
-            else {
-                return;
-            };
-            self.connectors.remove(&longest_deleted);
-        }
+        purge_finished_records(&mut self.connectors, MAX_CONNECTORS_PER_ENVIRONMENT);
     }
 
     /// `environmentStatus`: the roll-up of the environment's `checks`, which
@@ -2100,6 +2073,96 @@ pub const MAX_CONNECTORS_PER_ENVIRONMENT: usize = 64;
 /// hosts-per-environment quota as adjustable, so no single value is the published one,
 /// and this is far above the deletions of any ordinary workflow.
 pub const MAX_HOSTS_PER_ENVIRONMENT: usize = 256;
+
+/// One record kind this store KEEPS after it is finished with, so a later read still
+/// reports the end of its life: an environment, a connector or a host.
+///
+/// Everything the retention rule [`MAX_ENVIRONMENTS`] states needs to know about a
+/// record, and nothing else — whether the record is finished with, and when it was
+/// finished — so that the rule itself lives in one place
+/// ([`purge_finished_records`]) however many record kinds are subject to it. A kind that
+/// gains a cap implements this and calls that helper rather than spelling the rule
+/// again.
+pub trait FinishedRecord {
+    /// Whether this record is FINISHED with: its own status enum has reached the
+    /// terminal value its kind declares for a record that is gone. A record that is
+    /// still live answers `false`, INCLUDING one on its way out whose deletion has not
+    /// come due yet — until then a read must still report it as present.
+    fn is_finished(&self) -> bool;
+
+    /// Epoch milliseconds this record last changed at, which for a finished record is
+    /// the instant it was finished at.
+    fn finished_at_ms(&self) -> i64;
+}
+
+impl FinishedRecord for StoredEnvironment {
+    fn is_finished(&self) -> bool {
+        self.state == STATE_DELETED
+    }
+
+    fn finished_at_ms(&self) -> i64 {
+        self.modified_at_ms
+    }
+}
+
+impl FinishedRecord for StoredConnector {
+    fn is_finished(&self) -> bool {
+        self.state == CONNECTOR_DELETED
+    }
+
+    fn finished_at_ms(&self) -> i64 {
+        self.modified_at_ms
+    }
+}
+
+impl FinishedRecord for StoredHost {
+    fn is_finished(&self) -> bool {
+        self.state == HOST_DELETED
+    }
+
+    fn finished_at_ms(&self) -> i64 {
+        self.modified_at_ms
+    }
+}
+
+/// The key of the record that has been FINISHED with longest, which is the one the
+/// retention rule reclaims first; `None` when every record is still live, and then
+/// there is nothing the rule may drop.
+///
+/// Ties break on the key, so which record makes room is a function of the stored
+/// records alone.
+pub fn longest_finished_record<R: FinishedRecord>(
+    records: &BTreeMap<String, R>,
+) -> Option<&String> {
+    records
+        .iter()
+        .filter(|(_, record)| record.is_finished())
+        .map(|(key, record)| (record.finished_at_ms(), key))
+        .min()
+        .map(|(_, key)| key)
+}
+
+/// THE retention rule [`MAX_ENVIRONMENTS`] states, applied to one map of records: while
+/// the map holds more than `limit`, the record that has been finished with longest is
+/// dropped to bring it back inside the limit.
+///
+/// A live record is never dropped, so a map whose every record is still live is left as
+/// it stands even above the limit — the callers that admit a new record ask
+/// [`longest_finished_record`] first and refuse instead. One implementation for every
+/// record kind that is kept after it is finished with
+/// ([`StoredEnvironment::purge_finished_hosts`],
+/// [`StoredEnvironment::purge_finished_connectors`],
+/// [`ComAmazonawsEvsAmazonelasticvmwareserviceState::reclaim_environment_slot`]), so a
+/// change to the rule — the tie-break, which records count as finished, what happens
+/// when nothing is purgeable — is made once.
+pub fn purge_finished_records<R: FinishedRecord>(records: &mut BTreeMap<String, R>, limit: usize) {
+    while records.len() > limit {
+        let Some(longest_finished) = longest_finished_record(records).cloned() else {
+            return;
+        };
+        records.remove(&longest_finished);
+    }
+}
 
 /// The most Elastic IP associations one VLAN subnet holds — the cap that bounds
 /// caller-driven growth of a VLAN's association list.
@@ -2593,37 +2656,22 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
     /// [`Self::reclaim_environment_slot`].
     pub fn has_room_for_environment(&self) -> bool {
         self.environments.len() < MAX_ENVIRONMENTS
-            || self.longest_deleted_environment().is_some()
+            || longest_finished_record(&self.environments).is_some()
     }
 
     /// Make the room [`Self::has_room_for_environment`] found, by purging the
     /// longest-deleted record once the store is at [`MAX_ENVIRONMENTS`]; below the cap
     /// there is nothing to purge.
     ///
+    /// The retention rule itself is [`purge_finished_records`], asked here for the room
+    /// ONE more environment needs: a store trimmed to one below the cap is a store the
+    /// insert below leaves at the cap.
+    ///
     /// Call it IMMEDIATELY before inserting the new environment, with nothing that can
     /// fail left in between: the purge is the one irreversible thing a create does to
     /// another record, so it must not happen for a create that then answers an error.
     pub fn reclaim_environment_slot(&mut self) {
-        if self.environments.len() < MAX_ENVIRONMENTS {
-            return;
-        }
-        if let Some(environment_id) = self.longest_deleted_environment() {
-            self.environments.remove(&environment_id);
-        }
-    }
-
-    /// The `environmentId` of the finished (`DELETED`) record that has been deleted
-    /// longest, which is the one the retention rule reclaims first. `None` when every
-    /// record is still live.
-    fn longest_deleted_environment(&self) -> Option<String> {
-        self.environments
-            .values()
-            .filter(|environment| environment.state == STATE_DELETED)
-            .min_by(|left, right| {
-                (left.modified_at_ms, left.environment_id.as_str())
-                    .cmp(&(right.modified_at_ms, right.environment_id.as_str()))
-            })
-            .map(|environment| environment.environment_id.clone())
+        purge_finished_records(&mut self.environments, MAX_ENVIRONMENTS.saturating_sub(1));
     }
 
     /// The environment `environment_id` names, if this service holds it IN `region`.

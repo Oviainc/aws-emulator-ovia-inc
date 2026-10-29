@@ -72,6 +72,8 @@ mod environment_health_checks;
 mod environment_lifecycle;
 #[path = "all/error_wire_status.rs"]
 mod error_wire_status;
+#[path = "all/finished_record_retention.rs"]
+mod finished_record_retention;
 #[path = "all/hcx_eip_associations.rs"]
 mod hcx_eip_associations;
 #[path = "all/host_deletion.rs"]
