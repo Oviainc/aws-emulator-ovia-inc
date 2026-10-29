@@ -17,6 +17,12 @@
 //! spellings of "no value to match" — an absent `ValueList`, which the rule itself
 //! refuses, and one present but empty, which the modelled `@length(min: 1)` on the list
 //! shape refuses at the boundary before the rule is reached.
+//!
+//! The same rule judges a filter's VALUES against the attribute it selects on wherever the
+//! model enumerates that attribute's values: the `Status` filter of `ListChangeSets`
+//! selects within `ChangeStatus`, so each member is accepted (selecting an empty page when
+//! no change set carries it) and a value naming no member is refused rather than silently
+//! matching nothing.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -380,6 +386,135 @@ async fn one_filter_rule_refuses_alike_in_every_list() {
                 "case {case:?}: the fault must name the ValueList member, got {reported:?}"
             );
         }
+    }
+}
+
+/// The members of the model's `ChangeStatus` enum, which `Filter$ValueList` names as the
+/// values the `Status` filter selects within ("`Status` - The supported `ValueList` is a
+/// list of statuses for all change set requests", `smithy_query(query="shape",
+/// shape="Filter")`; the members themselves from `smithy_query(query="shape",
+/// shape="ChangeStatus")`). Spelled out here so the test judges the service against the
+/// model rather than against the service's own constant.
+const CHANGE_STATUS_VALUES: &[&str] = &["PREPARING", "APPLYING", "SUCCEEDED", "CANCELLED", "FAILED"];
+
+/// Every member of `ChangeStatus` is a `Status` filter value the list accepts — including
+/// the statuses nothing in this store carries, which select an empty page rather than being
+/// refused — and a value naming NO member is refused instead of selecting nothing.
+#[tokio::test]
+async fn the_status_filter_judges_its_values_against_the_published_statuses() {
+    let router = emulator();
+    seed(&router).await;
+
+    // Every published member, one row each, plus a `ValueList` carrying several of them:
+    // a value the attribute can hold is served, whether or not any change set holds it.
+    let mut accepted: Vec<(String, Vec<&str>)> = CHANGE_STATUS_VALUES
+        .iter()
+        .map(|status| (format!("the published status {status}"), vec![*status]))
+        .collect();
+    accepted.push((
+        "every published status at once".to_string(),
+        CHANGE_STATUS_VALUES.to_vec(),
+    ));
+    accepted.push((
+        "two published statuses".to_string(),
+        vec!["SUCCEEDED", "FAILED"],
+    ));
+
+    for (case, values) in accepted {
+        let answer = call(
+            &router,
+            "/ListChangeSets",
+            json!({
+                "Catalog": CATALOG,
+                "FilterList": [{"Name": "Status", "ValueList": values}],
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: a published status must be accepted, got {} with {:?}",
+            answer.status, answer.body
+        );
+    }
+
+    // A value outside the published set, varied along how it misses it: the casing of a
+    // member, a typo, a status word from another API's vocabulary, a member of another
+    // enum of THIS model, an empty string, and a good member beside a bad one.
+    let refused: Vec<(String, Vec<&str>, &str)> = vec![
+        (
+            "a published member in another casing".to_string(),
+            vec!["Succeeded"],
+            "Succeeded",
+        ),
+        (
+            "a published member lower-cased".to_string(),
+            vec!["failed"],
+            "failed",
+        ),
+        ("a typo of a member".to_string(), vec!["SUCEEDED"], "SUCEEDED"),
+        (
+            "a status word from another API".to_string(),
+            vec!["COMPLETED"],
+            "COMPLETED",
+        ),
+        (
+            "a member of another enum of this model".to_string(),
+            vec!["CLIENT_ERROR"],
+            "CLIENT_ERROR",
+        ),
+        (
+            "a member carrying trailing space".to_string(),
+            vec!["SUCCEEDED "],
+            "SUCCEEDED ",
+        ),
+        (
+            "a published member beside one naming no status".to_string(),
+            vec!["SUCCEEDED", "Succeeded"],
+            "Succeeded",
+        ),
+    ];
+
+    for (case, values, offending) in refused {
+        let answer = call(
+            &router,
+            "/ListChangeSets",
+            json!({
+                "Catalog": CATALOG,
+                "FilterList": [{"Name": "Status", "ValueList": values}],
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 422,
+            "case {case:?}: a value naming no status must be refused with 422, \
+             got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            "ValidationException",
+            "case {case:?}: must answer ValidationException, got {:?}",
+            answer.body
+        );
+        let message = answer.message();
+        assert!(
+            message.contains(offending),
+            "case {case:?}: the fault must name the rejected value {offending:?}, \
+             got {message:?}"
+        );
+        for status in CHANGE_STATUS_VALUES {
+            assert!(
+                message.contains(status),
+                "case {case:?}: the fault must name the published status {status}, \
+                 got {message:?}"
+            );
+        }
+        let served = answer.list("/ChangeSetSummaryList").len();
+        assert_eq!(
+            served, 0,
+            "case {case:?}: a refused call serves no page, got {served} in {:?}",
+            answer.body
+        );
     }
 }
 

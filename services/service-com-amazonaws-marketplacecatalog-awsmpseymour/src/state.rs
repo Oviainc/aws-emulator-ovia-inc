@@ -20,6 +20,7 @@ use serde_json::{Map, Value};
 use crate::ops::types::{
     AccessDeniedException, AMISecuritySummary, AmiProductSummary, AssessmentSummary,
     AssessmentTargetFilter, AssessmentTargetSummary, ChangeSetSummaryListItem, ChangeSummary,
+    CHANGE_STATUS_VALUES,
     ContainerProductSummary, ContainerSecuritySummary, ControlAssessment, ControlError,
     DataProductSummary, Entity, EntitySummary, ErrorDetail, ErrorScope,
     ExpressPrivateOfferConfigurationSummary, Filter, FrameworkFilters, FrameworkSummary,
@@ -119,6 +120,30 @@ pub const CHANGE_SET_TIME_FILTER_NAMES: &[&str] = &[
     "BeforeStartTime",
 ];
 
+/// The `Filter$Name` whose `ValueList` entries name members of a set the model
+/// ENUMERATES rather than values a caller invents: `Filter$ValueList` documents
+/// it as "a list of statuses for all change set requests", and the statuses a
+/// change set request has are the members of `ChangeStatus`
+/// ([`CHANGE_STATUS_VALUES`]).
+pub const CHANGE_SET_STATUS_FILTER_NAME: &str = "Status";
+
+/// The closed set a `Filter$ValueList` entry of the filter `name` has to name,
+/// and the noun a refusal calls one of its members by — and `None` for a filter
+/// whose values are the names and ids a caller chose (a change set name, an
+/// entity id), which no published set bounds.
+///
+/// A filter selects on an attribute, so when the model enumerates that
+/// attribute's values, a filter value outside that enum names no value the
+/// attribute can hold — refused, as every other value of this service naming
+/// nothing the catalog has is refused, rather than silently selecting the empty
+/// page it would match.
+pub fn filter_value_set(name: &str) -> Option<(&'static str, &'static [&'static str])> {
+    match name {
+        CHANGE_SET_STATUS_FILTER_NAME => Some(("status", CHANGE_STATUS_VALUES)),
+        _ => None,
+    }
+}
+
 /// The `Sort$SortBy` values `ListChangeSets` accepts, from `Sort$SortBy`'s doc
 /// ("For `ListChangeSets`, supported attributes include `StartTime` and
 /// `EndTime`"). The first entry is the default.
@@ -156,11 +181,13 @@ pub fn sorts_descending(sort_order: &str) -> bool {
 /// that you want to apply" and names an attribute the list being called filters
 /// on, while `Filter$ValueList` is "the list of values" that filter matches — so
 /// a filter naming no attribute, one naming an attribute this list does not
-/// filter on, and one carrying no value to match are the three ways a filter is
-/// refused, each under the member it is about. This is the one place that
-/// decision is made, so every list operation judges the same `Filter` shape the
-/// same way: `operation` is the list being called and `filtered_on` the
-/// attributes it publishes.
+/// filter on, and one carrying no value to match are three ways a filter is
+/// refused, each under the member it is about. The fourth is a value the
+/// attribute cannot hold: where the model enumerates that attribute's values
+/// ([`filter_value_set`]), a value outside the published set is refused too.
+/// This is the one place those decisions are made, so every list operation
+/// judges the same `Filter` shape the same way: `operation` is the list being
+/// called and `filtered_on` the attributes it publishes.
 pub fn filter_predicate(
     operation: &str,
     filtered_on: &[&str],
@@ -184,6 +211,14 @@ pub fn filter_predicate(
             "FilterList.ValueList",
             format!("filter {name} carries no value to match"),
         ));
+    }
+    if let Some((noun, published)) = filter_value_set(&name) {
+        if let Some(outside) = values
+            .iter()
+            .find(|value| !published.contains(&value.as_str()))
+        {
+            return Err(invalid_choice(noun, outside, published));
+        }
     }
     Ok((name, values))
 }
@@ -795,8 +830,9 @@ impl ChangeSetRecord {
     /// Whether this change set satisfies the `ListChangeSets` filter `name`
     /// with `values`, as `Filter$ValueList`'s documentation defines each one.
     ///
-    /// A name outside [`CHANGE_SET_FILTER_NAMES`] never reaches here: the
-    /// handler refuses the request first.
+    /// A name outside [`CHANGE_SET_FILTER_NAMES`] never reaches here, and
+    /// neither does a value outside the set a filter's attribute publishes
+    /// ([`filter_value_set`]): the shared filter rule refuses the request first.
     pub fn matches_filter(&self, name: &str, values: &[String]) -> bool {
         let bound = values.first().map(String::as_str).unwrap_or_default();
         match name {
@@ -3475,16 +3511,25 @@ pub fn invalid_entity_id_message(entity_id: &str) -> String {
     )
 }
 
-/// The modelled `ValidationException` payload for a `Sort$SortBy` outside the
-/// attributes the list being called sorts on (`supported`).
+/// The modelled `ValidationException` payload for a request value outside the
+/// set this service publishes for the member that carried it.
 ///
-/// The message is built from the request — the attribute it asked to sort by and
-/// the set this list accepts — in the form the service states such a refusal in.
-pub fn invalid_sort_by(sort_by: &str, supported: &[&str]) -> ValidationException {
+/// The message is built from the request — the noun the value was asked for as,
+/// the value sent, and the set it had to name — in the form this service states
+/// such a refusal in (`[Requested sort by '…' is invalid. It should be one of
+/// '…'.]`). Every closed-set refusal goes through here, so a caller reading any
+/// of them reads the same sentence.
+pub fn invalid_choice(noun: &str, value: &str, supported: &[&str]) -> ValidationException {
     validation_message(format!(
-        "Requested sort by '{sort_by}' is invalid. It should be one of '{}'.",
+        "Requested {noun} '{value}' is invalid. It should be one of '{}'.",
         supported.join(", ")
     ))
+}
+
+/// The modelled `ValidationException` payload for a `Sort$SortBy` outside the
+/// attributes the list being called sorts on (`supported`).
+pub fn invalid_sort_by(sort_by: &str, supported: &[&str]) -> ValidationException {
+    invalid_choice("sort by", sort_by, supported)
 }
 
 /// The modelled `ResourceNotFoundException` payload for a change set id that

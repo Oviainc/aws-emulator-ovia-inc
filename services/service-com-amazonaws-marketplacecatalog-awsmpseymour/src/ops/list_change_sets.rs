@@ -168,7 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListChangeSetsErrorModeled::ValidationException(fault).into());
         }
 
-        // Each filter has to name one of the attributes this list filters on,
+        // Each filter has to name one of the attributes this list filters on
+        // and carry values that attribute can hold — a value outside the set
+        // the model publishes for it is refused by the shared filter rule —
         // and a before/after filter one instant to compare against.
         let filters = input.filter_list.unwrap_or_default();
         let mut predicates: Vec<(String, Vec<String>)> = Vec::with_capacity(filters.len());
