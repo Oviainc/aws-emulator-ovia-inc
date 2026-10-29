@@ -99,6 +99,8 @@ mod reported_defaults_and_preference_validation;
 mod shared_paging_rules;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/summary_resource_type_surface.rs"]
+mod summary_resource_type_surface;
 #[path = "all/timestamp_probe.rs"]
 mod timestamp_probe;
 #[path = "all/unrestricted_preference_resource_types.rs"]

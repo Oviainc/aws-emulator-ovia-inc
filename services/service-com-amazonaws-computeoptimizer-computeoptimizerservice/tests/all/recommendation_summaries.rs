@@ -19,6 +19,7 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::RECOMMENDATION_SOURCE_TYPE_VALUES;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::ANALYSIS_DELAY;
 
 use crate::harness::{call, emulator, error_code, opt_in};
@@ -67,24 +68,6 @@ const FINDINGS_BY_RESOURCE_TYPE: &[(&str, &[&str])] = &[
             "NotOptimized",
         ],
     ),
-];
-
-/// The `RecommendationSourceType` values this service summarises WITHOUT a `Finding`
-/// vocabulary: the resource kinds Compute Optimizer reports only as idle resources, so a
-/// summary of one counts what was found idle and no rightsizing finding at all.
-///
-/// Source: the model's `IdleRecommendationResourceType` enum
-/// (`crate::ops::types::IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES`) less the resource types
-/// the `GetRecommendationSummaries` documentation above names a finding vocabulary for.
-/// What a summary of one reports is asserted in `tests/all/idle_recommendation_summaries.rs`.
-const IDLE_ONLY_RESOURCE_TYPES: &[&str] = &[
-    "NatGateway",
-    "DynamoDBTable",
-    "ElastiCacheCluster",
-    "MemoryDBCluster",
-    "DocumentDBCluster",
-    "WorkSpaces",
-    "SageMakerEndpoint",
 ];
 
 /// The model's `IdleFinding` enum (`crate::ops::types::IDLE_FINDING_VALUES`), the only
@@ -147,9 +130,9 @@ fn number(value: &Value, case: &str) -> f64 {
 
 /// Before the account opts in there are no findings to summarise at all, and the service
 /// says so with the modelled `OptInRequiredException` (HTTP 403) rather than an empty
-/// answer; an account that has just opted in is summarised over no rows, because the
-/// analysis its enrollment started is not due yet; once it is, every summary reported is the
-/// caller's own account's.
+/// answer; an opted-in account is summarised per resource type the service reports
+/// recommendations for, whether or not the analysis its enrollment started is due yet, and
+/// every summary reported is the caller's own account's.
 #[tokio::test]
 async fn summaries_need_the_account_to_be_opted_in_and_report_the_caller_account() {
     let router = emulator();
@@ -166,40 +149,38 @@ async fn summaries_need_the_account_to_be_opted_in_and_report_the_caller_account
     );
 
     opt_in(&router).await;
-    let fresh = get_summaries(&router, json!({})).await;
-    assert_eq!(
-        summaries_of(&fresh),
-        Vec::<Value>::new(),
-        "just opted in: the analysis is not due yet, so there is nothing to summarise, got \
-         {fresh}"
-    );
-
-    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
-    let body = get_summaries(&router, json!({})).await;
-    let summaries = summaries_of(&body);
-    assert!(
-        !summaries.is_empty(),
-        "once the analysis is due: the account's analysed resources must be summarised, got \
-         {body}"
-    );
-    for summary in &summaries {
-        let case = summary["recommendationResourceType"].to_string();
-        assert_eq!(
-            summary["accountId"].as_str(),
-            Some(caller_account().as_str()),
-            "case {case:?}: a summary reports the account whose resources it covers, got \
-             {summary}"
-        );
+    // Rows: the two phases of one enrollment — the analysis not due yet, and due. The set of
+    // summaries is the same in both, because a summary is a count roll-up per resource type
+    // and the analysis decides what those counts ARE, not whether the resource type is
+    // summarised.
+    for phase in ["just opted in", "the analysis is due"] {
+        if phase == "the analysis is due" {
+            tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+        }
+        let body = get_summaries(&router, json!({})).await;
+        let summaries = summaries_of(&body);
         assert!(
-            FINDINGS_BY_RESOURCE_TYPE
-                .iter()
-                .any(|(resource_type, _)| summary["recommendationResourceType"] == *resource_type)
-                || IDLE_ONLY_RESOURCE_TYPES
-                    .iter()
-                    .any(|resource_type| summary["recommendationResourceType"] == *resource_type),
-            "case {case:?}: recommendationResourceType must be a resource type the service \
-             summarises, got {summary}"
+            !summaries.is_empty(),
+            "case {phase:?}: an opted-in account is summarised per resource type the service \
+             reports recommendations for, got {body}"
         );
+        for summary in &summaries {
+            let resource_type = summary["recommendationResourceType"]
+                .as_str()
+                .unwrap_or_default();
+            let case = format!("{phase}/{resource_type}");
+            assert_eq!(
+                summary["accountId"].as_str(),
+                Some(caller_account().as_str()),
+                "case {case:?}: a summary reports the account whose resources it covers, got \
+                 {summary}"
+            );
+            assert!(
+                RECOMMENDATION_SOURCE_TYPE_VALUES.contains(&resource_type),
+                "case {case:?}: recommendationResourceType must be a RecommendationSourceType, \
+                 got {summary}"
+            );
+        }
     }
 
     // Opting back out takes the findings away again: the gate is the stored enrollment,
@@ -254,10 +235,10 @@ async fn every_summary_is_its_resource_type_s_resources_counted_and_costed() {
             .map(|(_, findings)| *findings)
             .unwrap_or_else(|| {
                 // A resource type the service names no `Finding` vocabulary for carries no
-                // rightsizing counts at all; it is summarised because resources of it were
-                // found idle.
+                // rightsizing counts at all; it is summarised because the service reports
+                // recommendations for resources of it.
                 assert!(
-                    IDLE_ONLY_RESOURCE_TYPES.contains(&resource_type.as_str()),
+                    RECOMMENDATION_SOURCE_TYPE_VALUES.contains(&resource_type.as_str()),
                     "case {case:?}: unknown resource type in {summary}"
                 );
                 &[]
@@ -316,11 +297,6 @@ async fn every_summary_is_its_resource_type_s_resources_counted_and_costed() {
         }
         let mut idle_resources = 0.0;
         let idle_counts = summary["idleSummaries"].as_array().cloned();
-        assert!(
-            resources > 0.0 || idle_counts.is_some(),
-            "case {case:?}: a resource type is summarised only where the account has analysed \
-             resources of it or resources of it were found idle, got {summary}"
-        );
 
         let ratings = &summary["currentPerformanceRiskRatings"];
         let rated = ["high", "medium", "low", "veryLow"]

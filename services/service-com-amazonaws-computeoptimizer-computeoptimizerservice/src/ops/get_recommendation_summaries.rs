@@ -5,13 +5,17 @@
 //! IMPLEMENTED: aggregates EVERYTHING the service holds for the account — its FINDINGS
 //! CATALOG (`crate::state::AnalysedResource`) and its IDLE resource analysis
 //! (`crate::state::IdleResourceAnalysis`, what `GetIdleRecommendations` reports) — into one
-//! summary per `RecommendationSourceType` the account has a record of either kind for: how
-//! many of its rightsized resources carry each `Finding` the service reports for that
-//! resource type and why, how many of its resources the analysis found idle at each
-//! `IdleFinding`, how many run each `CurrentPerformanceRisk`, and what adopting the
-//! rightsizing recommendations, the idle ones, and both together would save per month — one
-//! page at a time: at most `maxResults` summaries plus an opaque `nextToken` while summaries
-//! remain.
+//! summary per `RecommendationSourceType` the service reports recommendations for
+//! ([`crate::state::summarised_resource_types`]): how many of the account's rightsized
+//! resources carry each `Finding` the service reports for that resource type and why, how
+//! many of its resources the analysis found idle at each `IdleFinding`, how many run each
+//! `CurrentPerformanceRisk`, and what adopting the rightsizing recommendations, the idle
+//! ones, and both together would save per month — one page at a time: at most `maxResults`
+//! summaries plus an opaque `nextToken` while summaries remain.
+//!
+//! A summary is a COUNT ROLL-UP, so the summaries an enrolled account reads are that whole
+//! vocabulary and not the part of it the analysis holds a row of: a resource type nothing of
+//! which has been analysed is summarised with counts of zero.
 //!
 //! Every number is computed from the stored rows, so a count, a saving and a percentage
 //! can never disagree with each other or with the per-resource findings those same rows
@@ -251,20 +255,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The records a caller can read, grouped by resource type: the rightsizing catalog
         // and the idle analysis. A caller sees either only once the analysis its enrollment
         // started is due
-        // ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::visible_analysed_resources`]),
-        // so a just-enrolled account is summarised over no rows rather than over an analysis
-        // nothing has produced yet — the same gate the per-resource readers apply.
+        // ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::visible_analysed_resources`]) —
+        // the same gate the per-resource readers apply — so that gate decides what the counts
+        // below ARE and not which resource types are summarised.
         let analysed = guard.analysed_resources_by_type(&account_id);
         let idle = guard.idle_analyses_by_source_type(&account_id);
-        // One summary per resource type the account has a record of EITHER kind for, in one
-        // stable order: a resource type the service holds only idle resources of is
-        // summarised too, because the idle finding is as much a recommendation for it as a
-        // rightsizing finding is for a catalogued one.
-        let resource_types: ::std::collections::BTreeSet<&str> = analysed
-            .keys()
-            .copied()
-            .chain(idle.keys().copied())
-            .collect();
+        // One summary per resource type this service reports recommendations for
+        // ([`crate::state::summarised_resource_types`]), in one stable order, together with
+        // any resource type the account holds a record of outside that vocabulary so no group
+        // the store holds goes unsummarised. A summary is a COUNT ROLL-UP of the account's
+        // records of its resource type, so a resource type the account has no record of is
+        // summarised with counts of zero rather than left out: that is what tells a caller
+        // "enrolled, nothing to optimize of this kind" apart from "no such surface".
+        let resource_types: ::std::collections::BTreeSet<&str> =
+            crate::state::summarised_resource_types()
+                .iter()
+                .copied()
+                .chain(analysed.keys().copied())
+                .chain(idle.keys().copied())
+                .collect();
         for resource_type in resource_types {
             let resources = analysed
                 .get(resource_type)
@@ -274,14 +283,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .get(resource_type)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            // A resource type this service names no `Finding` vocabulary for and holds no
-            // idle resource of is not summarised, rather than summarised with an invented
-            // vocabulary or over nothing.
-            if crate::state::findings_reported_for(resource_type).is_empty()
-                && idle_resources.is_empty()
-            {
-                continue;
-            }
             if resume_at.as_deref().is_some_and(|start| resource_type < start) {
                 continue;
             }

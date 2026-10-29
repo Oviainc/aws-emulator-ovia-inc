@@ -2463,6 +2463,26 @@ pub const SOURCE_TYPE_WORKSPACES: &str = "WorkSpaces";
 /// See [`SOURCE_TYPE_NAT_GATEWAY`].
 pub const SOURCE_TYPE_SAGEMAKER_ENDPOINT: &str = "SageMakerEndpoint";
 
+/// The `RecommendationSourceType` values an enrolled account's recommendation summaries
+/// cover: every resource type this service reports recommendations for, which is the model's
+/// own `RecommendationSourceType` vocabulary
+/// (`crate::ops::types::RECOMMENDATION_SOURCE_TYPE_VALUES`).
+///
+/// A recommendation summary is a COUNT ROLL-UP per resource type — `Summary$value` is a
+/// count whose default is `0` — so the summaries an enrolled account is answered with are
+/// this whole vocabulary rather than the subset the analysis happens to hold a row of: a
+/// resource type nothing of which has been analysed is summarised with counts of zero, which
+/// is how a caller reads an enrolled account's zero-finding baseline instead of being unable
+/// to tell it from no summary surface at all.
+///
+/// What a summary COUNTS is the analysis a caller can read
+/// ([`ComAmazonawsComputeoptimizerComputeoptimizerserviceState::visible_analysed_resources`]),
+/// so the analysis an enrollment starts ([`ANALYSIS_DELAY`]) decides what the counts ARE and
+/// never whether the summary exists.
+pub fn summarised_resource_types() -> &'static [&'static str] {
+    RECOMMENDATION_SOURCE_TYPE_VALUES
+}
+
 /// The `Finding` values a summary of `resource_type` reports a count for, from the
 /// `GetRecommendationSummaries` documentation: "It returns the number of: Amazon EC2
 /// instances in an account that are Underprovisioned, Overprovisioned, or Optimized.

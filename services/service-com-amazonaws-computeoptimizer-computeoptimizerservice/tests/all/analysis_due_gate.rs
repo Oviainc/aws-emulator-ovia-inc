@@ -11,9 +11,12 @@
 //! The rule is about the ANALYSIS, not about one reader, so what is asserted here is the
 //! whole class of readers against it: every reader of this service's stored analysis is
 //! driven through the same four phases of one enrollment, each row differing in the resource
-//! type it reports on, in whether it lists an account's analysis or reports ONE named
-//! resource's, and so in how "no analysis yet" reaches a client — an empty list from a
-//! lister, the modelled `ResourceNotFoundException` from a reader of one resource.
+//! type it reports on, in whether it lists an account's analysis, rolls it up per resource
+//! type or reports ONE named resource's, and so in how "no analysis yet" reaches a client —
+//! an empty list from a lister, counts of zero from the roll-up, whose entries are the
+//! resource types the service reports recommendations for and so exist as soon as the
+//! account is enrolled, and the modelled `ResourceNotFoundException` from a reader of one
+//! resource.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +41,12 @@ enum NoAnalysis {
     /// The reader LISTS an account's analysis, so it reports the empty list under this
     /// member — an account with nothing analysed is not a failed request.
     EmptyList(&'static str),
+    /// The reader ROLLS the account's analysis UP per resource type the service reports
+    /// recommendations for, so its entries are that vocabulary whatever the analysis holds:
+    /// while the analysis is not due it reports an entry per resource type with every count
+    /// at zero, which is how a caller tells an enrolled account with nothing analysed apart
+    /// from an account with no such surface.
+    ZeroCounts(&'static str),
     /// The reader reports ONE named resource's analysis and models no per-resource error
     /// list, so a resource with no analysis is "a resource that is required for the action
     /// doesn't exist" (HTTP 404 `ResourceNotFoundException`).
@@ -79,7 +88,11 @@ fn readers(instance_arn: &str, database_arn: &str) -> Vec<Reader> {
         lister("GetLicenseRecommendations", "licenseRecommendations"),
         lister("GetIdleRecommendations", "idleRecommendations"),
         lister("GetRDSDatabaseRecommendations", "rdsDBRecommendations"),
-        lister("GetRecommendationSummaries", "recommendationSummaries"),
+        Reader {
+            operation: "GetRecommendationSummaries",
+            request: json!({}),
+            no_analysis: NoAnalysis::ZeroCounts("recommendationSummaries"),
+        },
         Reader {
             operation: "GetEC2RecommendationProjectedMetrics",
             request: json!({
@@ -111,6 +124,42 @@ fn items(case: &str, member: &str, body: &Value) -> Vec<Value> {
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected {member} to be a list, got {body}"))
         .clone()
+}
+
+/// Every count one roll-up entry carries is zero: the account has nothing analysed yet, so
+/// each `Summary` count, each `CurrentPerformanceRisk` rating and each saving it states is
+/// nothing, and the members that describe records the analysis holds none of are absent.
+fn assert_counts_are_zero(case: &str, entry: &Value) {
+    let resource_type = entry["recommendationResourceType"]
+        .as_str()
+        .unwrap_or_default();
+    for count in entry["summaries"].as_array().cloned().unwrap_or_default() {
+        assert_eq!(
+            count["value"].as_f64(),
+            Some(0.0),
+            "case {case:?}/{resource_type}: nothing is analysed yet, so every finding counts \
+             zero resources, got {count}"
+        );
+    }
+    for rating in ["high", "medium", "low", "veryLow"] {
+        assert_eq!(
+            entry["currentPerformanceRiskRatings"][rating].as_f64(),
+            Some(0.0),
+            "case {case:?}/{resource_type}: nothing is analysed yet, so no resource runs the \
+             {rating} risk, got {entry}"
+        );
+    }
+    assert_eq!(
+        entry["savingsOpportunity"]["estimatedMonthlySavings"]["value"].as_f64(),
+        Some(0.0),
+        "case {case:?}/{resource_type}: nothing is analysed yet, so there is nothing to save, \
+         got {entry}"
+    );
+    assert!(
+        entry["idleSummaries"].is_null() && entry["idleSavingsOpportunity"].is_null(),
+        "case {case:?}/{resource_type}: nothing was found idle yet, so neither idle member is \
+         reported, got {entry}"
+    );
 }
 
 /// Every reader is refused with the modelled `OptInRequiredException` (HTTP 403).
@@ -183,6 +232,22 @@ async fn every_reader_of_the_analysis_waits_for_the_enrollment_and_the_analysis(
                      {body}"
                 );
             }
+            NoAnalysis::ZeroCounts(member) => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: an account with nothing analysed is not a failed request, \
+                     expected 200, got {status}: {body}"
+                );
+                let rolled_up = items(&case, member, &body);
+                assert!(
+                    !rolled_up.is_empty(),
+                    "case {case:?}: a roll-up of the analysis per resource type is reported for \
+                     an enrolled account whether or not the analysis is due, got {body}"
+                );
+                for entry in &rolled_up {
+                    assert_counts_are_zero(&case, entry);
+                }
+            }
             NoAnalysis::NotFound => {
                 assert_eq!(
                     status, 404,
@@ -210,7 +275,7 @@ async fn every_reader_of_the_analysis_waits_for_the_enrollment_and_the_analysis(
              {body}"
         );
         match reader.no_analysis {
-            NoAnalysis::EmptyList(member) => assert!(
+            NoAnalysis::EmptyList(member) | NoAnalysis::ZeroCounts(member) => assert!(
                 !items(&case, member, &body).is_empty(),
                 "case {case:?}: once the analysis is due {member} carries it, got {body}"
             ),
