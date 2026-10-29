@@ -208,37 +208,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // The `resolveTo` filter is a resource reference: a type and an id that
-        // together name one resolved resource, so half of the pair identifies
-        // nothing and is refused as the bad request it is. `ResolveToResourceType`
-        // models the single value `ASSET`, which the runtime has already checked,
-        // so the id names an asset — and one that is absent draws the same refusal
-        // the target does.
-        let resolved_asset = match (
-            input.resolve_to_resource_type.as_deref(),
-            input.resolve_to_resource_id.as_deref(),
-        ) {
-            (Some(_), Some(asset_id)) => {
-                if !store.assets.contains_key(asset_id) {
-                    return Err(not_found(crate::state::not_found_message(
-                        crate::state::RESOURCE_ASSET,
-                        asset_id,
-                    )));
+        // The `resolveTo` filter is a resource reference, which this service
+        // resolves in ONE place: half of the pair identifies nothing and is
+        // refused as the bad request it is, and an id naming no stored asset
+        // draws the same absence refusal the target does. This operation only
+        // lifts each refusal into its own modelled error.
+        let resolved_asset = store
+            .resolve_to_asset(
+                input.resolve_to_resource_type.as_deref(),
+                input.resolve_to_resource_id.as_deref(),
+            )
+            .map_err(|refusal| {
+                let message = refusal.message();
+                match refusal {
+                    crate::state::ResolveToRefusal::StatedByHalves { .. } => {
+                        invalid_request(&message)
+                    }
+                    crate::state::ResolveToRefusal::AssetNotFound(_) => not_found(message),
                 }
-                Some(asset_id)
-            }
-            (None, None) => None,
-            (Some(_), None) => {
-                return Err(invalid_request(
-                    "resolveToResourceId is required when resolveToResourceType is specified.",
-                ))
-            }
-            (None, Some(_)) => {
-                return Err(invalid_request(
-                    "resolveToResourceType is required when resolveToResourceId is specified.",
-                ))
-            }
-        };
+            })?;
 
         // Every stored execution of the named target resource, narrowed by the
         // filters the request carries: the type of action executed, and the

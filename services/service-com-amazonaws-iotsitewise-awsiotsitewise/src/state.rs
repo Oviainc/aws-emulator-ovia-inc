@@ -3025,6 +3025,90 @@ pub fn target_resource_reference(
     }
 }
 
+/// The member a request states the TYPE of the resolved resource with. Source:
+/// `smithy_query(query="operation", operation="ListActions")` —
+/// `resolveToResourceType (ResolveToResourceType, one of: ASSET)`.
+pub const RESOLVE_TO_RESOURCE_TYPE_MEMBER: &str = "resolveToResourceType";
+
+/// The member a request states the ID of the resolved resource with. See
+/// [`RESOLVE_TO_RESOURCE_TYPE_MEMBER`] for the source of the pair.
+pub const RESOLVE_TO_RESOURCE_ID_MEMBER: &str = "resolveToResourceId";
+
+/// Why a `(resolveToResourceType, resolveToResourceId)` pair names no one
+/// resolved resource.
+///
+/// Described structurally rather than as one error type, for the reason
+/// [`TripleRefusal`] gives: each operation taking the pair declares its own
+/// modelled error set and maps these onto its own variants — a pair stated by
+/// halves onto its invalid-request error, an absent resource onto its not-found
+/// error — while [`ResolveToRefusal::message`] is the shared wording.
+#[derive(Debug, Clone)]
+pub enum ResolveToRefusal {
+    /// Only one half of the pair was stated, so it addresses nothing: `stated`
+    /// is the member the request gave, `missing` the one it left out.
+    StatedByHalves {
+        stated: &'static str,
+        missing: &'static str,
+    },
+    /// The pair addresses an asset this store does not hold.
+    AssetNotFound(String),
+}
+
+impl ResolveToRefusal {
+    /// What the caller is told.
+    pub fn message(&self) -> String {
+        match self {
+            Self::StatedByHalves { stated, missing } => {
+                format!("{missing} is required when {stated} is specified.")
+            }
+            Self::AssetNotFound(asset_id) => not_found_message(RESOURCE_ASSET, asset_id),
+        }
+    }
+}
+
+impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
+    /// The asset a `(resolveToResourceType, resolveToResourceId)` pair addresses,
+    /// `None` when the request stated neither member, or the refusal the pair
+    /// draws.
+    ///
+    /// The pair is a resource reference — a type and an id that TOGETHER name one
+    /// resolved resource — so half of it addresses nothing and is refused as the
+    /// bad request it is, and an id this store holds no asset for draws the same
+    /// absence refusal every other addressed resource does.
+    /// `ResolveToResourceType` models the single value `ASSET`, which the runtime
+    /// checks before any handler runs, so the id names an asset.
+    ///
+    /// The single definition for every operation that narrows to a resolved
+    /// resource — the two listings scoped to a target resource and a computation
+    /// model's execution summary — so a resolved resource is addressed
+    /// identically wherever a request names one, exactly as
+    /// [`target_resource_reference`] does for the sibling reference.
+    pub fn resolve_to_asset<'a>(
+        &self,
+        resolve_to_resource_type: Option<&str>,
+        resolve_to_resource_id: Option<&'a str>,
+    ) -> Result<Option<&'a str>, ResolveToRefusal> {
+        match (resolve_to_resource_type, resolve_to_resource_id) {
+            (Some(_), Some(asset_id)) => {
+                if self.assets.contains_key(asset_id) {
+                    Ok(Some(asset_id))
+                } else {
+                    Err(ResolveToRefusal::AssetNotFound(asset_id.to_string()))
+                }
+            }
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(ResolveToRefusal::StatedByHalves {
+                stated: RESOLVE_TO_RESOURCE_TYPE_MEMBER,
+                missing: RESOLVE_TO_RESOURCE_ID_MEMBER,
+            }),
+            (None, Some(_)) => Err(ResolveToRefusal::StatedByHalves {
+                stated: RESOLVE_TO_RESOURCE_ID_MEMBER,
+                missing: RESOLVE_TO_RESOURCE_TYPE_MEMBER,
+            }),
+        }
+    }
+}
+
 /// One execution of an action on a target resource: what `ListExecutions`
 /// summarises, keyed by its own `executionId` in
 /// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::executions`].
