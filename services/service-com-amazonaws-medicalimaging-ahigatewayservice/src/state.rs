@@ -596,6 +596,36 @@ pub fn handler_requirement_error(path: &str, value: Option<&str>, requirement: &
     format!("1 validation error detected: {clause}")
 }
 
+/// The requirement a member documented as carrying a document in the shape of the
+/// aggregated DICOM metadata document states when its text does not parse as JSON at all.
+pub const METADATA_DOCUMENT_REQUIREMENT: &str = "Member must be a JSON document";
+
+/// The requirement that same member states when its text parses as JSON but is not an
+/// OBJECT — a scalar, `null` or an array names no level of the document and so names
+/// neither an attribute nor a SOP instance.
+pub const METADATA_OBJECT_REQUIREMENT: &str = "Member must be a JSON object of DICOM attributes";
+
+/// The aggregated-metadata document `text` carries, or the requirement it fails.
+///
+/// Every member this service documents as carrying "a document" in the shape of the
+/// aggregated metadata document — the object [`METADATA_SCHEMA_VERSION_KEY`],
+/// [`METADATA_PATIENT_KEY`] and [`METADATA_STUDY_KEY`] are the levels of, which
+/// `GetImageSetMetadata` serves — is read through here, so one rule decides them all: the
+/// text has to parse as JSON, and what it parses to has to be an OBJECT, because any other
+/// JSON value carries no level of that document and therefore names nothing the member is
+/// documented to name. The error is the REQUIREMENT the value failed, for the caller to
+/// word through [`handler_requirement_error`] with the path of the member it is about; the
+/// value itself is never part of it, since every member read this way is `@sensitive`.
+pub fn metadata_document(
+    text: &[u8],
+) -> Result<::serde_json::Map<String, ::serde_json::Value>, &'static str> {
+    match ::serde_json::from_slice::<::serde_json::Value>(text) {
+        Ok(::serde_json::Value::Object(document)) => Ok(document),
+        Ok(_) => Err(METADATA_OBJECT_REQUIREMENT),
+        Err(_) => Err(METADATA_DOCUMENT_REQUIREMENT),
+    }
+}
+
 /// The validation path of ONE ELEMENT of an input list, for a refusal a handler raises
 /// about that element.
 ///

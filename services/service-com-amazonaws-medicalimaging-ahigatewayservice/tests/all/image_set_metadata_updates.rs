@@ -130,7 +130,10 @@ pub(crate) fn seed_image_set(emulator: &Emulator, datastore_id: &str, tags: DICO
 /// The `updateImageSetMetadataUpdates` payload for a `DICOMUpdates` update, with each
 /// document carried RAW — so a case can send bytes that are not a document at all. A blob
 /// member is base64 inside a JSON body, which is how an SDK client sends one.
-fn dicom_updates_raw(updatable: Option<&str>, removable: Option<&str>) -> Value {
+///
+/// `pub(crate)` because `crate::metadata_document_shape` drives the SHAPE rule these two
+/// blobs share with `CopyImageSet`'s selector through this same payload.
+pub(crate) fn dicom_updates_raw(updatable: Option<&str>, removable: Option<&str>) -> Value {
     let mut updates = json!({});
     if let Some(document) = updatable {
         updates["updatableAttributes"] = json!(aws_smithy_types::base64::encode(document));

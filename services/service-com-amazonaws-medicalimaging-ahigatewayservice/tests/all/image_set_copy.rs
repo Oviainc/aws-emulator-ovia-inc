@@ -26,8 +26,9 @@
 //!
 //! Every suite is a TABLE whose rows differ along what the rule generalises over:
 //! whether the destination is minted or versioned, how many versions each image set
-//! already holds, which optional flags the request carries, which JSON form
-//! `copiableAttributes` takes, and which resource or version the request gets wrong.
+//! already holds, which optional flags the request carries, what the
+//! `copiableAttributes` document names, and which resource or version the request gets
+//! wrong.
 //! Each case drives real HTTP through the production front door, so what is asserted
 //! is the wire behaviour a `medical-imaging` SDK client sees.
 //!
@@ -198,7 +199,8 @@ struct CopyCase {
 /// The rows span: minting a destination versus versioning one; a source and a
 /// destination at one, two and three versions; a source and a destination inside and
 /// outside the primary DICOM hierarchy; each optional flag present-true, present-false
-/// and absent; and `copiableAttributes` present as an object, as an array and absent.
+/// and absent; and `copiableAttributes` present as a document naming no instance, as a
+/// document naming one, and absent.
 fn copy_cases() -> Vec<CopyCase> {
     vec![
         CopyCase {
@@ -272,7 +274,9 @@ fn copy_cases() -> Vec<CopyCase> {
             destination_is_primary: true,
             force: Some(true),
             promote_to_primary: Some(false),
-            copiable_attributes: Some(r#"[{"SOPInstanceUID":"1.2.840.10008.1.2.1"}]"#),
+            copiable_attributes: Some(
+                r#"{"Study":{"Series":{"1.2.3":{"Instances":{"1.2.840.10008.1.2.1":{}}}}}}"#,
+            ),
             expected_destination_version: 4,
             expected_destination_primary: true,
         },
@@ -898,85 +902,7 @@ async fn a_destination_naming_the_source_is_refused() {
     }
 }
 
-/// `copiableAttributes` is documented as a JSON string, so every JSON document is
-/// admitted and a value that is not one is refused — without the value appearing in the
-/// refusal, since the model marks the member `@sensitive`.
-#[tokio::test]
-async fn copiable_attributes_must_be_a_json_document() {
-    // Rows span the JSON forms: object, nested object, array, string, number, boolean,
-    // null — and then the non-JSON forms a caller can send.
-    let accepted = [
-        r#"{"SchemaVersion":"1.1"}"#,
-        r#"{"Study":{"Series":{"1.2.3":{"Instances":{}}}}}"#,
-        r#"[{"SOPInstanceUID":"1.2.3"},{"SOPInstanceUID":"1.2.4"}]"#,
-        r#""1.2.840.10008""#,
-        "42",
-        "true",
-        "null",
-    ];
-    let refused = [
-        "{",
-        "not json at all",
-        " ",
-        r#"{"Study":}"#,
-        r#"{"Study": "unterminated}"#,
-        "[1,2",
-    ];
-
-    for attributes in accepted {
-        let emulator = Emulator::new();
-        let datastore_id = emulator.active_datastore("json.store", "json").await;
-        let source_id = seed_image_set(&emulator, &datastore_id, 1);
-        let answer = copy_image_set(
-            &emulator,
-            &datastore_id,
-            &source_id,
-            information("1", Some(attributes), None),
-            &[],
-        )
-        .await;
-        assert_eq!(
-            answer.status, 200,
-            "case accepted={attributes:?}: a JSON document must be admitted, got {answer:?}"
-        );
-    }
-
-    for attributes in refused {
-        let emulator = Emulator::new();
-        let datastore_id = emulator.active_datastore("json.store", "json").await;
-        let source_id = seed_image_set(&emulator, &datastore_id, 1);
-        let answer = copy_image_set(
-            &emulator,
-            &datastore_id,
-            &source_id,
-            information("1", Some(attributes), None),
-            &[],
-        )
-        .await;
-        assert_eq!(
-            answer.status, 400,
-            "case refused={attributes:?}: a value that is not JSON must be refused, got {answer:?}"
-        );
-        assert_eq!(
-            answer.error_code, "ValidationException",
-            "case refused={attributes:?}: wrong error code, got {answer:?}"
-        );
-        let message = answer.string(&["message"]);
-        assert!(
-            message.contains("copiableAttributes"),
-            "case refused={attributes:?}: the refusal must name the member, got {message:?}"
-        );
-        assert!(
-            !message.contains(attributes.trim()) || attributes.trim().is_empty(),
-            "case refused={attributes:?}: a `@sensitive` value must not be echoed, got {message:?}"
-        );
-
-        // And nothing was written: the source is still ACTIVE at version 1.
-        let read = get_image_set(&emulator, &datastore_id, &source_id, None).await;
-        assert_eq!(
-            read.string(&["imageSetState"]),
-            "ACTIVE",
-            "case refused={attributes:?}: a refusal must write nothing, got {read:?}"
-        );
-    }
-}
+// Which JSON forms `copiableAttributes` admits, and the refusal every other form draws,
+// is the rule `crate::metadata_document_shape` owns: that member and the two
+// `UpdateImageSetMetadata` blobs beside it are documented as carrying the same kind of
+// document, so one suite drives the rule over all three.

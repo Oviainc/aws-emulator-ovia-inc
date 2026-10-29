@@ -63,6 +63,8 @@ mod image_set_version_listing;
 mod import_job_listing;
 #[path = "all/list_element_refusal_paths.rs"]
 mod list_element_refusal_paths;
+#[path = "all/metadata_document_shape.rs"]
+mod metadata_document_shape;
 #[path = "all/metadata_document_structure.rs"]
 mod metadata_document_structure;
 #[path = "all/regional_isolation.rs"]

@@ -650,7 +650,9 @@ fn refuse(path: &str, requirement: &str) -> UpdateImageSetMetadataError {
 ///
 /// Both members are documented as "the DICOM tags" to update or remove, and a DICOM
 /// metadata document is the object `GetImageSetMetadata` serves — so a blob that is not a
-/// JSON object names no attribute at all and fails the constraint the service sets.
+/// JSON object names no attribute at all and fails the constraint the service sets. The
+/// rule itself is [`crate::state::metadata_document`], shared with every other member this
+/// service documents as carrying such a document.
 fn parse_document(
     blob: Option<&[u8]>,
     path: &str,
@@ -658,11 +660,9 @@ fn parse_document(
     let Some(bytes) = blob else {
         return Ok(None);
     };
-    match ::serde_json::from_slice::<Value>(bytes) {
-        Ok(Value::Object(document)) => Ok(Some(document)),
-        Ok(_) => Err(refuse(path, "Member must be a JSON object of DICOM attributes")),
-        Err(_) => Err(refuse(path, "Member must be a JSON document")),
-    }
+    crate::state::metadata_document(bytes)
+        .map(Some)
+        .map_err(|requirement| refuse(path, requirement))
 }
 
 /// Apply one update document to `attributes`: `removing` says whether the document names

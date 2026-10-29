@@ -18,7 +18,8 @@
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: how many
 //! SOP instances the selector names and which, whether it locates them under the series
 //! the source holds or another, whether it names an instance the source does not hold,
-//! whether it names none at all, what JSON form it takes, and — for the force suite —
+//! whether it names none at all, how deep the document that names none is, and — for the
+//! force suite —
 //! which metadata element disagrees and whether only one of the two image sets holds it.
 //! Every case drives real HTTP through the production front door, so what is asserted is
 //! the wire behaviour a `medical-imaging` SDK client sees.
@@ -247,7 +248,7 @@ pub(crate) fn selector(series_uid: &str, instances: &[&str]) -> String {
 /// The rows differ along: no selector at all; a selector naming one, two and all three of
 /// the source's instances; a selector naming an instance under a series the source does
 /// not hold; one naming an instance nothing holds; one naming no instance at all; and one
-/// that is a JSON array rather than a metadata document.
+/// carrying no `Study` level at all.
 fn subset_cases() -> Vec<SubsetCase> {
     vec![
         SubsetCase {
@@ -291,8 +292,10 @@ fn subset_cases() -> Vec<SubsetCase> {
             expected_instances: Vec::new(),
         },
         SubsetCase {
-            case: "a JSON array: a document that names no instance",
-            copiable_attributes: Some(json!([{ "SOPInstanceUID": INSTANCE_ONE }]).to_string()),
+            case: "a document with no Study level: nothing is copied",
+            copiable_attributes: Some(
+                json!({ "SchemaVersion": "1.1", "Patient": { "DICOM": {} } }).to_string(),
+            ),
             expected_instances: Vec::new(),
         },
     ]

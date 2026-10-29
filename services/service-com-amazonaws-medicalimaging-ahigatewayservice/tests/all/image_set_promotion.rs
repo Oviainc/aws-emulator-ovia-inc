@@ -46,8 +46,8 @@ struct PromoteCase {
 }
 
 /// The rows span: a non-primary and an already-primary source; a source at one, two and
-/// four versions; a whole copy and a subset copy (object and array forms); and `force`
-/// absent, present-false and present-true.
+/// four versions; a whole copy and a subset copy (a document naming no instance and one
+/// naming one); and `force` absent, present-false and present-true.
 fn promote_cases() -> Vec<PromoteCase> {
     vec![
         PromoteCase {
@@ -68,7 +68,9 @@ fn promote_cases() -> Vec<PromoteCase> {
             case: "a subset copy of a non-primary source at four versions, force false",
             source_is_primary: false,
             source_versions: 4,
-            copiable_attributes: Some(r#"[{"SOPInstanceUID":"1.2.840.10008.1.2.1"}]"#),
+            copiable_attributes: Some(
+                r#"{"Study":{"Series":{"1.2.3":{"Instances":{"1.2.840.10008.1.2.1":{}}}}}}"#,
+            ),
             force: Some(false),
         },
         PromoteCase {
@@ -321,7 +323,7 @@ fn promote_refusal_cases() -> Vec<PromoteRefusalCase> {
             case: "an already-primary destination, subset copy, forced",
             claimed_destination_version: "2",
             destination_is_primary: true,
-            copiable_attributes: Some(r#"[{"SOPInstanceUID":"1.2.3"}]"#),
+            copiable_attributes: Some(r#"{"Study":{"Series":{"1.2.3":{"Instances":{}}}}}"#),
             force: Some(true),
         },
     ]

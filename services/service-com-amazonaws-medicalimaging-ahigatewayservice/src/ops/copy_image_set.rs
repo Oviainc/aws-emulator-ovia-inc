@@ -41,10 +41,14 @@
 //!   holds no DICOM content yet takes any copy, and a MINTED destination holds nothing to
 //!   disagree with.
 //! * `sourceImageSet.DICOMCopies.copiableAttributes` is documented as "the JSON string
-//!   used to specify a subset of SOP Instances to copy", so a value that is not a JSON
-//!   document fails the constraint the service sets and is refused with
-//!   `ValidationException` (400), worded like every other refusal of this service and
-//!   WITHOUT echoing the value, which the model marks `@sensitive`. A value that IS one
+//!   used to specify a subset of SOP Instances to copy", and that subset is named in the
+//!   shape of the aggregated metadata document — an OBJECT — so a value that does not parse
+//!   as JSON, and one that parses as any other JSON value (a scalar, `null`, an array),
+//!   names no SOP instance at all: both fail the constraint the service sets and are
+//!   refused with `ValidationException` (400) by the one rule every member of this service
+//!   documented as carrying such a document is read through
+//!   ([`crate::state::metadata_document`]), worded like every other refusal of this service
+//!   and WITHOUT echoing the value, which the model marks `@sensitive`. A value that IS one
 //!   SELECTS the content the copy carries: the document is written in the shape of the
 //!   aggregated metadata document, which places a SOP instance at `Study` → `Series` →
 //!   series UID → `Instances` → SOP Instance UID, and only the instances it names there
@@ -182,7 +186,7 @@ const COPIABLE_ATTRIBUTES_PATH: &str =
 /// of every `Instances` level the document carries, whichever series locates them: what
 /// identifies a SOP instance is its own UID. A document that names none selects none, and
 /// the copy carries no instance.
-fn selected_instances(document: &Value) -> BTreeSet<String> {
+fn selected_instances(document: &Map<String, Value>) -> BTreeSet<String> {
     let mut selected = BTreeSet::new();
     let series = document
         .get(METADATA_STUDY_KEY)
@@ -467,27 +471,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let forced = input.force.unwrap_or(false);
 
         // `copiableAttributes` is documented as "the JSON string used to specify a
-        // subset of SOP Instances to copy", and the model constrains only its length —
-        // so whether it IS a JSON document is checked here, before any state is read.
-        // The value is never echoed: the model marks the member `@sensitive`. What the
-        // document NAMES is the subset the copy is then restricted to; a request that
-        // carries no `DICOMCopies` copies the whole image set.
+        // subset of SOP Instances to copy", named in the shape of the aggregated metadata
+        // document, and the model constrains only its length — so whether it IS such a
+        // document is checked here, before any state is read, by the rule every member of
+        // this service carrying one is read through. A value that parses as some other
+        // JSON value names no SOP instance and is refused rather than honoured as a
+        // selection. The value is never echoed: the model marks the member `@sensitive`.
+        // What the document NAMES is the subset the copy is then restricted to; a request
+        // that carries no `DICOMCopies` copies the whole image set.
         let selected = match &information.source_image_set.dicom_copies {
-            Some(copies) => match ::serde_json::from_str::<Value>(&copies.copiable_attributes) {
-                Ok(document) => Some(selected_instances(&document)),
-                Err(_) => {
-                    return Err(CopyImageSetErrorModeled::ValidationException(
-                        ValidationException {
-                            message: crate::state::handler_requirement_error(
-                                COPIABLE_ATTRIBUTES_PATH,
-                                None,
-                                "Member must be a JSON document",
-                            ),
-                        },
-                    )
-                    .into());
+            Some(copies) => {
+                match crate::state::metadata_document(copies.copiable_attributes.as_bytes()) {
+                    Ok(document) => Some(selected_instances(&document)),
+                    Err(requirement) => {
+                        return Err(CopyImageSetErrorModeled::ValidationException(
+                            ValidationException {
+                                message: crate::state::handler_requirement_error(
+                                    COPIABLE_ATTRIBUTES_PATH,
+                                    None,
+                                    requirement,
+                                ),
+                            },
+                        )
+                        .into());
+                    }
                 }
-            },
+            }
             None => None,
         };
 
