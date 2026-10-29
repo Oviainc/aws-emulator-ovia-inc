@@ -275,16 +275,25 @@ pub struct ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// The windows of one SLO are an ORDERED SET identified by configuration: a removal
     /// names a window by its configuration (`RemoveExclusionWindows`: "The window
     /// configuration must match an existing exclusion window"), so two windows with the same
-    /// configuration would be one window named twice. The order is the order the windows
-    /// were added in, which is what makes a `ListServiceLevelObjectiveExclusionWindows` page
-    /// cursor a stable boundary. Bounded at [`MAX_EXCLUSION_WINDOWS_PER_SLO`] per SLO by the
-    /// only writer, and the entry is dropped once an SLO holds no windows — holding none and
-    /// holding an empty set are the same state, exactly as for `tags`.
+    /// configuration would be one window named twice. Bounded at
+    /// [`MAX_EXCLUSION_WINDOWS_PER_SLO`] per SLO by the only writer, and the entry is dropped
+    /// once an SLO holds no windows — holding none and holding an empty set are the same
+    /// state, exactly as for `tags`.
+    ///
+    /// Within one SLO the windows are keyed by the ORDINAL they were added under
+    /// ([`next_exclusion_window_ordinal`]), so the ordered map iterates them in the order they
+    /// were added and each window keeps its key for as long as it is stored: an ordinal is
+    /// never reused and never moves when another window is removed, which is what makes a
+    /// `ListServiceLevelObjectiveExclusionWindows` page cursor a stable boundary over a set the
+    /// batch writer can change between two pages
+    /// ([`Self::page_exclusion_windows`]) — the same property the
+    /// instrumentation list gets from keying its own stored set
+    /// ([`Self::page_instrumentation_configurations`]).
     ///
     /// Every STORED window carries a concrete `StartTime`, whether or not the addition stated
     /// one ([`stored_exclusion_window`]), so the set a read reports is a set of windows that
     /// each start at a known instant.
-    pub exclusion_windows: BTreeMap<String, Vec<ExclusionWindow>>,
+    pub exclusion_windows: BTreeMap<String, BTreeMap<u64, ExclusionWindow>>,
     /// This account's grouping configuration, or `None` while none is configured.
     ///
     /// At most ONE configuration exists: `PutGroupingConfiguration` "creates or updates the
@@ -1549,6 +1558,34 @@ fn issued_offset(cursor: &str, len: usize) -> Option<usize> {
         .then_some(offset)
 }
 
+/// The ordinal `cursor` names as the boundary of a page over a stored exclusion-window set
+/// whose highest ordinal is `last_ordinal`, or `None` when it is not a boundary
+/// [`ComAmazonawsApplicationsignalsApplicationsignalsState::page_exclusion_windows`] can have
+/// minted over that set.
+///
+/// A page token is minted by keying on the LAST window the page served, and only while the set
+/// still holds a window beyond it, so every ordinal this service hands out is the ordinal of a
+/// stored window that at least one other window follows: an ordinal below
+/// [`FIRST_EXCLUSION_WINDOW_ORDINAL`] names no window at all — the first window is served by
+/// the request that states no cursor — and one at or past the highest stored ordinal bounds no
+/// page. An ordinal outside that range, or one spelled a way the encoder does not spell it
+/// ([`canonical_number`]), is therefore a boundary no read of this service issued over the set
+/// being read, exactly as for the offset cursors ([`issued_offset`]). An ordinal INSIDE it is
+/// honoured whether or not the set still holds the window it keys on, which is what makes the
+/// boundary survive the removal of that very window.
+///
+/// The range is the set as it stands NOW, because that is the only set this read can place a
+/// boundary in: a caller whose boundary and every window after it have since been removed is
+/// therefore refused rather than served an empty last page. The refusal loses no window — the
+/// survivors are all before the boundary and a cursorless read reports them — and it is the
+/// same answer the offset cursors give a position past the end of what they report.
+fn issued_window_ordinal(cursor: &str, last_ordinal: u64) -> Option<u64> {
+    let ordinal = canonical_number::<u64>(cursor)?;
+    (FIRST_EXCLUSION_WINDOW_ORDINAL..last_ordinal)
+        .contains(&ordinal)
+        .then_some(ordinal)
+}
+
 /// One page of a derived projection, plus the token for the page after it.
 ///
 /// The projections the time-ranged topology reads page over are DERIVED (they are
@@ -1593,6 +1630,55 @@ pub fn page_of<T>(
         None
     };
     Ok((page, next_token))
+}
+
+/// One page of a STORED, key-ordered collection: its records from `lower` onwards, bounded by
+/// `page_size`, together with the KEY of the last record on the page while the collection holds
+/// records beyond it (`None` once the page is the last one).
+///
+/// The page boundary is a KEY of the collection rather than a count of the records already
+/// served, which is what makes it survive a write landing between two pages: creating or
+/// removing a record moves no other record's key, so the next page can neither skip nor repeat
+/// a record the collection still holds. Every read of this service whose page is STORED records
+/// takes its page from here — one SLO's exclusion windows
+/// ([`ComAmazonawsApplicationsignalsApplicationsignalsState::page_exclusion_windows`]) and one
+/// scope's instrumentation configurations
+/// ([`ComAmazonawsApplicationsignalsApplicationsignalsState::page_instrumentation_configurations`])
+/// — so that property is implemented ONCE and a further such read inherits it instead of
+/// copying it. [`page_of`] is the offset cursor of the reads whose page is a projection DERIVED
+/// on every call instead.
+///
+/// At most `page_size + 1` records are visited, so both the response and the memory it takes to
+/// build are bounded by the page rather than by the size of the collection. `lower` is stated on
+/// the type the keys are LOOKED UP by, so a cursor a request carried resolves without being
+/// rebuilt as a key.
+fn page_keyed<'a, K, Q, V>(
+    records: &'a BTreeMap<K, V>,
+    lower: Bound<&Q>,
+    page_size: usize,
+) -> (Vec<&'a V>, Option<&'a K>)
+where
+    K: Ord + ::std::borrow::Borrow<Q>,
+    Q: Ord + ?Sized,
+{
+    // A page of nothing could not advance its own cursor, so a caller following `NextToken`
+    // would loop for ever. Every bound that reaches a read of this service is at least
+    // [`MIN_PAGE_BOUND`], so this floor only keeps the invariant local to this function.
+    let page_size = page_size.max(1);
+    let mut window: Vec<(&K, &V)> = records
+        .range::<Q, _>((lower, Bound::Unbounded))
+        .take(page_size.saturating_add(1))
+        .collect();
+    let boundary = if window.len() > page_size {
+        window.truncate(page_size);
+        window.last().map(|(key, _)| *key)
+    } else {
+        None
+    };
+    (
+        window.into_iter().map(|(_, record)| record).collect(),
+        boundary,
+    )
 }
 
 /// The `NextToken` tag a read whose projection the REQUEST selects issues its page tokens
@@ -2046,6 +2132,15 @@ pub const DEFAULT_EXCLUSION_WINDOW_PAGE: i32 = MAX_EXCLUSION_WINDOWS_PER_SLO as 
 /// that SLO bound into it ([`subject_token_tag`]).
 pub const EXCLUSION_WINDOWS_TOKEN_TAG: &str = "exclusion-windows/1/";
 
+/// The ordinal the first window added to an SLO is stored under
+/// ([`next_exclusion_window_ordinal`]).
+///
+/// The line starts at ONE, so zero is an ordinal no stored window ever holds and therefore a
+/// page boundary this service cannot have issued ([`issued_window_ordinal`]): the first window
+/// of a set is served by the request that states no cursor, so a cursor of zero would re-serve
+/// that first page under a token.
+const FIRST_EXCLUSION_WINDOW_ORDINAL: u64 = 1;
+
 /// Why one SLO named by a `BatchUpdateExclusionWindows` request was not updated.
 ///
 /// The failure is per SLO because the request is: one set of windows is applied to each id
@@ -2102,14 +2197,66 @@ impl ExclusionWindowFailure {
 }
 
 impl ComAmazonawsApplicationsignalsApplicationsignalsState {
-    /// The exclusion windows configured on the SLO an `Id` names, in the order they were
-    /// added. Empty for a stored SLO that holds none, and for an id that names no SLO \u2014 a
-    /// caller tells the two apart from [`Self::resolve`], which is what the reads refuse an
-    /// unknown id by.
-    pub fn exclusion_windows_of(&self, id: &str) -> &[ExclusionWindow] {
-        self.exclusion_windows
-            .get(slo_name_of(id))
-            .map_or(&[], Vec::as_slice)
+    /// One page of the exclusion windows configured on the SLO an `Id` names, in the order
+    /// they were added, starting strictly after the window the `token` bounds the page at,
+    /// together with the token for the page after it (`None` once the page is the last one).
+    ///
+    /// An SLO holding no windows and an id naming no SLO both answer an empty page — a caller
+    /// tells the two apart from [`Self::resolve`], which is what the reads refuse an unknown id
+    /// by.
+    ///
+    /// The cursor is the stored KEY of the last window the previous page served (the ordinal
+    /// it was added under, [`next_exclusion_window_ordinal`]) rather than a count of the
+    /// windows already served, so a window removed between two pages cannot make the next page
+    /// skip or repeat a window the SLO still holds: the boundary names a position in the stored
+    /// order, and removing a window leaves every other window's ordinal exactly where it was.
+    /// That is the property the stored instrumentation set already gets from its own key cursor
+    /// ([`Self::page_instrumentation_configurations`]); [`page_of`] is the offset cursor of the
+    /// reads whose projection is DERIVED on every call instead.
+    ///
+    /// At most `page_size + 1` windows are visited, so the response is bounded by the page
+    /// rather than by the number of stored windows ([`page_keyed`]).
+    ///
+    /// The token is opaque but not authenticated, so the key inside the tag is a value a caller
+    /// may have written: it is honoured only when it is a boundary this paging can have minted
+    /// over the set being read ([`issued_window_ordinal`]), and `Err` otherwise carries the
+    /// service's ONE wording for a token it did not issue ([`UNISSUED_NEXT_TOKEN`]).
+    pub fn page_exclusion_windows(
+        &self,
+        id: &str,
+        token_tag: &str,
+        token: Option<&str>,
+        page_size: usize,
+    ) -> Result<(Vec<ExclusionWindow>, Option<String>), String> {
+        let stored = self.exclusion_windows.get(slo_name_of(id));
+        // The ordinal of the LAST window this SLO holds, and so the one position past which
+        // this paging can have minted no boundary over the set being read. An SLO holding no
+        // windows has minted none at all.
+        let last_ordinal = stored
+            .and_then(|windows| windows.keys().next_back().copied())
+            .unwrap_or(0);
+        let boundary = match token {
+            None => None,
+            Some(token) => Some(
+                decode_cursor(token_tag, token)
+                    .and_then(|cursor| issued_window_ordinal(&cursor, last_ordinal))
+                    .ok_or_else(|| UNISSUED_NEXT_TOKEN.to_string())?,
+            ),
+        };
+        let Some(windows) = stored else {
+            // An SLO holding no windows reports none, and the only cursor that could have
+            // reached this line over an empty set was refused just above.
+            return Ok((Vec::new(), None));
+        };
+        let lower = match &boundary {
+            Some(ordinal) => Bound::Excluded(ordinal),
+            None => Bound::Unbounded,
+        };
+        let (page, next) = page_keyed(windows, lower, page_size);
+        Ok((
+            page.into_iter().cloned().collect(),
+            next.map(|ordinal| encode_cursor(token_tag, &ordinal.to_string())),
+        ))
     }
 
     /// Remove `remove` from the window set of the SLO an `Id` names and then add `add` to it,
@@ -2132,6 +2279,11 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// Every window in `add` must already be in the form the service stores
     /// ([`stored_exclusion_window`]): the server-defaulted members are settled once per call,
     /// so every SLO one request names gains the same window.
+    ///
+    /// An addition takes the next ORDINAL of the set it joins and a removal gives its own up
+    /// without moving any other ([`next_exclusion_window_ordinal`]), so the set keeps the order
+    /// the windows were added in while every surviving window keeps the key a page cursor may
+    /// already have been issued on ([`Self::page_exclusion_windows`]).
     pub fn update_exclusion_windows(
         &mut self,
         id: &str,
@@ -2147,15 +2299,16 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         for window in remove {
             let Some(at) = windows
                 .iter()
-                .position(|stored| same_exclusion_window(stored, window))
+                .find(|(_, stored)| same_exclusion_window(stored, window))
+                .map(|(ordinal, _)| *ordinal)
             else {
                 return Err(ExclusionWindowFailure::UnmatchedRemoval);
             };
-            windows.remove(at);
+            windows.remove(&at);
         }
         for window in add {
             if windows
-                .iter()
+                .values()
                 .any(|stored| same_exclusion_window(stored, window))
             {
                 continue;
@@ -2163,7 +2316,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             if windows.len() >= MAX_EXCLUSION_WINDOWS_PER_SLO {
                 return Err(ExclusionWindowFailure::TooManyWindows);
             }
-            windows.push(window.clone());
+            windows.insert(next_exclusion_window_ordinal(&windows), window.clone());
         }
 
         if windows.is_empty() {
@@ -2173,6 +2326,23 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         }
         Ok(())
     }
+}
+
+/// The ordinal the next window added to `windows` is stored under: one past the highest one
+/// that set holds, and [`FIRST_EXCLUSION_WINDOW_ORDINAL`] for a set holding none.
+///
+/// Counting past the HIGHEST ordinal rather than the window count is what keeps the ordinals of
+/// one set increasing in the order the windows were added while a removal is only ever the loss
+/// of one key: an addition never takes an ordinal a stored window already holds, and never
+/// takes one ahead of a window added before it, so a page cursor keyed on an ordinal stays the
+/// boundary it was issued as ([`ComAmazonawsApplicationsignalsApplicationsignalsState::page_exclusion_windows`]).
+fn next_exclusion_window_ordinal(windows: &BTreeMap<u64, ExclusionWindow>) -> u64 {
+    windows
+        .keys()
+        .next_back()
+        .map_or(FIRST_EXCLUSION_WINDOW_ORDINAL, |highest| {
+            highest.saturating_add(1)
+        })
 }
 
 /// `window` in the form this service STORES it: every member as the addition stated it, and a
@@ -4664,10 +4834,13 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// One page of `scope`'s configurations, in key order, starting strictly after `cursor`,
     /// together with the token for the page after it (`None` once the page is the last one).
     ///
-    /// At most `page_size + 1` records are collected, so the response is bounded by the page
+    /// At most `page_size + 1` records are visited, so the response is bounded by the page
     /// rather than by the number of stored configurations. The cursor is a stored KEY rather
     /// than an offset, so a configuration created or expired between two pages cannot make
-    /// the next page skip or repeat an entry.
+    /// the next page skip or repeat an entry — the rule every read of this service whose page
+    /// is stored records takes from [`page_keyed`]. The key a boundary carries is the one the
+    /// set holds the record under, which is that configuration's own
+    /// [`instrumentation_key`].
     pub fn page_instrumentation_configurations(
         &self,
         scope: &InstrumentationScope,
@@ -4680,32 +4853,12 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         let Some(set) = self.instrumentation_configurations.get(scope) else {
             return (Vec::new(), None);
         };
-        // A page of nothing could not advance its own cursor, so a caller following
-        // `NextToken` would loop for ever. `MaxResults` is modelled `range 1..100`, so this
-        // only ever clamps a bound no request can state.
-        let page_size = page_size.max(1);
         let lower = match cursor {
             Some(cursor) => Bound::Excluded(cursor),
             None => Bound::Unbounded,
         };
-        let mut window: Vec<&InstrumentationConfiguration> = set
-            .configurations
-            .range::<str, _>((lower, Bound::Unbounded))
-            .map(|(_, stored)| stored)
-            .take(page_size.saturating_add(1))
-            .collect();
-
-        let next_token = if window.len() > page_size {
-            window.truncate(page_size);
-            window.last().map(|stored| {
-                encode_cursor(
-                    &instrumentation_token_tag(scope),
-                    &instrumentation_key(&stored.signal_type, &stored.location_hash),
-                )
-            })
-        } else {
-            None
-        };
+        let (window, next) = page_keyed::<String, str, _>(&set.configurations, lower, page_size);
+        let next_token = next.map(|key| encode_cursor(&instrumentation_token_tag(scope), key));
         (
             window.into_iter().map(without_service_env).collect(),
             next_token,

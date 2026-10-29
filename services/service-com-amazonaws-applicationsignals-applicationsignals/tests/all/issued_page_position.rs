@@ -10,20 +10,21 @@
 //! (HTTP 400) and the service's ONE wording for a token it did not issue, rather than honoured
 //! as a page boundary.
 //!
-//! For the reads whose cursor is an OFFSET into a derived projection the service mints a
-//! position by counting past the page it just served (at least one entry) and only while the
-//! projection holds more entries beyond it, so the positions it can issue are the whole
-//! numbers from one to the entry count exclusive, each written as a bare decimal. A position of
-//! zero, a position spelled with a sign or a leading zero, and a position at or past the end
-//! of the projection are therefore none of its own — honouring them would re-serve the first
-//! page under a cursor, serve a page the caller never asked to resume from, or report the set
-//! as exhausted to a caller whose cursor the service never gave it.
+//! For the reads whose cursor carries a bare decimal position the service mints one by
+//! advancing past the page it just served (at least one entry) and only while the set holds
+//! more entries beyond it, so the positions it can issue are the whole numbers from one to the
+//! entry count exclusive. A position of zero, a position spelled with a sign or a leading zero,
+//! and a position at or past the end of the set are therefore none of its own — honouring them
+//! would re-serve the first page under a cursor, serve a page the caller never asked to resume
+//! from, or report the set as exhausted to a caller whose cursor the service never gave it.
 //!
-//! The rows span what the rule generalises over: WHICH read resolves the cursor (all eight
-//! whose cursor is an offset, differing in route, method, in where their model binds the page
-//! members, and in what their projection holds), HOW the position is misspelled, and WHERE it
-//! sits relative to the set. The chronological cursor of the status read is the same rule on a
-//! payload of several fields, and is the last table here.
+//! The rows span what the rule generalises over: WHICH read resolves the cursor (all eight whose
+//! cursor carries a decimal position — an offset into a derived projection for seven of them,
+//! and the stored ordinal of a window for the exclusion-window read, which over a set nothing
+//! has changed between pages is the same whole number — differing in route, method, in where
+//! their model binds the page members, and in what their set holds), HOW the position is
+//! misspelled, and WHERE it sits relative to the set. The chronological cursor of the status
+//! read is the same rule on a payload of several fields, and is the last table here.
 //!
 //! `unissued_next_token` pins the half of the rule that is about the TAG (a token that is not
 //! hex, carries no tag of this service, or was issued for another read); this suite is the half
@@ -76,7 +77,7 @@ enum PageMembers {
     Body,
 }
 
-/// One read whose cursor is an offset into a derived projection, pointed at one set of its own.
+/// One read whose cursor carries a decimal position, pointed at one set of its own.
 struct Read {
     /// The operation under test, named in every assertion.
     operation: &'static str,
@@ -169,7 +170,7 @@ async fn seed(router: &MultiServiceRouter) {
     );
 }
 
-/// Every read whose `NextToken` is an offset into a derived projection, each pointed at a set of
+/// Every read whose `NextToken` carries a decimal position, each pointed at a set of
 /// at least two entries.
 fn reads(now: i64) -> Vec<Read> {
     let window = format!("StartTime={}&EndTime={}", now - 3_600, now + 3_600);
@@ -424,8 +425,8 @@ fn unissued_positions(len: usize) -> Vec<(String, String)> {
     ]
 }
 
-/// Every read whose cursor is an offset refuses a position this service never issued, and keeps
-/// serving every position it can issue.
+/// Every read whose cursor carries a decimal position refuses a position this service never
+/// issued, and keeps serving every position it can issue.
 #[tokio::test]
 async fn an_offset_cursor_honours_only_a_position_this_service_issued() {
     let router = router();

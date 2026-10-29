@@ -37,6 +37,8 @@ mod entity_events;
 mod entity_identity;
 #[path = "all/error_identity.rs"]
 mod error_identity;
+#[path = "all/exclusion_window_page_stability.rs"]
+mod exclusion_window_page_stability;
 #[path = "all/exclusion_window_reads.rs"]
 mod exclusion_window_reads;
 #[path = "all/exclusion_window_start_time.rs"]

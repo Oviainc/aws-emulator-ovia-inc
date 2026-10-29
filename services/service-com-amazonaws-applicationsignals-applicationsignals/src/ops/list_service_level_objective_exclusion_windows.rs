@@ -145,10 +145,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// admits resolves to the same record, as every other operation taking an `Id` resolves
     /// it.
     ///
-    /// The page cursor is an offset into THAT SLO's set, so the SLO it was issued for is bound
-    /// into the token's tag ([`crate::state::subject_token_tag`]): a `NextToken` issued for
-    /// another SLO's set is refused with the modelled `ValidationException`, like any other
-    /// token this service did not issue, instead of skipping the first windows of this one.
+    /// The page cursor is the stored KEY of the last window the previous page served within THAT
+    /// SLO's set, so a window removed between two pages cannot make the next page skip a window
+    /// the SLO still holds
+    /// ([`crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::page_exclusion_windows`]).
+    /// The SLO the token was issued for is bound into the token's tag
+    /// ([`crate::state::subject_token_tag`]): a `NextToken` issued for another SLO's set is
+    /// refused with the modelled `ValidationException`, like any other token this service did
+    /// not issue, instead of resuming inside this one.
     async fn handle(
         &self,
         input: Self::Input,
@@ -166,7 +170,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::region_of(ctx.parts());
-        let (slo_name, windows) = {
+        // `MaxResults` declares no `@default`, so an omitted bound takes this read's own
+        // default page and a stated one is read straight off the input, its modelled
+        // `range 1..10` having been refused before this handler runs — the rule this service
+        // holds to in ONE place ([`crate::state::optional_page_bound`]).
+        let page_size = crate::state::optional_page_bound(
+            input.max_results,
+            crate::state::DEFAULT_EXCLUSION_WINDOW_PAGE,
+        );
+        let page = {
             let store = state.lock();
             let Some(slo) = store.resolve(&input.id) else {
                 return Err(
@@ -176,35 +188,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             };
-            // The SLO's name as the STORE holds it, not as this request spelled it, so the
-            // page cursor below is bound to the SLO rather than to the id form used.
-            let slo_name = slo.name.clone();
-            (slo_name, store.exclusion_windows_of(&input.id).to_vec())
+            // The page this read walks is one SLO's stored window set, so the cursor is a key
+            // within THAT set: the SLO is bound into the token's tag — by the SLO's name as
+            // the STORE holds it, not as this request spelled it — and a token carrying
+            // another SLO's boundary is refused rather than honoured here
+            // ([`crate::state::subject_token_tag`]).
+            let token_tag = crate::state::subject_token_tag(
+                crate::state::EXCLUSION_WINDOWS_TOKEN_TAG,
+                &[Some(slo.name.as_str())],
+            );
+            store.page_exclusion_windows(
+                &input.id,
+                &token_tag,
+                input.next_token.as_deref(),
+                page_size,
+            )
         };
-
-        // `MaxResults` declares no `@default`, so an omitted bound takes this read's own
-        // default page and a stated one is read straight off the input, its modelled
-        // `range 1..10` having been refused before this handler runs — the rule this service
-        // holds to in ONE place ([`crate::state::optional_page_bound`]).
-        let page_size = crate::state::optional_page_bound(
-            input.max_results,
-            crate::state::DEFAULT_EXCLUSION_WINDOW_PAGE,
-        );
-        // The page this read walks is one SLO's window set, so the cursor is an offset into
-        // THAT set: the SLO is bound into the token's tag, and a token carrying another SLO's
-        // offset is refused rather than honoured here
-        // ([`crate::state::subject_token_tag`]).
-        let token_tag = crate::state::subject_token_tag(
-            crate::state::EXCLUSION_WINDOWS_TOKEN_TAG,
-            &[Some(slo_name.as_str())],
-        );
-        let (exclusion_windows, next_token) = crate::state::page_of(
-            windows,
-            &token_tag,
-            input.next_token.as_deref(),
-            page_size,
-        )
-        .map_err(refused)?;
+        let (exclusion_windows, next_token) = page.map_err(refused)?;
 
         Ok(ListServiceLevelObjectiveExclusionWindowsOutput {
             exclusion_windows,
