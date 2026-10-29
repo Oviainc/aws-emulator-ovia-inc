@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetControlOperation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetControlOperation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetControlOperation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves an `operationIdentifier` against the control operation log in
+//! [`crate::state`], which every call acting on an `EnabledControl` appends to —
+//! `EnableControl`, `DisableControl`, `UpdateEnabledControl` and `ResetEnabledControl`.
+//! REPORTING only: it writes nothing but the transitions the clock already owed, which
+//! [`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::settle`]
+//! materialises. `ListControlOperations` reports the same records as summaries.
+//!
+//! AUTHORIZATION and THROTTLING are NOT emulated here, so the modelled
+//! `AccessDeniedException` (403) and `ThrottlingException` (429) are deliberately
+//! unreachable from this handler: the emulator verifies the request signature at its
+//! front door and models no per-principal policy or request budget. Read the silence as
+//! "not emulated", never as "checked and allowed".
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +156,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetControlOperation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetControlOperationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetControlOperation"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetControlOperationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Only materialises transitions the clock already owed; this operation is
+        // `@readonly` and writes nothing else.
+        store.settle(::std::time::SystemTime::now());
+
+        // The control operation log is its own store: an identifier a landing zone or a
+        // baseline call returned is not a control operation, so it does not resolve here.
+        // A record outlives the enablement it acted on, so the identifier a teardown
+        // returned still resolves once that resource is gone.
+        let Some(operation) = store.control_operations.get(&input.operation_identifier) else {
+            return Err(GetControlOperationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no control operation matches operationIdentifier {}",
+                        input.operation_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetControlOperationOutput {
+            control_operation: ControlOperation {
+                operation_identifier: Some(operation.operation_identifier.clone()),
+                operation_type: Some(operation.operation_type.as_wire().to_string()),
+                status: Some(operation.status.as_wire().to_string()),
+                start_time: Some(::aws_smithy_types::DateTime::from(operation.start_time)),
+                end_time: operation.end_time.map(::aws_smithy_types::DateTime::from),
+                // Carries a message only when the operation failed ("if the operation
+                // result is FAILED, this string contains a message explaining why"), so
+                // it is whatever the record carries.
+                status_message: operation.status_message.clone(),
+                control_identifier: Some(operation.control_identifier.clone()),
+                target_identifier: Some(operation.target_identifier.clone()),
+                enabled_control_identifier: Some(operation.enabled_control_arn.clone()),
+            },
+        })
     }
 }
+

@@ -223,8 +223,9 @@ pub(crate) async fn configured(
 }
 
 /// The control operation log, as `ListControlOperations` reports it, narrowed by `filter`
-/// (`Value::Null` asks for the whole log). `GetControlOperation` is still a scaffold stub
-/// (its own issue), so the log is read through the listing that resolves the same records.
+/// (`Value::Null` asks for the whole log). `GetControlOperation` resolves the same records
+/// one at a time; `tests/all/get_control_operation.rs` is where the two readers are
+/// asserted to agree.
 pub(crate) async fn control_operations(
     router: &MultiServiceRouter,
     filter: serde_json::Value,
