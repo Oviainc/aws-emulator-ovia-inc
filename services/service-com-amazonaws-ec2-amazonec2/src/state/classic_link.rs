@@ -32,6 +32,19 @@
 //! stored — the seam that operation writes through — and it keeps the store consistent by
 //! refusing a link whose instance or VPC this account does not hold, so a reported link
 //! always names resources that exist.
+//!
+//! ## Whether a VPC is enabled for ClassicLink is a fact of the VPC
+//!
+//! A link names a VPC, but being ENABLED for ClassicLink is a property of the VPC itself,
+//! which the modelled `Vpc` shape carries no member for — so it is held beside the VPC
+//! record, keyed by the same id, in
+//! [`ComAmazonawsEc2Amazonec2State::classic_link_enabled_vpcs`].
+//! [`ComAmazonawsEc2Amazonec2State::set_vpc_classic_link_enabled`] is the one way that flag
+//! is written (`DisableVpcClassicLink` writes `false` through it; `EnableVpcClassicLink`,
+//! still a scaffold, must write `true` through it), and
+//! [`ComAmazonawsEc2Amazonec2State::vpc_classic_link_view`] is the one projection of it into
+//! the modelled `VpcClassicLink` shape, so a writer and a reporter cannot disagree about one
+//! VPC's status.
 
 use super::*;
 
@@ -151,6 +164,72 @@ impl ComAmazonawsEc2Amazonec2State {
                     .collect(),
             ),
             tags: Some(tag_list(&instance.tags)),
+        })
+    }
+
+    /// Set whether the VPC `vpc_id` is enabled for ClassicLink, and answer whether the store
+    /// took the change.
+    ///
+    /// `false` means NOTHING was written and the caller must refuse the request rather than
+    /// report a status it did not set: the account holds no such VPC, and the store never
+    /// holds the ClassicLink status of a VPC that is not there, so a describe cannot report
+    /// one.
+    ///
+    /// The ONE seam a VPC's ClassicLink enablement is written through, so the operations that
+    /// set it cannot disagree about what the flag means: `DisableVpcClassicLink` writes
+    /// `false` through it, and `EnableVpcClassicLink` — still a scaffold, as
+    /// `AttachClassicLinkVpc` is — must write `true` through it rather than touching the
+    /// store itself. Idempotent: setting the value a VPC already holds leaves the store
+    /// exactly as it was, which is why disabling a VPC that was never enabled succeeds
+    /// without changing anything.
+    pub fn set_vpc_classic_link_enabled(&mut self, vpc_id: &str, enabled: bool) -> bool {
+        if !self.vpcs.contains_key(vpc_id) {
+            return false;
+        }
+        if enabled {
+            self.classic_link_enabled_vpcs.insert(vpc_id.to_string());
+        } else {
+            self.classic_link_enabled_vpcs.remove(vpc_id);
+        }
+        true
+    }
+
+    /// Is the VPC `vpc_id` enabled for ClassicLink?
+    ///
+    /// The one reading of [`Self::classic_link_enabled_vpcs`]: a VPC the set does not hold is
+    /// not enabled, so a VPC nobody has enabled and one that has been disabled again answer
+    /// the same — which is what AWS reports for both.
+    pub fn vpc_is_classic_link_enabled(&self, vpc_id: &str) -> bool {
+        self.classic_link_enabled_vpcs.contains(vpc_id)
+    }
+
+    /// Does the VPC `vpc_id` have any EC2-Classic instance linked to it?
+    ///
+    /// The question "You cannot disable ClassicLink for a VPC that has EC2-Classic instances
+    /// linked to it" (`DisableVpcClassicLink`) asks of the link store, answered off the links
+    /// themselves so it cannot drift from what `DescribeClassicLinkInstances` reports.
+    pub fn vpc_has_linked_classic_instances(&self, vpc_id: &str) -> bool {
+        self.classic_link_instances
+            .values()
+            .any(|record| record.vpc_id == vpc_id)
+    }
+
+    /// The modelled `VpcClassicLink` for `vpc_id`, or `None` when the account holds no such
+    /// VPC.
+    ///
+    /// The one projection of a VPC's ClassicLink status, so every operation that reports one
+    /// reports it identically. "Any tags assigned to the VPC" (`VpcClassicLink$Tags`) is read
+    /// off the VPC record rather than copied, so a tag `CreateTags` writes after the status
+    /// was set is reported by the next describe.
+    pub fn vpc_classic_link_view(
+        &self,
+        vpc_id: &str,
+    ) -> Option<crate::ops::types::VpcClassicLink> {
+        let vpc = self.vpcs.get(vpc_id)?;
+        Some(crate::ops::types::VpcClassicLink {
+            vpc_id: Some(vpc_id.to_string()),
+            classic_link_enabled: Some(self.vpc_is_classic_link_enabled(vpc_id)),
+            tags: Some(vpc.tags.clone().unwrap_or_default()),
         })
     }
 }

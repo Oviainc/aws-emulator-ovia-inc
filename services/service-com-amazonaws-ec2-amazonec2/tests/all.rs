@@ -636,6 +636,10 @@ mod volumes_in_recycle_bin;
 mod vpc_attributes;
 #[path = "all/vpc_block_public_access_exclusions.rs"]
 mod vpc_block_public_access_exclusions;
+// `DisableVpcClassicLink` and the reader it is proved through, `DescribeVpcClassicLink`: the
+// ClassicLink enablement the store keeps per VPC, what a disable changes and what it refuses.
+#[path = "all/vpc_classic_link.rs"]
+mod vpc_classic_link;
 #[path = "all/vpc_endpoint_connection_notifications.rs"]
 mod vpc_endpoint_connection_notifications;
 #[path = "all/vpc_endpoint_connections.rs"]

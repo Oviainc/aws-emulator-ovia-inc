@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableVpcClassicLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableVpcClassicLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableVpcClassicLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes the ClassicLink enablement off one VPC of this service's state
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::classic_link_enabled_vpcs`], written
+//! through [`crate::state::ComAmazonawsEc2Amazonec2State::set_vpc_classic_link_enabled`]),
+//! where `DescribeVpcClassicLink` reads it back.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +131,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableVpcClassicLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableVpcClassicLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableVpcClassicLink"))
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — a VPC is
+        // named by id, and whether it is enabled for ClassicLink is a fact of the VPC rather
+        // than of the Region the request was signed for. The store is reached through the
+        // engine held on `self`.
+        let _ = ctx;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "Disables ClassicLink for a VPC": a VPC id this account holds no VPC for is a
+        // refusal, not a no-op — a caller has to be able to tell a VPC it disabled from one
+        // that is not there.
+        if !store.vpcs.contains_key(&input.vpc_id) {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        }
+
+        // "You cannot disable ClassicLink for a VPC that has EC2-Classic instances linked to
+        // it" (`DisableVpcClassicLink`): a linked instance is a dependent resource of the
+        // VPC, so this is refused the way EC2 refuses an action on a resource that still has
+        // one, naming the VPC THE REQUEST NAMED and nothing else.
+        if store.vpc_has_linked_classic_instances(&input.vpc_id) {
+            return Err(state::dependency_violation(format!(
+                "The vpc '{vpc_id}' has dependencies and cannot be disabled for ClassicLink.",
+                vpc_id = input.vpc_id,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The one seam a VPC's ClassicLink enablement is written through, so this operation
+        // and `EnableVpcClassicLink` cannot disagree about what the flag means. It answers
+        // `false` only for a VPC the store does not hold, which the refusal above has already
+        // ruled out. Disabling a VPC that was not enabled writes nothing and still succeeds,
+        // the way disabling an already-disabled VPC does on AWS.
+        if !store.set_vpc_classic_link_enabled(&input.vpc_id, false) {
+            return Err(state::internal_error(
+                "the VPC checked a moment ago could not be written",
+            ));
+        }
+        Ok(DisableVpcClassicLinkOutput {
+            // "Returns true if the request succeeds; otherwise, it returns an error"
+            // (`DisableVpcClassicLinkResult$Return`).
+            r#return: Some(true),
+        })
     }
 }

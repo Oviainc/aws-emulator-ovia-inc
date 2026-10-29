@@ -2626,6 +2626,17 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// EC2-Classic instance, and a link is made by `AttachClassicLinkVpc`. See
     /// [`classic_link`].
     pub classic_link_instances: BTreeMap<String, ClassicLinkRecord>,
+    /// The VPCs the account has ENABLED for ClassicLink, by `VpcId`.
+    ///
+    /// Membership is the whole fact — a VPC either is enabled for ClassicLink or it is not —
+    /// so this is a SET rather than a map of flags, and a VPC it does not hold is reported as
+    /// not enabled, which is what AWS reports for a VPC nobody has enabled. The modelled
+    /// [`Vpc`] shape carries no member for it, so it lives beside the VPC record keyed by the
+    /// same id, the way [`Self::vpc_attributes`] does, and a VPC's entry goes out with the VPC
+    /// in [`Self::remove_vpc`]. Starts EMPTY: a fresh account has enabled no VPC for
+    /// ClassicLink. Written through [`Self::set_vpc_classic_link_enabled`] and reported
+    /// through [`Self::vpc_classic_link_view`]; see [`classic_link`].
+    pub classic_link_enabled_vpcs: BTreeSet<String>,
     /// A `RunInstances` `ClientToken` and the reservation it minted, so a repeat
     /// of the same request returns that reservation instead of launching again.
     pub client_tokens: HashMap<String, String>,
@@ -3941,6 +3952,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // A fresh account holds no EC2-Classic instance, so nothing is linked to a
             // ClassicLink-enabled VPC either.
             classic_link_instances: BTreeMap::new(),
+            // A fresh account has enabled no VPC for ClassicLink either.
+            classic_link_enabled_vpcs: BTreeSet::new(),
             client_tokens: HashMap::new(),
             assigned_private_ips: ::std::collections::HashSet::new(),
             stored_bytes: 0,
@@ -19802,6 +19815,10 @@ impl ComAmazonawsEc2Amazonec2State {
         // later must start from the creation defaults, never from what a
         // `ModifyVpcAttribute` left behind for a VPC that no longer exists.
         self.vpc_attributes.remove(vpc_id);
+        // The ClassicLink enablement of this VPC goes with it too: a VPC created later must
+        // start out not enabled for ClassicLink, never from what an enable left behind for a
+        // VPC that no longer exists.
+        self.classic_link_enabled_vpcs.remove(vpc_id);
         // The Region's DHCP option set does NOT go with the VPC: one set is shared by every
         // VPC of the Region and outlives all of them, as it does on AWS, so a delete leaves
         // [`Self::dhcp_options`] alone.
