@@ -178,10 +178,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
         let mut state = state.lock();
 
-        // `policyStoreId` is documented as an ID here — "The alias name cannot be
-        // used" — so it is looked up directly instead of through
+        // `policyStoreId` is documented as an ID here too — "The alias name
+        // cannot be used" — so it goes through the ID-only lookup instead of
         // `resolve_store_id`, which would also accept an alias reference.
-        if !state.policy_stores.contains_key(&input.policy_store_id) {
+        if state
+            .resolve_store_id_only(&input.policy_store_id)
+            .is_none()
+        {
             return Err(
                 CreatePolicyStoreAliasErrorModeled::ResourceNotFoundException(
                     crate::ops::resource_not_found(&input.policy_store_id, "POLICY_STORE"),

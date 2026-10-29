@@ -866,6 +866,20 @@ impl ComAmazonawsVerifiedpermissionsVerifiedpermissionsState {
         self.lookup_store_id(reference).ok()
     }
 
+    /// Resolve a `policyStoreId` request member that the model restricts to an
+    /// ID — "the alias name cannot be used. Only the ID can be used".
+    ///
+    /// Such a member carries no alias reference at all: whatever its shape, the
+    /// value is matched against store ids only, so a `policy-store-alias/<name>`
+    /// string is just an id that no policy store has, and the handler answers
+    /// whatever it answers for an unknown store. Members documented the other
+    /// way ("use its ID or alias name") go through [`Self::resolve_store_id`].
+    pub fn resolve_store_id_only(&self, id: &str) -> Option<String> {
+        self.policy_stores
+            .contains_key(id)
+            .then(|| id.to_string())
+    }
+
     /// [`Self::resolve_store_id`], but saying WHICH reference failed: an alias
     /// name no active alias carries is a different miss from a store id no store
     /// has, and the batch operations report the two with distinct codes.

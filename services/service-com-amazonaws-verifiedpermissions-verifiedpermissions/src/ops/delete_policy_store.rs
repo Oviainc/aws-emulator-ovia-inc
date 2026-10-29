@@ -7,6 +7,10 @@
 //! `ResourceNotFoundException`. Deleting a store that is already gone succeeds —
 //! the model declares no not-found error for this operation.
 //!
+//! This operation's `policyStoreId` is one of the two in the API the model
+//! restricts to an ID, so a `policy-store-alias/<name>` value names no store
+//! here and the request is the documented idempotent no-op.
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -126,9 +130,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
+        // `policyStoreId` is documented as an ID here — "the alias name cannot
+        // be used. Only the ID can be used" — so the reference is matched
+        // against store ids only, never resolved through an alias. An
+        // alias-shaped value is therefore an id no store has.
+        //
         // No such store is a success: `DeletePolicyStore` is `@idempotent` and
         // models no not-found error, so a repeat delete must not fail.
-        let Some(store_id) = state.resolve_store_id(&input.policy_store_id) else {
+        let Some(store_id) = state.resolve_store_id_only(&input.policy_store_id) else {
             crate::ops::audit(
                 ctx,
                 "DeletePolicyStore",
