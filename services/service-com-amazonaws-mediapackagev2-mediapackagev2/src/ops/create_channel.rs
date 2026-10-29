@@ -349,7 +349,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
 
         // The cross-member input rules first: they are about the request alone, so they
         // are decided before the store is consulted and before anything is written.
@@ -367,6 +366,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateChannelErrorModeled::ValidationException(violation).into());
         }
+
+        // The tag map the request carries is read by nothing but the request either, so
+        // it belongs with the refusals above rather than after the lookup below: the two
+        // tag rules judge the member this request sent, and a request that breaks one is
+        // malformed whether or not the names it addresses resolve.
+        let tags = input.tags.clone().unwrap_or_default();
+        // A create's tag map is the same unbounded-growth site `TagResource` is, so it is
+        // judged against the same bounds before anything is stored.
+        if let Some(rejection) = crate::state::tag_bounds_rejection("tags", &tags) {
+            return Err(CreateChannelErrorModeled::ValidationException(rejection).into());
+        }
+        // Tag-on-create writes into the same tag map `TagResource` does, so it is held to
+        // the same reserved-namespace rule: AWS owns the `aws:` tag-key namespace, and a
+        // request naming a key in it is refused before anything is stored. `tags` is the
+        // wire name of the member (`@jsonName("tags")` on `CreateChannelRequest$Tags`).
+        if let Some(rejection) =
+            crate::state::reserved_tag_key_rejection("tags", tags.keys().map(String::as_str))
+        {
+            return Err(CreateChannelErrorModeled::ValidationException(rejection).into());
+        }
+
+        let mut store = state.lock();
 
         // A channel only exists inside a channel group, so the parent has to be there.
         // An absent parent is reported exactly as `GetChannelGroup` reports it: the
@@ -391,21 +412,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The request's own fingerprint: every member it carried EXCEPT the token that
         // identifies the attempt.
-        let tags = input.tags.clone().unwrap_or_default();
-        // A create's tag map is the same unbounded-growth site `TagResource` is, so it is
-        // judged against the same bounds before anything is stored.
-        if let Some(rejection) = crate::state::tag_bounds_rejection("tags", &tags) {
-            return Err(CreateChannelErrorModeled::ValidationException(rejection).into());
-        }
-        // Tag-on-create writes into the same tag map `TagResource` does, so it is held to
-        // the same reserved-namespace rule: AWS owns the `aws:` tag-key namespace, and a
-        // request naming a key in it is refused before anything is stored. `tags` is the
-        // wire name of the member (`@jsonName("tags")` on `CreateChannelRequest$Tags`).
-        if let Some(rejection) =
-            crate::state::reserved_tag_key_rejection("tags", tags.keys().map(String::as_str))
-        {
-            return Err(CreateChannelErrorModeled::ValidationException(rejection).into());
-        }
         // Every OPTIONAL member is rendered so that ABSENT and present-but-default stay
         // apart: a member the request leaves out is materialised to the service's own
         // default, so a repeat that now SENDS that same value asks for a DIFFERENT

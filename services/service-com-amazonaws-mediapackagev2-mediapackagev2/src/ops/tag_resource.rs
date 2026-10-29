@@ -196,6 +196,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // AWS owns the `aws:` tag-key namespace: a caller may neither create nor replace
+        // a tag in it, so the keys the REQUEST names are judged against it before the
+        // store is read — like the ARN above, "that key is not yours to write" is decided
+        // without a lookup and is a different failure from "no such resource". `tags` is
+        // the wire name of the member they arrived in (`@jsonName("tags")` on
+        // `TagResourceRequest$Tags`).
+        if let Some(rejection) =
+            crate::state::reserved_tag_key_rejection("tags", input.tags.keys().map(String::as_str))
+        {
+            return Err(TagResourceErrorModeled::ValidationException(rejection).into());
+        }
+        // The bounds, on the map the REQUEST carries, in the same place and for the same
+        // reason: merging only ever ADDS to a resource's map, so a submitted map already
+        // past a bound leaves the resource past it whatever the resource holds — that
+        // much is decided without a lookup, and the refusal states what the request
+        // carried. The merge-dependent half (a map that is only too large once it is
+        // merged into what is there) is judged below, where the stored map is in hand.
+        if let Some(rejection) = crate::state::submitted_tag_bounds_rejection("tags", &input.tags) {
+            return Err(TagResourceErrorModeled::ValidationException(rejection).into());
+        }
+
         let mut store = state.lock();
         let at = crate::state::now();
 
@@ -210,15 +231,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::TAGGED_RESOURCE_NOT_FOUND_MESSAGE,
             ));
         };
-        // AWS owns the `aws:` tag-key namespace: a caller may neither create nor replace
-        // a tag in it, so the keys the REQUEST names are judged against it before
-        // anything is written. `tags` is the wire name of the member they arrived in
-        // (`@jsonName("tags")` on `TagResourceRequest$Tags`).
-        if let Some(rejection) =
-            crate::state::reserved_tag_key_rejection("tags", input.tags.keys().map(String::as_str))
-        {
-            return Err(TagResourceErrorModeled::ValidationException(rejection).into());
-        }
 
         let merged = crate::state::merged_tags(&current, &input.tags);
         if let Some(rejection) = crate::state::tag_bounds_rejection("tags", &merged) {

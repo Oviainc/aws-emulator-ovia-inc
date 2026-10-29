@@ -264,6 +264,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ONE hold of the lock covers the precondition check and the write, so two
         // concurrent conditional updates cannot both observe the same entity tag.
         let region = crate::state::request_region(ctx.parts());
+
+        // A repeat inside a submitted multiview configuration is about the request alone,
+        // so it is decided before the store is consulted — the same place `CreateChannel`
+        // decides it, through the same rule.
+        if let Some(violation) = input
+            .multiview_configuration
+            .as_ref()
+            .and_then(crate::state::multiview_repetition_violation)
+        {
+            return Err(UpdateChannelErrorModeled::ValidationException(violation).into());
+        }
+
         let mut store = state.lock();
 
         let Some(group) = store.channel_group_mut(&region, &input.channel_group_name) else {
@@ -331,15 +343,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateChannelErrorModeled::ValidationException(violation).into());
         }
         // A submitted multiview configuration REPLACES the stored one, so its contents are
-        // held to the rules the create holds them to: neither list may repeat an entry,
-        // and every available source has to be a channel of this same group whose input
-        // type a tile source may have. The required-member direction is not an update's:
-        // an absent configuration leaves the stored one in place (below), so the channel
-        // still has the one its input type requires.
-        if let Some(violation) = input.multiview_configuration.as_ref().and_then(|multiview| {
-            crate::state::multiview_repetition_violation(multiview)
-                .or_else(|| crate::state::multiview_source_violation(group, multiview))
-        }) {
+        // held to the rules the create holds them to: neither list may repeat an entry
+        // (decided above, without the store), and every available source has to be a
+        // channel of this same group whose input type a tile source may have. The
+        // required-member direction is not an update's: an absent configuration leaves the
+        // stored one in place (below), so the channel still has the one its input type
+        // requires.
+        if let Some(violation) = input
+            .multiview_configuration
+            .as_ref()
+            .and_then(|multiview| crate::state::multiview_source_violation(group, multiview))
+        {
             return Err(UpdateChannelErrorModeled::ValidationException(violation).into());
         }
 

@@ -114,3 +114,5 @@ mod segment_output_timestamp_mode;
 mod endpoint_member_input_type_restriction;
 #[path = "all/harvest_job_scheduled_window.rs"]
 mod harvest_job_scheduled_window;
+#[path = "all/request_refusal_precedence.rs"]
+mod request_refusal_precedence;

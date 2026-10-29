@@ -306,7 +306,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
 
         // The manifest-set rules are about the request alone, so they are decided before
         // the store is consulted and before anything is written: an endpoint with no
@@ -345,6 +344,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
         }
 
+        // The tag map the request carries is read by nothing but the request either, so
+        // it belongs with the refusals above rather than after the lookups below: the two
+        // tag rules judge the member this request sent, and a request that breaks one is
+        // malformed whether or not the names it addresses resolve.
+        let tags = input.tags.clone().unwrap_or_default();
+        // A create's tag map is the same unbounded-growth site `TagResource` is, so it is
+        // judged against the same bounds before anything is stored.
+        if let Some(rejection) = crate::state::tag_bounds_rejection("Tags", &tags) {
+            return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
+        }
+        // Tag-on-create writes into the same tag map `TagResource` does, so it is held to
+        // the same reserved-namespace rule: AWS owns the `aws:` tag-key namespace, and a
+        // request naming a key in it is refused before anything is stored. `Tags` is the
+        // wire name of the member (no `@jsonName` on `CreateOriginEndpointRequest$Tags`).
+        if let Some(rejection) =
+            crate::state::reserved_tag_key_rejection("Tags", tags.keys().map(String::as_str))
+        {
+            return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
+        }
+
+        let mut store = state.lock();
         let Some(group) = store.channel_group_mut(&region, &input.channel_group_name) else {
             return Err(CreateOriginEndpointErrorModeled::ResourceNotFoundException(
                 crate::state::ResourceKind::ChannelGroup.not_found(),
@@ -384,21 +404,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let channel_output_locking_mode = channel.output_locking_mode.clone();
         // The request's own fingerprint: every member it carried EXCEPT the token that
         // identifies the attempt.
-        let tags = input.tags.clone().unwrap_or_default();
-        // A create's tag map is the same unbounded-growth site `TagResource` is, so it is
-        // judged against the same bounds before anything is stored.
-        if let Some(rejection) = crate::state::tag_bounds_rejection("Tags", &tags) {
-            return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
-        }
-        // Tag-on-create writes into the same tag map `TagResource` does, so it is held to
-        // the same reserved-namespace rule: AWS owns the `aws:` tag-key namespace, and a
-        // request naming a key in it is refused before anything is stored. `Tags` is the
-        // wire name of the member (no `@jsonName` on `CreateOriginEndpointRequest$Tags`).
-        if let Some(rejection) =
-            crate::state::reserved_tag_key_rejection("Tags", tags.keys().map(String::as_str))
-        {
-            return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
-        }
         // Every OPTIONAL member is rendered so that ABSENT and present-but-default stay
         // apart: each of them admits its own type default as a submitted value
         // (`Description` is `@length 0..1024`, so `""`; `StartoverWindowSeconds` is

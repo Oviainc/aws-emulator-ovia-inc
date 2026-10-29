@@ -400,6 +400,43 @@ pub fn tag_bounds_rejection(
     member_path: &str,
     tags: &HashMap<String, String>,
 ) -> Option<ValidationException> {
+    tag_bounds_rejection_counted(member_path, tags, |count| {
+        format!(
+            "A resource carries at most {MAX_TAGS_PER_RESOURCE} tags; the request would \
+             leave it with {count}"
+        )
+    })
+}
+
+/// The same bounds, judged on the map the REQUEST carries rather than on the one the
+/// resource is left holding.
+///
+/// What a merging writer ([`merged_tags`]) can be refused for without reading the stored
+/// map at all: merging only ever ADDS keys and never shortens one, so a submitted map
+/// already past a bound leaves the resource past it whatever it holds. The count clause
+/// states what the REQUEST carried, because how many the resource would then hold is not
+/// known at this point — the map the resource is left with is judged by
+/// [`tag_bounds_rejection`] once that map is in hand.
+pub fn submitted_tag_bounds_rejection(
+    member_path: &str,
+    tags: &HashMap<String, String>,
+) -> Option<ValidationException> {
+    tag_bounds_rejection_counted(member_path, tags, |count| {
+        format!(
+            "A resource carries at most {MAX_TAGS_PER_RESOURCE} tags; the request carries \
+             {count}"
+        )
+    })
+}
+
+/// The bounds themselves, shared by the two readings above: `count_detail` words the
+/// entry-count clause for the map being judged, while the per-entry clauses are the same
+/// either way, because a key and a value are as long as the request made them.
+fn tag_bounds_rejection_counted(
+    member_path: &str,
+    tags: &HashMap<String, String>,
+    count_detail: impl Fn(usize) -> String,
+) -> Option<ValidationException> {
     let refuse = |detail: String| {
         Some(ValidationException {
             message: Some(validation_message(Some(member_path), &detail)),
@@ -407,11 +444,7 @@ pub fn tag_bounds_rejection(
         })
     };
     if tags.len() > MAX_TAGS_PER_RESOURCE {
-        return refuse(format!(
-            "A resource carries at most {MAX_TAGS_PER_RESOURCE} tags; the request would \
-             leave it with {}",
-            tags.len()
-        ));
+        return refuse(count_detail(tags.len()));
     }
     for (key, value) in tags {
         if key.chars().count() > MAX_TAG_KEY_CHARS {

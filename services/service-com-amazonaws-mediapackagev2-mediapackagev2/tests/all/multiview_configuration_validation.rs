@@ -92,7 +92,11 @@ fn assert_refusal(
 }
 
 /// A `MultiviewConfiguration` member value.
-fn multiview(sources: &[&str], layouts: &[&str]) -> Value {
+///
+/// `pub(crate)` because it is the ONE builder this crate's suites share for the member
+/// (`request_refusal_precedence` addresses the same member through it), so no suite needs
+/// a second copy.
+pub(crate) fn multiview(sources: &[&str], layouts: &[&str]) -> Value {
     json!({"AvailableSources": sources, "AvailableLayouts": layouts})
 }
 
