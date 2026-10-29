@@ -1461,14 +1461,35 @@ pub fn page_bound(member_path: &str, max_results: i32, maximum: i32) -> Result<u
 ///
 /// [`page_bound`] is the same rule for a member whose model states a maximum ONLY: there the
 /// bound is refused rather than defaulted, because such a member documents no default to fall
-/// back on. Both live here so every read of this service that holds to one of them holds to
-/// ONE copy of it, and the page sizes they default to are the constants beside them.
+/// back on, and [`optional_page_bound`] is the same rule for a member that declares its whole
+/// range but no usable default, which a handler therefore receives as an `Option`. All live
+/// here so every read of this service that holds to one of them holds to ONE copy of it, and
+/// the page sizes they default to are the constants beside them.
 pub fn defaulted_page_bound(max_results: i32, default: i32) -> usize {
     if max_results < MIN_PAGE_BOUND {
         default as usize
     } else {
         max_results as usize
     }
+}
+
+/// The page size a read serves for a `MaxResults` whose own model declares the WHOLE range it
+/// admits but NO usable `@default`, so the handler receives the member as an `Option`, where
+/// `default` is the page that operation documents for a caller who states no bound.
+///
+/// The centralized walk enforces both ends of such a member's range before any handler runs,
+/// so a bound that reaches a handler at all is inside the range and is read straight off the
+/// input; the only case left to decide is the member that is ABSENT, which takes that
+/// operation's documented default page rather than a page of nothing, which could not advance
+/// its own cursor ([`page_of`]).
+///
+/// [`defaulted_page_bound`] is the same rule for a member whose model carries that default
+/// itself (so the handler receives an `i32` already defaulted by the walk), and [`page_bound`]
+/// for one whose model states a maximum ONLY, where the bound is refused rather than
+/// defaulted. All three live here so every read of this service that holds to one of them
+/// holds to ONE copy of it, and the page sizes they default to are the constants beside them.
+pub fn optional_page_bound(max_results: Option<i32>, default: i32) -> usize {
+    max_results.unwrap_or(default).max(0) as usize
 }
 
 /// One page of a derived projection, plus the token for the page after it.

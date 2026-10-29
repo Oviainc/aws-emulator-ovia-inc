@@ -209,12 +209,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `MaxResults` declares no `@default`, so an absent one means the default the
-        // member documents. A value outside the modelled `range 1..10` is already refused
-        // before this handler runs.
-        let page_size = input
-            .max_results
-            .unwrap_or(crate::state::DEFAULT_AUDIT_FINDING_PAGE)
-            .max(0) as usize;
+        // member documents, and a stated one is inside the modelled `range 1..10` because
+        // anything outside it is refused before this handler runs — the rule this service
+        // holds to in ONE place ([`crate::state::optional_page_bound`]).
+        let page_size = crate::state::optional_page_bound(
+            input.max_results,
+            crate::state::DEFAULT_AUDIT_FINDING_PAGE,
+        );
 
         // The extra per-finding context is what `DetailLevel` asks for, so it is attached
         // only when the caller asks for the DETAILED level; the modelled enum admits one

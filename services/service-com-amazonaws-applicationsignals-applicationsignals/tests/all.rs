@@ -73,6 +73,8 @@ mod list_services;
 mod list_tags_for_resource;
 #[path = "all/max_results_range.rs"]
 mod max_results_range;
+#[path = "all/optional_page_bound.rs"]
+mod optional_page_bound;
 #[path = "all/page_bounds.rs"]
 mod page_bounds;
 #[path = "all/paged_cursor_selection_binding.rs"]

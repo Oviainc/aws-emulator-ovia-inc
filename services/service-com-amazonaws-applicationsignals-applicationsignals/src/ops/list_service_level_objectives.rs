@@ -181,11 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // hold": the modelled maximum of `ListServiceLevelObjectivesMaxResults`. A supplied
         // value is read straight off the input, because its modelled `range 1..50` is
         // enforced and worded once for every operation of this service — by the centralized
-        // walk, before any handler runs — exactly as every sibling list here relies on.
-        let page_size = match input.max_results {
-            None => crate::state::MAX_SLO_PAGE as usize,
-            Some(max_results) => max_results.max(0) as usize,
-        };
+        // walk, before any handler runs — and that whole rule is held to in ONE place
+        // ([`crate::state::optional_page_bound`]).
+        let page_size =
+            crate::state::optional_page_bound(input.max_results, crate::state::MAX_SLO_PAGE);
 
         let cursor = match input.next_token.as_deref() {
             None => None,

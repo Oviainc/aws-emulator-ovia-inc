@@ -182,14 +182,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (slo_name, store.exclusion_windows_of(&input.id).to_vec())
         };
 
-        // `MaxResults` declares no `@default`, so an omitted bound takes this service's own
-        // default page (`crate::state::DEFAULT_EXCLUSION_WINDOW_PAGE`); its modelled
-        // `range 1..10` is refused before this handler runs, so a stated bound is read
-        // straight off the input.
-        let page_size = input
-            .max_results
-            .unwrap_or(crate::state::DEFAULT_EXCLUSION_WINDOW_PAGE)
-            .max(0) as usize;
+        // `MaxResults` declares no `@default`, so an omitted bound takes this read's own
+        // default page and a stated one is read straight off the input, its modelled
+        // `range 1..10` having been refused before this handler runs — the rule this service
+        // holds to in ONE place ([`crate::state::optional_page_bound`]).
+        let page_size = crate::state::optional_page_bound(
+            input.max_results,
+            crate::state::DEFAULT_EXCLUSION_WINDOW_PAGE,
+        );
         // The page this read walks is one SLO's window set, so the cursor is an offset into
         // THAT set: the SLO is bound into the token's tag, and a token carrying another SLO's
         // offset is refused rather than honoured here
