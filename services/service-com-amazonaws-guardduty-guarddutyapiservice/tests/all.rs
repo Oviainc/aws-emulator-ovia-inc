@@ -151,6 +151,8 @@ mod member_organization_auto_enable;
 mod modeled_constraint_refusals;
 #[path = "all/negative_class_rejections.rs"]
 mod negative_class_rejections;
+#[path = "all/no_op_batch_clock.rs"]
+mod no_op_batch_clock;
 #[path = "all/no_op_mutation_clock.rs"]
 mod no_op_mutation_clock;
 #[path = "all/object_malware_scan.rs"]

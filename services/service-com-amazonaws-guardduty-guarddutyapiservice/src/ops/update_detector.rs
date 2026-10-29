@@ -189,7 +189,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(bad_request(message));
         }
-        let now = state.tick_millis();
+        // The instant this call's configuration write lands at, read WITHOUT being
+        // taken off the clock: every configurable member is optional, so whether
+        // this request writes any of the detector's configuration is answered only
+        // once they have all been applied below.
+        let now = state.pending_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             return Err(bad_request(crate::state::not_owned_message(
                 crate::state::DETECTOR_ID_MEMBER,
@@ -227,6 +231,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // timestamp either.
         if configured {
             detector.updated_at_millis = now;
+            // The instant is taken off the clock only now that the write has
+            // landed: a request that carried no configuration member changed
+            // nothing, so it consumes no instant and the next real change still
+            // stamps a wall-clock one.
+            state.commit_millis(now);
         }
 
         Ok(UpdateDetectorOutput {})

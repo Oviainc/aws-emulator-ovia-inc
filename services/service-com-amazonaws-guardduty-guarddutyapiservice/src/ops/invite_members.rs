@@ -219,10 +219,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.detector_in(&region, &input.detector_id).is_none() {
             return Err(not_owned(&input.detector_id));
         }
-        // The invitations this call sends are sent NOW, so the clock advances once for
-        // the whole call: every member it invites carries the same `InvitedAt` and the
-        // same `UpdatedAt`.
-        let now = state.tick_millis();
+        // The instant an invitation this call sends is sent at, read WITHOUT being
+        // taken off the clock: whether anything is written at all is answered only
+        // by the loop below and the delivery after it, because an account this
+        // administrator holds no member record for is reported and an account whose
+        // invitation is still pending keeps the one it has. One instant for the whole
+        // call, so every member it invites carries the same `InvitedAt` and the same
+        // `UpdatedAt`.
+        let now = state.pending_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // Unreachable: the detector was resolved above and the lock has not been
             // released since. Answered rather than panicked, because a handler owes
@@ -232,6 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut unprocessed = Vec::new();
         let mut sent = false;
+        let mut wrote = false;
         let mut seen = ::std::collections::BTreeSet::new();
         for account_id in &input.account_ids {
             // `AccountIds` names a SET of accounts: a repeated id is invited once, so
@@ -255,6 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             crate::state::RELATIONSHIP_INVITED.to_string();
                         member.invited_at_millis = Some(now);
                         member.updated_at_millis = now;
+                        wrote = true;
                     }
                 }
                 // An account this administrator holds no member record for cannot be
@@ -284,7 +290,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // every account this emulator presents carries the one canonical account id,
         // so a Region's inbox holds at most that single key.
         if sent {
-            state.deliver_invitation_in(&region, &administrator, now);
+            wrote |= state.deliver_invitation_in(&region, &administrator, now);
+        }
+
+        // The instant is taken off the clock only now that one of the two sides of
+        // the relationship has really been written: a call that invited nobody, and
+        // one that only re-sent invitations already pending, left the store exactly
+        // as it found it, so neither consumes an instant.
+        if wrote {
+            state.commit_millis(now);
         }
 
         // `Message` and `DisableEmailNotification` govern the EMAIL the invitation is

@@ -222,7 +222,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.detector_in(&region, &input.detector_id).is_none() {
             return Err(not_owned(&input.detector_id));
         }
-        let now = state.tick_millis();
+        // The instant the members this call records are recorded at, read WITHOUT
+        // being taken off the clock: whether anything is written at all is answered
+        // only by the loop below, because the administrator's own account and an
+        // account past the quota are reported rather than recorded, and re-creating
+        // an account whose stored details already match writes nothing.
+        let now = state.pending_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // Unreachable: the detector was resolved above and the lock has not been
             // released since. Answered rather than panicked, because a handler owes
@@ -236,6 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let organization = detector.organization.clone();
 
         let mut unprocessed = Vec::new();
+        let mut wrote = false;
         let mut seen = ::std::collections::BTreeSet::new();
         for detail in &input.account_details {
             // One account is one member: a second entry for an account already
@@ -271,13 +277,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     if changed {
                         existing.updated_at_millis = now;
                     }
+                    wrote |= changed;
                     // An EXISTING member takes the organization's auto-enable
                     // settings too, which is what `irrespective of the accounts
                     // being new or existing members` says. Its own per-feature
                     // instants move with the switches this writes; the
                     // RELATIONSHIP's `UpdatedAt` above is a different fact and
                     // stays where the relationship left it.
-                    crate::state::apply_organization_auto_enable(existing, &organization, now);
+                    wrote |=
+                        crate::state::apply_organization_auto_enable(existing, &organization, now);
                 }
                 None => {
                     // The quota bounds the store: an account past it is reported
@@ -315,8 +323,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         now,
                     );
                     detector.members.insert(detail.account_id.clone(), member);
+                    wrote = true;
                 }
             }
+        }
+
+        // The instant is taken off the clock only now that a member has really been
+        // recorded or moved: a call that only re-stated the details the store
+        // already held, and one whose every account was reported, left the store
+        // exactly as they found it and consume no instant.
+        if wrote {
+            state.commit_millis(now);
         }
 
         Ok(CreateMembersOutput {

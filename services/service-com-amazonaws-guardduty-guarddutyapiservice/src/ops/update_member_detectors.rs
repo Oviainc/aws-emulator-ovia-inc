@@ -214,9 +214,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(bad_request(message));
             }
         }
-        // The configuration changes now, so the clock advances once for the whole
-        // call: every switch this call moves carries the same instant.
-        let now = state.tick_millis();
+        // The instant the configuration this call writes changes at, read WITHOUT
+        // being taken off the clock: whether any switch moves at all is answered
+        // only by the loop below, because an account this administrator holds no
+        // record for is reported and a request that names no configuration, or
+        // re-states the switches an account already carries, writes nothing. One
+        // instant for the whole call, so every switch it moves carries the same one.
+        let now = state.pending_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // Unreachable: the detector was resolved above and the lock has not been
             // released since. Answered rather than panicked, because a handler owes
@@ -231,6 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let organization = detector.organization.clone();
 
         let mut unprocessed = Vec::new();
+        let mut wrote = false;
         let mut seen = ::std::collections::BTreeSet::new();
         for account_id in &input.account_ids {
             // `AccountIds` names a SET of accounts: a repeated id is configured once,
@@ -244,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // one applier that judges them against the organization's
                     // auto-enable settings, so a switch the organization owns is
                     // left to it whichever view named it.
-                    crate::state::apply_member_configuration(
+                    wrote |= crate::state::apply_member_configuration(
                         member,
                         input.data_sources.as_ref(),
                         input.features.as_ref(),
@@ -262,6 +267,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     result: crate::state::not_a_member_message(&administrator),
                 }),
             }
+        }
+
+        // The instant is taken off the clock only now that a switch has really
+        // moved: a call that named no configuration, and one whose every named
+        // account was reported, left the store exactly as it found it and consumes
+        // no instant.
+        if wrote {
+            state.commit_millis(now);
         }
 
         Ok(UpdateMemberDetectorsOutput {

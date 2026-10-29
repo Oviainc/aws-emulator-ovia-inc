@@ -214,15 +214,48 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// real change stamp a future instant. Monotonicity is what makes
     /// `UpdatedAt > CreatedAt` observable for two changes that land in the same
     /// wall-clock millisecond.
+    ///
+    /// An operation that cannot tell whether it is going to write until it is
+    /// writing — a batch that moves only the stored records it finds in a state it
+    /// can move — reads [`Self::pending_millis`] and commits it with
+    /// [`Self::commit_millis`] instead, which is this same pair of steps with the
+    /// write in between.
     pub fn tick_millis(&mut self) -> i64 {
+        let next = self.pending_millis();
+        self.commit_millis(next);
+        next
+    }
+
+    /// The instant [`Self::tick_millis`] would hand out, taking NOTHING off the
+    /// clock.
+    ///
+    /// For a mutation whose writes are decided one stored record at a time — a
+    /// batch that moves only the records it finds in a state it can move and leaves
+    /// every other one exactly as it was — "is this call going to write" is
+    /// answerable only while writing. Such a handler reads the instant here, stamps
+    /// whatever it moves with it, and takes it off the clock with
+    /// [`Self::commit_millis`] once a write has really landed: a call that moved
+    /// nothing commits nothing, so it leaves the clock exactly where it found it and
+    /// the next real change still stamps a wall-clock instant. A mutation that knows
+    /// before it writes whether it is going to reads [`Self::tick_millis`] and
+    /// returns ahead of it on the path that writes nothing.
+    pub fn pending_millis(&self) -> i64 {
         let wall = now_millis();
-        let next = if wall > self.last_millis {
+        if wall > self.last_millis {
             wall
         } else {
             self.last_millis.saturating_add(1)
-        };
-        self.last_millis = next;
-        next
+        }
+    }
+
+    /// Take the instant [`Self::pending_millis`] handed out off the clock, now that
+    /// a write carrying it has landed.
+    ///
+    /// Never moves the clock backwards, so an instant committed twice — and one
+    /// committed after a later mutation has already taken a further instant — still
+    /// leaves the instants this state hands out strictly increasing.
+    pub fn commit_millis(&mut self, millis: i64) {
+        self.last_millis = self.last_millis.max(millis);
     }
 
     /// Mint a fresh 32-hex-character id, the shape GuardDuty uses for both
@@ -470,8 +503,9 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// [`detector_id_rejection`] / [`finding_id_rejection`]: an endpoint that holds
     /// no such detector, or a batch naming a finding id that detector does not hold.
     /// Every id is resolved BEFORE anything is written, and the detector is resolved
-    /// before [`Self::tick_millis`] runs, so a refused request moves nothing and
-    /// advances nothing.
+    /// before the clock is read at all, so a refused request moves nothing and
+    /// advances nothing — and an ACCEPTED request that moves no finding consumes no
+    /// instant either ([`Self::pending_millis`]).
     pub fn set_findings_archived_in(
         &mut self,
         region: &str,
@@ -485,11 +519,17 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
         if let Some(unheld) = detector.first_unheld_finding_id(finding_ids) {
             return Err(finding_id_rejection(unheld));
         }
-        let now = self.tick_millis();
+        // Whether any finding moves is known only as the write walks the named ids —
+        // a batch naming none of them, and one naming only findings already in the
+        // requested state, each leave every record exactly as it was — so the
+        // instant is read here and taken off the clock only once a write has landed.
+        let now = self.pending_millis();
         let Some(detector) = self.detector_in_mut(region, detector_id) else {
             return Err(detector_id_rejection(detector_id));
         };
-        detector.set_findings_archived(finding_ids, archived, now);
+        if detector.set_findings_archived(finding_ids, archived, now) {
+            self.commit_millis(now);
+        }
         Ok(())
     }
 
@@ -507,8 +547,9 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     ///
     /// `Err` carries the message the request is refused with, already classified by
     /// [`detector_id_rejection`]: an endpoint that holds no such detector. The
-    /// detector is resolved before [`Self::tick_millis`] runs, so a refused request
-    /// moves nothing and advances nothing.
+    /// detector is resolved before the clock is read at all, so a refused request
+    /// moves nothing and advances nothing — and an accepted submission that changes
+    /// no finding consumes no instant either ([`Self::pending_millis`]).
     pub fn set_findings_feedback_in(
         &mut self,
         region: &str,
@@ -520,11 +561,17 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
         if self.detector_in(region, detector_id).is_none() {
             return Err(detector_id_rejection(detector_id));
         }
-        let now = self.tick_millis();
+        // Read without being taken off the clock, for the reason
+        // [`Self::set_findings_archived_in`] reads it that way: a submission that
+        // names no finding this detector holds, and one that re-submits the feedback
+        // already recorded, both write nothing.
+        let now = self.pending_millis();
         let Some(detector) = self.detector_in_mut(region, detector_id) else {
             return Err(detector_id_rejection(detector_id));
         };
-        detector.set_findings_feedback(finding_ids, feedback, comments, now);
+        if detector.set_findings_feedback(finding_ids, feedback, comments, now) {
+            self.commit_millis(now);
+        }
         Ok(())
     }
 
@@ -2315,7 +2362,11 @@ pub fn state_unavailable() -> crate::ops::types::shared_types::InternalServerErr
 }
 
 /// A configured detector feature and when its status last changed.
-#[derive(Debug, Clone)]
+///
+/// Compared by value, so a write over a stored configuration can answer whether it
+/// moved anything: re-applying the status a switch already carries leaves an EQUAL
+/// record behind ([`set_feature_in`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeatureRecord {
     pub name: String,
     pub status: String,
@@ -2336,7 +2387,7 @@ pub struct FeatureRecord {
 
 /// A feature's nested additional configuration (e.g. a Runtime Monitoring agent
 /// management switch).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdditionalConfigRecord {
     pub name: String,
     pub status: String,
@@ -2868,15 +2919,26 @@ impl Detector {
     /// activity, so only [`FindingRecord::updated_at_millis`] moves:
     /// [`FindingRecord::event_last_seen_millis`] stays where the last observation
     /// left it.
-    pub fn set_findings_archived(&mut self, finding_ids: &[String], archived: bool, now: i64) {
+    ///
+    /// Answers whether this call moved any finding at all, which is what lets the
+    /// caller take the instant it stamped off the clock only when one really moved.
+    pub fn set_findings_archived(
+        &mut self,
+        finding_ids: &[String],
+        archived: bool,
+        now: i64,
+    ) -> bool {
+        let mut moved = false;
         for id in finding_ids {
             if let Some(finding) = self.findings.get_mut(id) {
                 if finding.archived != archived {
                     finding.archived = archived;
                     finding.updated_at_millis = now;
+                    moved = true;
                 }
             }
         }
+        moved
     }
 
     /// Record `feedback` (and the `comments` it came with) on every named finding
@@ -2895,13 +2957,17 @@ impl Detector {
     /// left it. A submission that leaves every stored value where it was moves
     /// nothing at all, which is what makes a re-submission of the same feedback a
     /// true no-op.
+    ///
+    /// Answers whether this call changed any finding at all, as
+    /// [`Self::set_findings_archived`] does and for the same reason.
     pub fn set_findings_feedback(
         &mut self,
         finding_ids: &[String],
         feedback: &str,
         comments: Option<&str>,
         now: i64,
-    ) {
+    ) -> bool {
+        let mut moved = false;
         for id in finding_ids {
             if let Some(finding) = self.findings.get_mut(id) {
                 let changed = finding.user_feedback.as_deref() != Some(feedback)
@@ -2910,9 +2976,11 @@ impl Detector {
                     finding.user_feedback = Some(feedback.to_string());
                     finding.feedback_comments = comments.map(str::to_string);
                     finding.updated_at_millis = now;
+                    moved = true;
                 }
             }
         }
+        moved
     }
 
     /// The first id in `finding_ids` this detector holds no finding for, in the
@@ -6235,11 +6303,18 @@ fn apply_member_feature_configurations(
 /// auto-enabled, which is exactly the set an organization configuration holds
 /// ([`ORG_FEATURES`]): the foundational sources are on for every account anyway and
 /// no organization setting names them.
+///
+/// Answers whether this call wrote any switch at all — re-applying the status a
+/// switch already carries writes nothing ([`set_feature_in`]) — so a caller can
+/// tell a write that landed from one that left the record exactly as it was.
 pub fn apply_organization_auto_enable(
     member: &mut MemberRecord,
     organization: &OrganizationConfiguration,
     now: i64,
-) {
+) -> bool {
+    // The configuration as it stood before, so "did anything move" is answered on
+    // the stored switches themselves rather than on what the settings named.
+    let stored = member.features.clone();
     for name in MEMBER_FEATURES {
         if !org_status_flag(organization.feature_auto_enable(name)) {
             continue;
@@ -6263,6 +6338,7 @@ pub fn apply_organization_auto_enable(
             );
         }
     }
+    member.features != stored
 }
 
 /// Write one member account's REQUESTED configuration onto its stored record under
@@ -6283,6 +6359,11 @@ pub fn apply_organization_auto_enable(
 /// `DescribeOrganizationConfiguration` reports for the same organization HOWEVER it
 /// was written — the invariant `CreateMembers` states and maintains for the accounts
 /// it records, here for the per-account write of the same stored switches.
+///
+/// Answers whether this call wrote any switch at all, as
+/// [`apply_organization_auto_enable`] does: a request that names no configuration,
+/// and one that re-states the switches the account already carries, each leave the
+/// record exactly as it was.
 pub fn apply_member_configuration(
     member: &mut MemberRecord,
     data_sources: Option<&crate::ops::types::DataSourceConfigurations>,
@@ -6291,7 +6372,7 @@ pub fn apply_member_configuration(
     >,
     organization: &OrganizationConfiguration,
     now: i64,
-) {
+) -> bool {
     // The configuration as it stood BEFORE the request, so the switches the
     // organization owns can be put back exactly once the request has passed over
     // them.
@@ -6302,7 +6383,12 @@ pub fn apply_member_configuration(
     apply_member_data_sources(member, data_sources, now);
     apply_member_feature_configurations(member, features, now);
     restore_organization_managed_switches(&mut member.features, &stored, organization);
+    // Reported from the stored switches, not from this call's return: the
+    // auto-enablement is written over a configuration the request may itself have
+    // moved, so the one comparison that answers "did this request write" is the
+    // whole configuration against the one it found.
     apply_organization_auto_enable(member, organization, now);
+    member.features != stored
 }
 
 /// Put every switch the organization manages back the way `stored` held it, after a

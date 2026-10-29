@@ -191,9 +191,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.detector_in(&region, &input.detector_id).is_none() {
             return Err(not_owned(&input.detector_id));
         }
-        // The relationship changes now, so the clock advances once for the whole
-        // call: every member this call moves carries the same `UpdatedAt`.
-        let now = state.tick_millis();
+        // The instant a member whose monitoring this call restarts changes at, read
+        // WITHOUT being taken off the clock: whether any member moves at all is
+        // answered only by the loop below, because an account this administrator
+        // holds no record for and one whose monitoring was never stopped are both
+        // left alone. One instant for the whole call, so every member it moves
+        // carries the same `UpdatedAt`.
+        let now = state.pending_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // Unreachable: the detector was resolved above and the lock has not been
             // released since. Answered rather than panicked, because a handler owes
@@ -202,6 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut unprocessed = Vec::new();
+        let mut moved = false;
         let mut seen = ::std::collections::BTreeSet::new();
         for account_id in &input.account_ids {
             // `AccountIds` names a SET of accounts: a repeated id is processed once,
@@ -221,6 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         member.relationship_status =
                             crate::state::RELATIONSHIP_ENABLED.to_string();
                         member.updated_at_millis = now;
+                        moved = true;
                     }
                 }
                 // Only an account ASSOCIATED with this administrator is monitored
@@ -233,6 +239,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     result: crate::state::not_a_member_message(&administrator),
                 }),
             }
+        }
+
+        // The instant is taken off the clock only now that a member has really
+        // moved: a call whose every named account was unknown, disassociated or
+        // already monitored left the store exactly as it found it, so it consumes no
+        // instant.
+        if moved {
+            state.commit_millis(now);
         }
 
         Ok(StartMonitoringMembersOutput {
