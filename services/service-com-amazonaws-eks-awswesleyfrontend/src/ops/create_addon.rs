@@ -40,9 +40,14 @@
 //! `ownerArn`, so `DescribePodIdentityAssociation` and `ListPodIdentityAssociations`
 //! find exactly the associations the add-on reports.
 //!
-//! A new add-on is reported `CREATING` and the clock owes it `ACTIVE`
-//! [`crate::state::ADDON_ACTIVATION_DELAY`] later; the due instant is stored on the
-//! record and materialised by whichever read first runs after it.
+//! A new add-on is reported `CREATING` and the clock owes it the TERMINAL state its
+//! install settles in [`crate::state::ADDON_ACTIVATION_DELAY`] later: an install is
+//! asynchronous and settles in the state that reflects what the cluster could do with
+//! it — running, running without the replica it needs, or failed because the
+//! Kubernetes resources it is applied against are not there or refused it
+//! ([`crate::state::ComAmazonawsEksAwswesleyfrontendState::addon_install_outcome`]).
+//! Both the outcome and the due instant are stored on the record and materialised by
+//! whichever read first runs after it.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -128,7 +133,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    self, AddonRecord, ADDON_ACTIVATION_DELAY,
+    self, AddonRecord,
     ADDON_DEFAULT_NAMESPACE, ADDON_OWNER_AWS, ADDON_PUBLISHER_EKS, ADDON_STATUS_CREATING,
     DEFAULT_KUBERNETES_VERSION, MAX_ADDONS_PER_CLUSTER,
     MAX_POD_IDENTITY_ASSOCIATIONS_PER_CLUSTER, STATUS_ACTIVE,
@@ -516,10 +521,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ResourceInUseException {
                     cluster_name: Some(input.cluster_name.clone()),
                     addon_name: Some(input.addon_name.clone()),
-                    message: Some(format!(
-                        "Addon {} is already installed on cluster {}.",
-                        input.addon_name, input.cluster_name
-                    )),
+                    // The sentence Amazon EKS answers a duplicate install with; the
+                    // cluster and the add-on are reported in the exception's own
+                    // `clusterName` and `addonName` members rather than in it.
+                    message: Some("Addon already exists.".to_string()),
                     ..Default::default()
                 },
             )
@@ -627,6 +632,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // WHAT THE INSTALL SETTLES IN. An add-on install is asynchronous: it leaves
+        // `CREATING` for the terminal state that reflects what the cluster actually
+        // did with it, which is decided HERE, from the state of the cluster this
+        // install runs against, and materialised when the clock reaches the due
+        // instant below. The decision is made once and stored, so every later read
+        // answers the same thing.
+        let install_outcome = guard.addon_install_outcome(
+            &region,
+            &input.cluster_name,
+            &input.addon_name,
+            &namespace,
+            now,
+        );
+        // An add-on applied against another add-on's resources settles after that
+        // add-on does, so a chain installed in one go takes a span per level.
+        let settles_at =
+            guard.addon_install_settles_at(&region, &input.cluster_name, &input.addon_name, now);
+
         let record = AddonRecord {
             arn: addon_arn,
             // The caller's version if it named one, else the default version for the
@@ -635,7 +658,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: ADDON_STATUS_CREATING.to_string(),
             created_at: now,
             modified_at: now,
-            active_at: Some(now + ADDON_ACTIVATION_DELAY),
+            active_at: Some(settles_at),
             service_account_role_arn: input.service_account_role_arn.clone(),
             tags: input
                 .tags
@@ -656,9 +679,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing is in flight on a freshly installed add-on: `UpdateAddon` is
             // what puts a pending change on the record.
             pending_update: None,
-            // An add-on this emulator has just installed has nothing wrong with it:
-            // only a change an update could not make leaves an issue here.
+            // An install that has not settled yet reports nothing wrong with it: the
+            // issues of the state it settles in are the ones the outcome carries, and
+            // they are written onto the record when that state is materialised.
             health_issues: Vec::new(),
+            install_outcome,
             // `resolveConflicts` decides what happens to a SELF-MANAGED copy of the
             // add-on already running on the cluster; this emulator runs no Kubernetes,
             // so there is never a self-managed copy to resolve against, and the member

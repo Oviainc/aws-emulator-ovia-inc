@@ -22,6 +22,7 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::nodegroup_lifecycle::{create_nodegroup_in, minimal_request as nodegroup_request};
 use crate::wire::{call, emulator, encode_label, Answer};
 
 /// The region every request in this suite is signed for, unless a case names
@@ -59,6 +60,18 @@ async fn wait_for_cluster_active() {
 async fn active_cluster(router: &MultiServiceRouter, name: &str) {
     create_cluster_in(router, REGION, &cluster_request(name)).await;
     wait_for_cluster_active().await;
+}
+
+/// The same, carrying one managed node group: a cluster with compute, so an
+/// add-on whose workload has a replica to schedule has somewhere to place it and
+/// its install is owed the running status rather than a degraded one.
+async fn active_cluster_with_nodes(router: &MultiServiceRouter, name: &str) {
+    active_cluster(router, name).await;
+    let nodes = create_nodegroup_in(router, REGION, name, &nodegroup_request("nodes")).await;
+    assert_eq!(
+        nodes.status, 200,
+        "setup CreateNodegroup on {name:?}: got {nodes:?}"
+    );
 }
 
 async fn create_addon_in(
@@ -1009,7 +1022,7 @@ async fn addons_are_scoped_to_their_own_cluster_and_region() {
 #[tokio::test]
 async fn a_new_addon_reports_creating_until_the_clock_owes_it_active() {
     let router = emulator();
-    active_cluster(&router, "settling-addons").await;
+    active_cluster_with_nodes(&router, "settling-addons").await;
 
     let names = ["vpc-cni", "coredns"];
     for name in names {

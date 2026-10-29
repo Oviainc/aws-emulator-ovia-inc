@@ -27,6 +27,8 @@ mod addon_catalog_coverage;
 mod addon_catalog_publication;
 #[path = "all/addon_deletion.rs"]
 mod addon_deletion;
+#[path = "all/addon_install_outcome.rs"]
+mod addon_install_outcome;
 #[path = "all/addon_lifecycle.rs"]
 mod addon_lifecycle;
 #[path = "all/addon_update.rs"]

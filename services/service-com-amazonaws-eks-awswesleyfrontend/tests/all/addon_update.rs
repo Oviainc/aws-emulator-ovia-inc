@@ -22,6 +22,7 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::addon_lifecycle::{create_addon, describe_addon};
+use crate::nodegroup_lifecycle::{create_nodegroup_in, minimal_request as nodegroup_request};
 use crate::wire::{call, emulator, encode_label, error_code, Answer};
 
 /// The region every request in this suite is signed for — the one the shared
@@ -58,7 +59,9 @@ fn cluster_request(name: &str) -> serde_json::Value {
 }
 
 /// One cluster in [`REGION`], waited into `ACTIVE` so the add-on layer that
-/// requires a running control plane is past.
+/// requires a running control plane is past, and carrying one managed node group
+/// so the add-ons installed on it have compute to place their replicas onto —
+/// which is what lets an install of one settle running rather than degraded.
 async fn active_cluster(router: &MultiServiceRouter, name: &str) {
     let answer = call(
         router,
@@ -73,6 +76,11 @@ async fn active_cluster(router: &MultiServiceRouter, name: &str) {
         "setup CreateCluster {name:?}: got {answer:?}"
     );
     tokio::time::sleep(CLUSTER_ACTIVATION_DELAY + Duration::from_millis(250)).await;
+    let nodes = create_nodegroup_in(router, REGION, name, &nodegroup_request("nodes")).await;
+    assert_eq!(
+        nodes.status, 200,
+        "setup CreateNodegroup on {name:?}: got {nodes:?}"
+    );
 }
 
 /// Install one add-on and wait out the span the clock owes it, so it is `ACTIVE`
@@ -352,9 +360,9 @@ async fn an_addon_update_applies_exactly_what_the_request_asked_to_change() {
         Case {
             case: "an empty association list, which deletes the ones the add-on owns",
             install: serde_json::json!({
-                "addonName": "adot",
+                "addonName": "external-dns",
                 "podIdentityAssociations": [
-                    { "serviceAccount": "adot-collector", "roleArn": ROLE_ARN },
+                    { "serviceAccount": "external-dns", "roleArn": ROLE_ARN },
                 ],
             }),
             request: serde_json::json!({ "podIdentityAssociations": [] }),

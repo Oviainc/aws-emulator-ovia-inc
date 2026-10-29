@@ -2736,9 +2736,29 @@ pub const ADDON_STATUS_DELETING: &str = "DELETING";
 /// (`smithy_query query="shape" shape="AddonIssueCode"`).
 pub const ADDON_ISSUE_CONFIGURATION_CONFLICT: &str = "ConfigurationConflict";
 
+/// The `AddonIssueCode` an add-on reports when a Kubernetes resource its own
+/// resources are applied against is not on the cluster
+/// (`smithy_query query="shape" shape="AddonIssueCode"`).
+pub const ADDON_ISSUE_K8S_RESOURCE_NOT_FOUND: &str = "K8sResourceNotFound";
+
+/// The `AddonIssueCode` an add-on reports when fewer of its replicas are
+/// running than it needs — on a cluster with no compute to schedule them onto,
+/// none of them is.
+pub const ADDON_ISSUE_INSUFFICIENT_REPLICAS: &str = "InsufficientNumberOfReplicas";
+
+/// The `AddonIssueCode` an add-on reports when the API server refused its
+/// resources at admission, which is what an admission webhook with no replica
+/// to answer the review does to every resource it gates.
+pub const ADDON_ISSUE_ADMISSION_REQUEST_DENIED: &str = "AdmissionRequestDenied";
+
 /// See [`ADDON_STATUS_CREATING`] — the status an add-on reports when it is
 /// running but not healthy.
 pub const ADDON_STATUS_DEGRADED: &str = "DEGRADED";
+
+/// See [`ADDON_STATUS_CREATING`] — the status an add-on reports when the
+/// install never came up, which is terminal: the add-on is removed and
+/// installed again rather than repaired in place.
+pub const ADDON_STATUS_CREATE_FAILED: &str = "CREATE_FAILED";
 
 /// The `AddonStatus` members an add-on can take an update from: the ones in
 /// which it has SETTLED.
@@ -2775,7 +2795,8 @@ pub const UPDATE_PARAM_CONFIGURATION_VALUES: &str = "ConfigurationValues";
 pub const UPDATE_PARAM_POD_IDENTITY_ASSOCIATIONS: &str = "PodIdentityAssociations";
 
 /// How long a newly created add-on reports `CREATING` before the clock owes it
-/// `ACTIVE`.
+/// the terminal status its install settles in
+/// ([`ComAmazonawsEksAwswesleyfrontendState::addon_install_outcome`]).
 ///
 /// `CreateAddon` publishes no duration for the install, so this span is CHOSEN
 /// rather than cited — the same reasoning as [`CLUSTER_ACTIVATION_DELAY`]: long
@@ -2851,6 +2872,54 @@ pub struct PendingAddonUpdate {
     pub pod_identity_associations: Option<Vec<AddonPodIdentityAssociations>>,
 }
 
+/// The terminal state an add-on install is owed: the `AddonStatus` it settles
+/// in and the `AddonHealth$issues` it settles with.
+///
+/// An install is asynchronous and "leaves `CREATING` for a terminal state that
+/// reflects what happened in the cluster", so what it settles in is decided
+/// from the cluster's own state when the install starts
+/// ([`ComAmazonawsEksAwswesleyfrontendState::addon_install_outcome`]) and
+/// materialised when the clock reaches the due instant the record carries
+/// ([`AddonRecord::active_at`]) — nothing is recomputed on the read that
+/// observes it.
+#[derive(Debug, Clone)]
+pub struct AddonInstallOutcome {
+    /// The `AddonStatus` the install settles in.
+    pub status: String,
+    /// The `AddonHealth$issues` it settles with: EMPTY for an install that came
+    /// up, one issue naming what the cluster could not give it otherwise.
+    pub issues: Vec<AddonIssue>,
+}
+
+impl AddonInstallOutcome {
+    /// The outcome of an install the cluster can carry out: the add-on runs,
+    /// with nothing wrong with it.
+    pub fn running() -> Self {
+        Self {
+            status: ADDON_STATUS_ACTIVE.to_string(),
+            issues: Vec::new(),
+        }
+    }
+
+    /// The outcome of an install that never came up, carrying the issue that
+    /// says why.
+    pub fn failed(issue: AddonIssue) -> Self {
+        Self {
+            status: ADDON_STATUS_CREATE_FAILED.to_string(),
+            issues: vec![issue],
+        }
+    }
+
+    /// The outcome of an install whose resources were applied but which is not
+    /// healthy, carrying the issue that says why.
+    pub fn degraded(issue: AddonIssue) -> Self {
+        Self {
+            status: ADDON_STATUS_DEGRADED.to_string(),
+            issues: vec![issue],
+        }
+    }
+}
+
 /// One add-on of one cluster, as this service stores it.
 ///
 /// Everything an `Addon` reports is held here — including the server-generated
@@ -2896,11 +2965,15 @@ pub struct AddonRecord {
     /// The add-on's open health issues — "An object representing the health
     /// issues for an add-on" (`AddonHealth$issues`).
     ///
-    /// This emulator runs no Kubernetes, so nothing the add-on itself does can go
-    /// wrong and a healthy add-on reports an EMPTY list. The one thing that can is
-    /// a change an update carried that could not be made, which leaves the issue
-    /// saying why ([`Self::fail_update`]) until a later update succeeds.
+    /// A healthy add-on reports an EMPTY list. An add-on carries an issue when
+    /// its install did not come up in the cluster it was installed into
+    /// ([`Self::install_outcome`]), or when a change an update carried could not
+    /// be made ([`Self::fail_update`]) — in both cases the issue says which.
     pub health_issues: Vec<AddonIssue>,
+    /// The terminal state this add-on's INSTALL is owed, decided when the
+    /// install started and written onto [`Self::status`] and
+    /// [`Self::health_issues`] when the clock reaches [`Self::active_at`].
+    pub install_outcome: AddonInstallOutcome,
 }
 
 impl AddonRecord {
@@ -2925,11 +2998,13 @@ impl AddonRecord {
         let due = self.active_at.filter(|due| now >= *due)?;
         self.active_at = None;
         match self.pending_update.take() {
-            // No update is in flight, so the instant was stored for a create's
-            // `CREATING` -> `ACTIVE` move: the add-on is running once the clock
-            // reaches it.
+            // No update is in flight, so the instant was stored for the move out
+            // of `CREATING`: once the clock reaches it the add-on reports the
+            // terminal state its install was owed, with the health issues that
+            // state carries.
             None => {
-                self.status = ADDON_STATUS_ACTIVE.to_string();
+                self.status = self.install_outcome.status.clone();
+                self.health_issues = self.install_outcome.issues.clone();
                 None
             }
             Some(pending) => Some((due, pending)),
@@ -2943,6 +3018,10 @@ impl AddonRecord {
     /// `at` is the instant the update was owed its completion, so `modifiedAt` is
     /// the same value whenever the read that materialises it comes. A member the
     /// change leaves `None` is one the request did not ask to change.
+    ///
+    /// The status written here is the one the CHANGE earns; whether the add-on's
+    /// replicas are running is decided for every settled add-on alike, by
+    /// [`ComAmazonawsEksAwswesleyfrontendState::resettle_addon_replicas`].
     pub fn apply_update(&mut self, at: SystemTime, pending: &PendingAddonUpdate) {
         if let Some(addon_version) = pending.addon_version.clone() {
             self.addon_version = addon_version;
@@ -2956,6 +3035,33 @@ impl AddonRecord {
         self.status = ADDON_STATUS_ACTIVE.to_string();
         self.health_issues.clear();
         self.modified_at = at;
+    }
+
+    /// The `AddonStatus` this add-on has settled in, or the one its install is
+    /// owed when the clock has not reached the due instant yet.
+    ///
+    /// Whatever asks what an add-on IS — rather than what it reports at this
+    /// instant — asks this: an install whose outcome is already decided answers
+    /// with that outcome, so the answer does not depend on whether a read has
+    /// run since it came due.
+    pub fn settled_status(&self) -> &str {
+        match (&self.pending_update, self.active_at) {
+            (None, Some(_)) => self.install_outcome.status.as_str(),
+            _ => self.status.as_str(),
+        }
+    }
+
+    /// Whether this add-on is running on its cluster: its install came up and
+    /// nothing has taken it out of service since.
+    ///
+    /// An add-on that is not running serves nothing the rest of the cluster can
+    /// depend on, which is what an add-on installed against its resources is
+    /// judged by.
+    pub fn is_running(&self) -> bool {
+        !matches!(
+            self.settled_status(),
+            ADDON_STATUS_CREATE_FAILED | ADDON_STATUS_DEGRADED | ADDON_STATUS_DELETING
+        )
     }
 
     /// Record that the change an add-on update carried could not be made: the
@@ -3940,6 +4046,18 @@ const ADDON_COMMON_CONFIGURATION_PROPERTIES: &[AddonSchemaProperty] = &[
     ("topologySpreadConstraints", "array"),
 ];
 
+/// How an add-on's pods are placed on a cluster, which is what decides whether
+/// its install has a replica to get scheduled at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddonWorkload {
+    /// One pod per node, as a DaemonSet: a cluster with no nodes has no pod of
+    /// it to place, so applying its resources is the whole install.
+    PerNode,
+    /// At least one replica of a Deployment, which Kubernetes schedules onto a
+    /// node — so an install of it needs the cluster to have compute.
+    Replicated,
+}
+
 /// One row of the add-on catalog seed: an Amazon EKS-managed add-on, and the
 /// version line its published builds run along.
 ///
@@ -3963,6 +4081,28 @@ struct AddonCatalogSeed {
     /// The Kubernetes namespace the add-on's workloads are installed into
     /// (`AddonInfo$defaultNamespace`).
     default_namespace: &'static str,
+    /// How the add-on's pods are placed, which decides what its install needs
+    /// from the cluster: a [`AddonWorkload::PerNode`] add-on has nothing to
+    /// schedule on a cluster with no nodes, a [`AddonWorkload::Replicated`] one
+    /// must get a replica scheduled somewhere.
+    ///
+    /// Source: the workloads each add-on's chart ships — the node agents and
+    /// device plugins are DaemonSets, the controllers, operators and servers are
+    /// Deployments.
+    workload: AddonWorkload,
+    /// The add-ons whose Kubernetes resources this add-on's own resources are
+    /// applied against: the ones its documented install requires on the cluster
+    /// FIRST, because its custom resources, certificates or webhooks come from
+    /// them. EMPTY for an add-on that needs nothing but the cluster.
+    ///
+    /// Source: the prerequisites the Amazon EKS User Guide lists for the add-on.
+    required_addons: &'static [&'static str],
+    /// Whether the add-on serves an admission webhook the API server calls
+    /// before it admits the resources of an add-on installed against this one.
+    ///
+    /// Source: the webhook key the add-on's own configuration schema declares
+    /// ([`AddonCatalogSeed::configuration_properties`]).
+    admission_webhook: bool,
     /// Whether the add-on needs IAM permissions of its own
     /// (`AddonVersionInfo$requiresIamPermissions`).
     requires_iam_permissions: bool,
@@ -4029,6 +4169,11 @@ struct AddonCatalogSeed {
 const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     AddonCatalogSeed {
         addon_name: "adot",
+        // The OpenTelemetry Operator, whose admission webhooks are served with
+        // certificates cert-manager issues.
+        workload: AddonWorkload::Replicated,
+        required_addons: &["cert-manager"],
+        admission_webhook: true,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "observability",
@@ -4047,6 +4192,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "amazon-cloudwatch-observability",
+        workload: AddonWorkload::Replicated,
+        required_addons: &[],
+        admission_webhook: true,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "observability",
@@ -4074,6 +4222,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         // training and inference workloads of a HyperPod cluster whose
         // orchestration runs on this cluster.
         addon_name: "amazon-sagemaker-hyperpod-taskgovernance",
+        workload: AddonWorkload::Replicated,
+        required_addons: &["cert-manager"],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "machine-learning",
@@ -4092,6 +4243,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "amazon-sagemaker-hyperpod-training-operator",
+        workload: AddonWorkload::Replicated,
+        required_addons: &["cert-manager"],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "machine-learning",
@@ -4110,6 +4264,11 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "aws-ebs-csi-driver",
+        // The CSI drivers run a controller Deployment beside their node
+        // DaemonSet, so an install of one has a replica to place.
+        workload: AddonWorkload::Replicated,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "storage",
@@ -4135,6 +4294,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         // The Elastic Fabric Adapter device plugin, which advertises the EFA
         // network interfaces of a node to the scheduler.
         addon_name: "aws-efa-k8s-device-plugin",
+        workload: AddonWorkload::PerNode,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "networking",
@@ -4150,6 +4312,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "aws-efs-csi-driver",
+        workload: AddonWorkload::Replicated,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "storage",
@@ -4174,6 +4339,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "aws-guardduty-agent",
+        workload: AddonWorkload::PerNode,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "security",
@@ -4191,6 +4359,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "aws-mountpoint-s3-csi-driver",
+        workload: AddonWorkload::Replicated,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "storage",
@@ -4210,6 +4381,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         // CloudWatch Network Flow Monitor, which it publishes to with
         // permissions of its own.
         addon_name: "aws-network-flow-monitoring-agent",
+        workload: AddonWorkload::PerNode,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "observability",
@@ -4228,6 +4402,12 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "cert-manager",
+        // Its controller, cainjector and webhook are Deployments, and the
+        // webhook is the one the API server calls for the resources of the
+        // add-ons installed against it.
+        workload: AddonWorkload::Replicated,
+        required_addons: &[],
+        admission_webhook: true,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "security",
@@ -4248,6 +4428,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "coredns",
+        workload: AddonWorkload::Replicated,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "networking",
@@ -4265,6 +4448,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "datadog_operator",
+        workload: AddonWorkload::Replicated,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_MARKETPLACE,
         publisher: "datadog",
         addon_type: "monitoring",
@@ -4283,6 +4469,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "dynatrace_dynatrace-operator",
+        workload: AddonWorkload::Replicated,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_MARKETPLACE,
         publisher: "dynatrace",
         addon_type: "monitoring",
@@ -4297,6 +4486,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "eks-node-monitoring-agent",
+        workload: AddonWorkload::PerNode,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "observability",
@@ -4314,6 +4506,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "eks-pod-identity-agent",
+        workload: AddonWorkload::PerNode,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "security",
@@ -4331,6 +4526,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "external-dns",
+        workload: AddonWorkload::Replicated,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "networking",
@@ -4353,6 +4551,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "kube-proxy",
+        workload: AddonWorkload::PerNode,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "networking",
@@ -4372,6 +4573,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "kube-state-metrics",
+        workload: AddonWorkload::Replicated,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "observability",
@@ -4389,6 +4593,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "kubecost_kubecost",
+        workload: AddonWorkload::Replicated,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_MARKETPLACE,
         publisher: "kubecost",
         addon_type: "cost-management",
@@ -4409,6 +4616,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "metrics-server",
+        workload: AddonWorkload::Replicated,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "observability",
@@ -4427,6 +4637,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "prometheus-node-exporter",
+        workload: AddonWorkload::PerNode,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "observability",
@@ -4444,6 +4657,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "snapshot-controller",
+        workload: AddonWorkload::Replicated,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "storage",
@@ -4461,6 +4677,9 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
     },
     AddonCatalogSeed {
         addon_name: "vpc-cni",
+        workload: AddonWorkload::PerNode,
+        required_addons: &[],
+        admission_webhook: false,
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
         addon_type: "networking",
@@ -4597,6 +4816,14 @@ pub struct AddonCatalogRecord {
     pub owner: String,
     pub publisher: String,
     pub default_namespace: String,
+    /// How this add-on's pods are placed; see [`AddonCatalogSeed::workload`].
+    pub workload: AddonWorkload,
+    /// The add-ons this one's resources are applied against; see
+    /// [`AddonCatalogSeed::required_addons`].
+    pub required_addons: Vec<String>,
+    /// Whether this add-on serves an admission webhook; see
+    /// [`AddonCatalogSeed::admission_webhook`].
+    pub admission_webhook: bool,
     /// The AWS Marketplace listing this add-on is subscribed through, for an
     /// add-on owned by [`ADDON_OWNER_MARKETPLACE`]; `None` for an Amazon
     /// EKS-managed one, which is not listed on Marketplace at all.
@@ -4958,6 +5185,13 @@ fn seed_addon_catalog() -> Vec<AddonCatalogRecord> {
                 owner: seed.owner.to_string(),
                 publisher: seed.publisher.to_string(),
                 default_namespace: seed.default_namespace.to_string(),
+                workload: seed.workload,
+                required_addons: seed
+                    .required_addons
+                    .iter()
+                    .map(|required| (*required).to_string())
+                    .collect(),
+                admission_webhook: seed.admission_webhook,
                 marketplace_information: (seed.owner == ADDON_OWNER_MARKETPLACE)
                     .then(|| marketplace_listing(seed.addon_name)),
                 pod_identity: seed
@@ -5155,6 +5389,48 @@ impl ComAmazonawsEksAwswesleyfrontendState {
         }
         for capability in self.capabilities.values_mut() {
             capability.materialize_due_transitions(now);
+        }
+        self.resettle_addon_replicas(now);
+    }
+
+    /// Bring every settled add-on's status and health back in line with what the
+    /// cluster can run NOW — the last pass, so it reads the node groups and
+    /// Fargate profiles the passes above have just moved.
+    ///
+    /// Whether an add-on's replicas are running is a value DERIVED from the
+    /// cluster's compute, not a fact of the add-on: a replica-less add-on
+    /// recovers once the cluster has somewhere to schedule its pod (a node group
+    /// finishing, a Fargate profile that selects its namespace, Auto Mode), and
+    /// one whose compute has gone is short of replicas again. Recomputing it is
+    /// therefore the same kind of work as materialising a clock-owed move: the
+    /// answer was already true at this instant whether or not anybody called.
+    ///
+    /// Only the two states that are ABOUT the replicas are recomputed. An
+    /// install that never came up is terminal — such an add-on is removed and
+    /// installed again rather than recovering on its own — and one still
+    /// settling, taking an update or being deleted has its own pass above.
+    fn resettle_addon_replicas(&mut self, now: SystemTime) {
+        let settled: Vec<((String, String, String), String)> = self
+            .addons
+            .iter()
+            .filter(|(_, addon)| {
+                addon.pending_update.is_none()
+                    && addon.active_at.is_none()
+                    && matches!(
+                        addon.status.as_str(),
+                        ADDON_STATUS_ACTIVE | ADDON_STATUS_DEGRADED
+                    )
+            })
+            .map(|(key, addon)| (key.clone(), addon.namespace.clone()))
+            .collect();
+        for (key, namespace) in settled {
+            let outcome = self.addon_replica_outcome(&key.0, &key.1, &key.2, &namespace, now);
+            if let Some(addon) = self.addons.get_mut(&key) {
+                if addon.status != outcome.status {
+                    addon.status = outcome.status;
+                    addon.health_issues = outcome.issues;
+                }
+            }
         }
     }
 
@@ -5406,6 +5682,223 @@ impl ComAmazonawsEksAwswesleyfrontendState {
             .published_versions(now)
             .find(|version| version.is_default_for(kubernetes_version))
             .map(|version| version.addon_version.clone())
+    }
+
+    /// The add-on one `(region, cluster, addonName)` triple names, when that
+    /// cluster holds it.
+    pub fn installed_addon(
+        &self,
+        region: &str,
+        cluster_name: &str,
+        addon_name: &str,
+    ) -> Option<&AddonRecord> {
+        self.addons.get(&(
+            region.to_string(),
+            cluster_name.to_string(),
+            addon_name.to_string(),
+        ))
+    }
+
+    /// Whether `cluster_name` has compute a pod in `namespace` can be scheduled
+    /// onto.
+    ///
+    /// Three things give a cluster somewhere to run a pod: EKS Auto Mode, which
+    /// provisions nodes for the pods the cluster is asked to run; a managed node
+    /// group that is RUNNING and scaled to at least one node; and a Fargate
+    /// profile that is running and SELECTS the pod's namespace, since Fargate
+    /// runs only the pods a profile selects. A cluster with none of them runs
+    /// nothing.
+    ///
+    /// The status matters as much as the count on both: a node group or profile
+    /// the cluster is still creating carries no pod yet, which is why this is
+    /// re-read rather than answered once (see [`Self::materialize_due_transitions`]).
+    pub fn cluster_can_place_pods(
+        &self,
+        region: &str,
+        cluster_name: &str,
+        namespace: &str,
+    ) -> bool {
+        if self
+            .clusters
+            .get(&(region.to_string(), cluster_name.to_string()))
+            .is_some_and(ClusterRecord::is_auto_mode)
+        {
+            return true;
+        }
+        if self.nodegroups_of(region, cluster_name).any(|nodegroup| {
+            nodegroup.scaling_config.desired_size.unwrap_or_default() > 0
+                && matches!(nodegroup.status.as_str(), STATUS_ACTIVE | STATUS_UPDATING)
+        }) {
+            return true;
+        }
+        self.fargate_profiles_of(region, cluster_name)
+            .any(|profile| {
+                profile.status == FARGATE_PROFILE_STATUS_ACTIVE
+                    && profile
+                        .selectors
+                        .iter()
+                        .any(|selector| selector.namespace.as_deref() == Some(namespace))
+            })
+    }
+
+    /// The terminal state an install of `addon_name` into `namespace` on one
+    /// cluster is owed, decided from that cluster's own state.
+    ///
+    /// An add-on install is asynchronous and settles in the state that reflects
+    /// what the cluster could actually do with it, which is three questions in
+    /// order, each about one thing the install needs:
+    ///
+    /// 1. the add-ons its resources are applied against must be ON the cluster,
+    ///    otherwise the Kubernetes resources it needs are not there and the
+    ///    install fails ([`ADDON_ISSUE_K8S_RESOURCE_NOT_FOUND`]);
+    /// 2. one that is installed but is NOT RUNNING cannot answer the admission
+    ///    review the API server sends its webhook, so every resource that
+    ///    webhook gates is refused and the install fails
+    ///    ([`ADDON_ISSUE_ADMISSION_REQUEST_DENIED`]);
+    /// 3. an add-on with a replica to schedule needs the cluster to have compute
+    ///    to schedule it onto; without it the resources are applied but no pod
+    ///    of the add-on runs, which is a running add-on that is not healthy
+    ///    ([`ADDON_ISSUE_INSUFFICIENT_REPLICAS`]).
+    ///
+    /// An add-on this catalog does not publish carries none of these
+    /// requirements, so its install runs.
+    pub fn addon_install_outcome(
+        &self,
+        region: &str,
+        cluster_name: &str,
+        addon_name: &str,
+        namespace: &str,
+        now: SystemTime,
+    ) -> AddonInstallOutcome {
+        let Some(published) = self.published_addon(addon_name, now) else {
+            return AddonInstallOutcome::running();
+        };
+        let missing: Vec<String> = published
+            .required_addons
+            .iter()
+            .filter(|required| {
+                self.installed_addon(region, cluster_name, required)
+                    .is_none()
+            })
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return AddonInstallOutcome::failed(AddonIssue {
+                code: Some(ADDON_ISSUE_K8S_RESOURCE_NOT_FOUND.to_string()),
+                message: Some(format!(
+                    "The Kubernetes resources add-on {addon_name} is installed against are \
+                     not on cluster {cluster_name}: {} must be installed first.",
+                    missing.join(", ")
+                )),
+                resource_ids: Some(self.addon_resource_ids(&missing, now)),
+            });
+        }
+        let denied: Vec<String> = published
+            .required_addons
+            .iter()
+            .filter(|required| {
+                self.published_addon(required, now)
+                    .is_some_and(|entry| entry.admission_webhook)
+                    && self
+                        .installed_addon(region, cluster_name, required)
+                        .is_some_and(|record| !record.is_running())
+            })
+            .cloned()
+            .collect();
+        if !denied.is_empty() {
+            return AddonInstallOutcome::failed(AddonIssue {
+                code: Some(ADDON_ISSUE_ADMISSION_REQUEST_DENIED.to_string()),
+                message: Some(format!(
+                    "The admission webhook of add-on {} on cluster {cluster_name} is not \
+                     running, so the Kubernetes resources of add-on {addon_name} were denied \
+                     at admission.",
+                    denied.join(", ")
+                )),
+                resource_ids: Some(self.addon_resource_ids(&denied, now)),
+            });
+        }
+        self.addon_replica_outcome(region, cluster_name, addon_name, namespace, now)
+    }
+
+    /// The Kubernetes resources of each of `addon_names`, as an `AddonIssue`
+    /// names the resources an issue is about: `<namespace>/<add-on>`, the
+    /// namespace being the one the catalog installs that add-on into.
+    fn addon_resource_ids(&self, addon_names: &[String], now: SystemTime) -> Vec<String> {
+        addon_names
+            .iter()
+            .map(|addon_name| {
+                let namespace = self
+                    .published_addon(addon_name, now)
+                    .map_or(ADDON_DEFAULT_NAMESPACE, |published| {
+                        published.default_namespace.as_str()
+                    });
+                format!("{namespace}/{addon_name}")
+            })
+            .collect()
+    }
+
+    /// The state an add-on whose resources ARE on the cluster is in: running, or
+    /// running without the replica it needs.
+    ///
+    /// An add-on with a replica to schedule needs the cluster to have compute to
+    /// schedule it onto; without it the resources are applied but no pod of the
+    /// add-on runs, which is a running add-on that is not healthy. An add-on that
+    /// runs one pod per node has nothing to place, and so is healthy on a cluster
+    /// with no nodes.
+    ///
+    /// It is the question an install asks last, and the one every later read asks
+    /// again ([`Self::resettle_addon_replicas`]): an add-on reports what the
+    /// cluster can do with the resources it carries, at the instant it is read.
+    pub fn addon_replica_outcome(
+        &self,
+        region: &str,
+        cluster_name: &str,
+        addon_name: &str,
+        namespace: &str,
+        now: SystemTime,
+    ) -> AddonInstallOutcome {
+        let replicated = self
+            .published_addon(addon_name, now)
+            .is_some_and(|published| published.workload == AddonWorkload::Replicated);
+        if replicated && !self.cluster_can_place_pods(region, cluster_name, namespace) {
+            return AddonInstallOutcome::degraded(AddonIssue {
+                code: Some(ADDON_ISSUE_INSUFFICIENT_REPLICAS.to_string()),
+                message: Some(format!(
+                    "No replica of add-on {addon_name} is running: cluster {cluster_name} has \
+                     no compute to schedule a pod in namespace {namespace} onto."
+                )),
+                resource_ids: Some(vec![format!("{namespace}/{addon_name}")]),
+            });
+        }
+        AddonInstallOutcome::running()
+    }
+
+    /// The instant an install of `addon_name` on one cluster is owed its
+    /// terminal state.
+    ///
+    /// One span ([`ADDON_ACTIVATION_DELAY`]) from now for an add-on that waits
+    /// for nothing. An add-on applied against another add-on's resources cannot
+    /// settle before THAT add-on has, so when one it is installed against is
+    /// still settling, its own span starts from the last of their due instants:
+    /// a dependency level costs a span, which is what makes the install of a
+    /// chain take one span per level.
+    pub fn addon_install_settles_at(
+        &self,
+        region: &str,
+        cluster_name: &str,
+        addon_name: &str,
+        now: SystemTime,
+    ) -> SystemTime {
+        let required = self
+            .published_addon(addon_name, now)
+            .map(|published| published.required_addons.as_slice())
+            .unwrap_or_default();
+        let last_prerequisite = required
+            .iter()
+            .filter_map(|required| self.installed_addon(region, cluster_name, required))
+            .filter_map(|record| record.active_at)
+            .max();
+        last_prerequisite.unwrap_or(now).max(now) + ADDON_ACTIVATION_DELAY
     }
 
     /// Drop every add-on installed on one cluster.
