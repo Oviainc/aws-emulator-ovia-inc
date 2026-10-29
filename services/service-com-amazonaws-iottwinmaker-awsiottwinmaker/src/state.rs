@@ -4335,6 +4335,125 @@ pub fn decode_page_token(envelope: &str, scope: &[&str], token: &str) -> Option<
     (!key.is_empty()).then(|| key.to_string())
 }
 
+/// What a `nextToken` that resumes at an ORDINAL binds a property FILTER list
+/// to: the conjunction those filters stand for, as a value two requests share
+/// exactly when they keep the same rows out of the same sequence.
+///
+/// An ordinal only means something inside the ONE sequence it was counted in, so
+/// a listing that resumes at one binds its token to every request member that
+/// decides that sequence — and a filter decides it, since a value no filter
+/// selects is not in it. Filters are applied as a CONJUNCTION, which neither the
+/// order they were listed in nor a repeated term changes, so they are taken
+/// sorted and de-duplicated, the way a selection is; a filter naming no operator
+/// is taken under the one it is applied with
+/// ([`COMPARISON_OPERATOR_EQUALS`]). Shared by every paginated operation that
+/// filters on a property's value, so one filter list reads as one scope wherever
+/// it is bound.
+pub fn property_filters_token_scope(
+    filters: &[crate::ops::types::PropertyFilter],
+) -> ::serde_json::Value {
+    let mut rendered: Vec<String> = filters
+        .iter()
+        .map(|filter| {
+            ::serde_json::json!([
+                filter.property_name.as_deref().unwrap_or(""),
+                filter
+                    .operator
+                    .as_deref()
+                    .unwrap_or(COMPARISON_OPERATOR_EQUALS),
+                filter
+                    .value
+                    .as_ref()
+                    .map_or(::serde_json::Value::Null, |value| {
+                        data_value_scope(value, 0)
+                    }),
+            ])
+            .to_string()
+        })
+        .collect();
+    rendered.sort();
+    rendered.dedup();
+    ::serde_json::Value::from(rendered)
+}
+
+/// How deeply a `DataValue`'s list and map nesting is rendered into a token
+/// scope before the rendering stops. A `DataValue` nests through
+/// `listValue`/`mapValue` and a filter value's depth is what the REQUEST says it
+/// is, so the number of stack frames must not be something a caller gets to
+/// choose. Past the bound the nested value renders as nothing.
+const MAX_TOKEN_VALUE_DEPTH: usize = 32;
+
+/// A `DataValue` as the value a token scope binds to: the members it carries
+/// under the names the model gives them, so two values read the same here
+/// exactly when they are the same value.
+///
+/// A map's entries are taken in KEY order — a map is unordered, so the order a
+/// request wrote them in says nothing about the value — and a number is rendered
+/// as text, so two numbers one JSON double cannot tell apart are still told
+/// apart. JSON is what renders it, so a value's text delimits itself rather than
+/// depending on a separator a free-text string value could itself carry.
+///
+/// `depth` is how far inside a nested list or map this value sits.
+fn data_value_scope(value: &crate::ops::types::DataValue, depth: usize) -> ::serde_json::Value {
+    use ::serde_json::Value as Json;
+
+    if depth >= MAX_TOKEN_VALUE_DEPTH {
+        return Json::Null;
+    }
+    let mut members = ::serde_json::Map::new();
+    if let Some(found) = value.boolean_value {
+        members.insert("booleanValue".to_string(), Json::Bool(found));
+    }
+    if let Some(found) = value.double_value {
+        members.insert("doubleValue".to_string(), Json::String(format!("{found:?}")));
+    }
+    if let Some(found) = value.integer_value {
+        members.insert("integerValue".to_string(), Json::String(found.to_string()));
+    }
+    if let Some(found) = value.long_value {
+        members.insert("longValue".to_string(), Json::String(found.to_string()));
+    }
+    if let Some(found) = &value.string_value {
+        members.insert("stringValue".to_string(), Json::String(found.clone()));
+    }
+    if let Some(found) = &value.list_value {
+        members.insert(
+            "listValue".to_string(),
+            Json::Array(
+                found
+                    .iter()
+                    .map(|entry| data_value_scope(entry, depth + 1))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(found) = &value.map_value {
+        let entries: BTreeMap<&String, &crate::ops::types::DataValue> = found.iter().collect();
+        members.insert(
+            "mapValue".to_string(),
+            Json::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, entry)| (key.clone(), data_value_scope(entry, depth + 1)))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(found) = &value.relationship_value {
+        members.insert(
+            "relationshipValue".to_string(),
+            ::serde_json::json!([
+                found.target_entity_id.as_deref().unwrap_or(""),
+                found.target_component_name.as_deref().unwrap_or(""),
+            ]),
+        );
+    }
+    if let Some(found) = &value.expression {
+        members.insert("expression".to_string(), Json::String(found.clone()));
+    }
+    Json::Object(members)
+}
+
 /// The message for a `nextToken` [`decode_page_token`] does not recognise: the
 /// ONE refusal every paginated operation of this service reports for a token it
 /// did not mint, so the same failure reads the same way whichever page was

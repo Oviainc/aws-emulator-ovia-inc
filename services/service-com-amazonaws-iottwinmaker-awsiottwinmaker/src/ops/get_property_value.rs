@@ -989,7 +989,8 @@ fn table_response(
     // A row has no key of its own — which rows there are and in what order is
     // what this request's own filters and ordering say — so the token resumes
     // at the row's ORDINAL in that sequence, and is bound to the query that
-    // produced it so a token from another one is refused rather than resumed.
+    // produced it — those conditions included ([`token_scope`]) — so a token
+    // from another one is refused rather than resumed.
     let resume_at = match input.next_token.as_deref() {
         None | Some("") => 0,
         Some(token) => decode_row_token(input, token)
@@ -1144,32 +1145,71 @@ const VALUE_TOKEN_PREFIX: &str = "iottwinmaker:property-values:1:";
 const ROW_TOKEN_PREFIX: &str = "iottwinmaker:property-table:1:";
 
 /// What a `nextToken` is bound to besides its workspace: the members that
-/// decide WHICH properties of which components the page is of, so a token is
-/// only resumed by the query that minted it.
+/// decide WHICH properties of which components the page is of, and — for a
+/// TABULAR page — the conditions that decide which rows there are and in what
+/// order ([`conditions_scope`]), so a token is only resumed by the query that
+/// minted it.
 ///
-/// Last of the token's scope parts, which is the one that may itself contain the
-/// separator ([`crate::state::encode_page_token`]), because the selected
-/// property names are free text. The selection is taken sorted and
-/// de-duplicated, the way the answer is keyed, so re-asking for the same
-/// properties in another order still resumes.
+/// Last of the token's scope parts ([`crate::state::encode_page_token`]), which
+/// is the one that may itself contain the separator, because the selected
+/// property names and the filter values are free text. The selection is taken
+/// sorted and de-duplicated, the way the answer is keyed, so re-asking for the
+/// same properties in another order still resumes.
 ///
-/// The filters and the ordering of a TABULAR query are NOT part of this: a
-/// tabular token resumes at a row's ordinal in the sequence the request's own
-/// `tabularConditions` produce, so a caller resumes by repeating the whole
-/// request with the token, which is what an SDK paginator does.
+/// Rendered as JSON, so each member is delimited by the rendering rather than by
+/// a separator one of those free-text values could itself carry.
 fn token_scope(input: &GetPropertyValueInput) -> String {
     let mut selected = input.selected_properties.clone();
     selected.sort();
     selected.dedup();
-    format!(
-        "{}|{}|{}|{}|{}|{}",
+    ::serde_json::json!([
         input.entity_id.as_deref().unwrap_or(""),
         input.component_name.as_deref().unwrap_or(""),
         input.component_path.as_deref().unwrap_or(""),
         input.component_type_id.as_deref().unwrap_or(""),
         input.property_group_name.as_deref().unwrap_or(""),
-        selected.join(","),
-    )
+        selected,
+        conditions_scope(input.tabular_conditions.as_ref()),
+    ])
+    .to_string()
+}
+
+/// What a TABULAR page's token binds its `tabularConditions` to: the filters
+/// that decide which rows are in the sequence and the ordering keys that decide
+/// what order they come in.
+///
+/// A row has no key of its own, so a tabular page resumes at a row's ORDINAL in
+/// that sequence ([`table_response`]) — and an ordinal only means something
+/// inside the one sequence it was counted in, so a request whose conditions
+/// produce another sequence is not the query that minted the token and is
+/// refused rather than resumed. The ordering keys are taken IN the order they
+/// were given, since the first key is the primary one ([`Table::sift`]); the
+/// filters are taken under the one rule every paginated operation of this
+/// service binds a filter list by
+/// ([`crate::state::property_filters_token_scope`]). An ordering key naming no
+/// order is taken under the one it is sorted by ([`ORDER_ASCENDING`]), so
+/// spelling that default out still resumes.
+fn conditions_scope(conditions: Option<&TabularConditions>) -> ::serde_json::Value {
+    let Some(conditions) = conditions else {
+        return ::serde_json::Value::Null;
+    };
+    let orders: Vec<::serde_json::Value> = conditions
+        .order_by
+        .iter()
+        .flatten()
+        .map(|order| {
+            ::serde_json::json!([
+                order.property_name,
+                order.order.as_deref().unwrap_or(ORDER_ASCENDING),
+            ])
+        })
+        .collect();
+    ::serde_json::json!([
+        orders,
+        crate::state::property_filters_token_scope(
+            conditions.property_filters.as_deref().unwrap_or_default()
+        ),
+    ])
 }
 
 /// The opaque `nextToken` for a latest-value page that resumes at

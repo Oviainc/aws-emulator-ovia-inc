@@ -164,6 +164,9 @@ mod sync_job_role_trust;
 #[path = "all/sync_resource_listing.rs"]
 mod sync_resource_listing;
 
+#[path = "all/tabular_page_token_scope.rs"]
+mod tabular_page_token_scope;
+
 #[path = "all/time_series_property_refusal.rs"]
 mod time_series_property_refusal;
 
