@@ -285,17 +285,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MAX_CACHE_BEHAVIORS_PER_DISTRIBUTION
             )));
         }
-        let custom_error_responses = input.custom_error_responses.clone().unwrap_or_default();
-        if custom_error_responses.len()
-            > crate::state::MAX_CUSTOM_ERROR_RESPONSES_PER_DISTRIBUTION
-        {
-            return Err(invalid(format!(
-                "customErrorResponses carries {} entries, more than the {} one distribution \
-                 holds",
-                custom_error_responses.len(),
-                crate::state::MAX_CUSTOM_ERROR_RESPONSES_PER_DISTRIBUTION
-            )));
-        }
+        // Every custom error response the distribution records is the entry the
+        // request carried, with the documented default of the one member whose
+        // model states one filled in — the crate's one owner of that rule —
+        // and the list itself within its bound.
+        let custom_error_responses = crate::state::custom_error_responses_from_request(
+            input.custom_error_responses.as_deref().unwrap_or_default(),
+        )
+        .map_err(invalid)?;
         // "The IP address type for the distribution. [...] The default value is
         // dualstack."
         let ip_address_type = input

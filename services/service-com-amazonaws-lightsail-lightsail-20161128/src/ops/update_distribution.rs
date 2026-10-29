@@ -286,18 +286,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
-        if let Some(custom_error_responses) = &input.custom_error_responses {
-            if custom_error_responses.len()
-                > crate::state::MAX_CUSTOM_ERROR_RESPONSES_PER_DISTRIBUTION
-            {
-                return Err(invalid(format!(
-                    "customErrorResponses carries {} entries, more than the {} one distribution \
-                     holds",
-                    custom_error_responses.len(),
-                    crate::state::MAX_CUSTOM_ERROR_RESPONSES_PER_DISTRIBUTION
-                )));
-            }
-        }
+        // A request that carries the list replaces the distribution's with the
+        // entries it names, each with the documented default of the one member
+        // whose model states one filled in and the list itself within its bound
+        // — the same rule `CreateDistribution` records a new distribution's list
+        // by, asked of the crate's one owner of it.
+        let custom_error_responses = input
+            .custom_error_responses
+            .as_deref()
+            .map(crate::state::custom_error_responses_from_request)
+            .transpose()
+            .map_err(invalid)?;
         // "When you include this parameter, you must also include the origin
         // parameter with the resource name, even if the origin is not changing."
         if input.enable_private_origin_access.is_some() && origin_patch.is_none() {
@@ -432,7 +431,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(cache_behaviors) = input.cache_behaviors {
                 distribution.cache_behaviors = cache_behaviors;
             }
-            if let Some(custom_error_responses) = input.custom_error_responses {
+            if let Some(custom_error_responses) = custom_error_responses {
                 distribution.custom_error_responses = custom_error_responses;
             }
             if let Some(is_enabled) = input.is_enabled {

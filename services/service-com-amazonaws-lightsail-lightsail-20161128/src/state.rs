@@ -12300,6 +12300,15 @@ pub const MAX_CACHE_BEHAVIORS_PER_DISTRIBUTION: usize = 25;
 /// `DistributionCustomErrorResponseList` declares no length.
 pub const MAX_CUSTOM_ERROR_RESPONSES_PER_DISTRIBUTION: usize = 25;
 
+/// The `errorCachingMinTTL`, in seconds, a custom error response that names none
+/// of its own is cached for.
+///
+/// From the modelled `DistributionCustomErrorResponse$errorCachingMinTTL`
+/// documentation: "The minimum time, in seconds, that the distribution caches the
+/// custom error response before requesting the object again from the origin. If
+/// you don't specify a value, the default is 10 seconds."
+pub const DEFAULT_ERROR_CACHING_MIN_TTL_SECONDS: i64 = 10;
+
 /// How many distributions one `GetDistributions` page carries.
 ///
 /// The operation is paginated — its `pageToken` is "The token to advance to the
@@ -12505,6 +12514,43 @@ pub fn distribution_domain_name(id: &str) -> String {
     format!("d{token}.{DISTRIBUTION_DOMAIN_SUFFIX}")
 }
 
+/// The custom error responses `requested` asks a distribution to serve, each with
+/// every member it left out filled in from that member's documented default, or a
+/// refusal when the list carries more entries than one distribution holds.
+///
+/// A member the model documents a default for is one the SERVICE fills in, so a
+/// stored — and therefore reported — entry carries it whether or not the request
+/// did, exactly as the origin's `responseTimeout` and the distribution's
+/// `ipAddressType` do. `errorCachingMinTTL` is the only member of
+/// `DistributionCustomErrorResponse` whose documentation states a default; the
+/// other three are reported as the request stated them.
+///
+/// The ONE owner of that rule, so `CreateDistribution` and `UpdateDistribution`
+/// cannot record the list two different ways.
+pub fn custom_error_responses_from_request(
+    requested: &[DistributionCustomErrorResponse],
+) -> Result<Vec<DistributionCustomErrorResponse>, String> {
+    if requested.len() > MAX_CUSTOM_ERROR_RESPONSES_PER_DISTRIBUTION {
+        return Err(format!(
+            "customErrorResponses carries {} entries, more than the {} one distribution holds",
+            requested.len(),
+            MAX_CUSTOM_ERROR_RESPONSES_PER_DISTRIBUTION
+        ));
+    }
+    Ok(requested
+        .iter()
+        .map(|response| {
+            let mut recorded = response.clone();
+            recorded.error_caching_min_ttl = Some(
+                recorded
+                    .error_caching_min_ttl
+                    .unwrap_or(DEFAULT_ERROR_CACHING_MIN_TTL_SECONDS),
+            );
+            recorded
+        })
+        .collect())
+}
+
 /// What an origin name resolves to: the kind of resource it addresses, and the
 /// public DNS name this store publishes for that resource, if it publishes one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12561,7 +12607,8 @@ impl StoredCacheReset {
 ///
 /// What the caller asked for — name, bundle, origin, cache behaviour and
 /// settings, custom error responses, IP address type, certificate name, minimum
-/// viewer TLS version, default root object and tags — is kept verbatim; the ARN,
+/// viewer TLS version, default root object and tags — is kept as asked for, with
+/// the documented default of a member the request left out filled in; the ARN,
 /// support code, creation time, domain name, status and the origin's resolved
 /// resource type are assigned by this store from the request plus its own
 /// allocators.
@@ -12621,6 +12668,10 @@ pub struct StoredDistribution {
     pub ip_address_type: String,
     pub viewer_minimum_tls_protocol_version: Option<String>,
     pub default_root_object: Option<String>,
+    /// The custom error responses this distribution serves, as
+    /// [`custom_error_responses_from_request`] recorded them: the entries the
+    /// request carried, with each member the model documents a default for
+    /// filled in.
     pub custom_error_responses: Vec<DistributionCustomErrorResponse>,
     /// The last reset of this distribution's cached content, once one has been
     /// requested: `None` on a distribution whose cache has never been reset,
