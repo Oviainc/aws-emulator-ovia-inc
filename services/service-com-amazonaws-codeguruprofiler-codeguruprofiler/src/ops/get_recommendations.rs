@@ -14,10 +14,13 @@
 //! * the group must exist, or the operation answers its modelled
 //!   `ResourceNotFoundException` (HTTP 404);
 //! * `profilingGroupName` comes from the STORED group record, and
-//!   `profileStartTime`/`profileEndTime` from the receipt times of the agent profiles that
-//!   group retains inside the requested window — the profiles the analysis is about. A
-//!   window the group retains no profile in covers nothing, so the requested bounds are
-//!   reported back as the (empty) analysed span.
+//!   `profileStartTime`/`profileEndTime` from the receipt times of the AGGREGATED agent
+//!   profiles that group retains inside the requested window — the profiles the analysis
+//!   is about. A profile the service has received but whose aggregation is not due yet is
+//!   part of no aggregated profile, so it is part of no analysed span either, exactly as
+//!   `GetProfile` and `ListProfileTimes` do not report it. A window the group retains no
+//!   such profile in covers nothing, so the requested bounds are reported back as the
+//!   (empty) analysed span.
 //!
 //! `recommendations` and `anomalies` hold NO findings. This emulator stores an agent
 //! profile as the opaque payload `PostAgentProfile` uploaded (`GetProfile` hands the same
@@ -244,11 +247,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The span the analysed profiles cover: the earliest and latest receipt times the
-        // group retains inside the requested window. A window holding no profile covers
-        // nothing, so the requested bounds stand as the empty analysed span.
+        // The span the analysed profiles cover: the earliest and latest receipt times of
+        // the AGGREGATED profiles the group retains inside the requested window. A
+        // profile the service has received but not yet collected into an aggregated
+        // profile is in no aggregated profile, so it is in no analysed span either — the
+        // same instant-gated rule `GetProfile`, `ListProfileTimes` and
+        // `BatchGetFrameMetricData` report a group's profile data by. A window holding no
+        // such profile covers nothing, so the requested bounds stand as the empty
+        // analysed span.
         let (profile_start_time, profile_end_time) = group
-            .profile_span_in(input.start_time, input.end_time)
+            .profile_span_in(input.start_time, input.end_time, crate::state::now())
             .unwrap_or((input.start_time, input.end_time));
 
         Ok(GetRecommendationsOutput {

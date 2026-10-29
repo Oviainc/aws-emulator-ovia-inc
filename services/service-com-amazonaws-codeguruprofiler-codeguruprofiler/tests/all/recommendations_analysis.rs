@@ -13,8 +13,10 @@
 //! 3. the analysis is about a STORED group: an unknown name is a `ResourceNotFoundException`
 //!    (HTTP 404), the reported `profilingGroupName` comes from the stored record, and
 //!    `profileStartTime`/`profileEndTime` are the earliest and latest receipt times of the
-//!    agent profiles that group retains inside the requested window — the requested bounds
-//!    only when it retains none there;
+//!    AGGREGATED agent profiles that group retains inside the requested window — the
+//!    requested bounds only when it retains none there (the aggregation gate itself is
+//!    [`crate::recommendations_pending_aggregation`]'s rule, so every profile here is
+//!    placed at an instant whose aggregation fell due long ago);
 //! 4. the read changes nothing a later caller sees.
 //!
 //! Each table row varies what those rules generalise over (window position and width,

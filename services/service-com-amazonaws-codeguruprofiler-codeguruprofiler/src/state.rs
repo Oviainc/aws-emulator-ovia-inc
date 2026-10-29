@@ -1314,31 +1314,42 @@ impl ProfilingGroup {
             .filter(|policy| !policy.statements.is_empty())
     }
 
-    /// The span the retained profiles inside `[start, end]` cover, as (earliest receipt
-    /// time, latest receipt time), or `None` when this group retains no profile in that
-    /// window. Both bounds are inclusive, and the answer is derived from the stored
-    /// receipt times alone — this is what `GetRecommendations` reports as the span its
-    /// analysis is about.
+    /// The span the AGGREGATED profiles this group retains inside `[start, end]` cover
+    /// as of `at`, as (earliest receipt time, latest receipt time), or `None` when it
+    /// retains no such profile in that window. Both bounds are inclusive, and the answer
+    /// is derived from the stored receipt times and `at` alone — this is what
+    /// `GetRecommendations` reports as the span its analysis is about.
+    ///
+    /// A profile whose aggregation is not due yet ([`AgentProfile::is_aggregated`]) is in
+    /// no aggregated profile, so it is in no analysed span either — the same gate
+    /// [`ProfilingGroup::latest_profile_in`] and
+    /// [`ProfilingGroup::aggregated_profile_starts`] apply, so one instant's reads of a
+    /// group's profile data agree about which profiles exist.
     ///
     /// Instants are compared through [`instant_key`], so two receipt times a fraction of
     /// a microsecond apart still order exactly.
-    pub fn profile_span_in(&self, start: DateTime, end: DateTime) -> Option<(DateTime, DateTime)> {
+    pub fn profile_span_in(
+        &self,
+        start: DateTime,
+        end: DateTime,
+        at: DateTime,
+    ) -> Option<(DateTime, DateTime)> {
         let (lower, upper) = (instant_key(start), instant_key(end));
         let mut span: Option<(DateTime, DateTime)> = None;
         for profile in &self.profiles {
-            let at = instant_key(profile.received_at);
-            if at < lower || at > upper {
+            let received = instant_key(profile.received_at);
+            if received < lower || received > upper || !profile.is_aggregated(at) {
                 continue;
             }
             span = Some(match span {
                 None => (profile.received_at, profile.received_at),
                 Some((earliest, latest)) => (
-                    if at < instant_key(earliest) {
+                    if received < instant_key(earliest) {
                         profile.received_at
                     } else {
                         earliest
                     },
-                    if at > instant_key(latest) {
+                    if received > instant_key(latest) {
                         profile.received_at
                     } else {
                         latest

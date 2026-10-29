@@ -65,6 +65,8 @@ mod profile_times;
 mod profiling_group_lifecycle;
 #[path = "all/recommendations_analysis.rs"]
 mod recommendations_analysis;
+#[path = "all/recommendations_pending_aggregation.rs"]
+mod recommendations_pending_aggregation;
 #[path = "all/refusal_message_formats.rs"]
 mod refusal_message_formats;
 #[path = "all/refusal_message_rules.rs"]
