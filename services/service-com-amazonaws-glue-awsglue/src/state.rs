@@ -180,6 +180,15 @@
 //! `GetDataQualityRuleRecommendationRun` takes and nothing else, so the data source a run
 //! covers is recorded on the run rather than the run on the table.
 //!
+//! DATA QUALITY RULESETS — the DQDL rule sets `CreateDataQualityRuleset` registers — sit
+//! beside the catalog tree in a per-account namespace keyed by ruleset name
+//! ([`ComAmazonawsGlueAwsglueState::data_quality_rulesets`]), because every operation that
+//! addresses one (`GetDataQualityRuleset`, `UpdateDataQualityRuleset`,
+//! `DeleteDataQualityRuleset`) names it by `Name` alone and carries no `CatalogId`. The
+//! Glue table a ruleset is written against is recorded ON the ruleset, the way a
+//! recommendation run records its data source, because the ruleset's name is its whole
+//! address and the target table is optional.
+//!
 //! USAGE PROFILES — the job and session parameter sets an admin registers with
 //! `CreateUsageProfile` — sit beside the catalog tree in another per-account namespace
 //! keyed by profile name ([`ComAmazonawsGlueAwsglueState::usage_profiles`]), because every
@@ -230,14 +239,15 @@ use crate::ops::types::{
     Connection, ConnectionInput,
     ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets, CreateClassifierInput,
     CreateColumnStatisticsTaskSettingsInput, CreateCrawlerInput,
-    CreateCustomEntityTypeInput, CreateGlossaryInput, CreateGlossaryTermInput,
+    CreateCustomEntityTypeInput, CreateDataQualityRulesetInput, CreateGlossaryInput,
+    CreateGlossaryTermInput,
     CreateIntegrationResourcePropertyInput, CreateIntegrationTablePropertiesInput, CreateJobInput,
     CreateIcebergTableInput, IcebergSchema, JobBookmarkEntry, TableOptimizer,
     TableOptimizerConfiguration,
     CreateMLTransformInput, CsvClassifier,
     CreateSecurityConfigurationInput, CreateTriggerInput, CreateWorkflowInput, CustomEntityType,
     DataCatalogEncryptionSettings, DataLakeAccessPropertiesOutput, DataLakePrincipal,
-    DataQualityRuleRecommendationRunAdditionalRunOptions,
+    DataQualityRuleRecommendationRunAdditionalRunOptions, DataQualityTargetTable,
     DataSource, Database, DatabaseIdentifier, DatabaseInput,
     Edge, EncryptionAtRest, EncryptionConfiguration, ErrorDetail, EventBatchingCondition,
     ExecutionAttempt, ExecutionProperty, FederatedCatalog, FederatedDatabase,
@@ -388,6 +398,13 @@ pub const MAX_CUSTOM_ENTITY_TYPES: usize = 1_000;
 /// [`MAX_CRAWLERS`]. A create past it is refused with `CreateSecurityConfiguration`'s own
 /// modelled `ResourceNumberLimitExceededException`.
 pub const MAX_SECURITY_CONFIGURATIONS: usize = 1_000;
+
+/// Ceiling on the data quality rulesets this emulator will hold, for the same reason as
+/// [`MAX_CRAWLERS`]: `CreateDataQualityRuleset` writes a record any caller can reach, and
+/// each one carries up to the modelled 65536 characters of DQDL, so the number of records
+/// one process will hold is bounded here. A create past it is refused with
+/// `CreateDataQualityRuleset`'s own modelled `ResourceNumberLimitExceededException`.
+pub const MAX_DATA_QUALITY_RULESETS: usize = 1_000;
 
 /// Ceiling on the classifiers this emulator will hold, for the same reason as
 /// [`MAX_CRAWLERS`]. `CreateClassifier` models no limit error, so a create past it is
@@ -988,6 +1005,19 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// ([`DataQualityRuleRecommendationRunEntry`]). Kept in start order and bounded by
     /// [`MAX_DATA_QUALITY_RULE_RECOMMENDATION_RUNS`].
     pub data_quality_rule_recommendation_runs: Vec<DataQualityRuleRecommendationRunEntry>,
+    /// Every data quality ruleset this emulator holds, keyed by its name, in name order.
+    ///
+    /// Per account and beside the catalog tree, like crawlers and custom entity types:
+    /// `GetDataQualityRuleset`, `UpdateDataQualityRuleset` and `DeleteDataQualityRuleset`
+    /// address a ruleset by `Name` alone, with no `CatalogId` member, and
+    /// `CreateDataQualityRulesetRequest$Name` is "a unique name for the data quality
+    /// ruleset". The target table a ruleset is written against is recorded ON the ruleset
+    /// ([`DataQualityRulesetEntry::target_table`]) rather than the ruleset on the table,
+    /// because that name is the whole address and the `TargetTable` is optional. Ordered,
+    /// so `ListDataQualityRulesets` has one deterministic order to page over, and bounded
+    /// by [`MAX_DATA_QUALITY_RULESETS`]. The key is the name exactly as sent — the model
+    /// documents no case fold for `NameString`.
+    pub data_quality_rulesets: BTreeMap<String, DataQualityRulesetEntry>,
     /// Every resource policy this emulator holds, keyed by the ARN of the resource it is
     /// attached to, in ARN order.
     ///
@@ -2192,6 +2222,12 @@ impl ComAmazonawsGlueAwsglueState {
     /// [`MAX_CUSTOM_ENTITY_TYPES`].
     pub fn can_store_custom_entity_type(&self) -> bool {
         self.custom_entity_types.len() < MAX_CUSTOM_ENTITY_TYPES
+    }
+
+    /// Whether the store can hold another data quality ruleset, i.e. is below
+    /// [`MAX_DATA_QUALITY_RULESETS`].
+    pub fn can_store_data_quality_ruleset(&self) -> bool {
+        self.data_quality_rulesets.len() < MAX_DATA_QUALITY_RULESETS
     }
 
     /// The integration resource property record stored for `resource_arn`, if this account
@@ -9883,6 +9919,22 @@ pub mod messages {
     pub const DATA_SOURCE_REQUIRES_A_TABLE: &str =
         "DataSource must specify either a GlueTable or a DataQualityGlueTable.";
 
+    /// A data quality ruleset lookup for a name this account holds no ruleset under — the
+    /// miss of every operation that addresses one by `Name` (`GetDataQualityRuleset`, and
+    /// the update and delete that address a ruleset the same way). NOT recorded: the
+    /// sentence follows the per-resource template of its data quality sibling
+    /// [`data_quality_rule_recommendation_run_not_found`], built from the name the request
+    /// sent, which is the whole address of a ruleset.
+    pub fn data_quality_ruleset_not_found(name: &str) -> String {
+        format!("Data quality ruleset with name {name} does not exist")
+    }
+
+    /// `CreateDataQualityRuleset` for a name this account already holds a ruleset under.
+    /// NOT recorded: inferred from the recorded `CreateDatabase` duplicate, like
+    /// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of the
+    /// requested name.
+    pub const DATA_QUALITY_RULESET_ALREADY_EXISTS: &str = "Data quality ruleset already exists.";
+
     /// A partition create whose `PartitionInput` carries no `Values`. NOT recorded: what
     /// is pinned is the behaviour — `InvalidInputException`, as a per-item error for a
     /// batch create — and the sentence names the member the input has to carry, which is
@@ -11982,5 +12034,109 @@ pub fn recommended_ruleset(columns: &[String]) -> Option<String> {
         return None;
     }
     Some(format!("{DQDL_RULES_PREFIX}{rules}{DQDL_RULES_SUFFIX}"))
+}
+
+/// One stored data quality ruleset: the DQDL rules `CreateDataQualityRuleset` registers
+/// under a name, plus the members only the server sets.
+///
+/// Every member of the modelled `GetDataQualityRulesetResponse` is held here, so a read
+/// serves what the write stored and invents nothing, plus the create's `Tags` and
+/// `ClientToken`, which that response does not carry.
+#[derive(Debug, Clone)]
+pub struct DataQualityRulesetEntry {
+    /// "A unique name for the data quality ruleset", which is also its key in
+    /// [`ComAmazonawsGlueAwsglueState::data_quality_rulesets`].
+    pub name: String,
+    /// "A description of the data quality ruleset", absent when the write named none.
+    pub description: Option<String>,
+    /// "A Data Quality Definition Language (DQDL) ruleset", stored exactly as sent: this
+    /// emulator holds the Glue control plane, so the rules are kept as the text the client
+    /// authored rather than re-rendered.
+    pub ruleset: String,
+    /// "A target table associated with the data quality ruleset", as the write named it.
+    pub target_table: Option<DataQualityTargetTable>,
+    /// "The name of the security configuration created with the data quality encryption
+    /// option", as the write named it.
+    pub data_quality_security_configuration: Option<String>,
+    /// "The date and time the data quality ruleset was created", set by the create that
+    /// stored it and never moved afterwards.
+    pub created_on: SystemTime,
+    /// "The date and time the data quality ruleset was last modified": the instant of the
+    /// most recent write to this record, which for a ruleset nothing has updated is the
+    /// instant it was created.
+    pub last_modified_on: SystemTime,
+    /// "When a ruleset was created from a recommendation run, this run ID is generated to
+    /// link the two together" (`DataQualityRulesetListDetails$RecommendationRunId`) — so a
+    /// ruleset a client authored directly, which is what `CreateDataQualityRuleset` stores,
+    /// carries NO run id: there is no run to link it to.
+    pub recommendation_run_id: Option<String>,
+    /// The `ClientToken` the create carried, which is what makes a RETRY of that create
+    /// answer the stored ruleset instead of the duplicate-name refusal.
+    pub client_token: Option<String>,
+    /// The create's `Tags`, which no reader of a ruleset models.
+    ///
+    /// Kept so the create does not discard what the client sent, but NOT yet reachable
+    /// through the tagging operations, exactly as a custom entity type's are
+    /// ([`CustomEntityTypeEntry::tags`]): [`TaggedResourceKind`] carries no data quality
+    /// ruleset variant, because the model states no ARN resource-type segment for this kind.
+    pub tags: HashMap<String, String>,
+}
+
+impl DataQualityRulesetEntry {
+    /// Build a stored ruleset from a `CreateDataQualityRuleset` request served at `now`.
+    ///
+    /// Every member but the two timestamps comes from the request: the client authors the
+    /// whole ruleset, and the model gives a created ruleset no id or status of its own.
+    pub fn from_create_input(input: &CreateDataQualityRulesetInput, now: SystemTime) -> Self {
+        Self {
+            name: input.name.clone(),
+            description: input.description.clone(),
+            ruleset: input.ruleset.clone(),
+            target_table: input.target_table.clone(),
+            data_quality_security_configuration: input.data_quality_security_configuration.clone(),
+            created_on: now,
+            last_modified_on: now,
+            recommendation_run_id: None,
+            client_token: input.client_token.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Whether this stored ruleset is the one `input` asks to create, member for member.
+    ///
+    /// What makes a RETRY of a create idempotent is that it asks for the same resource, so
+    /// a request that reuses a stored ruleset's `ClientToken` while asking for a different
+    /// definition is not that retry: it earns the duplicate-name refusal rather than having
+    /// the definition it sent silently dropped behind a 200.
+    pub fn matches_create_input(&self, input: &CreateDataQualityRulesetInput) -> bool {
+        // The name is compared too, so the comparison is member for member and holds for
+        // any pair rather than only for a lookup already keyed by the requested name.
+        self.name == input.name
+            && self.description == input.description
+            && self.ruleset == input.ruleset
+            && self.data_quality_security_configuration == input.data_quality_security_configuration
+            && same_data_quality_target_table(self.target_table.as_ref(), input.target_table.as_ref())
+            && input
+                .tags
+                .as_ref()
+                .map_or(self.tags.is_empty(), |tags| &self.tags == tags)
+    }
+}
+
+/// Whether two optional `DataQualityTargetTable` values address the same Glue table. The
+/// modelled structure derives no equality, so its three members are compared here.
+fn same_data_quality_target_table(
+    stored: Option<&DataQualityTargetTable>,
+    requested: Option<&DataQualityTargetTable>,
+) -> bool {
+    match (stored, requested) {
+        (None, None) => true,
+        (Some(stored), Some(requested)) => {
+            stored.table_name == requested.table_name
+                && stored.database_name == requested.database_name
+                && stored.catalog_id == requested.catalog_id
+        }
+        _ => false,
+    }
 }
 

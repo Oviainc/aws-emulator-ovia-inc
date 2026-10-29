@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataQualityRuleset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDataQualityRuleset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDataQualityRuleset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the data quality ruleset this account holds under the requested name
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::data_quality_rulesets`]), which is what
+//! `CreateDataQualityRuleset` stored. READ-ONLY: every member is projected out of the
+//! stored record and nothing is written, so two reads of one ruleset agree.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +155,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDataQualityRuleset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDataQualityRulesetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDataQualityRuleset"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(GetDataQualityRulesetErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue data quality ruleset store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // Read-only: the stored ruleset is projected out and nothing is written.
+        let store = state.lock();
+        // `Name` is `@required` with `length 1..255`, so an absent or over-long one is
+        // refused at the boundary: reaching here, the only question is whether this
+        // account holds a ruleset under that name.
+        let Some(entry) = store.data_quality_rulesets.get(&input.name) else {
+            return Err(GetDataQualityRulesetErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    // The one wording this service gives a ruleset miss
+                    // ([`crate::state::messages::data_quality_ruleset_not_found`]), shared
+                    // with every other operation that addresses a ruleset by name.
+                    message: Some(crate::state::messages::data_quality_ruleset_not_found(
+                        &input.name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // Every member comes from the store, so a ruleset created with no description
+        // reports none rather than an empty string, and one no recommendation run created
+        // reports no run id.
+        Ok(GetDataQualityRulesetOutput {
+            name: Some(entry.name.clone()),
+            description: entry.description.clone(),
+            ruleset: Some(entry.ruleset.clone()),
+            target_table: entry.target_table.clone(),
+            created_on: Some(crate::state::to_date_time(entry.created_on)),
+            last_modified_on: Some(crate::state::to_date_time(entry.last_modified_on)),
+            recommendation_run_id: entry.recommendation_run_id.clone(),
+            data_quality_security_configuration: entry.data_quality_security_configuration.clone(),
+        })
     }
 }
