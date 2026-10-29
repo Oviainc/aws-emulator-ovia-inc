@@ -40,6 +40,13 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
+//! This file also owns how this service WORDS a constraint violation — the clause, the
+//! member's validation path and the `N validation error(s) detected: ` envelope — because
+//! `override_refusal` below is the seam the framework renders one through. A rule the model
+//! states only in prose reaches no boundary validator, so the handler that refuses it words
+//! its message through [`handler_constraint_violation`] rather than spelling a sentence of
+//! its own: one condition class, one wording, one spelling of the member.
+//!
 //! Two of those seams also serve this service's ACTIVATION handshake — the unsigned,
 //! non-modelled HTTP request a deployed gateway appliance makes to be issued the
 //! `ActivationKey` a later `CreateGateway` redeems. It carries no credential scope and no
@@ -48,6 +55,7 @@
 
 mod activation;
 
+use aws_smithy_schema_server::constraints::path as validation_path;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
@@ -128,10 +136,61 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
         (_, Some(_)) if names_a_sensitive_member(&violation.path) => "Value".to_string(),
         (_, Some(shown)) => format!("Value '{shown}'"),
     };
-    Some(format!(
-        "{subject} at '{}' failed to satisfy constraint: {requirement}",
-        violation.path
-    ))
+    Some(constraint_clause_at(&subject, &violation.path, &requirement))
+}
+
+/// One clause of this service's constraint wording: the subject, the member the violation
+/// is reported ON, and the requirement that member failed.
+///
+/// The ONE place the clause is spelled, so a constraint this service refuses in a handler
+/// ([`handler_constraint_violation`]) states the identical sentence a violation of a
+/// modelled constraint on the very same member does.
+fn constraint_clause_at(subject: &str, at: &str, requirement: &str) -> String {
+    format!("{subject} at '{at}' failed to satisfy constraint: {requirement}")
+}
+
+/// How a refusal of this service NAMES the member it is about: the member's validation
+/// path, which is lowerCamel whatever case the model spells the member in.
+///
+/// Built through the framework's own path module — the one the validating walk builds the
+/// paths in [`Violation`] with — so a member cannot be named one way by a refusal the
+/// boundary made and another way by a refusal a handler made.
+pub(crate) fn member_path(member: &str) -> String {
+    validation_path::member(member)
+}
+
+/// The validation path of `member` inside the element at `position` of the list member
+/// `list_member` — the path a violation INSIDE a collection is reported at, which names
+/// the element's place so a caller sending several of them is told which one was refused.
+///
+/// `position` counts from 1, as a validation path counts a list's elements.
+pub(crate) fn element_member_path(list_member: &str, position: usize, member: &str) -> String {
+    validation_path::join(&[
+        validation_path::member(list_member),
+        validation_path::element(position),
+        validation_path::member(member),
+    ])
+}
+
+/// This service's whole `ValidationException$Message` for ONE constraint a HANDLER refused
+/// itself: a rule the model states in prose, which no trait expresses and the boundary
+/// validator therefore never saw.
+///
+/// Same clause, same envelope and same member naming as a boundary refusal: "this member
+/// failed a constraint" is one condition class, so this service answers it in one wording
+/// wherever the check happens to live. `at` is a [`member_path`] or an
+/// [`element_member_path`]; `value` is the value refused, or `None` where the clause names
+/// the member alone, as it does for a `@sensitive` one.
+pub(crate) fn handler_constraint_violation(
+    value: Option<&str>,
+    at: &str,
+    requirement: &str,
+) -> String {
+    let subject = match value {
+        Some(shown) => format!("Value '{shown}'"),
+        None => "Value".to_string(),
+    };
+    envelope(&[constraint_clause_at(&subject, at, requirement)])
 }
 
 /// A `@pattern` expression without the anchors a model may spell it with. A `$` escaped
@@ -161,13 +220,22 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
         .iter()
         .map(constraint_clause)
         .collect::<Option<Vec<_>>>()?;
-    match clauses.len() {
-        0 => None,
-        1 => Some(format!("1 validation error detected: {}", clauses[0])),
-        n => Some(format!(
-            "{n} validation errors detected: {}",
-            clauses.join("; ")
-        )),
+    (!clauses.is_empty()).then(|| envelope(&clauses))
+}
+
+/// The AWS envelope over the clauses one refusal states, counting them: the whole message
+/// a client reads, for a refusal made at the boundary or in a handler alike.
+///
+/// At least one clause — an empty refusal is declined before it gets here, by
+/// [`constraint_envelope`].
+fn envelope(clauses: &[String]) -> String {
+    match clauses {
+        [only] => format!("1 validation error detected: {only}"),
+        many => format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        ),
     }
 }
 

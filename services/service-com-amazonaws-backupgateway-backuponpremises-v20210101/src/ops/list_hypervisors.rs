@@ -170,11 +170,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .ok_or_else(|| {
                         ListHypervisorsErrorModeled::ValidationException(ValidationException {
                             error_code: None,
-                            message: Some(
-                                "Value at 'NextToken' failed to satisfy constraint: the token \
-                                 must be one a previous ListHypervisors response returned"
-                                    .to_string(),
-                            ),
+                            // Worded by `crate::service`, as in `list_gateways`: the
+                            // member's validation path, under the validation-error
+                            // envelope, and the opaque token not echoed back.
+                            message: Some(crate::service::handler_constraint_violation(
+                                None,
+                                &crate::service::member_path("NextToken"),
+                                "the token must be one a previous ListHypervisors response \
+                                 returned",
+                            )),
                         })
                     })?,
             ),

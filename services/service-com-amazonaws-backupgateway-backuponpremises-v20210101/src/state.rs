@@ -2483,8 +2483,10 @@ fn page_of_where<T: Clone>(
 }
 
 /// Check ONE Amazon Web Services tag key/value pair, wherever in this model a request
-/// carries such a pair to be persisted — `member` is the member it arrived in, which the
-/// refusal names the way the boundary validator names a member it refuses itself.
+/// carries such a pair to be persisted — `key_at` and `value_at` are the validation paths
+/// of the members the two halves arrived in, which the refusal names the way the boundary
+/// validator names a member it refuses itself
+/// ([`crate::service::element_member_path`]).
 ///
 /// Two rules, both from the model's docs rather than its traits — so the boundary
 /// validator cannot have refused them already, whichever member targets the `TagKey` and
@@ -2498,23 +2500,44 @@ fn page_of_where<T: Clone>(
 ///   separates words exactly as a space does — where a KEY is allowed every separator its
 ///   pattern spells out as `\p{Z}`, so a key may carry spaces and a value may not.
 ///
-/// `Err` carries the sentence the refusal states, in which case the caller writes
+/// `Err` carries the whole message the refusal states, in which case the caller writes
 /// NOTHING.
-pub fn validate_tag_pair(key: &str, value: &str, member: &str) -> Result<(), String> {
+pub fn validate_tag_pair(
+    key: &str,
+    value: &str,
+    key_at: &str,
+    value_at: &str,
+) -> Result<(), String> {
     if key.to_ascii_lowercase().starts_with(RESERVED_TAG_KEY_PREFIX) {
-        return Err(format!(
-            "Value '{key}' at '{member}' failed to satisfy constraint: a tag key must not \
-             start with the reserved prefix '{RESERVED_TAG_KEY_PREFIX}'"
+        return Err(crate::service::handler_constraint_violation(
+            Some(key),
+            key_at,
+            &format!(
+                "a tag key must not start with the reserved prefix \
+                 '{RESERVED_TAG_KEY_PREFIX}'"
+            ),
         ));
     }
     if value.chars().any(char::is_whitespace) {
-        return Err(format!(
-            "Value '{value}' at '{member}' failed to satisfy constraint: a tag value must \
-             not contain spaces"
+        return Err(crate::service::handler_constraint_violation(
+            Some(value),
+            value_at,
+            "a tag value must not contain spaces",
         ));
     }
     Ok(())
 }
+
+/// The member a request carries resource tags in.
+///
+/// `smithy_query(query="shape",shape="CreateGatewayInput,ImportHypervisorConfigurationInput,TagResourceInput")`:
+/// every input of this model that accepts tags names the member `Tags`, targeting the one
+/// `Tags` list of `Tag`.
+const TAGS_MEMBER: &str = "Tags";
+
+/// The member a `PutHypervisorPropertyMappings` request carries its mappings in
+/// (`smithy_query(query="shape",shape="PutHypervisorPropertyMappingsInput")`).
+const TAG_MAPPINGS_MEMBER: &str = "VmwareToAwsTagMappings";
 
 /// Check the AWS tag pairs a request's `VmwareToAwsTagMappings` carries, by the same
 /// rules as every other AWS tag pair this service persists ([`validate_tag_pair`]).
@@ -2525,13 +2548,17 @@ pub fn validate_tag_pair(key: &str, value: &str, member: &str) -> Result<(), Str
 /// `VmwareTagName`) names a tag of the hypervisor rather than an AWS tag, so these rules
 /// do not reach it.
 ///
-/// `Err` carries the sentence the refusal states, and nothing is written.
+/// `Err` carries the message the refusal states, and nothing is written.
 pub fn validate_tag_mappings(mappings: &[VmwareToAwsTagMapping]) -> Result<(), String> {
-    for mapping in mappings {
+    for (index, mapping) in mappings.iter().enumerate() {
+        // The element's place in the list, counted as a validation path counts it, so a
+        // request carrying several mappings is told WHICH one was refused.
+        let position = index + 1;
         validate_tag_pair(
             &mapping.aws_tag_key,
             &mapping.aws_tag_value,
-            "VmwareToAwsTagMappings",
+            &crate::service::element_member_path(TAG_MAPPINGS_MEMBER, position, "AwsTagKey"),
+            &crate::service::element_member_path(TAG_MAPPINGS_MEMBER, position, "AwsTagValue"),
         )?;
     }
     Ok(())
@@ -2542,24 +2569,32 @@ pub fn validate_tag_mappings(mappings: &[VmwareToAwsTagMapping]) -> Result<(), S
 ///
 /// Each requested pair satisfies the tag rules [`validate_tag_pair`] states, and a
 /// resource carries at most [`MAX_TAGS_PER_RESOURCE`] tags — the one rule of the three
-/// that is about the resource rather than a single pair.
+/// that is about the resource rather than a single pair, and so the one reported at the
+/// tag member itself rather than at a pair inside it.
 ///
-/// `Err` carries the sentence the refusal states. Merging is by key, so a key already
+/// `Err` carries the message the refusal states. Merging is by key, so a key already
 /// present is overwritten rather than duplicated.
 pub fn merged_tags(
     existing: &BTreeMap<String, String>,
     requested: &[Tag],
 ) -> Result<BTreeMap<String, String>, String> {
     let mut merged = existing.clone();
-    for tag in requested {
-        validate_tag_pair(&tag.key, &tag.value, "Tags")?;
+    for (index, tag) in requested.iter().enumerate() {
+        // As in `validate_tag_mappings`: the position names the pair that was refused.
+        let position = index + 1;
+        validate_tag_pair(
+            &tag.key,
+            &tag.value,
+            &crate::service::element_member_path(TAGS_MEMBER, position, "Key"),
+            &crate::service::element_member_path(TAGS_MEMBER, position, "Value"),
+        )?;
         merged.insert(tag.key.clone(), tag.value.clone());
     }
     if merged.len() > MAX_TAGS_PER_RESOURCE {
-        return Err(format!(
-            "Value '{}' at 'Tags' failed to satisfy constraint: a resource must carry at \
-             most {MAX_TAGS_PER_RESOURCE} tags",
-            merged.len()
+        return Err(crate::service::handler_constraint_violation(
+            Some(&merged.len().to_string()),
+            &crate::service::member_path(TAGS_MEMBER),
+            &format!("a resource must carry at most {MAX_TAGS_PER_RESOURCE} tags"),
         ));
     }
     Ok(merged)

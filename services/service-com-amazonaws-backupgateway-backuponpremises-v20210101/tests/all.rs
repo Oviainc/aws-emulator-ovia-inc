@@ -67,6 +67,8 @@ mod page_token_provenance;
 mod put_bandwidth_rate_limit_schedule;
 #[path = "all/put_hypervisor_property_mappings.rs"]
 mod put_hypervisor_property_mappings;
+#[path = "all/refusal_names_the_member_one_way.rs"]
+mod refusal_names_the_member_one_way;
 #[path = "all/regional_listing_scope.rs"]
 mod regional_listing_scope;
 #[path = "all/resource_tagging_spans_every_resource.rs"]

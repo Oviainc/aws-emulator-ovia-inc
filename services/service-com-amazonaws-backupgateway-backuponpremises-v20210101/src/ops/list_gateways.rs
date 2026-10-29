@@ -169,11 +169,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .ok_or_else(|| {
                         ListGatewaysErrorModeled::ValidationException(ValidationException {
                             error_code: None,
-                            message: Some(
-                                "Value at 'NextToken' failed to satisfy constraint: the token \
-                                 must be one a previous ListGateways response returned"
-                                    .to_string(),
-                            ),
+                            // Worded by `crate::service`, so this refusal names the member
+                            // the way a refusal of a modelled constraint on it does: the
+                            // member's validation path, under the validation-error
+                            // envelope. The token itself is not echoed — it is an opaque
+                            // boundary the client was handed, not a value it chose.
+                            message: Some(crate::service::handler_constraint_violation(
+                                None,
+                                &crate::service::member_path("NextToken"),
+                                "the token must be one a previous ListGateways response \
+                                 returned",
+                            )),
                         })
                     })?,
             ),

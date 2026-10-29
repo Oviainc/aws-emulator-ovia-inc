@@ -152,6 +152,10 @@ fn accepted_values() -> Vec<(String, String)> {
 
 /// Assert one refusal: 400, the modelled `ValidationException`, and a message that names
 /// the member and the value it refused.
+///
+/// Every case below sends ONE pair, so the member named is the value of the first element
+/// of `Tags` at its validation path — the way the boundary validator names a member it
+/// refuses itself, which `refusal_names_the_member_one_way` pins.
 fn assert_refused(case: &str, operation: &str, value: &str, reply: &Reply) {
     assert_eq!(
         (reply.status, reply.code.as_deref()),
@@ -163,7 +167,11 @@ fn assert_refused(case: &str, operation: &str, value: &str, reply: &Reply) {
     );
     let stated = message_of(reply);
     assert!(
-        stated.contains("at 'Tags' failed to satisfy constraint: "),
+        stated.starts_with("1 validation error detected: "),
+        "case {case:?}: {operation} must state one validation error, got {stated:?}"
+    );
+    assert!(
+        stated.contains("at 'tags.1.member.value' failed to satisfy constraint: "),
         "case {case:?}: {operation} must state which member failed its constraint, got \
          {stated:?}"
     );

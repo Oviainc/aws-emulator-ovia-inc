@@ -649,8 +649,9 @@ async fn a_next_token_this_listing_did_not_issue_is_refused() {
         assert!(
             refused
                 .str_at("/Message")
-                .is_some_and(|stated| stated.contains("NextToken")),
-            "case {case:?}: the refusal must name the member it refused, got {:?}",
+                .is_some_and(|stated| stated.contains("at 'nextToken'")),
+            "case {case:?}: the refusal must name the member it refused, at its \
+             validation path, got {:?}",
             refused.body
         );
         assert!(

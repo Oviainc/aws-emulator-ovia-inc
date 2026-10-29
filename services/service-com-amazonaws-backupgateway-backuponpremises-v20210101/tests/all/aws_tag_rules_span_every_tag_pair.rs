@@ -47,7 +47,7 @@ use crate::hypervisor_property_mappings::{
 
 /// An `IamRoleArn` of this account, inside the modelled pattern
 /// `^arn:(aws|aws-cn|aws-us-gov):iam::([0-9]+):role/(\S+)$`.
-fn role_arn(name: &str) -> String {
+pub(crate) fn role_arn(name: &str) -> String {
     format!(
         "arn:aws:iam::{}:role/{name}",
         engine::EMULATOR_ACCOUNT_ID
@@ -57,7 +57,11 @@ fn role_arn(name: &str) -> String {
 /// A hypervisor a gateway is associated with: the scene a put can succeed in, driven
 /// entirely over the wire (the gate `PutHypervisorPropertyMappings` applies is the
 /// association `AssociateGatewayToServer` writes).
-async fn served_hypervisor(router: &MultiServiceRouter, name: &str, host: &str) -> String {
+pub(crate) async fn served_hypervisor(
+    router: &MultiServiceRouter,
+    name: &str,
+    host: &str,
+) -> String {
     let hypervisor = import(router, name, host).await;
     let gateway = create(router, &format!("gw-{name}")).await;
     let associated = associate(router, &gateway, &hypervisor).await;
@@ -108,8 +112,10 @@ async fn listed_tags(router: &MultiServiceRouter, arn: &str) -> BTreeMap<String,
 }
 
 /// Assert one refusal of a mapping: 400, the modelled `ValidationException`, and a message
-/// naming the member that failed its constraint and the value it refused.
-fn assert_mapping_refused(case: &str, offending: &str, reply: &Reply) {
+/// naming the member that failed its constraint — at the validation path of the AWS half of
+/// the mapping at `position` in the list, the way the boundary validator names a member it
+/// refuses itself (`refusal_names_the_member_one_way`) — and the value it refused.
+fn assert_mapping_refused(case: &str, position: usize, offending: &str, reply: &Reply) {
     assert_eq!(
         (reply.status, reply.code.as_deref()),
         (400, Some("ValidationException")),
@@ -119,9 +125,15 @@ fn assert_mapping_refused(case: &str, offending: &str, reply: &Reply) {
     );
     let stated = message_of(reply);
     assert!(
-        stated.contains("at 'VmwareToAwsTagMappings' failed to satisfy constraint: "),
-        "case {case:?}: the refusal must state which member failed its constraint, got \
+        stated.starts_with("1 validation error detected: "),
+        "case {case:?}: one violated constraint must state one validation error, got \
          {stated:?}"
+    );
+    let at = format!("at 'vmwareToAwsTagMappings.{position}.member.awsTag");
+    assert!(
+        stated.contains(&at),
+        "case {case:?}: the refusal must state which member of which element failed its \
+         constraint ({at:?}), got {stated:?}"
     );
     assert!(
         stated.contains(offending),
@@ -228,10 +240,12 @@ async fn a_mapping_whose_aws_tag_pair_breaks_a_tag_rule_is_refused() {
             mapping("env", "prod", &key, &value),
             mapping("owner", "platform", "Owner", "Platform"),
         ];
-        for (position, mappings) in [("alone", alone), ("second of three", among_others)] {
-            let case = format!("{case} ({position})");
+        for (where_it_sits, position, mappings) in
+            [("alone", 1, alone), ("second of three", 2, among_others)]
+        {
+            let case = format!("{case} ({where_it_sits})");
             let reply = put(&router, &hypervisor, &role, &mappings).await;
-            assert_mapping_refused(&case, &offending, &reply);
+            assert_mapping_refused(&case, position, &offending, &reply);
             assert_eq!(
                 persisted_mappings(&engine, &hypervisor),
                 "None",
@@ -287,7 +301,7 @@ async fn one_tag_pair_is_answered_the_same_way_as_a_tag_and_as_a_mapping() {
             &[mapping("env", "prod", &key, &value)],
         )
         .await;
-        assert_mapping_refused(&case, &offending, &reply);
+        assert_mapping_refused(&case, 1, &offending, &reply);
     }
     assert!(
         listed_tags(&router, &hypervisor).await.is_empty(),
@@ -367,7 +381,12 @@ async fn a_refused_mapping_leaves_the_stored_mappings_alone() {
                 &[mapping("env", "prod", &key, &value)],
             )
             .await;
-            assert_mapping_refused(&format!("{case}, attempt {attempt}"), &offending, &reply);
+            assert_mapping_refused(
+                &format!("{case}, attempt {attempt}"),
+                1,
+                &offending,
+                &reply,
+            );
         }
         assert_eq!(
             persisted_mappings(&engine, &hypervisor),
