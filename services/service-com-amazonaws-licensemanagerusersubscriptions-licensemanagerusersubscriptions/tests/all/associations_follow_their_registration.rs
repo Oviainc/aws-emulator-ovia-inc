@@ -53,7 +53,7 @@ const SUBNETS: &[&str] = &["subnet-0123456789abcdef0"];
 /// `ActiveDirectorySettings.DomainName` instead (smithy_query shape
 /// ActiveDirectoryIdentityProvider).
 #[derive(Debug, Clone, Copy)]
-enum Directory {
+pub(crate) enum Directory {
     /// An AWS-managed directory of the account's fleet.
     AwsManaged(&'static str),
     /// A directory shared INTO the account, which this service does not resolve.
@@ -63,7 +63,7 @@ enum Directory {
 }
 
 impl Directory {
-    fn union(self) -> Value {
+    pub(crate) fn union(self) -> Value {
         match self {
             Directory::AwsManaged(id) | Directory::SharedIntoAccount(id) => provider_union(id),
             Directory::SelfManaged(domain) => json!({
@@ -133,7 +133,7 @@ const ROWS: &[Row] = &[
 
 /// `ListUserAssociations` is bound to POST /user/ListUserAssociations (smithy_query:
 /// operation ListUserAssociations, http.uri).
-async fn list_associations(h: &Harness, provider: &Value, instance_id: &str) -> Reply {
+pub(crate) async fn list_associations(h: &Harness, provider: &Value, instance_id: &str) -> Reply {
     call(
         h,
         "/user/ListUserAssociations",
@@ -144,7 +144,7 @@ async fn list_associations(h: &Harness, provider: &Value, instance_id: &str) -> 
 
 /// A `RegisterIdentityProvider` body for any of the provider forms, which is why this
 /// suite builds its own rather than the `DirectoryId`-only one its siblings share.
-fn registration(provider: &Value, product: &str) -> Value {
+pub(crate) fn registration(provider: &Value, product: &str) -> Value {
     json!({
         "IdentityProvider": provider,
         "Product": product,
@@ -152,7 +152,7 @@ fn registration(provider: &Value, product: &str) -> Value {
     })
 }
 
-fn deregistration(provider: &Value, product: &str) -> Value {
+pub(crate) fn deregistration(provider: &Value, product: &str) -> Value {
     json!({ "IdentityProvider": provider, "Product": product })
 }
 

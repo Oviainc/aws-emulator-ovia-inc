@@ -209,16 +209,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let key = crate::state::provider_key(&input.identity_provider).map_err(into_error)?;
         if !state.provider_key_is_registered(&key) {
-            return Err(AssociateUserErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    // The one sentence this service's user-association plane states this
-                    // refusal with, so this handler and `ListUserAssociations` — which
-                    // resolves the same directory the same way — cannot word one refusal
-                    // two ways.
-                    message: Some(crate::state::IDENTITY_PROVIDER_NOT_REGISTERED.to_string()),
-                },
-            )
-            .into());
+            // Mapped through `into_error`, the ONE place this operation words a
+            // directory with no live registration, so this branch, any lookup that
+            // reports the same fact and `ListUserAssociations` — which resolves the same
+            // directory the same way — cannot word one refusal two ways.
+            return Err(into_error(crate::state::StateError::ProviderNotRegistered));
         }
 
         // Whether a tag is a legal AWS tag is a fact about the request, asked once the
@@ -338,15 +333,15 @@ fn into_error(error: crate::state::StateError) -> AssociateUserError {
             })
             .into()
         }
-        // This handler resolves the registration ITSELF (the inline branch above), and
-        // answers the modelled `ResourceNotFoundException` for one it cannot resolve — the
-        // contract this operation already landed with, which the
-        // `resource_resolution_refusals` suite pins and nothing in this change moves. The
-        // lookup therefore cannot report this here; the arm keeps that same class so the
-        // two paths cannot word one refusal two ways.
+        // The user-association plane answers a directory no LIVE registration of this
+        // account is for with its own modelled `ResourceNotFoundException` carrying the
+        // one sentence that plane states this refusal with — whether this handler
+        // resolved the registration itself (the inline branch above, which comes through
+        // here) or a lookup it called reported it, and exactly as the sibling
+        // `ListUserAssociations` does for the same resolution.
         crate::state::StateError::ProviderNotRegistered => {
             AssociateUserErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()),
+                message: Some(crate::state::IDENTITY_PROVIDER_NOT_REGISTERED.to_string()),
             })
             .into()
         }

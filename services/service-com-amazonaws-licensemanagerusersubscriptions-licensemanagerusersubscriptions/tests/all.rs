@@ -69,6 +69,8 @@ mod subscription_product_names_the_subscription;
 mod tag_validation;
 #[path = "all/update_settings_network_propagation.rs"]
 mod update_settings_network_propagation;
+#[path = "all/user_association_plane_states_one_refusal.rs"]
+mod user_association_plane_states_one_refusal;
 #[path = "all/user_associations.rs"]
 mod user_associations;
 #[path = "all/user_disassociation.rs"]

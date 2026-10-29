@@ -199,12 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // withhold: the modelled not-found says so, exactly as `AssociateUser` does for the
         // same resolution.
         if !state.provider_key_is_registered(&key) {
-            return Err(ListUserAssociationsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::IDENTITY_PROVIDER_NOT_REGISTERED.to_string()),
-                },
-            )
-            .into());
+            // Mapped through `into_error`, the ONE place this operation words a directory
+            // with no live registration, so this branch and any lookup that reports the
+            // same fact cannot word one refusal two ways.
+            return Err(into_error(crate::state::StateError::ProviderNotRegistered));
         }
 
         let mut matching = Vec::new();
@@ -281,11 +279,12 @@ fn into_error(error: crate::state::StateError) -> ListUserAssociationsError {
             })
             .into()
         }
-        // This handler resolves the directory's registration ITSELF (the inline branch
-        // above) and answers the modelled `ResourceNotFoundException` for one it cannot
-        // resolve, as the rest of the user-association plane does; the lookups it calls
-        // therefore cannot report this here, and the arm keeps that same class so the two
-        // paths cannot word one refusal two ways.
+        // The user-association plane answers a directory no LIVE registration of this
+        // account is for with its own modelled `ResourceNotFoundException` carrying the one
+        // sentence that plane states this refusal with — whether this handler resolved the
+        // registration itself (the inline branch above, which comes through here) or a
+        // lookup it called reported it, and exactly as the sibling `AssociateUser` does for
+        // the same resolution.
         crate::state::StateError::ProviderNotRegistered => {
             ListUserAssociationsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
