@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::ops::get_scaling_plan_resource_forecast_data::FORECAST_INTERVAL_SECONDS;
 use crate::ops::types::{
     ApplicationSource, PredefinedScalingMetricSpecification, ScalingInstruction, ScalingPolicy,
-    TargetTrackingConfiguration, LOAD_METRIC_TYPE_VALUES, METRIC_STATISTIC_VALUES,
+    TagFilter, TargetTrackingConfiguration, LOAD_METRIC_TYPE_VALUES, METRIC_STATISTIC_VALUES,
     POLICY_TYPE_VALUES, PREDICTIVE_SCALING_MAX_CAPACITY_BEHAVIOR_VALUES,
     PREDICTIVE_SCALING_MODE_VALUES, SCALABLE_DIMENSION_VALUES, SCALING_METRIC_TYPE_VALUES,
     SCALING_POLICY_UPDATE_BEHAVIOR_VALUES, SERVICE_NAMESPACE_VALUES,
@@ -596,8 +596,9 @@ fn set_key_parts<Parts: IntoIterator<Item = String>>(parts: Parts) -> Vec<String
 /// stays distinguishable from the separator (`TagFilter$Key` and `TagValues`' member
 /// admit every character in `\u0020-\uD7FF…`, punctuation included).
 ///
-/// `None` when the source names neither a stack nor a tag filter, so it identifies no
-/// application at all. A source that names BOTH is refused before this is reached —
+/// `None` when the source names neither a stack nor a tag, so it identifies no
+/// application at all — which a tag-filter list does whenever no filter in it names a
+/// tag ([`named_tag_key`]). A source that names BOTH is refused before this is reached —
 /// see [`validate_application_source`].
 pub fn application_source_key(source: &ApplicationSource) -> Option<String> {
     if let Some(arn) = named_stack_arn(source) {
@@ -606,11 +607,11 @@ pub fn application_source_key(source: &ApplicationSource) -> Option<String> {
         return Some(format!("stack:{arn}"));
     }
     let filters = source.tag_filters.as_ref()?;
-    if filters.is_empty() {
-        return None;
-    }
-    let rendered = set_key_parts(filters.iter().map(|filter| {
-        let key = escape_key_part(filter.key.as_deref().unwrap_or_default());
+    let rendered = set_key_parts(filters.iter().filter_map(|filter| {
+        // A filter that names no tag names no part of the set, so it contributes nothing
+        // to the identity — never an empty key-part, which would make a source that
+        // merely carries such a filter identify another application.
+        let key = escape_key_part(named_tag_key(filter)?);
         let values = set_key_parts(
             filter
                 .values
@@ -620,18 +621,33 @@ pub fn application_source_key(source: &ApplicationSource) -> Option<String> {
                 .map(String::as_str)
                 .map(escape_key_part),
         );
-        format!("{key}={}", values.join(","))
+        Some(format!("{key}={}", values.join(",")))
     }));
+    if rendered.is_empty() {
+        return None;
+    }
     Some(format!("tags:{}", rendered.join(";")))
 }
 
-/// Whether a tag-filter list identifies anything: a filter list that is absent or
-/// empty selects nothing.
+/// Whether a tag-filter list identifies anything: a list that is absent, empty, or holds
+/// no filter that names a tag selects nothing.
 fn names_tag_filters(source: &ApplicationSource) -> bool {
     source
         .tag_filters
         .as_ref()
-        .is_some_and(|filters| !filters.is_empty())
+        .is_some_and(|filters| filters.iter().any(|f| named_tag_key(f).is_some()))
+}
+
+/// The tag key a `TagFilter` names, or `None` when it names no tag.
+///
+/// A `TagFilter` "Represents a tag" and its `Key` is "The tag key", modelled
+/// `length {min: 1, max: 128}`, so a key that is absent — or present but empty — names no
+/// tag at all. This is the single place that decides what "names a tag" means, so the
+/// identity key ([`application_source_key`]), the exclusivity rule that key feeds and the
+/// per-filter check in [`validate_application_source`] cannot disagree about one filter —
+/// the same way [`named_stack_arn`] decides it for the other side of the alternative.
+fn named_tag_key(filter: &TagFilter) -> Option<&str> {
+    filter.key.as_deref().filter(|key| !key.is_empty())
 }
 
 /// The CloudFormation stack ARN an `ApplicationSource` names, or `None` when it names
@@ -705,6 +721,26 @@ pub fn entry_count_message(member: &str, max: usize) -> String {
     )
 }
 
+/// The refusal for a tag filter that names no tag, worded and pathed the way the
+/// framework words a member that is not there — so a filter whose `Key` is ABSENT is
+/// reported exactly like one whose `Key` is present and empty, which the modelled
+/// `length {min: 1, max: 128}` on `TagFilter$Key` has the framework refuse before a
+/// handler runs.
+///
+/// `position` is the filter's 1-based position, because that is how a list element names
+/// itself in a validation path (`::aws_smithy_schema_server::constraints::path`, the one
+/// place a path segment is spelled).
+fn keyless_tag_filter_message(position: usize) -> String {
+    use ::aws_smithy_schema_server::constraints::path;
+
+    ::aws_smithy_schema_server::constraints::missing_member_message(&path::join(&[
+        path::member("ApplicationSource"),
+        path::member("TagFilters"),
+        path::element(position),
+        path::member("Key"),
+    ]))
+}
+
 /// Refuse a request list member that holds more entries than its own documentation
 /// allows; a list within its bound is accepted.
 pub fn check_entry_count(member: &str, entries: usize, max: usize) -> Result<(), String> {
@@ -723,7 +759,12 @@ pub fn check_entry_count(member: &str, entries: usize, max: usize) -> Result<(),
 ///
 /// The tag-filter side carries two documented entry counts of its own — on the filter
 /// list and on each filter's value list — and a list past its bound is refused for its
-/// LENGTH before any member of it is read, so those come first.
+/// LENGTH before any member of it is read, so those come first. Each entry of that list
+/// then has to be a tag, which is what its key names, so a filter naming none is refused
+/// for that member rather than entering the set of tags the source is identified by —
+/// before the either/or check below, because a member of the request is answered on its
+/// own terms before what two members mean TOGETHER is decided (a source that writes both
+/// a stack ARN and a filter naming no tag is therefore reported for that filter).
 pub fn validate_application_source(source: &ApplicationSource) -> Result<String, String> {
     if let Some(filters) = source.tag_filters.as_ref() {
         check_entry_count("applicationSource.tagFilters", filters.len(), MAX_TAG_FILTERS)?;
@@ -736,6 +777,15 @@ pub fn validate_application_source(source: &ApplicationSource) -> Result<String,
                     MAX_TAG_VALUES,
                 ));
             }
+        }
+        // `TagFilters` is "A set of tags", and a tag is named by its key, so an entry
+        // carrying none names no tag and is reported for the member it leaves out — at
+        // the position of the first such entry, the way the bounds above name theirs.
+        if let Some(index) = filters
+            .iter()
+            .position(|filter| named_tag_key(filter).is_none())
+        {
+            return Err(keyless_tag_filter_message(index + 1));
         }
     }
     let stack_arn = named_stack_arn(source);

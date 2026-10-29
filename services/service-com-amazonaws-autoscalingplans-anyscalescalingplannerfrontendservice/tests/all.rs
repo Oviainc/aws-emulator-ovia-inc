@@ -63,3 +63,5 @@ mod stack_arn_predicate_consistency;
 mod state_roundtrip;
 #[path = "all/tag_filter_entry_bounds.rs"]
 mod tag_filter_entry_bounds;
+#[path = "all/tag_filter_names_a_tag.rs"]
+mod tag_filter_names_a_tag;

@@ -105,7 +105,10 @@ fn value_forms() -> Vec<ValueForm> {
 
 /// A stocked emulator holding [`PLAN`] over a stack source, settled, so the write paths
 /// have a plan to update and the read path has state to filter.
-async fn stocked() -> Emulator {
+///
+/// `pub(crate)` so a suite about another rule of the same `ApplicationSource` gate drives
+/// the same three paths from the same state rather than building a second harness.
+pub(crate) async fn stocked() -> Emulator {
     let emulator = Emulator::new();
     emulator
         .ok(
@@ -125,7 +128,10 @@ async fn stocked() -> Emulator {
 ///
 /// `CreateScalingPlan` names a plan that does not exist and `UpdateScalingPlan` the
 /// stored one, so neither is refused for its plan before the source is read.
-fn source_requests(source: &Value) -> Vec<(&'static str, Value)> {
+///
+/// `pub(crate)` for the same reason as [`stocked`]: one list of the paths that carry an
+/// application source.
+pub(crate) fn source_requests(source: &Value) -> Vec<(&'static str, Value)> {
     vec![
         (
             "CreateScalingPlan",
@@ -154,7 +160,9 @@ fn source_requests(source: &Value) -> Vec<(&'static str, Value)> {
 ///
 /// Each case runs against its own freshly stocked emulator, so a case that is SERVED on
 /// one path cannot change what the next case sees on another.
-async fn assert_refused_everywhere(label: &str, source: &Value, refusal: &str) {
+///
+/// `pub(crate)` for the same reason as [`stocked`].
+pub(crate) async fn assert_refused_everywhere(label: &str, source: &Value, refusal: &str) {
     let emulator = stocked().await;
     for (operation, request) in source_requests(source) {
         let (status, body) = emulator.call(operation, &request).await;
