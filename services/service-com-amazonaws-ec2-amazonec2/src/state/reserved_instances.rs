@@ -210,6 +210,14 @@ impl ComAmazonawsEc2Amazonec2State {
     /// field holds 48 bits, so the store's ceiling ([`MAX_STORED_RESERVED_INSTANCES`]) is
     /// reached long before the layout could repeat an id.
     pub fn mint_reserved_instances_id(&mut self) -> String {
+        self.mint_uuid()
+    }
+
+    /// A fresh, unused UUID in the layout this module gives every id of the Reserved
+    /// Instances domain: the ONE place those 128 bits are laid out, so an id of any of its
+    /// kinds — a purchase's, a modification's, an exchange's — draws on the same counter and
+    /// no two can collide.
+    fn mint_uuid(&mut self) -> String {
         format!(
             "{RESERVED_INSTANCES_ID_LAYOUT_PREFIX}-{node:012x}",
             node = self.next_uuid_node()
@@ -523,9 +531,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// across runs, and never taken from the request.
     pub fn mint_reserved_instances_modification_id(&mut self) -> String {
         format!(
-            "{RESERVED_INSTANCES_MODIFICATION_ID_PREFIX}-\
-             {RESERVED_INSTANCES_ID_LAYOUT_PREFIX}-{node:012x}",
-            node = self.next_uuid_node()
+            "{RESERVED_INSTANCES_MODIFICATION_ID_PREFIX}-{uuid}",
+            uuid = self.mint_uuid()
         )
     }
 
@@ -830,5 +837,302 @@ fn reserved_instances_spec_for_target(
             .map_or_else(SystemTime::now, date_time_to_system_time),
         fixed_price: template.fixed_price.unwrap_or_default(),
         usage_price: template.usage_price.unwrap_or_default(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Exchanging Convertible purchases for other offerings
+// ---------------------------------------------------------------------------
+
+/// The offering class of a Reserved Instance that may be exchanged for another: the
+/// `OfferingClassType` enum's `convertible` member
+/// (`smithy_query(query="shape",shape="OfferingClassType")`).
+///
+/// An exchange reads it on BOTH sides, because both sides of the sentence name it: "the IDs
+/// of the Convertible Reserved Instances to exchange for another Convertible Reserved
+/// Instance of the same or higher value"
+/// (`AcceptReservedInstancesExchangeQuoteRequest$ReservedInstanceIds`).
+pub const RESERVED_INSTANCE_OFFERING_CLASS_CONVERTIBLE: &str = "convertible";
+
+/// `InvalidReservedInstancesID.NotFound` (HTTP 400): EC2's code for a `reservedInstanceId`
+/// the exchange API cannot resolve to a Reserved Instance of this account.
+///
+/// ONE code for both halves of that — a value that is not a Reserved Instances id at all, and
+/// a well-formed id the account holds nothing under — because that is the code the recorded
+/// refusal carries for a value of the FIRST kind, which only a code covering both can do; the
+/// two are told apart by the message. It is deliberately not the
+/// [`invalid_reserved_instances_id`] of this module's other operations: that one is what
+/// `DeleteQueuedReservedInstances` was recorded answering for its own `reservedInstancesId`
+/// member, and the exchange API words its own member's refusal the way this one does.
+pub const INVALID_RESERVED_INSTANCES_ID_NOT_FOUND: &str = "InvalidReservedInstancesID.NotFound";
+
+/// `InvalidReservedInstancesOfferingId` (HTTP 400): the `offeringId` a target configuration
+/// named is not an offering this service publishes — "the specified Reserved Instances
+/// offering does not exist", as EC2's error reference puts it.
+pub const INVALID_RESERVED_INSTANCES_OFFERING_ID: &str = "InvalidReservedInstancesOfferingId";
+
+/// Refuse a `reservedInstanceId` that is not a Reserved Instances id at all: HTTP 400
+/// [`INVALID_RESERVED_INSTANCES_ID_NOT_FOUND`], quoting the value the request carried.
+///
+/// A Reserved Instances id is the hyphenated form of a UUID
+/// ([`reserved_instances_id_is_well_formed`]), so anything else names nothing and is refused
+/// before there is anything to look up. Only the first
+/// [`MAX_ECHOED_RESOURCE_ID_CHARS`] characters of the value are quoted
+/// ([`echoed_resource_id`]).
+pub fn reserved_instances_id_malformed<E>(reserved_instance_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_RESERVED_INSTANCES_ID_NOT_FOUND,
+        400,
+        format!(
+            "The reserved-instances ID '{id}' is malformed",
+            id = echoed_resource_id(reserved_instance_id)
+        ),
+    )
+}
+
+/// Refuse a well-formed `reservedInstanceId` the account holds no Reserved Instance under:
+/// HTTP 400 [`INVALID_RESERVED_INSTANCES_ID_NOT_FOUND`], the other half of that code.
+pub fn reserved_instances_id_does_not_exist<E>(reserved_instance_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_RESERVED_INSTANCES_ID_NOT_FOUND,
+        400,
+        format!(
+            "The reserved-instances ID '{id}' does not exist",
+            id = echoed_resource_id(reserved_instance_id)
+        ),
+    )
+}
+
+/// Refuse a `reservedInstanceId` whose Reserved Instance is not in effect: HTTP 400
+/// `InvalidParameterValue`, naming the member, the id and the state the store holds it in.
+///
+/// Only a purchase that is in effect has a term left to carry onto another offering — a
+/// queued one has not been made yet, a retired one is over, and one already exchanged is
+/// retired by the exchange that replaced it — so the state is what the caller has to act on,
+/// and it comes from this store rather than from the request.
+pub fn reserved_instances_not_exchangeable<E>(
+    reserved_instance_id: &str,
+    state: &str,
+) -> Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "Invalid value '{id}' for reservedInstanceId. The Reserved Instance is in the \
+         '{state}' state",
+        id = echoed_resource_id(reserved_instance_id)
+    ))
+}
+
+/// Refuse a `reservedInstanceId` whose Reserved Instance is not Convertible: HTTP 400
+/// `InvalidParameterValue`. Only a Convertible Reserved Instance can be exchanged
+/// ([`RESERVED_INSTANCE_OFFERING_CLASS_CONVERTIBLE`]).
+pub fn reserved_instances_not_convertible<E>(reserved_instance_id: &str) -> Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "Invalid value '{id}' for reservedInstanceId. Only Convertible Reserved Instances \
+         can be exchanged",
+        id = echoed_resource_id(reserved_instance_id)
+    ))
+}
+
+/// Refuse an `offeringId` that is not an offering this service publishes: HTTP 400
+/// [`INVALID_RESERVED_INSTANCES_OFFERING_ID`].
+///
+/// Every offering id carries its own terms, this service's marker and a checksum over both
+/// ([`encode_reserved_instances_offering_id`]), so a value
+/// [`decode_reserved_instances_offering_id`] cannot read is not an id this service ever
+/// reported an offering under: there is no offering for it to name, which is what "does not
+/// exist" says. There is no second, malformed half to tell it from — an offering is a search
+/// result rather than a stored resource, so an id that decodes names the offering it carries
+/// and one that does not names nothing.
+pub fn invalid_reserved_instances_offering_id<E>(offering_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_RESERVED_INSTANCES_OFFERING_ID,
+        400,
+        format!(
+            "The Reserved Instances offering ID '{id}' does not exist",
+            id = echoed_resource_id(offering_id)
+        ),
+    )
+}
+
+/// The id prefix a Reserved Instances offering id carries, in the `<prefix>-<payload>` form
+/// this service's derived offering ids take ([`CAPACITY_BLOCK_OFFERING_ID_PREFIX`] is the
+/// same construction for a Capacity Block offering). The model puts no pattern on
+/// `ReservedInstancesOfferingId` (a plain `String`), so the form is decided in
+/// [`encode_reserved_instances_offering_id`], the one place such an id is minted.
+pub const RESERVED_INSTANCES_OFFERING_ID_PREFIX: &str = "rio";
+
+/// The marker an offering id carries ahead of its checksum and terms, so an id a caller
+/// assembled is not read as one this service minted, and an id of another derived kind is not
+/// read as this one ([`encode_derived_id`]).
+const RESERVED_INSTANCES_OFFERING_ID_VERSION: &str = "ec2-rio-1";
+
+/// How many fields a Reserved Instances offering id's payload carries.
+const RESERVED_INSTANCES_OFFERING_FIELDS: usize = 8;
+
+/// What one Reserved Instances offering offers: the terms a purchase of it, or an exchange
+/// into it, turns into a [`ReservedInstancesSpec`].
+///
+/// An offering is NOT a stored resource, for the reason the Capacity Block offering of
+/// [`CapacityBlockOfferingTerms`] is not: nothing in the EC2 API creates or withdraws one, so
+/// the offerings of a Region are facts of that Region and its published catalogs rather than
+/// rows a caller wrote. The terms therefore travel INSIDE the offering id
+/// ([`encode_reserved_instances_offering_id`]) instead of in a map keyed by it — which is
+/// what lets a search report offerings without writing anything a later caller could see, and
+/// lets an exchange mint a purchase of exactly the terms the offering was reported with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReservedInstancesOfferingTerms {
+    /// "The instance type on which the Reserved Instance can be used"
+    /// (`ReservedInstancesOffering$InstanceType`): one of `INSTANCE_TYPE_VALUES`.
+    pub instance_type: String,
+    /// "The Availability Zone in which the Reserved Instance can be used" for an offering of
+    /// zonal scope; `None` for one of Regional scope.
+    pub availability_zone: Option<String>,
+    /// "The Reserved Instance product platform description"
+    /// (`ReservedInstancesOffering$ProductDescription`): one of
+    /// `R_I_PRODUCT_DESCRIPTION_VALUES`.
+    pub product_description: String,
+    /// "If `convertible` it can be exchanged for Reserved Instances of the same or higher
+    /// monetary value" (`ReservedInstancesOffering$OfferingClass`): one of
+    /// `OFFERING_CLASS_TYPE_VALUES`.
+    pub offering_class: String,
+    /// "The Reserved Instance offering type" (`ReservedInstancesOffering$OfferingType`): one
+    /// of `OFFERING_TYPE_VALUES_VALUES`.
+    pub offering_type: String,
+    /// "The duration of the Reserved Instance, in seconds"
+    /// (`ReservedInstancesOffering$Duration`).
+    pub duration_seconds: i64,
+    /// "The purchase price of the Reserved Instance"
+    /// (`ReservedInstancesOffering$FixedPrice`), per reservation.
+    pub fixed_price: f32,
+    /// "The usage price of the Reserved Instance, per hour"
+    /// (`ReservedInstancesOffering$UsagePrice`).
+    pub usage_price: f32,
+}
+
+/// The `ReservedInstancesOfferingId` for `terms`: `rio-<hex>` over the terms, this service's
+/// offering-id marker and a checksum ([`encode_derived_id`] is that construction, shared with
+/// every other derived id this service reports).
+///
+/// Deriving the id FROM the terms is what makes it stable — two searches that find the same
+/// offering report the same id, so a read changes nothing a later caller sees — and
+/// resolvable, since [`decode_reserved_instances_offering_id`] reads the terms back out
+/// without a store.
+pub fn encode_reserved_instances_offering_id(terms: &ReservedInstancesOfferingTerms) -> String {
+    encode_derived_id(
+        RESERVED_INSTANCES_OFFERING_ID_PREFIX,
+        RESERVED_INSTANCES_OFFERING_ID_VERSION,
+        &reserved_instances_offering_payload(terms),
+    )
+}
+
+/// The terms an id minted by [`encode_reserved_instances_offering_id`] carries; `None` for
+/// anything else — an id that does not carry this service's prefix or marker, is not hex,
+/// whose checksum does not match its terms, or whose terms are not the fields an offering
+/// has.
+pub fn decode_reserved_instances_offering_id(
+    offering_id: &str,
+) -> Option<ReservedInstancesOfferingTerms> {
+    let fields = decode_derived_id(
+        RESERVED_INSTANCES_OFFERING_ID_PREFIX,
+        RESERVED_INSTANCES_OFFERING_ID_VERSION,
+        offering_id,
+        RESERVED_INSTANCES_OFFERING_FIELDS,
+    )?;
+    Some(ReservedInstancesOfferingTerms {
+        duration_seconds: fields[0].parse().ok()?,
+        fixed_price: fields[1].parse().ok()?,
+        usage_price: fields[2].parse().ok()?,
+        instance_type: hex_field(&fields[3])?,
+        availability_zone: optional_hex_field(&fields[4])?,
+        product_description: hex_field(&fields[5])?,
+        offering_class: hex_field(&fields[6])?,
+        offering_type: hex_field(&fields[7])?,
+    })
+}
+
+/// The terms of one offering as the fields its id carries them as: the term and the prices as
+/// decimal, the text through the shared field writer.
+fn reserved_instances_offering_payload(terms: &ReservedInstancesOfferingTerms) -> Vec<String> {
+    vec![
+        terms.duration_seconds.to_string(),
+        terms.fixed_price.to_string(),
+        terms.usage_price.to_string(),
+        derived_id_text_field(Some(terms.instance_type.as_str())),
+        derived_id_text_field(terms.availability_zone.as_deref()),
+        derived_id_text_field(Some(terms.product_description.as_str())),
+        derived_id_text_field(Some(terms.offering_class.as_str())),
+        derived_id_text_field(Some(terms.offering_type.as_str())),
+    ]
+}
+
+/// The purchase an exchange into `terms` mints, holding `instance_count` reservations.
+///
+/// Everything about the new Reserved Instance comes from the OFFERING — its instance type,
+/// its Availability Zone and so its scope, its product description, its offering class and
+/// type, its term and its prices — because an exchange replaces a purchase with one of
+/// another offering rather than editing it; only how many reservations it holds is carried
+/// over from the purchases being exchanged. Its term starts when the exchange is accepted,
+/// and it is in effect at once ([`RESERVED_INSTANCE_STATE_ACTIVE`]): the exchanged purchases
+/// are gone from that instant, so what replaces them cannot be pending.
+pub fn reserved_instances_spec_for_offering(
+    terms: &ReservedInstancesOfferingTerms,
+    region: &str,
+    instance_count: i32,
+    accepted_at: SystemTime,
+) -> ReservedInstancesSpec {
+    ReservedInstancesSpec {
+        instance_type: terms.instance_type.clone(),
+        availability_zone: terms.availability_zone.clone(),
+        region: region.to_string(),
+        instance_count,
+        duration_seconds: terms.duration_seconds,
+        offering_class: terms.offering_class.clone(),
+        offering_type: terms.offering_type.clone(),
+        product_description: terms.product_description.clone(),
+        state: RESERVED_INSTANCE_STATE_ACTIVE.to_string(),
+        start: accepted_at,
+        fixed_price: terms.fixed_price,
+        usage_price: terms.usage_price,
+    }
+}
+
+/// What one Reserved Instance, or one side of a whole exchange, is WORTH: the purchase price
+/// of each reservation times how many of them there are.
+///
+/// The ONE definition of that number, because an exchange is only allowed "for another
+/// Convertible Reserved Instance of the same or higher value"
+/// (`AcceptReservedInstancesExchangeQuoteRequest$ReservedInstanceIds`) and the two sides of
+/// that comparison have to be measured the same way. It is the upfront value —
+/// `FixedPrice` is "the purchase price of the Reserved Instance" and `UsagePrice` is charged
+/// per hour as the reservation is used — so the comparison is of what the account has already
+/// paid for against what it is being given.
+pub fn reserved_instances_value(fixed_price: f32, instance_count: i32) -> f64 {
+    f64::from(fixed_price) * f64::from(instance_count)
+}
+
+/// How close two Reserved Instances values count as the SAME value: one cent, the smallest
+/// amount [`RESERVED_INSTANCE_CURRENCY_CODE`] is quoted in.
+///
+/// An exchange is allowed "for another Convertible Reserved Instance of the same or higher
+/// value", so one of equal value must not be refused because a sum of the single-precision
+/// prices the modelled shapes carry rounded a fraction of a cent the wrong way.
+pub const RESERVED_INSTANCES_VALUE_TOLERANCE: f64 = 0.01;
+
+/// One Reserved Instances value as a refusal names it: the amount to the cent, with the
+/// currency it is quoted in ([`RESERVED_INSTANCE_CURRENCY_CODE`]).
+pub fn reserved_instances_value_text(value: f64) -> String {
+    format!("{value:.2} {RESERVED_INSTANCE_CURRENCY_CODE}")
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// A fresh, unused `ExchangeId`: "the ID of the successful exchange"
+    /// (`AcceptReservedInstancesExchangeQuoteResult$ExchangeId`).
+    ///
+    /// A UUID, laid out by the same counter and layout as every other id of the Reserved
+    /// Instances domain ([`Self::mint_reserved_instances_id`]), so it is unique within a run,
+    /// the same across runs, and never taken from the request. The model pins no pattern on
+    /// `ExchangeId` (a plain `String`), so the form is decided here, in the one place one is
+    /// minted.
+    pub fn mint_reserved_instances_exchange_id(&mut self) -> String {
+        self.mint_uuid()
     }
 }

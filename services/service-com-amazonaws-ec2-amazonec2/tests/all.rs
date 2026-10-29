@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `AcceptReservedInstancesExchangeQuote` exchanges: which Convertible Reserved Instances
+// it retires, the purchases of the target offerings it mints in their place, and what it
+// refuses. Declared beside `prefix_lists` for the reason the note above gives: the sorted
+// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/reserved_instances_exchanges.rs"]
+mod reserved_instances_exchanges;
 // What `ModifyCapacityReservationFleet` changes about a stored Capacity Reservation Fleet,
 // what a describe then reports of it, and what the modification refuses. Declared beside
 // `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail

@@ -22925,21 +22925,13 @@ pub struct CapacityBlockOfferingTerms {
 }
 
 /// The `CapacityBlockOfferingId` for `terms`: `cbo-<hex>` over the terms, this service's
-/// offering-id marker and a checksum.
-///
-/// Deriving the id FROM the terms is what makes it stable — two searches that find the same
-/// window in the same zone for the same counts report the same id, so a read changes nothing
-/// a later caller sees — and resolvable, since [`decode_capacity_block_offering_id`] reads
-/// the terms back out without a store. The checksum is the same non-secret one a pagination
-/// token carries ([`page_token_checksum`]), for the same reason: it tells an id this service
-/// minted from one a caller assembled, nothing more.
+/// offering-id marker and a checksum ([`encode_derived_id`] is that construction, shared with
+/// every other derived id this service reports).
 pub fn encode_capacity_block_offering_id(terms: &CapacityBlockOfferingTerms) -> String {
-    let payload = capacity_block_offering_payload(terms);
-    let checksum = page_token_checksum(&payload);
-    let body = format!("{CAPACITY_BLOCK_OFFERING_ID_VERSION}:{checksum:016x}:{payload}");
-    format!(
-        "{CAPACITY_BLOCK_OFFERING_ID_PREFIX}-{}",
-        ::hex::encode(body.as_bytes())
+    encode_derived_id(
+        CAPACITY_BLOCK_OFFERING_ID_PREFIX,
+        CAPACITY_BLOCK_OFFERING_ID_VERSION,
+        &capacity_block_offering_payload(terms),
     )
 }
 
@@ -22948,34 +22940,21 @@ pub fn encode_capacity_block_offering_id(terms: &CapacityBlockOfferingTerms) -> 
 /// whose checksum does not match its terms, or whose terms are not the fields an offering
 /// has.
 pub fn decode_capacity_block_offering_id(offering_id: &str) -> Option<CapacityBlockOfferingTerms> {
-    let hexed = offering_id
-        .strip_prefix(CAPACITY_BLOCK_OFFERING_ID_PREFIX)
-        .and_then(|rest| rest.strip_prefix('-'))?;
-    let decoded = String::from_utf8(::hex::decode(hexed).ok()?).ok()?;
-    let marked = decoded
-        .strip_prefix(CAPACITY_BLOCK_OFFERING_ID_VERSION)
-        .and_then(|rest| rest.strip_prefix(':'))?;
-    let (checksum, payload) = marked.split_once(':')?;
-    if checksum != format!("{:016x}", page_token_checksum(payload)) {
-        return None;
-    }
-    // Every text field is itself hex, so no byte a request chose can carry the separator and
-    // shift the fields the service derived; the field count is therefore exact.
-    let fields: Vec<&str> = payload
-        .split(CAPACITY_BLOCK_OFFERING_FIELD_SEPARATOR)
-        .collect();
-    if fields.len() != CAPACITY_BLOCK_OFFERING_FIELDS {
-        return None;
-    }
+    let fields = decode_derived_id(
+        CAPACITY_BLOCK_OFFERING_ID_PREFIX,
+        CAPACITY_BLOCK_OFFERING_ID_VERSION,
+        offering_id,
+        CAPACITY_BLOCK_OFFERING_FIELDS,
+    )?;
     let terms = CapacityBlockOfferingTerms {
         start_date_secs: fields[0].parse().ok()?,
         end_date_secs: fields[1].parse().ok()?,
-        instance_count: optional_count_field(fields[2])?,
-        ultraserver_count: optional_count_field(fields[3])?,
-        availability_zone: hex_field(fields[4])?,
-        availability_zone_id: hex_field(fields[5])?,
-        instance_type: optional_hex_field(fields[6])?,
-        ultraserver_type: optional_hex_field(fields[7])?,
+        instance_count: optional_count_field(&fields[2])?,
+        ultraserver_count: optional_count_field(&fields[3])?,
+        availability_zone: hex_field(&fields[4])?,
+        availability_zone_id: hex_field(&fields[5])?,
+        instance_type: optional_hex_field(&fields[6])?,
+        ultraserver_type: optional_hex_field(&fields[7])?,
     };
     Some(terms)
 }
@@ -23004,34 +22983,94 @@ pub fn invalid_capacity_block_offering_id_malformed<E>(
     )
 }
 
-/// How many fields an offering id's payload carries.
+/// How many fields a Capacity Block offering id's payload carries.
 const CAPACITY_BLOCK_OFFERING_FIELDS: usize = 8;
 
-/// What separates them. Every text field is hex-encoded inside the payload, so no field can
-/// carry the separator whatever text it holds — see [`decode_capacity_block_offering_id`].
-const CAPACITY_BLOCK_OFFERING_FIELD_SEPARATOR: char = '|';
-
-/// The terms of one offering as the text its id carries them as: the instants and counts as
-/// decimal, every text field as hex, so a field is always separator-free.
-fn capacity_block_offering_payload(terms: &CapacityBlockOfferingTerms) -> String {
-    let separator = CAPACITY_BLOCK_OFFERING_FIELD_SEPARATOR;
-    let count = |value: Option<i32>| value.map(|count| count.to_string()).unwrap_or_default();
-    let text = |value: Option<&str>| ::hex::encode(value.unwrap_or_default().as_bytes());
-    format!(
-        "{}{separator}{}{separator}{}{separator}{}{separator}{}{separator}{}{separator}{}{separator}{}",
-        terms.start_date_secs,
-        terms.end_date_secs,
-        count(terms.instance_count),
-        count(terms.ultraserver_count),
-        text(Some(terms.availability_zone.as_str())),
-        text(Some(terms.availability_zone_id.as_str())),
-        text(terms.instance_type.as_deref()),
-        text(terms.ultraserver_type.as_deref()),
-    )
+/// The terms of one Capacity Block offering as the fields its id carries them as: the
+/// instants as decimal, the counts and the text through the shared field writers.
+fn capacity_block_offering_payload(terms: &CapacityBlockOfferingTerms) -> Vec<String> {
+    vec![
+        terms.start_date_secs.to_string(),
+        terms.end_date_secs.to_string(),
+        derived_id_count_field(terms.instance_count),
+        derived_id_count_field(terms.ultraserver_count),
+        derived_id_text_field(Some(terms.availability_zone.as_str())),
+        derived_id_text_field(Some(terms.availability_zone_id.as_str())),
+        derived_id_text_field(terms.instance_type.as_deref()),
+        derived_id_text_field(terms.ultraserver_type.as_deref()),
+    ]
 }
 
-/// One count field of an offering id: an empty field is a member the offering does not
-/// carry, anything that is not a number at all makes the whole id unreadable.
+// -----------------------------------------------------------------------------
+// The id a DERIVED resource is reported under
+// -----------------------------------------------------------------------------
+
+/// What separates the fields inside a derived id's payload. Every text field is hex-encoded
+/// inside the payload ([`derived_id_text_field`]), so no field can carry the separator
+/// whatever text it holds — see [`decode_derived_id`].
+const DERIVED_ID_FIELD_SEPARATOR: char = '|';
+
+/// The id a derived resource is reported under: `<prefix>-<hex>` over `fields`, `marker` and
+/// a checksum.
+///
+/// The ONE construction of such an id, for every kind of resource this service DERIVES rather
+/// than stores — a Capacity Block offering, a Reserved Instances offering — so a change to the
+/// layout or the checksum cannot drift between two kinds. Deriving the id FROM the fields is
+/// what makes it stable — two searches that find the same thing report the same id, so a read
+/// changes nothing a later caller sees — and resolvable, since [`decode_derived_id`] reads the
+/// fields back out without a store. The checksum is the same non-secret one a pagination token
+/// carries ([`page_token_checksum`]), for the same reason: it tells an id this service minted
+/// from one a caller assembled, nothing more. `marker` says which kind of resource the fields
+/// describe, so an id of one kind is never read as another's.
+fn encode_derived_id(prefix: &str, marker: &str, fields: &[String]) -> String {
+    let payload = fields.join(&DERIVED_ID_FIELD_SEPARATOR.to_string());
+    let checksum = page_token_checksum(&payload);
+    let body = format!("{marker}:{checksum:016x}:{payload}");
+    format!("{prefix}-{}", ::hex::encode(body.as_bytes()))
+}
+
+/// The `fields` an id minted by [`encode_derived_id`] carries; `None` for anything else — an
+/// id that does not carry `prefix` or `marker`, is not hex, whose checksum does not match its
+/// payload, or that does not carry exactly `fields` fields.
+fn decode_derived_id(
+    prefix: &str,
+    marker: &str,
+    id: &str,
+    fields: usize,
+) -> Option<Vec<String>> {
+    let hexed = id
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))?;
+    let decoded = String::from_utf8(::hex::decode(hexed).ok()?).ok()?;
+    let marked = decoded
+        .strip_prefix(marker)
+        .and_then(|rest| rest.strip_prefix(':'))?;
+    let (checksum, payload) = marked.split_once(':')?;
+    if checksum != format!("{:016x}", page_token_checksum(payload)) {
+        return None;
+    }
+    // Every text field is itself hex, so no byte a request chose can carry the separator and
+    // shift the fields the service derived; the field count is therefore exact.
+    let carried: Vec<String> = payload
+        .split(DERIVED_ID_FIELD_SEPARATOR)
+        .map(str::to_string)
+        .collect();
+    (carried.len() == fields).then_some(carried)
+}
+
+/// One text field of a derived id, as the hex its payload carries it as, so the field is
+/// separator-free whatever the text holds. An absent member is the empty field.
+fn derived_id_text_field(value: Option<&str>) -> String {
+    ::hex::encode(value.unwrap_or_default().as_bytes())
+}
+
+/// One count field of a derived id, as decimal. An absent member is the empty field.
+fn derived_id_count_field(value: Option<i32>) -> String {
+    value.map(|count| count.to_string()).unwrap_or_default()
+}
+
+/// One count field read back out of a derived id: an empty field is a member the resource does
+/// not carry, anything that is not a number at all makes the whole id unreadable.
 fn optional_count_field(field: &str) -> Option<Option<i32>> {
     if field.is_empty() {
         return Some(None);
@@ -23039,14 +23078,15 @@ fn optional_count_field(field: &str) -> Option<Option<i32>> {
     field.parse().ok().map(Some)
 }
 
-/// One text field of an offering id: the text its hex carries. A field that is not hex, or
-/// not UTF-8 under it, makes the whole id unreadable.
+/// One text field read back out of a derived id: the text its hex carries. A field that is not
+/// hex, or not UTF-8 under it, makes the whole id unreadable.
 fn hex_field(field: &str) -> Option<String> {
     String::from_utf8(::hex::decode(field).ok()?).ok()
 }
 
-/// One optional text field of an offering id: an empty field is a member the offering does
-/// not carry. The outer `None` is an unreadable field, the inner one an absent member.
+/// One optional text field read back out of a derived id: an empty field is a member the
+/// resource does not carry. The outer `None` is an unreadable field, the inner one an absent
+/// member.
 fn optional_hex_field(field: &str) -> Option<Option<String>> {
     if field.is_empty() {
         return Some(None);
@@ -28067,8 +28107,17 @@ pub const MAX_ECHOED_RESOURCE_ID_CHARS: usize = 128;
 /// refusal cannot word it a second way. Only the first
 /// [`MAX_ECHOED_RESOURCE_ID_CHARS`] characters of the value are named.
 pub fn invalid_id_message(id: &str) -> String {
-    let echoed: String = id.chars().take(MAX_ECHOED_RESOURCE_ID_CHARS).collect();
-    format!("Invalid id: \"{echoed}\"")
+    format!("Invalid id: \"{}\"", echoed_resource_id(id))
+}
+
+/// A resource id from the REQUEST, as a refusal may name it: its first
+/// [`MAX_ECHOED_RESOURCE_ID_CHARS`] characters.
+///
+/// The ONE place a refused id is cut down to length, so every refusal that quotes a value the
+/// caller chose bounds that echo the same way, whatever sentence it is quoted in —
+/// [`invalid_id_message`]'s or one a single operation's recorded refusal words differently.
+pub fn echoed_resource_id(id: &str) -> String {
+    id.chars().take(MAX_ECHOED_RESOURCE_ID_CHARS).collect()
 }
 
 /// Whether `id` is NOT the null id of the kind `prefix` names: `<prefix>-` followed by
