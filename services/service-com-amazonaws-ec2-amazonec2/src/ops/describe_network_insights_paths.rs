@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeNetworkInsightsPaths
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeNetworkInsightsPaths`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeNetworkInsightsPaths::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Reachability Analyzer paths the store holds — the ones a create stored —
+//! narrowed by the ids and the filters the request names and paged in path-id order. It is a
+//! pure read: a path is handed back ready, so it has no clock-owed move to materialise and
+//! this operation writes nothing at all.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +144,364 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeNetworkInsightsPaths` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeNetworkInsightsPathsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+        use std::collections::HashSet;
+
+        use crate::state;
+        use crate::state::{
+            CompiledFilter, MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
+            MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS,
+        };
+
+        // "The token for the next page of results" (`NextToken`) — anything else is refused
+        // rather than read as an id, and it is refused before any other member is looked at,
+        // so whether a bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_page_token(token)
+                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // Matching cost is filters x values x value length x stored paths, and the model
+        // bounds none of them (`FilterList` and `Filter$Values` carry no `@length`), so every
+        // request-controlled factor is capped HERE, before any work proportional to it is
+        // done and before the store is locked — the same ceilings the crate's other filtered
+        // describes enforce, from `crate::state`.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not support is refused whether or not any path
+        // would have matched it, so an unsupported filter can never read as "no results".
+        // Each value is compiled into its pattern ONCE here, rather than recompiled for every
+        // candidate path.
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !PATH_FILTERS.contains(&name) {
+                return Err(state::invalid_filter(&PATH_FILTERS));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so a value's size is bounded
+            // here too.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            compiled.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The IDs of the paths" (`NetworkInsightsPathIds`) is caller-sized, and each entry
+        // is resolved against the store, so it is capped the way every other EC2 operation of
+        // this crate caps a resource-id list.
+        let requested: &[String] = input
+            .network_insights_path_ids
+            .as_deref()
+            .unwrap_or_default();
+        if requested.len() > MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "NetworkInsightsPathIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested.len()
+            )));
+        }
+
+        // "The maximum number of results to return with a single call" (`MaxResults`). A
+        // request that names none gets the largest page the model publishes, so the
+        // `NextToken` path below behaves the same whether or not a page size was asked for.
+        // The model's `range 1..100` has already refused anything outside it; the same bounds
+        // are applied HERE, beside the other request-size caps and before the store is
+        // locked, so a value this handler could not page by never reaches the scan — neither
+        // one that is not a positive count (zero included, which would answer an empty page
+        // with a token that never advances) nor one above the published maximum.
+        let limit = match input.max_results {
+            None => DEFAULT_MAX_RESULTS,
+            Some(max_results) => usize::try_from(max_results)
+                .ok()
+                .filter(|limit| (MIN_MAX_RESULTS..=DEFAULT_MAX_RESULTS).contains(limit))
+                .ok_or_else(|| {
+                    state::invalid_parameter_value(format!(
+                        "Value ({max_results}) for parameter maxResults is invalid. \
+                         Expecting a value between {MIN_MAX_RESULTS} and {DEFAULT_MAX_RESULTS}"
+                    ))
+                })?,
+        };
+
+        // The store, with the "mounted on an engine that holds no state" case already turned
+        // into the server error every handler of this crate answers it with. Taken BEFORE the
+        // dry-run branch below, because whether a named path exists is one of the things a
+        // dry run has to answer — the guard is a READ lock and this operation writes nothing
+        // through it.
+        let service_state = state::require_service_state(&*self.engine)?;
+        let store = service_state.lock();
+
+        // An id that names no path of the account is an error, not an absent row. A set, so
+        // narrowing below costs one lookup per stored path rather than a scan of the
+        // asked-for list.
+        if let Some(unknown) = requested
+            .iter()
+            .find(|id| !store.network_insights_paths.contains_key(id.as_str()))
+        {
+            return Err(state::invalid_network_insights_path_id_not_found(unknown));
+        }
+        let wanted: HashSet<&str> = requested.iter().map(String::as_str).collect();
+
+        // DryRun sits AFTER every check a refusal could come from: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused for its token,
+        // its filters, the size of a list, its page size or an id naming no path of the
+        // account is refused with that reason instead. "If you have the required permissions,
+        // the error response is DryRunOperation" (`DryRun`), and every caller of this
+        // emulator is permitted, so a well-formed dry run reports that outcome — and reports
+        // no path, having read nothing out.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "Describes one or more of your paths": the ids named narrow the store, and a
+        // request naming none describes every path the account holds; every filter then has
+        // to hold too ("If you specify multiple filters, the filters are joined with an AND"
+        // — `Filter`). Each entry is taken as `(stored id, path)`: the store is KEYED by
+        // `NetworkInsightsPathId`, so the key is the id every path certainly has, while the
+        // member on the record is modelled optional — and narrowing, the paging order and the
+        // cursor below all read the key, so no part of paging can depend on an absent member.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeNetworkInsightsPaths"))
+        // Every comparison is charged to ONE budget, so the product of stored paths, filters,
+        // values and value length is bounded however the caller combines them — which is also
+        // what bounds how long this holds the store's lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<(&str, &NetworkInsightsPath)> = Vec::new();
+        for (path_id, path) in &store.network_insights_paths {
+            if budget.exhausted() {
+                break;
+            }
+            if !wanted.is_empty() && !wanted.contains(path_id.as_str()) {
+                continue;
+            }
+            if state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(path, name)
+            }) {
+                selected.push((path_id.as_str(), path));
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them or page with MaxResults"
+                ),
+            ));
+        }
+
+        // Paging is in `NetworkInsightsPathId` order, which the cursor below names a position
+        // in. That order is a TYPE-LEVEL guarantee rather than something this handler
+        // establishes: the store is a `BTreeMap` keyed by that id, so its iteration is sorted
+        // by key and the narrowing above preserves it. The invariant is therefore only
+        // re-checked in test builds — nothing a request can carry affects it, and a check
+        // that panicked in the serving path would turn a future container change into a panic
+        // instead of a response.
+        debug_assert!(
+            selected.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "the path store must iterate in NetworkInsightsPathId order"
+        );
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|(path_id, _)| *path_id < cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "This value is null when there are no more results to return" (`NextToken`): a
+        // token exactly when a path follows this page, naming the stored id that path is
+        // keyed by — so a page is never reported as the complete set while paths remain.
+        let next_token = page
+            .get(limit)
+            .map(|(path_id, _)| state::encode_page_token(path_id));
+
+        Ok(DescribeNetworkInsightsPathsOutput {
+            network_insights_paths: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|(_, path)| (*path).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model publishes
+/// (`NetworkInsightsMaxResults`, `range 1..100`), which is also the most EC2 returns in one
+/// page.
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// The smallest page size `MaxResults` may ask for, the bottom of the same published range.
+const MIN_MAX_RESULTS: usize = 1;
+
+/// The filter names this operation supports, in the order the model enumerates them.
+///
+/// `DescribeNetworkInsightsPathsRequest$Filters` names them itself — "destination - The ID of
+/// the resource. filter-at-source.source-address - The source IPv4 address at the source.
+/// filter-at-source.source-port-range - The source port range at the source.
+/// filter-at-source.destination-address - The destination IPv4 address at the source.
+/// filter-at-source.destination-port-range - The destination port range at the source.
+/// filter-at-destination.source-address - The source IPv4 address at the destination.
+/// filter-at-destination.source-port-range - The source port range at the destination.
+/// filter-at-destination.destination-address - The destination IPv4 address at the
+/// destination. filter-at-destination.destination-port-range - The destination port range at
+/// the destination. protocol - The protocol. source - The ID of the resource":
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeNetworkInsightsPathsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// Each one names a member of the path this operation reports (`NetworkInsightsPath$Source`,
+/// `$Destination`, `$Protocol`, and the four members of the `PathFilter` at either end), and
+/// each must be answered by [`filter_values`]. Nothing else — no `tag:` family, no id — is in
+/// the documented set, so every other name is refused.
+const PATH_FILTERS: [&str; 11] = [
+    "destination",
+    "filter-at-source.source-address",
+    "filter-at-source.source-port-range",
+    "filter-at-source.destination-address",
+    "filter-at-source.destination-port-range",
+    "filter-at-destination.source-address",
+    "filter-at-destination.source-port-range",
+    "filter-at-destination.destination-address",
+    "filter-at-destination.destination-port-range",
+    "protocol",
+    "source",
+];
+
+/// Which member of the `PathFilter` at one end of a path a filter name reaches, so the four
+/// `filter-at-source.*` names and the four `filter-at-destination.*` ones are answered by ONE
+/// lookup against either end rather than by eight copies of it.
+#[derive(Debug, Clone, Copy)]
+enum PathFilterMember {
+    /// `PathFilter$SourceAddress`.
+    SourceAddress,
+    /// `PathFilter$DestinationAddress`.
+    DestinationAddress,
+    /// `PathFilter$SourcePortRange`.
+    SourcePortRange,
+    /// `PathFilter$DestinationPortRange`.
+    DestinationPortRange,
+}
+
+/// The values the EC2 filter `name` compares against this path.
+///
+/// A filter naming an attribute this path does not carry compares against NO values, so it
+/// selects nothing — which is the answer for a `filter-at-source.*` name on a path that is
+/// not scoped at the source, the way it is for any other absent member. `name` is one of
+/// [`PATH_FILTERS`], every other name having been refused already.
+fn filter_values<'a>(
+    path: &'a NetworkInsightsPath,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    fn text(value: &Option<String>) -> Vec<Cow<'_, str>> {
+        value.as_deref().map(Cow::Borrowed).into_iter().collect()
+    }
+    fn at(end: &Option<PathFilter>, member: PathFilterMember) -> Vec<Cow<'_, str>> {
+        end.as_ref()
+            .map(|filter| match member {
+                PathFilterMember::SourceAddress => text(&filter.source_address),
+                PathFilterMember::DestinationAddress => text(&filter.destination_address),
+                PathFilterMember::SourcePortRange => {
+                    port_range_values(filter.source_port_range.as_ref())
+                }
+                PathFilterMember::DestinationPortRange => {
+                    port_range_values(filter.destination_port_range.as_ref())
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    match name {
+        // "destination - The ID of the resource" / "source - The ID of the resource": the
+        // path's own `Destination`/`Source`, the ids a create stored.
+        "destination" => text(&path.destination),
+        "source" => text(&path.source),
+        // "protocol - The protocol" (`NetworkInsightsPath$Protocol`, a member of the modelled
+        // `Protocol` catalog), compared as the wire carries it.
+        "protocol" => text(&path.protocol),
+        "filter-at-source.source-address" => {
+            at(&path.filter_at_source, PathFilterMember::SourceAddress)
+        }
+        "filter-at-source.destination-address" => {
+            at(&path.filter_at_source, PathFilterMember::DestinationAddress)
+        }
+        "filter-at-source.source-port-range" => {
+            at(&path.filter_at_source, PathFilterMember::SourcePortRange)
+        }
+        "filter-at-source.destination-port-range" => at(
+            &path.filter_at_source,
+            PathFilterMember::DestinationPortRange,
+        ),
+        "filter-at-destination.source-address" => {
+            at(&path.filter_at_destination, PathFilterMember::SourceAddress)
+        }
+        "filter-at-destination.destination-address" => at(
+            &path.filter_at_destination,
+            PathFilterMember::DestinationAddress,
+        ),
+        "filter-at-destination.source-port-range" => at(
+            &path.filter_at_destination,
+            PathFilterMember::SourcePortRange,
+        ),
+        "filter-at-destination.destination-port-range" => at(
+            &path.filter_at_destination,
+            PathFilterMember::DestinationPortRange,
+        ),
+        // Unreachable: the handler has already refused every other name. An undefined name
+        // compares against nothing, so it could never widen a result even if that check were
+        // bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// A port range as an EC2 filter value compares against it: its two INCLUSIVE bounds joined
+/// by a hyphen — `FilterPortRange$FromPort` is "The first port in the range" and `$ToPort`
+/// "The last port in the range" — so a range from 1024 to 65535 compares as `1024-65535`.
+///
+/// A range carrying only one of the two bounds names only that port, so it compares as that
+/// bound's decimal alone; one carrying neither carries no value for the filter to match, like
+/// any other absent member. The decimal rendering of a bound is the one
+/// [`crate::state::integer_filter_values`] gives every other numeric attribute.
+fn port_range_values(range: Option<&FilterPortRange>) -> Vec<::std::borrow::Cow<'static, str>> {
+    use ::std::borrow::Cow;
+
+    let Some(range) = range else {
+        return Vec::new();
+    };
+    match (range.from_port, range.to_port) {
+        (Some(from), Some(to)) => vec![Cow::Owned(format!("{from}-{to}"))],
+        (Some(only), None) | (None, Some(only)) => {
+            crate::state::integer_filter_values(Some(only))
+        }
+        (None, None) => Vec::new(),
     }
 }

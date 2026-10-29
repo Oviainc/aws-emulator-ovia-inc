@@ -59,8 +59,8 @@ async fn delete_path(router: &MultiServiceRouter, path_id: &str) -> (u16, String
 /// The refusal a `StartNetworkInsightsAnalysis` of `path_id` answers, as its status and
 /// error code: the reader this suite proves a delete through. That operation resolves its
 /// `NetworkInsightsPathId` against the SAME store the delete removes from, so a path it no
-/// longer resolves is a path no later caller can reach. (`DescribeNetworkInsightsPaths` is
-/// still a scaffold stub of its own, so it is not the reader here.)
+/// longer resolves is a path no later caller can reach. (`DescribeNetworkInsightsPaths` reads
+/// that same store, and the suite of its own asserts a deleted path stops being reported.)
 async fn analysis_start(
     router: &MultiServiceRouter,
     path_id: &str,
