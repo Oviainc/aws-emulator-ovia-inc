@@ -1005,9 +1005,16 @@ impl ConfigurationDefinitionRecord {
 #[derive(Debug, Clone)]
 pub struct ConfigurationManagerRecord {
     pub manager_arn: String,
-    /// The Region this manager was created in, the one its ARN carries: where a
-    /// configuration definition of this manager that names no target Region of its
-    /// own is deployed.
+    /// The Region this manager was created in, the one its ARN carries: the single
+    /// Region whose endpoint reports, mutates and tears this manager down, which
+    /// [`ComAmazonawsSsmquicksetupQuicksetupState::manager_in`] is the one place to
+    /// enforce.
+    ///
+    /// It is never a Region this manager is deployed INTO: a configuration definition
+    /// is deployed into exactly the Regions its own parameters name
+    /// ([`deployment_targets`], which is not even given this field), and a parameter
+    /// set naming none is refused with [`NO_DEPLOYMENT_REGION_MESSAGE`]
+    /// ([`deployment_targets_rejection`]) rather than deployed here.
     pub region: String,
     pub name: Option<String>,
     pub description: Option<String>,

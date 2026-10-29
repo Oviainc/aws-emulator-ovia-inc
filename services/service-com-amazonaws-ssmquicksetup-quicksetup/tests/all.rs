@@ -33,6 +33,8 @@ mod first_class_parameters;
 mod list_tags_for_resource;
 #[path = "all/manager_not_found_message.rs"]
 mod manager_not_found_message;
+#[path = "all/manager_region_scope.rs"]
+mod manager_region_scope;
 #[path = "all/pagination_tokens.rs"]
 mod pagination_tokens;
 #[path = "all/quick_setup_type_versions.rs"]
