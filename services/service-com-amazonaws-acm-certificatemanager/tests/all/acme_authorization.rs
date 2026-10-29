@@ -348,6 +348,49 @@ impl Refusal {
     }
 }
 
+/// The policy documents every suite of this crate holds an authorized operation to, and
+/// which of IAM's refusals the request then meets — `None` for a request a matching `Allow`
+/// permits. Stated here ONCE so two suites cannot drift apart on the rule they pin: no
+/// policy at all, an allow of the other actions of this service, an explicit deny of the
+/// action beside an allow of the whole service, an allow of exactly the action, and an allow
+/// of every action of this service.
+///
+/// `action` is the `acm:<OperationName>` under test; `others` the actions a row grants
+/// instead of it. A suite with more of the class to span appends its own rows.
+pub(crate) fn identity_documents(
+    action: &str,
+    others: &[String],
+) -> Vec<(&'static str, Option<Value>, Option<Refusal>)> {
+    vec![
+        ("no policy at all", None, Some(Refusal::DefaultDeny)),
+        (
+            "an allow of the other actions of this service, but not this one",
+            Some(allow(json!(others))),
+            Some(Refusal::DefaultDeny),
+        ),
+        (
+            "an explicit deny of this action beside an allow of everything",
+            Some(json!({
+                "Statement": [
+                    { "Effect": "Allow", "Action": "acm:*", "Resource": "*" },
+                    { "Effect": "Deny", "Action": action, "Resource": "*" },
+                ]
+            })),
+            Some(Refusal::ExplicitDeny),
+        ),
+        (
+            "an allow of exactly this action",
+            Some(allow(json!(action))),
+            None,
+        ),
+        (
+            "an allow of every action of this service",
+            Some(allow(json!("acm:*"))),
+            None,
+        ),
+    ]
+}
+
 /// The operations of this service a request can reach with a credential, as a table of
 /// `(operation, body)` — one per class the authorization rule generalises over: the
 /// credential-bearing read this suite was filed for, a read of a resource, a list under a
@@ -462,42 +505,15 @@ async fn every_operation_that_models_the_refusal_is_authorized_against_its_own_a
 
     for (operation, body) in &table {
         let action = format!("acm:{operation}");
-        let others: Vec<Value> = every_operation
+        let others: Vec<String> = every_operation
             .iter()
             .filter(|other| *other != operation)
-            .map(|other| json!(format!("acm:{other}")))
+            .map(|other| format!("acm:{other}"))
             .collect();
 
         // Each row: the case, the document in force on the role, and which refusal IAM
         // reaches — or `None` for a request a matching `Allow` permits.
-        let rows: Vec<(&str, Option<Value>, Option<Refusal>)> = vec![
-            ("no policy at all", None, Some(Refusal::DefaultDeny)),
-            (
-                "every other action of this service, but not this one",
-                Some(allow(json!(others))),
-                Some(Refusal::DefaultDeny),
-            ),
-            (
-                "an explicit deny of this action beside an allow of everything",
-                Some(json!({
-                    "Statement": [
-                        { "Effect": "Allow", "Action": "acm:*", "Resource": "*" },
-                        { "Effect": "Deny", "Action": action.clone(), "Resource": "*" },
-                    ]
-                })),
-                Some(Refusal::ExplicitDeny),
-            ),
-            (
-                "an allow of exactly this action",
-                Some(allow(json!(action.clone()))),
-                None,
-            ),
-            (
-                "an allow of every action of this service",
-                Some(allow(json!("acm:*"))),
-                None,
-            ),
-        ];
+        let rows = identity_documents(&action, &others);
 
         for (row, document, refused) in rows {
             let case = format!("{operation} with {row}");

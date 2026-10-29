@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_configuration.rs"]
 mod account_configuration;
+#[path = "all/account_configuration_authorization.rs"]
+mod account_configuration_authorization;
 #[path = "all/account_configuration_tokens.rs"]
 mod account_configuration_tokens;
 #[path = "all/acme_account_listing.rs"]
