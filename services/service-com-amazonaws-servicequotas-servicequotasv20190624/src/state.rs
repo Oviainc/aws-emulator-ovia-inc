@@ -29,7 +29,17 @@
 //! * the **tags on an applied quota** (`TagResource`, `ListTagsForResource`,
 //!   `UntagResource`) — keyed by the quota's own ARN, the only thing a tagging
 //!   operation names its resource by, so one quota has exactly one tag set however
-//!   it is reached.
+//!   it is reached;
+//! * the **quota request template** of the account's organization
+//!   (`PutServiceQuotaIncreaseRequestIntoTemplate`,
+//!   `GetServiceQuotaIncreaseRequestFromTemplate`,
+//!   `ListServiceQuotaIncreaseRequestsInTemplate`,
+//!   `DeleteServiceQuotaIncreaseRequestFromTemplate`) and whether it is ASSOCIATED with
+//!   that organization (`AssociateServiceQuotaTemplate`,
+//!   `DisassociateServiceQuotaTemplate`, `GetAssociationForServiceQuotaTemplate`) —
+//!   held ONCE rather than per region, because an entry names the Region its increase
+//!   applies to itself and the whole plane is served from [`TEMPLATE_HOME_REGION`]
+//!   only.
 //!
 //! Beside them it owns the account's **Automatic Management configuration**
 //! (`StartAutoManagement` / `UpdateAutoManagement` / `StopAutoManagement` write it,
@@ -57,6 +67,10 @@
 /// in force, which this module owns, is its denominator.
 pub mod usage;
 
+/// Whether the calling account belongs to an AWS Organization, read out of the service
+/// that owns that fact. The quota request TEMPLATE plane stands behind it.
+pub mod organization;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
@@ -66,7 +80,8 @@ use usage::QuotaUsage;
 
 use crate::ops::types::{
     MetricInfo, QuotaContextInfo, QuotaInfo, QuotaPeriod, QuotaUtilizationInfo,
-    RequestedServiceQuotaChange, ServiceInfo, ServiceQuota, Tag,
+    RequestedServiceQuotaChange, ServiceInfo, ServiceQuota, ServiceQuotaIncreaseRequestInTemplate,
+    Tag,
 };
 
 /// The region a request carries no SigV4 credential scope to name, and the one a
@@ -201,6 +216,17 @@ pub fn is_open_request_status(status: &str) -> bool {
 /// request with no usable credential scope is served as.
 pub const TEMPLATE_HOME_REGION: &str = "us-east-1";
 
+/// The `ServiceQuotaTemplateAssociationStatus` of a quota request template that IS
+/// associated with the account's organization, so AWS applies its entries to a new
+/// member account. One of the two members the model declares
+/// (`smithy_query(query="shape", shape="ServiceQuotaTemplateAssociationStatus")`, also
+/// [`crate::ops::types::SERVICE_QUOTA_TEMPLATE_ASSOCIATION_STATUS_VALUES`]).
+pub const TEMPLATE_STATUS_ASSOCIATED: &str = "ASSOCIATED";
+
+/// The `ServiceQuotaTemplateAssociationStatus` of a template that was associated and has
+/// since been disassociated: its entries are kept, and no longer applied.
+pub const TEMPLATE_STATUS_DISASSOCIATED: &str = "DISASSOCIATED";
+
 /// How long a quota increase request stays `PENDING` before the support case that
 /// processes it is opened.
 ///
@@ -329,6 +355,15 @@ pub const UTILIZATION_REPORT_PAGE_SIZE: usize = 1_000;
 /// The number is CHOSEN (AWS publishes no limit on stored quota requests); the
 /// regions it is charged against are bounded by [`KNOWN_REGIONS`].
 pub const MAX_REQUESTS_PER_REGION: usize = 1_000;
+
+/// The most quota increase requests one quota request template holds.
+///
+/// Past it a further entry is refused with the `QuotaExceededException` (HTTP 409) the
+/// model declares on `PutServiceQuotaIncreaseRequestIntoTemplate`, instead of growing
+/// the template without bound. The number is CHOSEN (AWS publishes no limit on the
+/// entries of a template); replacing the value of an entry the template already holds
+/// is not charged against it, since it adds nothing.
+pub const MAX_TEMPLATE_ENTRIES: usize = 1_000;
 
 /// The window a quota whose usage CloudWatch publishes as an `AWS/Usage`
 /// `ResourceCount` metric reports as its `Period`: that metric is published every
@@ -717,6 +752,45 @@ struct RegionState {
     reports_minted: u64,
 }
 
+/// Which quota, in which Region, one entry of the quota request template is for.
+///
+/// The three members `PutServiceQuotaIncreaseRequestIntoTemplate` requires identify the
+/// entry, so they are the key: putting the same triple twice replaces the value rather
+/// than storing a second entry, and a read or a delete naming one resolves to exactly
+/// one entry. `AwsRegion` is part of it because a template holds one increase per quota
+/// PER REGION — the Region the entry's increase is applied in, which is not the Region
+/// the call that stored it was made at.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TemplateKey {
+    /// The `ServiceCode` the quota belongs to.
+    pub service_code: String,
+    /// The `AwsRegion` the increase in this entry applies to.
+    pub aws_region: String,
+    /// The `QuotaCode` of the quota the increase is for.
+    pub quota_code: String,
+}
+
+/// The account's quota request template, and whether it is associated with the
+/// account's organization.
+///
+/// Held once for the account: the plane is served from [`TEMPLATE_HOME_REGION`] alone
+/// and an entry carries the Region it applies to, so there is nothing per-region to
+/// keep.
+#[derive(Debug, Default)]
+struct TemplateStore {
+    /// Whether the template is associated with the organization — `None` while it has
+    /// never been associated at all, which is the one state that has no
+    /// `ServiceQuotaTemplateAssociationStatus` to report: the model's
+    /// `ServiceQuotaTemplateNotInUseException` ("The quota request template is not
+    /// associated with your organization") is what a read of it answers.
+    associated: Option<bool>,
+    /// The entries, keyed by the triple that identifies one, holding the `DesiredValue`
+    /// the entry asks for. Everything else an entry reports (`ServiceName`, `QuotaName`,
+    /// `Unit`, `GlobalQuota`) is the quota catalog's own fact, read from there when the
+    /// entry is reported so the two cannot disagree.
+    entries: BTreeMap<TemplateKey, f64>,
+}
+
 /// Per-service state for com-amazonaws-servicequotas-servicequotasv20190624. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsServicequotasServicequotasv20190624State {
@@ -747,6 +821,9 @@ pub struct ComAmazonawsServicequotasServicequotasv20190624State {
     /// whichever regional endpoint reaches it, and a tag map is never minted for a
     /// quota that does not exist.
     quota_tags: BTreeMap<String, BTreeMap<String, String>>,
+    /// The account's quota request template: its entries and its association with the
+    /// account's organization.
+    templates: TemplateStore,
 }
 
 impl Default for ComAmazonawsServicequotasServicequotasv20190624State {
@@ -758,6 +835,7 @@ impl Default for ComAmazonawsServicequotasServicequotasv20190624State {
             regions: BTreeMap::new(),
             auto_management: None,
             quota_tags: BTreeMap::new(),
+            templates: TemplateStore::default(),
         }
     }
 }
@@ -1685,6 +1763,126 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         }
     }
 
+    /// The `ServiceQuotaTemplateAssociationStatus` of the account's quota request
+    /// template, or `None` while it has never been associated with the organization —
+    /// the state that has no status to report, only the model's
+    /// `ServiceQuotaTemplateNotInUseException`.
+    pub fn template_association_status(&self) -> Option<&'static str> {
+        self.templates
+            .associated
+            .map(|associated| {
+                if associated {
+                    TEMPLATE_STATUS_ASSOCIATED
+                } else {
+                    TEMPLATE_STATUS_DISASSOCIATED
+                }
+            })
+    }
+
+    /// Associate the template with the account's organization, so its entries are
+    /// applied to accounts created in that organization afterwards.
+    ///
+    /// Idempotent: associating a template that is already associated leaves it
+    /// associated, which is the state the caller asked for.
+    pub fn associate_template(&mut self) {
+        self.templates.associated = Some(true);
+    }
+
+    /// Disassociate the template from the account's organization, and answer whether
+    /// there was an association to end — `false` for a template that is not associated
+    /// (never was, or already disassociated), which is the model's
+    /// `ServiceQuotaTemplateNotInUseException`.
+    ///
+    /// The ENTRIES are kept: disassociating stops them being applied to new accounts,
+    /// it does not empty the template, so associating again applies the same entries.
+    pub fn disassociate_template(&mut self) -> bool {
+        if self.templates.associated != Some(true) {
+            return false;
+        }
+        self.templates.associated = Some(false);
+        true
+    }
+
+    /// Store `desired_value` as the template's entry for `key`, and answer whether it
+    /// was stored — `false` only when the template already holds
+    /// [`MAX_TEMPLATE_ENTRIES`] entries and this one would be a new one.
+    ///
+    /// A put for a triple the template already holds REPLACES that entry's value: the
+    /// three members are what identify an entry, so a template never holds two
+    /// increases for one quota in one Region. The ceiling is enforced HERE, at the one
+    /// insertion point, so no caller can grow the template past it.
+    pub fn put_template_entry(&mut self, key: TemplateKey, desired_value: f64) -> bool {
+        let replaces = self.templates.entries.contains_key(&key);
+        if !replaces && self.templates.entries.len() >= MAX_TEMPLATE_ENTRIES {
+            return false;
+        }
+        self.templates.entries.insert(key, desired_value);
+        true
+    }
+
+    /// The template's entry for `key` as the wire reports it, or `None` when the
+    /// template holds none for that triple (the model's `NoSuchResourceException`).
+    pub fn template_entry(&self, key: &TemplateKey) -> Option<ServiceQuotaIncreaseRequestInTemplate> {
+        let desired_value = *self.templates.entries.get(key)?;
+        Some(self.template_entry_view(key, desired_value))
+    }
+
+    /// Remove the template's entry for `key`, and answer whether there was one to
+    /// remove — `false` is the model's `NoSuchResourceException`.
+    pub fn remove_template_entry(&mut self, key: &TemplateKey) -> bool {
+        self.templates.entries.remove(key).is_some()
+    }
+
+    /// The template's entries a listing reports, narrowed by the filters it was given:
+    /// a caller that names a `ServiceCode` and/or an `AwsRegion` gets exactly the
+    /// entries matching them, and one that names neither gets the whole template.
+    ///
+    /// The order is the key's own — `(ServiceCode, AwsRegion, QuotaCode)` — so it is
+    /// the same for two callers and a pagination token keeps meaning the same position
+    /// as entries are added and removed around it.
+    pub fn template_entries(
+        &self,
+        service_code: Option<&str>,
+        aws_region: Option<&str>,
+    ) -> Vec<ServiceQuotaIncreaseRequestInTemplate> {
+        self.templates
+            .entries
+            .iter()
+            .filter(|(key, _)| service_code.is_none_or(|code| key.service_code == code))
+            .filter(|(key, _)| aws_region.is_none_or(|region| key.aws_region == region))
+            .map(|(key, desired_value)| self.template_entry_view(key, *desired_value))
+            .collect()
+    }
+
+    /// How many entries the template holds, against [`MAX_TEMPLATE_ENTRIES`].
+    pub fn template_entry_count(&self) -> usize {
+        self.templates.entries.len()
+    }
+
+    /// One template entry as `ServiceQuotaIncreaseRequestInTemplate` on the wire.
+    ///
+    /// The entry itself holds only the triple that identifies it and the `DesiredValue`
+    /// asked for; the quota's `ServiceName`, `QuotaName`, `Unit` and `GlobalQuota` are
+    /// the catalog's facts and are read from there, so an entry reports the same ones a
+    /// quota read does.
+    fn template_entry_view(
+        &self,
+        key: &TemplateKey,
+        desired_value: f64,
+    ) -> ServiceQuotaIncreaseRequestInTemplate {
+        let default = self.default_quota(&key.service_code, &key.quota_code);
+        ServiceQuotaIncreaseRequestInTemplate {
+            service_code: Some(key.service_code.clone()),
+            service_name: self.service_name(&key.service_code).map(str::to_string),
+            quota_code: Some(key.quota_code.clone()),
+            quota_name: default.map(|quota| quota.quota_name.clone()),
+            desired_value: Some(desired_value),
+            aws_region: Some(key.aws_region.clone()),
+            unit: default.map(|quota| quota.unit.clone()),
+            global_quota: default.is_some_and(|quota| quota.global_quota),
+        }
+    }
+
     /// The applied overlay in force for a quota in one context, read from where that
     /// quota's scope keeps it: account-wide for a `GlobalQuota`, the caller's region
     /// otherwise.
@@ -1880,6 +2078,22 @@ pub fn no_such_resource_arn_message(resource_arn: &str) -> String {
     format!("no applied quota with ResourceARN '{resource_arn}' exists")
 }
 
+/// How a read or a delete of a quota request template entry states that the template
+/// holds none for the triple it named, for the modelled `NoSuchResourceException`.
+///
+/// ONE wording for the fact, so the read and the delete of an entry that is not there
+/// state it the same way.
+pub fn no_such_template_entry_message(
+    service_code: &str,
+    quota_code: &str,
+    aws_region: &str,
+) -> String {
+    format!(
+        "the quota request template holds no increase request for QuotaCode '{quota_code}' of \
+         ServiceCode '{service_code}' in AwsRegion '{aws_region}'"
+    )
+}
+
 /// The identity a request records as its `Requester`: this emulator's single
 /// account's root identity, built through the canonical ARN helper.
 pub fn requester_identity() -> String {
@@ -1888,10 +2102,10 @@ pub fn requester_identity() -> String {
 
 /// Why a quota request TEMPLATE call is refused.
 ///
-/// Both arms are errors every template operation of this service models
-/// (`smithy_query(query="operation",
-/// operation="PutServiceQuotaIncreaseRequestIntoTemplate,…")`), so each handler maps
-/// this to its own error enum.
+/// Each arm is a condition on the PLANE, decided before the call reaches the template
+/// itself, and every handler maps it to the error of its own modelled set that states
+/// the condition (`smithy_query(query="operation",
+/// operation="PutServiceQuotaIncreaseRequestIntoTemplate,…")`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemplateRefusal {
     /// The call was made at a Region the template plane is not served from:
@@ -1900,35 +2114,80 @@ pub enum TemplateRefusal {
     /// The calling account belongs to no AWS Organization:
     /// `NoAvailableOrganizationException`.
     NoAvailableOrganization,
+    /// The calling account's organization does not have all features enabled, so the
+    /// organization-wide template feature is not available to it:
+    /// `OrganizationNotInAllFeaturesModeException` where the operation models it, and
+    /// `AWSServiceAccessNotEnabledException` for the operations that do not — Service
+    /// Access with Service Quotas cannot be enabled in an organization that is not in
+    /// all-features mode, so that is the condition those operations state.
+    OrganizationNotInAllFeaturesMode,
 }
 
 /// The gate every quota request template operation passes through, evaluated for a call
 /// made at `region`.
 ///
-/// Two conditions stand in front of the whole template plane, and this is the only
-/// place either is decided:
+/// A quota request template is an AWS ORGANIZATION-wide object: AWS applies its entries
+/// to the accounts created in the organization, which is what
+/// `AssociateServiceQuotaTemplate` documents it as. Two conditions therefore stand in
+/// front of the whole plane, and this is the only place either is decided:
 ///
 /// 1. the plane is served from one Region only ([`TEMPLATE_HOME_REGION`]), so a call
 ///    anywhere else is refused with [`TemplateRefusal::NotAvailableInRegion`];
-/// 2. a quota request template belongs to an AWS ORGANIZATION — AWS applies it to the
-///    organization's member accounts — so an account that is in none has no template to
-///    read, write or associate and is refused with
-///    [`TemplateRefusal::NoAvailableOrganization`].
+/// 2. the calling account must be in an organization with ALL features enabled: an
+///    account in none has no template to read, write or associate
+///    ([`TemplateRefusal::NoAvailableOrganization`]), and one whose organization enables
+///    only part of the feature set cannot have the organization-wide feature
+///    ([`TemplateRefusal::OrganizationNotInAllFeaturesMode`]).
 ///
-/// There is no third answer for the account this emulator serves: it is a single
-/// STANDALONE account. Service Quotas models no organization membership and has no
-/// operation that could create or join one (AWS Organizations is a different service,
-/// with its own state in its own crate), so condition 2 can never be satisfied from
-/// here and no template entry can become observable. That is why this returns a
-/// refusal rather than a `Result`: a template STORE would be state nothing could ever
-/// write or read, and a handler that pretended otherwise would report a template the
-/// account does not have.
-pub fn template_refusal(region: &str) -> TemplateRefusal {
-    if region == TEMPLATE_HOME_REGION {
-        TemplateRefusal::NoAvailableOrganization
-    } else {
-        TemplateRefusal::NotAvailableInRegion
+/// Membership is AWS Organizations' fact, not this service's, so it is READ from
+/// Organizations on every call ([`organization::membership`]) rather than copied here:
+/// an organization created through that service is what the gate sees immediately, and
+/// an emulator serving no Organizations holds no organization for the account to be in.
+pub async fn template_gate(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> Result<(), TemplateRefusal> {
+    if region != TEMPLATE_HOME_REGION {
+        return Err(TemplateRefusal::NotAvailableInRegion);
     }
+    match organization::membership(ctx).await {
+        organization::Membership::AllFeatures => Ok(()),
+        organization::Membership::PartialFeatures => {
+            Err(TemplateRefusal::OrganizationNotInAllFeaturesMode)
+        }
+        organization::Membership::None => Err(TemplateRefusal::NoAvailableOrganization),
+    }
+}
+
+/// How a refusal of the template plane's own conditions is worded, for the handler that
+/// maps it to its modelled error.
+///
+/// The wording is the fact the condition states, so one fact has one message however a
+/// caller reaches it. The Region is named where the condition is about the Region.
+pub fn template_refusal_message(refusal: TemplateRefusal, region: &str) -> String {
+    match refusal {
+        TemplateRefusal::NotAvailableInRegion => {
+            format!("The Service Quotas template is not available in Region '{region}'.")
+        }
+        TemplateRefusal::NoAvailableOrganization => {
+            "The Amazon Web Services account making this call is not a member of an organization."
+                .to_string()
+        }
+        TemplateRefusal::OrganizationNotInAllFeaturesMode => {
+            "The organization that your Amazon Web Services account belongs to is not in All \
+             Features mode."
+                .to_string()
+        }
+    }
+}
+
+/// How an operation that does not model the all-features refusal states the same
+/// condition: Service Access with Service Quotas is what an organization-wide feature
+/// needs, and it cannot be enabled in an organization that is not in all-features mode.
+pub fn service_access_not_enabled_message() -> String {
+    "The action you attempted is not allowed unless Service Access with Service Quotas is \
+     enabled in your organization."
+        .to_string()
 }
 
 /// The region a request is addressed to: the SigV4 credential scope's region, which

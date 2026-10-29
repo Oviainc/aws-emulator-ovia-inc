@@ -19,11 +19,14 @@
 //!   is processed under a support case and ends `APPROVED`, keeping that case's
 //!   `CaseId`, with its `DesiredValue` in force (the steps that get it there are
 //!   `support_case_lifecycle.rs`);
-//! * every template operation is refused by the template gate: outside the plane's
-//!   home Region with `TemplatesNotAvailableInRegionException`, and inside it — for an
-//!   account that belongs to no AWS Organization, which is the account this emulator
-//!   serves — with `NoAvailableOrganizationException`. No template entry becomes
-//!   observable either way, and unrelated Service Quotas calls keep working.
+//! * every template operation is refused by the template gate while the account is in no
+//!   AWS Organization: outside the plane's home Region with
+//!   `TemplatesNotAvailableInRegionException`, and inside it — for an account that belongs
+//!   to no organization, which is the account an emulator serves until one is created
+//!   through AWS Organizations — with `NoAvailableOrganizationException`. No template
+//!   entry becomes observable either way, and unrelated Service Quotas calls keep working.
+//!   What the plane serves once the account IS in an all-features organization is
+//!   `quota_request_template.rs`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,12 +56,21 @@ fn emulator() -> Arc<engine::InMemoryEngine> {
 }
 
 /// A caller for `region`, serving out of `engine`.
+///
+/// AWS Organizations is mounted beside Service Quotas because the template gate reads
+/// the caller's organization membership from it — and NO organization is created here,
+/// so what these cases pin is the gate's answer for an account that is in none.
 fn client(engine: &Arc<engine::InMemoryEngine>, region: &str) -> Client {
     let mut router = MultiServiceRouter::new();
     // These tests sign nothing, so they must not be refused for it.
     router.set_request_authentication(false);
     router.register_service(
         service_com_amazonaws_servicequotas_servicequotasv20190624::EmulatedService::new(
+            Arc::clone(engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_organizations_awsorganizationsv20161128::EmulatedService::new(
             Arc::clone(engine),
         ),
     );
@@ -409,8 +421,9 @@ async fn a_not_approved_request_is_terminal_and_blocks_no_later_request() {
     );
 }
 
-/// Every quota request template operation is refused by the template gate, and the
-/// refusal says WHICH condition failed.
+/// Every quota request template operation is refused by the template gate while the
+/// calling account belongs to no organization, and the refusal says WHICH condition
+/// failed.
 #[tokio::test]
 async fn every_template_operation_is_refused_by_the_template_gate() {
     let engine = emulator();

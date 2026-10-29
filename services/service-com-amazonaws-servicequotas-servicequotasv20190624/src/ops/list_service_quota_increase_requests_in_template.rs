@@ -5,21 +5,16 @@
 //! Lists the quota increase requests in the account's quota request template.
 //!
 //! Every quota request TEMPLATE operation passes one gate first
-//! ([`crate::state::template_refusal`]), and that gate is what a caller observes here:
+//! ([`crate::state::template_gate`]), because a template is an ORGANIZATION-wide object:
+//! a call from outside the plane's Region, from an account in no AWS Organization, or
+//! from one whose organization is not in all-features mode is refused there.
 //!
-//! * a call made at a Region the template plane is not served from ->
-//!   `TemplatesNotAvailableInRegionException`;
-//! * a call made at its home Region by an account that belongs to no AWS Organization
-//!   -> `NoAvailableOrganizationException`.
-//!
-//! Both are client faults, so this awsJson front end serves them on HTTP 400 whatever
-//! `@httpError` the shape declares ([`crate::scaffolded::wire_http_status`]).
-//!
-//! The account this emulator serves is a single STANDALONE account, so the gate has no
-//! third answer and there is no template to list — see
-//! [`crate::state::template_refusal`] for why. An empty 200 would be the WRONG answer:
-//! it would say the account has a template with nothing in it. Nothing is read, and no
-//! other Service Quotas call is affected.
+//! Past the gate this ENUMERATES the stored entries and writes nothing: narrowed to the
+//! optional `ServiceCode` and `AwsRegion` the call names (a call that names neither gets
+//! the whole template), in the entries' own stable order, and paginated by `MaxResults` /
+//! `NextToken`. A token that does not name a position in THIS listing is the modelled
+//! `IllegalArgumentException` — the refusal this operation carries for a bad input, since
+//! it models no pagination-token error of its own.
 //!
 //! ---
 //!
@@ -161,35 +156,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The template gate refuses this call before anything is read, so the
-        // request's members and this service's store are both untouched; they are
-        // bound here because the struct owns the engine either way.
-        let _ = (&input, &self.engine);
         let region = crate::state::request_region(&ctx.parts().headers);
-        Err(template_refusal(&region).into())
+        // The gate reads the caller's organization from the service that owns it, so it
+        // is evaluated before this service's own store is locked.
+        if let Err(refusal) = crate::state::template_gate(ctx, &region).await {
+            return Err(template_refusal(refusal, &region).into());
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListServiceQuotaIncreaseRequestsInTemplateErrorModeled::ServiceException(
+                ServiceException {
+                    message: Some("the Service Quotas state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // A pure read: it reports the stored entries and writes nothing.
+        let entries = state.lock().template_entries(
+            input.service_code.as_deref(),
+            input.aws_region.as_deref(),
+        );
+        // The token names a position in the listing the FILTERS selected, so both of
+        // them label it: a token issued for one selection is refused by another instead
+        // of resuming at an unrelated position.
+        let label = crate::state::listing_label(
+            Self::NAME,
+            &[input.service_code.as_deref(), input.aws_region.as_deref()],
+        );
+        let page = crate::state::paginate(
+            &label,
+            entries,
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .map_err(|_| {
+            ListServiceQuotaIncreaseRequestsInTemplateErrorModeled::IllegalArgumentException(
+                IllegalArgumentException {
+                    message: Some(
+                        "NextToken does not name a position in this listing".to_string(),
+                    ),
+                },
+            )
+        })?;
+        Ok(ListServiceQuotaIncreaseRequestsInTemplateOutput {
+            service_quota_increase_request_in_template_list: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }
 
 /// The gate's refusal, in this operation's own modelled error enum.
-fn template_refusal(region: &str) -> ListServiceQuotaIncreaseRequestsInTemplateErrorModeled {
-    match crate::state::template_refusal(region) {
+fn template_refusal(
+    refusal: crate::state::TemplateRefusal,
+    region: &str,
+) -> ListServiceQuotaIncreaseRequestsInTemplateErrorModeled {
+    match refusal {
         crate::state::TemplateRefusal::NotAvailableInRegion => {
             ListServiceQuotaIncreaseRequestsInTemplateErrorModeled::TemplatesNotAvailableInRegionException(
                 TemplatesNotAvailableInRegionException {
-                    message: Some(format!(
-                        "The Service Quotas template is not available in Region '{region}'."
-                    )),
+                    message: Some(crate::state::template_refusal_message(refusal, region)),
                 },
             )
         }
         crate::state::TemplateRefusal::NoAvailableOrganization => {
             ListServiceQuotaIncreaseRequestsInTemplateErrorModeled::NoAvailableOrganizationException(
                 NoAvailableOrganizationException {
-                    message: Some(
-                        "The Amazon Web Services account making this call is not a member of an \
-                         organization."
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::template_refusal_message(refusal, region)),
+                },
+            )
+        }
+        // This operation does not model the all-features condition; what it models is the
+        // Service Access that condition denies.
+        crate::state::TemplateRefusal::OrganizationNotInAllFeaturesMode => {
+            ListServiceQuotaIncreaseRequestsInTemplateErrorModeled::AWSServiceAccessNotEnabledException(
+                AWSServiceAccessNotEnabledException {
+                    message: Some(crate::state::service_access_not_enabled_message()),
                 },
             )
         }

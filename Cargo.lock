@@ -1159,6 +1159,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-organizations"
+version = "1.135.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "740419bcecb5f2469198f814e86bdc6f6699bdfc3e9b65e87f1e636ab0a9de49"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.0",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.1.0",
+ "aws-smithy-types",
+ "aws-types",
+ "fastrand",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-redshift"
 version = "1.126.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14666,6 +14689,7 @@ dependencies = [
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
  "aws-sdk-ec2",
+ "aws-sdk-organizations",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -14675,6 +14699,7 @@ dependencies = [
  "http",
  "serde_json",
  "service-com-amazonaws-ec2-amazonec2",
+ "service-com-amazonaws-organizations-awsorganizationsv20161128",
  "sha2 0.10.9",
  "tokio",
  "tracing",

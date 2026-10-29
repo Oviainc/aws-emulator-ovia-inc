@@ -6,20 +6,23 @@
 //! template is applied to new member accounts.
 //!
 //! Every quota request TEMPLATE operation passes one gate first
-//! ([`crate::state::template_refusal`]), and that gate is what a caller observes here:
+//! ([`crate::state::template_gate`]), because a template is an ORGANIZATION-wide object:
 //!
 //! * a call made at a Region the template plane is not served from ->
 //!   `TemplatesNotAvailableInRegionException`;
-//! * a call made at its home Region by an account that belongs to no AWS Organization
-//!   -> `NoAvailableOrganizationException`.
+//! * a call made by an account that belongs to no AWS Organization ->
+//!   `NoAvailableOrganizationException`;
+//! * a call made by an account whose organization is not in all-features mode ->
+//!   `OrganizationNotInAllFeaturesModeException`.
 //!
-//! Both are client faults, so this awsJson front end serves them on HTTP 400 whatever
+//! Those are client faults, so this awsJson front end serves them on HTTP 400 whatever
 //! `@httpError` the shape declares ([`crate::scaffolded::wire_http_status`]).
 //!
-//! The account this emulator serves is a single STANDALONE account, so the gate has no
-//! third answer and no association can become observable — see
-//! [`crate::state::template_refusal`] for why. Nothing is written, and no other Service
-//! Quotas call is affected.
+//! Past the gate this records the association, so `GetAssociationForServiceQuotaTemplate`
+//! reports `ASSOCIATED` and `DisassociateServiceQuotaTemplate` has an association to end.
+//! It is IDEMPOTENT: associating a template that is already associated leaves it
+//! associated. The template's entries are untouched — an association says the entries are
+//! applied to new accounts, it does not change them.
 //!
 //! ---
 //!
@@ -134,36 +137,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The template gate refuses this call before anything is written, so the
-        // request's members and this service's store are both untouched; they are
-        // bound here because the struct owns the engine either way.
-        let _ = (&input, &self.engine);
+        // This operation takes no members: the account it associates the template for is
+        // the caller's own.
+        let _ = &input;
         let region = crate::state::request_region(&ctx.parts().headers);
-        Err(template_refusal(&region).into())
+        // The gate reads the caller's organization from the service that owns it, so it
+        // is evaluated before this service's own store is locked.
+        if let Err(refusal) = crate::state::template_gate(ctx, &region).await {
+            return Err(template_refusal(refusal, &region).into());
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateServiceQuotaTemplateErrorModeled::ServiceException(ServiceException {
+                message: Some("the Service Quotas state store is unavailable".to_string()),
+            })
+        })?;
+
+        state.lock().associate_template();
+        Ok(AssociateServiceQuotaTemplateOutput {})
     }
 }
 
 /// The gate's refusal, in this operation's own modelled error enum.
-fn template_refusal(region: &str) -> AssociateServiceQuotaTemplateErrorModeled {
-    match crate::state::template_refusal(region) {
+fn template_refusal(
+    refusal: crate::state::TemplateRefusal,
+    region: &str,
+) -> AssociateServiceQuotaTemplateErrorModeled {
+    let message = Some(crate::state::template_refusal_message(refusal, region));
+    match refusal {
         crate::state::TemplateRefusal::NotAvailableInRegion => {
             AssociateServiceQuotaTemplateErrorModeled::TemplatesNotAvailableInRegionException(
-                TemplatesNotAvailableInRegionException {
-                    message: Some(format!(
-                        "The Service Quotas template is not available in Region '{region}'."
-                    )),
-                },
+                TemplatesNotAvailableInRegionException { message },
             )
         }
         crate::state::TemplateRefusal::NoAvailableOrganization => {
             AssociateServiceQuotaTemplateErrorModeled::NoAvailableOrganizationException(
-                NoAvailableOrganizationException {
-                    message: Some(
-                        "The Amazon Web Services account making this call is not a member of an \
-                         organization."
-                            .to_string(),
-                    ),
-                },
+                NoAvailableOrganizationException { message },
+            )
+        }
+        // This operation is the one that models the all-features condition, so it states
+        // it directly.
+        crate::state::TemplateRefusal::OrganizationNotInAllFeaturesMode => {
+            AssociateServiceQuotaTemplateErrorModeled::OrganizationNotInAllFeaturesModeException(
+                OrganizationNotInAllFeaturesModeException { message },
             )
         }
     }

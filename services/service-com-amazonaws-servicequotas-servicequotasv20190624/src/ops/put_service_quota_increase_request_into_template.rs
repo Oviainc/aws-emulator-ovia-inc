@@ -5,20 +5,29 @@
 //! Adds a quota increase request to the account's quota request template.
 //!
 //! Every quota request TEMPLATE operation passes one gate first
-//! ([`crate::state::template_refusal`]), and that gate is what a caller observes here:
+//! ([`crate::state::template_gate`]), because a template is an ORGANIZATION-wide object:
+//! a call from outside the plane's Region, from an account in no AWS Organization, or
+//! from one whose organization is not in all-features mode is refused there.
 //!
-//! * a call made at a Region the template plane is not served from ->
-//!   `TemplatesNotAvailableInRegionException`;
-//! * a call made at its home Region by an account that belongs to no AWS Organization
-//!   -> `NoAvailableOrganizationException`.
+//! Past the gate the entry is STORED, keyed by the `(ServiceCode, AwsRegion, QuotaCode)`
+//! triple that identifies it, and the stored entry is what is returned — so
+//! `GetServiceQuotaIncreaseRequestFromTemplate` and
+//! `ListServiceQuotaIncreaseRequestsInTemplate` read back the same record, and a second
+//! put for the same triple replaces its value rather than adding a second entry for one
+//! quota in one Region.
 //!
-//! Both are client faults, so this awsJson front end serves them on HTTP 400 whatever
-//! `@httpError` the shape declares ([`crate::scaffolded::wire_http_status`]).
+//! Refusals of the request itself:
 //!
-//! The account this emulator serves is a single STANDALONE account, so the gate has no
-//! third answer and no template entry can become observable — see
-//! [`crate::state::template_refusal`] for why. Nothing is stored, and no other Service
-//! Quotas call is affected.
+//! * an unknown `(ServiceCode, QuotaCode)` pair -> `NoSuchResourceException` (404);
+//! * an `AwsRegion` that is not an Amazon Web Services Region ->
+//!   `IllegalArgumentException` (400): the template applies its entry in that Region;
+//! * a quota AWS publishes as not adjustable -> `IllegalArgumentException` (400), since
+//!   "You can add a quota increase request for any adjustable quota to your template";
+//! * a `DesiredValue` that is not above the quota's AWS DEFAULT value ->
+//!   `IllegalArgumentException` (400): this entry is an INCREASE, and it is applied to
+//!   accounts that are created in the organization, which hold the default;
+//! * a template already holding [`crate::state::MAX_TEMPLATE_ENTRIES`] entries ->
+//!   `QuotaExceededException` (409).
 //!
 //! ---
 //!
@@ -154,35 +163,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The template gate refuses this call before anything is read or written, so
-        // the request's members and this service's store are both untouched; they are
-        // bound here because the struct owns the engine either way.
-        let _ = (&input, &self.engine);
         let region = crate::state::request_region(&ctx.parts().headers);
-        Err(template_refusal(&region).into())
+        // The gate reads the caller's organization from the service that owns it, so it
+        // is evaluated before this service's own store is locked.
+        if let Err(refusal) = crate::state::template_gate(ctx, &region).await {
+            return Err(template_refusal(refusal, &region).into());
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutServiceQuotaIncreaseRequestIntoTemplateErrorModeled::ServiceException(
+                ServiceException {
+                    message: Some("the Service Quotas state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let mut quotas_state = state.lock();
+        let Some(default) = quotas_state.default_quota(&input.service_code, &input.quota_code)
+        else {
+            return Err(
+                PutServiceQuotaIncreaseRequestIntoTemplateErrorModeled::NoSuchResourceException(
+                    NoSuchResourceException {
+                        message: Some(crate::state::no_such_quota_message(
+                            &input.service_code,
+                            &input.quota_code,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let adjustable = default.adjustable;
+        let default_value = default.value;
+
+        // The entry names the Region its increase is applied in, so that Region has to be
+        // one: `AwsRegion`'s modelled pattern admits any word, and an entry for a Region
+        // that does not exist could never be applied.
+        if !crate::state::KNOWN_REGIONS.contains(&input.aws_region.as_str()) {
+            return Err(
+                PutServiceQuotaIncreaseRequestIntoTemplateErrorModeled::IllegalArgumentException(
+                    IllegalArgumentException {
+                        message: Some(format!(
+                            "AwsRegion '{}' is not an Amazon Web Services Region",
+                            input.aws_region
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        if !adjustable {
+            return Err(
+                PutServiceQuotaIncreaseRequestIntoTemplateErrorModeled::IllegalArgumentException(
+                    IllegalArgumentException {
+                        message: Some(format!(
+                            "QuotaCode '{}' of ServiceCode '{}' is not adjustable",
+                            input.quota_code, input.service_code
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The entry is applied to accounts created in the organization, which hold the
+        // AWS default for the quota, so the increase is measured against that default.
+        if input.desired_value <= default_value {
+            return Err(
+                PutServiceQuotaIncreaseRequestIntoTemplateErrorModeled::IllegalArgumentException(
+                    IllegalArgumentException {
+                        message: Some(format!(
+                            "DesiredValue {} is not an increase on the default value \
+                             {default_value} of QuotaCode '{}'",
+                            input.desired_value, input.quota_code
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let key = crate::state::TemplateKey {
+            service_code: input.service_code.clone(),
+            aws_region: input.aws_region.clone(),
+            quota_code: input.quota_code.clone(),
+        };
+        if !quotas_state.put_template_entry(key.clone(), input.desired_value) {
+            return Err(
+                PutServiceQuotaIncreaseRequestIntoTemplateErrorModeled::QuotaExceededException(
+                    QuotaExceededException {
+                        message: Some(format!(
+                            "the quota request template already holds the maximum of {} quota \
+                             increase requests",
+                            crate::state::MAX_TEMPLATE_ENTRIES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The ENTRY AS STORED is what the caller is answered with, so the response and
+        // every later read of it are the same record.
+        Ok(PutServiceQuotaIncreaseRequestIntoTemplateOutput {
+            service_quota_increase_request_in_template: quotas_state.template_entry(&key),
+        })
     }
 }
 
 /// The gate's refusal, in this operation's own modelled error enum.
-fn template_refusal(region: &str) -> PutServiceQuotaIncreaseRequestIntoTemplateErrorModeled {
-    match crate::state::template_refusal(region) {
+fn template_refusal(
+    refusal: crate::state::TemplateRefusal,
+    region: &str,
+) -> PutServiceQuotaIncreaseRequestIntoTemplateErrorModeled {
+    match refusal {
         crate::state::TemplateRefusal::NotAvailableInRegion => {
             PutServiceQuotaIncreaseRequestIntoTemplateErrorModeled::TemplatesNotAvailableInRegionException(
                 TemplatesNotAvailableInRegionException {
-                    message: Some(format!(
-                        "The Service Quotas template is not available in Region '{region}'."
-                    )),
+                    message: Some(crate::state::template_refusal_message(refusal, region)),
                 },
             )
         }
         crate::state::TemplateRefusal::NoAvailableOrganization => {
             PutServiceQuotaIncreaseRequestIntoTemplateErrorModeled::NoAvailableOrganizationException(
                 NoAvailableOrganizationException {
-                    message: Some(
-                        "The Amazon Web Services account making this call is not a member of an \
-                         organization."
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::template_refusal_message(refusal, region)),
+                },
+            )
+        }
+        // This operation does not model the all-features condition; what it models is the
+        // Service Access that condition denies.
+        crate::state::TemplateRefusal::OrganizationNotInAllFeaturesMode => {
+            PutServiceQuotaIncreaseRequestIntoTemplateErrorModeled::AWSServiceAccessNotEnabledException(
+                AWSServiceAccessNotEnabledException {
+                    message: Some(crate::state::service_access_not_enabled_message()),
                 },
             )
         }

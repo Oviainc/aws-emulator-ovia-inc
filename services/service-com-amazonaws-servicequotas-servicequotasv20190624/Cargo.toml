@@ -33,6 +33,13 @@ hex = { workspace = true }
 # `src/state/usage.rs` counts them by asking EC2 rather than keeping a count of its own.
 # Only the generated client is needed — the emulator supplies the transport.
 aws-sdk-ec2 = { version = "1", default-features = false }
+# The AWS SDK for Organizations, driven over the same in-process callback: whether the
+# calling account is in an AWS Organization — and whether that organization has all
+# features enabled — is Organizations' own fact, and the whole quota request TEMPLATE
+# plane stands behind it (`src/state/organization.rs`), so it is read from the service
+# that owns it rather than copied into this one.
+# Only the generated client is needed — the emulator supplies the transport.
+aws-sdk-organizations = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -46,5 +53,11 @@ tokio = { workspace = true, features = ["time"] }
 # can only be driven end to end with the owner of those resources on the same engine.
 # DEV-ONLY: this crate takes no dependency on EC2 outside its tests.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# AWS Organizations, mounted beside this one in tests/all/quota_request_template.rs: the
+# template plane stands behind the calling account's organization membership, which that
+# service owns, so the rule can only be driven end to end with it on the same engine.
+# DEV-ONLY: this crate takes no dependency on the Organizations EMULATOR outside its
+# tests — the handler reads Organizations over the SDK client above.
+service-com-amazonaws-organizations-awsorganizationsv20161128 = { workspace = true }
 [lints]
 workspace = true
