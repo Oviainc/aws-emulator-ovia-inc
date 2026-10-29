@@ -2490,3 +2490,56 @@ fn healthlake_arn_resource(arn: &str) -> Option<&str> {
 pub fn epoch_nanos(at: &::aws_smithy_types::DateTime) -> i128 {
     i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos())
 }
+
+/// Whether `at` satisfies a listing's pair of timestamp cutoff members read as
+/// STRICT bounds — the reading a member documented as selecting records
+/// "before" / "after" the date it names carries, under which a record at
+/// exactly the named instant is neither before nor after it and so is reported
+/// by neither cutoff.
+///
+/// `before` is the later-bounding member and `after` the earlier-bounding one;
+/// a member the request left unset bounds nothing.
+pub fn within_strict_cutoffs(
+    at: &::aws_smithy_types::DateTime,
+    before: Option<&::aws_smithy_types::DateTime>,
+    after: Option<&::aws_smithy_types::DateTime>,
+) -> bool {
+    let at = epoch_nanos(at);
+    if let Some(before) = before {
+        if at >= epoch_nanos(before) {
+            return false;
+        }
+    }
+    if let Some(after) = after {
+        if at <= epoch_nanos(after) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `at` satisfies a listing's pair of timestamp cutoff members read as
+/// INCLUSIVE bounds — the reading a member documented as selecting records "at
+/// or before" / "at or after" the instant it names carries, under which a
+/// record at exactly that instant is reported by both cutoffs.
+///
+/// `before` is the later-bounding member and `after` the earlier-bounding one;
+/// a member the request left unset bounds nothing.
+pub fn within_inclusive_cutoffs(
+    at: &::aws_smithy_types::DateTime,
+    before: Option<&::aws_smithy_types::DateTime>,
+    after: Option<&::aws_smithy_types::DateTime>,
+) -> bool {
+    let at = epoch_nanos(at);
+    if let Some(before) = before {
+        if at > epoch_nanos(before) {
+            return false;
+        }
+    }
+    if let Some(after) = after {
+        if at < epoch_nanos(after) {
+            return false;
+        }
+    }
+    true
+}

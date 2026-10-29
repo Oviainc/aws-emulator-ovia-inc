@@ -219,8 +219,9 @@ const MAX_PAGE_SIZE: i32 = 500;
 
 /// Whether `datastore` satisfies every member the request's `DatastoreFilter`
 /// set: name and status match exactly, and `CreatedBefore`/`CreatedAfter` are
-/// the inclusive cutoffs the model documents ("all data stores created
-/// before/after the specified date are included").
+/// the STRICT cutoffs their own documentation words ("all data stores created
+/// before/after the specified date are included"), so a data store created at
+/// exactly the named instant is reported by neither.
 fn matches_filter(datastore: &crate::state::Datastore, filter: Option<&DatastoreFilter>) -> bool {
     let Some(filter) = filter else {
         return true;
@@ -235,16 +236,9 @@ fn matches_filter(datastore: &crate::state::Datastore, filter: Option<&Datastore
             return false;
         }
     }
-    let created_at = crate::state::epoch_nanos(&datastore.created_at);
-    if let Some(before) = filter.created_before.as_ref() {
-        if created_at > crate::state::epoch_nanos(before) {
-            return false;
-        }
-    }
-    if let Some(after) = filter.created_after.as_ref() {
-        if created_at < crate::state::epoch_nanos(after) {
-            return false;
-        }
-    }
-    true
+    crate::state::within_strict_cutoffs(
+        &datastore.created_at,
+        filter.created_before.as_ref(),
+        filter.created_after.as_ref(),
+    )
 }

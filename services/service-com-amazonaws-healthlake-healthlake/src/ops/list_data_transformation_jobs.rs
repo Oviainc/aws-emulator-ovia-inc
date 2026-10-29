@@ -260,11 +260,11 @@ fn internal_server(message: &str) -> ListDataTransformationJobsError {
 /// Each member narrows the listing on its own and all of them together:
 /// `JobName` and `JobStatus` match exactly (the model: "filters the results to
 /// include only jobs with the specified name" / "with the specified status"),
-/// and `SubmittedAfter` / `SubmittedBefore` are INCLUSIVE cutoffs on
-/// `SubmitTime` ("submitted at or after this timestamp" / "at or before this
-/// timestamp") — the same reading `ListFHIRExportJobs` gives its own pair, so
-/// two of this service's listings cannot disagree about whether a boundary
-/// instant is in the window.
+/// and `SubmittedAfter` / `SubmittedBefore` are the INCLUSIVE cutoffs on
+/// `SubmitTime` their own documentation words ("submitted at or after this
+/// timestamp" / "at or before this timestamp"), so a job submitted at exactly
+/// the named instant is reported by both — a spelling the FHIR job listings'
+/// own members do NOT carry, which is why those read their cutoffs strictly.
 fn matches_request(
     job: &crate::state::TransformationJob,
     input: &ListDataTransformationJobsInput,
@@ -282,16 +282,9 @@ fn matches_request(
             return false;
         }
     }
-    let submitted = crate::state::epoch_nanos(&job.submitted_at);
-    if let Some(before) = input.submitted_before.as_ref() {
-        if submitted > crate::state::epoch_nanos(before) {
-            return false;
-        }
-    }
-    if let Some(after) = input.submitted_after.as_ref() {
-        if submitted < crate::state::epoch_nanos(after) {
-            return false;
-        }
-    }
-    true
+    crate::state::within_inclusive_cutoffs(
+        &job.submitted_at,
+        input.submitted_before.as_ref(),
+        input.submitted_after.as_ref(),
+    )
 }

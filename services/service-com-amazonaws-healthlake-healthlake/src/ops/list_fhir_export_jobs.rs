@@ -265,10 +265,10 @@ const MAX_PAGE_SIZE: i32 = 500;
 /// Each member narrows the listing on its own and all of them together:
 /// `JobName` and `JobStatus` match exactly (the model: "limits the response to
 /// the export job with the specified job name" / "with the specified job
-/// status"), and `SubmittedBefore` / `SubmittedAfter` are INCLUSIVE cutoffs on
-/// `SubmitTime` — the same reading `ListFHIRDatastores` gives its own
-/// `CreatedBefore` / `CreatedAfter` pair, so one data store's two listings
-/// cannot disagree about whether a boundary instant is in the window.
+/// status"), and `SubmittedBefore` / `SubmittedAfter` are the STRICT cutoffs on
+/// `SubmitTime` their own documentation words ("submitted before a
+/// user-specified date" / "submitted after a user-specified date"), so a job
+/// submitted at exactly the named instant is reported by neither.
 fn matches_request(job: &crate::state::ExportJob, input: &ListFHIRExportJobsInput) -> bool {
     if let Some(name) = input.job_name.as_deref() {
         if job.name.as_deref() != Some(name) {
@@ -283,16 +283,9 @@ fn matches_request(job: &crate::state::ExportJob, input: &ListFHIRExportJobsInpu
             return false;
         }
     }
-    let submitted = crate::state::epoch_nanos(&job.submitted_at);
-    if let Some(before) = input.submitted_before.as_ref() {
-        if submitted > crate::state::epoch_nanos(before) {
-            return false;
-        }
-    }
-    if let Some(after) = input.submitted_after.as_ref() {
-        if submitted < crate::state::epoch_nanos(after) {
-            return false;
-        }
-    }
-    true
+    crate::state::within_strict_cutoffs(
+        &job.submitted_at,
+        input.submitted_before.as_ref(),
+        input.submitted_after.as_ref(),
+    )
 }

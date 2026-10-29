@@ -362,8 +362,13 @@ async fn every_filter_member_narrows_the_listing_to_the_jobs_it_names() {
             vec![],
         ),
         (
-            "SubmittedAfter exactly on a submit instant is inclusive",
+            "SubmittedAfter exactly on a submit instant excludes that job",
             json!({ "SubmittedAfter": BASE_SECS + 30 }),
+            vec!["job-delta"],
+        ),
+        (
+            "SubmittedAfter one second before a submit instant admits it",
+            json!({ "SubmittedAfter": BASE_SECS + 29 }),
             vec!["job-charlie", "job-delta"],
         ),
         (
@@ -372,8 +377,13 @@ async fn every_filter_member_narrows_the_listing_to_the_jobs_it_names() {
             vec!["job-delta"],
         ),
         (
-            "SubmittedBefore exactly on a submit instant is inclusive",
+            "SubmittedBefore exactly on a submit instant excludes that job",
             json!({ "SubmittedBefore": BASE_SECS + 20 }),
+            vec!["job-alpha"],
+        ),
+        (
+            "SubmittedBefore one second past a submit instant admits it",
+            json!({ "SubmittedBefore": BASE_SECS + 21 }),
             vec!["job-alpha", "job-bravo"],
         ),
         (
@@ -383,8 +393,13 @@ async fn every_filter_member_narrows_the_listing_to_the_jobs_it_names() {
         ),
         (
             "a window spanning the middle two jobs",
-            json!({ "SubmittedAfter": BASE_SECS + 20, "SubmittedBefore": BASE_SECS + 30 }),
+            json!({ "SubmittedAfter": BASE_SECS + 15, "SubmittedBefore": BASE_SECS + 35 }),
             vec!["job-bravo", "job-charlie"],
+        ),
+        (
+            "a window whose own bounds are two submit instants excludes both",
+            json!({ "SubmittedAfter": BASE_SECS + 20, "SubmittedBefore": BASE_SECS + 30 }),
+            vec![],
         ),
         (
             "an empty window",
@@ -406,8 +421,8 @@ async fn every_filter_member_narrows_the_listing_to_the_jobs_it_names() {
             json!({
                 "JobName": "nightly",
                 "JobStatus": "IN_PROGRESS",
-                "SubmittedAfter": BASE_SECS + 20,
-                "SubmittedBefore": BASE_SECS + 20,
+                "SubmittedAfter": BASE_SECS + 19,
+                "SubmittedBefore": BASE_SECS + 21,
             }),
             vec!["job-bravo"],
         ),
