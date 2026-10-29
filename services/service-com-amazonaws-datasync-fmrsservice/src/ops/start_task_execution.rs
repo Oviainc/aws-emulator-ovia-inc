@@ -230,6 +230,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .or_else(|| task.task_report_config.clone());
         let task_mode = task.task_mode.clone();
 
+        if let Some(message) = store.at_capacity(crate::state::ResourceStore::TaskExecutions) {
+            return Err(StartTaskExecutionErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
+                    error_code: None,
+                    datasync_error_code: None,
+                },
+            )
+            .into());
+        }
+
         let execution_arn = store.mint_execution_arn(&input.task_arn);
         store.task_executions.insert(
             execution_arn.clone(),

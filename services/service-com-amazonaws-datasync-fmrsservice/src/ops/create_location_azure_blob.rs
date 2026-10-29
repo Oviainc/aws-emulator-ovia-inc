@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLocationAzureBlob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLocationAzureBlob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLocationAzureBlob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `LocationArn` and stores the whole Azure Blob Storage transfer location in
+//! [`crate::state`], so `DescribeLocationAzureBlob` and `CreateTask` can resolve it
+//! again. Nothing is echoed back: the response carries only the newly minted ARN, and
+//! each call mints its own — two requests carrying the same configuration address two
+//! independent locations.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +189,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLocationAzureBlob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLocationAzureBlobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLocationAzureBlob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateLocationAzureBlobErrorModeled::InternalException(
+                InternalException {
+                    message: Some(
+                        "the DataSync emulator could not reach its state store".to_string(),
+                    ),
+                    error_code: None,
+                },
+            )
+            .into());
+        };
+
+        if let Some(message) = secret_combination_refusal(&input) {
+            return Err(CreateLocationAzureBlobErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
+                    error_code: None,
+                    datasync_error_code: None,
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let location_uri = crate::state::LocationKind::AzureBlob
+            .location_uri(container_global_id(&input.container_url), input.subdirectory.as_deref());
+        let blob_type = input.blob_type.unwrap_or_else(|| DEFAULT_BLOB_TYPE.to_string());
+        let access_tier = input
+            .access_tier
+            .unwrap_or_else(|| DEFAULT_ACCESS_TIER.to_string());
+
+        let location_arn = {
+            let mut store = state.lock();
+            store.advance_clock(now);
+            if let Some(message) = store.at_capacity(crate::state::ResourceStore::Locations) {
+                return Err(CreateLocationAzureBlobErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(message),
+                        error_code: None,
+                        datasync_error_code: None,
+                    },
+                )
+                .into());
+            }
+
+            // Where this location's credential ends up. The SAS token itself is neither
+            // stored nor reported: DataSync keeps it in a Secrets Manager secret, and
+            // the location record holds only that secret's ARN.
+            let secret = if let Some(custom) = input.custom_secret_config {
+                crate::state::LocationSecret::Customer {
+                    secret_arn: custom.secret_arn,
+                    secret_access_role_arn: custom.secret_access_role_arn,
+                }
+            } else if let Some(cmk) = input.cmk_secret_config {
+                crate::state::LocationSecret::ManagedWithCustomerKey {
+                    secret_arn: store.mint_managed_secret_arn(&region),
+                    kms_key_arn: cmk.kms_key_arn,
+                }
+            } else if input.sas_configuration.is_some() {
+                crate::state::LocationSecret::Managed {
+                    secret_arn: store.mint_managed_secret_arn(&region),
+                }
+            } else {
+                crate::state::LocationSecret::None
+            };
+
+            let location_arn = store.mint_location_arn(&region);
+            store.locations.insert(
+                location_arn.clone(),
+                crate::state::Location {
+                    arn: location_arn.clone(),
+                    location_uri,
+                    subdirectory: input.subdirectory,
+                    agent_arns: input.agent_arns.unwrap_or_default(),
+                    tags: input.tags.unwrap_or_default(),
+                    creation_time: now,
+                    config: crate::state::LocationConfig::AzureBlob(
+                        crate::state::AzureBlobLocationConfig {
+                            container_url: input.container_url,
+                            authentication_type: input.authentication_type,
+                            blob_type,
+                            access_tier,
+                            secret,
+                        },
+                    ),
+                },
+            );
+            location_arn
+        };
+
+        Ok(CreateLocationAzureBlobOutput {
+            location_arn: Some(location_arn),
+        })
     }
+}
+
+/// The blob type a request that declared none ends up with.
+///
+/// `BLOCK` is the only value the modelled `AzureBlobType` enum admits, and the member's
+/// own documentation says DataSync "only supports moving data into Azure Blob Storage as
+/// block blobs" — so no other blob type can be in effect.
+const DEFAULT_BLOB_TYPE: &str = "BLOCK";
+
+/// The access tier a request that declared none ends up with.
+///
+/// The modelled `AzureAccessTier` enum is `HOT | COOL | ARCHIVE`, and DataSync transfers
+/// objects into the hot tier unless the request asks for one of the colder ones.
+const DEFAULT_ACCESS_TIER: &str = "HOT";
+
+/// The refusal a request earns by combining the credential parameters in a way this
+/// operation does not accept, if any.
+///
+/// Both secret-configuration members document the same rule: a request provides either
+/// `CmkSecretConfig` together with the `SasConfiguration` whose token DataSync then puts
+/// in the secret it manages, or `CustomSecretConfig` on its own, naming a secret the
+/// caller already manages — never both, and never one without its partner.
+fn secret_combination_refusal(input: &CreateLocationAzureBlobInput) -> Option<String> {
+    let cmk = input.cmk_secret_config.is_some();
+    let custom = input.custom_secret_config.is_some();
+    let sas = input.sas_configuration.is_some();
+
+    if cmk && custom {
+        return Some(format!(
+            "{CREDENTIAL_PARAMETER_RULE} Do not provide both parameters for the same request."
+        ));
+    }
+    if custom && sas {
+        return Some(format!(
+            "{CREDENTIAL_PARAMETER_RULE} Do not provide CustomSecretConfig with SasConfiguration."
+        ));
+    }
+    if cmk && !sas {
+        return Some(format!(
+            "{CREDENTIAL_PARAMETER_RULE} Do not provide CmkSecretConfig without SasConfiguration."
+        ));
+    }
+    None
+}
+
+/// The rule both secret-configuration members document, as they word it, and the first
+/// sentence of every refusal above.
+const CREDENTIAL_PARAMETER_RULE: &str = "You can use either CmkSecretConfig (with \
+     SasConfiguration) or CustomSecretConfig (without SasConfiguration) to provide \
+     credentials for a CreateLocationAzureBlob request.";
+
+/// The GLOBAL_ID of an Azure Blob Storage container: everything after the scheme of the
+/// modelled `ContainerUrl`, which is `https://<host>/<container>`.
+fn container_global_id(container_url: &str) -> &str {
+    container_url
+        .split_once("://")
+        .map_or(container_url, |(_, after_scheme)| after_scheme)
 }

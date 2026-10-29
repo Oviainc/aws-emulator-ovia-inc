@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-datasync-fmrsservice service.
 //!
-//! This module owns the DataSync resources the handlers in `src/ops/` share — S3
+//! This module owns the DataSync resources the handlers in `src/ops/` share —
 //! transfer locations, transfer tasks and task executions — plus the two pieces of
 //! behaviour that cannot live in any single operation file:
 //!
@@ -37,8 +37,18 @@ pub const TRANSITION_SPAN: Duration = Duration::from_millis(300);
 /// one from (an unsigned request to the emulator).
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The longest credential-scope region segment this service will carry into an ARN. No
+/// published region identifier comes close, and the segment ends up in every ARN the
+/// service stores, so a longer one is treated like a scope it could not read at all.
+pub const MAX_REGION_LENGTH: usize = 64;
+
 /// The `datasync` ARN namespace, as the Smithy model's `awsService` trait declares it.
 const ARN_NAMESPACE: &str = "datasync";
+
+/// The ARN namespace of the service that holds a location's access credentials, as the
+/// modelled `SecretArn` pattern spells it
+/// (`^(arn:…:secretsmanager:<region>:<account>:secret:.*|)$`).
+const SECRETS_MANAGER_ARN_NAMESPACE: &str = "secretsmanager";
 
 /// `ListTasks`' page size when the request declares none.
 ///
@@ -46,38 +56,188 @@ const ARN_NAMESPACE: &str = "datasync";
 /// ever return and is what an unspecified page size resolves to.
 pub const LIST_TASKS_DEFAULT_PAGE_SIZE: usize = 100;
 
-/// What kind of storage a transfer location addresses.
-///
-/// Only the S3 family is implemented so far; the other eleven `CreateLocation*`
-/// operations are still scaffolded and will each add their own variant.
+/// A RESOURCE GUARD, not an AWS-published quota: every create call appends one record to
+/// one of this service's stores, which live in memory for the lifetime of the process and
+/// never expire (only `DeleteTask` removes anything), so each store needs a ceiling of its
+/// own. A create that would take a store past its ceiling is refused with the modelled
+/// client error — see [`ResourceStore`] and
+/// [`ComAmazonawsDatasyncFmrsserviceState::at_capacity`] — rather than growing the map.
+pub const MAX_LOCATIONS: usize = 10_000;
+
+/// The ceiling on stored transfer tasks. See [`MAX_LOCATIONS`].
+pub const MAX_TASKS: usize = 10_000;
+
+/// The ceiling on stored task executions. See [`MAX_LOCATIONS`]. It also bounds the
+/// `execution_arns` a single task remembers, because every ARN in that list names an
+/// execution this store holds.
+pub const MAX_TASK_EXECUTIONS: usize = 10_000;
+
+/// One of the per-request stores a create call grows, for asking whether it is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocationKind {
-    /// An Amazon S3 bucket or access point.
-    S3,
+pub enum ResourceStore {
+    Locations,
+    Tasks,
+    TaskExecutions,
 }
 
-impl LocationKind {
-    /// The scheme this kind uses in a `LocationUri`.
-    pub fn uri_scheme(self) -> &'static str {
+impl ResourceStore {
+    /// How many records this store holds at most.
+    const fn ceiling(self) -> usize {
         match self {
-            Self::S3 => "s3",
+            Self::Locations => MAX_LOCATIONS,
+            Self::Tasks => MAX_TASKS,
+            Self::TaskExecutions => MAX_TASK_EXECUTIONS,
+        }
+    }
+
+    /// How a refusal names what this store holds.
+    const fn resources(self) -> &'static str {
+        match self {
+            Self::Locations => "transfer locations",
+            Self::Tasks => "transfer tasks",
+            Self::TaskExecutions => "task executions",
         }
     }
 }
 
-/// A transfer location: what `CreateLocationS3` stored and `DescribeLocationS3` reports.
+/// What kind of storage a transfer location addresses.
+///
+/// Only the kinds an implemented `CreateLocation*` can mint are listed; the still
+/// scaffolded ones will each add their own variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocationKind {
+    /// An Amazon S3 bucket or access point.
+    S3,
+    /// A Microsoft Azure Blob Storage container.
+    AzureBlob,
+}
+
+impl LocationKind {
+    /// The scheme this kind uses in a `LocationUri`.
+    fn uri_scheme(self) -> &'static str {
+        match self {
+            Self::S3 => "s3",
+            Self::AzureBlob => "azure-blob",
+        }
+    }
+
+    /// The `LocationUri` for a location of this kind that addresses `global_id` and is
+    /// limited to `subdirectory`.
+    ///
+    /// `LocationUri` is documented as `TYPE://GLOBAL_ID/SUBDIR`, where TYPE is the kind
+    /// of location and GLOBAL_ID identifies the resource backing it (a bucket name for
+    /// Amazon S3, a container's host and name for Azure Blob Storage) — so every kind of
+    /// location assembles its URI the same way and contributes only its own GLOBAL_ID.
+    /// The subdirectory becomes one slash-delimited prefix, however many leading or
+    /// trailing slashes the request spelled it with.
+    pub fn location_uri(self, global_id: &str, subdirectory: Option<&str>) -> String {
+        let scheme = self.uri_scheme();
+        let global_id = global_id.trim_matches('/');
+        let prefix = subdirectory.unwrap_or_default().trim_matches('/');
+        if prefix.is_empty() {
+            format!("{scheme}://{global_id}/")
+        } else {
+            format!("{scheme}://{global_id}/{prefix}/")
+        }
+    }
+
+    /// How a refusal names this kind of location, article included.
+    pub fn described(self) -> &'static str {
+        match self {
+            Self::S3 => "an Amazon S3",
+            Self::AzureBlob => "an Azure Blob Storage",
+        }
+    }
+}
+
+/// Where a location's access credential is kept.
+///
+/// DataSync never reports the credential itself — only the Secrets Manager secret that
+/// holds it — so the token a request carries is not part of a location's stored record.
+#[derive(Debug, Clone)]
+pub enum LocationSecret {
+    /// This location needs no stored credential.
+    None,
+    /// A DataSync-managed secret, encrypted with the Amazon Web Services managed key.
+    Managed { secret_arn: String },
+    /// A DataSync-managed secret, encrypted with the customer-managed KMS key the
+    /// request named.
+    ManagedWithCustomerKey {
+        secret_arn: String,
+        kms_key_arn: Option<String>,
+    },
+    /// A secret the customer manages, reached through the IAM role the request named.
+    Customer {
+        secret_arn: Option<String>,
+        secret_access_role_arn: Option<String>,
+    },
+}
+
+/// The Amazon S3 configuration of a transfer location.
+#[derive(Debug, Clone)]
+pub struct S3LocationConfig {
+    pub bucket_arn: String,
+    pub s3_config: S3Config,
+    pub storage_class: String,
+}
+
+/// The Microsoft Azure Blob Storage configuration of a transfer location.
+#[derive(Debug, Clone)]
+pub struct AzureBlobLocationConfig {
+    pub container_url: String,
+    pub authentication_type: String,
+    pub blob_type: String,
+    pub access_tier: String,
+    pub secret: LocationSecret,
+}
+
+/// The per-kind configuration of a transfer location: one variant per
+/// [`LocationKind`], so a location holds the members of its own kind and no others.
+#[derive(Debug, Clone)]
+pub enum LocationConfig {
+    S3(S3LocationConfig),
+    AzureBlob(AzureBlobLocationConfig),
+}
+
+impl LocationConfig {
+    /// The kind of storage this configuration addresses.
+    pub fn kind(&self) -> LocationKind {
+        match self {
+            Self::S3(_) => LocationKind::S3,
+            Self::AzureBlob(_) => LocationKind::AzureBlob,
+        }
+    }
+
+    /// The Amazon S3 configuration, when that is this location's kind.
+    pub fn as_s3(&self) -> Option<&S3LocationConfig> {
+        match self {
+            Self::S3(s3) => Some(s3),
+            _ => None,
+        }
+    }
+
+    /// The Azure Blob Storage configuration, when that is this location's kind.
+    pub fn as_azure_blob(&self) -> Option<&AzureBlobLocationConfig> {
+        match self {
+            Self::AzureBlob(azure_blob) => Some(azure_blob),
+            _ => None,
+        }
+    }
+}
+
+/// A transfer location: what a `CreateLocation*` stored and the matching
+/// `DescribeLocation*` reports.
+///
+/// The members every kind of location has live here; the rest are in [`LocationConfig`].
 #[derive(Debug, Clone)]
 pub struct Location {
     pub arn: String,
     pub location_uri: String,
-    pub kind: LocationKind,
-    pub s3_bucket_arn: String,
-    pub s3_config: S3Config,
-    pub s3_storage_class: String,
     pub subdirectory: Option<String>,
     pub agent_arns: Vec<String>,
     pub tags: Vec<TagListEntry>,
     pub creation_time: SystemTime,
+    pub config: LocationConfig,
 }
 
 /// A transfer task's lifecycle status, as the modelled `TaskStatus` enum spells it.
@@ -275,6 +435,7 @@ pub struct ComAmazonawsDatasyncFmrsserviceState {
     next_location_seq: u64,
     next_task_seq: u64,
     next_execution_seq: u64,
+    next_secret_seq: u64,
 }
 
 impl ComAmazonawsDatasyncFmrsserviceState {
@@ -289,6 +450,17 @@ impl ComAmazonawsDatasyncFmrsserviceState {
         self.next_task_seq += 1;
         let seq = self.next_task_seq;
         (emulator_arn(region, &format!("task/task-{seq:017x}")), seq)
+    }
+
+    /// Mint the ARN of the DataSync-managed Secrets Manager secret that holds a
+    /// location's access credential: `secret:datasync-<17 hex digits>`.
+    pub fn mint_managed_secret_arn(&mut self, region: &str) -> String {
+        self.next_secret_seq += 1;
+        ::engine::emulator_arn(
+            SECRETS_MANAGER_ARN_NAMESPACE,
+            region,
+            &format!("secret:datasync-{seq:017x}", seq = self.next_secret_seq),
+        )
     }
 
     /// Mint the next `TaskExecutionArn`, which the model nests under its task's ARN.
@@ -320,10 +492,8 @@ impl ComAmazonawsDatasyncFmrsserviceState {
             if execution.launch_time.is_none() && now >= execution.schedule.launched_at {
                 execution.launch_time = Some(execution.schedule.launched_at);
             }
-            if execution.status.is_terminal() {
-                if execution.end_time.is_none() {
-                    execution.end_time = Some(execution.schedule.finished_at);
-                }
+            if execution.status.is_terminal() && execution.end_time.is_none() {
+                execution.end_time = Some(execution.schedule.finished_at);
                 finished.push((execution.task_arn.clone(), execution.arn.clone()));
             }
         }
@@ -336,6 +506,64 @@ impl ComAmazonawsDatasyncFmrsserviceState {
                 }
             }
         }
+    }
+
+    /// The refusal a create earns because `store` is full, if it is.
+    ///
+    /// `Some` is the message the calling operation reports through its own modelled
+    /// client error, so every store's ceiling is worded the same way.
+    pub fn at_capacity(&self, store: ResourceStore) -> Option<String> {
+        let held = match store {
+            ResourceStore::Locations => self.locations.len(),
+            ResourceStore::Tasks => self.tasks.len(),
+            ResourceStore::TaskExecutions => self.task_executions.len(),
+        };
+        (held >= store.ceiling()).then(|| {
+            format!(
+                "This account already holds the maximum of {ceiling} {resources}.",
+                ceiling = store.ceiling(),
+                resources = store.resources()
+            )
+        })
+    }
+
+    /// The Amazon S3 location stored under `arn`, with its S3 configuration.
+    pub fn s3_location(&self, arn: &str) -> Result<(&Location, &S3LocationConfig), String> {
+        self.located(arn, LocationKind::S3, LocationConfig::as_s3)
+    }
+
+    /// The Azure Blob Storage location stored under `arn`, with its Azure configuration.
+    pub fn azure_blob_location(
+        &self,
+        arn: &str,
+    ) -> Result<(&Location, &AzureBlobLocationConfig), String> {
+        self.located(arn, LocationKind::AzureBlob, LocationConfig::as_azure_blob)
+    }
+
+    /// The location stored under `arn`, projected through `pick` — the accessor for the
+    /// kind of location the asking operation reports.
+    ///
+    /// A location ARN addresses exactly one location, of exactly one kind, so an ARN
+    /// this service never minted and an ARN naming another kind of location are both
+    /// client errors rather than empty answers. `Err` carries the message the refusal
+    /// reports, so every `DescribeLocation*` words these two refusals the same way.
+    fn located<'a, C>(
+        &'a self,
+        arn: &str,
+        kind: LocationKind,
+        pick: fn(&'a LocationConfig) -> Option<&'a C>,
+    ) -> Result<(&'a Location, &'a C), String> {
+        let location = self
+            .locations
+            .get(arn)
+            .ok_or_else(|| format!("Location {arn} is not found."))?;
+        let config = pick(&location.config).ok_or_else(|| {
+            format!(
+                "Location {arn} is not {described} location.",
+                described = kind.described()
+            )
+        })?;
+        Ok((location, config))
     }
 
     /// Tasks in creation order — the order `ListTasks` pages over.
@@ -355,12 +583,15 @@ fn emulator_arn(region: &str, resource: &str) -> String {
 ///
 /// Falls back to [`DEFAULT_REGION`] for an unsigned request, and for a scope whose
 /// region segment could not appear in an ARN this service mints (the modelled ARN
-/// patterns allow `[a-z\-0-9]+` there).
+/// patterns allow `[a-z\-0-9]+` there) or is longer than any region identifier
+/// ([`MAX_REGION_LENGTH`]) — the segment is carried by every ARN this service stores,
+/// so an unbounded one would inflate every stored record.
 pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
     ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
         .map(|scope| scope.region)
         .filter(|region| {
             !region.is_empty()
+                && region.len() <= MAX_REGION_LENGTH
                 && region
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')

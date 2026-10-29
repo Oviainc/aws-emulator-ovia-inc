@@ -180,7 +180,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let bucket = s3_resource_name(&input.s3_bucket_arn);
-        let location_uri = s3_location_uri(&bucket, input.subdirectory.as_deref());
+        let location_uri = crate::state::LocationKind::S3
+            .location_uri(&bucket, input.subdirectory.as_deref());
         let s3_storage_class = input
             .s3_storage_class
             .clone()
@@ -189,20 +190,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let location_arn = {
             let mut store = state.lock();
             store.advance_clock(now);
+            if let Some(message) = store.at_capacity(crate::state::ResourceStore::Locations) {
+                return Err(CreateLocationS3ErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(message),
+                        error_code: None,
+                        datasync_error_code: None,
+                    },
+                )
+                .into());
+            }
             let location_arn = store.mint_location_arn(&region);
             store.locations.insert(
                 location_arn.clone(),
                 crate::state::Location {
                     arn: location_arn.clone(),
                     location_uri,
-                    kind: crate::state::LocationKind::S3,
-                    s3_bucket_arn: input.s3_bucket_arn,
-                    s3_config: input.s3_config,
-                    s3_storage_class,
                     subdirectory: input.subdirectory,
                     agent_arns: input.agent_arns.unwrap_or_default(),
                     tags: input.tags.unwrap_or_default(),
                     creation_time: now,
+                    config: crate::state::LocationConfig::S3(crate::state::S3LocationConfig {
+                        bucket_arn: input.s3_bucket_arn,
+                        s3_config: input.s3_config,
+                        storage_class: s3_storage_class,
+                    }),
                 },
             );
             location_arn
@@ -226,23 +238,6 @@ fn s3_resource_name(bucket_arn: &str) -> String {
         .next_back()
         .unwrap_or(resource)
         .to_string()
-}
-
-/// The `LocationUri` for an S3 location: the `s3` scheme, the bucket, and the
-/// prefix the caller asked DataSync to read from or write to.
-///
-/// The modelled `LocationUri` pattern is `^(efs|nfs|s3|smb|hdfs|fsx[a-z0-9-]+)://…`,
-/// so the scheme comes from [`crate::state::LocationKind::uri_scheme`] rather than a
-/// second literal. A `Subdirectory` is reported as a single slash-delimited prefix,
-/// however many leading or trailing slashes the request spelled it with.
-fn s3_location_uri(bucket: &str, subdirectory: Option<&str>) -> String {
-    let scheme = crate::state::LocationKind::S3.uri_scheme();
-    let prefix = subdirectory.unwrap_or_default().trim_matches('/');
-    if prefix.is_empty() {
-        format!("{scheme}://{bucket}/")
-    } else {
-        format!("{scheme}://{bucket}/{prefix}/")
-    }
 }
 
 /// The storage class a request that declared none ends up with.

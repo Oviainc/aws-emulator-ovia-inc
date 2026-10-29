@@ -165,41 +165,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         store.advance_clock(::std::time::SystemTime::now());
-        let Some(location) = store.locations.get(&input.location_arn) else {
-            return Err(DescribeLocationS3ErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(format!(
-                        "Location {} is not found.",
-                        input.location_arn
-                    )),
+        // An ARN addresses one location of one kind: an unknown ARN and an ARN naming
+        // another kind of location are both refused, worded in `crate::state`.
+        let (location, s3) = store
+            .s3_location(&input.location_arn)
+            .map_err(|message| {
+                DescribeLocationS3ErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: Some(message),
                     error_code: None,
                     datasync_error_code: None,
-                },
-            )
-            .into());
-        };
-
-        // An S3 location is the only kind this service stores so far; another kind
-        // under this ARN belongs to its own `DescribeLocation*` operation.
-        if location.kind != crate::state::LocationKind::S3 {
-            return Err(DescribeLocationS3ErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(format!(
-                        "Location {} is not an Amazon S3 location.",
-                        input.location_arn
-                    )),
-                    error_code: None,
-                    datasync_error_code: None,
-                },
-            )
-            .into());
-        }
+                })
+            })?;
 
         Ok(DescribeLocationS3Output {
             location_arn: Some(location.arn.clone()),
             location_uri: Some(location.location_uri.clone()),
-            s3_storage_class: Some(location.s3_storage_class.clone()),
-            s3_config: Some(location.s3_config.clone()),
+            s3_storage_class: Some(s3.storage_class.clone()),
+            s3_config: Some(s3.s3_config.clone()),
             // `AgentArns` is modelled `len 1..8`, so an empty list is not a legal
             // value for it: a location created without agents reports no member.
             agent_arns: (!location.agent_arns.is_empty()).then(|| location.agent_arns.clone()),
