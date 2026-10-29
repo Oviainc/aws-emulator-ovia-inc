@@ -4,8 +4,9 @@
 //!
 //! Updates the stored pricing rule the request's `Arn` names: every member the
 //! request carries replaces the stored one, every member it omits keeps the value
-//! state already holds, `LastModifiedTime` moves to now, and the response reports
-//! the rule's whole state afterwards — including the members no update can change
+//! state already holds, `LastModifiedTime` moves to now when the call actually
+//! modified the rule, and the response reports the rule's whole state afterwards —
+//! including the members no update can change
 //! (`Scope`, `Service`, `BillingEntity`, `UsageType`, `Operation`) and the derived
 //! `AssociatedPricingPlanCount`.
 //!
@@ -233,25 +234,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut updated = merge(&stored, &input)?;
-        updated.last_modified_time_millis = crate::state::now_millis();
 
-        // The name index follows the rename, so the old name frees up and the new one
-        // is taken by exactly this rule.
-        if updated.name != stored.name {
-            state.pricing_rule_names.remove(&stored.name);
-            state
-                .pricing_rule_names
-                .insert(updated.name.clone(), rule_arn.clone());
-        }
         // An association is in force from the billing period it was made in onward, so
         // the count an update reports is the one for the period this call is made in.
         let associated = state
             .associated_pricing_plan_count(&rule_arn, &crate::state::current_billing_period());
+
+        // `LastModifiedTime` is "the most recent time the pricing rule was modified", so
+        // it moves only when this call actually modified the rule: a request that names no
+        // member, or names the values the rule already holds, leaves it where it was. The
+        // generation in force starts in the billing period that instant falls in, so a
+        // call that modified nothing writes no generation either — the same rule
+        // `UpdateBillingGroup` applies to the sibling resource, decided by the state
+        // method that names the members a generation carries
+        // ([`crate::state::PricingRuleRecord::holds_same_members_as`]).
+        let changed = !updated.holds_same_members_as(&stored);
+        if changed {
+            updated.last_modified_time_millis = crate::state::now_millis();
+            // The name index follows the rename, so the old name frees up and the new one
+            // is taken by exactly this rule.
+            if updated.name != stored.name {
+                state.pricing_rule_names.remove(&stored.name);
+                state
+                    .pricing_rule_names
+                    .insert(updated.name.clone(), rule_arn.clone());
+            }
+            // A write takes effect in the billing period it is made in, so the rule the
+            // period BEFORE this one reports is the generation this write supersedes rather
+            // than the one it leaves ([`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::put_pricing_rule`]).
+            state.put_pricing_rule(updated.clone());
+        }
         let output = render(&updated, associated);
-        // A write takes effect in the billing period it is made in, so the rule the
-        // period BEFORE this one reports is the generation this write supersedes rather
-        // than the one it leaves ([`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::put_pricing_rule`]).
-        state.put_pricing_rule(updated);
 
         // The audit record for a state-changing call: who asked, what changed and
         // that it succeeded. Never a secret, and never a `@sensitive` member (the
@@ -261,8 +274,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation = Self::NAME,
             akid = %::engine::extract_akid(&ctx.parts().headers),
             pricing_rule_arn = %rule_arn,
-            outcome = "updated",
-            "pricing rule updated"
+            outcome = if changed { "updated" } else { "unchanged" },
+            "pricing rule update served"
         );
         Ok(output)
     }

@@ -42,12 +42,12 @@ const UPDATE_PATH: &str = "/update-pricing-rule";
 
 /// The billing period the service calls current, read from the same clock it answers
 /// from so an expectation holds whatever month the suite runs in.
-fn current_period() -> String {
+pub(crate) fn current_period() -> String {
     service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period()
 }
 
 /// Create a pricing rule through the wire and answer the ARN the service minted.
-async fn create_rule(em: &Emulator, case: &str, body: &Value) -> String {
+pub(crate) async fn create_rule(em: &Emulator, case: &str, body: &Value) -> String {
     let (status, answer) = em.post(CREATE_PATH, body).await;
     assert_eq!(
         status, 200,
@@ -73,7 +73,12 @@ async fn update_rule(em: &Emulator, case: &str, rule: &str, changes: &Value) {
 /// The `PricingRuleListElement` `ListPricingRules` reports for ONE rule in `period`
 /// (`None` names no period at all), or `None` when the listing does not report the rule
 /// for that period at all.
-async fn element_in(em: &Emulator, case: &str, rule: &str, period: Option<&str>) -> Option<Value> {
+pub(crate) async fn element_in(
+    em: &Emulator,
+    case: &str,
+    rule: &str,
+    period: Option<&str>,
+) -> Option<Value> {
     let mut body = json!({"Filters": {"Arns": [rule]}});
     if let Some(period) = period {
         body["BillingPeriod"] = json!(period);
@@ -89,7 +94,7 @@ async fn element_in(em: &Emulator, case: &str, rule: &str, period: Option<&str>)
 }
 
 /// Assert that `element` reports every member `expected` names with the value it names.
-fn assert_members(case: &str, element: &Value, expected: &Value) {
+pub(crate) fn assert_members(case: &str, element: &Value, expected: &Value) {
     let members = expected
         .as_object()
         .expect("an expectation is a map of member to value");

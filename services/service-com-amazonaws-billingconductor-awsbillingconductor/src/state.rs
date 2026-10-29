@@ -1143,6 +1143,22 @@ impl PricingRuleRecord {
         }
     }
 
+    /// Do this record and `other` hold the SAME values for every member a write can
+    /// change — exactly the members one generation of the rule carries
+    /// ([`Self::current_version`]), named here once so the two cannot drift?
+    ///
+    /// What decides whether a write modified the rule at all: `LastModifiedTime` is the
+    /// instant of the write that left the rule as it stands, and the generation in force
+    /// starts in the period that instant falls in, so a write leaving every one of these
+    /// members where it was neither moves the instant nor opens a generation.
+    pub fn holds_same_members_as(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.description == other.description
+            && self.rule_type == other.rule_type
+            && self.modifier_percentage == other.modifier_percentage
+            && self.tiering == other.tiering
+    }
+
     /// Every generation of this rule, OLDEST FIRST: the ones later writes superseded,
     /// frozen as they stood, and then the one in effect now.
     pub fn versions(&self) -> Vec<PricingRuleVersion> {
@@ -1232,7 +1248,7 @@ impl PricingRuleVersion {
 /// free-tier structure (`CreateFreeTierConfig` / `FreeTierConfig`, both a single
 /// `Activated` boolean), and both carry the SAME `CustomTier` shape — so the
 /// boolean is what is stored and `CustomTier` is reused as modelled.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TieringRecord {
     /// `Tiering.FreeTier.Activated`, absent when the request named no free tier.
     pub free_tier_activated: Option<bool>,

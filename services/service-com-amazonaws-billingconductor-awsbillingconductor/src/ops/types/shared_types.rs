@@ -137,7 +137,7 @@ pub struct AssociateResourceError {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.billingconductor#CustomTier")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CustomTier {
     pub begin_range_inclusive: f64,
     pub end_range_exclusive: Option<f64>,

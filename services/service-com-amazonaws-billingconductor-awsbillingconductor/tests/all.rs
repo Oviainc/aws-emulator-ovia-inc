@@ -115,6 +115,8 @@ mod pricing_rule_lifecycle;
 mod pricing_rule_rate_exclusivity;
 #[path = "all/pricing_rule_scope_members.rs"]
 mod pricing_rule_scope_members;
+#[path = "all/pricing_rule_unchanged_update.rs"]
+mod pricing_rule_unchanged_update;
 #[path = "all/pricing_rule_update.rs"]
 mod pricing_rule_update;
 #[path = "all/pricing_rules_associated_to_pricing_plan.rs"]
