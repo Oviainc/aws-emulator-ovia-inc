@@ -5,10 +5,10 @@
 //! The rule under test: the operation reports the events the data plane persisted on the
 //! monitor the route names — each as the JSON document it was accepted as, oldest first —
 //! narrowed to the events whose instant falls inside the requested time range and whose
-//! attributes satisfy every one of the request's filters, and paged at the request's
-//! `MaxResults`. Each table below differs along what that rule generalises over: the
-//! window's bounds (including the published default for an omitted `Before`), the filter
-//! key and its values, the number of values and of filters, and the page size.
+//! attributes match one of the request's filters, and paged at the request's `MaxResults`.
+//! Each table below differs along what that rule generalises over: the window's bounds
+//! (including the published default for an omitted `Before`), the filter key and its
+//! values, the number of values and of filters, and the page size.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
@@ -338,13 +338,13 @@ async fn the_time_range_selects_the_events_inside_it() {
 }
 
 #[tokio::test]
-async fn filters_select_the_events_matching_every_one_of_them() {
+async fn a_filter_selects_the_events_matching_its_key_and_values() {
     let router = seeded().await;
 
-    // Each row differs along the filter key, the number of values, the number of filters,
-    // and where the matched attribute lives. The keys are the ones the model enumerates
-    // (`QueryFilter$Name`: "Valid values for Name are Browser | Device | Country | Page |
-    // OS | EventType | Invert"), each exercised on an attribute the issue did not cite.
+    // Each row differs along the filter key, the number of values, and where the matched
+    // attribute lives. The keys are the ones the model enumerates (`QueryFilter$Name`:
+    // "Valid values for Name are Browser | Device | Country | Page | OS | EventType |
+    // Invert"), each exercised on an attribute the issue did not cite.
     let table: Vec<(&str, Value, Vec<usize>)> = vec![
         ("one browser", json!([{"Name": "Browser", "Values": ["Chrome"]}]), vec![1, 4]),
         (
@@ -367,22 +367,6 @@ async fn filters_select_the_events_matching_every_one_of_them() {
             json!([{"Name": "EventType", "Values": ["com.amazon.rum.page_view_event"]}]),
             vec![1, 4],
         ),
-        (
-            "two filters at once",
-            json!([
-                {"Name": "Browser", "Values": ["Chrome"]},
-                {"Name": "Device", "Values": ["mobile"]},
-            ]),
-            vec![4],
-        ),
-        (
-            "two filters with nothing in common",
-            json!([
-                {"Name": "Browser", "Values": ["Chrome"]},
-                {"Name": "Country", "Values": ["DE"]},
-            ]),
-            vec![],
-        ),
         ("a value nothing carries", json!([{"Name": "Browser", "Values": ["Opera"]}]), vec![]),
         (
             "a value only another dimension carries",
@@ -403,14 +387,6 @@ async fn filters_select_the_events_matching_every_one_of_them() {
             "an inverted event type",
             json!([{"Name": "Invert", "Values": ["com.amazon.rum.page_view_event"]}]),
             vec![2, 3, 5, 6],
-        ),
-        (
-            "an inverted value beside a filter",
-            json!([
-                {"Name": "Device", "Values": ["desktop"]},
-                {"Name": "Invert", "Values": ["Windows"]},
-            ]),
-            vec![2],
         ),
         ("no filters at all", json!([]), vec![1, 2, 3, 4, 5, 6]),
         (
@@ -436,7 +412,7 @@ async fn filters_select_the_events_matching_every_one_of_them() {
         assert_eq!(
             reported_ids(&documents),
             expected.iter().copied().map(id_of).collect::<Vec<_>>(),
-            "case {case:?}: expected the events matching every filter, got {:?}",
+            "case {case:?}: expected the events matching the filter, got {:?}",
             reported_ids(&documents)
         );
     }
@@ -458,6 +434,211 @@ async fn filters_select_the_events_matching_every_one_of_them() {
         vec![id_of(1)],
         "case \"a browser inside the first half\": expected only the in-window match, got {:?}",
         reported_ids(&documents)
+    );
+}
+
+#[tokio::test]
+async fn an_event_matching_one_of_the_filters_is_reported() {
+    let router = seeded().await;
+
+    // The rule: an event is reported when it matches ONE of the request's `QueryFilter`
+    // structures (`QueryFilter`: "The only performance events that are returned are those
+    // that have values matching the ones that you specify in one of your QueryFilter
+    // structures"; `GetAppMonitorDataRequest$Filters`: "filter the results to those that
+    // match one or more sets of key-value pairs that you specify"). Each row differs along
+    // what that generalises over: how many filters the request carries, whether their keys
+    // are the same or different dimensions, whether their matches overlap, how many values
+    // each carries, the order they arrive in, whether one of them is the negating `Invert`
+    // key, and whether one of them selects on nothing at all.
+    let table: Vec<(&str, Value, Vec<usize>)> = vec![
+        (
+            "two filters over disjoint dimensions",
+            json!([
+                {"Name": "Browser", "Values": ["Chrome"]},
+                {"Name": "Country", "Values": ["DE"]},
+            ]),
+            vec![1, 2, 4],
+        ),
+        (
+            "the same two filters in the other order",
+            json!([
+                {"Name": "Country", "Values": ["DE"]},
+                {"Name": "Browser", "Values": ["Chrome"]},
+            ]),
+            vec![1, 2, 4],
+        ),
+        (
+            "two filters over one dimension",
+            json!([
+                {"Name": "Browser", "Values": ["Chrome"]},
+                {"Name": "Browser", "Values": ["Edge"]},
+            ]),
+            vec![1, 4, 6],
+        ),
+        (
+            "two filters with one event in common",
+            json!([
+                {"Name": "Browser", "Values": ["Chrome"]},
+                {"Name": "Device", "Values": ["mobile"]},
+            ]),
+            vec![1, 3, 4],
+        ),
+        (
+            "two filters selecting the same events",
+            json!([
+                {"Name": "Browser", "Values": ["Chrome"]},
+                {"Name": "Page", "Values": ["/home"]},
+            ]),
+            vec![1, 4],
+        ),
+        (
+            "three filters over three dimensions",
+            json!([
+                {"Name": "Browser", "Values": ["Safari"]},
+                {"Name": "Country", "Values": ["GB"]},
+                {"Name": "Page", "Values": ["/pricing"]},
+            ]),
+            vec![3, 5, 6],
+        ),
+        (
+            "four filters over four dimensions",
+            json!([
+                {"Name": "OS", "Values": ["macOS"]},
+                {"Name": "Device", "Values": ["mobile"]},
+                {"Name": "EventType", "Values": ["com.amazon.rum.session_start_event"]},
+                {"Name": "Country", "Values": ["US"]},
+            ]),
+            vec![1, 2, 3, 4, 6],
+        ),
+        (
+            "two filters between them covering every event carrying that dimension",
+            json!([
+                {"Name": "Device", "Values": ["desktop"]},
+                {"Name": "Device", "Values": ["mobile"]},
+            ]),
+            vec![1, 2, 3, 4, 6],
+        ),
+        (
+            "several values across several filters",
+            json!([
+                {"Name": "Browser", "Values": ["Chrome", "Firefox"]},
+                {"Name": "EventType", "Values": ["com.amazon.rum.http_event"]},
+            ]),
+            vec![1, 2, 3, 4],
+        ),
+        (
+            "one filter matching nothing beside one that matches",
+            json!([
+                {"Name": "Browser", "Values": ["Opera"]},
+                {"Name": "Device", "Values": ["mobile"]},
+            ]),
+            vec![3, 4],
+        ),
+        (
+            "every filter matching nothing",
+            json!([
+                {"Name": "Browser", "Values": ["Opera"]},
+                {"Name": "Country", "Values": ["FR"]},
+            ]),
+            vec![],
+        ),
+        (
+            "an inverted value beside a filter",
+            json!([
+                {"Name": "Device", "Values": ["desktop"]},
+                {"Name": "Invert", "Values": ["Windows"]},
+            ]),
+            vec![1, 2, 3, 4, 5, 6],
+        ),
+        (
+            "two inverted filters",
+            json!([
+                {"Name": "Invert", "Values": ["Chrome"]},
+                {"Name": "Invert", "Values": ["Windows"]},
+            ]),
+            vec![2, 3, 4, 5, 6],
+        ),
+        // A filter that names no key, or no values, selects nothing out: it neither
+        // excludes an event nor admits one of its own.
+        (
+            "a selective filter beside one naming no values",
+            json!([
+                {"Name": "Browser", "Values": ["Chrome"]},
+                {"Name": "Country", "Values": []},
+            ]),
+            vec![1, 4],
+        ),
+        (
+            "a selective filter beside one naming no key",
+            json!([
+                {"Values": ["DE"]},
+                {"Name": "Browser", "Values": ["Chrome"]},
+            ]),
+            vec![1, 4],
+        ),
+    ];
+
+    for (case, filters, expected) in table {
+        let (documents, _) = events(&router, case, body(0, None, filters, 0)).await;
+        assert_eq!(
+            reported_ids(&documents),
+            expected.iter().copied().map(id_of).collect::<Vec<_>>(),
+            "case {case:?}: expected the events matching one of the filters, got {:?}",
+            reported_ids(&documents)
+        );
+    }
+
+    // The window still narrows what the filters between them selected.
+    let (documents, _) = events(
+        &router,
+        "a union inside the first half of the span",
+        body(
+            0,
+            Some(BASE + 120),
+            json!([
+                {"Name": "Browser", "Values": ["Chrome"]},
+                {"Name": "Country", "Values": ["DE"]},
+            ]),
+            0,
+        ),
+    )
+    .await;
+    assert_eq!(
+        reported_ids(&documents),
+        vec![id_of(1), id_of(2)],
+        "case \"a union inside the first half of the span\": expected only the in-window \
+         matches, got {:?}",
+        reported_ids(&documents)
+    );
+
+    // Paging walks what the filters between them selected, once each, in order.
+    let mut collected = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut request = body(
+            0,
+            None,
+            json!([
+                {"Name": "Browser", "Values": ["Chrome"]},
+                {"Name": "Country", "Values": ["DE"]},
+            ]),
+            2,
+        );
+        if let Some(token) = &token {
+            request["NextToken"] = json!(token);
+        }
+        let (documents, next) = events(&router, "a union paged at two", request).await;
+        collected.extend(reported_ids(&documents));
+        match next {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(
+        collected,
+        vec![id_of(1), id_of(2), id_of(4)],
+        "case \"a union paged at two\": expected paging to walk every matching event once, \
+         got {collected:?}"
     );
 }
 

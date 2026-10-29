@@ -4,9 +4,9 @@
 //!
 //! Reports the raw performance events `PutRumEvents` appended to the app monitor the
 //! route names: the monitor's own stored buffer, narrowed to the requested time window
-//! and to the requested `Filters`, returned one page at a time. Every event is reported
-//! as the JSON document the data plane accepted, so a read answers from persisted state
-//! and writes nothing of its own.
+//! and to the events matching one of the requested `Filters`, returned one page at a
+//! time. Every event is reported as the JSON document the data plane accepted, so a read
+//! answers from persisted state and writes nothing of its own.
 //!
 //! ## Shape of an operation
 //!
@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Every filter key is checked before anything is read, so a request naming a key
-        // this operation does not search is refused rather than quietly matching nothing.
+        // this operation does not search is refused rather than quietly selecting nothing.
         let filters = input.filters.unwrap_or_default();
         if let Some(unknown) = filters
             .iter()
@@ -233,6 +233,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let window = Window::from(&input.time_range);
         let page_size = page_size(input.max_results);
 
+        // What the request actually selects on, read once rather than per event: the
+        // filters that name both a key and at least one value.
+        let selections: Vec<Selection<'_>> = filters.iter().filter_map(Selection::read).collect();
+
         let store = state.lock();
         // The events are held ON the app monitor record, so a request naming no stored
         // monitor has no data to report rather than an empty page.
@@ -253,7 +257,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .filter(|stored| match parsed_event(&stored.event_json) {
                 Some(document) => {
-                    window.covers(event_seconds(&document)) && matches_filters(&document, &filters)
+                    window.covers(event_seconds(&document))
+                        && matches_filters(&document, &selections)
                 }
                 // An event whose stored document does not parse cannot be placed in the
                 // window, so it matches no query.
@@ -432,35 +437,51 @@ fn is_filter_key(name: &str) -> bool {
     filter_keys().contains(&name)
 }
 
-/// Whether an event matches EVERY filter the request carries.
+/// What one `QueryFilter` selects on: the key it searches and the values it accepts
+/// there. A filter naming no key, or no values to match against, selects nothing out and
+/// so has no `Selection` at all.
+struct Selection<'a> {
+    /// `QueryFilter$Name`, already checked to be one of [`filter_keys`].
+    key: &'a str,
+    /// `QueryFilter$Values`, never empty.
+    values: &'a [String],
+}
+
+impl<'a> Selection<'a> {
+    /// What `filter` selects on, or `None` when it selects nothing out.
+    fn read(filter: &'a QueryFilter) -> Option<Self> {
+        let key = filter.name.as_deref()?;
+        let values = filter.values.as_deref()?;
+        (!values.is_empty()).then_some(Self { key, values })
+    }
+
+    /// Whether an event matches this one selection.
+    fn matches(&self, document: &::serde_json::Value) -> bool {
+        if self.key == INVERT_KEY {
+            // "not equal to": every dimension is searched, and an event matching any of
+            // the values on any of them is the one case this selection excludes.
+            return !filter_keys()
+                .into_iter()
+                .filter(|key| *key != INVERT_KEY)
+                .filter_map(|key| dimension(document, key))
+                .any(|found| self.values.contains(&found));
+        }
+        dimension(document, self.key).is_some_and(|found| self.values.contains(&found))
+    }
+}
+
+/// Whether an event matches ONE of the filters the request carries.
 ///
 /// `QueryFilter` documents "The only performance events that are returned are those that
 /// have values matching the ones that you specify in one of your `QueryFilter`
-/// structures", so the filters are a conjunction while the `Values` of one filter are a
-/// disjunction.
-fn matches_filters(document: &::serde_json::Value, filters: &[QueryFilter]) -> bool {
-    filters.iter().all(|filter| matches_filter(document, filter))
-}
-
-/// Whether an event matches ONE filter. A filter that names no key, or no values to match
-/// against, selects nothing out and so narrows the query by nothing.
-fn matches_filter(document: &::serde_json::Value, filter: &QueryFilter) -> bool {
-    let (Some(key), Some(values)) = (filter.name.as_deref(), filter.values.as_deref()) else {
-        return true;
-    };
-    if values.is_empty() {
-        return true;
-    }
-    if key == INVERT_KEY {
-        // "not equal to": every dimension is searched, and an event matching any of the
-        // values on any of them is the one case this filter excludes.
-        return !filter_keys()
-            .into_iter()
-            .filter(|key| *key != INVERT_KEY)
-            .filter_map(|key| dimension(document, key))
-            .any(|found| values.contains(&found));
-    }
-    dimension(document, key).is_some_and(|found| values.contains(&found))
+/// structures", and `GetAppMonitorDataRequest$Filters` "An array of structures that you
+/// can use to filter the results to those that match one or more sets of key-value
+/// pairs": an event matching ONE of the structures is reported, so the filters are a
+/// disjunction, as are the `Values` within one of them. A request that selects on nothing
+/// — no filters, or only filters naming no key or no values — narrows by nothing and so
+/// reports everything the window covers.
+fn matches_filters(document: &::serde_json::Value, selections: &[Selection<'_>]) -> bool {
+    selections.is_empty() || selections.iter().any(|selection| selection.matches(document))
 }
 
 /// The value an event carries for one `QueryFilter$Name` key, or `None` when it carries
