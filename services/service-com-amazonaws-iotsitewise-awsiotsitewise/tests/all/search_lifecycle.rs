@@ -11,9 +11,10 @@
 //!   query statement, the search strategy (`QUICK` when the request named none),
 //!   the group it was filed under and the filters it carried — under a freshly
 //!   minted `searchId` that satisfies the modelled `SearchId` constraints;
-//! * `StartSearch` is idempotent on `clientToken`: a repeat of a call carrying one
-//!   answers from the search that token already started instead of starting a
-//!   second, so the stored search is the FIRST call's;
+//! * `StartSearch` is idempotent on `clientToken`: a RETRY — the same request under
+//!   the token that call spent — answers from the search that call started instead of
+//!   starting a second, and a DIFFERENT request reusing that token is the modelled
+//!   conflict, so the stored search stays the FIRST call's;
 //! * a search is addressed by `(workspaceName, searchId)`, so it is readable only
 //!   through the workspace it was started in and a pair no search is stored under
 //!   is a modelled not-found refusal, as is a workspace the store does not hold;
@@ -420,23 +421,34 @@ async fn repeating_a_client_token_answers_from_the_original_search() {
         ("longest-token", token("second-call-token-", 64)),
         ("punctuated-token", token("third/call+token=", 40)),
     ] {
-        let (status, first) = start(
-            &router,
-            WORKSPACE,
-            json!({
-                "queryStatement": format!("original statement for {label}"),
-                "searchType": "DEEP",
-                "groupId": "original",
-                "clientToken": client_token,
-            }),
-        )
-        .await;
+        let request = json!({
+            "queryStatement": format!("original statement for {label}"),
+            "searchType": "DEEP",
+            "groupId": "original",
+            "clientToken": client_token,
+        });
+        let (status, first) = start(&router, WORKSPACE, request.clone()).await;
         assert_eq!(status, 202, "case {label}: StartSearch: got {status} {first}");
         let search_id = first["searchId"].as_str().unwrap_or("").to_string();
 
-        // The repeat carries the same token and a DIFFERENT request: it must start
-        // nothing and answer from the search the token already started.
-        let (status, repeat) = start(
+        // The SAME request under that token is a RETRY of the call above: it must
+        // start nothing and answer from the search that call started.
+        let (status, repeat) = start(&router, WORKSPACE, request).await;
+        assert_eq!(status, 202, "case {label}: the retry is accepted, got {status} {repeat}");
+        assert_eq!(
+            repeat["searchId"].as_str().unwrap_or(""),
+            search_id,
+            "case {label}: a retry answers from the search its token started, got {repeat}"
+        );
+        assert_eq!(
+            repeat["groupId"].as_str().unwrap_or(""),
+            "original",
+            "case {label}: the retry reports the ORIGINAL search's members, got {repeat}"
+        );
+
+        // A DIFFERENT request reusing that spent token belongs to another call: the
+        // modelled conflict, naming the search the token's own call started.
+        let (status, refused) = start(
             &router,
             WORKSPACE,
             json!({
@@ -447,16 +459,15 @@ async fn repeating_a_client_token_answers_from_the_original_search() {
             }),
         )
         .await;
-        assert_eq!(status, 202, "case {label}: the repeat is accepted, got {status} {repeat}");
         assert_eq!(
-            repeat["searchId"].as_str().unwrap_or(""),
-            search_id,
-            "case {label}: a repeated clientToken answers from the original search, got {repeat}"
+            (status, error_code(&refused)),
+            (409, "ConflictingOperationException"),
+            "case {label}: a spent token expected the modelled conflict, got {status} {refused}"
         );
         assert_eq!(
-            repeat["groupId"].as_str().unwrap_or(""),
-            "original",
-            "case {label}: the repeat reports the ORIGINAL search's members, got {repeat}"
+            refused["resourceId"].as_str().unwrap_or(""),
+            search_id,
+            "case {label}: the conflict names the search the first call started, got {refused}"
         );
 
         let (status, described) = describe(&router, WORKSPACE, &search_id).await;
@@ -464,13 +475,15 @@ async fn repeating_a_client_token_answers_from_the_original_search() {
         assert_eq!(
             described["queryStatement"].as_str().unwrap_or(""),
             format!("original statement for {label}"),
-            "case {label}: the repeat must not overwrite the stored search, got {}",
+            "case {label}: neither the retry nor the refused request may overwrite the \
+             stored search, got {}",
             described["queryStatement"]
         );
         assert_eq!(
             described["searchType"].as_str().unwrap_or(""),
             "DEEP",
-            "case {label}: the repeat must not overwrite the stored search, got {described}"
+            "case {label}: neither the retry nor the refused request may overwrite the \
+             stored search, got {described}"
         );
 
         // A token no call has used yet starts a search of its own.

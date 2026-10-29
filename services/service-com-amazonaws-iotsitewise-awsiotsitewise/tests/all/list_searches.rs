@@ -196,7 +196,6 @@ fn plant(engine: &Arc<engine::InMemoryEngine>, index: usize, case: &Planted) -> 
             search_type: case.search_type.to_string(),
             search_filters: None,
             group_id: case.group_id.map(str::to_string),
-            client_token: None,
             started_at,
             running_at,
             succeeded_at,

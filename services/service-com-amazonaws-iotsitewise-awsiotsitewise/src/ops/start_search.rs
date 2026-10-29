@@ -8,9 +8,10 @@
 //! DUE INSTANTS, never slept on, so a poll derives the status it reports from the
 //! clock instead of writing one.
 //!
-//! Idempotent on `clientToken`: a repeat of a call that carried one answers from the
-//! search that token already started rather than starting a second. A workspace the
-//! store does not hold is the modelled not-found refusal.
+//! Idempotent on `clientToken`: a repeat of the SAME call under a token answers from
+//! the search that call started rather than starting a second, while a DIFFERENT
+//! request reusing that token belongs to another call and is the modelled conflict.
+//! A workspace the store does not hold is the modelled not-found refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -181,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartSearchError::Modeled(StartSearchErrorModeled::InternalFailureException(
@@ -190,6 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
         // A `timeIntervals` entry bounds the data the search reads, so an interval
@@ -199,6 +201,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         check_search_filters(input.search_filters.as_ref()).map_err(invalid_request)?;
 
         let mut store = state.lock();
+
+        // "The request is idempotent on clientToken: repeating a call with the same
+        // token returns the original search instead of starting a new one" — a
+        // token identifies the CALL that spent it, so the request is resolved
+        // against the store's record of the tokens this operation has already
+        // served, the way every other idempotent write of this service resolves
+        // one: a retry — the same request under that token — reports the search
+        // that call started and writes nothing, while a request differing in any
+        // member it is recognised by belongs to another call and is the modelled
+        // conflict rather than an answer about a search it never asked for.
+        // Decided BEFORE the request is resolved against the store, because the
+        // call it repeats was already served, whatever has changed since.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.workspace_name,
+                &input.query_statement,
+                &input.search_type,
+                &input.search_filters,
+                &input.group_id,
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // The retry reports that search at whatever status it has reached by
+                // now. One gone since — its workspace deleted — leaves the retry
+                // nothing to answer from, so it is served as the fresh start it now
+                // is.
+                let (workspace_name, search_id) =
+                    crate::state::workspace_scoped_token_key(&replayed);
+                if let Some(existing) = store.search(&workspace_name, &search_id) {
+                    return Ok(started(existing, now));
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                // The conflict names the search the token's own call started — the
+                // search the caller has to look at — as the error's required members
+                // state it.
+                let (workspace_name, search_id) =
+                    crate::state::workspace_scoped_token_key(&spent_on);
+                return Err(token_spent(
+                    &search_id,
+                    crate::state::search_arn(&region, &workspace_name, &search_id),
+                ));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
 
         // A search runs against the data of ONE workspace, so a request naming a
         // workspace this account does not hold addresses nothing: the modelled
@@ -210,18 +259,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::RESOURCE_WORKSPACE,
                 &input.workspace_name,
             )));
-        }
-
-        // "The request is idempotent on clientToken: repeating a call with the same
-        // token returns the original search instead of starting a new one" — the
-        // repeat writes nothing and reports the original search, at whatever status
-        // that search has reached by now.
-        if let Some(client_token) = input.client_token.as_deref() {
-            if let Some(existing) =
-                store.search_for_client_token(&input.workspace_name, client_token)
-            {
-                return Ok(started(existing, now));
-            }
         }
 
         // The store is bounded: a start is the only thing that adds a search and
@@ -254,7 +291,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_else(|| crate::state::DEFAULT_SEARCH_TYPE.to_string()),
             search_filters: input.search_filters.clone(),
             group_id: input.group_id.clone(),
-            client_token: input.client_token.clone(),
             started_at: now,
             // "The search runs in the background": the instants its transitions fall
             // due are STORED, never slept on, so this call returns immediately and a
@@ -267,6 +303,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.searches.insert(
             crate::state::search_key(&input.workspace_name, &search_id),
             record,
+        );
+        // The token is spent only now the start has SUCCEEDED: a refused request
+        // started no search, so the caller may send it again under that token.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &crate::state::workspace_scoped_token_resource(&input.workspace_name, &search_id),
+            now,
         );
 
         Ok(output)
@@ -309,6 +354,19 @@ fn invalid_request(message: String) -> StartSearchError {
 fn limit_exceeded(message: String) -> StartSearchError {
     StartSearchError::Modeled(StartSearchErrorModeled::LimitExceededException(
         LimitExceededException { message },
+    ))
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the search that request started,
+/// so `resourceId`/`resourceArn` name it.
+fn token_spent(search_id: &str, resource_arn: String) -> StartSearchError {
+    StartSearchError::Modeled(StartSearchErrorModeled::ConflictingOperationException(
+        ConflictingOperationException {
+            message: crate::state::already_using_message("search", "clientToken"),
+            resource_id: search_id.to_string(),
+            resource_arn,
+        },
     ))
 }
 

@@ -2672,10 +2672,6 @@ pub struct SearchRecord {
     /// without any reports none rather than empty lists it never carried.
     pub search_filters: Option<SearchFilters>,
     pub group_id: Option<String>,
-    /// The `clientToken` of the call that started this search, if it carried
-    /// one, so a repeat of that same call answers from this search instead of
-    /// starting another.
-    pub client_token: Option<String>,
     /// When the call that started the search landed — what `startedAt` reports.
     pub started_at: SystemTime,
     /// The instant the owed `QUEUED` -> `RUNNING` transition falls due.
@@ -2719,6 +2715,23 @@ impl SearchRecord {
 /// workspace it belongs to.
 pub fn search_key(workspace_name: &str, search_id: &str) -> (String, String) {
     (workspace_name.to_string(), search_id.to_string())
+}
+
+/// The resource type section a search's ARN carries, which is what the modelled
+/// conflict refusal reports for one.
+pub const SEARCH_RESOURCE_TYPE: &str = "search";
+
+/// The canonical ARN of a search in `region`.
+///
+/// The resource section carries the WORKSPACE as well as the id, for the reason
+/// [`query_arn`] states: a search is addressed only inside the workspace it was
+/// started in.
+pub fn search_arn(region: &str, workspace_name: &str, search_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{SEARCH_RESOURCE_TYPE}/{workspace_name}/{search_id}"),
+    )
 }
 
 /// One version of a task: the caller-owned configuration as of the call that
@@ -4891,22 +4904,6 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// was started in.
     pub fn search(&self, workspace_name: &str, search_id: &str) -> Option<&SearchRecord> {
         self.searches.get(&search_key(workspace_name, search_id))
-    }
-
-    /// The search `workspace` already started under `client_token`, if any.
-    ///
-    /// What makes `StartSearch` idempotent on its token: a repeat of a call that
-    /// carried one answers from the search it already started. Scoped to the
-    /// workspace, since that is what a search is addressed within.
-    pub fn search_for_client_token(
-        &self,
-        workspace_name: &str,
-        client_token: &str,
-    ) -> Option<&SearchRecord> {
-        self.searches.values().find(|record| {
-            record.workspace_name == workspace_name
-                && record.client_token.as_deref() == Some(client_token)
-        })
     }
 
     /// The dashboard a create carrying `client_token` already minted, if any.
