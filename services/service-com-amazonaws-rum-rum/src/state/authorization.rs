@@ -13,12 +13,15 @@
 //! The three pieces, each held in exactly one place:
 //!
 //! 1. **who** — the principal the request's access key id speaks for, read from the SAME
-//!    place `sts:GetCallerIdentity` answers from ([`sts_store::resolve_caller`]), so the
-//!    principal a refusal blames is the one the caller reads back from STS for the
-//!    credentials it signed with;
+//!    place `sts:GetCallerIdentity` answers from ([`sts_store::resolve_request_caller`]
+//!    over [`sts_store::long_term_identity`], so a key that names a session speaks for
+//!    that session and a long-term key for the IAM user that holds it), so the principal a
+//!    refusal blames is the one the caller reads back from STS for the credentials it
+//!    signed with;
 //! 2. **what it may do** — the identity-based policy documents the IAM store holds for
-//!    that principal (a role's inline policies and the default versions of the managed
-//!    policies attached to it, a user's inline policies), read out of the IAM service's
+//!    that principal: its inline policies and the default versions of the managed policies
+//!    attached to it, from the same two sources whichever kind of principal it is (the
+//!    role behind an assumed-role session, or an IAM user), read out of the IAM service's
 //!    OWN store so RUM sees exactly what IAM's handlers wrote;
 //! 3. **the decision** — [`::service_common::iam_authorization`], the shared evaluation of
 //!    those documents against `(action, resource, principal)`, so RUM and any other
@@ -26,15 +29,16 @@
 //!
 //! ## The two callers that are not IAM principals
 //!
-//! * **The account's own published credential.** A request signed with the long-term key
-//!   this emulator publishes resolves to [`sts_store::ambient_identity`], the account's
+//! * **The account's own published credential.** A request signed with a long-term key no
+//!   IAM user holds — the one this emulator publishes — resolves to
+//!   [`sts_store::ambient_identity`], the account's
 //!   own identity, which is not a principal the IAM store holds policies for — the same
 //!   position AWS account root credentials are in. Such a request is allowed, while an
 //!   explicit `Deny` in the resource policy still refuses it.
 //! * **A principal holding an attachment this emulator cannot read.** An AWS-managed
 //!   policy is owned by AWS, not by the account, so the IAM store holds no document for it
-//!   ([`iam_store::AWS_MANAGED_POLICY_ACCOUNT`]) — which is also why `AttachRolePolicy`
-//!   accepts one without the account holding it. A principal with such a policy attached
+//!   ([`iam_store::AWS_MANAGED_POLICY_ACCOUNT`]) — which is also why the IAM attach calls
+//!   accept one without the account holding it. A principal with such a policy attached
 //!   is allowed: RUM cannot see what that document grants, and refusing on evidence it
 //!   does not have would deny access AWS permits. An explicit `Deny` in a document it CAN
 //!   read still refuses. This applies ONLY to an AWS-managed ARN: an attachment naming a
@@ -44,7 +48,7 @@
 //! An expired session credential speaks for nobody: it carries no documents and no
 //! principal spelling, so every action it asks for is refused.
 //!
-//! Resolving the caller goes through STS's own [`sts_store::resolve_caller`], which
+//! Resolving the caller goes through STS's own [`sts_store::resolve_request_caller`], which
 //! materialises the session expiries the clock has already made due before it answers.
 //! That write is owed at the same instant whether or not anybody called, which is why a
 //! REPORTING operation (`GetAppMonitor`, `ListAppMonitors`) may make this decision: what a
@@ -268,16 +272,26 @@ pub fn caller<Eng: Send + Sync + 'static>(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
 ) -> Caller {
     let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    let iam = iam_store::service_state(engine);
+    // A credential that names no session speaks for the IAM user that holds that access
+    // key, which is the identity `sts:GetCallerIdentity` reports for it; a key no IAM user
+    // holds is the account's own published credential.
+    let long_term = match &iam {
+        Some(iam) => sts_store::long_term_identity(Some(&iam.lock()), &access_key_id),
+        None => sts_store::ambient_identity(),
+    };
     let identity = match sts_store::service_state(engine) {
-        Some(sts) => sts_store::resolve_caller(
+        Some(sts) => sts_store::resolve_request_caller(
             &mut sts.lock(),
             &access_key_id,
             SystemTime::now(),
             ctx.credential_store(),
-        ),
-        // No STS store on this engine: the only identity a request can present is the
-        // account's own published credential.
-        None => Ok(sts_store::ambient_identity()),
+            long_term,
+        )
+        .map(|caller| caller.identity),
+        // No STS store on this engine: the credential names no session, so it speaks for
+        // the long-term identity it was resolved to.
+        None => Ok(long_term),
     };
     let identity = match identity {
         Ok(identity) => identity,
@@ -300,44 +314,48 @@ pub fn caller<Eng: Send + Sync + 'static>(
         documents: Vec::new(),
         unreadable_attachment: false,
     };
-    let Some(iam) = iam_store::service_state(engine) else {
+    let Some(iam) = iam else {
         return caller;
     };
     let store = iam.lock();
-    if let Some(role_name) = assumed_role_name(&caller.arn) {
+    // The identity-based documents in force on a principal are its INLINE policies plus
+    // the default version of every MANAGED policy attached to it — the same two sources
+    // for every kind of principal, so the branches below only choose which maps those two
+    // sources are read from (and a role session is additionally known by the role's own
+    // ARN, which a resource policy may name it by).
+    let (inline, attached) = if let Some(role_name) = assumed_role_name(&caller.arn) {
         let role_key = iam_store::name_key(role_name);
         if let Some(held) = store.roles.get(&role_key) {
             caller.principals.push(held.arn.clone());
         }
-        caller.documents.extend(inline_documents(
-            &store.role_inline_policies,
-            &role_key,
-        ));
-        for attached in store
-            .role_attached_policies
-            .get(&role_key)
-            .into_iter()
-            .flatten()
-        {
-            match store
-                .policy_by_arn(attached)
-                .and_then(default_version_document)
-            {
-                Some(document) => caller.documents.push(document),
-                // Only an AWS-MANAGED policy is a grant this emulator cannot read (see
-                // the module docs); an attachment naming a customer-managed policy the
-                // account does not hold grants nothing.
-                None if is_aws_managed_policy(attached) => {
-                    caller.unreadable_attachment = true;
-                }
-                None => {}
-            }
-        }
+        (
+            inline_documents(&store.role_inline_policies, &role_key),
+            store.role_attached_policies.get(&role_key),
+        )
     } else if let Some(user_name) = iam_user_name(&caller.arn) {
-        caller.documents.extend(inline_documents(
-            &store.user_inline_policies,
-            &iam_store::name_key(user_name),
-        ));
+        let user_key = iam_store::name_key(user_name);
+        (
+            inline_documents(&store.user_inline_policies, &user_key),
+            store.user_attached_policies.get(&user_key),
+        )
+    } else {
+        (Vec::new(), None)
+    };
+    caller.documents.extend(inline);
+    for attachment in attached.into_iter().flatten() {
+        match store
+            .policy_by_arn(attachment)
+            .and_then(default_version_document)
+        {
+            Some(document) => caller.documents.push(document),
+            // Only an AWS-MANAGED policy is a grant this emulator cannot read (see the
+            // module docs); an attachment naming a customer-managed policy the account
+            // does not hold grants nothing.
+            None if is_aws_managed_policy(attachment) => {
+                caller.unreadable_attachment = true;
+            }
+            None => {}
+        }
     }
     caller
 }

@@ -357,6 +357,108 @@ impl Emulator {
         );
     }
 
+    /// Create an IAM user named `user_name`, give it `policy` as an inline policy when one
+    /// is supplied, mint a long-term access key for it through IAM's own
+    /// `CreateAccessKey`, and answer that key's id — the credential an IAM-user caller
+    /// signs its RUM requests with.
+    pub(crate) async fn iam_user_key(&self, user_name: &str, policy: Option<&str>) -> String {
+        let (status, body) = self
+            .query(
+                "iam",
+                "2010-05-08",
+                ACCOUNT_KEY,
+                "CreateUser",
+                &[("UserName", user_name.to_string())],
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "creating the user {user_name:?} must succeed, got {status} {body}"
+        );
+        if let Some(policy) = policy {
+            let (status, body) = self
+                .query(
+                    "iam",
+                    "2010-05-08",
+                    ACCOUNT_KEY,
+                    "PutUserPolicy",
+                    &[
+                        ("UserName", user_name.to_string()),
+                        ("PolicyName", "inline".to_string()),
+                        ("PolicyDocument", policy.to_string()),
+                    ],
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "putting the inline policy of {user_name:?} must succeed, got {status} {body}"
+            );
+        }
+        let (status, body) = self
+            .query(
+                "iam",
+                "2010-05-08",
+                ACCOUNT_KEY,
+                "CreateAccessKey",
+                &[("UserName", user_name.to_string())],
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "minting an access key for {user_name:?} must succeed, got {status} {body}"
+        );
+        xml_element(&body, "AccessKeyId")
+            .unwrap_or_else(|| panic!("CreateAccessKey must answer an AccessKeyId, got {body}"))
+    }
+
+    /// Attach the managed policy `policy_arn` to the user `user_name` through IAM's own
+    /// `AttachUserPolicy`.
+    pub(crate) async fn attach_user_policy(&self, user_name: &str, policy_arn: &str) {
+        let (status, body) = self
+            .query(
+                "iam",
+                "2010-05-08",
+                ACCOUNT_KEY,
+                "AttachUserPolicy",
+                &[
+                    ("UserName", user_name.to_string()),
+                    ("PolicyArn", policy_arn.to_string()),
+                ],
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "attaching {policy_arn:?} to {user_name:?} must succeed, got {status} {body}"
+        );
+    }
+
+    /// Add `document` to the managed policy `policy_arn` as a new version, making it the
+    /// policy's DEFAULT version when `set_as_default` is set.
+    pub(crate) async fn create_policy_version(
+        &self,
+        policy_arn: &str,
+        document: &str,
+        set_as_default: bool,
+    ) {
+        let (status, body) = self
+            .query(
+                "iam",
+                "2010-05-08",
+                ACCOUNT_KEY,
+                "CreatePolicyVersion",
+                &[
+                    ("PolicyArn", policy_arn.to_string()),
+                    ("PolicyDocument", document.to_string()),
+                    ("SetAsDefault", set_as_default.to_string()),
+                ],
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "adding a version to {policy_arn:?} must succeed, got {status} {body}"
+        );
+    }
+
     /// Attach `document` to the app monitor as its resource policy, with the account's own
     /// credential.
     pub(crate) async fn put_resource_policy(&self, monitor: &str, document: &str) {

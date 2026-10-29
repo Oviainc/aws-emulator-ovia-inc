@@ -43,6 +43,8 @@ mod dimension_keys_constraints;
 mod event_instant_round_trip;
 #[path = "all/extended_metric_dimension_entries.rs"]
 mod extended_metric_dimension_entries;
+#[path = "all/identity_policy_sources.rs"]
+mod identity_policy_sources;
 #[path = "all/list_app_monitors_page_size.rs"]
 mod list_app_monitors_page_size;
 #[path = "all/list_tags_for_resource.rs"]
