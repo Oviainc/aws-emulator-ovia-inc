@@ -31,6 +31,12 @@ const GROUP_TYPE: &str = "App::UserGroup";
 /// The group a permit policy in this suite is written over.
 const PERMITTED_GROUP: &str = "admins";
 
+/// The refusal a presented token whose audience the identity source accepts none of is
+/// answered with: ONE fixed sentence with no variable part, so a client can tell an
+/// audience failure apart from every other validation failure by matching it, and the
+/// rejected token's own audience is not reported back.
+const AUDIENCE_NOT_ACCEPTED: &str = "Token audience claim contains no valid audience";
+
 /// `bytes` as one base64url segment, unpadded, as a compact JWS carries it
 /// (RFC 7515 §2).
 fn base64url(bytes: &[u8]) -> String {
@@ -318,6 +324,9 @@ enum Expected {
     },
     /// A 400 `ValidationException` whose message carries this clause.
     Refused(String),
+    /// A 400 `ValidationException` whose message is EXACTLY this sentence: a refusal the
+    /// service words as fixed text rather than as a reason composed about the token.
+    RefusedExactly(&'static str),
     /// A 400 `ValidationException` whose `fieldList` names these request members.
     InvalidInput(Vec<&'static str>),
     /// A 404 `ResourceNotFoundException` for this resource: the call referenced something
@@ -453,18 +462,12 @@ async fn a_decision_follows_the_claims_of_a_token_the_issuer_signed() {
         (
             "an identity token issued to an app client the identity source does not list",
             request(&store, json!({ "identityToken": through_unlisted.1 })),
-            Expected::Refused(format!(
-                "its aud claim {unlisted_client:?} is not one of the clientIds the identity \
-                 source accepts"
-            )),
+            Expected::RefusedExactly(AUDIENCE_NOT_ACCEPTED),
         ),
         (
             "an access token issued to an app client the identity source does not list",
             request(&store, json!({ "accessToken": through_unlisted.0 })),
-            Expected::Refused(format!(
-                "its client_id claim {unlisted_client:?} is not one of the clientIds the \
-                 identity source accepts"
-            )),
+            Expected::RefusedExactly(AUDIENCE_NOT_ACCEPTED),
         ),
         (
             "an access token presented as the identity token",
@@ -613,6 +616,19 @@ async fn a_decision_follows_the_claims_of_a_token_the_issuer_signed() {
                     message.starts_with("Failed to verify "),
                     "case {case:?}: a token that does not verify is refused as such, got \
                      {message:?}"
+                );
+            }
+            Expected::RefusedExactly(sentence) => {
+                assert_eq!(
+                    (status, error_code(&answered).as_str()),
+                    (400, "ValidationException"),
+                    "case {case:?}: expected a 400 ValidationException, got {status} with \
+                     {answered}"
+                );
+                assert_eq!(
+                    fault_message(&answered),
+                    sentence,
+                    "case {case:?}: expected exactly {sentence:?}, got {answered}"
                 );
             }
             Expected::InvalidInput(members) => {
@@ -1460,5 +1476,208 @@ async fn a_type_the_stores_schema_declares_only_as_a_principal_cannot_be_supplie
             expected,
         )
         .await;
+    }
+}
+
+/// One row of the audience table: the clients the identity source lists, the token the
+/// call presents and the member it presents it in.
+struct Audience {
+    case: &'static str,
+    /// The app clients the identity source's `clientIds` names.
+    listed: Vec<String>,
+    /// The request member the token arrives in — `accessToken` or `identityToken`.
+    member: &'static str,
+    /// The token itself, issued to one app client of the pool.
+    token: String,
+    /// Whether the source accepts the client that token was issued to.
+    accepted: bool,
+}
+
+/// A token whose audience is none the identity source accepts is refused with ONE fixed
+/// sentence, and that sentence reports nothing the token claimed.
+///
+/// The rule under test: a presented token is usable only when the client it was issued to
+/// is one the identity source lists, a source listing none accepts any client of its
+/// issuer, and the refusal is always the same fixed `ValidationException` message —
+/// whichever member carried the token and however many clients the source lists — with no
+/// variable part, so neither the rejected audience nor the accepted ones are disclosed.
+///
+/// The rows differ along what the rule generalises over: how many clients the source lists
+/// (none, one, two), which of them the token was issued to (a listed one, the second
+/// listed one, none of them) and which member carried it.
+#[tokio::test]
+async fn an_audience_the_source_does_not_list_is_refused_with_one_fixed_sentence() {
+    let (router, _engine) = harness::router_with_engine();
+    let pool = harness::user_pool(&router, "audience-pool").await;
+    let first = app_client(&router, &pool, "audience-client-one").await;
+    let second = app_client(&router, &pool, "audience-client-two").await;
+    let unlisted = app_client(&router, &pool, "audience-client-unlisted").await;
+
+    // One identity in the permitted group, signed in through each of the three app
+    // clients: the tokens differ in their audience claim and in nothing else.
+    let member = sign_in(
+        &router,
+        &pool,
+        &first,
+        "member",
+        &[PERMITTED_GROUP],
+        &json!([]),
+    )
+    .await;
+    let through_first = (member.access_token.clone(), member.id_token.clone());
+    let through_second = reauthenticate(&router, &pool, &second, "member").await;
+    let through_unlisted = reauthenticate(&router, &pool, &unlisted, "member").await;
+
+    let row = |case: &'static str,
+               listed: &[&String],
+               member: &'static str,
+               token: &String,
+               accepted: bool| Audience {
+        case,
+        listed: listed.iter().map(|id| (*id).clone()).collect(),
+        member,
+        token: token.clone(),
+        accepted,
+    };
+    let rows: Vec<Audience> = vec![
+        row(
+            "one listed client, its own identity token",
+            &[&first],
+            "identityToken",
+            &through_first.1,
+            true,
+        ),
+        row(
+            "one listed client, an identity token from another",
+            &[&first],
+            "identityToken",
+            &through_unlisted.1,
+            false,
+        ),
+        row(
+            "one listed client, an access token from another",
+            &[&first],
+            "accessToken",
+            &through_unlisted.0,
+            false,
+        ),
+        row(
+            "two listed clients, an identity token from the second of them",
+            &[&first, &second],
+            "identityToken",
+            &through_second.1,
+            true,
+        ),
+        row(
+            "two listed clients, an access token from the second of them",
+            &[&first, &second],
+            "accessToken",
+            &through_second.0,
+            true,
+        ),
+        row(
+            "two listed clients, an identity token from neither",
+            &[&first, &second],
+            "identityToken",
+            &through_unlisted.1,
+            false,
+        ),
+        row(
+            "two listed clients, an access token from neither",
+            &[&first, &second],
+            "accessToken",
+            &through_unlisted.0,
+            false,
+        ),
+        row(
+            "a listed client the token was not issued to, the other way round",
+            &[&unlisted],
+            "identityToken",
+            &through_first.1,
+            false,
+        ),
+        // An empty list accepts any client of the issuer, which is what it means on the
+        // wire: `CognitoUserPoolConfiguration$clientIds` is an optional member.
+        row(
+            "a source listing no client at all, an identity token",
+            &[],
+            "identityToken",
+            &through_unlisted.1,
+            true,
+        ),
+        row(
+            "a source listing no client at all, an access token",
+            &[],
+            "accessToken",
+            &through_unlisted.0,
+            true,
+        ),
+    ];
+
+    for Audience {
+        case,
+        listed,
+        member: token_member,
+        token,
+        accepted,
+    } in rows
+    {
+        let store = harness::store_with_validation_off(&router).await;
+        let listed_ids: Vec<&str> = listed.iter().map(String::as_str).collect();
+        identity_source(&router, &store, &pool, &listed_ids, Some(GROUP_TYPE)).await;
+        let permit = policy(&router, &store, group_permit(GROUP_TYPE, &pool)).await;
+
+        let mut tokens = serde_json::Map::new();
+        tokens.insert(token_member.to_string(), json!(token));
+        let body = request(&store, Value::Object(tokens));
+        let (status, answered) = harness::call(&router, "IsAuthorizedWithToken", &body).await;
+
+        if accepted {
+            assert_eq!(
+                (status, answered["decision"].as_str()),
+                (200, Some("ALLOW")),
+                "case {case:?}: a token from a client the source accepts decides, got {status} \
+                 with {answered}"
+            );
+            assert_eq!(
+                answered["determiningPolicies"][0]["policyId"].as_str(),
+                Some(permit.as_str()),
+                "case {case:?}: the group policy must be the determining one, got {answered}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected a 400 ValidationException, got {status} with {answered}"
+        );
+        let message = fault_message(&answered);
+        assert_eq!(
+            message, AUDIENCE_NOT_ACCEPTED,
+            "case {case:?}: expected exactly {AUDIENCE_NOT_ACCEPTED:?}, got {message:?}"
+        );
+        let whole = answered.to_string();
+        for client in [&first, &second, &unlisted] {
+            assert!(
+                !whole.contains(client.as_str()),
+                "case {case:?}: an audience refusal discloses no app client id, got {answered}"
+            );
+        }
+        let named: Vec<String> = answered["fieldList"]
+            .as_array()
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter_map(|field| field["path"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            named,
+            vec![format!("/{token_member}")],
+            "case {case:?}: expected fieldList to name the member the token arrived in, got \
+             {answered}"
+        );
     }
 }

@@ -251,6 +251,13 @@ pub enum TokenRefusal {
     /// clause saying what about it failed; the operation words the sentence those two make
     /// and answers the modelled `ValidationException`.
     NotVerified { kind: TokenKind, reason: String },
+    /// The token was issued to a client the identity source does not accept, so its
+    /// audience is none of the ones the policy store takes. The service answers ONE fixed
+    /// sentence for this ([`crate::ops::is_authorized_with_token`]), so the refusal
+    /// carries nothing read off the rejected token — not the claim it was read from and
+    /// not the value it held — only the member the token arrived in, which `fieldList`
+    /// names.
+    AudienceNotAccepted { kind: TokenKind },
     /// No identity source of this policy store names the issuer the token claims, so the
     /// call references an identity source the store does not hold. The request is well
     /// formed and what it names is MISSING, which is the modelled
@@ -339,7 +346,9 @@ pub fn verify<Eng: Send + Sync + 'static>(
             )));
         }
     }
-    check_audience(source, &read, kind).map_err(refuse)?;
+    if !audience_accepted(source, &read, kind) {
+        return Err(TokenRefusal::AudienceNotAccepted { kind });
+    }
     check_window(&read, now).map_err(refuse)?;
 
     let principal = principal_entity(source, &read, kind).map_err(refuse)?;
@@ -408,51 +417,41 @@ fn expected_token_use(source: &IdentitySource, kind: TokenKind) -> Option<&'stat
     }
 }
 
-/// Refuse a token issued to a client the identity source does not list.
+/// Whether the client a token was issued to is one the identity source accepts.
 ///
 /// A source names the clients whose tokens the policy store accepts — `clientIds` for an
-/// Amazon Cognito user pool, `clientIds`/`audiences` for the two arms of an OpenID Connect
-/// token selection — and a token names the client it was issued to: the `aud` claim of an
-/// ID token, the `client_id` claim of an access token. A source that lists none accepts
-/// any client of its issuer, which is what an empty list means on the wire.
-fn check_audience(
+/// Amazon Cognito user pool, and for the two arms of an OpenID Connect token selection the
+/// `audiences` / `clientIds` the model calls "the `aud` claim values that you want to
+/// accept" and "the ID token audience, or client ID, claim values that you want to accept"
+/// — and a token names the client it was issued to: the `aud` claim of an ID token, the
+/// `client_id` claim of an access token. All three configurations are therefore the one
+/// rule: the token's audience must be one the source lists. A source that lists none
+/// accepts any client of its issuer, which is what an empty list means on the wire.
+fn audience_accepted(
     source: &IdentitySource,
     read: &::service_common::jwt::CompactJws,
     kind: TokenKind,
-) -> Result<(), String> {
-    let (allowed, member): (&[String], &str) = match (&source.configuration, kind) {
-        (IdentitySourceConfiguration::CognitoUserPool(cognito), _) => {
-            (&cognito.client_ids, "clientIds")
-        }
-        (
-            IdentitySourceConfiguration::OpenIdConnect(OpenIdConnectSource {
-                token_selection: OpenIdConnectTokens::AccessToken { audiences, .. },
-                ..
-            }),
-            _,
-        ) => (audiences, "audiences"),
-        (
-            IdentitySourceConfiguration::OpenIdConnect(OpenIdConnectSource {
-                token_selection: OpenIdConnectTokens::IdentityToken { client_ids, .. },
-                ..
-            }),
-            _,
-        ) => (client_ids, "clientIds"),
+) -> bool {
+    let allowed: &[String] = match &source.configuration {
+        IdentitySourceConfiguration::CognitoUserPool(cognito) => &cognito.client_ids,
+        IdentitySourceConfiguration::OpenIdConnect(OpenIdConnectSource {
+            token_selection: OpenIdConnectTokens::AccessToken { audiences, .. },
+            ..
+        }) => audiences,
+        IdentitySourceConfiguration::OpenIdConnect(OpenIdConnectSource {
+            token_selection: OpenIdConnectTokens::IdentityToken { client_ids, .. },
+            ..
+        }) => client_ids,
     };
     if allowed.is_empty() {
-        return Ok(());
+        return true;
     }
     let claim = match kind {
         TokenKind::Access => CLIENT_ID_CLAIM,
         TokenKind::Identity => AUDIENCE_CLAIM,
     };
     let claimed = read.claim_str(claim).unwrap_or_default();
-    if allowed.iter().any(|allowed| allowed == claimed) {
-        return Ok(());
-    }
-    Err(format!(
-        "its {claim} claim {claimed:?} is not one of the {member} the identity source accepts"
-    ))
+    allowed.iter().any(|allowed| allowed == claimed)
 }
 
 /// Refuse a token the clock has run out on, or one that is not yet valid.

@@ -19,6 +19,10 @@
 //! A token the service cannot verify is refused with the modelled `ValidationException`,
 //! worded as the sentence AWS answers for it — `Failed to verify <member>: <reason>` —
 //! rather than being answered with a `DENY`, which would read as "evaluated and denied".
+//! A token whose AUDIENCE is none the identity source accepts is that same
+//! `ValidationException` worded as the one fixed sentence AWS answers for it
+//! ([`AUDIENCE_NOT_ACCEPTED`]), which reports neither the claim the audience was read from
+//! nor the value it held.
 //! A token whose ISSUER is no identity source of the store is the modelled
 //! `ResourceNotFoundException` instead: the call references an identity source the store
 //! does not hold. A signature this service cannot CHECK at all — an issuer whose key set
@@ -375,6 +379,13 @@ const TOKEN_REQUIRED: &str =
 const DIFFERENT_PRINCIPALS: &str =
     "the access token and the identity token name different principals";
 
+/// The refusal a presented token whose audience the identity source does not accept is
+/// answered with: ONE fixed sentence, whichever member the token arrived in and whichever
+/// of its configured audiences the source lists them as, so a client can tell an audience
+/// failure apart from every other validation failure by matching it. It has no variable
+/// part — in particular the rejected token's own audience is not reported back.
+const AUDIENCE_NOT_ACCEPTED: &str = "Token audience claim contains no valid audience";
+
 /// One offending request member as this operation's modelled `ValidationException`.
 fn invalid(invalid: crate::ops::InvalidInput) -> IsAuthorizedWithTokenError {
     invalid_members([invalid])
@@ -423,7 +434,8 @@ fn refused_by_cedar(refusal: crate::state::cedar::Refusal) -> IsAuthorizedWithTo
 /// refusal as a sentence naming the member and what failed — `Failed to verify
 /// IdentityToken: signature is invalid` — so the message is that sentence rather than this
 /// service's fixed `Invalid input`, while `fieldList` still names the member for a client
-/// that reads it.
+/// that reads it. An audience the identity source does not accept is the exception the
+/// service words as fixed text instead ([`AUDIENCE_NOT_ACCEPTED`]).
 ///
 /// A token whose issuer is no identity source of the store is the other kind of answer:
 /// nothing about the token is wrong, and what the call referenced — an identity source for
@@ -446,6 +458,20 @@ fn refused(
                 field_list: Some(vec![ValidationExceptionField {
                     path: kind.path().to_string(),
                     message: reason,
+                }]),
+            })
+            .into()
+        }
+        // The audience rule has its own fixed sentence, so this refusal is NOT composed
+        // from a reason about the token: the message is that sentence alone, and
+        // `fieldList` names the member the token arrived in without reporting anything the
+        // token claimed.
+        crate::state::token::TokenRefusal::AudienceNotAccepted { kind } => {
+            IsAuthorizedWithTokenErrorModeled::ValidationException(ValidationException {
+                message: AUDIENCE_NOT_ACCEPTED.to_string(),
+                field_list: Some(vec![ValidationExceptionField {
+                    path: kind.path().to_string(),
+                    message: AUDIENCE_NOT_ACCEPTED.to_string(),
                 }]),
             })
             .into()
