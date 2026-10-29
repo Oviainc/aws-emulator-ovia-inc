@@ -10,8 +10,9 @@
 //! highest priority in the environment variable hierarchy") and the fully
 //! resolved mounts (the task's, with this request's per-node overrides merged by
 //! mount name). `DescribePipelineExecution` reports that record. A retry carrying
-//! the `clientToken` of a start that already succeeded for this pipeline replays
-//! that execution's id rather than starting a second one.
+//! the `clientToken` of a start that already succeeded — the SAME request under
+//! that token — replays that execution's id rather than starting a second one,
+//! while a DIFFERENT request reusing the token is the modelled conflict.
 //!
 //! What this does NOT do is run anything: a compute node runs its task's
 //! container image, and this emulator has no container runtime, so the recorded
@@ -205,29 +206,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // "Defaults to 2 when not specified", so a start naming no priority runs
+        // at that priority: the resolved value is what the execution records and
+        // what the request is recognised by below, because a start that states
+        // the default explicitly asks for the very same run.
+        let priority = input
+            .execution_priority
+            .unwrap_or(crate::state::DEFAULT_EXECUTION_PRIORITY);
+
         // `clientToken` makes the start idempotent, as the member documents: a
         // retry with the same token "returns the cached result from the original
-        // successful request without performing the operation again" — so a token
-        // this pipeline has already started an execution with replays that
-        // execution's id rather than starting a second one.
-        let token_key = input
-            .client_token
-            .as_deref()
-            .map(|token| {
-                crate::state::execution_token_key(
-                    &input.workspace_name,
-                    &input.pipeline_name,
-                    token,
-                )
-            });
-        if let Some(started) = token_key
-            .as_ref()
-            .and_then(|key| store.pipeline_execution_tokens.get(key))
-            .filter(|id| store.pipeline_executions.contains_key(*id))
-        {
-            return Ok(StartPipelineExecutionOutput {
-                pipeline_execution_id: started.clone(),
-            });
+        // successful request without performing the operation again". A token
+        // identifies the CALL that spent it, so it is resolved through the
+        // registry every other idempotent write of this service uses, over the
+        // members that say which pipeline to run and HOW to run it: the SAME
+        // request under that token replays the execution that call queued and
+        // queues nothing, while a DIFFERENT request reusing it belongs to another
+        // call and is the modelled conflict rather than an answer telling the
+        // caller a run it never described was accepted. Decided BEFORE the
+        // request is resolved against the store, because the call a retry repeats
+        // was already served, whatever has changed since.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.workspace_name,
+                &input.pipeline_name,
+                &priority,
+                &crate::state::execution_environment_variables_fingerprint(
+                    input.execution_environment_variable_overrides.as_ref(),
+                ),
+                &crate::state::mount_overrides_fingerprint(input.execution_mount_overrides.as_ref()),
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // The retry queues nothing and replays the id the original call
+                // minted. One whose execution this store no longer holds leaves
+                // the retry nothing to answer from, so it is served as the fresh
+                // start it now is.
+                if store.pipeline_executions.contains_key(&replayed) {
+                    return Ok(StartPipelineExecutionOutput {
+                        pipeline_execution_id: replayed,
+                    });
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                // The conflict is with the execution the earlier call queued, so
+                // it names that execution and the ARN of the pipeline the
+                // execution belongs to — both read off the stored records, so the
+                // refusal can name nothing this store does not hold. One that is
+                // no longer held leaves nothing to name, so such a request is
+                // served as the start it is.
+                if let Some((execution_id, pipeline_arn)) =
+                    store.pipeline_executions.get(&spent_on).and_then(|queued| {
+                        store
+                            .pipelines
+                            .get(&crate::state::pipeline_key(
+                                &queued.workspace_name,
+                                &queued.pipeline_name,
+                            ))
+                            .map(|pipeline| (queued.id.clone(), pipeline.arn.clone()))
+                    })
+                {
+                    return Err(token_spent(execution_id, pipeline_arn));
+                }
+            }
+            crate::state::TokenVerdict::Serve => {}
         }
 
         // The resources the path names are resolved OUTSIDE IN, as this service's
@@ -343,9 +387,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             pipeline_name: pipeline.name.clone(),
             pipeline_version: pipeline.version_label(),
             run_state: crate::state::EXECUTION_STATE_NOT_STARTED.to_string(),
-            execution_priority: input
-                .execution_priority
-                .unwrap_or(crate::state::DEFAULT_EXECUTION_PRIORITY),
+            execution_priority: priority,
             request_environment_variables: overrides.unwrap_or_default(),
             request_mount_overrides: input.execution_mount_overrides.clone(),
             accepted_at: now,
@@ -356,18 +398,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cancel_requested_at: None,
             cancel_reason: None,
             compute_nodes,
-            client_token: input.client_token.clone(),
         };
 
-        if let Some(key) = token_key {
-            store.pipeline_execution_tokens.insert(key, id.clone());
-        }
         store.pipeline_executions.insert(id.clone(), record);
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &id,
+            now,
+        );
 
         Ok(StartPipelineExecutionOutput {
             pipeline_execution_id: id,
         })
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// start already spent: the conflict is with the execution that start queued, so
+/// `resourceId` names it, and `resourceArn` names the pipeline it belongs to,
+/// since an execution carries no ARN of its own — the pair
+/// `CancelPipelineExecution` reports a conflict over an execution with.
+fn token_spent(
+    pipeline_execution_id: String,
+    pipeline_arn: String,
+) -> StartPipelineExecutionError {
+    StartPipelineExecutionError::Modeled(
+        StartPipelineExecutionErrorModeled::ConflictingOperationException(
+            ConflictingOperationException {
+                message: crate::state::already_using_message("pipeline execution", "clientToken"),
+                resource_id: pipeline_execution_id,
+                resource_arn: pipeline_arn,
+            },
+        ),
+    )
 }
 
 /// HTTP 404 `ResourceNotFoundException` naming the resource kind the request

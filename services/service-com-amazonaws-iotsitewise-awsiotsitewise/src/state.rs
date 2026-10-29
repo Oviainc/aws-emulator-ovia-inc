@@ -1913,11 +1913,6 @@ pub struct PipelineExecutionRecord {
     /// The compute nodes, in the DAG order
     /// [`compute_node_execution_order`] put them in.
     pub compute_nodes: Vec<ComputeNodeExecutionRecord>,
-    /// The `clientToken` of the start that made this execution, if it carried
-    /// one, so a retry of that same start replays its answer rather than
-    /// starting a second execution; see
-    /// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::pipeline_execution_tokens`].
-    pub client_token: Option<String>,
 }
 
 impl PipelineExecutionRecord {
@@ -2008,16 +2003,6 @@ impl PipelineExecutionRecord {
         self.cancel_requested_at = Some(now);
         self.cancel_reason = reason;
     }
-}
-
-/// The key a started execution's `clientToken` is indexed under: the pipeline it
-/// started and the token itself.
-///
-/// Scoped to the pipeline because a token makes ONE call idempotent, and the
-/// token is last so the two names cannot be confused with it (both are modelled
-/// `^[a-zA-Z0-9_-]+$`, which admits no `/`).
-pub fn execution_token_key(workspace_name: &str, pipeline_name: &str, client_token: &str) -> String {
-    format!("{workspace_name}/{pipeline_name}/{client_token}")
 }
 
 /// The canonical ARN of a workspace in `region`.
@@ -4044,12 +4029,6 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// and the record names the workspace and pipeline it belongs to, so a read
     /// scoped to another pipeline resolves to nothing.
     pub pipeline_executions: HashMap<String, PipelineExecutionRecord>,
-    /// `clientToken` -> `pipelineExecutionId`, keyed by
-    /// [`execution_token_key`], so a retried `StartPipelineExecution` carrying
-    /// the token of an execution it already started replays that answer instead
-    /// of starting a second one. Written beside the execution itself, and
-    /// bounded by it: at most one entry per execution that carried a token.
-    pub pipeline_execution_tokens: HashMap<String, String>,
     /// The capture sources (video streams) of every workspace: the workspace
     /// they live in, then the source's own `timeSeriesId`, because a capture
     /// source is addressable only inside its workspace — nested so a lookup
@@ -5439,9 +5418,8 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     }
 
     /// Forget a pipeline and everything keyed off it: every version it holds and
-    /// its tags (both on the record), the executions recorded against it, and
-    /// the client-token entries those executions are indexed under — so no later
-    /// read resolves to a pipeline this service no longer holds.
+    /// its tags (both on the record) and the executions recorded against it — so
+    /// no later read resolves to a pipeline this service no longer holds.
     pub fn forget_pipeline(
         &mut self,
         workspace_name: &str,
@@ -5461,8 +5439,6 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .collect();
         self.pipeline_executions
             .retain(|id, _| !forgotten.contains(id));
-        self.pipeline_execution_tokens
-            .retain(|_, id| !forgotten.contains(id));
         Some(record)
     }
 
@@ -9381,6 +9357,55 @@ pub fn compute_nodes_fingerprint(nodes: &[ComputeNode]) -> String {
         })
         .collect::<Vec<String>>()
         .join(",")
+}
+
+/// A canonical rendering of the `executionEnvironmentVariableOverrides` a
+/// request carried, for the [`request_fingerprint`] of that request.
+///
+/// The global overrides go in through [`string_map_fingerprint`] and the
+/// per-compute-node ones as their node names SORTED, each node's own map through
+/// that same helper: both members are maps, which have no order of their own, so
+/// a retry of one call has to render identically to it whatever order either
+/// request's maps happen to iterate in.
+///
+/// A `computeNodes` map the request omitted renders like one it sent empty,
+/// because both override no node at all and so ask for the same run.
+pub fn execution_environment_variables_fingerprint(
+    overrides: Option<&ExecutionEnvironmentVariables>,
+) -> String {
+    match overrides {
+        None => FINGERPRINT_ABSENT.to_string(),
+        Some(given) => {
+            let mut nodes: Vec<(&String, String)> = given
+                .compute_nodes
+                .iter()
+                .flatten()
+                .map(|(node, variables)| (node, string_map_fingerprint(Some(variables))))
+                .collect();
+            nodes.sort_by_key(|(node, _)| *node);
+            format!(
+                "{}/{nodes:?}",
+                string_map_fingerprint(given.global.as_ref())
+            )
+        }
+    }
+}
+
+/// A canonical rendering of the `executionMountOverrides` a request carried, for
+/// the [`request_fingerprint`] of that request.
+///
+/// The compute nodes it names go in SORTED, because it addresses them through a
+/// map; each node's own overrides keep the ORDER the request stated them in,
+/// because a list is ordered and two orderings are two requests.
+pub fn mount_overrides_fingerprint(overrides: Option<&MountOverrides>) -> String {
+    match overrides {
+        None => FINGERPRINT_ABSENT.to_string(),
+        Some(given) => {
+            let mut nodes: Vec<(&String, &Vec<Mount>)> = given.compute_nodes.iter().collect();
+            nodes.sort_by_key(|(node, _)| *node);
+            format!("{nodes:?}")
+        }
+    }
 }
 
 /// A canonical rendering of a `taskConfiguration` a request carried, for the

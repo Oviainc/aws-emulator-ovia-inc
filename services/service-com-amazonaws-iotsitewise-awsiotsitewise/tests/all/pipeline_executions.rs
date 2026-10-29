@@ -132,7 +132,10 @@ fn map_of(pairs: &[(&str, &str)]) -> Value {
 }
 
 /// A `Mount` naming an S3 access point, in the modelled shape.
-fn mount(name: &str, relative_path: &str) -> Value {
+///
+/// `pub(crate)` because the sibling `pipeline_execution_client_token` suite sends
+/// the same mount overrides: one definition of them, so the two cannot drift.
+pub(crate) fn mount(name: &str, relative_path: &str) -> Value {
     json!({
         "name": name,
         "relativePath": relative_path,
