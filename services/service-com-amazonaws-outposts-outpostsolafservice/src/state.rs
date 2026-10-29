@@ -1229,6 +1229,19 @@ impl QuoteRecord {
             .and_then(outpost_id_in_arn)
     }
 
+    /// Whether an order has ALREADY been submitted from this quote.
+    ///
+    /// An order is submitted from a quote once, and that submit is what moves the
+    /// quote to [`QUOTE_STATUS_ORDER_SUBMITTED`] — "An order has been submitted for
+    /// the quote" — and names the order it minted in the quote's `SubmittedOrderId`.
+    /// One accessor, so every caller that has to say whether a quote is a RECORD of an
+    /// order — the second record this store keeps of an order outstanding on an
+    /// Outpost, and the update that may not rewrite what such an order was submitted
+    /// under — reads the same value.
+    pub fn records_submitted_order(&self) -> bool {
+        self.quote.quote_status.as_deref() == Some(QUOTE_STATUS_ORDER_SUBMITTED)
+    }
+
     /// Whether `quote_option_identifier` is one of the configuration-and-pricing
     /// options THIS quote offers.
     ///
@@ -4301,7 +4314,7 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     ) -> Option<&QuoteRecord> {
         all_in_region(&self.quotes, region).find(|record| {
             if record.associated_outpost_id() != Some(outpost_id)
-                || record.quote.quote_status.as_deref() != Some(QUOTE_STATUS_ORDER_SUBMITTED)
+                || !record.records_submitted_order()
             {
                 return false;
             }
@@ -5908,6 +5921,29 @@ pub fn quote_outpost_report() -> String {
     validation_report(&[clause(
         QUOTE_IDENTIFIER_MEMBER,
         "the quote must be associated with the Outpost the order is placed on",
+    )])
+}
+
+/// The report an update that would rewrite what an order was submitted under states.
+///
+/// A quote an order has already been submitted from
+/// ([`QuoteRecord::records_submitted_order`]) is this service's record of that order:
+/// the order names the option of that quote it was submitted against
+/// ([`QuoteRecord::offers_option`]), and the quote's Outpost association is what made
+/// it an order OF an Outpost — the second record this store keeps of an order
+/// outstanding on one
+/// ([`ComAmazonawsOutpostsOutpostsolafserviceState::quote_ordered_from_on_outpost`]).
+/// Re-pricing such a quote, or moving its association, would leave the order naming an
+/// option no quote offers and this store's second record of it on an Outpost it was
+/// never placed on, so the update is refused with nothing written. The operation models
+/// no `ConflictException`, so what the refusal states is the bad request the modelled
+/// `ValidationException` (HTTP 400) is for. AWS publishes no wording for it, so the
+/// sentence is the emulator's own, worded by the same rule as every other constraint
+/// this service reports — the member and the requirement, never the value.
+pub fn quote_submitted_order_report() -> String {
+    validation_report(&[clause(
+        QUOTE_IDENTIFIER_MEMBER,
+        "the quote must not have an order submitted from it",
     )])
 }
 

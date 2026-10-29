@@ -18,6 +18,14 @@
 //! same two rules `CreateQuote` derives them by. An update that touches neither
 //! leaves both exactly as they stand.
 //!
+//! Which is also why a quote an order has ALREADY been submitted from takes no such
+//! update: that quote is this service's record of the order, so re-deriving what the
+//! order was submitted under is refused (400 `ValidationException`) rather than
+//! leaving the order naming an option the quote no longer offers, or this store's
+//! second record of it on an Outpost it was never placed on. An update that re-derives
+//! nothing — a description, the physical constraints — is applied to such a quote like
+//! any other.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -232,8 +240,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_quotes();
         // The quote this request names is what a refusal is about, so it is resolved
         // before the Outpost the request may also name.
-        if store.quote(&region, &quote_id).is_none() {
+        let Some(record) = store.quote(&region, &quote_id) else {
             return Err(quote_not_found(&input.quote_identifier));
+        };
+
+        // What a quote's DERIVED members follow from: its options are priced on the
+        // configuration it asks for, and its requirements are checked against the
+        // country it is for and the Outpost it names. An update that replaces one of
+        // those re-derives what follows from it; one that names neither leaves both
+        // as they stand. Read off the request before its members are applied below.
+        let reprice = input.requested_capacities.is_some()
+            || input.requested_payment_options.is_some()
+            || input.requested_payment_terms.is_some();
+        let recheck = input.country_code.is_some() || input.outpost_identifier.is_some();
+
+        // A quote an order has already been submitted from is this store's record of
+        // that order: the order names an option OF this quote, and this quote's Outpost
+        // association is the second record the store keeps of that order being
+        // outstanding on an Outpost. So what an update of such a quote may not do is
+        // re-derive what the order was submitted under — exactly what re-pricing it or
+        // moving its association does — and the request asking for it is refused with
+        // nothing written, the way the expiry of such a quote and a second order from
+        // it are refused. An update that re-derives nothing is applied as it is to any
+        // other quote.
+        //
+        // The quote's own state is what this refusal is about, so it is stated before
+        // the Outpost the request may also name is resolved — the same order the
+        // not-found above states: on such a quote, an `OutpostIdentifier` that names no
+        // Outpost of this region is refused for the quote rather than reported absent.
+        if record.records_submitted_order() && (reprice || recheck) {
+            return Err(
+                UpdateQuoteErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::quote_submitted_order_report()),
+                })
+                .into(),
+            );
         }
 
         // The association the request asks for, resolved while the store is only
@@ -285,17 +326,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Association::Set(outpost_arn)
             }
         };
-
-        // What a quote's DERIVED members follow from: its options are priced on the
-        // configuration it asks for, and its requirements are checked against the
-        // country it is for and the Outpost it names. An update that replaces one of
-        // those re-derives what follows from it; one that names neither leaves both
-        // as they stand. Read off the request before its members are applied below.
-        let reprice = input.requested_capacities.is_some()
-            || input.requested_payment_options.is_some()
-            || input.requested_payment_terms.is_some();
-        let recheck =
-            input.country_code.is_some() || !matches!(association, Association::Unchanged);
 
         // The same quote, now borrowed to change. It was resolved above under this
         // same lock, which has not been released, so the fallback is unreachable by

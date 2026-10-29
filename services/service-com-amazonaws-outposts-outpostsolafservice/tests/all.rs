@@ -99,6 +99,8 @@ mod quote_options;
 mod quote_store_bound;
 #[path = "all/quote_update.rs"]
 mod quote_update;
+#[path = "all/quote_update_after_order.rs"]
+mod quote_update_after_order;
 #[path = "all/regional_scope.rs"]
 mod regional_scope;
 #[path = "all/renewal_contract.rs"]
