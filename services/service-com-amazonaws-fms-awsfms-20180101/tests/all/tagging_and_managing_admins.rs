@@ -27,6 +27,7 @@
 //! association is asserted by the sibling `tagging_administrator_gate` suite.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_fms_awsfms_20180101::state;
 
 use crate::administrator_gated_operations::associate_admin;
 use crate::policy_lifecycle::{call, call_in, emulator, error_code, ACCOUNT, REGION};
@@ -629,10 +630,11 @@ async fn list_admins_managing_account_reports_the_administrator_or_is_not_found(
             );
         }
 
-        // A token this service minted for this page class resumes the
-        // enumeration; anything else names no boundary and is the modelled
+        // A token this service minted for THIS page resumes the enumeration;
+        // anything else — including the bare account id, which is no stamped
+        // boundary of any page — names no boundary and is the modelled
         // `InvalidInputException`.
-        let own_token = hex::encode(account);
+        let own_token = state::encode_account_page_token(state::ADMINS_MANAGING_ACCOUNT_PAGE, account);
         let (status, body) = call(
             &router,
             "ListAdminsManagingAccount",
@@ -658,6 +660,18 @@ async fn list_admins_managing_account_reports_the_administrator_or_is_not_found(
             (
                 "a token minted for a policy page",
                 hex::encode("0f13c2a4-1111-4a26-9d0e-6b4f8d2a7c31"),
+            ),
+            ("the bare account id, carrying no page", hex::encode(account)),
+            (
+                "a token minted for the organisation-roster page",
+                state::encode_account_page_token(state::MEMBER_ACCOUNTS_PAGE, account),
+            ),
+            (
+                "a token minted for the organisation-administrators page",
+                state::encode_account_page_token(
+                    state::ADMIN_ACCOUNTS_FOR_ORGANIZATION_PAGE,
+                    account,
+                ),
             ),
         ];
         for (case, token) in foreign {

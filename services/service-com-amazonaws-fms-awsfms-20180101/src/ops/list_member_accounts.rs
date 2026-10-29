@@ -171,11 +171,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // signed for, which is the Region whose association was looked for.
         crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
 
-        // A token this service did not mint names no page boundary. The model
-        // declares no client-input error for ListMemberAccounts, so refuse it as a
-        // bad request rather than inventing a page.
+        // A token this service did not mint, or one minted for ANOTHER
+        // account-keyed collection of this service, names no boundary in the
+        // organisation's roster: those collections are different sets, so a
+        // boundary of theirs may sort past accounts this page holds. The
+        // boundary therefore carries the collection it was minted for
+        // ([`crate::state::encode_account_page_token`]). The model declares no
+        // client-input error for ListMemberAccounts, so refuse a token naming
+        // no boundary of this page as a bad request rather than inventing a
+        // page.
         let start = match input.next_token.as_deref() {
-            Some(token) => match crate::state::decode_account_page_token(token) {
+            Some(token) => match crate::state::decode_account_page_token(
+                crate::state::MEMBER_ACCOUNTS_PAGE,
+                token,
+            ) {
                 Some(start) => Some(start),
                 None => {
                     return Err(crate::scaffolded::Scaffolded::validation(
@@ -200,9 +209,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let member_accounts: Vec<String> = remaining.by_ref().take(page_size).cloned().collect();
         // A token only when an account is left AFTER this page, so the last page
         // carries none.
-        let next_token = remaining
-            .next()
-            .map(|account_id| crate::state::encode_page_token(account_id));
+        let next_token = remaining.next().map(|account_id| {
+            crate::state::encode_account_page_token(
+                crate::state::MEMBER_ACCOUNTS_PAGE,
+                account_id,
+            )
+        });
 
         Ok(ListMemberAccountsOutput {
             member_accounts: Some(member_accounts),

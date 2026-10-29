@@ -20,13 +20,15 @@
 //! * the page is ordered by account id and bounded by `MaxResults`, so walking
 //!   the `NextToken` chain reports every administrator exactly once whatever the
 //!   page size, and the last page carries no token;
-//! * a `NextToken` this service did not mint names no page boundary and is
-//!   refused, while one it did resumes the enumeration at that account;
+//! * a `NextToken` this service did not mint for THIS listing — including one
+//!   it minted for another account-keyed listing — names no page boundary and
+//!   is refused, while one it did mint resumes the enumeration at that account;
 //! * the call is organisation-scoped, so with no administrator association it is
 //!   refused before it reports anything.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_fms_awsfms_20180101::ops::types::ORGANIZATION_STATUS_VALUES;
+use service_com_amazonaws_fms_awsfms_20180101::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::admin_account_disassociation::wait_out_the_disassociation;
@@ -183,6 +185,14 @@ fn expected(default_admin: &str, onboarded: &[&str], onboarded_status: &str) -> 
     rows
 }
 
+/// A `NextToken` this page minted, naming `account` as the boundary the next
+/// page starts at. A boundary carries the collection it belongs to, so this is
+/// how a client's token is formed for THIS listing and not for another
+/// account-keyed one.
+fn own_token(account: &str) -> String {
+    state::encode_account_page_token(state::ADMIN_ACCOUNTS_FOR_ORGANIZATION_PAGE, account)
+}
+
 /// With no administrator association the call is organisation-scoped and
 /// refused — in either Region, and whatever page parameters it carries — so it
 /// reports nothing about the organization.
@@ -191,10 +201,7 @@ async fn with_no_administrator_association_the_enumeration_is_refused() {
     let requests = [
         ("no members at all", json!({})),
         ("a page bound", json!({ "MaxResults": 1 })),
-        (
-            "a token",
-            json!({ "NextToken": hex::encode(ADMIN_ACCOUNTS[0]) }),
-        ),
+        ("a token", json!({ "NextToken": own_token(ADMIN_ACCOUNTS[0]) })),
     ];
 
     for region in [REGION, OTHER_REGION] {
@@ -420,7 +427,7 @@ async fn a_next_token_resumes_the_page_only_when_this_service_minted_it() {
     for (index, (account, _, _)) in whole.iter().enumerate() {
         let (status, code, reported, _) = list_admins(
             &router,
-            &json!({ "NextToken": hex::encode(account) }),
+            &json!({ "NextToken": own_token(account) }),
             REGION,
         )
         .await;
@@ -450,6 +457,18 @@ async fn a_next_token_resumes_the_page_only_when_this_service_minted_it() {
             hex::encode("0123456789AbCdEfGhIjKl"),
         ),
         ("hex of an empty key", hex::encode("")),
+        (
+            "the bare account id of its own boundary, carrying no page",
+            hex::encode(&whole[0].0),
+        ),
+        (
+            "a token minted for the organisation-roster page",
+            state::encode_account_page_token(state::MEMBER_ACCOUNTS_PAGE, &whole[0].0),
+        ),
+        (
+            "a token minted for the managing-administrators page",
+            state::encode_account_page_token(state::ADMINS_MANAGING_ACCOUNT_PAGE, &whole[0].0),
+        ),
     ];
     for (case, token) in foreign {
         let (status, code, reported, next) = list_admins(

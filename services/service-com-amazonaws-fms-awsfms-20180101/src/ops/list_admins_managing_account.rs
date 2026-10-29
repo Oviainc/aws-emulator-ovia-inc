@@ -157,11 +157,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A token this service did not mint names no page boundary, so the
-        // request's parameters are invalid — the modelled `InvalidInputException`
-        // — rather than a page being invented for it.
+        // A token this service did not mint, or one minted for ANOTHER
+        // account-keyed collection of this service, names no boundary in the
+        // administrators that manage the caller: those collections are
+        // different sets, so a boundary of theirs may sort past administrators
+        // this page holds. The boundary therefore carries the collection it was
+        // minted for ([`crate::state::encode_account_page_token`]), and a token
+        // naming no boundary of this page makes the request's parameters
+        // invalid — the modelled `InvalidInputException` — rather than a page
+        // being invented for it.
         let start = match input.next_token.as_deref() {
-            Some(token) => match crate::state::decode_account_page_token(token) {
+            Some(token) => match crate::state::decode_account_page_token(
+                crate::state::ADMINS_MANAGING_ACCOUNT_PAGE,
+                token,
+            ) {
                 Some(start) => Some(start),
                 None => {
                     return Err(ListAdminsManagingAccountErrorModeled::InvalidInputException(
@@ -217,9 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         // A token only when an account is left AFTER this page, so the last page
         // carries none.
-        let next_token = remaining
-            .get(page_size)
-            .map(|account| crate::state::encode_page_token(account));
+        let next_token = remaining.get(page_size).map(|account| {
+            crate::state::encode_account_page_token(
+                crate::state::ADMINS_MANAGING_ACCOUNT_PAGE,
+                account,
+            )
+        });
 
         Ok(ListAdminsManagingAccountOutput {
             admin_accounts: Some(admin_accounts),

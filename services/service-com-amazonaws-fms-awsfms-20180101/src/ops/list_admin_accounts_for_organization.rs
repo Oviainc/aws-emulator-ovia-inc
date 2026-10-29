@@ -180,11 +180,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot learn anything about what the organization holds.
         crate::state::require_administrator_at(&store, &region, now)?;
 
-        // A token this service did not mint names no page boundary. The model
-        // declares no client-input error for this operation, so refuse it as a
-        // bad request rather than inventing a page for it.
+        // A token this service did not mint, or one minted for ANOTHER
+        // account-keyed collection of this service, names no boundary in the
+        // organization's administrators: those collections are different sets,
+        // so a boundary of theirs may sort past administrators this page
+        // holds. The boundary therefore carries
+        // the collection it was minted for
+        // ([`crate::state::encode_account_page_token`]). The model declares no
+        // client-input error for this operation, so refuse a token naming no
+        // boundary of this page as a bad request rather than inventing a page
+        // for it.
         let start = match input.next_token.as_deref() {
-            Some(token) => match crate::state::decode_account_page_token(token) {
+            Some(token) => match crate::state::decode_account_page_token(
+                crate::state::ADMIN_ACCOUNTS_FOR_ORGANIZATION_PAGE,
+                token,
+            ) {
                 Some(start) => Some(start),
                 None => {
                     return Err(crate::scaffolded::Scaffolded::validation(
@@ -226,9 +236,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         // A token only when an administrator is left AFTER this page, so the
         // last page carries none.
-        let next_token = remaining
-            .next()
-            .map(|(account, _)| crate::state::encode_page_token(account));
+        let next_token = remaining.next().map(|(account, _)| {
+            crate::state::encode_account_page_token(
+                crate::state::ADMIN_ACCOUNTS_FOR_ORGANIZATION_PAGE,
+                account,
+            )
+        });
 
         Ok(ListAdminAccountsForOrganizationOutput {
             admin_accounts: Some(admin_accounts),

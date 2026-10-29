@@ -3319,9 +3319,11 @@ pub fn page_size(max_results: Option<i32>) -> usize {
 }
 
 /// Encode a page boundary (the key the next page starts at — a `PolicyId` for
-/// `ListPolicies`, an account id for `ListMemberAccounts` and
-/// `ListAdminsManagingAccount`) as an opaque
-/// `PaginationToken`.
+/// `ListPolicies`) as an opaque `PaginationToken`.
+///
+/// For a page whose key class more than ONE listing of this service uses, the
+/// boundary carries the collection it belongs to beside the key
+/// ([`encode_scoped_page_token`], [`encode_account_page_token`]) instead.
 ///
 /// Hex keeps the token inside the modelled `PaginationToken` pattern
 /// (`^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`) and its 1..4096 length, and makes it
@@ -3410,19 +3412,57 @@ pub fn decode_uri_page_token(token: &str) -> Option<String> {
     parse_arn(&decoded).is_some().then_some(decoded)
 }
 
-/// Decode an account-keyed `PaginationToken` produced by
-/// [`encode_page_token`]. `None` when the token was not produced by this
-/// service.
+/// The page scope [`encode_account_page_token`] stamps a
+/// `ListAdminAccountsForOrganization` boundary with: the collection that
+/// listing enumerates is the organisation's administrators
+/// ([`ComAmazonawsFmsAwsfms20180101State::admin_account_summaries`]).
+pub const ADMIN_ACCOUNTS_FOR_ORGANIZATION_PAGE: &str = "ListAdminAccountsForOrganization";
+
+/// The page scope [`encode_account_page_token`] stamps a `ListMemberAccounts`
+/// boundary with: the collection that listing enumerates is every account the
+/// organisation holds
+/// ([`ComAmazonawsFmsAwsfms20180101State::member_accounts`]), a strict superset
+/// of the administrators.
+pub const MEMBER_ACCOUNTS_PAGE: &str = "ListMemberAccounts";
+
+/// The page scope [`encode_account_page_token`] stamps a
+/// `ListAdminsManagingAccount` boundary with: the collection that listing
+/// enumerates is the administrators that manage the caller
+/// ([`ComAmazonawsFmsAwsfms20180101State::managing_admin_accounts`]).
+pub const ADMINS_MANAGING_ACCOUNT_PAGE: &str = "ListAdminsManagingAccount";
+
+/// Encode an account-keyed page boundary of the collection `scope` names as an
+/// opaque `PaginationToken`.
 ///
-/// The token-to-key step is [`decode_key_token`]'s, like every other
+/// Three listings of this service page an account-keyed collection, and those
+/// collections are different sets, so an account id alone names no page: the
+/// same id may be absent from another collection, or sort after entries that
+/// collection does hold, and resuming from it there would silently drop them.
+/// Carrying the collection beside the key is what lets
+/// [`decode_account_page_token`] tell a boundary of THIS collection from one of
+/// another — the same discipline the listings whose store key already begins
+/// with the collection it belongs to apply to that key's prefix
+/// ([`shield_attack_key_prefix`], [`third_party_firewall_policy_key_prefix`]).
+pub fn encode_account_page_token(scope: &str, account_id: &str) -> String {
+    encode_scoped_page_token(scope, account_id)
+}
+
+/// Decode an account-keyed `PaginationToken` produced by
+/// [`encode_account_page_token`] for the collection `scope` names, yielding the
+/// account id the next page starts at. `None` when the token was not produced
+/// by this service, or was produced for ANOTHER collection: either way it names
+/// no boundary of this page.
+///
+/// The token-to-key step is [`decode_scoped_page_token`]'s, like every other
 /// specialised decoder here, so this module expresses that rule once; this one
 /// adds only its own shape check.
 ///
-/// The decoded value must still be an `AWSAccountId` ([`is_account_id`]), so a
-/// token minted for a policy page — or any foreign token that happens to be
-/// valid hex — is refused rather than resumed from as an arbitrary key.
-pub fn decode_account_page_token(token: &str) -> Option<String> {
-    let decoded = decode_key_token(token)?;
+/// The decoded boundary must still be an `AWSAccountId` ([`is_account_id`]), so
+/// a token minted for a page of another key class — or any foreign token that
+/// happens to be valid hex — is refused rather than resumed from as an
+/// arbitrary key.
+pub fn decode_account_page_token(scope: &str, token: &str) -> Option<String> {
+    let decoded = decode_scoped_page_token(scope, token)?;
     is_account_id(&decoded).then_some(decoded)
 }
 
@@ -3434,14 +3474,16 @@ fn scoped_page_key(scope: &str, key: &str) -> String {
     format!("{scope}#{key}")
 }
 
-/// Encode a page boundary of a listing whose page set is SELECTED by a request
-/// member — the accounts one policy applies to, the members of one resource set,
-/// the lists of one namespace — as an opaque `PaginationToken` carrying the
-/// selecting value beside the boundary.
+/// Encode a page boundary of a listing whose page set is one of SEVERAL this
+/// service pages by the same key class — the collection a request member
+/// SELECTS (the accounts one policy applies to, the members of one resource set,
+/// the lists of one namespace), or the collection ONE listing of a shared key
+/// class enumerates ([`encode_account_page_token`]) — as an opaque
+/// `PaginationToken` carrying the collection beside the boundary.
 ///
-/// A boundary of such a page names nothing in another selection: the key may be
-/// absent there, or sort after items that selection does hold, so resuming from
-/// it would silently drop them. Carrying the selecting value is what lets
+/// A boundary of such a page names nothing in another collection: the key may be
+/// absent there, or sort after items that collection does hold, so resuming from
+/// it would silently drop them. Carrying the collection is what lets
 /// [`decode_scoped_page_token`] tell a token minted for THIS page from one
 /// minted for another — the same check the listings whose store key already
 /// begins with the selecting member make against that key's prefix
@@ -3455,14 +3497,14 @@ pub fn encode_scoped_page_token(scope: &str, key: &str) -> String {
 }
 
 /// Decode a `PaginationToken` produced by [`encode_scoped_page_token`] for the
-/// page `scope` selects, yielding the boundary inside it. `None` when the token
-/// was not produced by this service, or was produced for ANOTHER selection:
+/// page `scope` names, yielding the boundary inside it. `None` when the token
+/// was not produced by this service, or was produced for ANOTHER collection:
 /// either way it names no boundary of this page, so the caller refuses it
 /// instead of resuming from an arbitrary key.
 ///
 /// The token-to-key step is [`decode_key_token`]'s, like every other specialised
 /// decoder here, so this module expresses that rule once; this one adds only the
-/// selecting-value check and leaves the boundary's own shape to the page class
+/// collection check and leaves the boundary's own shape to the page class
 /// that asked ([`is_account_id`] for an account-keyed page, [`parse_arn`] for a
 /// URI-keyed one, [`is_minted_identifier`] for one keyed by a minted id).
 pub fn decode_scoped_page_token(scope: &str, token: &str) -> Option<String> {

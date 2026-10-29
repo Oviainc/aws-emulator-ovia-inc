@@ -4,14 +4,18 @@
 //! operation of this service shares.
 //!
 //! The rule: a `NextToken` names a page boundary exactly when it is the hex
-//! encoding of a UTF-8 store key of that page class's own shape; any other value
+//! encoding of a UTF-8 store key of that page class's own shape, stamped with
+//! the collection it belongs to where more than one listing pages that key
+//! class; any other value
 //! names no boundary, so the request is refused rather than answered with an
 //! invented page, and a refusal reports nothing and changes nothing.
 //!
 //! The decode step itself (`crate::state::decode_key_token`) is one helper every
 //! specialised decoder delegates to, and each page class adds only its own shape
 //! check on the decoded key — an `AWSAccountId` for the account-keyed pages, a
-//! 36-character minted identifier for the policy-keyed ones. This suite drives
+//! 36-character minted identifier for the policy-keyed ones — plus, for a page
+//! class SEVERAL listings of this service serve, the collection the boundary
+//! belongs to. This suite drives
 //! that shared path end-to-end through an operation of EACH class, so the two
 //! kinds of page cannot come to disagree about what a token of this service is:
 //!
@@ -30,6 +34,7 @@
 //! are about the WIRE response.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_fms_awsfms_20180101::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::admin_account_scopes::{full_admin_scope, put_admin_account, wait_out_the_onboarding};
@@ -61,13 +66,17 @@ const ACCOUNT_SHAPED_KEY: &str = "000000000000";
 /// One paginated page class: the operation that serves it, the output member
 /// carrying its items, the member of an item that is the store key the page is
 /// ordered by (`None` when the item IS that key), the modelled error code the
-/// operation refuses a token it did not mint with, and a key of another class.
+/// operation refuses a token it did not mint with, a key of another class, and
+/// how this class FORMS the token naming a boundary of its own page — the bare
+/// key for a page class only one listing serves, and the key stamped with the
+/// collection it belongs to for one several listings share.
 struct PageClass {
     operation: &'static str,
     items: &'static str,
     key_member: Option<&'static str>,
     refusal: &'static str,
     foreign_key: &'static str,
+    token: fn(&str) -> String,
 }
 
 /// The page classes the shared decode rule is asserted over: one account-keyed
@@ -81,6 +90,9 @@ fn page_classes() -> Vec<PageClass> {
             key_member: None,
             refusal: "InvalidInputException",
             foreign_key: POLICY_SHAPED_KEY,
+            token: |key| {
+                state::encode_account_page_token(state::ADMINS_MANAGING_ACCOUNT_PAGE, key)
+            },
         },
         PageClass {
             operation: "ListMemberAccounts",
@@ -88,6 +100,7 @@ fn page_classes() -> Vec<PageClass> {
             key_member: None,
             refusal: "ValidationException",
             foreign_key: POLICY_SHAPED_KEY,
+            token: |key| state::encode_account_page_token(state::MEMBER_ACCOUNTS_PAGE, key),
         },
         PageClass {
             operation: "ListPolicies",
@@ -95,6 +108,7 @@ fn page_classes() -> Vec<PageClass> {
             key_member: Some("PolicyId"),
             refusal: "ValidationException",
             foreign_key: ACCOUNT_SHAPED_KEY,
+            token: state::encode_page_token,
         },
     ]
 }
@@ -210,7 +224,7 @@ async fn a_token_is_a_boundary_exactly_when_it_is_the_hex_of_a_key_of_that_page_
         let whole = whole_page(&router, &class).await;
 
         for (index, key) in whole.iter().enumerate() {
-            let token = hex::encode(key);
+            let token = (class.token)(key);
             let (status, code, resumed, _) =
                 page(&router, &class, &json!({ "NextToken": token })).await;
             assert_eq!(
@@ -233,11 +247,11 @@ async fn a_token_is_a_boundary_exactly_when_it_is_the_hex_of_a_key_of_that_page_
             ("hex of bytes that are not UTF-8", "ff".to_string()),
             (
                 "hex of one of its own keys carrying a control character",
-                hex::encode(format!("{}\u{1}", whole[0])),
+                (class.token)(&format!("{}\u{1}", whole[0])),
             ),
             (
-                "hex of a key of another page class",
-                hex::encode(class.foreign_key),
+                "a token of this page naming a key of another page class",
+                (class.token)(class.foreign_key),
             ),
         ];
         for (case, token) in refused {

@@ -21,6 +21,12 @@
 #[path = "all/third_party_firewall_firewall_policies.rs"]
 mod third_party_firewall_firewall_policies;
 
+// Declared here too, outside the sorted list below, for the reason stated above:
+// inserting a `mod` into that list collides with every other fms suite landing
+// in the same window. The suite itself is an ordinary `tests/all/<name>.rs` file.
+#[path = "all/account_page_token_scoping.rs"]
+mod account_page_token_scoping;
+
 // Declared beside it, for the same reason: this suite's name sorts right into
 // the contended region of the list below. The suite itself is an ordinary
 // `tests/all/<name>.rs` file.
