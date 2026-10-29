@@ -21,11 +21,11 @@
 //!
 //! The data is seeded through the store's own writers (`crate::state::GraphData`), which
 //! is where the data plane writes: the operation that writes a graph's data over the wire
-//! (`ExecuteQuery`) is still scaffolded and has its own issue. `ListGraphSnapshots` is a
-//! scaffold stub too, so the id of a snapshot a call minted is read out of the store
-//! (which is also what proves exactly one was minted); every assertion about that
-//! snapshot then goes over the wire through `GetGraphSnapshot`, and what it captured of
-//! the graph is read back through `RestoreGraphFromSnapshot`.
+//! (`ExecuteQuery`) is still scaffolded and has its own issue. The id of a snapshot a
+//! call minted is read out of the store, which is what proves exactly one was minted;
+//! every assertion about that snapshot then goes over the wire through
+//! `GetGraphSnapshot`, and what it captured of the graph is read back through
+//! `RestoreGraphFromSnapshot`.
 
 use std::sync::Arc;
 use std::time::Instant;

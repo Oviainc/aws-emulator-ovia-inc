@@ -85,6 +85,8 @@ mod query_cancellation;
 mod query_listing;
 #[path = "all/query_status_reporting.rs"]
 mod query_status_reporting;
+#[path = "all/records_outlive_their_graph.rs"]
+mod records_outlive_their_graph;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
 #[path = "all/resource_tagging.rs"]

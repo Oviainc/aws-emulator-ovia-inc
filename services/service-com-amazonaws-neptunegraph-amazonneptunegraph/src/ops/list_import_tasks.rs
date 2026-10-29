@@ -187,18 +187,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_all(now);
 
         // `graphIdentifier` is optional: absent, the listing spans every import task of
-        // the Region; present, it has to name a graph of this Region, because a listing
-        // of the import tasks of a graph that does not exist is a failed lookup rather
-        // than an empty page.
+        // the Region; present, it narrows the listing to the tasks that loaded into that
+        // one graph. A task is read by its own id and keeps the id of the graph it
+        // loaded into, so it stays listed under that graph after the graph itself is
+        // reclaimed: the identifier is resolved against everything the Region still
+        // holds under it (`crate::state::listable_graph_id`), and only an identifier it
+        // holds nothing under is the failed lookup this listing reports rather than an
+        // empty page.
         let of_graph = match input.graph_identifier.as_deref() {
             Some(identifier) => {
-                let Some(graph) = store.settled_graph(identifier, &region, now) else {
+                let Some(graph_id) = store.listable_graph_id(identifier, &region, now) else {
                     return Err(ListImportTasksErrorModeled::ResourceNotFoundException(
                         crate::state::graph_not_found(identifier),
                     )
                     .into());
                 };
-                Some(graph.id.clone())
+                Some(graph_id)
             }
             None => None,
         };

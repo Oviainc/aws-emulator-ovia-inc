@@ -1879,6 +1879,50 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         Some(graph)
     }
 
+    /// The graph id a PER-GRAPH LISTING of records that outlive their graph resolves
+    /// `identifier` to IN `region`, or `None` when this Region holds nothing under it.
+    ///
+    /// A listing of the records TAKEN FROM a graph is not a read OF that graph. A
+    /// snapshot, an import task and an export task each store a COPY of their graph's
+    /// id ([`Snapshot::source_graph_id`], [`ImportTask::graph_id`],
+    /// [`ExportTask::source_graph_id`]) precisely so the record — and the provenance it
+    /// reports — survives the graph, and [`Self::remove_graph`] reclaims none of them.
+    /// So the identifier is resolved against everything this Region still holds under
+    /// it: the graph record while it exists, and once that record is reclaimed the
+    /// retained records whose provenance names it. Only an identifier that resolves to
+    /// neither names no resource at all, which is the failed lookup the modelled
+    /// `ResourceNotFoundException` reports; a graph that exists and holds no such record
+    /// resolves fine, to an empty page.
+    ///
+    /// Whether this Region knows an id is ONE fact, not one per record kind, so all
+    /// three listings resolve it here and cannot disagree about it. A query and a
+    /// private graph endpoint are NOT retained records — [`Self::remove_graph`] takes
+    /// them with the graph — so the listings that page over those resolve their graph
+    /// through [`Self::settled_graph`] instead.
+    pub fn listable_graph_id(
+        &mut self,
+        identifier: &str,
+        region: &str,
+        now: Instant,
+    ) -> Option<String> {
+        if let Some(graph) = self.settled_graph(identifier, region, now) {
+            return Some(graph.id.clone());
+        }
+        let retained = self
+            .snapshots_in(region, Some(identifier), None)
+            .next()
+            .is_some()
+            || self
+                .import_tasks_in(region, Some(identifier), None)
+                .next()
+                .is_some()
+            || self
+                .export_tasks_in(region, Some(identifier), None)
+                .next()
+                .is_some();
+        retained.then(|| identifier.to_string())
+    }
+
     /// Apply every provisioning transition the clock has made due across the store.
     pub fn settle_all(&mut self, now: Instant) {
         self.reap_deleted_graphs(now);

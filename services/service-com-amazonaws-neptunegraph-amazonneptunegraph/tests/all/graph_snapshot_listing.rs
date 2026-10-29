@@ -9,8 +9,10 @@
 //!   for: every entry carries the same members an independent `GetGraphSnapshot` read
 //!   of that snapshot answers, and nothing a request fabricated.
 //! * `graphIdentifier` narrows the listing to the snapshots taken from that one graph;
-//!   absent, the listing spans every snapshot of the Region. An identifier naming no
-//!   graph of this Region is a failed lookup (404) rather than an empty page.
+//!   absent, the listing spans every snapshot of the Region. An identifier this Region
+//!   holds nothing under — neither a graph nor a snapshot taken from one — is a failed
+//!   lookup (404) rather than an empty page; a snapshot outliving its graph stays listed
+//!   under it, which `tests/all/records_outlive_their_graph.rs` covers.
 //! * The `@paginated` contract: a page carries at most `maxResults` entries, a
 //!   `nextToken` is issued only while entries remain, and resuming from it returns the
 //!   remainder without repeats or omissions, in the service's one stable order.
