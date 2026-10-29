@@ -154,6 +154,15 @@ pub struct RestApiEntry {
     pub description: Option<String>,
     pub version: Option<String>,
     pub created_date: Option<::aws_smithy_types::DateTime>,
+    /// The Region this API was created in — the Region of the request that created it
+    /// ([`request_region`]), recorded once rather than re-derived per read.
+    ///
+    /// Every ARN this service builds for the API, and for the stages under it, names this
+    /// Region, so the ARN is the same string whichever endpoint a later caller addressed
+    /// the emulator by. That matters most where the later caller carries no Region of its
+    /// own: a deployed stage is invoked at a host that need not spell one, while the stage
+    /// ARN another service bound the stage by was built from the Region of the create.
+    pub region: String,
     pub binary_media_types: Vec<String>,
     pub minimum_compression_size: Option<i32>,
     /// What the request set, or [`DEFAULT_API_KEY_SOURCE`] when it set nothing: the
@@ -220,6 +229,16 @@ pub struct RestApiEntry {
 }
 
 impl RestApiEntry {
+    /// The Region [`Self::region`] records, or [`DEFAULT_REGION`] for a record that
+    /// carries none: the Region every ARN of this API and of its stages names.
+    pub fn arn_region(&self) -> &str {
+        if self.region.is_empty() {
+            DEFAULT_REGION
+        } else {
+            &self.region
+        }
+    }
+
     /// This API's resources in creation order — the root resource first, because it is
     /// created with the API and so carries the lowest rank.
     pub fn resources_in_creation_order(&self) -> Vec<&ResourceEntry> {

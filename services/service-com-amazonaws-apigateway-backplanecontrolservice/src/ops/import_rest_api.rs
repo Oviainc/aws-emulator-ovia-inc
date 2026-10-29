@@ -536,6 +536,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: definition.description.clone(),
             version: definition.version.clone(),
             created_date: Some(crate::state::now()),
+            // The Region the import is addressed in, on the same rule
+            // `CreateRestApi` records it by: every ARN of the API and of the stages
+            // under it names the Region the API was created in.
+            region: crate::state::request_region(ctx.parts()),
             binary_media_types: definition.binary_media_types.clone().unwrap_or_default(),
             // The members an imported definition carries nothing for: this operation
             // models no input member for them, and a document declares none, so the

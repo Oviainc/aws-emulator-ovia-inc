@@ -906,15 +906,6 @@ fn endpoint_of_host(host: &str) -> Option<&str> {
     first.get(..VPC_ENDPOINT_ID_PREFIX.len() + hex.len())
 }
 
-/// The Region `host` addresses, read off its own labels, or `None` for a host that is not
-/// an `execute-api` endpoint and so names no Region.
-///
-/// It is the Region of the ARN a statement of the api's resource policy names the method by
-/// and a refusal reports, which is the Region the client addressed the endpoint in.
-fn region_of_host(host: Option<&str>) -> Option<&str> {
-    endpoint_labels(host?).map(|(_first, region)| region)
-}
-
 /// Whether `path` addresses the `@connections` space of ApiGatewayManagementApi, in either
 /// of the two forms that service's callers use: with the stage prefix the SDK's endpoint
 /// carries (`/{stage}/@connections/{id}`) and without it (`/@connections/{id}`).
@@ -1060,7 +1051,12 @@ fn serve_resolved<Eng: Send + Sync + 'static>(
             let signed_as = (authorization_type == AUTHORIZATION_AWS_IAM)
                 .then(::service_common::caller_principal::ambient_user_arn);
             let call = resource_policy::Call {
-                region: region_of_host(addressed.host).unwrap_or(crate::state::DEFAULT_REGION),
+                // The api's own Region, from the record: an api lives in exactly one
+                // Region, so the ARN a statement names its methods by carries the Region
+                // the api was created in, not one read off whichever endpoint this
+                // caller reached the emulator by (the path-addressed data plane reaches
+                // it at a host that spells no Region at all).
+                region: api.arn_region(),
                 api_id: &api.id,
                 stage: &stage.stage_name,
                 verb,
@@ -1237,9 +1233,6 @@ fn web_acl_decision<Eng: Send + Sync + 'static>(
     req: &RtRequest,
 ) -> EdgeOutcome {
     let addressed = Addressed::of_request(req);
-    let region = region_of_host(addressed.host)
-        .unwrap_or(crate::state::DEFAULT_REGION)
-        .to_string();
     // The stage's ARN, and the invoke path WITHIN the api — which is the path AWS's
     // edge inspects, `/{stage}/{resource-path}`, whichever addressing the client
     // reached this emulator by.
@@ -1255,8 +1248,13 @@ fn web_acl_decision<Eng: Send + Sync + 'static>(
             return EdgeOutcome::Unchanged;
         }
         (
+            // The Region comes from the api's own record, because the ARN the web ACL
+            // was bound by is the stage's one ARN: `AssociateWebACL` is given the ARN
+            // of a stage created in a Region, while a client invoking that stage
+            // reaches this emulator at a host that need not spell any Region, so a
+            // Region read off the request would look up a key nothing ever stored.
             crate::state::tagged_resource_arn(
-                &region,
+                resolved.api.arn_region(),
                 &crate::state::TaggedResource::Stage {
                     rest_api_id: resolved.api.id.clone(),
                     stage_name: stage_name.to_string(),
@@ -3142,29 +3140,6 @@ mod tests {
             assert_eq!(
                 resolved, *expected,
                 "case {host:?}: expected the endpoint id {expected:?}, got {resolved:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_endpoint_host_names_the_region_its_method_arns_carry() {
-        // Rows differ along the endpoint form (an api's own, a VPC endpoint's) and the
-        // region label, plus a host that names no region at all.
-        let cases: &[(Option<&str>, Option<&str>)] = &[
-            (Some("abc1230000.execute-api.us-east-1.amazonaws.com"), Some("us-east-1")),
-            (
-                Some("vpce-0123456789abcdef0.execute-api.eu-west-3.vpce.amazonaws.com"),
-                Some("eu-west-3"),
-            ),
-            (Some("abc1230000.execute-api.ap-southeast-2.amazonaws.com:443"), Some("ap-southeast-2")),
-            (Some("127.0.0.1:9297"), None),
-            (None, None),
-        ];
-        for (host, expected) in cases {
-            let resolved = region_of_host(*host);
-            assert_eq!(
-                resolved, *expected,
-                "case {host:?}: expected the region {expected:?}, got {resolved:?}"
             );
         }
     }

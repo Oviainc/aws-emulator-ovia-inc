@@ -280,3 +280,6 @@ mod rest_api_import_gateway_responses;
 mod vpc_link_provisioning;
 #[path = "all/vpc_link_records.rs"]
 mod vpc_link_records;
+// Appended for the reason the note above gives.
+#[path = "all/stage_arn_names_the_creation_region.rs"]
+mod stage_arn_names_the_creation_region;

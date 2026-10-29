@@ -373,7 +373,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The Region this API is created in, recorded on the record: every ARN of the
+        // API and of the stages under it names it, including the one another service
+        // binds a stage by, which a data-plane invoke cannot read off its own host.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
 
@@ -482,6 +485,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             version: input.version,
             created_date: Some(crate::state::now()),
+            region,
             binary_media_types: input.binary_media_types.unwrap_or_default(),
             minimum_compression_size: input.minimum_compression_size,
             // The members AWS fills in itself when the request sets none: a created API

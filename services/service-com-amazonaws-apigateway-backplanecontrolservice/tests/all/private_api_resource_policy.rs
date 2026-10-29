@@ -32,9 +32,15 @@ use serde_json::{json, Value};
 use crate::execute_api_data_plane::{invoke_on_host, json_template, mock_resource};
 use crate::rest_api_lifecycle::{string_member, Gateway};
 
-/// The Region every host in this suite is addressed in, which is therefore the Region of
-/// the method ARN a statement names and a refusal reports.
+/// The Region every host in this suite is addressed in.
 const REGION: &str = "us-west-2";
+
+/// The Region the api is CREATED in — the Region the shared control-plane harness
+/// ([`Gateway`]) scopes its requests to — which is therefore the Region of the method ARN a
+/// statement names and a refusal reports: an api lives in one Region, so its ARNs name that
+/// one whatever endpoint a later invoke arrived at (and an invoke can arrive at an endpoint
+/// that names no Region at all).
+const API_REGION: &str = "us-east-1";
 
 /// The stage the api is deployed to.
 const STAGE: &str = "s";
@@ -209,7 +215,7 @@ impl Deployed {
     /// The method ARN of the deployed `GET` on `path_part`.
     fn path_method_arn(&self, path_part: &str) -> String {
         format!(
-            "arn:aws:execute-api:{REGION}:000000000000:{api}/{STAGE}/GET/{path_part}",
+            "arn:aws:execute-api:{API_REGION}:000000000000:{api}/{STAGE}/GET/{path_part}",
             api = self.api
         )
     }
