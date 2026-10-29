@@ -767,8 +767,8 @@ async fn only_an_active_outpost_that_is_not_being_decommissioned_is_reported() {
 }
 
 /// Rule 3: the whole endpoint lifecycle runs on an Outpost provisioned purely through
-/// AWS API calls, and a created endpoint reads back through both listings before a
-/// delete makes it observably gone.
+/// AWS API calls, and a created endpoint reads back through this account's own listing
+/// before a delete makes it observably gone.
 #[tokio::test]
 async fn the_endpoint_lifecycle_runs_on_an_outpost_the_control_plane_provisioned() {
     let catalog = Catalog::discover(&Emulator::new()).await;
@@ -804,31 +804,34 @@ async fn the_endpoint_lifecycle_runs_on_an_outpost_the_control_plane_provisioned
         "the endpoint's ARN names the Outpost it is on, in that Outpost's own Region"
     );
 
-    // Read back through both listings: the Outpost-scoped one and the caller's own.
-    for (case, reply) in [
-        (
-            "ListSharedEndpoints",
-            emulator.shared_endpoints_in(REGION, &outpost_id).await,
-        ),
-        ("ListEndpoints", emulator.endpoints_in(REGION).await),
-    ] {
-        assert_eq!(
-            reply.status, 200,
-            "case {case:?}: the listing is served, got {} {}",
-            reply.status, reply.body
-        );
-        let arns: Vec<String> = reply.body["Endpoints"]
-            .as_array()
-            .unwrap_or_else(|| panic!("case {case:?}: must carry Endpoints: {}", reply.body))
-            .iter()
-            .map(|endpoint| string_at(endpoint, "EndpointArn"))
-            .collect();
-        assert_eq!(
-            arns,
-            vec![arn.clone()],
-            "case {case:?}: the created endpoint is the one reported"
-        );
-    }
+    // Read back through this account's own listing: the Outpost was provisioned through
+    // this account's control plane, so it is one the account OWNS, and the Outpost-scoped
+    // listing — which serves the Outposts another account shared with this caller — does
+    // not report endpoints for it (`shared_endpoint_listing.rs`).
+    let reply = emulator.endpoints_in(REGION).await;
+    assert_eq!(
+        reply.status, 200,
+        "case \"ListEndpoints\": the listing is served, got {} {}",
+        reply.status, reply.body
+    );
+    let arns: Vec<String> = reply.body["Endpoints"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case \"ListEndpoints\": must carry Endpoints: {}", reply.body))
+        .iter()
+        .map(|endpoint| string_at(endpoint, "EndpointArn"))
+        .collect();
+    assert_eq!(
+        arns,
+        vec![arn.clone()],
+        "case \"ListEndpoints\": the created endpoint is the one reported"
+    );
+    let refused = emulator.shared_endpoints_in(REGION, &outpost_id).await;
+    assert_eq!(
+        refused.status, 404,
+        "case \"ListSharedEndpoints\": an Outpost this account owns is not one it serves, \
+         got {} {}",
+        refused.status, refused.body
+    );
 
     let deleted = emulator
         .delete_endpoint_in(REGION, &outpost_id, &endpoint_id)

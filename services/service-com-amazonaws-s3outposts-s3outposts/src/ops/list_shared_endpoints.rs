@@ -184,20 +184,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(ListSharedEndpointsErrorModeled::ValidationException)?;
 
-        // The Outpost the request named, as this Region reaches it: an Outpost
-        // installed in another Region is not one this Region's endpoint serves,
-        // so it resolves to the modelled 404 like one that does not exist.
-        crate::state::resolve_outpost(&inventory, &region, scope)
+        // The Outpost the request named, as an operation scoped to the Outposts
+        // another account has shared with this one reaches it: this operation's
+        // subject is an Outpost reached through a cross-account share, so an
+        // Outpost the calling account owns is outside its scope, and so is one
+        // installed in another Region than the request was signed for. Each
+        // resolves to the modelled 404 like an Outpost that does not exist.
+        crate::state::resolve_shared_outpost(&inventory, &region, scope)
             .map_err(ListSharedEndpointsErrorModeled::ResourceNotFoundException)?;
 
         // The walk, the page bound and the cursor are the one listing rule this
         // service's listings serve, so they live in `crate::state`; what is this
-        // operation's own is which endpoints it reports. The listing is scoped by
-        // the Outpost the request named, and by nothing else: the model states
-        // `OutpostId` as the only scoping member and documents "all endpoints
-        // associated with an Outpost", so every endpoint on it is reported — the
-        // caller's own included, since `CreateEndpoint`/`DeleteEndpoint` are the
-        // related actions and they operate on exactly those.
+        // operation's own is which endpoints it reports. Of the Outpost resolved
+        // above, every endpoint stored against it is reported — the caller's own
+        // included, since `CreateEndpoint`/`DeleteEndpoint` are the related
+        // actions and they operate on exactly those.
         let page = crate::state::endpoint_page(
             &mut store,
             &inventory,

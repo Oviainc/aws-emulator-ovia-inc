@@ -18,12 +18,13 @@
 //! `ListEndpoints`, `ListSharedEndpoints` and `ListOutpostsWithS3` — through the router in
 //! the row's Region, so each answer is the one a client signing for that Region receives.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::arn_patterns::optional_member;
 use crate::endpoint_lifecycle::{
     create_in, emulator_holding, emulator_in_region, endpoint_id_of, list_endpoints_in,
-    list_outposts_in, list_shared_in, minimal_create, owned_outposts_in, string_at, Answer,
+    list_outposts_in, list_shared_in, minimal_create, owned_outposts_in, shared_outpost_in,
+    string_at, Answer,
 };
 
 /// The query every listing below is driven with: one page big enough for the whole answer,
@@ -233,29 +234,84 @@ async fn every_arn_names_the_partition_of_the_region_the_request_was_signed_for(
             absent_rows += 1;
         }
 
-        // Stored either way: both listings report the endpoint, carrying the very same
-        // EndpointArn member the create answered with.
-        for (listing, answer) in [
-            (
-                "ListEndpoints",
-                list_endpoints_in(&router, region, WHOLE_PAGE).await,
-            ),
-            (
-                "ListSharedEndpoints",
-                list_shared_in(&router, region, &shared_query(&outpost_id)).await,
-            ),
-        ] {
-            let (endpoint, listed_arn) = the_only_endpoint(&answer, case, listing);
+        // Stored either way: the listing of this account's own endpoints reports the
+        // endpoint, carrying the very same EndpointArn member the create answered with.
+        let (endpoint, listed_arn) = the_only_endpoint(
+            &list_endpoints_in(&router, region, WHOLE_PAGE).await,
+            case,
+            "ListEndpoints",
+        );
+        assert_eq!(
+            string_at(&endpoint, "OutpostsId"),
+            outpost_id,
+            "case {case:?} ({region}): ListEndpoints must report the endpoint on its own \
+             Outpost, got {endpoint:?}"
+        );
+        assert_eq!(
+            listed_arn, reported,
+            "case {case:?} ({region}): ListEndpoints must report the same EndpointArn member \
+             the create answered with ({reported:?}), got {listed_arn:?}"
+        );
+
+        // The Outpost-scoped listing serves an Outpost another account shared with this
+        // caller (`shared_endpoint_listing.rs`), so an endpoint created there is read back
+        // through it — under the very same member rule.
+        let shared_outpost = shared_outpost_in(&router, region).await;
+        const SHARED_SUBNET: &str = "subnet-0000000000000f001";
+        let mut request = minimal_create(&shared_outpost);
+        request["SubnetId"] = json!(SHARED_SUBNET);
+        request["SecurityGroupId"] = json!("sg-0000000000000f001");
+        let on_shared = create_in(&router, region, request).await;
+        assert_eq!(
+            on_shared.status, 200,
+            "case {case:?} ({region}): CreateEndpoint on the shared Outpost must answer 200, \
+             got {} with {:?}",
+            on_shared.status, on_shared.body
+        );
+        let shared_arn = optional_member(&on_shared.body, "EndpointArn");
+        assert_eq!(
+            shared_arn.is_some(),
+            partition.is_some(),
+            "case {case:?} ({region}): the EndpointArn member must be carried exactly where \
+             the member's own alternation lists this Region's partition, got {:?}",
+            on_shared.body
+        );
+        let listing = list_shared_in(&router, region, &shared_query(&shared_outpost)).await;
+        assert_eq!(
+            listing.status, 200,
+            "case {case:?} ({region}): ListSharedEndpoints must answer 200, got {} with {:?}",
+            listing.status, listing.body
+        );
+        let listed = listing
+            .endpoints()
+            .iter()
+            .find(|endpoint| endpoint["SubnetId"] == json!(SHARED_SUBNET))
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?} ({region}): ListSharedEndpoints must report the endpoint \
+                     created on {shared_outpost}, got {:?}",
+                    listing.body
+                )
+            });
+        assert_eq!(
+            string_at(&listed, "OutpostsId"),
+            shared_outpost,
+            "case {case:?} ({region}): ListSharedEndpoints must report the endpoint on its own \
+             Outpost, got {listed:?}"
+        );
+        assert_eq!(
+            optional_member(&listed, "EndpointArn"),
+            shared_arn,
+            "case {case:?} ({region}): ListSharedEndpoints must report the same EndpointArn \
+             member the create answered with ({shared_arn:?}), got {listed:?}"
+        );
+        if let Some(arn) = &shared_arn {
             assert_eq!(
-                string_at(&endpoint, "OutpostsId"),
-                outpost_id,
-                "case {case:?} ({region}): {listing} must report the endpoint on its own \
-                 Outpost, got {endpoint:?}"
-            );
-            assert_eq!(
-                listed_arn, reported,
-                "case {case:?} ({region}): {listing} must report the same EndpointArn member \
-                 the create answered with ({reported:?}), got {listed_arn:?}"
+                Some(partition_of(arn)),
+                *partition,
+                "case {case:?} ({region}): the EndpointArn must name this Region's partition, \
+                 got {arn:?}"
             );
         }
 

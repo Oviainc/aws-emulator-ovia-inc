@@ -30,7 +30,7 @@ use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::endpoint_lifecycle::{
-    create_in, emulator_holding, endpoint_id_of, list_endpoints_in, list_shared_in,
+    create_in, emulator_holding_shared, endpoint_id_of, list_endpoints_in, list_shared_in,
     reported_arns, string_at, Answer,
 };
 
@@ -93,6 +93,11 @@ fn cursor_of(outpost_id: &str, arn: &str) -> String {
 /// The store every case here reads: two endpoints on every Outpost of every Region, each
 /// created through the Region its Outpost is installed in, beside the cursor each one is
 /// named by.
+///
+/// Every Outpost is one another account shared with this caller, so BOTH endpoint listings
+/// serve it: `ListSharedEndpoints` reports the endpoints of exactly such an Outpost
+/// (`shared_endpoint_listing.rs`), and the endpoints on it are this account's own, which is
+/// what `ListEndpoints` reports.
 async fn multi_region_fixture() -> (MultiServiceRouter, Vec<(&'static str, String)>) {
     let declared: Vec<(String, &str)> = SITES
         .iter()
@@ -102,7 +107,7 @@ async fn multi_region_fixture() -> (MultiServiceRouter, Vec<(&'static str, Strin
                 .map(move |outpost_id| ((*outpost_id).to_string(), *region))
         })
         .collect();
-    let router = emulator_holding(&declared);
+    let router = emulator_holding_shared(&declared);
 
     let mut cursors: Vec<(&'static str, String)> = Vec::new();
     let mut seed = 1usize;
@@ -317,12 +322,16 @@ const OUTPOSTS_IN_ONE_REGION: &[(&str, usize)] = &[
 /// The store the Outpost-scope cases read: every Outpost of [`OUTPOSTS_IN_ONE_REGION`] in
 /// the one Region, with the endpoints each is declared to carry, beside the
 /// `(OutpostId, EndpointArn)` pair of every endpoint created.
+///
+/// Every Outpost is one another account shared with this caller, so the Outpost-scoped
+/// listing serves each of them (`shared_endpoint_listing.rs`), while the endpoints on them
+/// are this account's own, which is what the Region-wide listing reports.
 async fn one_region_fixture() -> (MultiServiceRouter, Vec<(&'static str, String)>) {
     let declared: Vec<(String, &str)> = OUTPOSTS_IN_ONE_REGION
         .iter()
         .map(|(outpost_id, _)| ((*outpost_id).to_string(), ONE_REGION))
         .collect();
-    let router = emulator_holding(&declared);
+    let router = emulator_holding_shared(&declared);
 
     let mut created: Vec<(&'static str, String)> = Vec::new();
     let mut seed = 0x101usize;

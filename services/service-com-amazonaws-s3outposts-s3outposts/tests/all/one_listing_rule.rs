@@ -27,9 +27,9 @@ use crate::endpoint_lifecycle::listing_fixture;
 /// names the first record that page did not serve.
 ///
 /// The rows differ along what the rule generalises over: which listing is walked (the
-/// Outpost inventory, the account's own endpoints, an Outpost it owns and an Outpost
-/// shared with it — so each of the three operations, over sets of different sizes and
-/// two cursor forms), and the page size, including `MaxResults` left out, both bounds
+/// Outpost inventory, the account's own endpoints, and an Outpost another account shared
+/// with it — so each of the three operations, over sets of different sizes and two cursor
+/// forms), and the page size, including `MaxResults` left out, both bounds
 /// of its published `@range(min: 0, max: 100)` and sizes between them.
 #[tokio::test]
 async fn every_listing_pages_over_one_stable_order() {

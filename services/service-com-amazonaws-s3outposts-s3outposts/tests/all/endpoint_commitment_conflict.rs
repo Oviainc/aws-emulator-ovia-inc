@@ -18,8 +18,10 @@
 //! Outpost it sits on (one this account owns, one shared with it) and which of the three
 //! members the create differs in.
 //!
-//! The oracle is the persisted records and the Outpost's own listing: every row ends by
-//! checking that no Outpost reports two endpoints on one (subnet, security group).
+//! The oracle is the persisted records: every row ends by checking that no Outpost holds
+//! two endpoints on one (subnet, security group), whoever owns them — a fact about the
+//! store, since no one listing of this API reports every account's endpoints on an Outpost
+//! this account owns.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -30,11 +32,9 @@ use service_com_amazonaws_s3outposts_s3outposts::state::{
     EndpointRecord, ACCESS_TYPE_PRIVATE, ENDPOINT_STATUS_AVAILABLE,
 };
 use service_com_amazonaws_s3outposts_s3outposts::ComAmazonawsS3outpostsS3outpostsState;
-use smithy_server_runtime::MultiServiceRouter;
 
 use crate::endpoint_lifecycle::{
-    create, emulator_with_engine, list_shared, owned_outposts, shared_outpost, string_at,
-    SHARING_ACCOUNT_ID,
+    create, emulator_with_engine, owned_outposts, shared_outpost, string_at, SHARING_ACCOUNT_ID,
 };
 
 /// A third synthetic account: one that is neither the account this emulator serves nor the
@@ -125,26 +125,30 @@ fn stored_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
     store.endpoints.len()
 }
 
-/// Check, through the Outpost's own listing, that `outpost_id` reports no two endpoints on
-/// one (subnet, security group) — the invariant the conflict exists to keep.
-async fn one_endpoint_per_commitment(router: &MultiServiceRouter, case: &str, outpost_id: &str) {
-    let answer = list_shared(router, &format!("?outpostId={outpost_id}&maxResults=100")).await;
-    assert_eq!(
-        answer.status, 200,
-        "case {case:?}: the Outpost's listing must answer 200, got {} with {:?}",
-        answer.status, answer.body
-    );
+/// Check, in the store itself, that `outpost_id` holds no two endpoints on one (subnet,
+/// security group) — the invariant the conflict exists to keep, whoever owns each record.
+fn one_endpoint_per_commitment(
+    engine: &Arc<engine::InMemoryEngine>,
+    case: &str,
+    outpost_id: &str,
+) {
+    let state = engine.state::<ComAmazonawsS3outpostsS3outpostsState>();
+    let store = state.lock();
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
-    for endpoint in answer.endpoints() {
+    for record in store
+        .endpoints
+        .values()
+        .filter(|record| record.outpost_id == outpost_id)
+    {
         let commitment = (
-            string_at(endpoint, "SubnetId"),
-            string_at(endpoint, "SecurityGroupId"),
+            record.subnet_id.clone(),
+            record.security_group_id.clone(),
         );
         assert!(
             seen.insert(commitment.clone()),
-            "case {case:?}: Outpost {outpost_id} must report at most one endpoint on \
+            "case {case:?}: Outpost {outpost_id} must hold at most one endpoint on \
              {commitment:?}, got {:?}",
-            answer.body
+            store.endpoints
         );
     }
 }
@@ -338,7 +342,7 @@ async fn a_committed_subnet_and_security_group_on_one_outpost_conflicts_whoever_
         }
 
         for outpost in owned.iter().chain(std::iter::once(&shared)) {
-            one_endpoint_per_commitment(&router, case, outpost).await;
+            one_endpoint_per_commitment(&engine, case, outpost);
         }
     }
 }

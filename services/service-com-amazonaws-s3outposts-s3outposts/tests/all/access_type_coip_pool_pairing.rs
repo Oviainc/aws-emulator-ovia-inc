@@ -169,14 +169,23 @@ async fn a_coip_pool_is_stored_and_reported_whatever_the_access_type() {
         let arn = string_at(&created.body, "EndpointArn");
 
         // Read the record back through the listing that reports this caller's endpoints,
-        // and through the Outpost-scoped one: one stored record, the members it was given.
+        // and — for an Outpost another account shared with this caller, the Outposts the
+        // Outpost-scoped listing serves (`shared_endpoint_listing.rs`) — through that one
+        // too: one stored record, the members it was given.
         let from_own = endpoint_with_arn(&list_endpoints(&router, "?maxResults=100").await, &arn);
-        let from_shared = endpoint_with_arn(
-            &list_shared(&router, &format!("?outpostId={outpost_id}&maxResults=100")).await,
-            &arn,
-        );
-        for (listing, endpoint) in [("ListEndpoints", &from_own), ("ListSharedEndpoints", &from_shared)]
+        let from_shared = if outpost_id == shared {
+            Some(endpoint_with_arn(
+                &list_shared(&router, &format!("?outpostId={outpost_id}&maxResults=100")).await,
+                &arn,
+            ))
+        } else {
+            None
+        };
+        for (listing, endpoint) in [("ListEndpoints", Some(&from_own)), ("ListSharedEndpoints", from_shared.as_ref())]
         {
+            let Some(endpoint) = endpoint else {
+                continue;
+            };
             assert_eq!(
                 endpoint["CustomerOwnedIpv4Pool"],
                 json!(pool),
@@ -190,10 +199,12 @@ async fn a_coip_pool_is_stored_and_reported_whatever_the_access_type() {
                 endpoint["AccessType"]
             );
         }
-        assert_eq!(
-            from_own, from_shared,
-            "case {case:?}: both listings report the one stored record, got {from_own:?} and \
-             {from_shared:?}"
-        );
+        if let Some(from_shared) = &from_shared {
+            assert_eq!(
+                &from_own, from_shared,
+                "case {case:?}: both listings report the one stored record, got {from_own:?} and \
+                 {from_shared:?}"
+            );
+        }
     }
 }

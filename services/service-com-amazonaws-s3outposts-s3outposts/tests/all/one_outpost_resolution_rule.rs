@@ -8,7 +8,13 @@
 //! the Region the request was signed for. An id that names neither is the modelled
 //! `ResourceNotFoundException` (404) carrying this service's one fixed text — the same
 //! answer, member for member, whichever door was knocked on; an id that names both is
-//! served, and the door goes on to do its own work.
+//! resolved, and the door goes on to do its own work.
+//!
+//! What a door does once the Outpost resolves is its OWN: `ListSharedEndpoints` reports
+//! endpoints for an Outpost another account shared with this caller, so an Outpost of this
+//! account is outside that one door's scope and is answered with the very same refusal
+//! (`shared_endpoint_listing.rs` is that scope's own subject), while the other two doors
+//! serve owned and shared alike.
 //!
 //! Every case goes through the router, so each exercises routing, deserialization, the
 //! handler, the persisted state and serialization — the path a client takes. The rows are
@@ -20,9 +26,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::endpoint_lifecycle::{
-    create_in, delete_endpoint_in, emulator_holding, emulator_in_region_with_engine,
-    endpoint_id_of, list_shared_in, owned_outposts_in, shared_outpost_in, string_at, Answer,
-    REGION,
+    create_in, delete_endpoint_in, emulator_holding_shared, emulator_in_region_with_engine,
+    endpoint_id_of, list_endpoints_in, list_shared_in, owned_outposts_in, shared_outpost_in,
+    string_at, Answer, REGION,
 };
 
 /// The one `ResourceNotFoundException$Message` an `OutpostId` that resolves to nothing is
@@ -112,6 +118,10 @@ impl Door {
     /// of exactly that Outpost's endpoints, or an accepted delete of an endpoint the same
     /// listing reported.
     ///
+    /// `ListSharedEndpoints` serves the Outposts another account shared with this caller,
+    /// so that door is driven here only at such an Outpost; at one this account owns it
+    /// answers its own modelled 404 ([`Door::assert_outside_its_scope`]).
+    ///
     /// `tag` keeps each row's commitments distinct (see [`create_request`]).
     async fn assert_served(
         &self,
@@ -141,16 +151,14 @@ impl Door {
                     "case {case:?}: the EndpointArn must name the Outpost the request \
                      resolved, got {arn:?}"
                 );
-                // The create STORED the endpoint: the Outpost's own listing reports it.
-                let listing = endpoint_listing(router, region, outpost_id).await;
+                // The create STORED the endpoint: the Outpost's own endpoints report it.
+                let endpoints = own_endpoints_on(router, region, outpost_id).await;
                 assert!(
-                    listing
-                        .endpoints()
+                    endpoints
                         .iter()
                         .any(|endpoint| endpoint["EndpointArn"].as_str() == Some(arn.as_str())),
-                    "case {case:?}: the Outpost's listing must report the endpoint {arn:?} \
-                     the create stored, got {:?}",
-                    listing.body
+                    "case {case:?}: the Outpost's endpoints must report the endpoint {arn:?} \
+                     the create stored, got {endpoints:?}"
                 );
             }
             Door::Delete => {
@@ -158,12 +166,11 @@ impl Door {
                 // listing before the delete: so the delete below is accepted for a record
                 // this Region reaches, and not for nothing.
                 let endpoint_id = endpoint_on(router, region, outpost_id, tag).await;
-                let before = endpoint_listing(router, region, outpost_id).await;
+                let before = own_endpoints_on(router, region, outpost_id).await;
                 assert!(
                     reports(&before, &endpoint_id),
                     "case {case:?}: the endpoint {endpoint_id} must exist before it is \
-                     deleted, got {:?}",
-                    before.body
+                     deleted, got {before:?}"
                 );
                 let deleted = delete_endpoint_in(router, region, outpost_id, &endpoint_id).await;
                 assert_eq!(
@@ -175,9 +182,9 @@ impl Door {
             }
             Door::ListShared => {
                 let endpoint_id = endpoint_on(router, region, outpost_id, tag).await;
-                let listing = endpoint_listing(router, region, outpost_id).await;
+                let listing = shared_listing(router, region, outpost_id).await;
                 assert!(
-                    reports(&listing, &endpoint_id),
+                    reports(listing.endpoints(), &endpoint_id),
                     "case {case:?}: the listing must report the endpoint {endpoint_id} \
                      stored on this Outpost, got {:?}",
                     listing.body
@@ -194,11 +201,33 @@ impl Door {
             }
         }
     }
+
+    /// Drive this door in `region` at an Outpost that Region resolves but the door's own
+    /// scope excludes, and assert the one shared refusal: `ListSharedEndpoints` serves the
+    /// Outposts another account shared with this caller, so an Outpost this account owns is
+    /// not one it reports endpoints for.
+    async fn assert_outside_its_scope(
+        &self,
+        case: &str,
+        router: &MultiServiceRouter,
+        region: &str,
+        outpost_id: &str,
+    ) {
+        assert!(
+            matches!(self, Door::ListShared),
+            "case {case:?}: only ListSharedEndpoints narrows the Outposts it serves"
+        );
+        let answer = self
+            .knock(router, region, outpost_id, NEVER_ISSUED_ENDPOINT_ID)
+            .await;
+        assert_not_found(case, &answer);
+    }
 }
 
-/// The endpoints the Outpost's own listing reports in `region`, in one page large enough
-/// for every endpoint these cases store.
-async fn endpoint_listing(router: &MultiServiceRouter, region: &str, outpost_id: &str) -> Answer {
+/// The Outpost-scoped listing of `outpost_id` in `region`, in one page large enough for
+/// every endpoint these cases store. It serves an Outpost another account shared with this
+/// caller, which is the only kind it is called with here.
+async fn shared_listing(router: &MultiServiceRouter, region: &str, outpost_id: &str) -> Answer {
     let listing = list_shared_in(
         router,
         region,
@@ -215,11 +244,33 @@ async fn endpoint_listing(router: &MultiServiceRouter, region: &str, outpost_id:
     listing
 }
 
-/// Whether `listing` reports the endpoint `endpoint_id`, read off the id at the tail of
-/// each reported `EndpointArn`.
-fn reports(listing: &Answer, endpoint_id: &str) -> bool {
+/// The endpoints of this account on `outpost_id`, read in `region` through the listing of
+/// its own endpoints: the door into an Outpost's endpoints that is open whoever owns it.
+async fn own_endpoints_on(
+    router: &MultiServiceRouter,
+    region: &str,
+    outpost_id: &str,
+) -> Vec<Value> {
+    let listing = list_endpoints_in(router, region, "?maxResults=100").await;
+    assert_eq!(
+        listing.status,
+        200,
+        "reading this account's endpoints in {region} must answer 200, got {} with {:?}",
+        listing.status,
+        listing.body
+    );
     listing
         .endpoints()
+        .iter()
+        .filter(|endpoint| string_at(endpoint, "OutpostsId") == outpost_id)
+        .cloned()
+        .collect()
+}
+
+/// Whether `endpoints` holds the endpoint `endpoint_id`, read off the id at the tail of
+/// each reported `EndpointArn`.
+fn reports(endpoints: &[Value], endpoint_id: &str) -> bool {
+    endpoints
         .iter()
         .any(|endpoint| endpoint_id_of(&string_at(endpoint, "EndpointArn")) == endpoint_id)
 }
@@ -263,7 +314,8 @@ fn assert_not_found(case: &str, answer: &Answer) {
 
 /// Every door serves an `OutpostId` the signing Region resolves: an Outpost of this
 /// account's own and one another account shared with it are each reached through all three
-/// doors, in two Regions.
+/// doors, in two Regions — the Outpost-scoped listing answering its own modelled 404 for
+/// the Outposts outside its scope.
 #[tokio::test]
 async fn every_door_serves_an_outpost_its_region_resolves() {
     for region in [REGION, SECOND_REGION] {
@@ -275,16 +327,24 @@ async fn every_door_serves_an_outpost_its_region_resolves() {
         );
         let shared = shared_outpost_in(&router, region).await;
         let resolvable = [
-            ("an Outpost of this account", owned[0].clone()),
-            ("another Outpost of this account", owned[1].clone()),
-            ("an Outpost another account shared with it", shared),
+            ("an Outpost of this account", owned[0].clone(), false),
+            ("another Outpost of this account", owned[1].clone(), false),
+            ("an Outpost another account shared with it", shared, true),
         ];
 
         let mut tag = 0x100usize;
-        for (kind, outpost_id) in &resolvable {
+        for (kind, outpost_id, shared_with_caller) in &resolvable {
             for door in DOORS {
                 let case = format!("{} in {region} on {kind}", door.operation());
                 tag += 1;
+                // Every door resolves the Outpost the same way; what a door does once it
+                // has is its own, and `ListSharedEndpoints` reports endpoints only for an
+                // Outpost another account shared with this caller.
+                if matches!(door, Door::ListShared) && !shared_with_caller {
+                    door.assert_outside_its_scope(&case, &router, region, outpost_id)
+                        .await;
+                    continue;
+                }
                 door.assert_served(&case, &router, region, outpost_id, tag)
                     .await;
             }
@@ -322,7 +382,9 @@ async fn every_door_refuses_an_unresolvable_outpost_identically() {
     // Region other than the one the request is signed for: the resolution is the Region's
     // too, so each door refuses the very endpoint its own Region serves.
     let outpost_id = "op-0a1b2c3d4e5f60718";
-    let router = emulator_holding(&[(outpost_id.to_string(), OTHER_REGION)]);
+    // Shared with this caller by another account, so every door — the Outpost-scoped
+    // listing included — serves it through its own Region below.
+    let router = emulator_holding_shared(&[(outpost_id.to_string(), OTHER_REGION)]);
     let endpoint_id = endpoint_on(&router, OTHER_REGION, outpost_id, 0x11).await;
 
     for signed_for in [REGION, SECOND_REGION] {

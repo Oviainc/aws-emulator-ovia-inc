@@ -25,8 +25,8 @@ use service_com_amazonaws_s3outposts_s3outposts::state::ENDPOINT_TRANSITION;
 
 use crate::endpoint_lifecycle::{
     create_in, delete_endpoint_in, emulator_holding, emulator_in_region, endpoint_id_of,
-    list_endpoints_in, list_outposts_in, list_shared_in, minimal_create, owned_outposts_in,
-    reported_arns, string_at, Answer,
+    list_endpoints_in, list_outposts_in, list_shared_in, minimal_create, reported_arns,
+    shared_outpost_in, string_at, Answer,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -118,13 +118,12 @@ fn assert_outpost_missing(case: &str, what: &str, answer: &Answer) {
 async fn a_resource_is_reached_only_through_the_region_it_lives_in() {
     let account = engine::emulator_account_id();
     for Row { case, home, reader } in ROWS {
-        // The fixture's Outposts are installed in `home`, so `reader` has none at all.
+        // The fixture's Outposts are installed in `home`, so `reader` has none at all. The
+        // Outpost another account shared with this caller is the one every listing of this
+        // service reaches, the Outpost-scoped one included
+        // (`shared_endpoint_listing.rs`).
         let router = emulator_in_region(home);
-        let outpost_id = owned_outposts_in(&router, home)
-            .await
-            .first()
-            .unwrap_or_else(|| panic!("case {case:?}: the emulator presents an owned Outpost"))
-            .clone();
+        let outpost_id = shared_outpost_in(&router, home).await;
 
         let created = create_in(&router, home, minimal_create(&outpost_id)).await;
         assert_eq!(
@@ -158,12 +157,28 @@ async fn a_resource_is_reached_only_through_the_region_it_lives_in() {
         );
         let shared_at_home =
             list_shared_in(&router, home, &format!("?outpostId={outpost_id}&maxResults=100")).await;
+        let on_the_outpost = reported_arns(&shared_at_home);
+        // Exactly the two endpoints the fixture holds on that Outpost: the one created
+        // above and the sharing account's own, which that fixture seeds on it.
         assert_eq!(
-            reported_arns(&shared_at_home),
-            vec![arn.clone()],
+            on_the_outpost.len(),
+            2,
+            "case {case:?}: the Outpost's own listing in {home} must report the endpoint \
+             created above and the sharing account's, got {:?}",
+            shared_at_home.body
+        );
+        assert!(
+            on_the_outpost.contains(&arn),
             "case {case:?}: the Outpost's own listing in {home} must report it, got {:?}",
             shared_at_home.body
         );
+        for listed in &on_the_outpost {
+            assert!(
+                listed.contains(&format!(":{home}:")) && !listed.contains(&format!(":{reader}:")),
+                "case {case:?}: every ARN the Outpost's listing reports must name the Outpost's \
+                 own Region {home}, got {listed:?}"
+            );
+        }
         assert!(
             reported_outposts(&list_outposts_in(&router, home, "?maxResults=100").await)
                 .contains(&outpost_id),

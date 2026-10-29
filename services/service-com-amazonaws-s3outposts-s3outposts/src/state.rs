@@ -873,6 +873,35 @@ pub fn resolve_outpost<'a>(
         .ok_or_else(not_found)
 }
 
+/// The Outpost `outpost_id` as an operation scoped to the Outposts ANOTHER account
+/// has shared with this one reaches it, or the modelled refusal when this Region's
+/// inventory holds no such Outpost or holds one the calling account owns itself.
+///
+/// An operation whose documented subject is a resource reached through a
+/// cross-account share serves only resources another account owns: the caller's
+/// own Outpost was never shared with it, so it is outside that operation's scope
+/// and is refused exactly like an Outpost the inventory does not hold — the same
+/// [`not_found`] payload every unresolvable reference under an `OutpostId`
+/// answers with, since the two cases are one fact from the caller's side: no
+/// Outpost this operation serves.
+///
+/// Which account owns the Outpost is already on the record [`resolve_outpost`]
+/// hands back ([`OutpostRecord::owner_id`], "useful for comparing owned versus
+/// shared outposts"), so the share is read off the inventory rather than tracked
+/// beside it: the Region resolution stays the one every door shares, and this
+/// adds only the qualifier the scoped operation's own subject states.
+pub fn resolve_shared_outpost<'a>(
+    inventory: &'a OutpostInventory,
+    region: &str,
+    outpost_id: &str,
+) -> Result<&'a OutpostRecord, ResourceNotFoundException> {
+    let outpost = resolve_outpost(inventory, region, outpost_id)?;
+    if outpost.owner_id == caller_account() {
+        return Err(not_found());
+    }
+    Ok(outpost)
+}
+
 /// The home Region of the Outpost `outpost_id`, or `None` when the inventory holds
 /// no such Outpost.
 ///

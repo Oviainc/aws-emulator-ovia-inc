@@ -62,28 +62,57 @@ pub(crate) fn unprovisioned_emulator() -> MultiServiceRouter {
     unprovisioned_emulator_with_engine().0
 }
 
-/// One emulator whose inventory holds exactly the `(OutpostId, home Region)` pairs given,
-/// every one owned by the account this emulator serves.
+/// One emulator whose inventory holds exactly the `(OutpostId, owner account, home
+/// Region)` triples given, beside the engine for the cases that read the store itself.
 ///
 /// An Outpost is hardware nothing in this API provisions, so the store's own provisioning
 /// seam is the one way to stand one up — the same seam `S3_OUTPOSTS_PROVISIONED_OUTPOSTS`
-/// reaches in a running emulator.
-pub(crate) fn emulator_holding(outposts: &[(String, &str)]) -> MultiServiceRouter {
-    let owner = engine::emulator_account_id().to_string();
+/// reaches in a running emulator. The owner is what tells an Outpost this account owns
+/// from one another account shared with it (`Outpost$OwnerId`, "useful for comparing owned
+/// versus shared outposts").
+pub(crate) fn emulator_holding_owned(
+    outposts: &[(&str, &str, &str)],
+) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (router, engine) = unprovisioned_emulator_with_engine();
     {
         let state = engine.state::<ComAmazonawsS3outpostsS3outpostsState>();
         let mut store = state.lock();
-        for (outpost_id, region) in outposts {
+        for (outpost_id, owner, region) in outposts {
             store.provision_outpost(
-                OutpostRecord::provisioned(outpost_id, &owner, 48 * TEBIBYTE, region)
+                OutpostRecord::provisioned(outpost_id, owner, 48 * TEBIBYTE, region)
                     .unwrap_or_else(|| {
-                        panic!("{outpost_id} in {region} must be a provisionable Outpost")
+                        panic!(
+                            "{outpost_id} owned by {owner} in {region} must be a provisionable \
+                             Outpost"
+                        )
                     }),
             );
         }
     }
-    router
+    (router, engine)
+}
+
+/// One emulator whose inventory holds exactly the `(OutpostId, home Region)` pairs given,
+/// every one owned by `owner`.
+fn emulator_holding_owned_by(owner: &str, outposts: &[(String, &str)]) -> MultiServiceRouter {
+    let triples: Vec<(&str, &str, &str)> = outposts
+        .iter()
+        .map(|(outpost_id, region)| (outpost_id.as_str(), owner, *region))
+        .collect();
+    emulator_holding_owned(&triples).0
+}
+
+/// One emulator whose inventory holds exactly the `(OutpostId, home Region)` pairs given,
+/// every one owned by the account this emulator serves.
+pub(crate) fn emulator_holding(outposts: &[(String, &str)]) -> MultiServiceRouter {
+    emulator_holding_owned_by(engine::emulator_account_id(), outposts)
+}
+
+/// One emulator whose inventory holds exactly the `(OutpostId, home Region)` pairs given,
+/// every one owned by [`SHARING_ACCOUNT_ID`] — the Outposts another account has shared
+/// with this caller, which are the ones `ListSharedEndpoints` reports endpoints for.
+pub(crate) fn emulator_holding_shared(outposts: &[(String, &str)]) -> MultiServiceRouter {
+    emulator_holding_owned_by(SHARING_ACCOUNT_ID, outposts)
 }
 
 /// One emulator for an account that DOES have S3 on Outposts capacity: two Outposts of
@@ -422,6 +451,8 @@ pub(crate) async fn shared_outpost(router: &MultiServiceRouter) -> String {
 
 /// The id of an endpoint on `outpost_id` that this account does NOT own, read back through
 /// the Outpost-scoped listing: the endpoint whose `EndpointArn` names another account.
+/// `outpost_id` is an Outpost another account shared with this caller, which is the one
+/// kind that listing serves.
 pub(crate) async fn another_accounts_endpoint_id(
     router: &MultiServiceRouter,
     outpost_id: &str,
@@ -494,7 +525,8 @@ pub(crate) fn minimal_create(outpost_id: &str) -> Value {
 }
 
 /// Which listing a case drives: the Outpost inventory, this account's own endpoints, or
-/// the endpoints on one named Outpost.
+/// the endpoints on one named Outpost — which `ListSharedEndpoints` serves for an Outpost
+/// another account shared with this caller.
 ///
 /// The three listings differ only in the store map they walk, the form of their cursor,
 /// which records they report and the shape they project each record into, so this is the
@@ -714,6 +746,10 @@ pub(crate) async fn create_endpoints(
 /// over more than one record — endpoints of this account on both Outposts it owns and on
 /// the Outpost another account shared with it (which already carries that account's own
 /// endpoint) — beside the listings a paging case drives.
+///
+/// The Outpost-scoped listing is driven at the SHARED Outpost: `ListSharedEndpoints`
+/// reports the endpoints of an Outpost another account shared with this caller, so an
+/// Outpost this account owns is not one it serves (`shared_endpoint_listing.rs`).
 pub(crate) async fn listing_fixture() -> (
     MultiServiceRouter,
     Arc<engine::InMemoryEngine>,
@@ -729,7 +765,6 @@ pub(crate) async fn listing_fixture() -> (
     let listings = vec![
         Listing::Outposts,
         Listing::OwnEndpoints,
-        Listing::EndpointsOn(owned[0].clone()),
         Listing::EndpointsOn(shared),
     ];
     (router, engine, listings)
@@ -1504,7 +1539,10 @@ async fn customer_owned_ip_without_a_coip_pool_is_refused() {
 #[tokio::test]
 async fn a_coip_pool_is_required_by_customer_owned_ip_and_admitted_with_any_access_type() {
     let router = emulator();
-    let outpost_id = owned_outposts(&router).await[0].clone();
+    // The Outpost another account shared with this caller: both listings report an
+    // endpoint on it, the Outpost-scoped one being the listing of exactly such an
+    // Outpost.
+    let outpost_id = shared_outpost(&router).await;
 
     // Three values of `CustomerOwnedIpv4Pool`, whose pattern (from
     // smithy_query(query="shape", shape="CreateEndpointRequest")) is
@@ -1642,10 +1680,11 @@ async fn a_coip_pool_is_required_by_customer_owned_ip_and_admitted_with_any_acce
     );
 }
 
-/// `ListSharedEndpoints` reports the endpoints of the Outpost its `OutpostId` names — the
-/// caller's own endpoints on that Outpost included, since `CreateEndpoint` and
-/// `DeleteEndpoint` are its related actions and operate on exactly those — and an Outpost
-/// the store does not hold is the modelled 404.
+/// `ListSharedEndpoints` reports the endpoints of the Outpost its `OutpostId` names, where
+/// that Outpost is one another account shared with this caller — the caller's own endpoints
+/// on it included, since `CreateEndpoint` and `DeleteEndpoint` are its related actions and
+/// operate on exactly those. An Outpost this account owns, and one the store does not hold
+/// at all, are each the modelled 404.
 #[tokio::test]
 async fn list_shared_endpoints_reports_the_endpoints_of_the_named_outpost() {
     let router = emulator();
@@ -1668,55 +1707,71 @@ async fn list_shared_endpoints_reports_the_endpoints_of_the_named_outpost() {
         );
         own_arns.push(string_at(&answer.body, "EndpointArn"));
     }
+    let shared_index = own_arns.len() - 1;
 
-    // Every Outpost the store holds: its own endpoint is listed under it and under no
-    // other Outpost, and the shared one also carries the endpoint another account owns.
-    for (index, outpost_id) in owned.iter().chain(std::iter::once(&shared)).enumerate() {
-        let answer = list_shared(&router, &format!("?outpostId={outpost_id}&maxResults=100")).await;
+    // The shared Outpost: every endpoint stored against it is reported — this account's
+    // own and the sharing account's — and no endpoint of any other Outpost is.
+    let answer = list_shared(&router, &format!("?outpostId={shared}&maxResults=100")).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {shared:?}: ListSharedEndpoints must answer 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    let arns: Vec<String> = answer
+        .endpoints()
+        .iter()
+        .map(|endpoint| string_at(endpoint, "EndpointArn"))
+        .collect();
+    assert!(
+        arns.contains(&own_arns[shared_index]),
+        "case {shared:?}: the endpoint this account created on it must be listed, got {arns:?}"
+    );
+    let elsewhere: Vec<&String> = own_arns
+        .iter()
+        .enumerate()
+        .filter(|(other, _)| *other != shared_index)
+        .map(|(_, arn)| arn)
+        .filter(|arn| arns.contains(arn))
+        .collect();
+    assert!(
+        elsewhere.is_empty(),
+        "case {shared:?}: an endpoint on another Outpost must not be listed, got {elsewhere:?}"
+    );
+    for endpoint in answer.endpoints() {
         assert_eq!(
-            answer.status, 200,
-            "case {outpost_id:?}: ListSharedEndpoints must answer 200, got {} with {:?}",
-            answer.status, answer.body
-        );
-        let arns: Vec<String> = answer
-            .endpoints()
-            .iter()
-            .map(|endpoint| string_at(endpoint, "EndpointArn"))
-            .collect();
-        assert!(
-            arns.contains(&own_arns[index]),
-            "case {outpost_id:?}: the endpoint this account created on it must be listed, \
-             got {arns:?}"
-        );
-        let elsewhere: Vec<&String> = own_arns
-            .iter()
-            .enumerate()
-            .filter(|(other, _)| *other != index)
-            .map(|(_, arn)| arn)
-            .filter(|arn| arns.contains(arn))
-            .collect();
-        assert!(
-            elsewhere.is_empty(),
-            "case {outpost_id:?}: an endpoint on another Outpost must not be listed, \
-             got {elsewhere:?}"
-        );
-        for endpoint in answer.endpoints() {
-            assert_eq!(
-                endpoint["OutpostsId"],
-                json!(outpost_id),
-                "case {outpost_id:?}: every endpoint reported is on the named Outpost, got {:?}",
-                endpoint["OutpostsId"]
-            );
-        }
-        // One endpoint of this account on every Outpost, plus the other account's on the
-        // one it shared.
-        let expected = 1 + usize::from(outpost_id == &shared);
-        assert_eq!(
-            arns.len(),
-            expected,
-            "case {outpost_id:?}: expected {expected} endpoint(s) on it, got {arns:?}"
+            endpoint["OutpostsId"],
+            json!(shared),
+            "case {shared:?}: every endpoint reported is on the named Outpost, got {:?}",
+            endpoint["OutpostsId"]
         );
     }
+    assert_eq!(
+        arns.len(),
+        2,
+        "case {shared:?}: expected this account's endpoint and the sharing account's, \
+         got {arns:?}"
+    );
+
+    // An Outpost this account OWNS has not been shared with it, so it is not one this
+    // operation reports endpoints for — even while it carries an endpoint of this
+    // account's that `ListEndpoints` does report.
+    for outpost_id in &owned {
+        let answer = list_shared(&router, &format!("?outpostId={outpost_id}&maxResults=100")).await;
+        assert_eq!(
+            (answer.status, answer.error_code()),
+            (404, "ResourceNotFoundException"),
+            "case {outpost_id:?}: an Outpost this account owns must answer 404, got {} with {:?}",
+            answer.status,
+            answer.body
+        );
+    }
+    let own = list_endpoints(&router, "?maxResults=100").await;
+    assert_eq!(
+        reported_arns(&own),
+        own_arns,
+        "this account's own listing must still report every endpoint it created, got {:?}",
+        own.body
+    );
 
     // Every form `OutpostId` admits, for an Outpost the store does not hold.
     for unknown in [UNKNOWN_OUTPOST_ID, "123456789012", "ec2"] {

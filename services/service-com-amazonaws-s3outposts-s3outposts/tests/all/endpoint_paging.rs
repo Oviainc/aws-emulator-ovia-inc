@@ -4,7 +4,8 @@
 //!
 //! `ListEndpoints` and `ListSharedEndpoints` differ only in which endpoints they report —
 //! the caller's own across every Outpost, versus every endpoint on the Outpost the request
-//! names. Everything else about the listing is one rule: the endpoints are served in the
+//! names, which is one another account shared with the caller. Everything else about the
+//! listing is one rule: the endpoints are served in the
 //! store's own `(OutpostId, EndpointId)` order, a page holds at most `MaxResults` of them,
 //! the `NextToken` an unfinished page carries is the `(OutpostId, EndpointId)` pair of the
 //! first endpoint it did NOT serve, and a `NextToken` this service never issued is refused
@@ -35,9 +36,9 @@ fn cursor_of(arn: &str) -> String {
     format!("{outpost_id}/{endpoint_id}")
 }
 
-/// The listings of the shared fixture that report ENDPOINTS: this account's own endpoints,
-/// an Outpost it owns and an Outpost shared with it — so each of the two endpoint
-/// listings, over sets of different sizes.
+/// The listings of the shared fixture that report ENDPOINTS: this account's own endpoints
+/// and an Outpost another account shared with it — so each of the two endpoint listings,
+/// over sets of different sizes.
 async fn endpoint_listings() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>, Vec<Listing>) {
     let (router, engine, listings) = listing_fixture().await;
     let endpoint_listings: Vec<Listing> = listings
@@ -52,7 +53,7 @@ async fn endpoint_listings() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>
 /// the first endpoint that page did not serve.
 ///
 /// The rows differ along both of the things the rule generalises over: which listing is
-/// walked (the account's own endpoints, an Outpost it owns, an Outpost shared with it — so
+/// walked (the account's own endpoints, and an Outpost another account shared with it — so
 /// each of the two operations, over sets of different sizes), and the page size, including
 /// `MaxResults` left out, both bounds of its published `@range(min: 0, max: 100)` and sizes
 /// between them.

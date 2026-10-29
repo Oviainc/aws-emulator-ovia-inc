@@ -11,9 +11,9 @@
 //! `ValidationException` naming itself.
 //!
 //! The rows are the fixture's listings: the Outpost inventory, this account's own
-//! endpoints, an Outpost it owns and an Outpost another account shared with it — so each
-//! operation, over sets of different sizes and both cursor forms. The oracle is the
-//! persisted records, read through the harness's own store readers.
+//! endpoints, and an Outpost another account shared with it — so each operation, over sets
+//! of different sizes and both cursor forms. The oracle is the persisted records, read
+//! through the harness's own store readers.
 
 use service_com_amazonaws_s3outposts_s3outposts::state::PAGE_LIMIT;
 

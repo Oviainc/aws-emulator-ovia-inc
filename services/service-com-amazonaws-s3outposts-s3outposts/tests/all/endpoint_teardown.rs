@@ -7,8 +7,9 @@
 //! transient `EndpointStatus` value that action puts it in, and still holding everything it
 //! committed — until the clock completes the action, and only then does the record
 //! disappear. For a deletion that value is `Deleting`, which the model enumerates beside
-//! `Pending`: inside the span the endpoint is a record like any other (both listings report
-//! it, its members do not move, another delete of it resolves, and the subnet, security
+//! `Pending`: inside the span the endpoint is a record like any other (every listing that
+//! serves its Outpost reports it, its members do not move, another delete of it resolves,
+//! and the subnet, security
 //! group and CIDR it holds are not free for a new endpoint), and past the span it is gone
 //! (no listing reports it, naming it is the modelled 404, and what it held is available
 //! again).
@@ -16,8 +17,10 @@
 //! The rows differ along what the rule generalises over: the status the endpoint was in
 //! when the delete arrived (one the clock had already made `Available`, one still
 //! `Pending`), how many times the delete is repeated inside the span, and which Outpost of
-//! the fixture the endpoint sits on. Every assertion goes through the router, so each row
-//! exercises routing, deserialization, the handler, the persisted state and serialization.
+//! the fixture the endpoint sits on — one this account owns, or one another account shared
+//! with it, which is also the Outpost the Outpost-scoped listing serves. Every assertion
+//! goes through the router, so each row exercises routing, deserialization, the handler,
+//! the persisted state and serialization.
 
 use std::time::{Duration, Instant};
 
@@ -26,7 +29,7 @@ use service_com_amazonaws_s3outposts_s3outposts::state::ENDPOINT_TRANSITION;
 
 use crate::endpoint_lifecycle::{
     create, delete_endpoint, emulator, endpoint_id_of, endpoint_with_arn, list_endpoints,
-    list_shared, owned_outposts, reported_arns, string_at,
+    list_shared, owned_outposts, reported_arns, shared_outpost, string_at,
 };
 
 /// The one text a reference under an `OutpostId` that does not resolve answers with,
@@ -45,7 +48,9 @@ enum Arrives {
 }
 
 /// One row of the table: what state the endpoint is in when the delete arrives, how many
-/// deletes are issued inside the teardown span, and which Outpost it sits on.
+/// deletes are issued inside the teardown span, and which Outpost it sits on — the two this
+/// account owns, or the one another account shared with it, which is also the Outpost the
+/// Outpost-scoped listing serves (`shared_endpoint_listing.rs`).
 #[derive(Debug, Clone, Copy)]
 struct Row {
     case: &'static str,
@@ -81,10 +86,10 @@ async fn a_deleted_endpoint_reports_deleting_until_the_clock_completes_the_teard
             outpost: 0,
         },
         Row {
-            case: "an endpoint still Pending when the delete arrives",
+            case: "an endpoint still Pending when the delete arrives, on a shared Outpost",
             arrives: Arrives::WhilePending,
             deletes: 1,
-            outpost: 0,
+            outpost: 2,
         },
         Row {
             case: "the delete repeated three times inside the span",
@@ -93,18 +98,24 @@ async fn a_deleted_endpoint_reports_deleting_until_the_clock_completes_the_teard
             outpost: 1,
         },
         Row {
-            case: "a Pending endpoint, the delete repeated inside the span",
+            case: "a Pending endpoint on a shared Outpost, the delete repeated inside the span",
             arrives: Arrives::WhilePending,
             deletes: 2,
-            outpost: 1,
+            outpost: 2,
         },
     ];
 
     for row in rows {
         // A fresh emulator per row, so each row's timing and store are its own.
         let router = emulator();
-        let outposts = owned_outposts(&router).await;
+        let mut outposts = owned_outposts(&router).await;
+        outposts.push(shared_outpost(&router).await);
+        let shared = outposts[outposts.len() - 1].clone();
         let outpost_id = outposts[row.outpost % outposts.len()].clone();
+        // The Outpost-scoped listing serves an Outpost another account shared with this
+        // caller, so a row on an Outpost this account owns reads the record through its
+        // own listing alone.
+        let on_shared_outpost = outpost_id == shared;
         let request = json!({
             "OutpostId": outpost_id,
             "SubnetId": "subnet-0d1e2f30415263748",
@@ -147,14 +158,23 @@ async fn a_deleted_endpoint_reports_deleting_until_the_clock_completes_the_teard
         }
 
         let listed = list_endpoints(&router, "?maxResults=100").await;
-        let shared = list_shared(&router, &outpost_query).await;
+        let on_outpost = if on_shared_outpost {
+            Some(list_shared(&router, &outpost_query).await)
+        } else {
+            None
+        };
         // Everything below is about the endpoint INSIDE the teardown span; a run slow
         // enough to have left it is not evidence either way, so it is asserted only while
         // the span is demonstrably still open.
         let inside = started.elapsed() < ENDPOINT_TRANSITION;
         if inside {
-            for (listing, answer) in [("ListEndpoints", &listed), ("ListSharedEndpoints", &shared)]
-            {
+            for (listing, answer) in [
+                ("ListEndpoints", Some(&listed)),
+                ("ListSharedEndpoints", on_outpost.as_ref()),
+            ] {
+                let Some(answer) = answer else {
+                    continue;
+                };
                 let endpoint = endpoint_with_arn(answer, &arn);
                 assert_eq!(
                     endpoint["Status"],
@@ -194,11 +214,18 @@ async fn a_deleted_endpoint_reports_deleting_until_the_clock_completes_the_teard
         }
 
         let after = list_endpoints(&router, "?maxResults=100").await;
-        let after_shared = list_shared(&router, &outpost_query).await;
+        let after_on_outpost = if on_shared_outpost {
+            Some(list_shared(&router, &outpost_query).await)
+        } else {
+            None
+        };
         for (listing, answer) in [
-            ("ListEndpoints", &after),
-            ("ListSharedEndpoints", &after_shared),
+            ("ListEndpoints", Some(&after)),
+            ("ListSharedEndpoints", after_on_outpost.as_ref()),
         ] {
+            let Some(answer) = answer else {
+                continue;
+            };
             assert!(
                 !reported_arns(answer).contains(&arn),
                 "case {:?}: {listing} must not report {arn} once the teardown completed, \

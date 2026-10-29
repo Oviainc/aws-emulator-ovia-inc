@@ -343,8 +343,8 @@ async fn an_outpost_reports_only_the_arns_its_members_patterns_admit() {
 }
 
 /// `CreateEndpoint` mints an `EndpointArn` only where `EndpointArn`'s pattern admits the
-/// Outpost the endpoint sits on; either way the endpoint is stored and both listings report
-/// it, carrying the very same ARN member the create answered with.
+/// Outpost the endpoint sits on; either way the endpoint is stored and the listings that
+/// serve its Outpost report it, carrying the very same ARN member the create answered with.
 #[tokio::test]
 async fn an_endpoint_reports_only_an_arn_its_pattern_admits() {
     let caller = engine::emulator_account_id().to_string();
@@ -400,14 +400,31 @@ async fn an_endpoint_reports_only_an_arn_its_pattern_admits() {
                 endpoint_arns_absent += 1;
             }
 
-            // Stored either way, and read back by both listings with the same ARN member.
-            for (listing, answer) in [
-                ("ListEndpoints", list_endpoints_in(&router, region).await),
-                (
+            // Stored either way, and read back with the same ARN member by the listing of
+            // this account's own endpoints — and, for an Outpost another account shared
+            // with this caller, by the Outpost-scoped listing too, which serves exactly
+            // those (`shared_endpoint_listing.rs`).
+            let mut answers: Vec<(&str, Answer)> =
+                vec![("ListEndpoints", list_endpoints_in(&router, region).await)];
+            match row.owner {
+                Owner::Sharing => answers.push((
                     "ListSharedEndpoints",
                     list_shared_in(&router, region, id).await,
-                ),
-            ] {
+                )),
+                Owner::Caller => {
+                    let refused = list_shared_in(&router, region, id).await;
+                    assert_eq!(
+                        (refused.status, refused.error_code()),
+                        (404, "ResourceNotFoundException"),
+                        "case {case:?}: an Outpost this account owns is not one \
+                         ListSharedEndpoints serves, got {} with {:?}",
+                        refused.status,
+                        refused.body
+                    );
+                }
+            }
+
+            for (listing, answer) in answers {
                 assert_eq!(
                     answer.status, 200,
                     "case {case:?}: {listing} must answer 200, got {} with {:?}",

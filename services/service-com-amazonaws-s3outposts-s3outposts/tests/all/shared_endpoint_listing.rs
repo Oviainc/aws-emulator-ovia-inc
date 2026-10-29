@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What `ListSharedEndpoints` reports, end to end over HTTP.
+//! Which Outposts `ListSharedEndpoints` serves, and what it reports for them, end to end
+//! over HTTP.
 //!
-//! The rule under test: the listing is scoped by the Outpost its `OutpostId` names and by
-//! nothing else — `OutpostId` is the only scoping member the model declares, and the
-//! operation documents "all endpoints associated with an Outpost", whose related actions
-//! `CreateEndpoint` and `DeleteEndpoint` operate on the caller's own endpoints. So every
-//! endpoint record stored against the named Outpost is reported, in the store's own order,
-//! and no endpoint of any other Outpost is — in particular an endpoint the calling account
-//! created on an Outpost another account shared with it is listed, not hidden.
+//! The rule under test: an operation whose documented subject is a resource reached through
+//! a cross-account share serves only resources ANOTHER account owns, so an Outpost the
+//! calling account owns is outside this listing's scope and is refused with the modelled
+//! `ResourceNotFoundException` (404), exactly like an Outpost the inventory does not hold;
+//! for an Outpost another account shared with the caller, every endpoint stored against it
+//! is reported — the caller's own included, since `CreateEndpoint` and `DeleteEndpoint` are
+//! its related actions and operate on exactly those — in the store's own order, and no
+//! endpoint of any other Outpost is.
 //!
 //! The oracle is the persisted records themselves: each case compares the listing with the
 //! endpoints the store holds for that Outpost, so no filter the handler invents can pass.
@@ -17,9 +19,23 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::endpoint_lifecycle::{
-    create, create_endpoints, emulator_with_engine, list_endpoints, list_shared, minimal_create,
-    owned_outposts, reported_arns, shared_outpost, string_at, Listing,
+    create, create_endpoints, create_in, emulator_holding_owned, emulator_with_engine,
+    list_endpoints, list_endpoints_in, list_shared, list_shared_in, minimal_create,
+    owned_outposts, reported_arns, shared_outpost, string_at, Answer, Listing,
+    SHARING_ACCOUNT_ID,
 };
+
+/// The one `ResourceNotFoundException$Message` an `OutpostId` this operation does not serve
+/// is answered with. Written out here rather than imported from the crate, so a wrong
+/// constant in the service cannot make these cases pass.
+const OUTPOST_NOT_SERVED: &str =
+    "The specified outpost does not exist, or does not have S3 capacity provisioned on it.";
+
+/// A THIRD account, neither the caller nor [`SHARING_ACCOUNT_ID`]: a second account that can
+/// share an Outpost, so no case passes by comparing against one other account id. A
+/// synthetic, non-routable placeholder in the same all-zero family as
+/// `engine::emulator_account_id`.
+const THIRD_ACCOUNT_ID: &str = "000000000002";
 
 /// Which Outpost of the fixture a case names: one of the two this account owns, or the one
 /// another account shared with it (which already carries that account's own endpoint).
@@ -29,6 +45,97 @@ enum Which {
     SecondOwned,
     Shared,
 }
+
+/// Who owns the Outpost of a row.
+#[derive(Debug, Clone, Copy)]
+enum Owner {
+    /// The account this emulator serves — an Outpost it owns, which no account shared with
+    /// it.
+    Caller,
+    /// Another account, which shared the Outpost with this caller.
+    Another(&'static str),
+}
+
+/// One row of the ownership table: an Outpost to provision, who owns it and the Region it
+/// is installed in.
+#[derive(Debug, Clone, Copy)]
+struct Row {
+    case: &'static str,
+    outpost_id: &'static str,
+    owner: Owner,
+    region: &'static str,
+    /// How many endpoints of this account the row stores on the Outpost before it reads.
+    endpoints: usize,
+}
+
+/// The rows span what the rule generalises over: who owns the Outpost (the caller, the
+/// sharing account, a third account), every branch of `OutpostId`'s
+/// `^(op-[a-f0-9]{17}|\d{12}|ec2)$` (from `smithy_query(query="shape", shape="OutpostId")`,
+/// the `ec2` and 12-digit branches the issue did not cite included), how many endpoints of
+/// this account sit on it (none, one, several) and the Region it is installed in.
+const ROWS: &[Row] = &[
+    Row {
+        case: "the op- branch, owned by this account",
+        outpost_id: "op-0a1b2c3d4e5f60718",
+        owner: Owner::Caller,
+        region: "us-east-1",
+        endpoints: 2,
+    },
+    Row {
+        case: "the op- branch, owned by this account, with no endpoint on it",
+        outpost_id: "op-1b2c3d4e5f6071829",
+        owner: Owner::Caller,
+        region: "eu-west-1",
+        endpoints: 0,
+    },
+    Row {
+        case: "the op- branch, shared by another account",
+        outpost_id: "op-2c3d4e5f607182930",
+        owner: Owner::Another(SHARING_ACCOUNT_ID),
+        region: "us-east-1",
+        endpoints: 2,
+    },
+    Row {
+        case: "the op- branch, shared by a third account, with no endpoint on it",
+        outpost_id: "op-3d4e5f6071829304a",
+        owner: Owner::Another(THIRD_ACCOUNT_ID),
+        region: "eu-west-1",
+        endpoints: 0,
+    },
+    Row {
+        case: "the ec2 branch, owned by this account",
+        outpost_id: "ec2",
+        owner: Owner::Caller,
+        region: "us-east-1",
+        endpoints: 1,
+    },
+    Row {
+        case: "the ec2 branch, shared by another account",
+        outpost_id: "ec2",
+        owner: Owner::Another(SHARING_ACCOUNT_ID),
+        region: "us-west-2",
+        endpoints: 3,
+    },
+    Row {
+        case: "the 12-digit branch, owned by this account",
+        outpost_id: "123456789012",
+        owner: Owner::Caller,
+        region: "us-east-1",
+        endpoints: 3,
+    },
+    Row {
+        case: "the 12-digit branch, shared by a third account",
+        outpost_id: "999999999999",
+        owner: Owner::Another(THIRD_ACCOUNT_ID),
+        region: "us-west-2",
+        endpoints: 1,
+    },
+];
+
+/// The queries a row is read with, so no answer depends on the page size: none at all (the
+/// model's `@default(0)`), one endpoint per page and the published ceiling of 100
+/// (`smithy_query(query="operation", operation="ListSharedEndpoints")`).
+const PAGE_SIZES: &[&str] = &["", "&maxResults=1", "&maxResults=100"];
 
 /// The `OutpostId` `which` names, discovered through `ListOutpostsWithS3` the way a client
 /// discovers it rather than hardcoded.
@@ -41,26 +148,183 @@ async fn outpost_id(router: &MultiServiceRouter, which: Which) -> String {
 }
 
 /// The listing of `outpost`, whose stored set is every endpoint record held against it,
-/// in the order the store keeps them — the answer every listing of that Outpost owes,
-/// whoever owns each record.
+/// in the order the store keeps them — the answer this listing owes for an Outpost it
+/// serves, whoever owns each record.
 fn stored_listing(outpost: &str) -> Listing {
     Listing::EndpointsOn(outpost.to_string())
 }
 
-/// The listing of an Outpost is exactly the endpoints stored against it — the calling
+/// The `SubnetId`s a listing reports, in the order it reported them. Each endpoint these
+/// cases create sits in its own subnet, so the subnet identifies the record whichever ARN
+/// members its Outpost's id branch admits (`arn_patterns.rs` is those members' subject).
+fn reported_subnets(answer: &Answer) -> Vec<String> {
+    answer
+        .endpoints()
+        .iter()
+        .map(|endpoint| string_at(endpoint, "SubnetId"))
+        .collect()
+}
+
+/// The subnet the `index`-th endpoint of a row sits in, in the 17-hex-digit width
+/// `SubnetId`'s `^subnet-([0-9a-f]{8}|[0-9a-f]{17})$` admits.
+fn row_subnet(row: usize, index: usize) -> String {
+    format!("subnet-{row:09x}{index:08x}")
+}
+
+/// Store `count` endpoints of this account on `outpost_id`, through the Region it is
+/// installed in, and answer the subnets they sit in.
+async fn endpoints_of_this_account(
+    router: &MultiServiceRouter,
+    region: &str,
+    outpost_id: &str,
+    row: usize,
+    count: usize,
+) -> Vec<String> {
+    let mut subnets = Vec::with_capacity(count);
+    for index in 0..count {
+        let subnet_id = row_subnet(row, index);
+        let answer = create_in(
+            router,
+            region,
+            json!({
+                "OutpostId": outpost_id,
+                "SubnetId": subnet_id,
+                "SecurityGroupId": format!("sg-{row:09x}{index:08x}"),
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "setup: creating an endpoint on {outpost_id} in {region} must answer 200, got {} \
+             with {:?}",
+            answer.status, answer.body
+        );
+        subnets.push(subnet_id);
+    }
+    subnets
+}
+
+/// The modelled 404 with exactly the one fixed text, carrying nothing of the request.
+fn assert_not_served(case: &str, answer: &Answer, outpost_id: &str) {
+    assert_eq!(
+        (answer.status, answer.error_code()),
+        (404, "ResourceNotFoundException"),
+        "case {case:?}: an Outpost this listing does not serve must be 404/\
+         ResourceNotFoundException, got {}/{:?} with {:?}",
+        answer.status,
+        answer.error_code(),
+        answer.body
+    );
+    assert_eq!(
+        answer.message(),
+        OUTPOST_NOT_SERVED,
+        "case {case:?}: expected Message {OUTPOST_NOT_SERVED:?}, got {:?}",
+        answer.message()
+    );
+    assert!(
+        !answer.message().contains(outpost_id),
+        "case {case:?}: the Message must not disclose the requested id {outpost_id:?}, got {:?}",
+        answer.message()
+    );
+}
+
+/// An Outpost another account shared with this caller is served and every endpoint stored
+/// against it is reported; an Outpost the calling account owns is not an Outpost this
+/// listing serves, and is the modelled 404 — whatever its id's branch, its Region, and
+/// however many endpoints of this account sit on it.
+#[tokio::test]
+async fn only_an_outpost_another_account_shared_is_one_this_listing_serves() {
+    for (index, row) in ROWS.iter().enumerate() {
+        let owner = match row.owner {
+            Owner::Caller => engine::emulator_account_id().to_string(),
+            Owner::Another(account) => account.to_string(),
+        };
+        // Its own emulator per row, holding exactly the row's Outpost, so what the listing
+        // answers is about that one record.
+        let (router, _engine) =
+            emulator_holding_owned(&[(row.outpost_id, owner.as_str(), row.region)]);
+        let stored = endpoints_of_this_account(
+            &router,
+            row.region,
+            row.outpost_id,
+            index,
+            row.endpoints,
+        )
+        .await;
+
+        for page in PAGE_SIZES {
+            let case = format!("{} read with {page:?}", row.case);
+            let query = format!("?outpostId={}{page}", row.outpost_id);
+            let answer = list_shared_in(&router, row.region, &query).await;
+
+            match row.owner {
+                Owner::Caller => assert_not_served(&case, &answer, row.outpost_id),
+                Owner::Another(_) => {
+                    assert_eq!(
+                        answer.status, 200,
+                        "case {case:?}: an Outpost another account shared with this caller must \
+                         be served, got {} with {:?}",
+                        answer.status, answer.body
+                    );
+                    // One page per `maxResults`, followed to the end: the whole set, in the
+                    // store's own order.
+                    let mut walked = reported_subnets(&answer);
+                    let mut token = answer.next_token();
+                    let mut pages = 1usize;
+                    while let Some(cursor) = token {
+                        let next =
+                            list_shared_in(&router, row.region, &format!("{query}&nextToken={cursor}"))
+                                .await;
+                        assert_eq!(
+                            next.status, 200,
+                            "case {case:?}: a page of this listing's own cursor must answer 200, \
+                             got {} with {:?}",
+                            next.status, next.body
+                        );
+                        walked.extend(reported_subnets(&next));
+                        pages += 1;
+                        assert!(
+                            pages <= row.endpoints + 1,
+                            "case {case:?}: paging must terminate, walked {walked:?}"
+                        );
+                        token = next.next_token();
+                    }
+                    assert_eq!(
+                        walked, stored,
+                        "case {case:?}: the listing must report every endpoint stored against \
+                         the Outpost, got {walked:?}"
+                    );
+                }
+            }
+        }
+
+        // Whichever answer the row got, this account's OWN listing still reports the
+        // endpoints it created: a refusal hides nothing else and stores nothing.
+        let own = list_endpoints_in(&router, row.region, "?maxResults=100").await;
+        assert_eq!(
+            reported_subnets(&own),
+            stored,
+            "case {:?}: this account's own listing must report the endpoints it created, got {:?}",
+            row.case,
+            own.body
+        );
+    }
+}
+
+/// The listing of a shared Outpost is exactly the endpoints stored against it — the calling
 /// account's own included.
 ///
-/// The rows differ along what the rule generalises over: which Outpost is named (one this
-/// account owns, and one another account shared with it), how many endpoints of this
-/// account are on it (none, one, several), and whether the Outpost also carries an endpoint
-/// this account does not own.
+/// The rows differ along what the rule generalises over: how many endpoints of this account
+/// are on the shared Outpost (none, one, several), beside the endpoint this account does not
+/// own that the Outpost already carries.
 #[tokio::test]
-async fn the_listing_of_an_outpost_is_every_endpoint_stored_against_it() {
+async fn the_listing_of_a_shared_outpost_is_every_endpoint_stored_against_it() {
     let cases = [
-        ("an owned Outpost with no endpoint at all", Which::FirstOwned, 0usize),
-        ("an owned Outpost with one endpoint of this account", Which::FirstOwned, 1),
-        ("an owned Outpost with three endpoints of this account", Which::SecondOwned, 3),
-        ("a shared Outpost carrying only another account's endpoint", Which::Shared, 0),
+        (
+            "a shared Outpost carrying only another account's endpoint",
+            Which::Shared,
+            0usize,
+        ),
         ("a shared Outpost with one endpoint of this account", Which::Shared, 1),
         ("a shared Outpost with four endpoints of this account", Which::Shared, 4),
     ];
@@ -105,6 +369,39 @@ async fn the_listing_of_an_outpost_is_every_endpoint_stored_against_it() {
             "case {case:?}: a listing that fits in one page carries no NextToken, got {:?}",
             answer.next_token()
         );
+    }
+}
+
+/// An endpoint the calling account created on an Outpost it OWNS is reported by this
+/// account's own listing and by nothing else: the Outpost-scoped listing does not serve
+/// that Outpost at all, so the endpoint is neither hidden from the caller nor reachable
+/// through the shared listing.
+///
+/// The rows differ along which owned Outpost of the fixture carries it and how many
+/// endpoints of this account sit on it.
+#[tokio::test]
+async fn an_endpoint_on_an_owned_outpost_is_reported_by_this_accounts_own_listing_only() {
+    for (index, (case, which, count)) in [
+        ("one endpoint on the first owned Outpost", Which::FirstOwned, 1usize),
+        ("three endpoints on the second owned Outpost", Which::SecondOwned, 3),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (router, _engine) = emulator_with_engine();
+        let outpost = outpost_id(&router, which).await;
+        let created = create_endpoints(&router, &outpost, count, index + 0x20).await;
+
+        let refused = list_shared(&router, &format!("?outpostId={outpost}&maxResults=100")).await;
+        assert_not_served(case, &refused, &outpost);
+
+        let own = reported_arns(&list_endpoints(&router, "?maxResults=100").await);
+        for arn in &created {
+            assert!(
+                own.contains(arn),
+                "case {case:?}: this account's own listing must report {arn}, got {own:?}"
+            );
+        }
     }
 }
 
@@ -179,9 +476,9 @@ async fn an_endpoint_created_on_a_shared_outpost_is_listed_with_its_stored_membe
     }
 }
 
-/// Paging an Outpost's listing walks that same set once, in that same order, whatever page
-/// size the caller asks for: the pages concatenated equal the single-page answer, and no
-/// page is longer than the size requested.
+/// Paging a shared Outpost's listing walks that same set once, in that same order, whatever
+/// page size the caller asks for: the pages concatenated equal the single-page answer, and
+/// no page is longer than the size requested.
 ///
 /// The rows differ along the page size, including `MaxResults` left out (the model's
 /// `@default(0)`, i.e. no preference) and the published ceiling of 100
