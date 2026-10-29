@@ -199,8 +199,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The store's own work holds this service's lock and contains no await, so the
+        // guard cannot outlive it: a lock over state shared between requests must not be
+        // held across the announcement below.
+        let output = self.publish_version(input)?;
+        // The state change it recorded, if the publish changed the version at all,
+        // announced on the account's default event bus.
+        crate::state::package_version_events::publish(ctx, &*self.engine).await;
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PublishPackageVersion<Eng> {
+    /// Store the asset this request publishes, and RECORD the state change it made to the
+    /// version — the whole of this operation's work on the store.
+    ///
+    /// Separate from the handler, and not `async`, because the announcement the handler
+    /// makes is an await: this is the critical section, and its end is where the store's
+    /// guard is released.
+    fn publish_version(
+        &self,
+        input: PublishPackageVersionInput,
+    ) -> Result<PublishPackageVersionOutput, PublishPackageVersionError> {
         // ------------------------------------------------------------------
         // Request-only rules, refused before the store is touched at all: a
         // rejected publish must leave nothing behind.
@@ -387,7 +409,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // upstream ingestion BLOCKED (`crate::state::Package::published`). A publish into a
         // package the repository already holds leaves its configuration alone: the controls
         // are chosen from how the package was created, and this one already exists.
-        let package = repository.packages.entry(key).or_insert_with(|| {
+        let package = repository.packages.entry(key.clone()).or_insert_with(|| {
             crate::state::Package::published(
                 &input.format,
                 input.namespace.as_deref(),
@@ -402,6 +424,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             crate::state::PACKAGE_VERSION_STATUS_PUBLISHED
         };
+
+        // What this publish did to the version, for the event that announces it: `None`
+        // when it changed nothing (the same asset, byte for byte, into a version that
+        // stays unfinished), because there is no state change to announce.
+        let mut announced: Option<(&'static str, crate::state::package_version_events::VersionChanges)> =
+            None;
 
         match package.versions.get_mut(&input.package_version) {
             // A version nobody has published yet: the asset creates it.
@@ -437,13 +465,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // API "takes" no `package.json` or `pom.xml`, so there is nothing
                         // for the metadata-sourced members to be read from.
                         manifest: None,
+                        // This publish is the first change of this version.
+                        sequence_number: 1,
                     },
                 );
+                announced = Some((
+                    crate::state::package_version_events::OPERATION_CREATED,
+                    crate::state::package_version_events::VersionChanges::published(1, false),
+                ));
             }
             // An unfinished version is still accepting assets.
             Some(existing)
                 if existing.status == crate::state::PACKAGE_VERSION_STATUS_UNFINISHED =>
             {
+                let mut assets_added = 0i64;
                 match existing.assets.get(&input.asset_name) {
                     // The same content under the same name: the publish already
                     // happened, so repeating it changes nothing. Compared by the stored
@@ -477,11 +512,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         }
                         refuse_if_store_is_full(stored_asset_bytes, &asset)?;
                         existing.assets.insert(input.asset_name.clone(), asset);
+                        assets_added = 1;
                     }
                 }
                 // The final asset — the one published without `unfinished` — closes the
                 // version.
+                let status_changed = existing.status != requested_status;
                 existing.status = requested_status.to_string();
+                // A publish that added an asset, or closed the version, CHANGED it; one
+                // that repeated an asset into a version that stays unfinished did not, and
+                // announces nothing.
+                if assets_added > 0 || status_changed {
+                    existing.advance_sequence();
+                    announced = Some((
+                        crate::state::package_version_events::OPERATION_UPDATED,
+                        crate::state::package_version_events::VersionChanges {
+                            assets_added,
+                            status_changed,
+                            ..crate::state::package_version_events::VersionChanges::default()
+                        },
+                    ));
+                }
             }
             // Every other status is a version that is no longer open: a published
             // version's content is immutable, and it cannot be reopened as unfinished.
@@ -519,7 +570,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        Ok(PublishPackageVersionOutput {
+        let output = PublishPackageVersionOutput {
             format: Some(package.format.clone()),
             namespace: package.namespace.clone(),
             package: Some(package.name.clone()),
@@ -527,7 +578,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version_revision: Some(stored_version.revision()),
             status: Some(stored_version.status.clone()),
             asset: Some(stored_asset.summary()),
-        })
+        };
+
+        // The state change this publish made, read back off the stored records so the
+        // event announces the same revision and status the response reports. Recorded
+        // under this request's lock and announced below, once it is released.
+        if let Some((operation, changes)) = announced {
+            let recorded = store
+                .domain(&input.domain, input.domain_owner.as_deref())
+                .and_then(|domain| domain.repositories.get(&input.repository))
+                .and_then(|repository| {
+                    let held = repository.packages.get(&key)?;
+                    let version = held.versions.get(&input.package_version)?;
+                    Some(crate::state::package_version_events::VersionChange::of(
+                        repository,
+                        held,
+                        version,
+                        operation,
+                        changes,
+                        ::std::time::SystemTime::now(),
+                    ))
+                });
+            if let Some(change) = recorded {
+                store.record_version_change(change);
+            }
+        }
+
+        Ok(output)
     }
 }
 

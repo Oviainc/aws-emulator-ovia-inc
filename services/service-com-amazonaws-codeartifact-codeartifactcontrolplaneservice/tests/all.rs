@@ -81,3 +81,5 @@ mod authorization_token_issuance;
 mod npm_registry_endpoint;
 #[path = "all/authorization_token_caller_binding.rs"]
 mod authorization_token_caller_binding;
+#[path = "all/package_version_state_change_events.rs"]
+mod package_version_state_change_events;

@@ -56,6 +56,20 @@ percent-encoding = "2.3"
 # The STREAMING read of an npm metadata document, so a dependency list is reported in the
 # order the document declares it whatever map type `serde_json` was built with.
 serde = { workspace = true }
+# The AWS SDK for EventBridge, driven over the in-process callback
+# (`OperationContext::callback`): CodeArtifact announces every package version state
+# change on the account's default event bus
+# (`state::package_version_events`). Only the generated client is needed — the emulator
+# supplies the transport, so the SDK's own HTTPS stack and runtime are left out.
+aws-sdk-eventbridge = { version = "1", default-features = false }
+
+[dev-dependencies]
+# EventBridge and SQS are mounted beside CodeArtifact on one engine in the integration
+# tests, because a package version state change is published onto the default event bus and
+# a rule on that bus delivers it to an SQS queue: without them mounted there is nothing for
+# the publication to reach.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

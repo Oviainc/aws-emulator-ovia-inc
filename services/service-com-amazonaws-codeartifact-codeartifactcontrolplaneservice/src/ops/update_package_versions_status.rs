@@ -204,8 +204,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The store's own work holds this service's lock and contains no await, so the
+        // guard cannot outlive it: a lock over state shared between requests must not be
+        // held across the announcement below.
+        let output = self.move_versions(input)?;
+        // The state changes it recorded: each version this call moved, announced on the
+        // account's default event bus.
+        crate::state::package_version_events::publish(ctx, &*self.engine).await;
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
+    UpdatePackageVersionsStatus<Eng>
+{
+    /// Move the versions this request names to the target status, and RECORD the state
+    /// change each move made — the whole of this operation's work on the store.
+    ///
+    /// Separate from the handler, and not `async`, because the announcement the handler
+    /// makes is an await: this is the critical section, and its end is where the store's
+    /// guard is released.
+    fn move_versions(
+        &self,
+        input: UpdatePackageVersionsStatusInput,
+    ) -> Result<UpdatePackageVersionsStatusOutput, UpdatePackageVersionsStatusError> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 UpdatePackageVersionsStatusErrorModeled::InternalServerException(
@@ -302,6 +326,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::std::collections::HashMap::new();
         let mut failed: ::std::collections::HashMap<String, PackageVersionError> =
             ::std::collections::HashMap::new();
+        // The versions this call MOVED, whose state change is announced below.
+        let mut changed: Vec<String> = Vec::new();
 
         let revisions = input.version_revisions.unwrap_or_default();
 
@@ -392,7 +418,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // The write: the new status is COMMITTED to the stored version, so
             // `DescribePackageVersion` and `ListPackageVersions` report it from here on.
+            // A version already in the target status is left as it is and announces
+            // nothing: its state did not change.
+            let moved = stored.status != input.target_status;
             stored.status = input.target_status.clone();
+            if moved {
+                stored.advance_sequence();
+                changed.push(version.clone());
+            }
             successful.insert(
                 version.clone(),
                 SuccessfulPackageVersionInfo {
@@ -405,10 +438,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        Ok(UpdatePackageVersionsStatusOutput {
+        let output = UpdatePackageVersionsStatusOutput {
             successful_versions: Some(successful),
             failed_versions: Some(failed),
-        })
+        };
+
+        // A status move is a state change of the version it moved, announced with the
+        // status and revision the move left it at — read back off the stored records.
+        let mut changes: Vec<crate::state::package_version_events::VersionChange> = Vec::new();
+        if let Some(repository) = store
+            .domain(&input.domain, input.domain_owner.as_deref())
+            .and_then(|domain| domain.repositories.get(&input.repository))
+        {
+            if let Some(held) = repository.packages.get(&key) {
+                for version in changed {
+                    if let Some(stored) = held.versions.get(&version) {
+                        changes.push(crate::state::package_version_events::VersionChange::of(
+                            repository,
+                            held,
+                            stored,
+                            crate::state::package_version_events::OPERATION_UPDATED,
+                            crate::state::package_version_events::VersionChanges::status_moved(),
+                            ::std::time::SystemTime::now(),
+                        ));
+                    }
+                }
+            }
+        }
+        for change in changes {
+            store.record_version_change(change);
+        }
+
+        Ok(output)
     }
 }
 

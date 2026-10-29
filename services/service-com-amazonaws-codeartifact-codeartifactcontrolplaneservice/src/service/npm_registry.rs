@@ -52,18 +52,20 @@
 //!   protocols (a PyPI index, a Maven repository), each of which is its own body of
 //!   behaviour; a request under another format's path is not claimed here at all rather
 //!   than answered in npm's envelope.
-//! * No upstream or external-connection resolution: a packument and a tarball are answered
-//!   out of the addressed repository's own records. Ingesting a version from an upstream
-//!   repository or a public registry is the behaviour of
-//!   `AssociateExternalConnection`/`upstreams`, and belongs with the issue that owns it.
+//! * No EXTERNAL-connection resolution: a package this domain holds nowhere is not fetched
+//!   from a public registry, which is the behaviour of `AssociateExternalConnection` and
+//!   belongs with the issue that owns it. UPSTREAM repositories inside the domain ARE
+//!   resolved, and what they resolve is retained here ([`retain_from_upstreams`]).
 
 use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use ::aws_smithy_types::body::SdkBody;
 use ::serde_json::{json, Map, Value};
+use ::std::sync::Arc;
 use ::std::time::SystemTime;
 
 use ::service_common::data_plane_addressing::{first_segment, host_only, names_a_service};
 
+use crate::state::package_version_events::{VersionChange, VersionChanges, OPERATION_CREATED};
 use crate::state::{
     service_state, Asset, ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState as CaState,
     Package, PackageVersion,
@@ -146,9 +148,14 @@ pub fn claims_request<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest)
 
 /// Answer a request this plane claimed, out of the records the control plane holds.
 ///
-/// Reached from `Service::override_routing_error` — which the router consults BEFORE it
-/// authenticates, which is what lets a client carrying an npm bearer token rather than a
+/// Reached from the ONE operation this service serves a repository endpoint's traffic with
+/// ([`NpmRegistryEndpoint`]), which the routing seam resolves before the request is
+/// authenticated — which is what lets a client carrying an npm bearer token rather than a
 /// SigV4 signature be answered at all.
+///
+/// Every state change it makes is RECORDED on the store
+/// ([`CaState::record_version_change`]); the operation announces them once this function
+/// has returned and the store's lock is released.
 pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtResponse {
     let uri = parsed_uri(req.uri());
     let addressed = Addressed::of_request(req, &uri);
@@ -202,6 +209,22 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
     };
     if let Some(refusal) = policy_refusal(&state.lock(), &resolved, &principal, action) {
         return rendered(&refusal);
+    }
+
+    // A READ of a package the addressed repository does not hold is served from the
+    // repository's upstreams, and what they resolve is retained here before it is read, so
+    // every answer below comes out of the addressed repository's own records.
+    match &request {
+        NpmRequest::Packument(package)
+        | NpmRequest::Tarball(package, _)
+        | NpmRequest::ReadDistTags(package) => {
+            retain_from_upstreams(&mut state.lock(), &resolved, package, now);
+        }
+        NpmRequest::Ping
+        | NpmRequest::Publish(_)
+        | NpmRequest::SetDistTag(..)
+        | NpmRequest::DeleteDistTag(..)
+        | NpmRequest::UnencodedScope(_) => {}
     }
 
     let served = match request {
@@ -1103,6 +1126,243 @@ fn held_package<'s>(
         )
 }
 
+// ---------------------------------------------------------------------------
+// Upstream repositories
+// ---------------------------------------------------------------------------
+
+/// Retain in the ADDRESSED repository every version of `package` that a repository it
+/// reaches through its upstream chain holds and it does not.
+///
+/// A CodeArtifact repository resolves a package through its upstream repositories, and a
+/// version found in one is COPIED into the repository that was asked for it, where it is
+/// retained — so the next request is served by that repository itself, and keeps being
+/// served from it after the upstream is detached (AWS CodeArtifact user guide, *Working
+/// with upstream repositories*). Retaining is therefore what a request for a package the
+/// repository does not hold DOES, not a side effect of reading one: it runs before the
+/// answer, and every answer is then read out of the addressed repository's own records.
+///
+/// The search is breadth first over the chain, each repository in its own upstream order,
+/// so the nearest copy is the one retained; the copy is made in the repository the request
+/// addressed, and an intermediate hop retains nothing because nothing was asked of it.
+///
+/// Nothing is retained when the addressed repository already holds the versions, when its
+/// own origin control blocks upstream ingestion for the package
+/// ([`Package::upstream_allowed`]), when no reachable repository holds a downloadable
+/// version, or when the copy would take this emulator past the content it may retain
+/// ([`crate::state::MAX_STORED_ASSET_BYTES`]). In each case the answer is read out of the
+/// addressed repository alone, as it was.
+fn retain_from_upstreams(
+    store: &mut CaState,
+    resolved: &Resolved,
+    package: &NpmPackage,
+    now: SystemTime,
+) {
+    let key = crate::state::package_key(
+        PACKAGE_FORMAT_NPM,
+        package.namespace.as_deref(),
+        &package.name,
+    );
+
+    // What there is to retain, read as OWNED records so the store can be taken mutably
+    // below without this reading borrow still being alive.
+    let Some(domain) = store.domain(&resolved.domain, Some(&resolved.domain_owner)) else {
+        return;
+    };
+    let Some(addressed) = domain.repositories.get(&resolved.repository) else {
+        return;
+    };
+    let held = addressed.packages.get(&key);
+    if held.is_some_and(|held| !held.upstream_allowed()) {
+        return;
+    }
+    let already: ::std::collections::BTreeSet<String> = held
+        .map(|held| held.versions.keys().cloned().collect())
+        .unwrap_or_default();
+    let resolved_upstream = upstream_chain(domain, &resolved.repository)
+        .into_iter()
+        .filter_map(|name| domain.repositories.get(&name))
+        .find_map(|upstream| {
+            let candidate = upstream.packages.get(&key)?;
+            // Only a version whose content this repository would serve is worth a copy:
+            // an `Archived` or `Disposed` version's assets are not downloadable, so a copy
+            // of one would answer nothing.
+            let versions: Vec<PackageVersion> = candidate
+                .versions
+                .values()
+                .filter(|version| {
+                    downloadable(&version.status) && !already.contains(&version.version)
+                })
+                .cloned()
+                .collect();
+            let tags: Vec<(String, String)> = candidate
+                .dist_tags
+                .iter()
+                .map(|(tag, version)| (tag.clone(), version.clone()))
+                .collect();
+            (!versions.is_empty()).then_some((upstream.name.clone(), versions, tags))
+        });
+    let Some((upstream_name, versions, tags)) = resolved_upstream else {
+        return;
+    };
+    let incoming: i64 = versions
+        .iter()
+        .map(|version| {
+            version
+                .asset_size_bytes()
+                .saturating_add(version.manifest_size_bytes())
+        })
+        .sum();
+    if store
+        .stored_content_bytes()
+        .saturating_add(incoming)
+        > crate::state::MAX_STORED_ASSET_BYTES
+    {
+        ::tracing::warn!(
+            domain = %resolved.domain,
+            repository = %resolved.repository,
+            package = %package.display_name(),
+            "this emulator already retains the package content it may hold, so the \
+             versions resolved from an upstream repository are not retained"
+        );
+        return;
+    }
+
+    let Some(repository) = store
+        .domain_mut(&resolved.domain, Some(&resolved.domain_owner))
+        .and_then(|domain| domain.repositories.get_mut(&resolved.repository))
+    else {
+        return;
+    };
+    if !repository.packages.contains_key(&key)
+        && repository.packages.len() >= crate::state::MAX_PACKAGES_PER_REPOSITORY
+    {
+        return;
+    }
+    // A package record this retention CREATES carries the controls CodeArtifact sets for a
+    // package that came to exist by upstream ingestion: ingestion allowed, publishing
+    // blocked.
+    let destination = repository.packages.entry(key).or_insert_with(|| {
+        Package::ingested(
+            PACKAGE_FORMAT_NPM,
+            package.namespace.as_deref(),
+            &package.name,
+        )
+    });
+    let room = crate::state::MAX_PACKAGE_VERSIONS_PER_PACKAGE
+        .saturating_sub(destination.versions.len());
+    let mut retained: Vec<String> = Vec::new();
+    for version in versions.into_iter().take(room) {
+        let number = version.version.clone();
+        destination.versions.insert(
+            number.clone(),
+            // The copy keeps the ORIGIN of the version it copies: a version's origin is
+            // where it entered the DOMAIN, which is the repository it was published into,
+            // not the one that retained it. Its own change count starts here, because this
+            // is the first change of this repository's copy.
+            PackageVersion {
+                sequence_number: 1,
+                ..version
+            },
+        );
+        retained.push(number);
+    }
+    // The distribution tags the upstream carries for the versions that were retained: a
+    // tag is how a client resolves "the latest version", and it resolves it against the
+    // repository it asked.
+    for (tag, version) in tags {
+        let new_tag = !destination.dist_tags.contains_key(&tag);
+        if new_tag && destination.dist_tags.len() >= crate::state::MAX_DIST_TAGS_PER_PACKAGE {
+            break;
+        }
+        if destination.versions.contains_key(&version) {
+            destination.dist_tags.insert(tag, version);
+        }
+    }
+    ::tracing::info!(
+        domain = %resolved.domain,
+        repository = %resolved.repository,
+        upstream = %upstream_name,
+        package = %package.display_name(),
+        versions = retained.len(),
+        "a repository retained package versions resolved from an upstream repository"
+    );
+    record_created(store, resolved, package, &retained, now);
+}
+
+/// Every repository of `domain` that the repository `from` reaches through its upstream
+/// chain, nearest first and each named once.
+///
+/// Breadth first, in each repository's own upstream order, because that is the order a
+/// repository's upstreams are searched in and a nearer copy wins over a further one. The
+/// visited set is what makes a chain that names a repository twice (or loops back) stop,
+/// so the walk is bounded by the repositories the domain holds.
+fn upstream_chain(domain: &crate::state::Domain, from: &str) -> Vec<String> {
+    let mut seen: ::std::collections::BTreeSet<String> =
+        ::std::collections::BTreeSet::from([from.to_string()]);
+    let mut frontier: ::std::collections::VecDeque<String> =
+        ::std::collections::VecDeque::from([from.to_string()]);
+    let mut chain: Vec<String> = Vec::new();
+    while let Some(name) = frontier.pop_front() {
+        let Some(repository) = domain.repositories.get(&name) else {
+            continue;
+        };
+        for upstream in &repository.upstreams {
+            let Some(next) = upstream.repository_name.as_deref() else {
+                continue;
+            };
+            if !seen.insert(next.to_string()) {
+                continue;
+            }
+            chain.push(next.to_string());
+            frontier.push_back(next.to_string());
+        }
+    }
+    chain
+}
+
+/// Record the state change each version in `versions` just underwent in the addressed
+/// repository: it came to exist there, whether by a publish into it or by a retention from
+/// an upstream.
+///
+/// Read back off the STORED record, so the revision, status and sequence number the event
+/// announces are the ones a later `DescribePackageVersion` reports for the same version.
+/// A version the store does not hold contributes nothing: there is no change to announce.
+fn record_created(
+    store: &mut CaState,
+    resolved: &Resolved,
+    package: &NpmPackage,
+    versions: &[String],
+    now: SystemTime,
+) {
+    let mut changes: Vec<VersionChange> = Vec::new();
+    if let Some(repository) = store
+        .domain(&resolved.domain, Some(&resolved.domain_owner))
+        .and_then(|domain| domain.repositories.get(&resolved.repository))
+    {
+        if let Some(held) = repository.package(
+            PACKAGE_FORMAT_NPM,
+            package.namespace.as_deref(),
+            &package.name,
+        ) {
+            for version in versions {
+                if let Some(stored) = held.versions.get(version) {
+                    changes.push(VersionChange::of(
+                        repository,
+                        held,
+                        stored,
+                        OPERATION_CREATED,
+                        VersionChanges::published(stored.assets.len(), stored.manifest.is_some()),
+                        now,
+                    ));
+                }
+            }
+        }
+    }
+    for change in changes {
+        store.record_version_change(change);
+    }
+}
+
 /// `SystemTime` as RFC 3339, the spelling a packument's `time` map carries.
 fn rfc3339(at: SystemTime) -> Option<String> {
     ::aws_smithy_types::DateTime::from(at)
@@ -1255,6 +1515,8 @@ fn publish(
                 // the version's manifest rather than as an asset: it is what every member
                 // read off a version's metadata is read from.
                 manifest: Some(published.manifest.clone()),
+                // This publish is the first change of this version.
+                sequence_number: 1,
             },
         );
     }
@@ -1279,6 +1541,13 @@ fn publish(
         versions = versions.len(),
         "a package manager published npm package versions over the repository endpoint"
     );
+    // Every version this publish created is a state change of that version, announced on
+    // the account's default event bus once this request has released the store.
+    let created: Vec<String> = versions
+        .iter()
+        .map(|published| published.version.clone())
+        .collect();
+    record_created(store, resolved, package, &created, now);
     Served::json(
         200,
         &json!({ "ok": true, "success": true, "id": package.display_name() }),
@@ -1502,6 +1771,67 @@ fn rendered(served: &Served) -> RtResponse {
         }
     }
     response
+}
+
+// ---------------------------------------------------------------------------
+// The operation a repository endpoint's traffic is served as
+// ---------------------------------------------------------------------------
+
+/// The ONE operation this service serves a repository endpoint's own traffic with.
+///
+/// A repository endpoint's traffic names no modelled operation — no modelled operation is
+/// bound under a repository endpoint's path — so the service RESOLVES it to this one
+/// ([`crate::service::EmulatedService::override_operation`]) rather than letting it fall
+/// through to a routing refusal. Being an operation is what gives the npm plane the two
+/// things a routing refusal cannot have:
+///
+/// * the request's own callback into this emulator, so the package version state changes a
+///   publish or a retention committed are announced on the account's default event bus
+///   ([`crate::state::package_version_events`]) the way every other service announces its
+///   own events;
+/// * `auth_schemes` of its own, which is what says this request is NOT SigV4-signed: the
+///   credential an npm client presents is the bearer token `GetAuthorizationToken` minted,
+///   resolved by [`serve`] against the tokens this service remembers minting, so the
+///   framework has no signature to verify and refuses nothing before the handler runs.
+pub struct NpmRegistryEndpoint<Eng> {
+    /// The SAME shared engine every operation of this service holds: a version published
+    /// over this endpoint is a version of the repository the control plane describes.
+    engine: Arc<Eng>,
+}
+
+impl<Eng> NpmRegistryEndpoint<Eng> {
+    /// Build the endpoint's operation from the shared engine.
+    pub fn new(engine: Arc<Eng>) -> Self {
+        Self { engine }
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ::smithy_server_runtime::ErasedOperation
+    for NpmRegistryEndpoint<Eng>
+{
+    fn run<'r>(
+        &'r self,
+        _svc: &'r dyn ::smithy_server_runtime::Service,
+        req: &'r RtRequest,
+        ctx: &'r ::smithy_server_runtime::OperationContext<'r>,
+    ) -> ::smithy_server_runtime::BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // The answer is composed with no store lock held past it — [`serve`] takes and
+            // releases the guard inside itself — so the announcement that follows cannot
+            // hold this request's own store.
+            let response = serve(&*self.engine, req);
+            crate::state::package_version_events::publish(ctx, &*self.engine).await;
+            response
+        })
+    }
+
+    /// Served UNSIGNED: an npm client presents the repository's bearer token, not a SigV4
+    /// signature, so there is no signature for the framework to verify. The credential is
+    /// not skipped — [`serve`] resolves the presented token against the tokens this
+    /// service minted and answers `401` for anything else.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
 }
 
 #[cfg(test)]

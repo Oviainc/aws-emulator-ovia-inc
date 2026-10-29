@@ -49,8 +49,9 @@
 //!   and answered `404 UnknownService` for the one address this service told the client to
 //!   use. [`can_handle`](Service::can_handle) also claims a request addressed to a
 //!   repository endpoint this service holds, and
-//!   [`override_routing_error`](Service::override_routing_error) answers it out of the same
-//!   package and asset records the control plane writes.
+//!   [`override_operation`](Service::override_operation) resolves it to the one operation
+//!   that serves it ([`npm_registry::NpmRegistryEndpoint`]), out of the same package and
+//!   asset records the control plane writes.
 //! - [`npm_manifest`] — the one reading of an npm metadata document, which is where every
 //!   member this service reports off one comes from.
 //! - [`token_authorization`] — whether IAM lets the caller mint a repository bearer
@@ -165,10 +166,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The SAME shared engine the generated entry threads into every operation.
     ///
     /// Held here because a repository ENDPOINT's own traffic ([`npm_registry`]) is claimed
-    /// by `can_handle` and served from `override_routing_error`, neither of which is an
-    /// operation with a `self.engine` of its own: both must read the one store the
-    /// control-plane operations write, not a second copy.
+    /// by `can_handle`, which is not an operation with a `self.engine` of its own and must
+    /// read the one store the control-plane operations write, not a second copy.
     engine: Arc<Eng>,
+    /// The one operation a repository endpoint's own traffic is served as
+    /// ([`npm_registry::NpmRegistryEndpoint`]), built from that same engine and resolved by
+    /// [`override_operation`](Service::override_operation).
+    npm_registry_endpoint: npm_registry::NpmRegistryEndpoint<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -178,6 +182,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            npm_registry_endpoint: npm_registry::NpmRegistryEndpoint::new(Arc::clone(&engine)),
             engine,
         }
     }
@@ -220,7 +225,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        //
+        // A repository ENDPOINT's own traffic is exactly such a request: it addresses the
+        // DOMAIN's published host and speaks npm's protocol, so no modelled operation's
+        // route can name it. It is resolved to the one operation that serves it, which is
+        // what gives that plane an operation's own callback into this emulator (the
+        // package version state changes a publish or a retention commits are announced on
+        // the account's default event bus) and its own auth schemes — the credential it
+        // carries is the repository's bearer token, not a SigV4 signature.
+        if npm_registry::claims_request(&*self.engine, req) {
+            return Some(&self.npm_registry_endpoint);
+        }
         None
     }
 
@@ -263,13 +278,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501).
         //
-        // A repository endpoint's own traffic is exactly that case by construction — no
-        // modelled operation is bound under a repository endpoint's path — so this is where
-        // it is served, BEFORE authentication, which is what lets a package manager
-        // presenting an npm bearer token rather than a SigV4 signature be answered at all.
-        if npm_registry::claims_request(&*self.engine, req) {
-            return Some(npm_registry::serve(&*self.engine, req));
-        }
+        // A repository endpoint's own traffic does not reach here: `override_operation`
+        // resolves it to the operation that serves it, ahead of the generated routing
+        // table and of authentication.
+        let _ = req;
         None
     }
 

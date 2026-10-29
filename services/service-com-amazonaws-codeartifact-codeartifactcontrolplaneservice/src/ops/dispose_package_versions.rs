@@ -198,8 +198,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The store's own work holds this service's lock and contains no await, so the
+        // guard cannot outlive it: a lock over state shared between requests must not be
+        // held across the announcement below.
+        let output = self.dispose_versions(input)?;
+        // The state changes it recorded: each version this call disposed, announced on the
+        // account's default event bus.
+        crate::state::package_version_events::publish(ctx, &*self.engine).await;
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DisposePackageVersions<Eng> {
+    /// Dispose the versions this request names, and RECORD the state change each disposal
+    /// made — the whole of this operation's work on the store.
+    ///
+    /// Separate from the handler, and not `async`, because the announcement the handler
+    /// makes is an await: this is the critical section, and its end is where the store's
+    /// guard is released.
+    fn dispose_versions(
+        &self,
+        input: DisposePackageVersionsInput,
+    ) -> Result<DisposePackageVersionsOutput, DisposePackageVersionsError> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DisposePackageVersionsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -264,6 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::std::collections::HashMap::new();
         let mut failed: ::std::collections::HashMap<String, PackageVersionError> =
             ::std::collections::HashMap::new();
+        // The versions this call disposed, and how many assets each one lost — the state
+        // change each disposal announces.
+        let mut disposed: Vec<(String, usize)> = Vec::new();
 
         let revisions = input.version_revisions.unwrap_or_default();
 
@@ -332,8 +357,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // stored version, so `DescribePackageVersion` reports a disposed version with
             // no assets from here on, and the domain's derived `assetSizeBytes` — summed
             // from the assets themselves — drops by what they held.
+            let assets_removed = stored.assets.len();
+            let status_changed = stored.status != crate::state::PACKAGE_VERSION_STATUS_DISPOSED;
             stored.assets.clear();
             stored.status = crate::state::PACKAGE_VERSION_STATUS_DISPOSED.to_string();
+            if assets_removed > 0 || status_changed {
+                stored.advance_sequence();
+                disposed.push((version.clone(), assets_removed));
+            }
             successful.insert(
                 version.clone(),
                 SuccessfulPackageVersionInfo {
@@ -345,10 +376,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        Ok(DisposePackageVersionsOutput {
+        let output = DisposePackageVersionsOutput {
             successful_versions: Some(successful),
             failed_versions: Some(failed),
-        })
+        };
+
+        // A disposal is a state change of the version it disposed: its assets are gone and
+        // its status moved, which is what the event's `changes` states. Read back off the
+        // stored records, so the revision announced is the one the disposal left.
+        let mut changes: Vec<crate::state::package_version_events::VersionChange> = Vec::new();
+        if let Some(repository) = store
+            .domain(&input.domain, input.domain_owner.as_deref())
+            .and_then(|domain| domain.repositories.get(&input.repository))
+        {
+            if let Some(held) = repository.packages.get(&key) {
+                for (version, assets_removed) in disposed {
+                    if let Some(stored) = held.versions.get(&version) {
+                        changes.push(crate::state::package_version_events::VersionChange::of(
+                            repository,
+                            held,
+                            stored,
+                            crate::state::package_version_events::OPERATION_UPDATED,
+                            crate::state::package_version_events::VersionChanges {
+                                assets_removed: i64::try_from(assets_removed)
+                                    .unwrap_or(i64::MAX),
+                                status_changed: true,
+                                ..crate::state::package_version_events::VersionChanges::default()
+                            },
+                            ::std::time::SystemTime::now(),
+                        ));
+                    }
+                }
+            }
+        }
+        for change in changes {
+            store.record_version_change(change);
+        }
+
+        Ok(output)
     }
 }
 

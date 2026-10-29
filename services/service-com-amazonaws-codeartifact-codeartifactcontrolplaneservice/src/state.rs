@@ -15,7 +15,7 @@
 //! `repositoryCount`, a package group's `parent` and each origin restriction's
 //! `effectiveMode` above all — can never go stale against the records it summarises.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
@@ -27,6 +27,13 @@ use crate::ops::types::{
     RepositorySummary, ResourcePolicy, Tag, UpstreamRepositoryInfo, ValidationException,
     PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES,
 };
+
+/// The event a package version's state change announces, and how it reaches the account's
+/// default event bus. A state change is RECORDED on this store
+/// ([`ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState::record_version_change`])
+/// by whatever changed the version, and published from there once the store's lock is
+/// released, so every plane that changes a version announces it the same way.
+pub mod package_version_events;
 
 /// This service's SigV4 signing name, which is also the service segment of every ARN
 /// it mints (`arn:aws:codeartifact:...`).
@@ -342,6 +349,15 @@ pub struct ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState {
     /// this map: the credential is this service's own, so this service is what resolves
     /// it. Bounded by [`MAX_AUTHORIZATION_TOKENS`].
     pub authorization_tokens: BTreeMap<String, AuthorizationToken>,
+    /// The package-version state changes this service has committed and not yet announced,
+    /// oldest first.
+    ///
+    /// A change is recorded here while this store's lock is held and announced after it is
+    /// released ([`package_version_events`]), which is what keeps the in-process call into
+    /// the event bus off the critical section. A ring bounded by
+    /// [`package_version_events::MAX_PENDING_VERSION_EVENTS`] — see
+    /// [`Self::record_version_change`], the one place it grows.
+    pub pending_version_changes: VecDeque<package_version_events::VersionChange>,
 }
 
 impl ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState {
@@ -441,6 +457,36 @@ impl ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState {
                 expires_at,
             },
         );
+    }
+
+    /// Remember that a package version's state changed, for the event that announces it.
+    ///
+    /// Called with this store's lock held, by whatever made the change — so the npm data
+    /// plane and every control-plane operation that creates, moves or removes a version
+    /// record it the same way. The oldest records make room once the queue is at
+    /// [`package_version_events::MAX_PENDING_VERSION_EVENTS`], which only an emulator with
+    /// nothing draining the queue ever reaches.
+    pub fn record_version_change(&mut self, change: package_version_events::VersionChange) {
+        while self.pending_version_changes.len()
+            >= package_version_events::MAX_PENDING_VERSION_EVENTS
+        {
+            if self.pending_version_changes.pop_front().is_none() {
+                break;
+            }
+        }
+        self.pending_version_changes.push_back(change);
+    }
+
+    /// Take up to `limit` recorded changes off the queue, oldest first.
+    ///
+    /// Moving them out is what makes an announcement happen once: a change this returns is
+    /// no longer on the queue, so a second drain cannot publish it again.
+    pub fn take_pending_version_changes(
+        &mut self,
+        limit: usize,
+    ) -> Vec<package_version_events::VersionChange> {
+        let taken = self.pending_version_changes.len().min(limit);
+        self.pending_version_changes.drain(..taken).collect()
     }
 
     /// The record of the bearer credential `token`, when this service minted it and the
@@ -1537,6 +1583,25 @@ impl Package {
         }
     }
 
+    /// A package record created because a version was INGESTED into the repository from an
+    /// upstream rather than published into it: publishing is blocked and upstream
+    /// ingestion stays allowed.
+    ///
+    /// The mirror image of [`Self::published`], chosen for the same reason: the controls
+    /// follow from how the package came to exist. A package name that exists in a
+    /// repository because it was resolved from an upstream must not also be publishable
+    /// directly into it, or a publisher could substitute its own content for the
+    /// dependency a consumer already resolves from upstream.
+    pub fn ingested(format: &str, namespace: Option<&str>, name: &str) -> Self {
+        Self {
+            origin_restrictions: PackageOriginRestrictions {
+                publish: ORIGIN_RESTRICTION_BLOCK.to_string(),
+                upstream: ORIGIN_RESTRICTION_ALLOW.to_string(),
+            },
+            ..Self::new(format, namespace, name)
+        }
+    }
+
     /// The modelled `PackageSummary` for this record — what the package `List*`
     /// operations return.
     pub fn summary(&self) -> PackageSummary {
@@ -1558,6 +1623,16 @@ impl Package {
     /// Whether origin control permits publishing a version into this package.
     pub fn publish_allowed(&self) -> bool {
         self.origin_restrictions.publish != ORIGIN_RESTRICTION_BLOCK
+    }
+
+    /// Whether origin control permits a version of this package being INGESTED into the
+    /// repository from elsewhere — an upstream repository or an external connection — as
+    /// `PutPackageOriginConfiguration`'s `upstream` restriction sets it.
+    ///
+    /// The companion of [`Self::publish_allowed`]: the two restrictions decide the two
+    /// ways a version comes to exist in a repository, so they are read the same way.
+    pub fn upstream_allowed(&self) -> bool {
+        self.origin_restrictions.upstream != ORIGIN_RESTRICTION_BLOCK
     }
 
     /// `defaultDisplayVersion`: the version of this package a client should DISPLAY, or
@@ -1636,6 +1711,13 @@ pub struct PackageVersion {
     /// the metadata file for the package format"). It is not an ASSET: the format decides
     /// what a version's assets are, and for npm that is the tarball alone.
     pub manifest: Option<String>,
+    /// Which change of this version the next event announces: `1` for the change that
+    /// created it, advanced by every later change to it.
+    ///
+    /// Reported as the event's `sequenceNumber`, which orders the announcements of ONE
+    /// version. It is a property of the record rather than of the store, so two versions'
+    /// numbers are independent and a version that is removed takes its counter with it.
+    pub sequence_number: i64,
 }
 
 impl PackageVersion {
@@ -1764,6 +1846,13 @@ impl PackageVersion {
         self.assets.values().fold(0i64, |total, asset| {
             total.saturating_add(asset.size_bytes())
         })
+    }
+
+    /// Count one further change to this version, answering the number the event
+    /// announcing that change carries ([`Self::sequence_number`]).
+    pub fn advance_sequence(&mut self) -> i64 {
+        self.sequence_number = self.sequence_number.saturating_add(1);
+        self.sequence_number
     }
 
     /// The size of this version's metadata document, or `0` for a version that carries

@@ -197,8 +197,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The store's own work holds this service's lock and contains no await, so the
+        // guard cannot outlive it: a lock over state shared between requests must not be
+        // held across the announcement below.
+        let output = self.remove_versions(input)?;
+        // The state changes it recorded: each removed version, announced on the account's
+        // default event bus.
+        crate::state::package_version_events::publish(ctx, &*self.engine).await;
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeletePackageVersions<Eng> {
+    /// Remove the versions this request names, and RECORD the state change each removal
+    /// made — the whole of this operation's work on the store.
+    ///
+    /// Separate from the handler, and not `async`, because the announcement the handler
+    /// makes is an await: this is the critical section, and its end is where the store's
+    /// guard is released.
+    fn remove_versions(
+        &self,
+        input: DeletePackageVersionsInput,
+    ) -> Result<DeletePackageVersionsOutput, DeletePackageVersionsError> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeletePackageVersionsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -265,6 +287,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::std::collections::HashMap::new();
         let mut failed: ::std::collections::HashMap<String, PackageVersionError> =
             ::std::collections::HashMap::new();
+        // The records this call removed, kept so the state change each removal announces
+        // can be built from the version as it last stood.
+        let mut removed: Vec<crate::state::PackageVersion> = Vec::new();
 
         for version in &input.versions {
             // Both answers are MAPS keyed by version, so a list that repeats a version
@@ -310,15 +335,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // Read off the record BEFORE it goes: the revision the version last had is
             // what identifies the content this call removed.
-            let revision = stored.revision();
-            package.versions.remove(version);
+            let Some(record) = package.versions.remove(version) else {
+                continue;
+            };
             successful.insert(
                 version.clone(),
                 SuccessfulPackageVersionInfo {
-                    revision: Some(revision),
+                    revision: Some(record.revision()),
                     status: Some(crate::state::PACKAGE_VERSION_STATUS_DELETED.to_string()),
                 },
             );
+            removed.push(record);
         }
 
         // The package record stays, however many versions this call removed: a package is
@@ -329,10 +356,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation the other one for its last version, and would lose the configuration a
         // caller set on the package.
 
-        Ok(DeletePackageVersionsOutput {
+        let output = DeletePackageVersionsOutput {
             successful_versions: Some(successful),
             failed_versions: Some(failed),
-        })
+        };
+
+        // A removal is a state change of the version it removed: the repository no longer
+        // holds it, so the event announces the record as it last stood, in the state a
+        // version that is gone is in.
+        let mut changes: Vec<crate::state::package_version_events::VersionChange> = Vec::new();
+        if let Some(repository) = store
+            .domain(&input.domain, input.domain_owner.as_deref())
+            .and_then(|domain| domain.repositories.get(&input.repository))
+        {
+            if let Some(held) = repository.packages.get(&key) {
+                for record in &removed {
+                    changes.push(crate::state::package_version_events::VersionChange::deleted(
+                        repository,
+                        held,
+                        record,
+                        ::std::time::SystemTime::now(),
+                    ));
+                }
+            }
+        }
+        for change in changes {
+            store.record_version_change(change);
+        }
+
+        Ok(output)
     }
 }
 

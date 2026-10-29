@@ -214,8 +214,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The store's own work holds this service's lock and contains no await, so the
+        // guard cannot outlive it: a lock over state shared between requests must not be
+        // held across the announcement below.
+        let output = self.copy_versions(input)?;
+        // The state changes it recorded: each version the copy wrote into the destination
+        // repository, announced on the account's default event bus.
+        crate::state::package_version_events::publish(ctx, &*self.engine).await;
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyPackageVersions<Eng> {
+    /// Copy the versions this request names into the destination repository, and RECORD the
+    /// state change each written version made — the whole of this operation's work on the
+    /// store.
+    ///
+    /// Separate from the handler, and not `async`, because the announcement the handler
+    /// makes is an await: this is the critical section, and its end is where the store's
+    /// guard is released.
+    fn copy_versions(
+        &self,
+        input: CopyPackageVersionsInput,
+    ) -> Result<CopyPackageVersionsOutput, CopyPackageVersionsError> {
         // Request-only rule, refused before the store is touched: "You must specify
         // versions or versionRevisions. You cannot specify both" (this operation's own
         // documentation). The two members cannot be checked by the boundary validator,
@@ -516,10 +539,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut successful: ::std::collections::HashMap<String, SuccessfulPackageVersionInfo> =
             ::std::collections::HashMap::new();
+        // Which versions the copy wrote, and whether each one came to exist in the
+        // destination or replaced a version it already held — the state change each write
+        // announces, recorded below off the stored records.
+        let mut written: Vec<(String, &'static str)> = Vec::new();
         if !to_write.is_empty() {
             // Created on demand, and only now: a copy that wrote no version must not leave
             // an empty package record behind in the destination.
-            let package = destination.packages.entry(key).or_insert_with(|| {
+            let package = destination.packages.entry(key.clone()).or_insert_with(|| {
                 crate::state::Package::new(
                     &input.format,
                     input.namespace.as_deref(),
@@ -527,6 +554,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             });
             for (version, record) in to_write {
+                let replaced = package
+                    .versions
+                    .get(&version)
+                    .map(|held| held.sequence_number);
+                let operation = match replaced {
+                    Some(_) => crate::state::package_version_events::OPERATION_UPDATED,
+                    None => crate::state::package_version_events::OPERATION_CREATED,
+                };
+                // The destination's copy counts its OWN changes: the first change of a
+                // version this repository did not hold, the next one of a version it
+                // replaces.
+                let record = crate::state::PackageVersion {
+                    sequence_number: replaced.unwrap_or_default().saturating_add(1),
+                    ..record
+                };
                 // Read off the record that is being STORED, so the reported revision and
                 // status cannot disagree with what the destination now holds.
                 let info = SuccessfulPackageVersionInfo {
@@ -534,14 +576,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status: Some(record.status.clone()),
                 };
                 package.versions.insert(version.clone(), record);
+                written.push((version.clone(), operation));
                 successful.insert(version, info);
             }
         }
 
-        Ok(CopyPackageVersionsOutput {
+        let output = CopyPackageVersionsOutput {
             successful_versions: Some(successful),
             failed_versions: Some(failed),
-        })
+        };
+
+        // Every version the copy wrote is a state change of that version IN THE
+        // DESTINATION repository: it is where the version now exists, with its own
+        // revision and change count. Read back off the stored records, so the event
+        // announces what the destination holds.
+        let mut changes: Vec<crate::state::package_version_events::VersionChange> = Vec::new();
+        if let Some(repository) = store
+            .domain(&input.domain, input.domain_owner.as_deref())
+            .and_then(|domain| domain.repositories.get(&input.destination_repository))
+        {
+            if let Some(held) = repository.packages.get(&key) {
+                for (version, operation) in written {
+                    if let Some(stored) = held.versions.get(&version) {
+                        changes.push(crate::state::package_version_events::VersionChange::of(
+                            repository,
+                            held,
+                            stored,
+                            operation,
+                            crate::state::package_version_events::VersionChanges::published(
+                                stored.assets.len(),
+                                stored.manifest.is_some(),
+                            ),
+                            ::std::time::SystemTime::now(),
+                        ));
+                    }
+                }
+            }
+        }
+        for change in changes {
+            store.record_version_change(change);
+        }
+
+        Ok(output)
     }
 }
 
