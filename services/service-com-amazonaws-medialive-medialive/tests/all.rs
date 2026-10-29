@@ -347,6 +347,9 @@ mod sdi_source_lifecycle;
 #[path = "all/sdi_source_tags_and_statuses.rs"]
 mod sdi_source_tags_and_statuses;
 
+#[path = "all/shared_alert_state_filter_rule.rs"]
+mod shared_alert_state_filter_rule;
+
 #[path = "all/shared_page_size_rule.rs"]
 mod shared_page_size_rule;
 

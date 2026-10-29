@@ -172,16 +172,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // alerts with CLEARED state. ALL - Return all alerts." The member targets
         // bare `__string`, so the request boundary admits any string and a value
         // outside that documented set — which names no set of alerts — is refused
-        // here, naming the member and the values it accepts.
-        let state_filter = input.state_filter.as_deref();
-        if let Some(filter) = state_filter {
-            if !crate::state::CLUSTER_ALERT_FILTERS.contains(&filter) {
-                return Err(bad_request(&format!(
-                    "stateFilter must be one of {}, got {filter}",
-                    crate::state::CLUSTER_ALERT_FILTERS.join(", ")
-                )));
-            }
-        }
+        // by the service's shared membership rule
+        // ([`crate::state::alert_state_filter`]), whose sentence this operation
+        // answers as its own modelled client error.
+        let state_filter = crate::state::alert_state_filter(input.state_filter.as_deref())
+            .map_err(|filter| {
+                bad_request(&crate::state::undocumented_alert_state_filter_message(
+                    filter,
+                ))
+            })?;
 
         // The token is how many of this cluster's admitted alerts the previous
         // pages already reported. An alert has no id of its own that identifies

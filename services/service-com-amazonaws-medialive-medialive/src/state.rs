@@ -375,14 +375,16 @@ pub use event_bridge_rule_templates::{
 pub(crate) use event_bridge_rule_templates::event_bridge_rule_template_output;
 
 /// The alert vocabulary every alert surface of this service shares: the two
-/// states an alert is in, the `StateFilter` values each listing documents, and
-/// the two derivations (`State` out of the cleared instant, and which alerts a
-/// filter admits) the cluster slice and the multiplex slice both delegate to.
+/// states an alert is in, the `StateFilter` values each listing documents, the
+/// membership rule that refuses a value outside them and the sentence that
+/// refusal carries, and the two derivations (`State` out of the cleared instant,
+/// and which alerts a filter admits) the cluster slice and the multiplex slice
+/// both delegate to.
 pub mod alerts;
 
 pub use alerts::{
-    alert_admitted_by, alert_state, alert_state_of, ALERT_STATE_FILTERS,
-    ALERT_STATE_FILTER_ALL,
+    alert_admitted_by, alert_state, alert_state_filter, alert_state_of,
+    undocumented_alert_state_filter_message, ALERT_STATE_FILTERS, ALERT_STATE_FILTER_ALL,
 };
 
 /// The input device slice: the record `ClaimDevice` registers, the device-id

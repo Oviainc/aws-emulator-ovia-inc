@@ -168,18 +168,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // alerts with CLEARED state. ALL - Return all alerts." It targets the
         // free-form `__string`, so the request boundary refuses no value and a
         // value outside that documented set — which names no set of alerts — is
-        // refused here, naming the member and the values it accepts, exactly as
-        // `ListClusterAlerts` refuses it against the same shared set. A request
-        // carrying none asks for the unfiltered listing, which is every alert.
-        let state_filter = input.state_filter.as_deref();
-        if let Some(filter) = state_filter {
-            if !crate::state::MULTIPLEX_ALERT_STATE_FILTERS.contains(&filter) {
-                return Err(bad_request(format!(
-                    "stateFilter must be one of {}, got {filter:?}",
-                    crate::state::MULTIPLEX_ALERT_STATE_FILTERS.join(", ")
-                )));
-            }
-        }
+        // refused by the service's shared membership rule
+        // ([`crate::state::alert_state_filter`]), the one every alert listing of
+        // this service reads its filter through, and whose sentence this
+        // operation answers as its own modelled client error — quoting the
+        // offending value, as this operation's messages quote the value a
+        // request carried (its `NextToken` refusal below does too). A request
+        // carrying no filter asks for the unfiltered listing, which is every
+        // alert.
+        let state_filter = crate::state::alert_state_filter(input.state_filter.as_deref())
+            .map_err(|filter| {
+                bad_request(crate::state::undocumented_alert_state_filter_message(
+                    &format!("{filter:?}"),
+                ))
+            })?;
 
         // `NextToken` is the `Id` of the alert the next page starts at, which is
         // the form this operation hands out, so a value that is not an alert id
