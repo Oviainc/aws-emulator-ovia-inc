@@ -1395,3 +1395,183 @@ fn entity_item_to_cedar_json(item: &EntityItem) -> Result<serde_json::Value, Inv
 
     Ok(serde_json::Value::Object(entity))
 }
+
+/// Whether `entity_type` names an ACTION, rather than a principal or a resource.
+///
+/// The form is the model's own: `ActionType`'s pattern is `^Action$|^.+::Action$`
+/// (`smithy_query(query="shape", shape="ActionIdentifier")`), so an action's entity type
+/// is `Action`, alone or qualified by a namespace, and every other entity type names a
+/// principal or a resource. The form is read here rather than re-derived at each caller,
+/// so one answer decides what an action entity is wherever that matters.
+pub fn is_action_entity_type(entity_type: &str) -> bool {
+    match entity_type.strip_suffix("Action") {
+        Some("") => true,
+        Some(qualifier) => qualifier
+            .strip_suffix("::")
+            .is_some_and(|namespace| !namespace.is_empty()),
+        None => false,
+    }
+}
+
+/// One entity type a policy store knows as a PRINCIPAL type, and where it says so — which
+/// is what a refusal naming the type reports.
+#[derive(Debug, Clone)]
+pub struct PrincipalEntityType {
+    /// The entity type itself.
+    pub entity_type: String,
+    /// Where the store says this type names principals.
+    pub origin: PrincipalEntityTypeOrigin,
+}
+
+impl PrincipalEntityType {
+    /// A type an identity source generates principals (or their groups) as.
+    pub fn from_identity_source(entity_type: impl Into<String>) -> Self {
+        Self {
+            entity_type: entity_type.into(),
+            origin: PrincipalEntityTypeOrigin::IdentitySource,
+        }
+    }
+}
+
+/// The two places a policy store says an entity type names principals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrincipalEntityTypeOrigin {
+    /// An identity source of the store generates principals of this type, or maps their
+    /// groups to it.
+    IdentitySource,
+    /// The store's schema declares this type as the principal an action applies to.
+    Schema,
+}
+
+/// Every entity type a policy store's SCHEMA declares as a principal and not as a
+/// resource.
+///
+/// A Cedar schema is where a store declares which entity types name principals: each
+/// action it declares names the principal types and the resource types it applies to. A
+/// type the schema names on BOTH sides is a legitimate resource of some action, so only
+/// the types it knows exclusively as principals are reported — the kinds are read off the
+/// PARSED schema rather than searched for in its text.
+///
+/// `schema_json` is the text the store holds (already accepted by [`parse_schema`]), so
+/// text that will not parse is service-side state the caller cannot fix; a store holding
+/// no schema declares no principal type.
+pub fn schema_principal_entity_types(
+    schema_json: Option<&str>,
+) -> Result<Vec<PrincipalEntityType>, Refusal> {
+    let Some(schema_json) = schema_json else {
+        return Ok(Vec::new());
+    };
+    let parsed = parse_schema(schema_json).map_err(|e| {
+        Refusal::ServiceFault(format!(
+            "the policy store's schema could not be parsed, so the entities an authorization \
+             request carries cannot be checked against it: {e}"
+        ))
+    })?;
+    let resources: BTreeSet<String> = parsed
+        .schema
+        .resources()
+        .map(ToString::to_string)
+        .collect();
+    let principals: BTreeSet<String> = parsed
+        .schema
+        .principals()
+        .map(ToString::to_string)
+        .filter(|entity_type| !resources.contains(entity_type))
+        .collect();
+    Ok(principals
+        .into_iter()
+        .map(|entity_type| PrincipalEntityType {
+            entity_type,
+            origin: PrincipalEntityTypeOrigin::Schema,
+        })
+        .collect())
+}
+
+/// Check the `entities` slice of an authorization request whose principal comes from a
+/// TOKEN, over the Cedar JSON [`entities_to_cedar_json`] built.
+///
+/// Such a call takes its principal from only the token it presented, so the slice carries
+/// only resource and action entities:
+///
+/// * an entity whose type the store knows as a principal type —
+///   [`PrincipalEntityType`], whether an identity source generates it or the store's
+///   schema declares it — is refused, because the principal of this call is the token's to
+///   build and no caller-supplied principal takes part in the decision;
+/// * an action entity ([`is_action_entity_type`]) is NAMED and not described, so one
+///   supplying attributes, parent entities or tags is refused; an action entity carrying
+///   its identifier and type alone is accepted, as a resource entity is.
+pub fn check_token_request_entities(
+    supplied: &[serde_json::Value],
+    principal_entity_types: &[PrincipalEntityType],
+) -> Result<(), InvalidInput> {
+    for entity in supplied {
+        let Some(entity_type) = entity_uid_type(entity) else {
+            continue;
+        };
+        if is_action_entity_type(entity_type) {
+            if let Some(surplus) = described_beyond_its_identity(entity) {
+                return Err(InvalidInput::new(
+                    paths::ENTITIES,
+                    format!(
+                        "it carries an action entity of type {entity_type} supplying \
+                         {surplus}, and an action entity can carry only its identifier and \
+                         its entity type"
+                    ),
+                ));
+            }
+            continue;
+        }
+        if let Some(principal) = principal_entity_types
+            .iter()
+            .find(|principal| principal.entity_type == entity_type)
+        {
+            return Err(InvalidInput::new(
+                paths::ENTITIES,
+                match principal.origin {
+                    PrincipalEntityTypeOrigin::IdentitySource => format!(
+                        "it carries an entity of type {entity_type}, which is an entity type \
+                         the identity source that issued the token generates"
+                    ),
+                    PrincipalEntityTypeOrigin::Schema => format!(
+                        "it carries an entity of type {entity_type}, which the policy store's \
+                         schema declares as a principal type, and an authorization request \
+                         whose principal comes from a token carries only resource and action \
+                         entities"
+                    ),
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The uid TYPE of one entity in a Cedar entity store. Cedar's entity JSON carries a uid
+/// either plainly or behind its `__entity` escape, and both name the same entity.
+fn entity_uid_type(entity: &serde_json::Value) -> Option<&str> {
+    entity
+        .pointer("/uid/type")
+        .or_else(|| entity.pointer("/uid/__entity/type"))
+        .and_then(serde_json::Value::as_str)
+}
+
+/// What one entity describes BEYOND its identity, named as the request describes it —
+/// `None` when it carries nothing but its uid. An absent member and an empty one are the
+/// same thing: [`entity_item_to_cedar_json`] always writes the attribute map and the
+/// parent list, empty where the request named none.
+fn described_beyond_its_identity(entity: &serde_json::Value) -> Option<&'static str> {
+    [
+        ("attrs", "attributes"),
+        ("parents", "parent entities"),
+        ("tags", "tags"),
+    ]
+    .into_iter()
+    .find(|(key, _)| {
+        entity.get(key).is_some_and(|value| match value {
+            serde_json::Value::Object(members) => !members.is_empty(),
+            serde_json::Value::Array(items) => !items.is_empty(),
+            serde_json::Value::Null => false,
+            _ => true,
+        })
+    })
+    .map(|(_, described)| described)
+}

@@ -1073,3 +1073,401 @@ async fn an_issuer_with_no_identity_source_is_refused_naming_the_issuer_and_the_
         "case the covered issuer after the refusals: expected ALLOW on {permit}, got {after}"
     );
 }
+
+/// What a row of the entity-kind table expects of the slice it sends.
+enum Slice {
+    /// The slice is carried into the evaluation, which decides as it does without it.
+    Carried,
+    /// The call is refused with a 400 `ValidationException` naming `/entities`.
+    Refused,
+}
+
+/// One `entityList` slice carrying a single entity of `entity_type` named `entity_id`,
+/// described by whatever `described` names of `attributes`, `parents` and `tags`.
+fn listed_entity(entity_type: &str, entity_id: &str, described: Value) -> Value {
+    let mut item = json!({
+        "identifier": { "entityType": entity_type, "entityId": entity_id },
+    });
+    for (member, value) in described
+        .as_object()
+        .expect("the described members are an object")
+    {
+        item[member.clone()] = value.clone();
+    }
+    json!({ "entityList": [item] })
+}
+
+/// The same single-entity slice in `entities`' other arm: Cedar's own entity JSON, where
+/// the entity is described under Cedar's `attrs`, `parents` and `tags` keys.
+fn cedar_json_entity(entity_type: &str, entity_id: &str, described: Value) -> Value {
+    let mut entity = json!({
+        "uid": { "type": entity_type, "id": entity_id },
+        "attrs": {},
+        "parents": [],
+    });
+    for (member, value) in described
+        .as_object()
+        .expect("the described members are an object")
+    {
+        entity[member.clone()] = value.clone();
+    }
+    json!({ "cedarJson": Value::Array(vec![entity]).to_string() })
+}
+
+/// Send one `IsAuthorizedWithToken` call carrying `entities` and assert what the row
+/// expects of it: either the slice is carried into the evaluation, which decides by
+/// `permit` as it does without the slice, or the call is refused naming `/entities`.
+async fn assert_slice(
+    router: &MultiServiceRouter,
+    case: &str,
+    store: &str,
+    id_token: &str,
+    permit: &str,
+    entities: Value,
+    expected: Slice,
+) {
+    let mut body = request(store, json!({ "identityToken": id_token }));
+    body["entities"] = entities;
+    let (status, answered) = harness::call(router, "IsAuthorizedWithToken", &body).await;
+    match expected {
+        Slice::Carried => {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the slice carries only resource and action entities, so it is \
+                 evaluated, got {status} with {answered}"
+            );
+            assert_eq!(
+                answered["decision"].as_str(),
+                Some("ALLOW"),
+                "case {case:?}: expected the token's own decision, got {answered}"
+            );
+            assert_eq!(
+                answered["determiningPolicies"][0]["policyId"].as_str(),
+                Some(permit),
+                "case {case:?}: expected {permit} to determine the decision, got {answered}"
+            );
+        }
+        Slice::Refused => {
+            assert_eq!(
+                (status, error_code(&answered).as_str()),
+                (400, "ValidationException"),
+                "case {case:?}: expected a 400 ValidationException, got {status} with {answered}"
+            );
+            let named: Vec<String> = answered["fieldList"]
+                .as_array()
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .filter_map(|field| field["path"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                named,
+                vec!["/entities".to_string()],
+                "case {case:?}: expected fieldList to name /entities, got {answered}"
+            );
+        }
+    }
+}
+
+/// The `entities` slice of a call that takes its principal from a TOKEN carries only
+/// resource and action entities.
+///
+/// The rule under test: a principal entity is this call's to build out of the token, so an
+/// entity whose type the policy store knows as a principal type — the entity type the
+/// identity source generates principals as, or the one it maps their groups to — is
+/// refused; and an action entity is NAMED rather than described, so one supplying
+/// attributes, parent entities or tags is refused, while one carrying its identifier and
+/// entity type alone is carried like any resource entity. An action's entity type is the
+/// form the model gives it (`ActionType`'s pattern `^Action$|^.+::Action$`), so both the
+/// namespaced and the bare spelling are action entities.
+///
+/// The rows differ along what the rule generalises over: which kind of entity the slice
+/// carries, which of `attributes`/`parents`/`tags` describes it, how its type is spelled,
+/// and which arm of `EntitiesDefinition` the request sent it in.
+#[tokio::test]
+async fn an_entities_slice_of_a_token_call_carries_only_resource_and_action_entities() {
+    let (router, _engine) = harness::router_with_user_pools();
+    let pool = user_pool(&router, "entity-kind-pool").await;
+    let client = app_client(&router, &pool, "entity-kind-client").await;
+    let member = sign_in(
+        &router,
+        &pool,
+        &client,
+        "member",
+        &[PERMITTED_GROUP],
+        &json!([]),
+    )
+    .await;
+
+    let store = harness::store_with_validation_off(&router).await;
+    identity_source(&router, &store, &pool, &[&client], Some(GROUP_TYPE)).await;
+    let permit = policy(&router, &store, group_permit(GROUP_TYPE, &pool)).await;
+
+    let rows: Vec<(&str, Value, Slice)> = vec![
+        (
+            "a resource entity carrying attributes",
+            listed_entity(
+                "App::Doc",
+                DOCUMENT,
+                json!({ "attributes": { "owner": { "string": "member" } } }),
+            ),
+            Slice::Carried,
+        ),
+        (
+            "a resource entity carrying parents and tags",
+            listed_entity(
+                "App::Doc",
+                DOCUMENT,
+                json!({
+                    "parents": [{ "entityType": "App::Folder", "entityId": "shared" }],
+                    "tags": { "class": { "string": "public" } },
+                }),
+            ),
+            Slice::Carried,
+        ),
+        (
+            "an entity of a type nothing in the store declares as a principal",
+            listed_entity(
+                "App::Album",
+                "holiday",
+                json!({ "attributes": { "public": { "boolean": true } } }),
+            ),
+            Slice::Carried,
+        ),
+        (
+            "an action entity carrying only its identifier and entity type",
+            listed_entity("App::Action", "read", json!({})),
+            Slice::Carried,
+        ),
+        (
+            "an action entity carrying attributes",
+            listed_entity(
+                "App::Action",
+                "read",
+                json!({ "attributes": { "risk": { "long": 1 } } }),
+            ),
+            Slice::Refused,
+        ),
+        (
+            "an action entity carrying parent entities",
+            listed_entity(
+                "App::Action",
+                "read",
+                json!({ "parents": [{ "entityType": "App::Action", "entityId": "readers" }] }),
+            ),
+            Slice::Refused,
+        ),
+        (
+            "an action entity carrying tags",
+            listed_entity(
+                "App::Action",
+                "read",
+                json!({ "tags": { "class": { "string": "public" } } }),
+            ),
+            Slice::Refused,
+        ),
+        (
+            "an action entity of the bare Action type carrying attributes",
+            listed_entity(
+                "Action",
+                "read",
+                json!({ "attributes": { "risk": { "long": 1 } } }),
+            ),
+            Slice::Refused,
+        ),
+        (
+            "an entity of the type the identity source generates",
+            listed_entity(
+                PRINCIPAL_TYPE,
+                &member.entity_id(),
+                json!({ "attributes": { "admin": { "boolean": true } } }),
+            ),
+            Slice::Refused,
+        ),
+        (
+            "an entity of the group type the identity source maps",
+            listed_entity(GROUP_TYPE, &format!("{pool}|{PERMITTED_GROUP}"), json!({})),
+            Slice::Refused,
+        ),
+        (
+            "a resource entity in the Cedar-JSON arm",
+            cedar_json_entity("App::Doc", DOCUMENT, json!({ "attrs": { "owner": "member" } })),
+            Slice::Carried,
+        ),
+        (
+            "an action entity carrying only its uid in the Cedar-JSON arm",
+            cedar_json_entity("App::Action", "read", json!({})),
+            Slice::Carried,
+        ),
+        (
+            "an action entity carrying attributes in the Cedar-JSON arm",
+            cedar_json_entity("App::Action", "read", json!({ "attrs": { "risk": 1 } })),
+            Slice::Refused,
+        ),
+        (
+            "an action entity carrying parents in the Cedar-JSON arm",
+            cedar_json_entity(
+                "App::Action",
+                "read",
+                json!({ "parents": [{ "type": "App::Action", "id": "readers" }] }),
+            ),
+            Slice::Refused,
+        ),
+        (
+            "a principal of the identity source's own type in the Cedar-JSON arm",
+            cedar_json_entity(PRINCIPAL_TYPE, &member.entity_id(), json!({})),
+            Slice::Refused,
+        ),
+    ];
+
+    for (case, entities, expected) in rows {
+        assert_slice(
+            &router,
+            case,
+            &store,
+            &member.id_token,
+            &permit,
+            entities,
+            expected,
+        )
+        .await;
+    }
+}
+
+/// A Cedar schema with one namespace whose single action declares, in its `appliesTo`, the
+/// entity types that are PRINCIPALS of it and the ones that are its RESOURCES — the place
+/// a policy store says which of its entity types name principals.
+///
+/// `App::Reviewer` is declared on both sides on purpose: a type that is the resource of
+/// some action is a legitimate resource entity, whatever else it may be the principal of.
+fn kinds_schema() -> String {
+    serde_json::to_string(&json!({
+        "App": {
+            "entityTypes": {
+                "User": { "memberOfTypes": ["UserGroup"] },
+                "UserGroup": {},
+                "Admin": {},
+                "Reviewer": {},
+                "Doc": {},
+            },
+            "actions": {
+                "read": {
+                    "appliesTo": {
+                        "principalTypes": ["User", "Admin", "Reviewer"],
+                        "resourceTypes": ["Doc", "Reviewer"],
+                    },
+                },
+            },
+        },
+    }))
+    .expect("the schema document serializes")
+}
+
+/// The policy store's SCHEMA is the other place it declares which entity types name
+/// principals, so the same rule covers a principal type no identity source generates.
+///
+/// The rule under test: an entity whose type the store's schema declares as an action's
+/// principal — and not as any action's resource — is refused, while a type the schema
+/// declares as a resource is carried, and an action the schema declares is still carried
+/// only when it is named rather than described.
+///
+/// The rows differ along what the schema says about the type the slice carries: principal
+/// only, principal and resource, resource only, the identity source's own type, and the
+/// action the schema declares.
+#[tokio::test]
+async fn a_type_the_stores_schema_declares_only_as_a_principal_cannot_be_supplied() {
+    let (router, _engine) = harness::router_with_user_pools();
+    let pool = user_pool(&router, "schema-kind-pool").await;
+    let client = app_client(&router, &pool, "schema-kind-client").await;
+    let member = sign_in(
+        &router,
+        &pool,
+        &client,
+        "member",
+        &[PERMITTED_GROUP],
+        &json!([]),
+    )
+    .await;
+
+    let store = harness::store_with_validation_off(&router).await;
+    harness::ok(
+        &router,
+        "PutSchema",
+        &json!({
+            "policyStoreId": store,
+            "definition": { "cedarJson": kinds_schema() },
+        }),
+    )
+    .await;
+    identity_source(&router, &store, &pool, &[&client], Some(GROUP_TYPE)).await;
+    let permit = policy(&router, &store, group_permit(GROUP_TYPE, &pool)).await;
+
+    let rows: Vec<(&str, Value, Slice)> = vec![
+        (
+            "a type the schema declares only as a principal",
+            listed_entity(
+                "App::Admin",
+                "root",
+                json!({ "attributes": { "admin": { "boolean": true } } }),
+            ),
+            Slice::Refused,
+        ),
+        (
+            "that same type in the Cedar-JSON arm",
+            cedar_json_entity("App::Admin", "root", json!({})),
+            Slice::Refused,
+        ),
+        (
+            "a type the schema declares as a principal AND as a resource",
+            listed_entity(
+                "App::Reviewer",
+                "rev-1",
+                json!({ "attributes": { "level": { "long": 2 } } }),
+            ),
+            Slice::Carried,
+        ),
+        (
+            "a type the schema declares only as a resource",
+            listed_entity(
+                "App::Doc",
+                DOCUMENT,
+                json!({ "attributes": { "owner": { "string": "member" } } }),
+            ),
+            Slice::Carried,
+        ),
+        (
+            "the type the identity source generates, which the schema declares too",
+            listed_entity(PRINCIPAL_TYPE, &member.entity_id(), json!({})),
+            Slice::Refused,
+        ),
+        (
+            "the action the schema declares, carrying only its identifier",
+            listed_entity("App::Action", "read", json!({})),
+            Slice::Carried,
+        ),
+        (
+            "the action the schema declares, carrying attributes",
+            listed_entity(
+                "App::Action",
+                "read",
+                json!({ "attributes": { "risk": { "long": 1 } } }),
+            ),
+            Slice::Refused,
+        ),
+    ];
+
+    for (case, entities, expected) in rows {
+        assert_slice(
+            &router,
+            case,
+            &store,
+            &member.id_token,
+            &permit,
+            entities,
+            expected,
+        )
+        .await;
+    }
+}

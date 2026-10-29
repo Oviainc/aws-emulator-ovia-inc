@@ -8,7 +8,10 @@
 //! the member it arrived in takes, it was issued to a client the source accepts and the
 //! clock has not run out on it — and the principal it names, that principal's groups and
 //! its attributes all come from its claims. Those entities join the request's own
-//! `entities` slice, and the decision is then whatever the real Cedar authorizer computed
+//! `entities` slice, which carries only resource and action entities for that reason: an
+//! entity whose type the store knows as a principal type is refused, and an action entity
+//! may carry only its identifier and its entity type
+//! ([`crate::state::cedar::check_token_request_entities`]). The decision is then whatever the real Cedar authorizer computed
 //! over the store's persisted policies ([`crate::state::cedar::authorize`]), exactly as
 //! [`crate::ops::is_authorized`] computes it for a principal the request names. It writes
 //! nothing, and verifying a token neither consumes nor records it.
@@ -290,10 +293,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The principal and its groups are entities THIS call builds out of the token, so
-        // a request supplying its own entities of those types is refused rather than
-        // silently overridden — or colliding with them in the slice.
-        let owned = &identity.owned_entity_types;
+        // The `entities` slice of a call whose principal comes from the TOKEN carries only
+        // resource and action entities: a principal entity is this call's to build out of
+        // the token, and an action entity is named rather than described.
         let Some(supplied) = entities.as_array_mut() else {
             // Only the Cedar-JSON arm can carry something that is no entity LIST, and the
             // principal this call built belongs IN that list: refused here, where that is
@@ -303,27 +305,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "it is not a Cedar entity store: an entity store is a list of entities",
             )));
         };
-        let conflicting: Option<String> = supplied
+        // The principal types this store knows: the ones the identity source that issued
+        // the token generates — including the group type it maps, which this call builds
+        // entities of too — and the ones its schema declares.
+        let mut principal_entity_types: Vec<crate::state::cedar::PrincipalEntityType> = identity
+            .owned_entity_types
             .iter()
-            // Cedar's entity JSON carries a uid either plainly or behind its `__entity`
-            // escape, and both name the same entity.
-            .filter_map(|entity| {
-                entity
-                    .pointer("/uid/type")
-                    .or_else(|| entity.pointer("/uid/__entity/type"))
-                    .and_then(serde_json::Value::as_str)
-            })
-            .find(|entity_type| owned.iter().any(|owned| owned == entity_type))
-            .map(str::to_string);
-        if let Some(entity_type) = conflicting {
-            return Err(invalid(crate::ops::InvalidInput::new(
-                crate::ops::paths::ENTITIES,
-                format!(
-                    "it carries an entity of type {entity_type}, which is an entity type the \
-                     identity source that issued the token generates"
-                ),
-            )));
-        }
+            .map(crate::state::cedar::PrincipalEntityType::from_identity_source)
+            .collect();
+        principal_entity_types.extend(
+            crate::state::cedar::schema_principal_entity_types(
+                store.schema.as_ref().map(|schema| schema.cedar_json.as_str()),
+            )
+            .map_err(refused_by_cedar)?,
+        );
+        crate::state::cedar::check_token_request_entities(supplied, &principal_entity_types)
+            .map_err(invalid)?;
         supplied.extend(identity.entities());
 
         let verdict = crate::state::cedar::authorize(
@@ -334,26 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             context,
             entities,
         )
-        .map_err(|refusal| match refusal {
-            // The same split `IsAuthorized` makes: a member the caller can fix is the
-            // modelled `ValidationException`, and service-side state it cannot is a
-            // server fault.
-            crate::state::cedar::Refusal::InvalidInput(field) => invalid(field),
-            crate::state::cedar::Refusal::ServiceFault(message) => {
-                IsAuthorizedWithTokenErrorModeled::InternalServerException(
-                    InternalServerException { message },
-                )
-                .into()
-            }
-            crate::state::cedar::Refusal::SchemaValidation(reasons) => {
-                IsAuthorizedWithTokenErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: reasons.join("; "),
-                    },
-                )
-                .into()
-            }
-        })?;
+        .map_err(refused_by_cedar)?;
 
         Ok(IsAuthorizedWithTokenOutput {
             decision: verdict.decision,
@@ -409,6 +387,31 @@ fn invalid_members(
         invalid,
     ))
     .into()
+}
+
+/// A refusal [`crate::state::cedar`] raised, on this operation's error channel.
+///
+/// The same split `IsAuthorized` makes: a member the caller can fix is the modelled
+/// `ValidationException`, and service-side state it cannot — a stored schema that will
+/// not parse, a store holding more Cedar than one request evaluates — is a server fault.
+/// An authorization request carries no policy content, so reasons reaching the schema arm
+/// are about content the store already holds, which is service-side state too.
+fn refused_by_cedar(refusal: crate::state::cedar::Refusal) -> IsAuthorizedWithTokenError {
+    match refusal {
+        crate::state::cedar::Refusal::InvalidInput(field) => invalid(field),
+        crate::state::cedar::Refusal::ServiceFault(message) => {
+            IsAuthorizedWithTokenErrorModeled::InternalServerException(InternalServerException {
+                message,
+            })
+            .into()
+        }
+        crate::state::cedar::Refusal::SchemaValidation(reasons) => {
+            IsAuthorizedWithTokenErrorModeled::InternalServerException(InternalServerException {
+                message: reasons.join("; "),
+            })
+            .into()
+        }
+    }
 }
 
 /// The modelled error a token this call could not use is refused with.

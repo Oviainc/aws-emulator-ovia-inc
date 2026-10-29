@@ -175,12 +175,12 @@ pub struct TokenIdentity {
     /// The entity types the identity SOURCE generates: its `principalEntityType` and, when
     /// it maps groups, the entity type it maps them to.
     ///
-    /// They are the types an authorization request may not supply entities of —
-    /// "this parameter can't include any entities of a type that matches the user or
-    /// group entity types that you defined in your identity source" (the operation's
-    /// `entities` documentation) — because this call builds those entities itself, out of
-    /// the token. They come from the SOURCE's configuration and not from the groups this
-    /// token happens to carry, so the rule holds for a token naming no group too.
+    /// They are principal types of the store, so an authorization request may not supply
+    /// entities of them — this call builds those entities itself, out of the token. They
+    /// come from the SOURCE's configuration and not from the groups this token happens to
+    /// carry, so the rule holds for a token naming no group too;
+    /// [`crate::state::cedar::check_token_request_entities`] is what applies it, together
+    /// with the principal types the store's schema declares.
     pub owned_entity_types: Vec<String>,
 }
 
