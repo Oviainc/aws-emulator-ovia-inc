@@ -15,6 +15,8 @@
 mod azure_blob_location;
 #[path = "all/bounded_stores.rs"]
 mod bounded_stores;
+#[path = "all/object_storage_location.rs"]
+mod object_storage_location;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/transfer_task_lifecycle.rs"]

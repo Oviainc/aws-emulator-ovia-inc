@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLocationObjectStorage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLocationObjectStorage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLocationObjectStorage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `LocationArn` and stores the whole object storage transfer location in
+//! [`crate::state`], so `DescribeLocationObjectStorage`,
+//! `UpdateLocationObjectStorage` and `CreateTask` can resolve it again. Nothing is
+//! echoed back: the response carries only the newly minted ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +198,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLocationObjectStorage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLocationObjectStorageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLocationObjectStorage"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateLocationObjectStorageErrorModeled::InternalException(
+                InternalException {
+                    message: Some(
+                        "the DataSync emulator could not reach its state store".to_string(),
+                    ),
+                    error_code: None,
+                },
+            )
+            .into());
+        };
+
+        if let Some(message) = secret_combination_refusal(&input) {
+            return Err(CreateLocationObjectStorageErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
+                    error_code: None,
+                    datasync_error_code: None,
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // `ServerProtocol` documents HTTPS as its default, and the port follows the
+        // protocol a request that named no port ends up speaking. The modelled enum
+        // is enforced before this handler runs, so the value is HTTP or HTTPS.
+        let server_protocol = input
+            .server_protocol
+            .unwrap_or_else(|| crate::state::DEFAULT_SERVER_PROTOCOL.to_string());
+        let server_port = input
+            .server_port
+            .unwrap_or_else(|| crate::state::default_server_port(&server_protocol));
+        let location_uri = crate::state::LocationKind::ObjectStorage.location_uri(
+            &object_storage_global_id(&input.server_hostname, &input.bucket_name),
+            input.subdirectory.as_deref(),
+        );
+
+        let location_arn = {
+            let mut store = state.lock();
+            store.advance_clock(now);
+            if let Some(message) = store.at_capacity(crate::state::ResourceStore::Locations) {
+                return Err(CreateLocationObjectStorageErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(message),
+                        error_code: None,
+                        datasync_error_code: None,
+                    },
+                )
+                .into());
+            }
+
+            // Where this location's credential ends up. The secret key itself is
+            // neither stored nor reported: DataSync keeps it in a Secrets Manager
+            // secret, and the location record holds only that secret's ARN.
+            let secret = store.object_storage_secret(
+                &region,
+                &crate::state::LocationSecret::None,
+                input.secret_key.as_deref(),
+                input.cmk_secret_config.as_ref(),
+                input.custom_secret_config.as_ref(),
+            );
+
+            let location_arn = store.mint_location_arn(&region);
+            store.locations.insert(
+                location_arn.clone(),
+                crate::state::Location {
+                    arn: location_arn.clone(),
+                    location_uri,
+                    subdirectory: input.subdirectory,
+                    agent_arns: input.agent_arns.unwrap_or_default(),
+                    tags: input.tags.unwrap_or_default(),
+                    creation_time: now,
+                    config: crate::state::LocationConfig::ObjectStorage(
+                        crate::state::ObjectStorageLocationConfig {
+                            bucket_name: input.bucket_name,
+                            server_hostname: input.server_hostname,
+                            server_port,
+                            server_protocol,
+                            access_key: input.access_key,
+                            server_certificate: input.server_certificate,
+                            secret,
+                        },
+                    ),
+                },
+            );
+            location_arn
+        };
+
+        Ok(CreateLocationObjectStorageOutput {
+            location_arn: Some(location_arn),
+        })
     }
 }
+
+/// The GLOBAL_ID of an object storage location: the server that holds the bucket, and
+/// the bucket on it.
+pub(crate) fn object_storage_global_id(server_hostname: &str, bucket_name: &str) -> String {
+    format!("{server_hostname}/{bucket_name}")
+}
+
+/// The refusal a request earns by combining the credential parameters in a way this
+/// operation does not accept, if any.
+///
+/// Both secret-configuration members document the same rule: a request provides either
+/// `CmkSecretConfig` together with the `SecretKey` that DataSync then puts in the secret
+/// it manages, or `CustomSecretConfig` on its own, naming a secret the caller already
+/// manages — never both, and never one without its partner.
+fn secret_combination_refusal(input: &CreateLocationObjectStorageInput) -> Option<String> {
+    let cmk = input.cmk_secret_config.is_some();
+    let custom = input.custom_secret_config.is_some();
+    let secret_key = input.secret_key.is_some();
+
+    if cmk && custom {
+        return Some(format!(
+            "{CREDENTIAL_PARAMETER_RULE} Do not provide both parameters for the same request."
+        ));
+    }
+    if custom && secret_key {
+        return Some(format!(
+            "{CREDENTIAL_PARAMETER_RULE} Do not provide CustomSecretConfig with SecretKey."
+        ));
+    }
+    if cmk && !secret_key {
+        return Some(format!(
+            "{CREDENTIAL_PARAMETER_RULE} Do not provide CmkSecretConfig without SecretKey."
+        ));
+    }
+    None
+}
+
+/// The rule both secret-configuration members document, as they word it, and the first
+/// sentence of every refusal above.
+const CREDENTIAL_PARAMETER_RULE: &str = "You can use either CmkSecretConfig (with \
+     SecretKey) or CustomSecretConfig (without SecretKey) to provide credentials for a \
+     CreateLocationObjectStorage request.";
+

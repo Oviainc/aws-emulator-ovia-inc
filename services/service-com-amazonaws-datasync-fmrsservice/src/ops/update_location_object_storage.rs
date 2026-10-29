@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLocationObjectStorage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLocationObjectStorage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLocationObjectStorage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the configuration parameters the request names onto the object storage
+//! transfer location `CreateLocationObjectStorage` stored in [`crate::state`], so
+//! `DescribeLocationObjectStorage` reports them afterwards. A member the request
+//! omits is left as it was, and the location's agents cannot be changed at all.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +177,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLocationObjectStorage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLocationObjectStorageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLocationObjectStorage"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateLocationObjectStorageErrorModeled::InternalException(
+                InternalException {
+                    message: Some(
+                        "the DataSync emulator could not reach its state store".to_string(),
+                    ),
+                    error_code: None,
+                },
+            )
+            .into());
+        };
+
+        // The two secret members are alternatives, on an update exactly as on a
+        // create: a location's credential lives in one secret, so a request cannot
+        // name two places to find it.
+        if input.cmk_secret_config.is_some() && input.custom_secret_config.is_some() {
+            return Err(invalid_request(
+                "You can use either CmkSecretConfig or CustomSecretConfig to provide \
+                 credentials for an UpdateLocationObjectStorage request. Do not provide \
+                 both parameters for the same request."
+                    .to_string(),
+            ));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // The credential this location ends up with, and the two refusals the ARN
+        // itself can earn. An ARN addresses one location of one kind: an unknown ARN
+        // and an ARN naming another kind of location are both refused, worded in
+        // `crate::state`.
+        let (agentless, current_secret) = match store.object_storage_location(&input.location_arn) {
+            Ok((location, object_storage)) => (
+                location.agent_arns.is_empty(),
+                object_storage.secret.clone(),
+            ),
+            Err(message) => return Err(invalid_request(message)),
+        };
+
+        // A location created without an agent is agentless for life: an agentless
+        // cross-cloud transfer has no agent to reach, so naming agents for it later
+        // is refused rather than converting the location. A location created with
+        // agents takes the list the request names.
+        if input.agent_arns.is_some() && agentless {
+            return Err(invalid_request(
+                "Invalid parameter: Updating AgentArns is not permitted for agentless \
+                 object storage locations."
+                    .to_string(),
+            ));
+        }
+
+        // Resolved before the location is borrowed for writing, because minting a
+        // DataSync-managed secret draws on the same store. An update that names none
+        // of the credential members leaves the secret the location already has.
+        let secret = store.object_storage_secret(
+            &region,
+            &current_secret,
+            input.secret_key.as_deref(),
+            input.cmk_secret_config.as_ref(),
+            input.custom_secret_config.as_ref(),
+        );
+
+        let location = match store.object_storage_location_mut(&input.location_arn) {
+            Ok(location) => location,
+            Err(message) => return Err(invalid_request(message)),
+        };
+
+        // Every member the request names replaces what the location held; the rest
+        // keep the value the create (or an earlier update) gave them.
+        if let Some(server_hostname) = input.server_hostname {
+            location.config.server_hostname = server_hostname;
+        }
+        if let Some(server_protocol) = input.server_protocol {
+            location.config.server_protocol = server_protocol;
+            // A request that changes the protocol without naming a port moves the
+            // location to the port the new protocol speaks.
+            if input.server_port.is_none() {
+                location.config.server_port =
+                    crate::state::default_server_port(&location.config.server_protocol);
+            }
+        }
+        if let Some(server_port) = input.server_port {
+            location.config.server_port = server_port;
+        }
+        if input.access_key.is_some() {
+            location.config.access_key = input.access_key;
+        }
+        if input.server_certificate.is_some() {
+            location.config.server_certificate = input.server_certificate;
+        }
+        location.config.secret = secret;
+        if let Some(subdirectory) = input.subdirectory {
+            *location.subdirectory = Some(subdirectory);
+        }
+        if let Some(agent_arns) = input.agent_arns {
+            *location.agent_arns = agent_arns;
+        }
+
+        // The URI reports where the location now points, so it is rebuilt from what
+        // the location holds after the update.
+        *location.location_uri = crate::state::LocationKind::ObjectStorage.location_uri(
+            &super::create_location_object_storage::object_storage_global_id(
+                &location.config.server_hostname,
+                &location.config.bucket_name,
+            ),
+            location.subdirectory.as_deref(),
+        );
+
+        Ok(UpdateLocationObjectStorageOutput {})
     }
+}
+
+/// A 400 refusal of this request, as every DataSync client failure is modelled.
+fn invalid_request(message: String) -> UpdateLocationObjectStorageError {
+    UpdateLocationObjectStorageErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+        error_code: None,
+        datasync_error_code: None,
+    })
+    .into()
 }

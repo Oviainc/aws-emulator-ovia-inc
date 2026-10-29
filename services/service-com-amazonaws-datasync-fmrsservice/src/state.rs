@@ -3,7 +3,7 @@
 //! Engine state for the com-amazonaws-datasync-fmrsservice service.
 //!
 //! This module owns the DataSync resources the handlers in `src/ops/` share —
-//! transfer locations, transfer tasks and task executions — plus the two pieces of
+//! transfer locations, transfer tasks and task executions — plus the pieces of
 //! behaviour that cannot live in any single operation file:
 //!
 //! * [`ComAmazonawsDatasyncFmrsserviceState::advance_clock`], which materialises the
@@ -13,6 +13,10 @@
 //! * the modelled defaults ([`default_options`]) and the per-execution overlay
 //!   ([`overlay_options`]) that `CreateTask`, `StartTaskExecution` and the two
 //!   `Describe*` operations must agree on.
+//! * the object storage location members a `CreateLocationObjectStorage` and an
+//!   `UpdateLocationObjectStorage` have to resolve the same way
+//!   ([`DEFAULT_SERVER_PROTOCOL`], [`default_server_port`] and
+//!   [`ComAmazonawsDatasyncFmrsserviceState::object_storage_secret`]).
 //!
 //! Resource ids are minted from monotonic counters held here, so every ARN this
 //! service hands out is also stored here and can be resolved again.
@@ -21,7 +25,8 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    FilterRule, ManifestConfig, Options, S3Config, TagListEntry, TaskReportConfig, TaskSchedule,
+    CmkSecretConfig, CustomSecretConfig, FilterRule, ManifestConfig, Options, S3Config,
+    TagListEntry, TaskReportConfig, TaskSchedule,
 };
 
 /// How long each clock-owed transition takes.
@@ -110,6 +115,8 @@ pub enum LocationKind {
     S3,
     /// A Microsoft Azure Blob Storage container.
     AzureBlob,
+    /// A self-managed or third-party object storage system.
+    ObjectStorage,
 }
 
 impl LocationKind {
@@ -118,6 +125,7 @@ impl LocationKind {
         match self {
             Self::S3 => "s3",
             Self::AzureBlob => "azure-blob",
+            Self::ObjectStorage => "object-storage",
         }
     }
 
@@ -126,10 +134,11 @@ impl LocationKind {
     ///
     /// `LocationUri` is documented as `TYPE://GLOBAL_ID/SUBDIR`, where TYPE is the kind
     /// of location and GLOBAL_ID identifies the resource backing it (a bucket name for
-    /// Amazon S3, a container's host and name for Azure Blob Storage) — so every kind of
-    /// location assembles its URI the same way and contributes only its own GLOBAL_ID.
-    /// The subdirectory becomes one slash-delimited prefix, however many leading or
-    /// trailing slashes the request spelled it with.
+    /// Amazon S3, a container's host and name for Azure Blob Storage, a server and a
+    /// bucket for an object storage system) — so every kind of location assembles its
+    /// URI the same way and contributes only its own GLOBAL_ID. The subdirectory becomes
+    /// one slash-delimited prefix, however many leading or trailing slashes the request
+    /// spelled it with.
     pub fn location_uri(self, global_id: &str, subdirectory: Option<&str>) -> String {
         let scheme = self.uri_scheme();
         let global_id = global_id.trim_matches('/');
@@ -146,6 +155,7 @@ impl LocationKind {
         match self {
             Self::S3 => "an Amazon S3",
             Self::AzureBlob => "an Azure Blob Storage",
+            Self::ObjectStorage => "an object storage",
         }
     }
 }
@@ -173,6 +183,22 @@ pub enum LocationSecret {
     },
 }
 
+impl LocationSecret {
+    /// The ARN of the secret this credential lives in, when there is one.
+    ///
+    /// An update that names only a customer-managed KMS key re-encrypts the secret the
+    /// location ALREADY has, so it needs to ask where that secret is.
+    pub fn secret_arn(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Managed { secret_arn } | Self::ManagedWithCustomerKey { secret_arn, .. } => {
+                Some(secret_arn)
+            }
+            Self::Customer { secret_arn, .. } => secret_arn.as_deref(),
+        }
+    }
+}
+
 /// The Amazon S3 configuration of a transfer location.
 #[derive(Debug, Clone)]
 pub struct S3LocationConfig {
@@ -191,12 +217,25 @@ pub struct AzureBlobLocationConfig {
     pub secret: LocationSecret,
 }
 
+/// The object storage configuration of a transfer location.
+#[derive(Debug, Clone)]
+pub struct ObjectStorageLocationConfig {
+    pub bucket_name: String,
+    pub server_hostname: String,
+    pub server_port: i32,
+    pub server_protocol: String,
+    pub access_key: Option<String>,
+    pub server_certificate: Option<Vec<u8>>,
+    pub secret: LocationSecret,
+}
+
 /// The per-kind configuration of a transfer location: one variant per
 /// [`LocationKind`], so a location holds the members of its own kind and no others.
 #[derive(Debug, Clone)]
 pub enum LocationConfig {
     S3(S3LocationConfig),
     AzureBlob(AzureBlobLocationConfig),
+    ObjectStorage(ObjectStorageLocationConfig),
 }
 
 impl LocationConfig {
@@ -205,6 +244,7 @@ impl LocationConfig {
         match self {
             Self::S3(_) => LocationKind::S3,
             Self::AzureBlob(_) => LocationKind::AzureBlob,
+            Self::ObjectStorage(_) => LocationKind::ObjectStorage,
         }
     }
 
@@ -220,6 +260,23 @@ impl LocationConfig {
     pub fn as_azure_blob(&self) -> Option<&AzureBlobLocationConfig> {
         match self {
             Self::AzureBlob(azure_blob) => Some(azure_blob),
+            _ => None,
+        }
+    }
+
+    /// The object storage configuration, when that is this location's kind.
+    pub fn as_object_storage(&self) -> Option<&ObjectStorageLocationConfig> {
+        match self {
+            Self::ObjectStorage(object_storage) => Some(object_storage),
+            _ => None,
+        }
+    }
+
+    /// The object storage configuration for writing, when that is this location's
+    /// kind — what `UpdateLocationObjectStorage` changes.
+    pub fn as_object_storage_mut(&mut self) -> Option<&mut ObjectStorageLocationConfig> {
+        match self {
+            Self::ObjectStorage(object_storage) => Some(object_storage),
             _ => None,
         }
     }
@@ -540,6 +597,90 @@ impl ComAmazonawsDatasyncFmrsserviceState {
         self.located(arn, LocationKind::AzureBlob, LocationConfig::as_azure_blob)
     }
 
+    /// The object storage location stored under `arn`, with its object storage
+    /// configuration.
+    pub fn object_storage_location(
+        &self,
+        arn: &str,
+    ) -> Result<(&Location, &ObjectStorageLocationConfig), String> {
+        self.located(
+            arn,
+            LocationKind::ObjectStorage,
+            LocationConfig::as_object_storage,
+        )
+    }
+
+    /// The object storage location stored under `arn`, borrowed for an update to write
+    /// to: the members every location has that an update can change, and the object
+    /// storage configuration. Refused in the same words as the reading lookup.
+    pub fn object_storage_location_mut(
+        &mut self,
+        arn: &str,
+    ) -> Result<ObjectStorageLocationMut<'_>, String> {
+        let Location {
+            location_uri,
+            subdirectory,
+            agent_arns,
+            config,
+            ..
+        } = self
+            .locations
+            .get_mut(arn)
+            .ok_or_else(|| location_not_found_message(arn))?;
+        let config = config.as_object_storage_mut().ok_or_else(|| {
+            location_kind_mismatch_message(arn, LocationKind::ObjectStorage)
+        })?;
+        Ok(ObjectStorageLocationMut {
+            location_uri,
+            subdirectory,
+            agent_arns,
+            config,
+        })
+    }
+
+    /// Where an object storage location's credential ends up, from the credential
+    /// members of a create or an update request and the secret it already has.
+    ///
+    /// `CustomSecretConfig` points at a secret the caller manages. `CmkSecretConfig`
+    /// asks for a DataSync-managed secret encrypted with the caller's KMS key: with a
+    /// `SecretKey` DataSync creates that secret, and on its own it re-encrypts the
+    /// secret the location ALREADY has, which therefore stays where it is. A
+    /// `SecretKey` alone goes into a secret DataSync manages with the Amazon Web
+    /// Services managed key. A request naming none of the three leaves a created
+    /// location without a credential and an updated one with the credential it had.
+    pub fn object_storage_secret(
+        &mut self,
+        region: &str,
+        current: &LocationSecret,
+        secret_key: Option<&str>,
+        cmk_secret_config: Option<&CmkSecretConfig>,
+        custom_secret_config: Option<&CustomSecretConfig>,
+    ) -> LocationSecret {
+        if let Some(custom) = custom_secret_config {
+            return LocationSecret::Customer {
+                secret_arn: custom.secret_arn.clone(),
+                secret_access_role_arn: custom.secret_access_role_arn.clone(),
+            };
+        }
+        if let Some(cmk) = cmk_secret_config {
+            let held = current.secret_arn().filter(|_| secret_key.is_none());
+            let secret_arn = match held {
+                Some(secret_arn) => secret_arn.to_string(),
+                None => self.mint_managed_secret_arn(region),
+            };
+            return LocationSecret::ManagedWithCustomerKey {
+                secret_arn,
+                kms_key_arn: cmk.kms_key_arn.clone(),
+            };
+        }
+        if secret_key.is_some_and(|key| !key.is_empty()) {
+            return LocationSecret::Managed {
+                secret_arn: self.mint_managed_secret_arn(region),
+            };
+        }
+        current.clone()
+    }
+
     /// The location stored under `arn`, projected through `pick` — the accessor for the
     /// kind of location the asking operation reports.
     ///
@@ -556,13 +697,9 @@ impl ComAmazonawsDatasyncFmrsserviceState {
         let location = self
             .locations
             .get(arn)
-            .ok_or_else(|| format!("Location {arn} is not found."))?;
-        let config = pick(&location.config).ok_or_else(|| {
-            format!(
-                "Location {arn} is not {described} location.",
-                described = kind.described()
-            )
-        })?;
+            .ok_or_else(|| location_not_found_message(arn))?;
+        let config =
+            pick(&location.config).ok_or_else(|| location_kind_mismatch_message(arn, kind))?;
         Ok((location, config))
     }
 
@@ -577,6 +714,14 @@ impl ComAmazonawsDatasyncFmrsserviceState {
 /// An ARN in this service's `datasync` namespace, with the emulator's account id.
 fn emulator_arn(region: &str, resource: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, resource)
+}
+
+/// The bare resource id of a DataSync ARN — `loc-…`, `task-…`, `agent-…`.
+///
+/// This is how DataSync identifies a resource in a refusal message: the id alone,
+/// never the ARN the request carried and never the member that carried it.
+pub fn resource_id(arn: &str) -> &str {
+    arn.split('/').next_back().unwrap_or(arn)
 }
 
 /// The region a request was signed for, from its SigV4 credential scope.
@@ -612,6 +757,53 @@ pub fn millis_between(from: SystemTime, to: SystemTime) -> i64 {
     to.duration_since(from)
         .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+/// The protocol an object storage location whose request named none ends up with:
+/// "If not specified, the default value is HTTPS" (`ServerProtocol`'s own
+/// documentation).
+pub const DEFAULT_SERVER_PROTOCOL: &str = "HTTPS";
+
+/// The port an object storage request that named none ends up with: the one its
+/// protocol speaks.
+///
+/// The modelled `ObjectStorageServerProtocol` has exactly two values, and each has a
+/// well-known port — 443 for HTTPS, 80 for HTTP — so an unspecified `ServerPort`
+/// resolves to the default port of the protocol the location uses.
+pub fn default_server_port(server_protocol: &str) -> i32 {
+    if server_protocol == "HTTP" {
+        80
+    } else {
+        443
+    }
+}
+
+/// DataSync's not-found refusal text for a location.
+///
+/// One wording for every operation that resolves a `LocationArn`, so a read, an
+/// update and a task create all report a missing location the same way.
+pub fn location_not_found_message(location_arn: &str) -> String {
+    format!("Location {location_arn} is not found.")
+}
+
+/// The refusal text for an ARN that names a location of another kind than the one the
+/// asking operation reports on.
+pub fn location_kind_mismatch_message(location_arn: &str, expected: LocationKind) -> String {
+    format!(
+        "Location {location_arn} is not {described} location.",
+        described = expected.described()
+    )
+}
+
+/// An object storage location borrowed for an update: the members every location has
+/// that `UpdateLocationObjectStorage` can change, beside the object storage
+/// configuration it changes the rest of.
+#[derive(Debug)]
+pub struct ObjectStorageLocationMut<'a> {
+    pub location_uri: &'a mut String,
+    pub subdirectory: &'a mut Option<String>,
+    pub agent_arns: &'a mut Vec<String>,
+    pub config: &'a mut ObjectStorageLocationConfig,
 }
 
 /// The task options a `CreateTask` that declared none ends up with.

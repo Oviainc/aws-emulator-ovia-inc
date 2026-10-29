@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLocationObjectStorage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLocationObjectStorage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeLocationObjectStorage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the object storage transfer location `CreateLocationObjectStorage` stored
+//! in [`crate::state`], with the configuration `UpdateLocationObjectStorage` has
+//! since changed. Nothing here is derived from the request beyond the ARN it names.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +165,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLocationObjectStorage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLocationObjectStorageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLocationObjectStorage"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeLocationObjectStorageErrorModeled::InternalException(
+                InternalException {
+                    message: Some(
+                        "the DataSync emulator could not reach its state store".to_string(),
+                    ),
+                    error_code: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+        // An ARN addresses one location of one kind: an unknown ARN and an ARN naming
+        // another kind of location are both refused, worded in `crate::state`.
+        let (location, object_storage) = store
+            .object_storage_location(&input.location_arn)
+            .map_err(|message| {
+                DescribeLocationObjectStorageErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(message),
+                        error_code: None,
+                        datasync_error_code: None,
+                    },
+                )
+            })?;
+
+        // Exactly one of the three secret members describes where the location's
+        // credential lives, so the other two are absent; a location that needs no
+        // stored credential reports none of them.
+        let (managed_secret_config, cmk_secret_config, custom_secret_config) =
+            match &object_storage.secret {
+                crate::state::LocationSecret::None => (None, None, None),
+                crate::state::LocationSecret::Managed { secret_arn } => (
+                    Some(ManagedSecretConfig {
+                        secret_arn: Some(secret_arn.clone()),
+                    }),
+                    None,
+                    None,
+                ),
+                crate::state::LocationSecret::ManagedWithCustomerKey {
+                    secret_arn,
+                    kms_key_arn,
+                } => (
+                    None,
+                    Some(CmkSecretConfig {
+                        secret_arn: Some(secret_arn.clone()),
+                        kms_key_arn: kms_key_arn.clone(),
+                    }),
+                    None,
+                ),
+                crate::state::LocationSecret::Customer {
+                    secret_arn,
+                    secret_access_role_arn,
+                } => (
+                    None,
+                    None,
+                    Some(CustomSecretConfig {
+                        secret_arn: secret_arn.clone(),
+                        secret_access_role_arn: secret_access_role_arn.clone(),
+                    }),
+                ),
+            };
+
+        Ok(DescribeLocationObjectStorageOutput {
+            location_arn: Some(location.arn.clone()),
+            location_uri: Some(location.location_uri.clone()),
+            access_key: object_storage.access_key.clone(),
+            server_port: Some(object_storage.server_port),
+            server_protocol: Some(object_storage.server_protocol.clone()),
+            // `AgentArns` is modelled `len 1..8`, so an empty list is not a legal
+            // value for it: an agentless location reports no member.
+            agent_arns: (!location.agent_arns.is_empty()).then(|| location.agent_arns.clone()),
+            creation_time: Some(crate::state::as_timestamp(location.creation_time)),
+            server_certificate: object_storage.server_certificate.clone(),
+            managed_secret_config,
+            cmk_secret_config,
+            custom_secret_config,
+        })
     }
 }
