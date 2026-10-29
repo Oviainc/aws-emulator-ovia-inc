@@ -41,8 +41,9 @@ use crate::service_error_rules::{assert_validation_invariants, message_of};
 /// The requirement an `AmendBenefitApplication` refusal of a `FieldPath` naming no
 /// amendable field states, as that operation words it.
 const UNAMENDABLE: &str = "Member must name one of the amendable fields (Name, Description, \
-                           BenefitApplicationDetails), or a `.`-separated path into \
-                           BenefitApplicationDetails";
+                           BenefitApplicationDetails, PartnerContacts, FileDetails), a \
+                           `.`-separated path into BenefitApplicationDetails, or a member \
+                           of one element of PartnerContacts or FileDetails";
 
 /// A tag key in the AWS-reserved namespace, which no caller may supply.
 const RESERVED_KEY: &str = "aws:createdBy";

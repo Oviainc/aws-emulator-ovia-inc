@@ -29,18 +29,30 @@
 //!
 //! ## What a `FieldPath` may name
 //!
-//! `Name`, `Description`, or `BenefitApplicationDetails` followed by a `.`-separated
-//! path into that document — each optionally written in JSON-path form (`$.Name`).
-//! Those are the members a caller supplies and `UpdateBenefitApplication` also writes;
-//! everything else on the record is service-owned, so a path naming one is refused with
-//! the modelled `ValidationException`, as is a `NewValue` outside the modelled length of
-//! the member the path names.
+//! Every member a caller supplies and `UpdateBenefitApplication` also writes: `Name`,
+//! `Description`, `BenefitApplicationDetails` followed by a `.`-separated path into that
+//! document, and a caller-supplied member of one element of `PartnerContacts` or
+//! `FileDetails`. `NewValue` is one string and a list is not, so the path below a list
+//! member addresses ONE element — its 0-based position, as a JSON path indexes a list,
+//! written either as a subscript on that list member's name (`PartnerContacts[0].Email`)
+//! or as a segment of its own (`FileDetails.1.FileURI`) — followed by the member of that
+//! element to write. Each path may also be written in JSON-path form (`$.Name`).
+//!
+//! Everything else on the record is service-owned — its identity, its status, the programs
+//! of the benefit it requests, and the members of a stored attachment that follow the URI
+//! or record who attached it and when — so a path naming one is refused with the modelled
+//! `ValidationException`, as is a `NewValue` the member the path names is not modelled to
+//! accept: `Amendment$NewValue` is an unconstrained `String`, so the target member's own
+//! constraints are enforced here, by the same validating walk the centralized request
+//! validation runs.
 //!
 //! The members the model leaves unconstrained carry this service's own bounds, so no
 //! request and no sequence of requests can grow one record without limit: at most
 //! [`crate::state::MAX_AMENDMENTS_PER_REQUEST`] amendments per request, a `FieldPath` of
 //! at most [`crate::state::MAX_FIELD_PATH_LEN`] bytes and
-//! [`crate::state::MAX_DETAILS_DEPTH`] segments, a details value of at most
+//! [`crate::state::MAX_DETAILS_DEPTH`] segments, a details value — and a value written to
+//! a member the model leaves unconstrained ([`CONTACT_UNCONSTRAINED_MEMBERS`],
+//! [`FILE_UNCONSTRAINED_MEMBERS`]) — of at most
 //! [`crate::state::MAX_DETAILS_VALUE_LEN`], an `AmendmentReason` and a `ClientToken`
 //! within the lengths the model gives them
 //! ([`crate::state::MAX_AMENDMENT_REASON_LEN`], [`crate::state::MAX_CLIENT_TOKEN_LEN`] —
@@ -144,13 +156,67 @@ const FIELD_NAME: &str = "Name";
 const FIELD_DESCRIPTION: &str = "Description";
 /// The benefit-application member a `BenefitApplicationDetails...` path amends.
 const FIELD_DETAILS: &str = "BenefitApplicationDetails";
+/// The benefit-application member a `PartnerContacts...` path amends.
+const FIELD_PARTNER_CONTACTS: &str = "PartnerContacts";
+/// The benefit-application member a `FileDetails...` path amends.
+const FIELD_FILE_DETAILS: &str = "FileDetails";
 
 /// The members of a benefit application an amendment may write.
 ///
-/// They are the members a caller supplies and `UpdateBenefitApplication` also writes;
-/// everything else on the record is service-owned (its identity, its status, the
-/// programs of the benefit it requests) and no amendment reaches it.
-const AMENDABLE_FIELDS: &[&str] = &[FIELD_NAME, FIELD_DESCRIPTION, FIELD_DETAILS];
+/// They are the members a caller supplies and `UpdateBenefitApplication` also writes
+/// (`Name`, `Description`, `BenefitApplicationDetails`, `PartnerContacts`, `FileDetails` —
+/// that operation's own input); everything else on the record is service-owned (its
+/// identity, its status, the programs of the benefit it requests) and no amendment reaches
+/// it.
+const AMENDABLE_FIELDS: &[&str] = &[
+    FIELD_NAME,
+    FIELD_DESCRIPTION,
+    FIELD_DETAILS,
+    FIELD_PARTNER_CONTACTS,
+    FIELD_FILE_DETAILS,
+];
+
+/// The two amendable fields whose shape is a LIST of structures, so a path below one
+/// addresses an element of it. They are the only fields a subscript is read on.
+const LIST_FIELDS: &[&str] = &[FIELD_PARTNER_CONTACTS, FIELD_FILE_DETAILS];
+
+/// The members of one `PartnerContacts` element an amendment may write, as the model
+/// spells them: every member of the modelled `Contact`, which is a structure the caller
+/// supplies whole (`smithy_query(query="shape",shape="Contact")`).
+const MEMBER_EMAIL: &str = "Email";
+const MEMBER_FIRST_NAME: &str = "FirstName";
+const MEMBER_LAST_NAME: &str = "LastName";
+const MEMBER_BUSINESS_TITLE: &str = "BusinessTitle";
+const MEMBER_PHONE: &str = "Phone";
+const CONTACT_MEMBERS: &[&str] = &[
+    MEMBER_EMAIL,
+    MEMBER_FIRST_NAME,
+    MEMBER_LAST_NAME,
+    MEMBER_BUSINESS_TITLE,
+    MEMBER_PHONE,
+];
+
+/// The members of one `FileDetails` element an amendment may write: the members of the
+/// modelled `FileInput` a caller supplies for an attachment
+/// (`smithy_query(query="shape",shape="FileInput")`). The rest of a stored `FileDetail` is
+/// the service's own — `FileName` and `FileType` follow the URI, `CreatedBy` and
+/// `CreatedAt` record who attached the file and when (see [`crate::state::file_detail`]).
+const MEMBER_FILE_URI: &str = "FileURI";
+const MEMBER_BUSINESS_USE_CASE: &str = "BusinessUseCase";
+const FILE_MEMBERS: &[&str] = &[MEMBER_FILE_URI, MEMBER_BUSINESS_USE_CASE];
+
+/// The member of a `Contact` the model constrains not at all: `Phone` targets
+/// `ContactPhone`, which carries no `@length`
+/// (`smithy_query(query="shape",shape="Contact")`). A value written to it therefore
+/// carries this service's own bound on a persisted caller value, exactly as a leaf of the
+/// details document does ([`crate::state::MAX_DETAILS_VALUE_LEN`]), so no amendment can
+/// grow one record without limit.
+const CONTACT_UNCONSTRAINED_MEMBERS: &[&str] = &[MEMBER_PHONE];
+
+/// The member of a `FileInput` the model constrains not at all, for the same reason:
+/// `BusinessUseCase` targets a bare `String`
+/// (`smithy_query(query="shape",shape="FileInput")`).
+const FILE_UNCONSTRAINED_MEMBERS: &[&str] = &[MEMBER_BUSINESS_USE_CASE];
 
 /// The longest value `Name` accepts: the modelled `BenefitApplicationName`
 /// `@length(min: 1, max: 255)`. `Amendment$NewValue` is an unconstrained `String`, so
@@ -187,25 +253,150 @@ fn member_path(position: usize, member: &str) -> String {
 }
 
 /// The segments of one `FieldPath`: a field name, optionally written in JSON-path form
-/// (`$.Name`), with `.`-separated member names below it.
+/// (`$.Name`), with `.`-separated member names below it. A list element's position is
+/// written either as a subscript on the field name (`PartnerContacts[0]`) or as a segment
+/// of its own (`PartnerContacts.0`) — a JSON path indexes a list in brackets, so both
+/// spellings address the same element and the walk below reads one grammar.
+///
+/// A subscript is read on the FIELD NAME of a LIST member ([`LIST_FIELDS`]) and nowhere
+/// else, because that is where a list is addressed: on any other field name, and on every
+/// segment below a field name, the brackets are part of the name — a key of the details
+/// document is a name the CALLER chose and is addressed verbatim, brackets included.
 ///
 /// `None` for a path this service cannot read: one longer than
-/// [`crate::state::MAX_FIELD_PATH_LEN`], one with an empty segment, or one with more
-/// than [`crate::state::MAX_DETAILS_DEPTH`] segments. `FieldPath` is an unconstrained
-/// `String`, so those two bounds are what keep the walk below from recursing without
-/// limit and the path from being stored at arbitrary length.
+/// [`crate::state::MAX_FIELD_PATH_LEN`], one with an empty segment, one whose subscript is
+/// unclosed, or one with more than [`crate::state::MAX_DETAILS_DEPTH`] segments.
+/// `FieldPath` is an unconstrained `String`, so those two bounds are what keep the walk
+/// below from recursing without limit and the path from being stored at arbitrary length.
 fn path_segments(field_path: &str) -> Option<Vec<&str>> {
     if field_path.len() > crate::state::MAX_FIELD_PATH_LEN {
         return None;
     }
-    let segments: Vec<&str> = field_path
+    let mut steps = field_path
         .strip_prefix("$.")
         .unwrap_or(field_path)
-        .split('.')
-        .collect();
+        .split('.');
+    let head = steps
+        .next()
+        .expect("`split('.')` yields at least one segment");
+    let mut segments: Vec<&str> = Vec::new();
+    match head.split_once('[') {
+        Some((field, subscript)) if LIST_FIELDS.contains(&field) => {
+            segments.push(field);
+            segments.push(subscript.strip_suffix(']')?);
+        }
+        _ => segments.push(head),
+    }
+    segments.extend(steps);
     (segments.iter().all(|segment| !segment.is_empty())
         && segments.len() <= crate::state::MAX_DETAILS_DEPTH)
     .then_some(segments)
+}
+
+/// The element of a list member a `FieldPath` addresses and the member of that element it
+/// writes, from the path below the list member.
+///
+/// `rest` is that path: the element's position, 0-based as a JSON path indexes a list, then
+/// the name of the member to write. `None` for a path of any other shape — `NewValue` is
+/// one string, so a path that does not address one element and one of its members names
+/// nothing an amendment can write. The position is a decimal written canonically, so one
+/// element has ONE spelling: a sign, a leading zero or any other text names no element.
+fn list_element_path<'p>(rest: &[&'p str]) -> Option<(usize, &'p str)> {
+    let [position, member] = rest else {
+        return None;
+    };
+    let canonical = position.bytes().all(|byte| byte.is_ascii_digit())
+        && (position.len() == 1 || !position.starts_with('0'));
+    canonical
+        .then(|| position.parse().ok())
+        .flatten()
+        .map(|index| (index, *member))
+}
+
+/// The requirement `value` fails as the member `member` of the modelled structure
+/// `schema`, or `None` when the shape accepts it.
+///
+/// `Amendment$NewValue` is an unconstrained `String`, so the constraints of the member it
+/// is written to are enforced here — by the SAME validating walk the centralized request
+/// validation runs (`aws_smithy_schema_server::constraints::validate` over the shape's own
+/// schema), so a value an amendment writes into a member must satisfy exactly what a value
+/// the create or the update supplied for it must. Only the member the amendment wrote is
+/// reported on, and the requirement is worded by [`crate::service::constraint_requirement`]
+/// — the words every refusal of this service uses — and echoes nothing of the value.
+fn member_requirement(
+    value: &dyn ::aws_smithy_schema::serde::SerializableStruct,
+    schema: &::aws_smithy_schema::Schema,
+    member: &str,
+) -> Option<String> {
+    let path = ::aws_smithy_schema_server::constraints::path::member(member);
+    ::aws_smithy_schema_server::constraints::validate(value, schema)
+        .into_iter()
+        .filter(|violation| violation.path == path)
+        .find_map(|violation| crate::service::constraint_requirement(&violation.kind))
+}
+
+/// The slot of `contact` the element member `member` writes, or `None` when `member` names
+/// none of [`CONTACT_MEMBERS`].
+fn contact_slot<'c>(contact: &'c mut Contact, member: &str) -> Option<&'c mut Option<String>> {
+    match member {
+        MEMBER_EMAIL => Some(&mut contact.email),
+        MEMBER_FIRST_NAME => Some(&mut contact.first_name),
+        MEMBER_LAST_NAME => Some(&mut contact.last_name),
+        MEMBER_BUSINESS_TITLE => Some(&mut contact.business_title),
+        MEMBER_PHONE => Some(&mut contact.phone),
+        _ => None,
+    }
+}
+
+/// The caller-supplied content of one stored attachment — the `FileInput` an amendment
+/// writes into, and which the rest of the stored record follows (see
+/// [`crate::state::file_detail`]).
+fn file_input(file: &FileDetail) -> FileInput {
+    FileInput {
+        file_uri: file.file_uri.clone(),
+        business_use_case: file.business_use_case.clone(),
+    }
+}
+
+/// The requirement a `FieldPath` below a list member states: it addresses one element of
+/// the list and names the member of that element to write.
+fn element_path_requirement(field: &str) -> String {
+    format!(
+        "Member must name a member of one element of {field}, as that element's 0-based \
+         position followed by the member name"
+    )
+}
+
+/// The requirement a `FieldPath` fails when it addresses an element the list does not
+/// hold. It states how many elements the RECORD holds — the service's own data — and
+/// echoes nothing of the path the request carried.
+fn element_count_requirement(field: &str, count: usize) -> String {
+    format!("Member must name a 0-based element position within the {count} elements {field} holds")
+}
+
+/// The requirement a `FieldPath` fails when it names a member of a list element that is
+/// not one an amendment may write.
+fn element_member_requirement(field: &str, members: &[&str]) -> String {
+    format!(
+        "Member must name one of the amendable members of a {field} element ({})",
+        members.join(", ")
+    )
+}
+
+/// The requirement a value fails against this service's own bound on a member the model
+/// leaves unconstrained, or `None` for a member the model bounds itself — there the
+/// modelled constraint is the only one, so the two cannot disagree. `unconstrained` is the
+/// set for the shape the member belongs to
+/// ([`CONTACT_UNCONSTRAINED_MEMBERS`], [`FILE_UNCONSTRAINED_MEMBERS`]).
+fn unconstrained_member_clause(
+    unconstrained: &[&str],
+    member: &str,
+    value: &str,
+) -> Option<String> {
+    if !unconstrained.contains(&member) {
+        return None;
+    }
+    crate::state::length_clause(value, 0, crate::state::MAX_DETAILS_VALUE_LEN)
 }
 
 /// Write `value` at `path` inside `document`, creating the objects the path needs.
@@ -270,11 +461,18 @@ fn apply_amendment(
         AmendmentRefusal::new(
             member_path(position, "fieldPath"),
             format!(
-                "Member must name one of the amendable fields ({}), or a `.`-separated path \
-                 into {FIELD_DETAILS}",
+                "Member must name one of the amendable fields ({}), a `.`-separated path \
+                 into {FIELD_DETAILS}, or a member of one element of \
+                 {FIELD_PARTNER_CONTACTS} or {FIELD_FILE_DETAILS}",
                 AMENDABLE_FIELDS.join(", ")
             ),
         )
+    };
+    let refused_path = |requirement: String| {
+        AmendmentRefusal::new(member_path(position, "fieldPath"), requirement)
+    };
+    let refused_value = |requirement: String| {
+        AmendmentRefusal::new(member_path(position, "newValue"), requirement)
     };
 
     let segments = path_segments(&amendment.field_path).ok_or_else(&unamendable)?;
@@ -287,10 +485,7 @@ fn apply_amendment(
             if let Some(clause) =
                 crate::state::length_clause(&amendment.new_value, MIN_LEN, NAME_MAX_LEN)
             {
-                return Err(AmendmentRefusal::new(
-                    member_path(position, "newValue"),
-                    clause,
-                ));
+                return Err(refused_value(clause));
             }
             application.name = Some(amendment.new_value.clone());
         }
@@ -300,10 +495,7 @@ fn apply_amendment(
                 MIN_LEN,
                 DESCRIPTION_MAX_LEN,
             ) {
-                return Err(AmendmentRefusal::new(
-                    member_path(position, "newValue"),
-                    clause,
-                ));
+                return Err(refused_value(clause));
             }
             application.description = Some(amendment.new_value.clone());
         }
@@ -323,24 +515,97 @@ fn apply_amendment(
                 0,
                 crate::state::MAX_DETAILS_VALUE_LEN,
             ) {
-                return Err(AmendmentRefusal::new(
-                    member_path(position, "newValue"),
-                    clause,
-                ));
+                return Err(refused_value(clause));
             }
             let document = application
                 .benefit_application_details
                 .get_or_insert_with(|| Document::Object(HashMap::new()));
             set_document_member(document, rest, &amendment.new_value).map_err(|depth| {
-                AmendmentRefusal::new(
-                    member_path(position, "fieldPath"),
-                    format!(
-                        "Member must name a member of an object: segment {} of the path names a \
-                         value that is not an object",
-                        depth + 1
-                    ),
-                )
+                refused_path(format!(
+                    "Member must name a member of an object: segment {} of the path names a \
+                     value that is not an object",
+                    depth + 1
+                ))
             })?;
+        }
+        FIELD_PARTNER_CONTACTS => {
+            // A contact is a structure the caller supplies whole, so an amendment names
+            // the element and the member of it to write; the element has to be one the
+            // record holds, since the MEMBERSHIP of the list is what the update rewrites.
+            let (index, member) = list_element_path(rest)
+                .ok_or_else(|| refused_path(element_path_requirement(FIELD_PARTNER_CONTACTS)))?;
+            let count = application.partner_contacts.len();
+            let contact = application
+                .partner_contacts
+                .get_mut(index)
+                .ok_or_else(|| {
+                    refused_path(element_count_requirement(FIELD_PARTNER_CONTACTS, count))
+                })?;
+            let mut amended = contact.clone();
+            let slot = contact_slot(&mut amended, member).ok_or_else(|| {
+                refused_path(element_member_requirement(
+                    FIELD_PARTNER_CONTACTS,
+                    CONTACT_MEMBERS,
+                ))
+            })?;
+            *slot = Some(amendment.new_value.clone());
+            if let Some(requirement) = member_requirement(&amended, &Contact::SCHEMA, member) {
+                return Err(refused_value(requirement));
+            }
+            if let Some(clause) = unconstrained_member_clause(
+                CONTACT_UNCONSTRAINED_MEMBERS,
+                member,
+                &amendment.new_value,
+            ) {
+                return Err(refused_value(clause));
+            }
+            *contact = amended;
+        }
+        FIELD_FILE_DETAILS => {
+            // An attachment's caller-supplied content is its `FileURI` and its
+            // `BusinessUseCase`; the rest of the stored record follows them.
+            let (index, member) = list_element_path(rest)
+                .ok_or_else(|| refused_path(element_path_requirement(FIELD_FILE_DETAILS)))?;
+            let count = application.file_details.len();
+            let file = application
+                .file_details
+                .get_mut(index)
+                .ok_or_else(|| refused_path(element_count_requirement(FIELD_FILE_DETAILS, count)))?;
+            let mut supplied = file_input(file);
+            match member {
+                MEMBER_FILE_URI => supplied.file_uri = amendment.new_value.clone(),
+                MEMBER_BUSINESS_USE_CASE => {
+                    supplied.business_use_case = Some(amendment.new_value.clone());
+                }
+                _ => {
+                    return Err(refused_path(element_member_requirement(
+                        FIELD_FILE_DETAILS,
+                        FILE_MEMBERS,
+                    )))
+                }
+            }
+            if let Some(requirement) = member_requirement(&supplied, &FileInput::SCHEMA, member) {
+                return Err(refused_value(requirement));
+            }
+            if let Some(clause) = unconstrained_member_clause(
+                FILE_UNCONSTRAINED_MEMBERS,
+                member,
+                &amendment.new_value,
+            ) {
+                return Err(refused_value(clause));
+            }
+            // `FileName` and `FileType` follow the URI, exactly as they do for an
+            // attachment the create or the update stored
+            // ([`crate::state::file_detail`]), so a write that moved the URI derives them
+            // again — and a write to anything else leaves every member the URI governs
+            // exactly as it was. `CreatedBy` and `CreatedAt` record WHO attached the file
+            // and WHEN rather than what was attached, so no amendment touches them.
+            if supplied.file_uri != file.file_uri {
+                file.file_name = crate::state::file_name_of(&supplied.file_uri);
+                file.file_type = crate::state::file_type_of(&supplied.file_uri);
+                file.file_uri = supplied.file_uri;
+            }
+            file.business_use_case = supplied.business_use_case;
         }
         _ => return Err(unamendable()),
     }
@@ -613,11 +878,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The revision and `UpdatedAt` move only when the record actually changed, so an
         // amendment naming the value a field already holds reports the revision the
         // application already had — the same rule the writes beside this one apply (see
-        // [`crate::state::BenefitApplication::revise`]). The three amendable fields are
-        // the only ones `apply_amendment` writes.
+        // [`crate::state::BenefitApplication::revise`]). The amendable fields
+        // ([`AMENDABLE_FIELDS`]) are the only ones `apply_amendment` writes, and each is
+        // compared the way the write beside this one compares it: a contact through the
+        // canonical document of the modelled shape
+        // ([`crate::state::same_value`]), a stored attachment through its
+        // caller-supplied content ([`crate::state::same_file_details`]), which is all an
+        // amendment can change because the rest of the record follows it.
         if amended.name != application.name
             || amended.description != application.description
             || amended.benefit_application_details != application.benefit_application_details
+            || !crate::state::same_value(&application.partner_contacts, &amended.partner_contacts)
+            || !crate::state::same_file_details(
+                &application.file_details,
+                &amended.file_details.iter().map(file_input).collect::<Vec<_>>(),
+            )
         {
             amended.revise(now);
         }

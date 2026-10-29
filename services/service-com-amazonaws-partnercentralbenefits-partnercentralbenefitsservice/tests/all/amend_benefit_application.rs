@@ -136,7 +136,15 @@ async fn get(harness: &Harness, case: &str, identifier: &str) -> Value {
 }
 
 /// One amendment request body.
-fn amend_body(identifier: &str, revision: &str, token: &str, amendments: Value) -> Value {
+///
+/// Shared with `tests/all/amend_caller_supplied_members.rs`, which drives the same
+/// operation, so the two suites cannot build a request two ways.
+pub(crate) fn amend_body(
+    identifier: &str,
+    revision: &str,
+    token: &str,
+    amendments: Value,
+) -> Value {
     json!({
         "Catalog": CATALOG,
         "ClientToken": token,
@@ -147,8 +155,8 @@ fn amend_body(identifier: &str, revision: &str, token: &str, amendments: Value) 
     })
 }
 
-/// One `(FieldPath, NewValue)` pair.
-fn amendment(field_path: &str, new_value: &str) -> Value {
+/// One `(FieldPath, NewValue)` pair. Shared, for the same reason.
+pub(crate) fn amendment(field_path: &str, new_value: &str) -> Value {
     json!({ "FieldPath": field_path, "NewValue": new_value })
 }
 
@@ -599,8 +607,9 @@ async fn amend_refuses_an_unamendable_path_or_a_value_past_a_bound() {
             Some(clause(
                 "amendments.2.member.fieldPath",
                 "Member must name one of the amendable fields (Name, Description, \
-                 BenefitApplicationDetails), or a `.`-separated path into \
-                 BenefitApplicationDetails",
+                 BenefitApplicationDetails, PartnerContacts, FileDetails), a \
+                 `.`-separated path into BenefitApplicationDetails, or a member of one \
+                 element of PartnerContacts or FileDetails",
             )),
         ),
         (
@@ -684,7 +693,10 @@ async fn amend_refuses_an_unamendable_path_or_a_value_past_a_bound() {
 
 /// The validation envelope over one clause, as this service answers a refused request:
 /// `service::constraint_envelope` of a single violation.
-fn clause(path: &str, requirement: &str) -> String {
+///
+/// Shared with `tests/all/amend_caller_supplied_members.rs`, so one envelope is asserted
+/// one way.
+pub(crate) fn clause(path: &str, requirement: &str) -> String {
     format!("1 validation error detected: Value at '{path}' failed to satisfy constraint: {requirement}")
 }
 
