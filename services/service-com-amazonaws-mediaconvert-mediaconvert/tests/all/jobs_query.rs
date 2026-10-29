@@ -50,7 +50,10 @@ const HELD_IN_SUBMITTED: Duration = Duration::from_secs(3_600);
 ///
 /// The span is state, as the job settle span is, so no case depends on how fast the
 /// machine is. Nothing on a request path writes it.
-fn pin_query_span(emulator: &Emulator, span: Duration) {
+///
+/// `pub(crate)` because `tests/all/blank_jobs_query_id.rs` holds its fixture query in
+/// `SUBMITTED` the same way, and one place that pins this span beats a second copy of it.
+pub(crate) fn pin_query_span(emulator: &Emulator, span: Duration) {
     emulator
         .engine
         .state::<ComAmazonawsMediaconvertMediaconvertState>()

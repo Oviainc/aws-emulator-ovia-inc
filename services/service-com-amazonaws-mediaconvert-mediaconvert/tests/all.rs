@@ -21,6 +21,8 @@ mod blank_delete_name;
 mod blank_filter_value;
 #[path = "all/blank_job_reference.rs"]
 mod blank_job_reference;
+#[path = "all/blank_jobs_query_id.rs"]
+mod blank_jobs_query_id;
 #[path = "all/blank_resource_name.rs"]
 mod blank_resource_name;
 #[path = "all/caller_sent_key_identity.rs"]
