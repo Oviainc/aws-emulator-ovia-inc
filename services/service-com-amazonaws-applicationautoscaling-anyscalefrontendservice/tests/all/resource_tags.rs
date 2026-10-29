@@ -75,9 +75,15 @@ async fn register(emulator: &Emulator, index: usize, case: &str) -> String {
     let (namespace, resource_id, dimension) = IDENTITIES[index % IDENTITIES.len()];
     let resource_id = format!("{resource_id}-{index}");
     // A scalable target resolves the resource it scales in the service that owns it, so
-    // the DynamoDB rows get their table created first.
+    // the DynamoDB and ECS rows get their resource created first.
     if let Some(table) = resource_id.strip_prefix("table/") {
         emulator.create_provisioned_table(table, 1, 1).await;
+    }
+    if let Some((cluster, service)) = resource_id
+        .strip_prefix("service/")
+        .and_then(|rest| rest.split_once('/'))
+    {
+        emulator.given_ecs_service(cluster, service, 1).await;
     }
     let (status, body) = emulator
         .call(

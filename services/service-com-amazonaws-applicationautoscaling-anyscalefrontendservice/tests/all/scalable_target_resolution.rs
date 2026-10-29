@@ -11,8 +11,9 @@
 //!   `ValidationException`;
 //! * a scalable target is a capacity dimension OF A RESOURCE, so registering one resolves
 //!   that resource in the service that owns it: a DynamoDB table that does not exist, one
-//!   in on-demand billing mode (no provisioned capacity to scale) and a global secondary
-//!   index the table does not carry are all refused;
+//!   in on-demand billing mode (no provisioned capacity to scale), a global secondary
+//!   index the table does not carry and an ECS service the cluster does not run are all
+//!   refused;
 //! * deregistering a target RETIRES it, so registering the same identity again mints a new
 //!   target — a new `ScalableTargetARN`, with none of the retired target's tags or
 //!   policies.
@@ -37,6 +38,8 @@ enum Setup {
     OnDemandTable,
     /// A PROVISIONED table `orders` carrying the global secondary index `by-customer`.
     TableWithIndex,
+    /// The ECS service `web-app` in the cluster `prod-cluster`.
+    EcsService,
 }
 
 /// One registration, and whether it names a resource at all.
@@ -117,8 +120,32 @@ const RESOURCE_CATALOG: &[ResourceRow] = &[
         namespace: "ecs",
         resource_id: "service/prod-cluster/web-app",
         dimension: "ecs:service:DesiredCount",
-        setup: Setup::Nothing,
+        setup: Setup::EcsService,
         accepted: true,
+    },
+    ResourceRow {
+        case: "an ECS service that does not exist",
+        namespace: "ecs",
+        resource_id: "service/prod-cluster/web-app",
+        dimension: "ecs:service:DesiredCount",
+        setup: Setup::Nothing,
+        accepted: false,
+    },
+    ResourceRow {
+        case: "another cluster's service, in a cluster that holds none",
+        namespace: "ecs",
+        resource_id: "service/staging-cluster/web-app",
+        dimension: "ecs:service:DesiredCount",
+        setup: Setup::EcsService,
+        accepted: false,
+    },
+    ResourceRow {
+        case: "a service the cluster does not run",
+        namespace: "ecs",
+        resource_id: "service/prod-cluster/batch-worker",
+        dimension: "ecs:service:DesiredCount",
+        setup: Setup::EcsService,
+        accepted: false,
     },
     ResourceRow {
         case: "an ECS service id without its cluster",
@@ -228,6 +255,9 @@ async fn prepare(emulator: &Emulator, setup: Setup) {
             emulator
                 .create_table_with_index("orders", "by-customer", "customer", 2, 2)
                 .await;
+        }
+        Setup::EcsService => {
+            emulator.given_ecs_service("prod-cluster", "web-app", 1).await;
         }
     }
 }

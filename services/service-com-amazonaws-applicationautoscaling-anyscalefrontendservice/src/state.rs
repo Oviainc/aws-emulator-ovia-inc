@@ -67,13 +67,15 @@ pub struct ScalableTargetRecord {
     pub max_capacity: i32,
     /// The capacity this service believes the scalable target currently sits at.
     ///
-    /// Application Auto Scaling learns a resource's capacity from the target service
-    /// (ECS, DynamoDB, …) and moves it on the target's behalf; this emulator does not
-    /// drive those data planes yet, so it tracks the capacity of the scalable target
-    /// itself. A first registration adopts the window's floor — the registered minimum
-    /// is the smallest capacity "inside of this range", and adopting it records no
-    /// activity because nothing was moved — and every later movement is an action this
-    /// service performed, so it is recorded as a scaling activity.
+    /// Application Auto Scaling learns a resource's capacity from the service that owns it
+    /// (ECS, DynamoDB, …) and moves it on the target's behalf, so for a namespace this
+    /// emulator holds a store for this follows that resource's own capacity: every
+    /// registration places it inside the registered window, and every movement is applied
+    /// there ([`policy_execution`]). For a namespace whose owning service this emulator
+    /// cannot read, this IS the capacity: a first registration adopts the window's floor —
+    /// the registered minimum is the smallest capacity "inside of this range", and adopting
+    /// it records no activity because nothing was moved — and every later movement is an
+    /// action this service performed, so it is recorded as a scaling activity.
     pub current_capacity: i32,
     pub role_arn: String,
     pub creation_time: SystemTime,
@@ -668,8 +670,27 @@ pub fn scalable_target_of(key: &TargetKey, record: &ScalableTargetRecord) -> Sca
         predicted_capacity: None,
         role_arn: record.role_arn.clone(),
         creation_time: timestamp_of(record.creation_time),
-        suspended_state: record.suspended_state.clone(),
+        suspended_state: Some(reported_suspended_state(record.suspended_state.as_ref())),
         scalable_target_arn: Some(record.arn.clone()),
+    }
+}
+
+/// The `SuspendedState` a report of a scalable target carries: all three flags the shape
+/// declares, each `false` where nothing has suspended that activity.
+///
+/// A scaling activity is either suspended or it is not, and a target nobody has suspended
+/// anything on has all three running — so each flag is reported as the boolean it is. A
+/// member left out would make a caller that reads whether scaling is suspended guess, and
+/// the same holds for a partial suspension: suspending one activity says nothing about the
+/// other two, which are still running.
+pub fn reported_suspended_state(stored: Option<&SuspendedState>) -> SuspendedState {
+    let flag = |read: fn(&SuspendedState) -> Option<bool>| {
+        Some(stored.and_then(read).unwrap_or(false))
+    };
+    SuspendedState {
+        dynamic_scaling_in_suspended: flag(|state| state.dynamic_scaling_in_suspended),
+        dynamic_scaling_out_suspended: flag(|state| state.dynamic_scaling_out_suspended),
+        scheduled_scaling_suspended: flag(|state| state.scheduled_scaling_suspended),
     }
 }
 
@@ -1099,6 +1120,7 @@ pub fn resolve_target_resource<Eng: Send + Sync + 'static>(
             &target.resource_id,
             &target.scalable_dimension,
         ),
+        "ecs" => resolve_ecs_capacity(engine, &target.resource_id),
         _ => Ok(None),
     }
 }
@@ -1122,6 +1144,39 @@ pub fn split_ecs_resource_id(resource_id: &str) -> Option<(&str, &str)> {
     let (cluster, service) = rest.split_once('/')?;
     (!cluster.is_empty() && !service.is_empty() && !service.contains('/'))
         .then_some((cluster, service))
+}
+
+/// The `desiredCount` the ECS store holds for the service an `ecs` `ResourceId` names, or
+/// the `ValidationException` message for a service that cannot carry the target.
+///
+/// A scalable target is a capacity dimension OF A RESOURCE, so `ecs:service:DesiredCount` —
+/// "the task count of an ECS service" — needs that service to exist: one that does not has
+/// no task count to scale, and neither has one that has been deleted, whose count is no
+/// longer maintained. The same rule the DynamoDB resolver applies one namespace over
+/// ([`resolve_dynamodb_capacity`]), against the store that owns ECS services; a process
+/// where that store is not reachable resolves nothing rather than refusing.
+pub fn resolve_ecs_capacity<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    resource_id: &str,
+) -> Result<Option<i64>, String> {
+    use ::service_com_amazonaws_ecs_amazonec2containerservicev20141113 as ecs;
+
+    let (cluster, service_name) = split_ecs_resource_id(resource_id).ok_or_else(|| {
+        format!(
+            "ResourceId not valid for the ecs service namespace: {resource_id} must name an ECS \
+             service as service/<cluster>/<service>"
+        )
+    })?;
+    let Some(store) = ecs::state::service_state(engine) else {
+        return Ok(None);
+    };
+    let store = store.lock();
+    let service = store
+        .services
+        .get(&(cluster.to_string(), service_name.to_string()))
+        .filter(|service| service.is_active())
+        .ok_or_else(|| format!("ECS service doesn't exist: {resource_id}"))?;
+    Ok(Some(i64::from(service.desired_count)))
 }
 
 /// The provisioned capacity the DynamoDB store holds for what a `dynamodb` scalable target
@@ -1434,11 +1489,10 @@ const WORKSPACES_POOL: &[&str] = &["workspaces:workspacespool:DesiredUserSession
 
 /// The window a provisioned-throughput utilisation target must lie in.
 ///
-/// Both services whose scalable dimension IS a provisioned read/write throughput publish
-/// the same one: the Amazon DynamoDB Developer Guide ("Managing throughput capacity
-/// automatically with DynamoDB auto scaling": a target utilisation between 20 and 90
-/// percent) and the Amazon Keyspaces Developer Guide for a provisioned-throughput table.
-const PROVISIONED_UTILIZATION_RANGE: (f64, f64) = (20.0, 90.0);
+/// Both services whose scalable dimension IS a provisioned read/write throughput publish the
+/// same one, and recorded behaviour of each is that both bounds are inclusive: a target
+/// utilisation of ten percent of the provisioned capacity is accepted, and so is ninety.
+const PROVISIONED_UTILIZATION_RANGE: (f64, f64) = (10.0, 90.0);
 
 const PREDEFINED_METRICS: &[PredefinedMetric] = &[
     metric("DynamoDBReadCapacityUtilization", "AWS/DynamoDB", "ConsumedReadCapacityUnits", "Sum", true, 60, DYNAMODB_READ, Some(PROVISIONED_UTILIZATION_RANGE)),
@@ -1740,27 +1794,55 @@ pub fn metric_signature(config: &TargetTrackingScalingPolicyConfiguration) -> St
     }
 }
 
-/// How long an alarm's metric has to stay past its threshold before the alarm fires, as
-/// a number of periods.
+/// How the pair of alarms on the metric a policy TRACKS is evaluated: how many periods a
+/// breach has to last in each direction, and where the scale-in alarm sits relative to the
+/// scale-out threshold.
+#[derive(Debug, Clone, Copy)]
+struct TrackedAlarmRules {
+    /// Periods the metric has to stay past the target before the scale-out alarm fires.
+    scale_out_evaluation_periods: i32,
+    /// Periods below the scale-in threshold before the scale-in alarm fires.
+    scale_in_evaluation_periods: i32,
+    /// The fraction of the scale-out threshold the scale-in alarm's threshold sits at.
+    scale_in_fraction: f64,
+}
+
+/// The rules for the pair on a tracked metric, which follow WHAT that metric measures.
 ///
-/// Chosen by this emulator, not a documented AWS value: a scale-out alarm reacts in two
-/// periods and a scale-in alarm is deliberately slower, the asymmetry target tracking is
-/// built on ("scaling in is more gradual than scaling out").
-const SCALE_OUT_EVALUATION_PERIODS: i32 = 2;
-const SCALE_IN_EVALUATION_PERIODS: i32 = 15;
+/// Scaling in is slower than scaling out in both rows — the asymmetry target tracking is
+/// built on, "scaling in is more gradual than scaling out" — and each row is the behaviour
+/// of the integration that mints such a pair:
+///
+/// * a metric that already IS the quantity the target names (a utilisation percentage, a
+///   count per target): recorded behaviour — the scale-out alarm fires after three periods
+///   above the target value and the scale-in alarm sits a tenth below it, over fifteen;
+/// * a metric that COUNTS the capacity units consumed over the period, which is how the two
+///   provisioned-throughput services publish their utilisation: their auto scaling adds
+///   capacity after two periods above the target and removes it after fifteen below a fifth
+///   under it (the Amazon DynamoDB Developer Guide's "Managing throughput capacity
+///   automatically with DynamoDB auto scaling", which scales out on a two-minute breach and
+///   in on a fifteen-minute one).
+fn tracked_alarm_rules(consumed_units: bool) -> TrackedAlarmRules {
+    if consumed_units {
+        TrackedAlarmRules {
+            scale_out_evaluation_periods: 2,
+            scale_in_evaluation_periods: 15,
+            scale_in_fraction: 0.8,
+        }
+    } else {
+        TrackedAlarmRules {
+            scale_out_evaluation_periods: 3,
+            scale_in_evaluation_periods: 15,
+            scale_in_fraction: 0.9,
+        }
+    }
+}
 
 /// The period of the two alarms that watch the resource's provisioned capacity, and how
 /// many of them must breach. Also this emulator's choice; the capacity of a resource moves
 /// far less often than its utilisation, so these alarms are coarser.
 const CAPACITY_ALARM_PERIOD: i32 = 300;
 const CAPACITY_ALARM_EVALUATION_PERIODS: i32 = 3;
-
-/// The fraction of the target utilisation the scale-in alarm sits at.
-///
-/// Target tracking does not scale in the moment utilisation dips below the target — it waits
-/// for a margin below it, or every small dip would remove capacity that the next data point
-/// asks back. The margin is 20% of the target.
-const SCALE_IN_TARGET_FRACTION: f64 = 0.8;
 
 /// The prefix every alarm a target-tracking policy mints carries, which is what lets a
 /// client find them with `DescribeAlarms`' `AlarmNamePrefix`.
@@ -1770,12 +1852,16 @@ const ALARM_NAME_PREFIX: &str = "TargetTracking";
 /// a resource id of up to 1600 characters would otherwise blow through.
 const MAX_ALARM_NAME_LEN: usize = 255;
 
-/// The name of one of a policy's alarms: the `TargetTracking` prefix, the resource the policy
-/// scales, which of the policy's alarms this is, and an opaque id that makes the name unique
-/// to this policy.
+/// The name of one of a policy's alarms, in the grammar the service mints one by:
+/// `TargetTracking-<resource id>-<kind>-<id>`, where the trailing id is an 8-4-4-4-12
+/// identifier ([`uuid_shaped_id`]).
+///
+/// The GRAMMAR is the requirement, not the id: a client identifies which of a policy's
+/// alarms it holds by reading the kind out of the name, so every segment has to be
+/// separable — an id that carried no group separators would run into the kind before it.
 pub fn policy_alarm_name(key: &PolicyKey, kind: AlarmKind) -> String {
     let kind = kind.name_segment(&key.target.service_namespace);
-    let id = opaque_id(
+    let id = uuid_shaped_id(
         &[
             "alarm",
             &key.target.service_namespace,
@@ -1785,7 +1871,6 @@ pub fn policy_alarm_name(key: &PolicyKey, kind: AlarmKind) -> String {
             kind,
         ]
         .join("\u{1f}"),
-        32,
     );
     let suffix = format!("-{kind}-{id}");
     let room = MAX_ALARM_NAME_LEN
@@ -1798,6 +1883,43 @@ pub fn policy_alarm_name(key: &PolicyKey, kind: AlarmKind) -> String {
         return format!("{ALARM_NAME_PREFIX}{suffix}");
     }
     format!("{ALARM_NAME_PREFIX}-{resource}{suffix}")
+}
+
+/// What separates a scaling policy's ARN from the id of the alarm set minted for it, inside
+/// one of that policy's alarm actions. See [`policy_alarm_action`].
+const ALARM_ACTION_CREATED_BY: &str = ":createdBy/";
+
+/// The ACTION one of a policy's alarms executes when it moves into `ALARM`: the policy's own
+/// ARN, followed by the id of the alarm set that policy minted —
+/// `<policy ARN>:createdBy/<id>`.
+///
+/// The action is the wiring that makes a target-tracking policy alarm-driven, so it names
+/// the policy; the suffix says the alarm was minted BY that policy, which is what lets a
+/// client tell a policy's own alarms from one it wired up itself by matching the
+/// `<policy ARN>:createdBy/` prefix. One id per POLICY — its alarms were minted together —
+/// derived from the policy's identity so it survives a re-put rather than changing per call.
+pub fn policy_alarm_action(policy_arn: &str, key: &PolicyKey) -> String {
+    let id = uuid_shaped_id(
+        &[
+            "createdBy",
+            &key.target.service_namespace,
+            &key.target.resource_id,
+            &key.target.scalable_dimension,
+            &key.policy_name,
+        ]
+        .join("\u{1f}"),
+    );
+    format!("{policy_arn}{ALARM_ACTION_CREATED_BY}{id}")
+}
+
+/// The scaling policy an alarm action names: an action is either a policy's bare ARN — which
+/// is how a client wires its OWN alarm to a step scaling policy — or that ARN with the
+/// minting suffix [`policy_alarm_action`] adds, and both name the same policy.
+pub fn policy_arn_in_action(action: &str) -> &str {
+    match action.split_once(ALARM_ACTION_CREATED_BY) {
+        Some((policy_arn, _)) => policy_arn,
+        None => action,
+    }
 }
 
 /// The largest index at or below `at` that `text` can be split on.
@@ -2025,6 +2147,7 @@ pub fn target_tracking_alarms(
     };
 
     let capacity_rules = capacity_alarm_rules(&key.target.service_namespace);
+    let tracked_rules = tracked_alarm_rules(consumed_units);
     let mut alarms = Vec::new();
     for kind in AlarmKind::ALL {
         // A direction that cannot act has no alarm to trigger it. Whether that takes the
@@ -2075,7 +2198,7 @@ pub fn target_tracking_alarms(
                     utilisation_threshold(if kind.scales_out() {
                         1.0
                     } else {
-                        SCALE_IN_TARGET_FRACTION
+                        tracked_rules.scale_in_fraction
                     }),
                     if kind.scales_out() {
                         "GreaterThanThreshold"
@@ -2097,9 +2220,9 @@ pub fn target_tracking_alarms(
             evaluation_periods: if kind.watches_capacity() {
                 CAPACITY_ALARM_EVALUATION_PERIODS
             } else if kind.scales_out() {
-                SCALE_OUT_EVALUATION_PERIODS
+                tracked_rules.scale_out_evaluation_periods
             } else {
-                SCALE_IN_EVALUATION_PERIODS
+                tracked_rules.scale_in_evaluation_periods
             },
             threshold,
             comparison_operator,
@@ -2306,9 +2429,10 @@ fn apply_alarms<Eng: Send + Sync + 'static>(
             )),
             alarm_configuration_updated_timestamp: Some(cloudwatch::state::to_timestamp(now)),
             actions_enabled: Some(true),
-            // The alarm's action IS the scaling policy: that is the wiring that makes a
-            // target-tracking policy alarm-driven.
-            alarm_actions: Some(vec![policy_arn.to_string()]),
+            // The alarm's one action names the scaling policy it executes, with the
+            // minting suffix that says the policy created it ([`policy_alarm_action`]):
+            // that is the wiring which makes a target-tracking policy alarm-driven.
+            alarm_actions: Some(vec![policy_alarm_action(policy_arn, key)]),
             state_value,
             state_reason,
             state_updated_timestamp: state_updated,

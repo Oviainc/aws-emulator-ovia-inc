@@ -206,6 +206,11 @@ async fn a_capacity_under_its_dimensions_floor_names_the_floor() {
                 .await;
             }
             None => {
+                // An accepted row's resource has to exist, because a registration resolves
+                // it; a refused one is refused on its window before anything is resolved.
+                emulator
+                    .given_resource(row.namespace, row.resource_id, row.min)
+                    .await;
                 accepted(&emulator, row.case, "RegisterScalableTarget", request).await;
             }
         }

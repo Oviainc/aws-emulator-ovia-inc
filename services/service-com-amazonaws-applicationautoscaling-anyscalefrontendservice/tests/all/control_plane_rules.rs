@@ -171,19 +171,20 @@ struct TargetValueRow {
 /// Target values at and past each published bound.
 ///
 /// Both services whose scalable dimension IS a provisioned read/write throughput publish the
-/// same window for a target utilisation — 20 to 90 percent (the Amazon DynamoDB Developer
-/// Guide's "Managing throughput capacity automatically with DynamoDB auto scaling" and the
-/// Amazon Keyspaces Developer Guide) — so each bound is tested, and one step past it. A
-/// metric that is a COUNT publishes no window, and a large count is accepted.
+/// same window for a target utilisation, and recorded behaviour of each is that it runs from
+/// 10 to 90 percent INCLUSIVE — so each bound is tested, and one step past it. A metric that
+/// is a COUNT publishes no window, and a large count is accepted.
 const TARGET_VALUE_CATALOG: &[TargetValueRow] = &[
+    TargetValueRow { dimension: "dynamodb:table:ReadCapacityUnits", metric_type: "DynamoDBReadCapacityUtilization", target_value: 10.0, accepted: true },
     TargetValueRow { dimension: "dynamodb:table:ReadCapacityUnits", metric_type: "DynamoDBReadCapacityUtilization", target_value: 20.0, accepted: true },
     TargetValueRow { dimension: "dynamodb:table:ReadCapacityUnits", metric_type: "DynamoDBReadCapacityUtilization", target_value: 55.5, accepted: true },
     TargetValueRow { dimension: "dynamodb:table:ReadCapacityUnits", metric_type: "DynamoDBReadCapacityUtilization", target_value: 90.0, accepted: true },
-    TargetValueRow { dimension: "dynamodb:table:ReadCapacityUnits", metric_type: "DynamoDBReadCapacityUtilization", target_value: 19.9, accepted: false },
+    TargetValueRow { dimension: "dynamodb:table:ReadCapacityUnits", metric_type: "DynamoDBReadCapacityUtilization", target_value: 9.9, accepted: false },
     TargetValueRow { dimension: "dynamodb:table:ReadCapacityUnits", metric_type: "DynamoDBReadCapacityUtilization", target_value: 90.1, accepted: false },
     TargetValueRow { dimension: "dynamodb:table:ReadCapacityUnits", metric_type: "DynamoDBReadCapacityUtilization", target_value: 150.0, accepted: false },
     TargetValueRow { dimension: "dynamodb:table:ReadCapacityUnits", metric_type: "DynamoDBReadCapacityUtilization", target_value: 0.0, accepted: false },
     TargetValueRow { dimension: "dynamodb:index:WriteCapacityUnits", metric_type: "DynamoDBWriteCapacityUtilization", target_value: 95.0, accepted: false },
+    TargetValueRow { dimension: "cassandra:table:ReadCapacityUnits", metric_type: "CassandraReadCapacityUtilization", target_value: 10.0, accepted: true },
     TargetValueRow { dimension: "cassandra:table:ReadCapacityUnits", metric_type: "CassandraReadCapacityUtilization", target_value: 90.0, accepted: true },
     TargetValueRow { dimension: "cassandra:table:ReadCapacityUnits", metric_type: "CassandraReadCapacityUtilization", target_value: 99.0, accepted: false },
     // A request count per target is not a percentage of anything, so nothing bounds it.
@@ -478,19 +479,12 @@ async fn a_capacity_below_the_dimensions_floor_is_refused() {
         let emulator = Emulator::empty();
         let namespace = row.dimension.split(':').next().unwrap_or_default();
         let resource_id = resource_id_for(row.dimension);
-        // The DynamoDB rows name a real table, so the registration is refused (or accepted)
-        // on its capacity window and not on an unresolvable resource.
-        if namespace == "dynamodb" {
-            let rest = resource_id.trim_start_matches("table/");
-            match rest.split_once("/index/") {
-                Some((table, index)) => {
-                    emulator
-                        .create_table_with_index(table, index, "status", 4, 4)
-                        .await
-                }
-                None => emulator.create_provisioned_table(rest, 4, 4).await,
-            }
-        }
+        // The rows whose namespace this emulator owns a store for name a real resource, so
+        // the registration is refused (or accepted) on its capacity window and not on an
+        // unresolvable resource. The resource is created inside the window the row declares.
+        emulator
+            .given_resource(namespace, &resource_id, row.min)
+            .await;
         let (status, body) = emulator
             .call(
                 "RegisterScalableTarget",
@@ -653,6 +647,15 @@ async fn concurrent_registrations_of_different_targets_all_succeed() {
 
     let mut calls = Vec::new();
     for dimension in dimensions {
+        // The resource each target scales exists first, where this emulator owns the service
+        // it lives in: resolving it is part of the registration under test.
+        emulator
+            .given_resource(
+                dimension.split(':').next().unwrap_or_default(),
+                &resource_id_for(dimension),
+                1,
+            )
+            .await;
         let emulator = Arc::clone(&emulator);
         calls.push(tokio::spawn(async move {
             let (status, body) = emulator

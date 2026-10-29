@@ -13,8 +13,9 @@
 //!   resource's provisioned capacity;
 //! * the scale-out alarm's threshold is COMPUTED, as `target% * period * provisioned units`
 //!   for such a consumed-units metric and as the target value itself for a metric that
-//!   already is the quantity the target names, with the scale-in alarm a fixed margin below
-//!   it;
+//!   already is the quantity the target names, with the scale-in alarm a margin below it —
+//!   how far below, and how many periods each direction is evaluated over, following what
+//!   the tracked metric measures;
 //! * a direction that is disabled (`DisableScaleIn`) or suspended (`SuspendedState`) has no
 //!   alarm on the tracked metric, and resuming it brings the alarm back — while the pair
 //!   that watches the provisioned capacity follows the direction only where the owning
@@ -28,9 +29,10 @@ use super::emulator::{
     alarm_kind, alarm_kinds, error_code, Emulator, ACCOUNT, ALARM_NAME_PREFIX, REGION,
 };
 
-/// The margin below the target the scale-in alarm sits at: target tracking scales in only
-/// after utilisation has dropped a fifth below the target.
-const SCALE_IN_FRACTION: f64 = 0.8;
+/// How many periods below its threshold the scale-in alarm is evaluated over, whatever the
+/// tracked metric measures: scaling in is the slower of the two directions in every
+/// integration that mints such a pair.
+const SCALE_IN_EVALUATION_PERIODS: i64 = 15;
 
 /// How the resource a row scales is created in the service that owns it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +67,11 @@ struct AlarmRow {
     expected_period: i64,
     /// The scale-out alarm's threshold.
     expected_threshold: f64,
+    /// The scale-in alarm's threshold, for a row that has one: a margin below the scale-out
+    /// threshold, and how far below it is the owning integration's own rule.
+    expected_scale_in_threshold: f64,
+    /// How many periods above the target the scale-out alarm is evaluated over.
+    expected_scale_out_evaluation_periods: i64,
     /// The dimensions the alarm must carry, as (name, value) pairs.
     expected_dimensions: &'static [(&'static str, &'static str)],
 }
@@ -96,6 +103,11 @@ const CASSANDRA_CAPACITY_ALARMS: &[&str] = &[
 /// `…HighResolution` metric types as evaluating "every 20 seconds"), and whether scale-in is
 /// disabled. The first row is the case the issue cited — 40% of one provisioned read unit at
 /// a 60-second period, so a threshold of 24 consumed units.
+///
+/// The two expected scale-in thresholds and scale-out evaluation periods are the ones the
+/// integration that mints the pair uses: a consumed-units metric breaches out after two
+/// periods and in a fifth below the scale-out threshold, a metric that already is the
+/// quantity the target names after three periods and a tenth below it.
 const ALARM_CATALOG: &[AlarmRow] = &[
     AlarmRow {
         case: "dynamodb read capacity at 40% of one provisioned unit",
@@ -112,6 +124,8 @@ const ALARM_CATALOG: &[AlarmRow] = &[
         expected_statistic: "Sum",
         expected_period: 60,
         expected_threshold: 24.0,
+        expected_scale_in_threshold: 19.2,
+        expected_scale_out_evaluation_periods: 2,
         expected_dimensions: &[("TableName", "orders")],
     },
     AlarmRow {
@@ -129,6 +143,8 @@ const ALARM_CATALOG: &[AlarmRow] = &[
         expected_statistic: "Sum",
         expected_period: 60,
         expected_threshold: 210.0,
+        expected_scale_in_threshold: 168.0,
+        expected_scale_out_evaluation_periods: 2,
         expected_dimensions: &[("TableName", "orders")],
     },
     AlarmRow {
@@ -146,6 +162,8 @@ const ALARM_CATALOG: &[AlarmRow] = &[
         expected_statistic: "Sum",
         expected_period: 60,
         expected_threshold: 60.0,
+        expected_scale_in_threshold: 48.0,
+        expected_scale_out_evaluation_periods: 2,
         expected_dimensions: &[
             ("TableName", "orders"),
             ("GlobalSecondaryIndexName", "by-customer"),
@@ -166,6 +184,8 @@ const ALARM_CATALOG: &[AlarmRow] = &[
         expected_statistic: "Average",
         expected_period: 60,
         expected_threshold: 45.0,
+        expected_scale_in_threshold: 40.5,
+        expected_scale_out_evaluation_periods: 3,
         expected_dimensions: &[("ClusterName", "prod-cluster"), ("ServiceName", "web-app")],
     },
     AlarmRow {
@@ -183,6 +203,8 @@ const ALARM_CATALOG: &[AlarmRow] = &[
         expected_statistic: "Average",
         expected_period: 20,
         expected_threshold: 65.0,
+        expected_scale_in_threshold: 58.5,
+        expected_scale_out_evaluation_periods: 3,
         expected_dimensions: &[("ClusterName", "prod-cluster"), ("ServiceName", "web-app")],
     },
     AlarmRow {
@@ -200,6 +222,8 @@ const ALARM_CATALOG: &[AlarmRow] = &[
         expected_statistic: "Average",
         expected_period: 60,
         expected_threshold: 0.7,
+        expected_scale_in_threshold: 0.63,
+        expected_scale_out_evaluation_periods: 3,
         expected_dimensions: &[("FunctionName", "ingest"), ("Resource", "ingest:green")],
     },
     AlarmRow {
@@ -220,6 +244,8 @@ const ALARM_CATALOG: &[AlarmRow] = &[
         expected_statistic: "Sum",
         expected_period: 60,
         expected_threshold: 24.0,
+        expected_scale_in_threshold: 19.2,
+        expected_scale_out_evaluation_periods: 2,
         expected_dimensions: &[("Keyspace", "orders_ks"), ("TableName", "orders")],
     },
     AlarmRow {
@@ -243,6 +269,9 @@ const ALARM_CATALOG: &[AlarmRow] = &[
         expected_statistic: "Sum",
         expected_period: 60,
         expected_threshold: 42.0,
+        // Scale-in is disabled, so there is no scale-in alarm to carry a threshold.
+        expected_scale_in_threshold: 0.0,
+        expected_scale_out_evaluation_periods: 2,
         expected_dimensions: &[("Keyspace", "orders_ks"), ("TableName", "orders")],
     },
     AlarmRow {
@@ -260,6 +289,8 @@ const ALARM_CATALOG: &[AlarmRow] = &[
         expected_statistic: "Sum",
         expected_period: 60,
         expected_threshold: 24.0,
+        expected_scale_in_threshold: 0.0,
+        expected_scale_out_evaluation_periods: 2,
         expected_dimensions: &[("TableName", "orders")],
     },
 ];
@@ -298,6 +329,11 @@ async fn register(emulator: &Emulator, row: &AlarmRow) {
         }
         Resource::External => {}
     }
+    // A namespace whose store this emulator does hold still needs its resource: an `ecs`
+    // row's service is created here, inside the window registered below.
+    emulator
+        .given_resource(row.namespace, row.resource_id, 1)
+        .await;
     let (status, body) = emulator
         .call(
             "RegisterScalableTarget",
@@ -356,21 +392,63 @@ async fn a_target_tracking_policy_mints_the_alarms_that_drive_it() {
         );
         for alarm in &alarms {
             let name = alarm["AlarmName"].as_str().unwrap_or_default();
+            // The GRAMMAR of a minted alarm name, which is how a client identifies which of
+            // a policy's alarms it holds: `TargetTracking-<resource id>-<kind>-<id>`, with
+            // the id an 8-4-4-4-12 hex identifier.
+            let kind = alarm_kind(alarm);
+            let expected_head = format!("{ALARM_NAME_PREFIX}-{}-{kind}-", row.resource_id);
             assert!(
-                name.starts_with(ALARM_NAME_PREFIX),
-                "case {case:?}: expected every minted alarm under the {ALARM_NAME_PREFIX} \
-                 prefix, got {name:?}"
+                name.starts_with(&expected_head),
+                "case {case:?}: expected an alarm name of the form {expected_head}<id>, got \
+                 {name:?}"
+            );
+            let id = name.trim_start_matches(&expected_head);
+            let groups: Vec<&str> = id.split('-').collect();
+            assert_eq!(
+                groups.iter().map(|group| group.len()).collect::<Vec<_>>(),
+                vec![8, 4, 4, 4, 12],
+                "case {case:?}: expected the name to end in an 8-4-4-4-12 identifier, got \
+                 {id:?}"
+            );
+            assert!(
+                groups
+                    .iter()
+                    .all(|group| group.chars().all(|digit| digit.is_ascii_hexdigit())),
+                "case {case:?}: expected that identifier to be hexadecimal, got {id:?}"
+            );
+            assert!(
+                row.expected_kinds.contains(&kind.as_str()),
+                "case {case:?}: expected the name to carry one of the kinds the policy mints \
+                 ({:?}), got {kind:?}",
+                row.expected_kinds
             );
             assert_eq!(
                 alarm["AlarmArn"],
                 json!(format!("arn:aws:cloudwatch:{REGION}:{ACCOUNT}:alarm:{name}")),
                 "case {case:?}: expected the alarm's own ARN, got {alarm:?}"
             );
+            let action = alarm["AlarmActions"]
+                .as_array()
+                .and_then(|actions| match actions.as_slice() {
+                    [action] => action.as_str(),
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: expected exactly one AlarmAction, got {alarm:?}")
+                });
+            let expected_prefix = format!("{policy_arn}:createdBy/");
+            assert!(
+                action.starts_with(&expected_prefix),
+                "case {case:?}: expected the alarm's action to be the scaling policy with the \
+                 minting suffix ({expected_prefix}<id>), got {action:?}"
+            );
+            let created_by = action.trim_start_matches(&expected_prefix);
+            let groups: Vec<usize> = created_by.split('-').map(str::len).collect();
             assert_eq!(
-                alarm["AlarmActions"],
-                json!([policy_arn]),
-                "case {case:?}: expected the alarm's action to be the scaling policy, got \
-                 {alarm:?}"
+                groups,
+                vec![8, 4, 4, 4, 12],
+                "case {case:?}: expected an 8-4-4-4-12 id after the createdBy separator, got \
+                 {created_by:?}"
             );
             assert_eq!(
                 alarm["Namespace"],
@@ -424,10 +502,17 @@ async fn a_target_tracking_policy_mints_the_alarms_that_drive_it() {
             "case {case:?}: expected a scale-out threshold of {}, got {threshold}",
             row.expected_threshold
         );
+        assert_eq!(
+            high["EvaluationPeriods"],
+            json!(row.expected_scale_out_evaluation_periods),
+            "case {case:?}: expected the scale-out alarm to be evaluated over {} periods, got \
+             {high:?}",
+            row.expected_scale_out_evaluation_periods
+        );
 
         if row.expected_kinds.contains(&"AlarmLow") {
             let low = alarm_of(&alarms, "AlarmLow", case);
-            let expected = row.expected_threshold * SCALE_IN_FRACTION;
+            let expected = row.expected_scale_in_threshold;
             let threshold = low["Threshold"].as_f64().unwrap_or_default();
             assert!(
                 (threshold - expected).abs() < 1e-9,
@@ -438,6 +523,12 @@ async fn a_target_tracking_policy_mints_the_alarms_that_drive_it() {
                 json!("LessThanThreshold"),
                 "case {case:?}: expected the scale-in alarm to fire below its threshold, got \
                  {low:?}"
+            );
+            assert_eq!(
+                low["EvaluationPeriods"],
+                json!(SCALE_IN_EVALUATION_PERIODS),
+                "case {case:?}: expected the scale-in alarm to be evaluated over \
+                 {SCALE_IN_EVALUATION_PERIODS} periods, got {low:?}"
             );
         }
 

@@ -147,6 +147,7 @@ async fn a_registered_target_is_described_from_what_was_persisted() {
             request["Tags"] = json!({"team": "search"});
         }
 
+        emulator.given_resource(row.namespace, row.resource_id, row.min).await;
         let (status, body) = emulator.call("RegisterScalableTarget", request).await;
         assert_eq!(
             status, 200,
@@ -275,7 +276,7 @@ async fn register_updates_only_the_members_the_request_names() {
             min: 4,
             max: 10,
             role: first_role,
-            suspended: || Value::Null,
+            suspended: || json!({"DynamicScalingInSuspended": false, "DynamicScalingOutSuspended": false, "ScheduledScalingSuspended": false}),
         },
         UpdateRow {
             case: "MaxCapacity only",
@@ -283,7 +284,7 @@ async fn register_updates_only_the_members_the_request_names() {
             min: 4,
             max: 40,
             role: first_role,
-            suspended: || Value::Null,
+            suspended: || json!({"DynamicScalingInSuspended": false, "DynamicScalingOutSuspended": false, "ScheduledScalingSuspended": false}),
         },
         UpdateRow {
             case: "RoleARN only",
@@ -291,7 +292,7 @@ async fn register_updates_only_the_members_the_request_names() {
             min: 4,
             max: 40,
             role: second_role,
-            suspended: || Value::Null,
+            suspended: || json!({"DynamicScalingInSuspended": false, "DynamicScalingOutSuspended": false, "ScheduledScalingSuspended": false}),
         },
         UpdateRow {
             case: "one suspended-scaling attribute",
@@ -299,7 +300,7 @@ async fn register_updates_only_the_members_the_request_names() {
             min: 4,
             max: 40,
             role: second_role,
-            suspended: || json!({"DynamicScalingInSuspended": true}),
+            suspended: || json!({"DynamicScalingInSuspended": true, "DynamicScalingOutSuspended": false, "ScheduledScalingSuspended": false}),
         },
         UpdateRow {
             case: "a second suspended-scaling attribute",
@@ -308,7 +309,7 @@ async fn register_updates_only_the_members_the_request_names() {
             max: 40,
             role: second_role,
             suspended: || {
-                json!({"DynamicScalingInSuspended": true, "ScheduledScalingSuspended": true})
+                json!({"DynamicScalingInSuspended": true, "DynamicScalingOutSuspended": false, "ScheduledScalingSuspended": true})
             },
         },
         UpdateRow {
@@ -318,7 +319,7 @@ async fn register_updates_only_the_members_the_request_names() {
             max: 40,
             role: second_role,
             suspended: || {
-                json!({"DynamicScalingInSuspended": true, "ScheduledScalingSuspended": true})
+                json!({"DynamicScalingInSuspended": true, "DynamicScalingOutSuspended": false, "ScheduledScalingSuspended": true})
             },
         },
     ];
@@ -530,6 +531,7 @@ async fn a_policy_round_trips_for_every_modelled_policy_type() {
         let case = row.case;
         let policy_name = format!("{}-policy", row.policy_type);
 
+        emulator.given_resource(row.namespace, row.resource_id, 1).await;
         let (status, body) = emulator
             .call(
                 "RegisterScalableTarget",
@@ -760,6 +762,9 @@ async fn a_policy_without_a_registered_target_is_refused() {
 #[tokio::test]
 async fn a_policy_missing_the_configuration_its_type_requires_is_refused() {
     let emulator = Emulator::with_tables(TABLES).await;
+    emulator
+        .given_resource("ecs", "service/prod-cluster/web-app", 1)
+        .await;
     let (status, body) = emulator
         .call(
             "RegisterScalableTarget",
@@ -1204,6 +1209,7 @@ async fn every_modelled_dimension_names_the_namespace_it_belongs_to() {
         ("rds", "rds:cluster:ReadReplicaCount", "cluster:my-db"),
     ] {
         let case = format!("{namespace} with {dimension}");
+        emulator.given_resource(namespace, resource_id, 1).await;
         let (status, body) = emulator
             .call(
                 "RegisterScalableTarget",

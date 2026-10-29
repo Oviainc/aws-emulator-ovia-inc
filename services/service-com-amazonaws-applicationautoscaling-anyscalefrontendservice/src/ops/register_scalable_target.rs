@@ -293,6 +293,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         }
+        // A window whose bounds are INVERTED is refused from the request alone, before
+        // anything about the resource is resolved: both bounds are in hand, and no resource
+        // could carry such a window. An update that names one bound is checked against the
+        // window it leaves behind, which takes the stored one, below.
+        if let (Some(min_capacity), Some(max_capacity)) = (input.min_capacity, input.max_capacity) {
+            check_capacity_range(min_capacity, max_capacity)?;
+        }
 
         let key = TargetKey {
             service_namespace: input.service_namespace.clone(),
@@ -368,35 +375,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // target when it is created. To tag an existing scalable target, use the
                 // TagResource operation."
                 check_capacity_range(updated.min_capacity, updated.max_capacity)?;
-                // "Any parameters that you don't specify are not changed" — but the
-                // capacity window is enforced regardless: "Application Auto Scaling
-                // retrieves the current capacity of the resource. If it's below the
-                // minimum capacity or above the maximum capacity, Application Auto
-                // Scaling adjusts the capacity of the scalable target to place it within
-                // these bounds, even if you don't include the MinCapacity or MaxCapacity
-                // request parameters." A movement this service makes is a scaling
-                // activity, which `DescribeScalingActivities` reports.
-                let moved = updated
-                    .current_capacity
-                    .clamp(updated.min_capacity, updated.max_capacity);
-                // What caused the movement, from the bound the capacity was placed at.
-                // Every writer leaves `current_capacity` inside the stored window, so a
-                // capacity outside it means THIS request moved that bound past it: a
-                // capacity pushed up was pushed by the new floor, one pushed down by the
-                // new ceiling.
-                let adjustment = (moved != updated.current_capacity).then(|| {
-                    if moved > updated.current_capacity {
-                        format!("minimum capacity was set to {}", updated.min_capacity)
-                    } else {
-                        format!("maximum capacity was set to {}", updated.max_capacity)
-                    }
-                });
-                updated.current_capacity = moved;
                 let arn = updated.arn.clone();
                 state.targets.insert(key.clone(), updated);
-                if let Some(cause) = adjustment {
-                    state.record_capacity_change(&key, moved, cause, now);
-                }
                 arn
             }
             None => {
@@ -432,9 +412,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     arn: arn.clone(),
                     min_capacity,
                     max_capacity,
-                    // A first registration adopts the floor of the window it declares
-                    // rather than moving anything, so it records no scaling activity;
-                    // see `ScalableTargetRecord::current_capacity`.
+                    // What the resource itself holds is what the window is enforced on
+                    // below; until it is resolved the target carries the floor of the
+                    // window it declares, which is the capacity a resource this emulator
+                    // cannot read is reported at. See
+                    // `ScalableTargetRecord::current_capacity`.
                     current_capacity: min_capacity,
                     role_arn: input
                         .role_arn
@@ -455,11 +437,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // The capacity window is enforced on the RESOURCE, on a first registration as on
+        // an update: "Application Auto Scaling retrieves the current capacity of the
+        // resource. If it's below the minimum capacity or above the maximum capacity,
+        // Application Auto Scaling adjusts the capacity of the scalable target to place it
+        // within these bounds, even if you don't include the MinCapacity or MaxCapacity
+        // request parameters."
+        let effective_capacity = enforce_capacity_window(state, &key, resolved_capacity, now);
+
         // Suspending or resuming a scaling activity changes which alarms the target's
         // policies want to exist, and a capacity move changes what their thresholds are
         // computed from, so the alarm set is re-materialised here: planned under this
-        // service's lock, applied with it RELEASED, recorded under it again.
-        let plan = crate::state::plan_target_alarms(state, &region, &key, resolved_capacity);
+        // service's lock, applied with it RELEASED, recorded under it again. The capacity
+        // the thresholds are computed from is the one the resource is left at, not the one
+        // it was read at.
+        let plan = crate::state::plan_target_alarms(state, &region, &key, effective_capacity);
         drop(guard);
         let minted = crate::state::apply_target_alarms(&*self.engine, &plan);
         let orphaned = crate::state::record_minted_alarms(&mut self_state.lock(), minted);
@@ -530,6 +522,49 @@ fn check_capacity_range(min_capacity: i32, max_capacity: i32) -> Result<(), Regi
         return Err(validation(crate::state::CAPACITY_RANGE_INVERTED_MESSAGE));
     }
     Ok(())
+}
+
+/// Place the capacity of the registered resource inside the window the target now carries,
+/// and answer the capacity it is left at — `None` for a resource whose capacity this
+/// emulator cannot read, which leaves nothing for the window to be enforced on.
+///
+/// The capacity corrected is the RESOURCE's own, read in the service that owns it
+/// (`resolved_capacity`), because that is the capacity the registered bounds are about and
+/// the one a client reads back there. A correction is a capacity movement this service
+/// performed, so it is recorded as the scaling activity
+/// `DescribeScalingActivities` reports and queued for delivery to that service — the
+/// activity and the movement are the same event, never one without the other.
+///
+/// What CAUSED the movement is the bound the capacity was placed at: a capacity pushed up
+/// was pushed by the floor the registration declares, one pushed down by its ceiling.
+fn enforce_capacity_window(
+    state: &mut crate::state::ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
+    key: &crate::state::TargetKey,
+    resolved_capacity: Option<i64>,
+    now: ::std::time::SystemTime,
+) -> Option<i64> {
+    let record = state.targets.get(key)?;
+    let (min_capacity, max_capacity) = (record.min_capacity, record.max_capacity);
+    // A capacity the resource reports that is too large for the capacity type the window is
+    // stated in is read as the ceiling of that type, which is still outside any window a
+    // caller can register and so is corrected down to the one it registered.
+    let current = match resolved_capacity {
+        Some(capacity) => i32::try_from(capacity).unwrap_or(i32::MAX),
+        None => record.current_capacity,
+    };
+    let moved = current.clamp(min_capacity.min(max_capacity), max_capacity.max(min_capacity));
+    if let Some(record) = state.targets.get_mut(key) {
+        record.current_capacity = moved;
+    }
+    if moved != current {
+        let cause = if moved > current {
+            format!("minimum capacity was set to {min_capacity}")
+        } else {
+            format!("maximum capacity was set to {max_capacity}")
+        };
+        state.record_capacity_change(key, moved, cause, now);
+    }
+    resolved_capacity.map(|_| i64::from(moved))
 }
 
 /// Apply the suspended-scaling attributes the request names, keeping the stored value of

@@ -389,7 +389,9 @@ fn unexecuted_breaches<Eng: Send + Sync + 'static>(
             continue;
         };
         for action in alarm.alarm_actions.iter().flatten() {
-            let Some(policy) = wired.get(action.as_str()) else {
+            // An action names its policy by ARN, whether or not it carries the suffix that
+            // says the policy minted the alarm (`super::policy_alarm_action`).
+            let Some(policy) = wired.get(super::policy_arn_in_action(action)) else {
                 continue;
             };
             // The transition this policy was last executed for; a newer one is a breach it
@@ -698,24 +700,21 @@ fn percentage_magnitude(
 /// dimension names, or `None` when this emulator cannot read it.
 ///
 /// "Application Auto Scaling retrieves the current capacity of the resource": an adjustment is
-/// computed from the resource's OWN capacity, not from what this service last set. One arm per
-/// namespace whose resource store this emulator holds; for any other namespace there is
-/// nothing to read, and the capacity this service tracks for the target is what the adjustment
-/// is computed from instead.
+/// computed from the resource's OWN capacity, not from what this service last set. Read
+/// through the one resolver a registration validates the resource with
+/// ([`super::resolve_target_resource`]), so both see the same capacity; for a namespace whose
+/// resource store this emulator does not hold — and for a resource that resolver refuses —
+/// there is nothing to read, and the capacity this service tracks for the target is what the
+/// adjustment is computed from instead.
 pub fn resource_capacity<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
     target: &TargetKey,
 ) -> Option<i32> {
-    match target.service_namespace.as_str() {
-        "ecs" => ecs_desired_count(engine, &target.resource_id),
-        // Every other namespace this emulator can resolve a resource for reports its capacity
-        // through the same resolver a registration validates it with.
-        _ => super::resolve_target_resource(engine, region, target)
-            .ok()
-            .flatten()
-            .and_then(|capacity| i32::try_from(capacity).ok()),
-    }
+    super::resolve_target_resource(engine, region, target)
+        .ok()
+        .flatten()
+        .and_then(|capacity| i32::try_from(capacity).ok())
 }
 
 /// Set the capacity of the resource a scalable target scales, in the service that owns it, and
@@ -735,21 +734,43 @@ fn set_resource_capacity<Eng: Send + Sync + 'static>(
 ) -> bool {
     match target.service_namespace.as_str() {
         "ecs" => set_ecs_desired_count(engine, region, &target.resource_id, capacity),
+        "dynamodb" => set_dynamodb_capacity(engine, region, target, capacity),
         _ => false,
     }
 }
 
-/// The `desiredCount` the ECS store holds for the service an `ecs` `ResourceId` names.
-fn ecs_desired_count<Eng: Send + Sync + 'static>(engine: &Eng, resource_id: &str) -> Option<i32> {
-    use ::service_com_amazonaws_ecs_amazonec2containerservicev20141113 as ecs;
+/// Set the provisioned read or write capacity of the DynamoDB table, or global secondary
+/// index, a `dynamodb` `ResourceId` names.
+///
+/// This is what the four `dynamodb:*:*CapacityUnits` dimensions scale, and the bookkeeping a
+/// capacity move owes is the DynamoDB store's own, so it is that store's helper that applies
+/// it ([`dynamodb::state::ComAmazonawsDynamodbDynamodb20120810State::scale_provisioned_capacity`]) —
+/// the same one an `UpdateTable` that moves capacity goes through.
+fn set_dynamodb_capacity<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    target: &TargetKey,
+    capacity: i32,
+) -> bool {
+    use ::service_com_amazonaws_dynamodb_dynamodb_20120810 as dynamodb;
 
-    let (cluster, service_name) = super::split_ecs_resource_id(resource_id)?;
-    let store = ecs::state::service_state(engine)?;
-    let store = store.lock();
-    let service = store
-        .services
-        .get(&(cluster.to_string(), service_name.to_string()))?;
-    service.is_active().then_some(service.desired_count)
+    let Some((table_name, index_name)) = super::split_dynamodb_resource_id(&target.resource_id)
+    else {
+        return false;
+    };
+    let Some(store) = dynamodb::state::service_state(engine) else {
+        return false;
+    };
+    let reads = super::dimension_scaling_property(&target.scalable_dimension) == "ReadCapacityUnits";
+    let moved = store.lock().scale_provisioned_capacity(
+        region,
+        table_name,
+        index_name,
+        reads,
+        i64::from(capacity),
+        SystemTime::now(),
+    );
+    moved
 }
 
 /// Set the `desiredCount` of the ECS service an `ecs` `ResourceId` names, and put the ECS

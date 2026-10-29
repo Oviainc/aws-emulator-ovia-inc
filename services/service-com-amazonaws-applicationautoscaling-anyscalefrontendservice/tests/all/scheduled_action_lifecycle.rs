@@ -25,8 +25,11 @@ use super::emulator::{error_code, Emulator, ACCOUNT, REGION};
 /// exists before the target does.
 const TABLES: &[&str] = &["my-table", "schedules", "updates", "alpha", "bravo", "bounds"];
 
-/// Register `resource_id`/`dimension` so a scheduled action has a target to hang off.
+/// Register `resource_id`/`dimension` so a scheduled action has a target to hang off,
+/// creating the resource it scales where this emulator owns the service that resource
+/// lives in.
 async fn register(emulator: &Emulator, namespace: &str, resource_id: &str, dimension: &str) {
+    emulator.given_resource(namespace, resource_id, 1).await;
     let (status, body) = emulator
         .call(
             "RegisterScalableTarget",

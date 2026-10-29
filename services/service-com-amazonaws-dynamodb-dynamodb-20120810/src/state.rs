@@ -5655,6 +5655,89 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             .ok_or_else(|| not_found(name))
     }
 
+    /// Set the provisioned read or write capacity of a table — or of one of its global
+    /// secondary indexes — to `units`, answering whether there was a provisioned resource
+    /// there to move.
+    ///
+    /// The bookkeeping a capacity move owes, in ONE place, the same `UpdateTable` does: the
+    /// move is recorded in that resource's throughput history (which is what
+    /// `ProvisionedThroughputDescription` reports as the last increase or decrease, and what
+    /// counts the day's decreases), and the table leaves `ACTIVE` for the span a capacity
+    /// update takes ([`STATUS_TRANSITION`]).
+    ///
+    /// This is what a service that SCALES a table's throughput moves: Application Auto
+    /// Scaling holds no capacity of its own — it "adjusts the capacity of the scalable
+    /// target", which for `dynamodb:table:ReadCapacityUnits` and its three siblings is this
+    /// table's own provisioned throughput — so it calls this instead of keeping a second
+    /// copy a client would never see here.
+    ///
+    /// Nothing moves for a table that is not there or is being deleted, for an index the
+    /// table does not have, for a resource that provisions no capacity at all (a
+    /// `PAY_PER_REQUEST` table), for a capacity below the one unit a provisioned resource
+    /// can be given, and for one that is already the capacity the resource holds.
+    pub fn scale_provisioned_capacity(
+        &mut self,
+        region: &str,
+        table_name: &str,
+        index_name: Option<&str>,
+        reads: bool,
+        units: i64,
+        now: SystemTime,
+    ) -> bool {
+        if units < 1 {
+            return false;
+        }
+        let Ok(table) = self.table_mut(region, table_name) else {
+            return false;
+        };
+        if table.removed_at.is_some() {
+            return false;
+        }
+        let moved = {
+            let (throughput, history) = match index_name {
+                None => (
+                    table.provisioned_throughput.as_mut(),
+                    &mut table.throughput_history,
+                ),
+                Some(index_name) => {
+                    match table
+                        .global_secondary_indexes
+                        .iter_mut()
+                        .find(|index| index.name == index_name)
+                    {
+                        Some(index) => (
+                            index.provisioned_throughput.as_mut(),
+                            &mut index.throughput_history,
+                        ),
+                        None => return false,
+                    }
+                }
+            };
+            let Some(throughput) = throughput else {
+                return false;
+            };
+            let before = throughput.clone();
+            if reads {
+                throughput.read_capacity_units = units;
+            } else {
+                throughput.write_capacity_units = units;
+            }
+            let after = throughput.clone();
+            if after.read_capacity_units == before.read_capacity_units
+                && after.write_capacity_units == before.write_capacity_units
+            {
+                false
+            } else {
+                history.record(now, &before, &after);
+                true
+            }
+        };
+        if moved {
+            table.updated_at = Some(now + STATUS_TRANSITION);
+        }
+        moved
+    }
+
     /// Remember what a `ClientRequestToken` stands for, so a retry of that transaction
     /// is answered rather than re-applied.
     ///

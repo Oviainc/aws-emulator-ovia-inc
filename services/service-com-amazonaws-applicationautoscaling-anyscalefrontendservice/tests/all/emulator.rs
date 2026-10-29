@@ -394,21 +394,7 @@ impl Emulator {
     pub async fn given_target(&self, dimension: &str, min: i64, max: i64) -> Value {
         let namespace = dimension.split(':').next().unwrap_or_default();
         let resource_id = resource_id_for(dimension);
-        if namespace == "dynamodb" {
-            let rest = resource_id.trim_start_matches("table/");
-            match rest.split_once("/index/") {
-                Some((table, index)) => {
-                    if !self.table_exists(table).await {
-                        self.create_table_with_index(table, index, "status", 4, 4).await;
-                    }
-                }
-                None => {
-                    if !self.table_exists(rest).await {
-                        self.create_provisioned_table(rest, 4, 4).await;
-                    }
-                }
-            }
-        }
+        self.given_resource(namespace, &resource_id, min).await;
         let target = json!({
             "ServiceNamespace": namespace,
             "ResourceId": resource_id,
@@ -425,12 +411,67 @@ impl Emulator {
         target
     }
 
+    /// Create the resource a `(namespace, resource id)` pair names, where this emulator owns
+    /// the service that resource lives in, at `capacity` units of the property a scalable
+    /// target would scale.
+    ///
+    /// A scalable target is a capacity dimension OF A RESOURCE, so a registration resolves
+    /// that resource in the service that owns it: a `dynamodb` target needs its table (and,
+    /// for an index dimension, that index) and an `ecs` target needs its service. Idempotent,
+    /// so a suite that registers several targets on one resource calls it once per target;
+    /// a namespace whose service this emulator holds no store for needs nothing created.
+    pub async fn given_resource(&self, namespace: &str, resource_id: &str, capacity: i64) {
+        // A provisioned resource cannot be created with no capacity at all, and a window
+        // whose floor is zero is still a window this resource sits inside of.
+        let capacity = capacity.max(1);
+        match namespace {
+            "dynamodb" => {
+                let rest = resource_id.trim_start_matches("table/");
+                match rest.split_once("/index/") {
+                    Some((table, index)) => {
+                        if !self.table_exists(table).await {
+                            self.create_table_with_index(table, index, "status", capacity, capacity)
+                                .await;
+                        }
+                    }
+                    None => {
+                        if !self.table_exists(rest).await {
+                            self.create_provisioned_table(rest, capacity, capacity).await;
+                        }
+                    }
+                }
+            }
+            "ecs" => {
+                if let Some((cluster, service)) = resource_id
+                    .strip_prefix("service/")
+                    .and_then(|rest| rest.split_once('/'))
+                {
+                    if !self.ecs_service_exists(cluster, service).await {
+                        self.given_ecs_service(cluster, service, capacity).await;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Whether the DynamoDB store already holds a table by that name.
     async fn table_exists(&self, name: &str) -> bool {
         let (status, _) = self
             .call_dynamodb("DescribeTable", json!({"TableName": name}))
             .await;
         status == 200
+    }
+
+    /// Whether the ECS store already holds that service in that cluster.
+    pub async fn ecs_service_exists(&self, cluster: &str, service: &str) -> bool {
+        let (status, body) = self
+            .call_ecs(
+                "DescribeServices",
+                json!({"cluster": cluster, "services": [service]}),
+            )
+            .await;
+        status == 200 && body["services"].as_array().is_some_and(|found| !found.is_empty())
     }
 
     /// Every alarm CloudWatch holds under the `TargetTracking` prefix, by alarm name.
@@ -555,12 +596,16 @@ pub fn resource_id_for(dimension: &str) -> String {
     }
 }
 
-/// Which of a policy's alarms an alarm name is: the segment between the resource id and the
-/// opaque id, as `TargetTracking-<resource id>-<kind>-<id>`.
+/// Which of a policy's alarms an alarm name is, read out of the grammar the service mints
+/// one by: `TargetTracking-<resource id>-<kind>-<id>`, whose trailing id is an 8-4-4-4-12
+/// identifier — so the kind is the segment before the LAST five dash-separated groups.
 pub fn alarm_kind(alarm: &Value) -> String {
     let name = alarm["AlarmName"].as_str().unwrap_or_default();
-    let mut segments = name.rsplitn(3, '-');
-    segments.next();
+    let mut segments = name.rsplitn(7, '-');
+    // The five groups of the trailing identifier.
+    for _ in 0..5 {
+        segments.next();
+    }
     segments.next().unwrap_or_default().to_string()
 }
 
