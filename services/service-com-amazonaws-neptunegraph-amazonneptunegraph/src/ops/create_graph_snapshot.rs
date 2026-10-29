@@ -173,7 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CreateGraph` enforces `graphName` with. Length (1..63) is already refused at
         // the boundary by the `@length` trait, so the value echoed below is bounded by
         // the model.
-        if !crate::state::resource_name_is_well_formed(&input.snapshot_name, SNAPSHOT_ID_PREFIX) {
+        if !crate::state::resource_name_is_well_formed(
+            &input.snapshot_name,
+            crate::state::SNAPSHOT_NAME_RESERVED_PREFIX,
+        ) {
             return Err(CreateGraphSnapshotErrorModeled::ValidationException(
                 ValidationException {
                     message: crate::state::validation_envelope(&[
@@ -337,10 +340,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(output)
     }
 }
-
-/// The prefix the service reserves for snapshot ids, which a `snapshotName` may
-/// therefore not take — the `(?!gs-)` clause of [`SNAPSHOT_NAME_PATTERN`].
-const SNAPSHOT_ID_PREFIX: &str = "gs-";
 
 /// The modelled `SnapshotName` pattern, exactly as the model spells it
 /// (`smithy_query(query="shape",shape="SnapshotName")`): the expression a refusal

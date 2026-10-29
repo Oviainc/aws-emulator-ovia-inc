@@ -1459,10 +1459,19 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
     ///
     /// The request that asks for a final snapshot carries no name, so the service names
     /// it: after the graph it is taken of, which is how a caller finds it again. A name
-    /// that would break the modelled length, or that the account already holds IN THAT
-    /// REGION, falls back to the snapshot's own freshly minted id, which no stored
-    /// snapshot shares. Names are per Region, so a name another Region holds is free
-    /// here.
+    /// the modelled `SnapshotName` constraints would not accept, or that the account
+    /// already holds IN THAT REGION, falls back to the snapshot's own freshly minted
+    /// id, which no stored snapshot shares. Names are per Region, so a name another
+    /// Region holds is free here.
+    ///
+    /// A name this service MINTS is held to the same constraints it enforces on a name a
+    /// caller sends, so the candidate goes through [`resource_name_is_well_formed`] —
+    /// the one place that pattern is enforced — and not through its length clause alone.
+    /// A `graphName` satisfies `GraphName`, which reserves a DIFFERENT prefix (`g-`), so
+    /// a graph may legitimately be named `gs…`; the name built from such a graph opens
+    /// with the prefix `SnapshotName` reserves and is therefore not a snapshot name, and
+    /// the fallback is taken instead. The fallback opens with its own fixed stem, so it
+    /// satisfies the pattern whatever the graph is called.
     pub fn free_final_snapshot_name(
         &self,
         graph_name: &str,
@@ -1471,15 +1480,16 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
     ) -> String {
         let after_the_graph = format!("{graph_name}{FINAL_SNAPSHOT_SUFFIX}");
         if after_the_graph.len() <= MAX_RESOURCE_NAME_CHARS
+            && resource_name_is_well_formed(&after_the_graph, SNAPSHOT_NAME_RESERVED_PREFIX)
             && self.snapshot_id_named(&after_the_graph, region).is_none()
         {
             return after_the_graph;
         }
-        let mut from_the_id = format!("final-snapshot-{snapshot_id}");
+        let mut from_the_id = format!("{FINAL_SNAPSHOT_STEM}-{snapshot_id}");
         let mut attempt = 1u32;
         while self.snapshot_id_named(&from_the_id, region).is_some() {
             attempt += 1;
-            from_the_id = format!("final-snapshot-{snapshot_id}-{attempt}");
+            from_the_id = format!("{FINAL_SNAPSHOT_STEM}-{snapshot_id}-{attempt}");
         }
         from_the_id
     }
@@ -2136,6 +2146,24 @@ pub const MAX_RESOURCE_NAME_CHARS: usize = 63;
 /// What the name of a graph's FINAL snapshot — the one a `skipSnapshot=false` delete
 /// asks for — adds to the graph's own name.
 pub const FINAL_SNAPSHOT_SUFFIX: &str = "-final-snapshot";
+
+/// What a final snapshot is named after when the graph's own name yields no name the
+/// modelled `SnapshotName` accepts: this stem, then the snapshot's freshly minted id.
+///
+/// It opens with a lowercase letter and carries nothing but lowercase letters and
+/// single interior hyphens, so prefixing a `gs-…` id with it also lifts the value clear
+/// of the prefix `SnapshotName` reserves.
+pub const FINAL_SNAPSHOT_STEM: &str = "final-snapshot";
+
+/// The prefix the modelled `SnapshotName` pattern `^(?!gs-)[a-z][a-z0-9]*(-[a-z0-9]+)*$`
+/// forbids a snapshot name from opening with — the prefix the service reserves for
+/// snapshot IDS (`SnapshotId`: `^gs-[a-z0-9]{10}$`), so that a name can never be read as
+/// an id.
+///
+/// Passed to [`resource_name_is_well_formed`] by every site that CHECKS a caller's
+/// `snapshotName` and by the site that MINTS one, so neither can enforce a different
+/// reserved prefix than the other.
+pub const SNAPSHOT_NAME_RESERVED_PREFIX: &str = "gs-";
 
 /// The most import tasks one store holds.
 ///
@@ -4664,6 +4692,28 @@ mod tests {
                 longest_graph_name.as_str(),
                 false,
             ),
+            // `GraphName` reserves `g-` and `SnapshotName` reserves `gs-`, so a graph
+            // may legitimately carry a name that no snapshot may carry.
+            (
+                "a graph name opening with the prefix snapshot names reserve",
+                "gs-data",
+                false,
+            ),
+            (
+                "a graph name that is the reserved prefix without its hyphen",
+                "gs",
+                false,
+            ),
+            (
+                "a graph name opening with the reserved letters and no hyphen",
+                "gsx-data",
+                true,
+            ),
+            (
+                "a graph name opening with the prefix GRAPH ids reserve, hyphenless",
+                "g0-x",
+                true,
+            ),
         ];
         for (case, graph_name, after_the_graph) in cases {
             let minted = state.free_final_snapshot_name(graph_name, "gs-1234567890", "us-east-1");
@@ -4678,7 +4728,7 @@ mod tests {
                  got {minted:?}"
             );
             assert!(
-                resource_name_is_well_formed(&minted, "gs-"),
+                resource_name_is_well_formed(&minted, SNAPSHOT_NAME_RESERVED_PREFIX),
                 "case {case:?}: expected a name the modelled pattern accepts, got {minted:?}"
             );
             let clash = state.snapshot_id_named(&minted, "us-east-1");
