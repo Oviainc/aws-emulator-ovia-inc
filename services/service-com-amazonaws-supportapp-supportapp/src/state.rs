@@ -306,8 +306,10 @@ pub fn workspace_not_registered_message(team_id: &str) -> String {
 /// A listing that mints no token therefore has no position any token could name, so a
 /// request that carries one is refused rather than silently read as "from the
 /// beginning" — the caller is told the member is wrong instead of being handed a page
-/// it did not ask for. Neither paginated operation models a client-input error, so the
-/// refusal travels through the scaffold's 400 `ValidationException` channel, worded by
+/// it did not ask for. The refusal is a handler-raised request-validation refusal like
+/// every other one of this service, so it travels in the 400 `ValidationException` this
+/// SERVICE models — widened onto each listing's own error enum, since neither
+/// operation's `errors` list names it — worded by
 /// [`invalid_pagination_token_message`]; `operation` is the caller's `Operation::NAME`.
 pub fn pagination_token_refusal(operation: &str, next_token: Option<&str>) -> Option<String> {
     next_token.map(|_| invalid_pagination_token_message(operation))

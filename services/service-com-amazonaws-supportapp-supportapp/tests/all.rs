@@ -21,6 +21,8 @@ mod channel_role_account;
 mod delete_slack_workspace_configuration;
 #[path = "all/error_message_templates.rs"]
 mod error_message_templates;
+#[path = "all/handler_validation_refusal_shape.rs"]
+mod handler_validation_refusal_shape;
 #[path = "all/listing_pagination.rs"]
 mod listing_pagination;
 #[path = "all/notification_flag_default.rs"]

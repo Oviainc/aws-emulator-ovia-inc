@@ -67,6 +67,9 @@
 //!   this action.
 //! * `InternalServerException` (HTTP 500) — We can’t process your request right now because
 //!   of a server issue. Try again later.
+//! * `ValidationException` (HTTP 400) — widened in through `extra_errors` (see below): the
+//!   shape this SERVICE models for a request whose input does not meet the constraints it
+//!   specifies, and the code this operation refuses a `nextToken` with.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -82,11 +85,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-supportapp-supportapp.j
 // here — hence the `ListSlackWorkspaceConfigurationsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.supportapp#ListSlackWorkspaceConfigurations")]
+//
+// `ValidationException` is widened in through `extra_errors`: this SERVICE models that
+// shape ("Your request input doesn't meet the constraints that the Amazon Web Services
+// Support App specifies") while this operation's own `errors` list omits it, and it is
+// the shape every handler-raised request-validation refusal of this service carries —
+// here, a `nextToken` no response of this operation returned.
+#[smithy_macros::operation_error(
+    "com.amazonaws.supportapp#ListSlackWorkspaceConfigurations",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum ListSlackWorkspaceConfigurationsErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -152,7 +165,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) =
             crate::state::pagination_token_refusal(Self::NAME, input.next_token.as_deref())
         {
-            return Err(crate::scaffolded::Scaffolded::validation(message));
+            return Err(ListSlackWorkspaceConfigurationsErrorModeled::ValidationException(
+                ValidationException {
+                    // The same modelled shape and the same validation envelope every
+                    // other request-validation refusal this service raises from a
+                    // handler carries.
+                    message: Some(message),
+                },
+            )
+            .into());
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
