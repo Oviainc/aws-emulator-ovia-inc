@@ -167,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and neither leaks an identifier the request did not carry.
         let Some(cluster) = store.cluster_by_name_or_arn_mut(&input.cluster_name) else {
             return Err(DescribeClusterNodeErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(crate::state::CLUSTER_NODE_LOOKUP_CLUSTER_NOT_FOUND.to_string()),
+                message: Some(crate::state::CLUSTER_NOT_FOUND.to_string()),
             })
             .into());
         };

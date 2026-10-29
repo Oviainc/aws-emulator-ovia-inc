@@ -152,14 +152,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(trial) = store.trial(&input.trial_name) else {
             // Never a 200 with empty fields: a caller cannot tell that from a trial that
-            // exists and carries nothing.
-            let arn = crate::state::resource_arn(
-                &crate::state::request_region(ctx),
-                "experiment-trial",
-                &input.trial_name,
-            );
+            // exists and carries nothing. The sentence is the slice's own, so every
+            // reader of a missing trial words it the same way.
             return Err(DescribeTrialErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Trial {arn} does not exist.")),
+                message: Some(crate::state::trial_does_not_exist(
+                    &crate::state::request_region(ctx),
+                    &input.trial_name,
+                )),
             })
             .into());
         };

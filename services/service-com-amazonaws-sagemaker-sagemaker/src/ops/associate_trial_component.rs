@@ -159,13 +159,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // through the owning slices' own keys, and each refusal reuses the sentence that
         // slice's own reader words, so one fact is not stated two ways.
         let Some(trial) = store.trial(&input.trial_name) else {
-            // `TrialArn`'s modelled pattern fixes the resource kind a trial's ARN carries
-            // (`…:[0-9]{12}:experiment-trial/`) — the one `CreateTrial` mints and
-            // `DescribeTrial` names a missing trial by.
-            let trial_arn =
-                crate::state::resource_arn(&region, "experiment-trial", &input.trial_name);
+            // The trial-not-found sentence is the slice's own, so every reader of a
+            // missing trial — this one, `DescribeTrial`, `DeleteTrial` and the
+            // disassociate — words it the same way and resolves the same ARN.
             return Err(AssociateTrialComponentErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Trial {trial_arn} does not exist.")),
+                message: Some(crate::state::trial_does_not_exist(&region, &input.trial_name)),
             })
             .into());
         };

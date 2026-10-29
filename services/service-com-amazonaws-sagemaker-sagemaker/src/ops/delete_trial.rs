@@ -150,10 +150,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this service's trial reader words the same fact, naming the trial by the ARN the
         // identifier resolves to in the Region the request signed for.
         let Some(arn) = store.trials.get(&key).map(|trial| trial.arn.clone()) else {
-            let missing =
-                crate::state::resource_arn(&region, "experiment-trial", &input.trial_name);
             return Err(DeleteTrialErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Trial {missing} does not exist.")),
+                message: Some(crate::state::trial_does_not_exist(&region, &input.trial_name)),
             })
             .into());
         };

@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let region = crate::state::request_region(ctx);
-        let arn = crate::state::resource_arn(&region, "experiment-trial", &input.trial_name);
+        let arn = crate::state::resource_arn(&region, crate::state::TRIAL_KIND, &input.trial_name);
 
         let mut store = state.lock();
         // The experiment is the trial's PARENT — a trial cannot exist outside one — so an

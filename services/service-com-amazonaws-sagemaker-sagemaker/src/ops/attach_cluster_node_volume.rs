@@ -170,12 +170,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The `ClusterArn` says WHERE to attach, and it is resolved before anything else.
         // A cluster this account does not hold is the modelled `ResourceNotFound` — the
         // same class as the node below, since both are resources the request addresses —
-        // and carries the cluster-node lookup's own fixed sentence, which states the
-        // condition and NOTHING from the request. The two sentences differ, so a caller
-        // tells an unknown cluster from an unknown node by the text.
+        // and carries the cluster lookup's own fixed sentence, which states the condition
+        // and NOTHING from the request, not even the name of the condition itself: the
+        // class of the failure travels in the error code. The two sentences differ, so a
+        // caller tells an unknown cluster from an unknown node by the text.
         let Some(cluster) = store.cluster_by_arn_mut(&input.cluster_arn) else {
             return Err(AttachClusterNodeVolumeErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(crate::state::CLUSTER_NODE_LOOKUP_CLUSTER_NOT_FOUND.to_string()),
+                message: Some(crate::state::CLUSTER_NOT_FOUND.to_string()),
             })
             .into());
         };

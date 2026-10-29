@@ -183,6 +183,8 @@ mod trial_component_disassociation;
 mod trial_component_tracking;
 #[path = "all/trial_deletion.rs"]
 mod trial_deletion;
+#[path = "all/trial_not_found_refusal.rs"]
+mod trial_not_found_refusal;
 // Declared after the sorted list rather than among the other `hyperpod_*` suites: the
 // cluster operations are being implemented one issue at a time, so that run of lines is
 // where every concurrent cluster change inserts its own suite.

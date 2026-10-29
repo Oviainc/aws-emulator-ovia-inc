@@ -3356,15 +3356,17 @@ fn arn_resource<'v>(arn: &'v str, region: &str) -> Option<&'v str> {
         .then_some(parsed.resource)
 }
 
-/// How SageMaker's lineage and pipeline readers state a resource the account does not
-/// hold: the entity kind, then the identifier RESOLVED TO ITS ARN in single quotes, then
-/// `does not exist.`
+/// How SageMaker's lineage, pipeline and experiment-trial readers state a resource the
+/// account does not hold: the entity kind, then the identifier RESOLVED TO ITS ARN in
+/// single quotes, then `does not exist.`
 ///
 /// These resources are addressed by name OR by ARN (`ExperimentEntityNameOrArn`,
-/// `PipelineNameOrArn`), and the recorded refusals report the ARN the request resolved
-/// to whichever form arrived — so the identifier a consumer extracts from the message is
-/// the same one it would read off a successful call. The single quotes are part of that
-/// rule: a parser that cuts on them has to find them.
+/// `PipelineNameOrArn`) — or, for a trial, by name alone — and the recorded refusals
+/// report the ARN the request resolved to whichever form arrived, so the identifier a
+/// consumer extracts from the message is the same one it would read off a successful
+/// call. The single quotes are part of that rule: a parser that cuts on them has to find
+/// them, and they are what delimits the ARN when the resource name carries no separator
+/// of its own.
 ///
 /// Stated once here so the reader and the delete of one resource kind, and the kinds
 /// sharing the template, cannot word the same fact differently. The hosting resources
@@ -3394,6 +3396,28 @@ pub const PIPELINE_ENTITY: &str = "Pipeline";
 
 /// The entity label [`does_not_exist`] names one execution of a pipeline by.
 pub const PIPELINE_EXECUTION_ENTITY: &str = "Pipeline execution";
+
+/// The entity label [`does_not_exist`] names an experiment trial by.
+pub const TRIAL_ENTITY: &str = "Trial";
+
+/// The ARN resource kind an experiment trial carries, i.e. the `<kind>` in
+/// [`resource_arn`]. Fixed by `TrialArn`'s modelled pattern
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:experiment-trial/`), and named once
+/// here so the create mints and every reader matches the same ARN.
+pub const TRIAL_KIND: &str = "experiment-trial";
+
+/// How every operation that cannot resolve the trial a request names states it: the
+/// [`does_not_exist`] sentence over the trial's ARN, resolved from the requested
+/// `TrialName` against the Region the request signed for.
+///
+/// A trial is addressed by NAME only (`ExperimentEntityName`), so the ARN in the message
+/// is always one [`resource_arn`] resolves — and it is resolved, rather than the name
+/// echoed, so the identifier a consumer cuts out of the refusal is the same one a
+/// successful call would have answered. Stated once here so the readers, the delete and
+/// the two membership operations cannot word the same fact differently.
+pub fn trial_does_not_exist(region: &str, trial_name: &str) -> String {
+    does_not_exist(TRIAL_ENTITY, &resource_arn(region, TRIAL_KIND, trial_name))
+}
 
 /// How the `does not exist.` sentence renders the ARN it names — the ONE thing the two
 /// recorded templates that use it differ in.
@@ -3495,19 +3519,16 @@ pub fn tuning_job_not_found(name: &str) -> String {
 ///
 /// A FIXED sentence carrying NOTHING from the request: the recorded refusals of the
 /// cluster operations state the condition and no identifier, so no refusal leaks an ARN
-/// the caller never supplied or a name it can only match against its own input. Stated
-/// once here so the cluster-scoped operations cannot word the same fact differently.
+/// the caller never supplied or a name it can only match against its own input. The
+/// sentence is the whole message — the class of the failure travels in the error CODE, so
+/// no name of a condition or type is prefixed onto it. Stated once here so every
+/// cluster-scoped operation, including the ones that address one node of a cluster, words
+/// the same fact the same way.
 pub const CLUSTER_NOT_FOUND: &str = "Specified cluster not found";
-
-/// [`CLUSTER_NOT_FOUND`] as the HyperPod NODE lookup words it: the same sentence behind
-/// the name of the condition that lookup raises, which is the form recorded for the
-/// operations that address one node of a cluster.
-pub const CLUSTER_NODE_LOOKUP_CLUSTER_NOT_FOUND: &str =
-    "ClusterNotExistsException: Specified cluster not found";
 
 /// How the HyperPod node lookup words a node the named cluster does not own.
 ///
-/// Fixed text, and DIFFERENT from [`CLUSTER_NODE_LOOKUP_CLUSTER_NOT_FOUND`]: the two
+/// Fixed text, and DIFFERENT from [`CLUSTER_NOT_FOUND`]: the two
 /// unknown-identifier cases of one request — the cluster, and the node inside it — are
 /// what a caller tells apart by the refusal text, since both carry the same code.
 pub const CLUSTER_NODE_NOT_FOUND: &str = "Specified cluster node not found";

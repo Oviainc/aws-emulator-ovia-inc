@@ -1325,9 +1325,17 @@ async fn batch_add_cluster_nodes_adds_what_it_can_and_reports_what_it_cannot() {
 #[tokio::test]
 async fn an_unknown_cluster_and_an_unknown_node_carry_their_own_fixed_refusals() {
     // The two sentences are the whole point of the rule, so the fixture starts by pinning
-    // that they differ: a caller that cannot tell them apart learns nothing from either.
+    // them: each is the condition and nothing else — no identifier from the request and no
+    // name of a condition or type, since the class of the failure travels in the error code
+    // — and they differ, because a caller that cannot tell them apart learns nothing from
+    // either.
+    assert_eq!(
+        (sm::CLUSTER_NOT_FOUND, sm::CLUSTER_NODE_NOT_FOUND),
+        ("Specified cluster not found", "Specified cluster node not found"),
+        "each refusal is AWS's fixed sentence alone"
+    );
     assert_ne!(
-        sm::CLUSTER_NODE_LOOKUP_CLUSTER_NOT_FOUND, sm::CLUSTER_NODE_NOT_FOUND,
+        sm::CLUSTER_NOT_FOUND, sm::CLUSTER_NODE_NOT_FOUND,
         "the unknown-cluster and unknown-node refusals must differ"
     );
 
@@ -1367,7 +1375,7 @@ async fn an_unknown_cluster_and_an_unknown_node_carry_their_own_fixed_refusals()
             "AttachClusterNodeVolume",
             json!({"ClusterArn": absent_arn, "NodeId": node, "VolumeId": volume}),
             "ResourceNotFound",
-            sm::CLUSTER_NODE_LOOKUP_CLUSTER_NOT_FOUND,
+            sm::CLUSTER_NOT_FOUND,
         ),
         (
             "describe: an unknown node of a cluster addressed by name",
@@ -1395,14 +1403,14 @@ async fn an_unknown_cluster_and_an_unknown_node_carry_their_own_fixed_refusals()
             "DescribeClusterNode",
             json!({"ClusterName": "no-such-cluster", "NodeId": node}),
             "ResourceNotFound",
-            sm::CLUSTER_NODE_LOOKUP_CLUSTER_NOT_FOUND,
+            sm::CLUSTER_NOT_FOUND,
         ),
         (
             "describe: a cluster ARN this account does not hold",
             "DescribeClusterNode",
             json!({"ClusterName": absent_arn, "NodeId": node}),
             "ResourceNotFound",
-            sm::CLUSTER_NODE_LOOKUP_CLUSTER_NOT_FOUND,
+            sm::CLUSTER_NOT_FOUND,
         ),
     ];
 
