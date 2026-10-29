@@ -30,8 +30,9 @@
 //!   first call started, and a second create for work a job is still doing is the
 //!   modelled conflict;
 //! * a `clientToken` of any length the input models makes its create idempotent —
-//!   a retry replays the job that token started, identical or not, and starts
-//!   nothing — while a token outside that length is refused as client input and
+//!   a retry of the SAME request replays the job that token started and starts
+//!   nothing, while a DIFFERENT request reusing that spent token is the modelled
+//!   conflict — and a token outside that length is refused as client input and
 //!   starts no job; and the identity, status and creation instant a create answers
 //!   are the ones the job it persisted carries.
 //!
@@ -466,10 +467,15 @@ async fn a_listing_reports_only_the_jobs_of_the_workspace_it_names() {
     // listing that leaked across workspaces cannot pass.
     let mut there = Vec::new();
     for case in JOB_CASES.iter().take(2) {
+        // A `clientToken` names the CALL that spent it, and the fixture's creates
+        // already spent the tokens these rows carry: this create is another call,
+        // so it carries no token of its own.
+        let mut case = *case;
+        case.client_token = None;
         let (status, body) = create(
             &router,
             OTHER_WORKSPACE,
-            create_body(case, &datasets[case.dataset]),
+            create_body(&case, &datasets[case.dataset]),
         )
         .await;
         assert_eq!(
@@ -995,17 +1001,23 @@ async fn a_client_token_replays_its_job_for_every_length_the_input_models() {
             "case {case:?}: a replay reports the job's own creation instant, got {replayed}"
         );
 
-        // The same token asking for other work replays that same job too: the token
-        // identifies the create, not the configuration it carried.
+        // The same token asking for OTHER work repeats no call: the token was spent
+        // by the create above, so this request is the modelled conflict and starts
+        // nothing.
         let (status, again) = create(&router, WORKSPACE, body(UNUSED_ALIAS, &token)).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: a retry asking for other work got {status} {again}"
+            status, 409,
+            "case {case:?}: a different request under the spent token got {status} {again}"
         );
         assert_eq!(
-            again["jobId"].as_str(),
+            error_code(&again),
+            "ConflictingOperationException",
+            "case {case:?}: unexpected error code in {again}"
+        );
+        assert_eq!(
+            again["resourceId"].as_str(),
             Some(job_id.as_str()),
-            "case {case:?}: the token replays the job it started, got {again}"
+            "case {case:?}: the conflict names the job the token started, got {again}"
         );
 
         assert_eq!(
@@ -1477,12 +1489,9 @@ async fn a_retried_create_replays_the_job_its_token_already_started() {
     let (status, first) = create(&router, WORKSPACE, create_body(&case, &dataset_id)).await;
     assert_eq!(status, 200, "the first create got {status} {first}");
 
-    // A retry carrying the same token reports the job the FIRST call started, even
-    // when the rest of the request differs, and starts nothing.
-    let mut retried = case;
-    retried.target = Target::Alias(UNUSED_ALIAS);
-    retried.trim = (1_700_000_000, 0, 1_700_000_900, 0);
-    let (status, replayed) = create(&router, WORKSPACE, create_body(&retried, &dataset_id)).await;
+    // The SAME request again under the same token reports the job the FIRST call
+    // started and starts nothing.
+    let (status, replayed) = create(&router, WORKSPACE, create_body(&case, &dataset_id)).await;
     assert_eq!(status, 200, "the retry got {status} {replayed}");
     assert_eq!(
         replayed["jobId"].as_str(),
@@ -1513,14 +1522,34 @@ async fn a_retried_create_replays_the_job_its_token_already_started() {
         "a replay must not rewrite the job it replays, got {summary}"
     );
 
-    // The same token in ANOTHER workspace is a different call, since a job is
-    // addressed within its workspace.
-    let (status, elsewhere) = create(&router, OTHER_WORKSPACE, create_body(&case, &dataset_id)).await;
-    assert_eq!(status, 200, "the create in {OTHER_WORKSPACE} got {status} {elsewhere}");
+    // A create naming ANOTHER workspace is another request, since the workspace is
+    // one of the members the call is recognised by: it repeats no call, so under the
+    // spent token it is the modelled conflict.
+    let (status, elsewhere) =
+        create(&router, OTHER_WORKSPACE, create_body(&case, &dataset_id)).await;
+    assert_eq!(
+        status, 409,
+        "the spent token in {OTHER_WORKSPACE} got {status} {elsewhere}"
+    );
+    assert_eq!(
+        error_code(&elsewhere),
+        "ConflictingOperationException",
+        "the spent token in another workspace: unexpected error code in {elsewhere}"
+    );
+
+    // That same request under a token no create spent is a call of its own, so it
+    // starts a job in the other workspace.
+    let mut fresh = case;
+    fresh.client_token = Some("33333333-3333-3333-3333-333333333333");
+    let (status, started) = create(&router, OTHER_WORKSPACE, create_body(&fresh, &dataset_id)).await;
+    assert_eq!(
+        status, 200,
+        "the create in {OTHER_WORKSPACE} got {status} {started}"
+    );
     assert_ne!(
-        elsewhere["jobId"].as_str(),
+        started["jobId"].as_str(),
         first["jobId"].as_str(),
-        "the same token in another workspace starts a job of its own, got {elsewhere}"
+        "an unspent token starts a job of its own, got {started}"
     );
 
     let held = {

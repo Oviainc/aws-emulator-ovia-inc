@@ -4941,24 +4941,6 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .count()
     }
 
-    /// The enrichment job `workspace_name` already created under
-    /// `client_token`, if any.
-    ///
-    /// What makes `CreateEnrichmentJob` idempotent on its token: "If you submit
-    /// the same request with the same token within the idempotency window, you
-    /// receive the original job details without creating a duplicate." Scoped
-    /// to the workspace, since that is what a job is addressed within.
-    pub fn enrichment_job_for_client_token(
-        &self,
-        workspace_name: &str,
-        client_token: &str,
-    ) -> Option<&EnrichmentJobRecord> {
-        self.enrichment_jobs.values().find(|record| {
-            record.workspace_name == workspace_name
-                && record.client_token.as_deref() == Some(client_token)
-        })
-    }
-
     /// How many enrichment jobs `workspace_name` holds — what the per-workspace
     /// bound reads.
     pub fn enrichment_jobs_in_workspace(&self, workspace_name: &str) -> usize {
@@ -8958,8 +8940,11 @@ pub struct EnrichmentJobRecord {
     /// the dataset it analyses and the time series it names — is DERIVED from
     /// it rather than copied beside it, so the two cannot drift.
     pub configuration: EnrichmentJobConfiguration,
-    /// The `clientToken` the create carried, if any: what makes a retry of that
-    /// same create replay this job rather than start a second one.
+    /// The `clientToken` the create carried, if any — a record of how that call
+    /// was identified. What makes a RETRY of it replay this job is the store's
+    /// registry of the tokens an operation has already served
+    /// ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::idempotent_verdict`]),
+    /// which recognises the CALL and not the job it left behind.
     pub client_token: Option<String>,
     /// When the job was created, which is the `createdAt` a read reports and
     /// the instant its whole lifecycle is owed from.

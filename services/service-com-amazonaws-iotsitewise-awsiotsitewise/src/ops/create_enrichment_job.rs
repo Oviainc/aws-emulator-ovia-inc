@@ -224,14 +224,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If you submit the same request with the same token within the idempotency
         // window, you receive the original job details without creating a duplicate":
-        // the retry writes nothing and reports the job the ORIGINAL call started, at
-        // whatever status that job has reached by now.
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(existing) =
-                store.enrichment_job_for_client_token(&input.workspace_name, token)
-            {
-                return Ok(created(existing, now));
+        // the replay is conditioned on the request being the SAME one, so the token is
+        // resolved against the store's record of the tokens THIS operation has already
+        // served, the way every other idempotent write of this service resolves one
+        // (cf. `StartSearch`). A token identifies the CALL that spent it: a retry —
+        // the same request under that token, the configuration the work is described
+        // by included — writes nothing and reports the job that call started, at
+        // whatever status it has reached by now, while a request differing in any
+        // member it is recognised by belongs to another call and is the modelled
+        // conflict rather than an answer about a job it never asked for.
+        let fingerprint = crate::state::request_fingerprint(
+            &[&input.workspace_name, &input.job_configuration],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // One gone since leaves the retry nothing to answer from, so that
+                // retry is served as the fresh create it now is.
+                let (workspace_name, job_id) =
+                    crate::state::workspace_scoped_token_key(&replayed);
+                let key = crate::state::enrichment_job_key(&workspace_name, &job_id);
+                if let Some(existing) = store.enrichment_jobs.get(&key) {
+                    return Ok(created(existing, now));
+                }
             }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                // The conflict names the job the token's own call started — the job
+                // the caller has to look at — as the error's required members state
+                // it.
+                let (_, job_id) = crate::state::workspace_scoped_token_key(&spent_on);
+                let region = crate::state::request_region(ctx.parts());
+                return Err(token_spent(
+                    &job_id,
+                    crate::state::enrichment_job_arn(&region, &job_id),
+                ));
+            }
+            crate::state::TokenVerdict::Serve => {}
         }
 
         // "The IoT SiteWise dataset ID containing the video time-series data to
@@ -310,7 +338,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let output = created(&record, now);
         let key = crate::state::enrichment_job_key(&record.workspace_name, &record.job_id);
+        let token_resource = crate::state::workspace_scoped_token_resource(
+            &record.workspace_name,
+            &record.job_id,
+        );
         store.enrichment_jobs.insert(key, record);
+        // The token is spent only now that the create has SUCCEEDED: a refused
+        // request started no job, so the caller may send it again under that token.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &token_resource,
+            now,
+        );
 
         Ok(output)
     }
@@ -358,6 +399,17 @@ fn conflicting_operation(
         resource_arn,
     })
     .into()
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the job that request started, so
+/// `resourceId`/`resourceArn` name it — the job the caller has to look at.
+fn token_spent(job_id: &str, resource_arn: String) -> CreateEnrichmentJobError {
+    conflicting_operation(
+        crate::state::already_using_message(crate::state::RESOURCE_ENRICHMENT_JOB, "clientToken"),
+        job_id.to_string(),
+        resource_arn,
+    )
 }
 
 /// HTTP 410 `LimitExceededException` carrying `message`.

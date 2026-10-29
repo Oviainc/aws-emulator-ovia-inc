@@ -448,6 +448,8 @@ mod describe_task_reads;
 // In its alphabetical place inside the sorted list, rather than appended after it:
 // the end of this file is where every concurrent iotsitewise change appends a
 // declaration of its own, and each append there collided with this one.
+#[path = "all/enrichment_job_client_token_names_the_call.rs"]
+mod enrichment_job_client_token_names_the_call;
 #[path = "all/enrichment_jobs.rs"]
 mod enrichment_jobs;
 #[path = "all/execute_query.rs"]
