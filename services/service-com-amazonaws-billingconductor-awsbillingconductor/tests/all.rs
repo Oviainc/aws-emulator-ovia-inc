@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_association_billing_periods.rs"]
 mod account_association_billing_periods;
+#[path = "all/account_association_group_filter.rs"]
+mod account_association_group_filter;
 #[path = "all/account_exclusivity_at_list_bounds.rs"]
 mod account_exclusivity_at_list_bounds;
 #[path = "all/account_exclusivity_refusal.rs"]

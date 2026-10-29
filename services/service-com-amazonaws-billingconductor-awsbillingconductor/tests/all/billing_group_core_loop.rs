@@ -1181,8 +1181,9 @@ async fn list_account_associations_honours_each_filter() {
         );
     }
 
-    // An `Association` naming a group that does not exist is a reference to a
-    // resource that doesn't exist.
+    // An `Association` naming a group no membership of this period is in is a
+    // PREDICATE that selects no account, not a resource lookup — the rule
+    // `tests/all/account_association_group_filter.rs` owns and spans.
     let (status, body) = em
         .post(
             "/list-account-associations",
@@ -1190,13 +1191,13 @@ async fn list_account_associations_honours_each_filter() {
         )
         .await;
     assert_eq!(
-        status, 404,
-        "case \"Association names no stored group\": expected HTTP 404, got {status} with {body:?}"
+        status, 200,
+        "case \"Association names no stored group\": expected HTTP 200, got {status} with {body:?}"
     );
-    assert_eq!(
-        error_code(&body),
-        "ResourceNotFoundException",
-        "case \"Association names no stored group\": expected ResourceNotFoundException, got {body:?}"
+    let listed = body["LinkedAccounts"].as_array().cloned().unwrap_or_default();
+    assert!(
+        listed.is_empty(),
+        "case \"Association names no stored group\": expected no linked account, got {listed:?}"
     );
 }
 

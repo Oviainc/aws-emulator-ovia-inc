@@ -11,6 +11,12 @@
 //! page is bounded by `crate::state::DEFAULT_PAGE_SIZE` and continued through the
 //! modelled `NextToken`.
 //!
+//! Every member of `Filters` is a PREDICATE over that same per-period answer, never a
+//! resource lookup: an `Association` naming a billing group selects the accounts whose
+//! membership in the period asked about is in that group, and selects none when no
+//! membership of that period is — the same rule the `Arns` filter of `ListBillingGroups`
+//! and the `BillingGroups` filter of `ListCustomLineItems` follow.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -189,26 +195,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(crate::state::current_billing_period);
         let filters = input.filters.unwrap_or_default();
 
-        // An `Association` that is neither MONITORED nor UNMONITORED is a billing
-        // group ARN (or bare id) to restrict the listing to. One that names no stored
-        // group is a reference to a resource that doesn't exist.
-        let association_group = match filters.association.as_deref() {
-            None | Some(MONITORED | UNMONITORED) => None,
-            Some(value) => {
-                let arn = crate::state::normalize_billing_group_arn(value);
-                if !state.billing_groups.contains_key(&arn) {
-                    return Err(ListAccountAssociationsErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: "the billing group does not exist".to_string(),
-                            resource_id: arn,
-                            resource_type: "billinggroup".to_string(),
-                        },
-                    )
-                    .into());
-                }
-                Some(arn)
-            }
-        };
+        // "Billing Group Arn: linked accounts that are associated to the provided
+        // Billing Group Arn" — an `Association` that is neither MONITORED nor
+        // UNMONITORED is a billing group ARN (or the bare id the `Association`
+        // pattern equally admits), normalised to the identity a membership is keyed
+        // by. It is a PREDICATE over the memberships of the period being read, not a
+        // resource lookup: an ARN no membership of that period names selects no
+        // account, exactly as the `Arns` filter of `ListBillingGroups`, the
+        // `BillingGroupArns` filter of `ListBillingGroupCostReports` and the
+        // `BillingGroups` filter of `ListCustomLineItems` do. That is the only answer
+        // that can agree with the `BillingGroupArn` this same listing reports for the
+        // period, since the memberships a group held outlive the group itself
+        // (`crate::state::remove_billing_group`): a group deleted since still holds,
+        // for a period it existed in, the accounts it held then.
+        let association_group = filters
+            .association
+            .as_deref()
+            .filter(|value| !matches!(*value, MONITORED | UNMONITORED))
+            .map(crate::state::normalize_billing_group_arn);
 
         let mut selected: Vec<(String, AccountAssociationsListElement)> = Vec::new();
         for (account_id, group_arn) in state.linked_accounts(&billing_period) {

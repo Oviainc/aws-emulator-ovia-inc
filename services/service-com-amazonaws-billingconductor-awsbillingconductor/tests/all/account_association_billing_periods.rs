@@ -46,13 +46,17 @@ use crate::pricing_rule_association_periods::{period_start_millis, shift_period}
 
 /// The billing period the service calls current, read from the same clock it answers
 /// from so an expectation holds whatever month the suite runs in.
-fn current_period() -> String {
+pub(crate) fn current_period() -> String {
     service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period()
 }
 
 /// A live emulator holding only this service, with the engine kept so a row can
 /// backdate a membership the wire could only make now.
-struct Emulator {
+///
+/// This is the harness every account-association suite in this crate drives
+/// (`tests/all/account_association_group_filter.rs`), so the dispatch, signing and
+/// membership-backdating boilerplate exists once.
+pub(crate) struct Emulator {
     engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
@@ -62,7 +66,7 @@ impl Emulator {
     /// organization's PAYER account — the world in which this payer-account-only
     /// control plane is reachable at all (see `tests/all/payer_account_gate.rs` for the
     /// denial every other caller gets).
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         engine
             .state::<BillingConductorState>()
@@ -75,7 +79,7 @@ impl Emulator {
 
     /// POST a JSON body to one of this service's routes and return the status plus the
     /// parsed response body.
-    async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!(
@@ -104,7 +108,7 @@ impl Emulator {
     }
 
     /// Create a pricing plan and answer the ARN the service minted.
-    async fn create_plan(&self, name: &str) -> String {
+    pub(crate) async fn create_plan(&self, name: &str) -> String {
         let (status, body) = self.post("/create-pricing-plan", &json!({"Name": name})).await;
         assert_eq!(
             status, 200,
@@ -122,7 +126,7 @@ impl Emulator {
     /// `linked` (an account designated the group's main account is an account of that
     /// group), and which account that is makes no difference to the per-period
     /// memberships these rows read.
-    async fn create_group(&self, name: &str, plan: &str, linked: &[&str]) -> String {
+    pub(crate) async fn create_group(&self, name: &str, plan: &str, linked: &[&str]) -> String {
         let (status, body) = self
             .post(
                 "/create-billing-group",
@@ -144,7 +148,7 @@ impl Emulator {
     }
 
     /// `AssociateAccounts`: add `accounts` to the group's membership.
-    async fn associate(&self, group: &str, accounts: &[&str]) {
+    pub(crate) async fn associate(&self, group: &str, accounts: &[&str]) {
         let (status, body) = self
             .post(
                 "/associate-accounts",
@@ -158,7 +162,7 @@ impl Emulator {
     }
 
     /// `DisassociateAccounts`: take `accounts` out of the group.
-    async fn disassociate(&self, group: &str, accounts: &[&str]) {
+    pub(crate) async fn disassociate(&self, group: &str, accounts: &[&str]) {
         let (status, body) = self
             .post(
                 "/disassociate-accounts",
@@ -172,7 +176,7 @@ impl Emulator {
     }
 
     /// `DeleteBillingGroup`: remove the group, which ends the memberships it held.
-    async fn delete_group(&self, group: &str) {
+    pub(crate) async fn delete_group(&self, group: &str) {
         let (status, body) = self
             .post("/delete-billing-group", &json!({"Arn": group}))
             .await;
@@ -187,7 +191,7 @@ impl Emulator {
     /// only for the periods from the one it was created in onward
     /// (`tests/all/billing_group_billing_periods.rs` owns that rule), so the group a row
     /// reads the per-period membership of has to exist in every period it reads.
-    fn group_created_in(&self, group: &str, period: &str) {
+    pub(crate) fn group_created_in(&self, group: &str, period: &str) {
         let at = period_start_millis(period);
         let state = self.engine.state::<BillingConductorState>();
         let mut state = state.lock();
@@ -203,7 +207,7 @@ impl Emulator {
     /// `[start, end)`, as if the associating call had been made in `start` and the
     /// membership had ended in `end` — the world no request can ask for, since a call
     /// happens now.
-    fn membership_ran(&self, account_id: &str, start: &str, end: Option<&str>) {
+    pub(crate) fn membership_ran(&self, account_id: &str, start: &str, end: Option<&str>) {
         let state = self.engine.state::<BillingConductorState>();
         let mut state = state.lock();
         let memberships = state
@@ -219,7 +223,7 @@ impl Emulator {
     /// The `BillingGroupArn` `ListAccountAssociations` reports for one account in
     /// `period` (`None` names no period at all): `Some(arn)` while it is in a group,
     /// `None` when it is `UNMONITORED` then.
-    async fn association_in(
+    pub(crate) async fn association_in(
         &self,
         case: &str,
         account_id: &str,
@@ -253,7 +257,7 @@ impl Emulator {
 
     /// The account ids `ListAccountAssociations` reports in `period` under an
     /// `Association` filter (`MONITORED`, `UNMONITORED` or a billing group ARN).
-    async fn filtered_accounts(
+    pub(crate) async fn filtered_accounts(
         &self,
         case: &str,
         association: &str,
