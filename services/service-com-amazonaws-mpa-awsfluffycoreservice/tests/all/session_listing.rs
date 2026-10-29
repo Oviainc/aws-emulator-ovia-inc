@@ -17,7 +17,8 @@
 //!   three fields `Filter$FieldName` documents for this operation (`ActionName`,
 //!   `SessionStatus`, `InitiationTime`) and the operators `Filter$Operator` documents for
 //!   each of them. A filter this operation cannot apply is refused 400 rather than
-//!   ignored.
+//!   ignored — including one whose `FieldName`, `Operator` or `Value` arrives as the
+//!   empty string, which states no question any more than leaving the member out does.
 //! * the ARN-addressed boundary every read of this service shares: an ARN outside the
 //!   caller's account is refused 403 BEFORE the lookup, a team this store does not hold
 //!   is 404 with the one not-found sentence, and a value that is not a well-formed MPA
@@ -782,6 +783,173 @@ async fn a_filter_this_operation_cannot_apply_is_refused_rather_than_ignored() {
             "case {case:?}: expected every session, got {page:?}"
         );
     }
+}
+
+/// The members of a `Filter`, as the model names them (`Filter$FieldName`,
+/// `Filter$Operator`, `Filter$Value`) — each one optional, so each one can arrive empty.
+const FILTER_MEMBERS: [&str; 3] = ["FieldName", "Operator", "Value"];
+
+/// Every (field, operator) pair this operation applies, from the per-field operator
+/// catalogs `Filter$Operator`'s documentation lists ("ActionName: EQ | NE | CONTAINS |
+/// NOT_CONTAINS", "SessionStatus: EQ | NE", "InitiationTime: GT | LT | GTE | LTE |
+/// BETWEEN").
+fn applied_field_operators() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("ActionName", "EQ"),
+        ("ActionName", "NE"),
+        ("ActionName", "CONTAINS"),
+        ("ActionName", "NOT_CONTAINS"),
+        ("SessionStatus", "EQ"),
+        ("SessionStatus", "NE"),
+        ("InitiationTime", "GT"),
+        ("InitiationTime", "LT"),
+        ("InitiationTime", "GTE"),
+        ("InitiationTime", "LTE"),
+        ("InitiationTime", "BETWEEN"),
+    ]
+}
+
+/// The text a refusal for an empty `member` must name it by.
+///
+/// `FieldName` and `Operator` target the `FilterField` and `Operator` ENUMS, so the
+/// modelled enum constraint refuses an empty token before this operation reads it and
+/// names the member by its wire path; `Filter$Value` is a plain string this operation
+/// reads itself, so its refusal names the member by the filter's position.
+fn member_named_by(member: &str) -> String {
+    if member == "Value" {
+        return "Filters[0].Value".to_string();
+    }
+    format!(
+        "member.{}{}",
+        member[..1].to_ascii_lowercase(),
+        &member[1..]
+    )
+}
+
+/// A value the named field and operator apply, so that the only thing a row of the
+/// empty-member table changes is WHICH member arrives empty.
+fn applicable_value(field: &str, operator: &str) -> String {
+    match (field, operator) {
+        ("InitiationTime", "BETWEEN") => format!("{} AND {}", INITIATED[0], INITIATED[3]),
+        ("InitiationTime", _) => INITIATED[0].to_string(),
+        ("SessionStatus", _) => "PENDING".to_string(),
+        _ => ACTION.to_string(),
+    }
+}
+
+/// A filter member that arrives EMPTY states no question, exactly like one left out, so
+/// the filter is refused rather than applied as a comparison that admits every session or
+/// none of them.
+///
+/// The table spans which member is empty, every field this operation filters on and every
+/// operator each of those fields takes — including the operators whose empty comparison
+/// would have been answered as the whole unfiltered page (`NE`, `NOT_CONTAINS`) and those
+/// whose would have been answered as an empty one (`EQ`, `CONTAINS`) — plus the member
+/// arriving empty on a filter that is not the first.
+#[tokio::test]
+async fn a_filter_member_that_arrives_empty_is_refused_like_one_left_out() {
+    let harness = Harness::new();
+    let (team_arn, sessions) = filter_fixture(&harness).await;
+
+    // The page an accepted empty comparison would have been answered with (whole, for
+    // `NE` and `NOT_CONTAINS`) — read first, so the assertions below can tell a refusal
+    // from either half of that outcome.
+    let unfiltered = json!({ "MaxResults": MAX_PAGE_SIZE });
+    let (status, page) = list_sessions(&harness, &team_arn, unfiltered.clone()).await;
+    assert_eq!(
+        status, 200,
+        "case \"the unfiltered page\": expected 200, got {status} with {page:?}"
+    );
+    assert_eq!(
+        listed_arns(&page),
+        sessions,
+        "case \"the unfiltered page\": expected every session, got {page:?}"
+    );
+
+    for (field, operator) in applied_field_operators() {
+        let value = applicable_value(field, operator);
+        // The pair itself is applicable: a refusal below is about the EMPTY member only.
+        let applied = json!({ "FieldName": field, "Operator": operator, "Value": value });
+        let (status, body) = list_sessions(
+            &harness,
+            &team_arn,
+            json!({ "MaxResults": MAX_PAGE_SIZE, "Filters": [applied.clone()] }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {applied:?}: an applicable filter must be answered, got {status} with {body:?}"
+        );
+
+        for member in FILTER_MEMBERS {
+            let mut filter = applied.clone();
+            filter[member] = json!("");
+            let case = format!("{field} {operator} with an empty {member}");
+            let (status, body) = list_sessions(
+                &harness,
+                &team_arn,
+                json!({ "MaxResults": MAX_PAGE_SIZE, "Filters": [filter.clone()] }),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400, got {status} with {body:?}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case {case:?}: wrong error code in {body:?}"
+            );
+            let named = member_named_by(member);
+            assert!(
+                message(&body).contains(&named),
+                "case {case:?}: the refusal must name {named}, got {body:?}"
+            );
+            assert!(
+                body.get("Sessions").is_none(),
+                "case {case:?}: a refused filter must not be answered with a page, got {body:?}"
+            );
+        }
+
+        // The same empty member on the SECOND filter is refused naming that position, so
+        // the rule is about the member and not about the first filter of a request.
+        let mut second = applied.clone();
+        second["Value"] = json!("");
+        let case = format!("{field} {operator} with an empty Value at index 1");
+        let (status, body) = list_sessions(
+            &harness,
+            &team_arn,
+            json!({
+                "MaxResults": MAX_PAGE_SIZE,
+                "Filters": [
+                    { "FieldName": "ActionName", "Operator": "EQ", "Value": ACTION },
+                    second,
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} with {body:?}"
+        );
+        assert!(
+            message(&body).contains("Filters[1].Value"),
+            "case {case:?}: the refusal must name Filters[1].Value, got {body:?}"
+        );
+    }
+
+    // Every refusal above left the listing alone: the unfiltered page still reports the
+    // same sessions, so none of them was read as a narrowing.
+    let (status, page) = list_sessions(&harness, &team_arn, unfiltered).await;
+    assert_eq!(
+        status, 200,
+        "case \"the unfiltered page, after the refusals\": expected 200, got {status} with {page:?}"
+    );
+    assert_eq!(
+        listed_arns(&page),
+        sessions,
+        "case \"the unfiltered page, after the refusals\": expected every session, got {page:?}"
+    );
 }
 
 /// Every token `SessionStatus` declares is a value the status filter applies, and the

@@ -34,9 +34,10 @@
 //! A filter this operation cannot apply is REFUSED with `ValidationException` (400)
 //! rather than ignored, so a client never reads a page as narrowed when it was not: one
 //! of the other `FilterField` tokens the shared enum declares, an operator the named
-//! field does not take, a filter leaving out `FieldName`, `Operator` or `Value`, a
-//! `SessionStatus` value outside that enum's own token catalog, and a time value that
-//! names no instant are each a refusal naming the member at fault.
+//! field does not take, a filter leaving out `FieldName`, `Operator` or `Value` — or
+//! carrying one of them as the EMPTY string, which states no question any more than
+//! leaving it out does — a `SessionStatus` value outside that enum's own token catalog,
+//! and a time value that names no instant are each a refusal naming the member at fault.
 //! `Filter$Value` is a plain string, so the instant in a time filter is read here rather
 //! than by the protocol: the civil part is parsed by the library and shifted by the UTC
 //! offset the one shared reader (`service_common::rfc3339::split_utc_offset`) reports, so
@@ -447,8 +448,9 @@ fn compile_filters(filters: &[Filter]) -> Result<Vec<Predicate>, ListSessionsErr
 
 /// Compile the filter at `index`, or refuse it with `ValidationException` (400).
 fn compile_filter(index: usize, filter: &Filter) -> Result<Predicate, ListSessionsError> {
-    // All three members are `@optional` in the model, so absence reaches here; a filter
-    // missing any of them states no question to ask.
+    // All three members are `@optional` in the model, so absence — and, under the
+    // empty-is-absent rule `required` applies, the empty string — reaches here; a filter
+    // stating no question for any of them states no question to ask.
     let field = required(index, "FieldName", filter.field_name.as_deref())?;
     let operator = required(index, "Operator", filter.operator.as_deref())?;
     let value = required(index, "Value", filter.value.as_deref())?;
@@ -491,13 +493,23 @@ fn declared_status(index: usize, value: &str) -> Result<&str, ListSessionsError>
     )))
 }
 
-/// One member of a filter, or the refusal naming the one that is missing.
+/// One member of a filter, or the refusal naming the one that states no question.
+///
+/// An optional request string that arrives EMPTY is read as ABSENT, the one rule this
+/// crate applies to every optional string a request may leave out (`NextToken` in
+/// `crate::state::token_position`, `ClientToken` in the two creates): the empty string
+/// asks nothing of a session, so a filter carrying it is refused like one leaving the
+/// member out rather than applied as a comparison that narrows to everything (`NE`,
+/// `CONTAINS`) or to nothing (`EQ`, `NOT_CONTAINS`). `FieldName` and `Operator` target
+/// enums, whose modelled constraint already refuses a token no catalog declares, so the
+/// member this reading decides is in practice `Value`, which the model holds to a maximum
+/// length only.
 fn required<'a>(
     index: usize,
     member: &str,
     value: Option<&'a str>,
 ) -> Result<&'a str, ListSessionsError> {
-    value.ok_or_else(|| {
+    value.filter(|value| !value.is_empty()).ok_or_else(|| {
         validation(format!(
             "Filters[{index}].{member} is required for the filter to be applied."
         ))
