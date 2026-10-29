@@ -161,23 +161,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is exactly "the quotes for your Amazon Web Services account".
         let region = crate::state::request_region(ctx.parts());
 
-        // The resume point the caller's token names. A token this service did not
-        // issue for THIS list is a bad request, not an empty page — the rule every
-        // other list in this service applies to theirs, and on the same shape: the
-        // service's own `ValidationException` (400), widened into this operation's
-        // error enum above.
-        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
-            Some(token) => Some(
-                crate::state::decode_page_token(crate::state::QUOTE_PAGE, token).ok_or_else(
-                    || {
-                        ListQuotesErrorModeled::ValidationException(ValidationException {
-                            message: Some(crate::state::page_token_report(Self::NAME)),
-                        })
-                    },
-                )?,
-            ),
-            None => None,
-        };
+        // The resume point the caller's token names, by the rule
+        // `crate::state::page_boundary` states for every paged answer of this service:
+        // a token it did not issue for THIS list is a bad request, not an empty page,
+        // answered on this service's own `ValidationException` (400), widened into
+        // this operation's error enum above.
+        let after = crate::state::page_boundary(
+            crate::state::QUOTE_PAGE,
+            Self::NAME,
+            input.next_token.as_deref(),
+        )
+        .map_err(|report| {
+            ListQuotesErrorModeled::ValidationException(ValidationException {
+                message: Some(report),
+            })
+        })?;
         let size = crate::state::page_size(input.max_results);
 
         let mut store = state.lock();

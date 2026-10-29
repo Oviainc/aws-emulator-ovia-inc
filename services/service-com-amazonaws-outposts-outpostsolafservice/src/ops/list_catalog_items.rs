@@ -157,21 +157,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The resume point the caller's token names. A token this service did not
-        // issue for THIS list is a bad request, not an empty page — the same rule
-        // every other list in this service applies to theirs.
-        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
-            Some(token) => Some(
-                crate::state::decode_page_token(crate::state::CATALOG_ITEM_PAGE, token).ok_or_else(
-                    || {
-                        ListCatalogItemsErrorModeled::ValidationException(ValidationException {
-                            message: Some(crate::state::page_token_report("ListCatalogItems")),
-                        })
-                    },
-                )?,
-            ),
-            None => None,
-        };
+        // The resume point the caller's token names, by the rule
+        // `crate::state::page_boundary` states for every paged answer of this service:
+        // a token it did not issue for THIS list is a bad request, not an empty page.
+        let after = crate::state::page_boundary(
+            crate::state::CATALOG_ITEM_PAGE,
+            Self::NAME,
+            input.next_token.as_deref(),
+        )
+        .map_err(|report| {
+            ListCatalogItemsErrorModeled::ValidationException(ValidationException {
+                message: Some(report),
+            })
+        })?;
         let size = crate::state::page_size(input.max_results);
         // Each filter is a LIST of accepted values for ONE fact about an item, so an
         // item is reported when EVERY filter the request carried accepts it, and a

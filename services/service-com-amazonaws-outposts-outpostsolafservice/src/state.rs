@@ -6172,6 +6172,30 @@ pub fn decode_page_token(kind: &str, token: &str) -> Option<u64> {
     sequence.parse().ok()
 }
 
+/// The page boundary the caller's `NextToken` names, or the report a token this
+/// service cannot resume from is refused with.
+///
+/// Shared by every paged answer of this service so they cannot drift apart on that
+/// rule: a `NextToken` the caller omitted — or sent empty — names no resume point and
+/// so starts at the beginning, a non-empty one names the boundary it carries for the
+/// `kind` list it was stamped with ([`decode_page_token`]), and one this service never
+/// issued for that list is refused as a bad request rather than honoured or silently
+/// truncated, worded by [`page_token_report`] for `operation`. Only the stamp and the
+/// operation vary between the paged answers; each wraps the report this returns in the
+/// `ValidationException` (400) its own model declares.
+pub fn page_boundary(
+    kind: &str,
+    operation: &str,
+    next_token: Option<&str>,
+) -> Result<Option<u64>, String> {
+    match next_token.filter(|token| !token.is_empty()) {
+        Some(token) => decode_page_token(kind, token)
+            .map(Some)
+            .ok_or_else(|| page_token_report(operation)),
+        None => Ok(None),
+    }
+}
+
 /// The page size a list serves, given the `MaxResults` the caller sent.
 ///
 /// `MaxResults1000` is modelled `range(1..1000)`, so the framework has already

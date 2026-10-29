@@ -194,21 +194,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(outpost_not_found)?
             .to_string();
 
-        // The resume point the caller's token names. A token this service did not
-        // issue for THIS list is a bad request, not an empty page.
-        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
-            Some(token) => Some(
-                crate::state::decode_page_token(crate::state::BLOCKING_INSTANCE_PAGE, token)
-                    .ok_or_else(|| {
-                        ListBlockingInstancesForCapacityTaskErrorModeled::ValidationException(
-                            ValidationException {
-                                message: Some(crate::state::page_token_report(Self::NAME)),
-                            },
-                        )
-                    })?,
-            ),
-            None => None,
-        };
+        // The resume point the caller's token names, by the rule
+        // `crate::state::page_boundary` states for every paged answer of this service:
+        // a token it did not issue for THIS list is a bad request, not an empty page.
+        let after = crate::state::page_boundary(
+            crate::state::BLOCKING_INSTANCE_PAGE,
+            Self::NAME,
+            input.next_token.as_deref(),
+        )
+        .map_err(|report| {
+            ListBlockingInstancesForCapacityTaskErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(report),
+                },
+            )
+        })?;
         let size = crate::state::page_size(input.max_results);
 
         // A read, so the guard is taken immutably: which instances are running on the

@@ -192,19 +192,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(not_found)?
             .to_string();
         // The resume point the caller's token names. A token this service did not
-        // issue for THIS list is a bad request, not an empty page.
-        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
-            Some(token) => Some(
-                crate::state::decode_page_token(crate::state::ASSET_PAGE, token).ok_or_else(
-                    || {
-                        ListAssetsErrorModeled::ValidationException(ValidationException {
-                            message: Some(crate::state::page_token_report("ListAssets")),
-                        })
-                    },
-                )?,
-            ),
-            None => None,
-        };
+        // issue for THIS list is a bad request, not an empty page —
+        // `crate::state::page_boundary` is where that rule is stated, so this handler
+        // only names its own list and wraps the report in the error it models.
+        let after = crate::state::page_boundary(
+            crate::state::ASSET_PAGE,
+            Self::NAME,
+            input.next_token.as_deref(),
+        )
+        .map_err(|report| {
+            ListAssetsErrorModeled::ValidationException(ValidationException {
+                message: Some(report),
+            })
+        })?;
         let size = crate::state::page_size(input.max_results);
 
         // An Outpost's hardware is installed when an order placed on it has delivered

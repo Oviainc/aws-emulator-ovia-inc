@@ -79,6 +79,8 @@ mod outpost_hardware_type_change;
 mod outpost_order_driven_lifecycle;
 #[path = "all/outpost_server_connection.rs"]
 mod outpost_server_connection;
+#[path = "all/page_boundary_rule.rs"]
+mod page_boundary_rule;
 #[path = "all/page_token_refusal_shape.rs"]
 mod page_token_refusal_shape;
 #[path = "all/private_connectivity.rs"]

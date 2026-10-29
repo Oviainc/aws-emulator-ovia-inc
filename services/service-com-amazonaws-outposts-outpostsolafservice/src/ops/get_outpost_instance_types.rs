@@ -195,24 +195,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(not_found)?
             .to_string();
 
-        // The resume point the caller's token names. A token this service did not
-        // issue for THIS report is a bad request, not an empty page — the same rule
-        // every other paged answer in this service applies to its own token.
-        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
-            Some(token) => Some(
-                crate::state::decode_page_token(crate::state::CONFIGURED_INSTANCE_TYPE_PAGE, token)
-                    .ok_or_else(|| {
-                        GetOutpostInstanceTypesErrorModeled::ValidationException(
-                            ValidationException {
-                                message: Some(crate::state::page_token_report(
-                                    "GetOutpostInstanceTypes",
-                                )),
-                            },
-                        )
-                    })?,
-            ),
-            None => None,
-        };
+        // The resume point the caller's token names, by the rule
+        // `crate::state::page_boundary` states for every paged answer of this service:
+        // a token it did not issue for THIS report is a bad request, not an empty page.
+        let after = crate::state::page_boundary(
+            crate::state::CONFIGURED_INSTANCE_TYPE_PAGE,
+            Self::NAME,
+            input.next_token.as_deref(),
+        )
+        .map_err(|report| {
+            GetOutpostInstanceTypesErrorModeled::ValidationException(ValidationException {
+                message: Some(report),
+            })
+        })?;
         let size = crate::state::page_size(input.max_results);
 
         let mut store = state.lock();

@@ -217,24 +217,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(outpost_not_found)?
             .to_string();
 
-        // The resume point the caller's token names. A token this service did not
-        // issue for THIS report is a bad request, not an empty page — the same rule
-        // every other paged answer in this service applies to its own token.
-        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
-            Some(token) => Some(
-                crate::state::decode_page_token(crate::state::SUPPORTED_INSTANCE_TYPE_PAGE, token)
-                    .ok_or_else(|| {
-                        GetOutpostSupportedInstanceTypesErrorModeled::ValidationException(
-                            ValidationException {
-                                message: Some(crate::state::page_token_report(
-                                    "GetOutpostSupportedInstanceTypes",
-                                )),
-                            },
-                        )
-                    })?,
-            ),
-            None => None,
-        };
+        // The resume point the caller's token names, by the rule
+        // `crate::state::page_boundary` states for every paged answer of this service:
+        // a token it did not issue for THIS report is a bad request, not an empty page.
+        let after = crate::state::page_boundary(
+            crate::state::SUPPORTED_INSTANCE_TYPE_PAGE,
+            Self::NAME,
+            input.next_token.as_deref(),
+        )
+        .map_err(|report| {
+            GetOutpostSupportedInstanceTypesErrorModeled::ValidationException(ValidationException {
+                message: Some(report),
+            })
+        })?;
         let size = crate::state::page_size(input.max_results);
 
         // What an Outpost's hardware can support is a fact about that hardware, but
