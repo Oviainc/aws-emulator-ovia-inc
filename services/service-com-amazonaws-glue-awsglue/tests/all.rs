@@ -199,6 +199,8 @@ mod table_version_listing;
 mod table_versions;
 #[path = "all/trigger_action_runs.rs"]
 mod trigger_action_runs;
+#[path = "all/trigger_definition_reads.rs"]
+mod trigger_definition_reads;
 #[path = "all/trigger_listing.rs"]
 mod trigger_listing;
 #[path = "all/trigger_on_demand_lifecycle.rs"]

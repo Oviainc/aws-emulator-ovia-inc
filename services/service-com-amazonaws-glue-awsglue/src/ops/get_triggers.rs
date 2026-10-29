@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTriggers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTriggers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the trigger DEFINITIONS this Region's store holds
+//! (`crate::state::ComAmazonawsGlueAwsglueState::triggers`), in name order, one bounded
+//! page at a time, narrowed to the triggers that can start the job `DependentJobName`
+//! names when the request names one.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTriggers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The definitions come from the same records `CreateTrigger` wrote, `UpdateTrigger`
+//! overwrote and `GetTrigger` reads back, so this reporting read never differs from a
+//! single-trigger read, and `ListTriggers` names exactly the triggers this call projects.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +75,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page `MaxResults` accepts, from the member's own range
+/// (`GetTriggersRequest$MaxResults`, `OrchestrationPageSize200` range 1..200) — and so the
+/// page size for a request that names none.
+const MAX_PAGE_SIZE: i32 = 200;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +152,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTriggers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTriggersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // An unreachable store is an internal mounting fault, reported through this
+            // operation's own server error.
+            return Err(GetTriggersErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue trigger store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The maximum size of the response" (`MaxResults`, range 1..200). Absent, the page
+        // is the largest the model accepts for it; the clamp re-states that range here so
+        // the page size is never 0 even if the boundary validator ever stops enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        // Only THIS Region's triggers are reported: a trigger is served only through the
+        // endpoint that created it.
+        let stored = store.triggers_in(&region);
+
+        // "The name of the job to retrieve triggers for. The trigger that can start this job
+        // is returned, and if there is no such trigger, all triggers are returned"
+        // (`DependentJobName`): the filter narrows the set to the triggers whose actions run
+        // that job, and falls back to the whole set when it would narrow it to nothing.
+        let selected: Vec<&crate::state::TriggerEntry> = match input.dependent_job_name.as_deref() {
+            Some(job_name) => {
+                let dependent: Vec<&crate::state::TriggerEntry> = stored
+                    .iter()
+                    .copied()
+                    .filter(|trigger| trigger.starts_job(job_name))
+                    .collect();
+                if dependent.is_empty() {
+                    stored
+                } else {
+                    dependent
+                }
+            }
+            None => stored,
+        };
+
+        // Already in name order: the set comes from `triggers_in`, whose order is the
+        // store's own key order, and the filter above does not reorder it — so one page
+        // follows another deterministically.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTriggers"))
+        // The token is the last name of the previous page, so the page resumes at the first
+        // stored name strictly after it — which stays correct across triggers created or
+        // deleted between two calls.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => selected.partition_point(|trigger| trigger.name.as_str() <= cursor),
+            None => 0,
+        };
+        // Taken with `skip`/`take` rather than by slicing, so a cursor the request chose can
+        // never index outside the set.
+        let page: Vec<&crate::state::TriggerEntry> = selected
+            .iter()
+            .copied()
+            .skip(start)
+            .take(page_size)
+            .collect();
+        let end = start.saturating_add(page.len());
+        // The token names the last entry of the page, taken from the page itself so there is
+        // no index arithmetic to underflow on an empty page.
+        let next_token = if end < selected.len() {
+            page.last().map(|trigger| trigger.name.clone())
+        } else {
+            None
+        };
+
+        Ok(GetTriggersOutput {
+            triggers: Some(page.iter().map(|trigger| trigger.to_trigger()).collect()),
+            next_token,
+        })
     }
 }
