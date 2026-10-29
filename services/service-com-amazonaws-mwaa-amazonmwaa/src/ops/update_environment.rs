@@ -13,6 +13,11 @@
 //! snapshot phase reports the configuration it is running on, with its `LastUpdate` still
 //! `PENDING`.
 //!
+//! One member is not merged on its own: each optional Amazon S3 object is a PAIR — the
+//! object's relative path and that object's version — so a patch that clears either side
+//! of a pair leaves the environment loading no such object, with neither member of the
+//! pair left on the record (see [`crate::state::EnvironmentSpec::normalise_s3_objects`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -372,6 +377,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(value) = input.weekly_maintenance_window_start {
             spec.weekly_maintenance_window_start = value;
         }
+
+        // Each optional Amazon S3 object is recorded as the complete pair that identifies
+        // it or not at all, so a patch that clears one side of a pair — either member can
+        // carry the empty string, which names nothing — leaves the environment loading no
+        // such object, with no half of the pair left behind on the record.
+        merged.normalise_s3_objects();
 
         // The rules the model cannot state, judged on the configuration this update would
         // store — so a patch naming only `MinWorkers` is compared against the `MaxWorkers`

@@ -640,6 +640,45 @@ pub struct EnvironmentSpec {
 }
 
 impl EnvironmentSpec {
+    /// Record each optional Amazon S3 object as the COMPLETE pair that identifies it — the
+    /// object's relative path together with that object's version — or not at all.
+    ///
+    /// An object version identifies one object, and a path identifies an object only beside
+    /// the version of it to load, so neither member of such a pair means anything without
+    /// the other. Both members are `@length(0, 1024)`, so either can carry the empty
+    /// string, which names nothing (see [`RequestedS3Objects::validate`]): a configuration
+    /// in which either member of a pair names nothing loads no such object at all, and
+    /// keeps NEITHER member of it.
+    ///
+    /// Run by `CreateEnvironment` and by `UpdateEnvironment` on the configuration the
+    /// request would store, before it is compared, validated or recorded — so no stored
+    /// record can report a version for an object it names no path for, and an environment
+    /// that loads no plugins object reports that pair exactly the same way whether no call
+    /// ever named one or a later call cleared the path a previous one named.
+    pub fn normalise_s3_objects(&mut self) {
+        for (path, version) in [
+            (
+                &mut self.plugins_s3_path,
+                &mut self.plugins_s3_object_version,
+            ),
+            (
+                &mut self.requirements_s3_path,
+                &mut self.requirements_s3_object_version,
+            ),
+            (
+                &mut self.startup_script_s3_path,
+                &mut self.startup_script_s3_object_version,
+            ),
+        ] {
+            let names_object = path.as_deref().is_some_and(|path| !path.is_empty());
+            let names_version = version.as_deref().is_some_and(|value| !value.is_empty());
+            if !names_object || !names_version {
+                *path = None;
+                *version = None;
+            }
+        }
+    }
+
     /// Every rule the RESOLVED environment configuration must satisfy that the Smithy
     /// model cannot state — a value set the member's doc fixes, the Apache Airflow release
     /// a value the member's doc floors needs, the per-class count range a sizing member's

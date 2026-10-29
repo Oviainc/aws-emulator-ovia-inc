@@ -223,6 +223,52 @@ fn assert_refused(case: &str, answer: &Answer) {
     );
 }
 
+/// The optional Amazon S3 objects an environment loads, as `(path member, version
+/// member)`: each object is identified by the PAIR, which is why a path named without its
+/// version is refused below. From the members of
+/// `smithy_query(query="operation", operation="UpdateEnvironment")`.
+const S3_OBJECT_PAIRS: [(&str, &str); 3] = [
+    ("PluginsS3Path", "PluginsS3ObjectVersion"),
+    ("RequirementsS3Path", "RequirementsS3ObjectVersion"),
+    ("StartupScriptS3Path", "StartupScriptS3ObjectVersion"),
+];
+
+/// The members the environment ends up configured by: `members` merged over `seed`, the
+/// way a patch merges onto the configuration the create stored.
+fn merged(seed: &Value, members: &Value) -> Value {
+    let mut configuration = seed.clone();
+    let target = configuration.as_object_mut().expect("an object seed");
+    for (member, value) in members.as_object().expect("an object of members") {
+        target.insert(member.clone(), value.clone());
+    }
+    configuration
+}
+
+/// What the stored record reports for a member a request named, given the `configuration`
+/// the environment ends up with.
+///
+/// Every member reads back exactly as the request named it, with one exception: an optional
+/// Amazon S3 object is stored as the complete PAIR that identifies it — the object's
+/// relative path together with that object's version — or not at all. Both members are
+/// `@length(0, 1024)`, so either can carry the empty string, which names nothing: a
+/// configuration in which either side names nothing loads no such object and reports
+/// NEITHER member of that pair. That rule has its own table in
+/// `tests/all/environment_s3_object_pair.rs`; here it only says what these rows read back.
+fn reported(configuration: &Value, member: &str) -> Value {
+    let value = |member: &str| configuration.get(member).cloned().unwrap_or(Value::Null);
+    let names_something =
+        |member: &str| value(member).as_str().is_some_and(|value| !value.is_empty());
+    for (path_member, version_member) in S3_OBJECT_PAIRS {
+        if member == path_member || member == version_member {
+            if names_something(path_member) && names_something(version_member) {
+                return value(member);
+            }
+            return Value::Null;
+        }
+    }
+    value(member)
+}
+
 /// One row of a create/update table: the members it carries, and whether the rules accept
 /// them.
 struct Row {
@@ -247,12 +293,14 @@ async fn assert_creates(table: &str, rows: &[Row]) {
                 answer.status, answer.body
             );
             let environment = harness.environment(&case, &name).await;
-            for (member, value) in row.members.as_object().expect("an object of members") {
+            // A create configures the environment from its own members alone.
+            let configuration = merged(&json!({}), &row.members);
+            for member in row.members.as_object().expect("an object of members").keys() {
+                let actual = environment.get(member).cloned().unwrap_or(Value::Null);
+                let expected = reported(&configuration, member);
                 assert_eq!(
-                    environment.get(member),
-                    Some(value),
-                    "case {case}: {member} must read back as the create stored it, got {:?}",
-                    environment.get(member)
+                    actual, expected,
+                    "case {case}: expected {member} to read back as {expected}, got {actual}"
                 );
             }
         } else {
@@ -315,16 +363,20 @@ async fn assert_updates(table: &str, seed: &Value, rows: &[Row]) {
     for (index, case) in accepted {
         let name = env_name(table, index);
         let after = harness.environment(&case, &name).await;
-        for (member, value) in rows[index]
+        // The patch merges onto what the seed configured, so that is what the record ends
+        // up holding.
+        let configuration = merged(seed, &rows[index].members);
+        for member in rows[index]
             .members
             .as_object()
             .expect("an object of members")
+            .keys()
         {
+            let actual = after.get(member).cloned().unwrap_or(Value::Null);
+            let expected = reported(&configuration, member);
             assert_eq!(
-                after.get(member),
-                Some(value),
-                "case {case}: {member} must read back as the patch left it, got {:?}",
-                after.get(member)
+                actual, expected,
+                "case {case}: expected {member} to read back as {expected}, got {actual}"
             );
         }
     }

@@ -31,6 +31,8 @@ mod environment_endpoint_management_lifecycle;
 mod environment_lifecycle;
 #[path = "all/environment_region_scoping.rs"]
 mod environment_region_scoping;
+#[path = "all/environment_s3_object_pair.rs"]
+mod environment_s3_object_pair;
 #[path = "all/environment_service_defaults.rs"]
 mod environment_service_defaults;
 #[path = "all/environment_teardown_write_gate.rs"]

@@ -297,7 +297,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .unwrap_or_else(|| crate::state::DEFAULT_ENVIRONMENT_CLASS.to_string());
 
-        let spec = crate::state::EnvironmentSpec {
+        let mut spec = crate::state::EnvironmentSpec {
             execution_role_arn: input.execution_role_arn.clone(),
             source_bucket_arn: input.source_bucket_arn.clone(),
             dag_s3_path: input.dag_s3_path.clone(),
@@ -368,6 +368,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
             environment_class,
         };
+
+        // Each optional Amazon S3 object is recorded as the complete pair that identifies
+        // it or not at all, so a create that named a path naming no object (the empty
+        // string both members' `@length(0, 1024)` admits) stores no such object — and reads
+        // back exactly like a create that named no path at all. Before the comparison
+        // below, so two creates that load the same objects are one create however each
+        // spelled "no object".
+        spec.normalise_s3_objects();
 
         // The rules the model cannot state: the S3 path/version pairing, judged on the
         // request's own members, and the value sets and cross-member bounds, judged on the
