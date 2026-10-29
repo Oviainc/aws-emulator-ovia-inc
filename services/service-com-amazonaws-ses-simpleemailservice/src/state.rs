@@ -2887,10 +2887,11 @@ pub fn missing_custom_verification_email_template_message(template_name: &str) -
 /// `FromEmailAddressNotVerifiedException` is "Indicates that the sender address
 /// specified for a custom verification email is not verified, and is therefore
 /// not eligible to send the custom verification email", so the address the
-/// request (or the stored template) carried is the one variable part. One
-/// wording, for the same reason as [`illegal_address_message`].
+/// request (or the stored template) carried is the one variable part, stated
+/// bare — the sentence names the address, it does not bracket it. One wording,
+/// for the same reason as [`illegal_address_message`].
 pub fn unverified_from_address_message(from_email_address: &str) -> String {
-    format!("From email address <{from_email_address}> is not verified.")
+    format!("The from email address {from_email_address} is not verified.")
 }
 
 /// 64 bits of entropy this process did not choose, salting a minted id so it is

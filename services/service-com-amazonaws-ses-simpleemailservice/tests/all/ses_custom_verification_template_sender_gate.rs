@@ -164,7 +164,7 @@ async fn a_template_is_created_only_once_its_senders_verification_has_come_throu
             (
                 400,
                 Some(NOT_VERIFIED),
-                Some(format!("From email address <{}> is not verified.", row.sender).as_str())
+                Some(format!("The from email address {} is not verified.", row.sender).as_str())
             ),
             "case {case:?}: expected the unverified-sender refusal naming {:?}, got {status} \
              with {body}",
@@ -255,7 +255,7 @@ async fn a_sender_no_verified_identity_covers_is_refused_and_persists_nothing() 
             (
                 400,
                 Some(NOT_VERIFIED),
-                Some(format!("From email address <{sender}> is not verified.").as_str())
+                Some(format!("The from email address {sender} is not verified.").as_str())
             ),
             "case {case:?}: expected the unverified-sender refusal naming {sender:?}, got \
              {status} with {body}"

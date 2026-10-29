@@ -306,7 +306,7 @@ async fn an_unverified_sender_is_refused_and_leaves_nothing_behind() {
             (code(&body).as_str(), message(&body).as_str()),
             (
                 "FromEmailAddressNotVerified",
-                format!("From email address <{sender}> is not verified.").as_str()
+                format!("The from email address {sender} is not verified.").as_str()
             ),
             "case {case:?}: expected the unverified-sender refusal, got {body}"
         );
@@ -415,7 +415,7 @@ async fn only_a_sender_whose_verification_succeeded_is_accepted() {
             (code(&body).as_str(), message(&body).as_str()),
             (
                 "FromEmailAddressNotVerified",
-                format!("From email address <{address}> is not verified.").as_str()
+                format!("The from email address {address} is not verified.").as_str()
             ),
             "case {case:?}: expected the unverified-sender refusal, got {body}"
         );
@@ -435,7 +435,7 @@ async fn only_a_sender_whose_verification_succeeded_is_accepted() {
         (code(&body).as_str(), message(&body).as_str()),
         (
             "FromEmailAddressNotVerified",
-            "From email address <nobody@example.org> is not verified."
+            "The from email address nobody@example.org is not verified."
         ),
         "case an address with no identity: expected the unverified-sender refusal, got {body}"
     );
