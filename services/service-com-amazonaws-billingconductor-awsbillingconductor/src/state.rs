@@ -294,6 +294,21 @@ impl BillingPeriodSpan {
         )
     }
 
+    /// The span a call that ENDS a resource NOW takes away from it: the billing period
+    /// the call was made in and every later one.
+    ///
+    /// A call that stops a billing-period-scoped record standing, and names no range of
+    /// its own, takes effect FROM the period it is made in and never earlier — the
+    /// periods before it are closed bills the record really was in effect in, so a read
+    /// scoped to one of them still reports it. That is the bound the rest of this store
+    /// ends a record at ([`ComAmazonawsBillingconductorAwsbillingconductorState::release_account`],
+    /// [`PricingPlanRecord::end_rule_associations`]), and the counterpart of
+    /// [`Self::started_now`]: an absent END stays open, because nothing puts the record
+    /// back in effect in a later period.
+    pub fn ending_now() -> Self {
+        Self::new(Some(current_billing_period()), None)
+    }
+
     /// Is `billing_period` inside this span? See [`billing_period_range_covers`].
     pub fn covers(&self, billing_period: &str) -> bool {
         billing_period_range_covers(
@@ -3416,19 +3431,13 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         billing_period: &str,
     ) -> BTreeMap<String, f64> {
         let mut charges: BTreeMap<String, f64> = BTreeMap::new();
-        let mut computed: BTreeMap<String, f64> = BTreeMap::new();
-        let mut being_computed: BTreeSet<String> = BTreeSet::new();
+        let mut computed: BTreeMap<&str, f64> = BTreeMap::new();
         for item in self.custom_line_items.values() {
             if item.billing_group_arn != group_arn || !item.covers(billing_period) {
                 continue;
             }
             let charge = charge_sign(&item.charge_type)
-                * self.custom_line_item_charge(
-                    item,
-                    billing_period,
-                    &mut computed,
-                    &mut being_computed,
-                );
+                * self.custom_line_item_charge(item, billing_period, &mut computed);
             *charges
                 .entry(custom_line_item_product_name(item).to_string())
                 .or_insert(0.0) += charge;
@@ -3450,61 +3459,90 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// nothing.
     ///
     /// `computed` carries the charges already worked out for this billing period, so an
-    /// item several others are associated to is computed once. `being_computed` carries
-    /// the items whose charge this walk is in the middle of: nothing stops two percentage
-    /// items from being associated to each other, and an item whose own value is not
-    /// settled yet has no value to lend, so it contributes nothing and that nothing is not
-    /// remembered — it is a property of the walk rather than of the item.
+    /// item several others are associated to is computed once.
+    ///
+    /// An association of one percentage item to another is a resource a CALLER arranges,
+    /// so the items it can reach form a graph of the caller's shape: as many items as the
+    /// store holds, chained one to the next, and nothing stops two of them from being
+    /// associated to each other. The walk over that graph is therefore kept on the HEAP
+    /// — the items it has still to settle, each with whether its associations have been
+    /// reached yet — rather than on the native call stack, whose depth a long chain would
+    /// otherwise decide. An item whose own value the walk is in the middle of has no
+    /// value to lend, so it contributes nothing and that nothing is not remembered: it is
+    /// a property of the walk rather than of the item.
     ///
     /// The charge values are the ones of the GENERATION of the item that applies in that
     /// billing period ([`CustomLineItemRecord::effective_in`]), so a bill of a period a
     /// later write did not claim is computed from what the item charged then.
-    fn custom_line_item_charge(
-        &self,
-        item: &CustomLineItemRecord,
+    fn custom_line_item_charge<'a>(
+        &'a self,
+        item: &'a CustomLineItemRecord,
         billing_period: &str,
-        computed: &mut BTreeMap<String, f64>,
-        being_computed: &mut BTreeSet<String>,
+        computed: &mut BTreeMap<&'a str, f64>,
     ) -> f64 {
-        if let Some(charge) = computed.get(&item.arn) {
+        let arn = item.arn.as_str();
+        if let Some(charge) = computed.get(arn) {
             return *charge;
         }
-        let details = item
-            .effective_in(billing_period)
-            .map_or_else(|| item.charge_details(), |version| version.charge_details);
-        let charge = if let Some(flat) = details.flat {
-            flat.charge_value
-        } else if let Some(percentage) = details.percentage {
-            let percentage_value = percentage.percentage_value;
-            if !being_computed.insert(item.arn.clone()) {
-                return 0.0;
+        // The items whose charge this walk is in the middle of, and the items it has
+        // still to visit: a percentage item is visited once to reach the items it is
+        // associated to and once more to add up what they lend it.
+        let mut being_computed: BTreeSet<&'a str> = BTreeSet::new();
+        let mut pending: Vec<(&'a CustomLineItemRecord, bool)> = vec![(item, false)];
+        while let Some((current, associations_reached)) = pending.pop() {
+            let current_arn = current.arn.as_str();
+            if computed.contains_key(current_arn) {
+                continue;
             }
-            let combined: f64 = item
+            let details = current
+                .effective_in(billing_period)
+                .map_or_else(|| current.charge_details(), |version| version.charge_details);
+            let Some(percentage) = details.percentage.filter(|_| details.flat.is_none()) else {
+                // A flat item's charge is its own `ChargeValue`, and it lends that
+                // whatever else the store holds. An item carrying neither charge member
+                // is one no create of this service can leave behind, since exactly one
+                // of them is required.
+                computed.insert(
+                    current_arn,
+                    details.flat.map_or(0.0, |flat| flat.charge_value),
+                );
+                continue;
+            };
+            if !associations_reached {
+                being_computed.insert(current_arn);
+                pending.push((current, true));
+                for association in &current.associated_resources {
+                    if !association.covers(billing_period) {
+                        continue;
+                    }
+                    let Some(associated) = self.custom_line_items.get(&association.arn) else {
+                        continue;
+                    };
+                    let associated_arn = associated.arn.as_str();
+                    if !computed.contains_key(associated_arn)
+                        && !being_computed.contains(associated_arn)
+                    {
+                        pending.push((associated, false));
+                    }
+                }
+                continue;
+            }
+            // Every associated item whose charge this walk could settle is in `computed`
+            // by now, so what the percentage is taken of is the sum of those: a resource
+            // that is not a stored custom line item — a billing group, which contributes
+            // the metered usage of its accounts, of which this emulator records none —
+            // and an item this same walk is still in the middle of have no charge to
+            // lend, and each contributes nothing.
+            let combined: f64 = current
                 .associated_resources
                 .iter()
                 .filter(|association| association.covers(billing_period))
-                .map(|association| {
-                    self.custom_line_items
-                        .get(&association.arn)
-                        .map_or(0.0, |associated| {
-                            self.custom_line_item_charge(
-                                associated,
-                                billing_period,
-                                computed,
-                                being_computed,
-                            )
-                        })
-                })
+                .filter_map(|association| computed.get(association.arn.as_str()).copied())
                 .sum();
-            being_computed.remove(&item.arn);
-            percentage_value / 100.0 * combined
-        } else {
-            // Neither charge member: an item no create of this service can leave behind,
-            // since exactly one of them is required.
-            0.0
-        };
-        computed.insert(item.arn.clone(), charge);
-        charge
+            being_computed.remove(current_arn);
+            computed.insert(current_arn, percentage.percentage_value / 100.0 * combined);
+        }
+        computed.get(arn).copied().unwrap_or(0.0)
     }
 }
 

@@ -18,16 +18,18 @@
 //!
 //! `BillingPeriodRange` is "the billing period range in which the custom line item
 //! request will be applied", and an association is in effect over the half-open range
-//! `[InclusiveStartBillingPeriod, ExclusiveEndBillingPeriod)`. So a request that names
-//! no range disassociates the resource in every billing period and the association is
-//! dropped, while one that names a range disassociates it ONLY in the periods that
-//! range covers: the association keeps the earlier periods it applied in and resumes at
-//! the range's exclusive end, so a read of a period at or after that end still reports
-//! the resource. A read of a period inside the range does not, and an association left
-//! covering no period at all is dropped. A request that would leave one association in
-//! effect over more separate stretches of billing periods than the store holds for one
-//! fails THAT resource with the modelled `SERVICE_LIMIT_EXCEEDED` reason and writes
-//! nothing for it.
+//! `[InclusiveStartBillingPeriod, ExclusiveEndBillingPeriod)`. A request that names a
+//! range disassociates the resource ONLY in the periods that range covers: the
+//! association keeps the earlier periods it applied in and resumes at the range's
+//! exclusive end, so a read of a period at or after that end still reports the
+//! resource. A read of a period inside the range does not, and an association left
+//! covering no period at all is dropped. A request that names NO range ends the
+//! association at the billing period the call is made in — it is disassociated from
+//! that period on, while the earlier periods it was in effect in are closed bills a
+//! read scoped to one of them still reports it for. A request that would leave one
+//! association in effect over more separate stretches of billing periods than the store
+//! holds for one fails THAT resource with the modelled `SERVICE_LIMIT_EXCEEDED` reason
+//! and writes nothing for it.
 //!
 //! ## Shape of an operation
 //!
@@ -183,8 +185,9 @@ fn failed(arn: &str, reason: &str, message: String) -> DisassociateResourceRespo
 ///
 /// The range is half-open, so the association keeps every period outside it: a range
 /// bounded on both sides takes only the periods between its bounds and the association
-/// RESUMES at the exclusive end, while an open-ended range (and the fully open span a
-/// request naming no range disassociates over) takes every period from its start on.
+/// RESUMES at the exclusive end, while an open-ended range (and the span from the
+/// current billing period on that a request naming no range disassociates over) takes
+/// every period from its start on.
 /// An association left in effect in no period at all is dropped, and one the range
 /// shares no period with is left exactly as it is, so a retry of the same request
 /// changes nothing. A removal the store's bound on an association's separate stretches
@@ -283,25 +286,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The billing periods the disassociation applies to: the start is inclusive and
         // the end exclusive, so an end at or before the start would cover no billing
-        // period. A request that names no range disassociates the resource in every
-        // billing period, which is the fully open span.
-        if let Some(range) = &input.billing_period_range {
-            if let Err((reason, field, message)) =
-                crate::state::check_billing_period_range_is_ordered(range)
-            {
-                return Err(validation(reason, field, message));
-            }
-        }
-        let removed = input
-            .billing_period_range
-            .as_ref()
-            .map(|range| {
+        // period.
+        let removed = match &input.billing_period_range {
+            Some(range) => {
+                if let Err((reason, field, message)) =
+                    crate::state::check_billing_period_range_is_ordered(range)
+                {
+                    return Err(validation(reason, field, message));
+                }
                 crate::state::BillingPeriodSpan::new(
                     Some(range.inclusive_start_billing_period.clone()),
                     range.exclusive_end_billing_period.clone(),
                 )
-            })
-            .unwrap_or_default();
+            }
+            // A request that names no range ENDS the association at the billing period
+            // this call is made in: it stays in effect in every earlier period, so a
+            // read scoped to one of those closed bills still reports the resource, and
+            // in none from this period on
+            // ([`crate::state::BillingPeriodSpan::ending_now`]).
+            None => crate::state::BillingPeriodSpan::ending_now(),
+        };
 
         // EVERY requested resource is resolved against the store FIRST, so the
         // outcomes are decided on one consistent view and the stored item is borrowed

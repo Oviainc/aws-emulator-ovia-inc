@@ -13,11 +13,12 @@
 //! a target that is not a percentage item, a billing period range covering no period)
 //! is the call's own modelled error. It is `@idempotent`, so a resource the item holds
 //! no association for is already disassociated and its element succeeds unchanged. A
-//! request that names no `BillingPeriodRange` disassociates the resource in every
-//! billing period, so the association is dropped; one that names a range disassociates
-//! it ONLY in the billing periods that half-open range covers, so the association keeps
-//! every period outside it — the earlier ones it applied in, and the ones from the
-//! range's exclusive end on — and is dropped when it would then cover no period at all.
+//! request that names a `BillingPeriodRange` disassociates the resource ONLY in the
+//! billing periods that half-open range covers, so the association keeps every period
+//! outside it — the earlier ones it applied in, and the ones from the range's exclusive
+//! end on; a request that names no range at all ends the association as of the billing
+//! period the call is made in, keeping the earlier periods it applied in. Either way the
+//! association is dropped when it would then cover no period at all.
 //! What is left is what `ListResourcesAssociatedToCustomLineItem` reports back, with the
 //! `EndBillingPeriod` of the association as it stands in the period the read asks about.
 //!
@@ -372,8 +373,10 @@ fn bare_id(arn: &str) -> String {
 
 /// Every class of resource an association can name, in both the forms the member
 /// admits, in requests of one and of several resources: what is disassociated is the
-/// resource, not the spelling, and a request with no billing period range disassociates
-/// it in every period.
+/// resource, not the spelling. Each association here is made with no range of its own,
+/// so it is in effect from the current billing period on and a request with no billing
+/// period range — which ends it as of that same period — leaves it covering nothing and
+/// drops it.
 #[tokio::test]
 async fn a_disassociation_drops_the_association_however_the_resource_is_named() {
     // (case, name the item's OWN billing group as a resource, how many custom line
@@ -1231,6 +1234,177 @@ fn one_digit_month(billing_period: &str) -> String {
         .split_once('-')
         .expect("a billing period is spelled YYYY-MM");
     format!("{year}-{}", month.trim_start_matches('0'))
+}
+
+/// One row of the no-range table: the billing periods the association was made over,
+/// and what a read of each probed billing period reports after a disassociation that
+/// names NO `BillingPeriodRange` at all.
+struct UnboundedRow {
+    case: &'static str,
+    /// The `BillingPeriodRange` of the ASSOCIATING call, if any — `None` associates the
+    /// resource from the billing period that call landed in on.
+    associated: Option<Value>,
+    /// Per billing period, what a read of it reports ([`probe`]): the periods before the
+    /// current one the association was in effect in still report it, carrying the period
+    /// it now ends at, and the current period and every later one do not.
+    probes: Vec<(String, Option<Option<String>>)>,
+    /// Are the two association RECORDS still there, i.e. is each resource left in effect
+    /// in some billing period? Asserted through `AssociationSize`, which counts the
+    /// records whatever period each covers.
+    left: bool,
+}
+
+/// A disassociation that names NO `BillingPeriodRange` ENDS the association at the
+/// billing period the call is made in: every earlier period it was in effect in is a
+/// closed bill, so a read scoped to one of those still reports the resource with that
+/// period as its `EndBillingPeriod`, while the current period and every later one no
+/// longer report it — and the record is dropped only when nothing of it is left.
+///
+/// The rows differ along the association's own bounds (none of its own, open-ended from
+/// an earlier period, bounded to end later, bounded and already ended, beginning only in
+/// a later period) and along the spelling of its start month (`2026-4` / `2026-04`),
+/// with each row run for a billing group named by full ARN and a custom line item named
+/// by bare id in ONE request.
+#[tokio::test]
+async fn an_unbounded_disassociation_ends_the_association_at_the_current_billing_period() {
+    let rows: Vec<UnboundedRow> = vec![
+        UnboundedRow {
+            case: "an open-ended association reaching back before the current period",
+            associated: Some(json!({ "InclusiveStartBillingPeriod": period(-3) })),
+            probes: vec![
+                probe(&period(-4), None),
+                probe(&period(-3), Some(Some(&period(0)))),
+                probe(&period(-1), Some(Some(&period(0)))),
+                probe(&period(0), None),
+                probe(&period(1), None),
+            ],
+            left: true,
+        },
+        UnboundedRow {
+            case: "an association bounded to end after the current period",
+            associated: Some(json!({
+                "InclusiveStartBillingPeriod": period(-1),
+                "ExclusiveEndBillingPeriod": period(2),
+            })),
+            probes: vec![
+                probe(&period(-2), None),
+                probe(&period(-1), Some(Some(&period(0)))),
+                probe(&period(0), None),
+                probe(&period(1), None),
+                probe(&period(2), None),
+            ],
+            left: true,
+        },
+        UnboundedRow {
+            case: "an association with no range of its own",
+            associated: None,
+            probes: vec![
+                probe(&period(-1), None),
+                probe(&period(0), None),
+                probe(&period(1), None),
+            ],
+            left: false,
+        },
+        UnboundedRow {
+            case: "an association beginning only in a later period",
+            associated: Some(json!({ "InclusiveStartBillingPeriod": period(2) })),
+            probes: vec![
+                probe(&period(0), None),
+                probe(&period(2), None),
+                probe(&period(3), None),
+            ],
+            left: false,
+        },
+        UnboundedRow {
+            case: "an association that already ended before the current period",
+            associated: Some(json!({
+                "InclusiveStartBillingPeriod": period(-5),
+                "ExclusiveEndBillingPeriod": period(-2),
+            })),
+            probes: vec![
+                probe(&period(-6), None),
+                probe(&period(-5), Some(Some(&period(-2)))),
+                probe(&period(-3), Some(Some(&period(-2)))),
+                probe(&period(-2), None),
+                probe(&period(0), None),
+            ],
+            left: true,
+        },
+        UnboundedRow {
+            case: "an association whose start is spelled without a leading zero",
+            associated: Some(json!({
+                "InclusiveStartBillingPeriod": one_digit_month(&period(-2)),
+            })),
+            probes: vec![
+                probe(&one_digit_month(&period(-2)), Some(Some(&period(0)))),
+                probe(&period(-2), Some(Some(&period(0)))),
+                probe(&period(-1), Some(Some(&period(0)))),
+                probe(&period(0), None),
+                probe(&period(1), None),
+            ],
+            left: true,
+        },
+    ];
+
+    for row in rows {
+        let emulator = Emulator::new();
+        let home = emulator.billing_group("home").await;
+        let target = emulator.percentage_item(&home, "target").await;
+        // Both classes of resource an association can name, each in one of the two
+        // forms the member admits, disassociated in ONE request.
+        let group = home.clone();
+        let child = emulator.percentage_item(&home, "child").await;
+        let requested = vec![group.clone(), bare_id(&child)];
+        emulator
+            .associate(&target, &requested, row.associated.clone())
+            .await;
+
+        // The same disassociation TWICE: `@idempotent`, so the second call leaves
+        // exactly what the first one did rather than eating a further period.
+        for attempt in 1..=2 {
+            let case = format!("{} (attempt {attempt})", row.case);
+            let (status, body) = emulator.disassociate(&target, &requested, None).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200, got {status} with {body}"
+            );
+            assert_eq!(
+                reported(&body, "SuccessfullyDisassociatedResources"),
+                requested,
+                "case {case:?}: expected both resources reported disassociated as the caller \
+                 named them, got {body}"
+            );
+            assert!(
+                failures(&body, "FailedDisassociatedResources").is_empty(),
+                "case {case:?}: expected no failed resource, got {:?}",
+                failures(&body, "FailedDisassociatedResources")
+            );
+
+            for resource in [&group, &child] {
+                for (billing_period, expected) in &row.probes {
+                    let reported_back = emulator
+                        .in_billing_period(&target, resource, billing_period)
+                        .await;
+                    assert_eq!(
+                        &reported_back, expected,
+                        "case {case:?} ({resource}) in {billing_period}: expected \
+                         {expected:?}, got {reported_back:?}"
+                    );
+                }
+            }
+            // `AssociationSize` counts the association RECORDS whatever period each
+            // covers, so it is what says a record was dropped rather than only ended as
+            // of the current billing period.
+            let size = emulator.association_size(&case, &target).await;
+            assert_eq!(
+                size,
+                if row.left { 2 } else { 0 },
+                "case {case:?}: expected the two association records to be {}, got \
+                 AssociationSize {size}",
+                if row.left { "kept" } else { "dropped" }
+            );
+        }
+    }
 }
 
 /// Each bounded disassociation can carve one more separate stretch of billing periods
