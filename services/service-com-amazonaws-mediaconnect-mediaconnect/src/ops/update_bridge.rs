@@ -30,6 +30,11 @@
 //! state alone: it only settles a transition the clock had already made due, exactly as
 //! DescribeBridge and UpdateFlow do.
 //!
+//! A bridge whose deletion the service has already accepted is RETIRED and admits no
+//! further configuration: the update is refused with `ConflictException` (HTTP 409)
+//! through [`crate::state::retired_bridge_rejection`], the one place every operation that
+//! writes to a stored bridge reads that precondition from.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -242,6 +247,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(bridge) = store.bridges.get_mut(&input.bridge_arn) else {
             return Err(not_found(&input.bridge_arn));
         };
+
+        // A bridge on its way to the terminal `DELETED` state is retired: its deletion is
+        // irreversible, so no setting of it can be written any more. The precondition and
+        // its wording are read from the one place this crate decides a bridge is past being
+        // changed, and it is checked before anything is written, so a refused update leaves
+        // the bridge as it was.
+        if let Some(message) = crate::state::retired_bridge_rejection(bridge) {
+            return Err(
+                UpdateBridgeErrorModeled::ConflictException(ConflictException { message }).into(),
+            );
+        }
 
         // What each setting becomes once this request is applied: the request's value where
         // it carries one, the stored value where it does not. A wrapper the addressed

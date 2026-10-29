@@ -212,6 +212,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(&input.bridge_arn));
         };
 
+        // A bridge on its way to the terminal `DELETED` state is retired, so no output can
+        // be added to it any more — the same precondition every operation that writes to a
+        // stored bridge reads from `crate::state::retired_bridge_rejection`, checked before
+        // anything is written.
+        if let Some(message) = crate::state::retired_bridge_rejection(bridge) {
+            return Err(AddBridgeOutputsErrorModeled::ConflictException(ConflictException {
+                message,
+            })
+            .into());
+        }
+
         // The bound is on the STORED bridge, so it counts the outputs already stored plus
         // the ones this request would add — and the bound is the bridge's OWN: an output a
         // request configures is a network output, which only a cloud-to-ground bridge

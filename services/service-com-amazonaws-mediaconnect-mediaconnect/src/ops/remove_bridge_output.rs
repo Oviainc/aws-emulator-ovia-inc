@@ -200,6 +200,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is read, exactly as AddBridgeOutputs and the reporting operations do it.
         store.settle_due_transitions(::std::time::SystemTime::now());
 
+        // A bridge on its way to the terminal `DELETED` state is retired, so no output can
+        // be taken out of it any more — the same precondition every operation that writes
+        // to a stored bridge reads from `crate::state::retired_bridge_rejection`, checked
+        // before anything is written. A bridge the store does not hold is resolved below,
+        // in this operation's own not-found words.
+        if let Some(message) = store
+            .bridges
+            .get(&input.bridge_arn)
+            .and_then(crate::state::retired_bridge_rejection)
+        {
+            return Err(RemoveBridgeOutputErrorModeled::ConflictException(ConflictException {
+                message,
+            })
+            .into());
+        }
+
         // A bridge's FLOW output is the service's own record of a cloud flow that takes the
         // bridge as its source, which no request shape configures, so no request can remove
         // one either: the refusal and its wording are read from the one place this crate

@@ -261,6 +261,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(bridge) = store.bridges.get(&input.bridge_arn) else {
             return Err(not_found(&input.bridge_arn));
         };
+
+        // A bridge on its way to the terminal `DELETED` state is retired, so no source of
+        // it can be reconfigured any more — the same precondition every operation that
+        // writes to a stored bridge reads from `crate::state::retired_bridge_rejection`,
+        // checked before anything is written.
+        if let Some(message) = crate::state::retired_bridge_rejection(bridge) {
+            return Err(UpdateBridgeSourceErrorModeled::ConflictException(ConflictException {
+                message,
+            })
+            .into());
+        }
         // The source updated is the one of THIS bridge's sources the bridge addresses by
         // the requested name ("this name is used to reference the source and must be unique
         // among sources in this bridge"), so at most one position matches; a name of some

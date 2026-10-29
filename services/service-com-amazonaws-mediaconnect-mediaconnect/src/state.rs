@@ -236,6 +236,37 @@ pub fn is_stopped_bridge_state(bridge_state: &str) -> bool {
     )
 }
 
+/// Whether `bridge_state` is a state a bridge reaches only once its deletion has been
+/// accepted: [`BRIDGE_STATE_DELETING`] while that deletion is in flight, and the terminal
+/// [`BRIDGE_STATE_DELETED`] the clock settles it in.
+pub fn is_bridge_retirement_state(bridge_state: &str) -> bool {
+    matches!(bridge_state, BRIDGE_STATE_DELETING | BRIDGE_STATE_DELETED)
+}
+
+/// Why the bridge `bridge` may no longer be CHANGED, or `None` while it still may be.
+///
+/// A bridge whose move to the `DELETED` member of `DesiredState` has been accepted is on
+/// its way out: it reports [`BRIDGE_STATE_DELETING`] until the clock settles it in the
+/// terminal [`BRIDGE_STATE_DELETED`], and from the instant that move is accepted the record
+/// is RETIRED — kept readable, but no longer a bridge a later call can act on, because the
+/// deletion it is settling into is irreversible. So every operation that WRITES to a stored
+/// bridge — its own settings, its sources, its outputs — refuses once the bridge is in such
+/// a state or headed for one ([`StoredBridge::settling_state`]), through this one function,
+/// with `ConflictException` (HTTP 409): the request "would cause a conflict with the current
+/// state of a service resource associated with the request", which is the same refusal
+/// UpdateBridgeState already answers such a bridge with. DeleteBridge is the one call a
+/// retired bridge still admits, because it removes the record rather than changing it.
+pub fn retired_bridge_rejection(bridge: &StoredBridge) -> Option<String> {
+    let retired = is_bridge_retirement_state(&bridge.bridge_state)
+        || is_bridge_retirement_state(bridge.settling_state());
+    retired.then(|| {
+        format!(
+            "Bridge {} is {} and can no longer be changed.",
+            bridge.bridge_arn, bridge.bridge_state
+        )
+    })
+}
+
 /// The `RouterInputState` enum the model declares for a router input
 /// (`smithy_query(query="shape",shape="RouterInputState")`: CREATING | STANDBY | STARTING
 /// | ACTIVE | STOPPING | DELETING | UPDATING | ERROR | RECOVERING | MIGRATING). Only the
