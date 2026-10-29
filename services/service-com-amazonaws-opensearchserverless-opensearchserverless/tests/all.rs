@@ -33,6 +33,8 @@ mod collection_lifecycle;
 mod encryption_indexes_and_tagging;
 #[path = "all/index_name_rule.rs"]
 mod index_name_rule;
+#[path = "all/index_schema_update.rs"]
+mod index_schema_update;
 #[path = "all/lifecycle_policy.rs"]
 mod lifecycle_policy;
 #[path = "all/lifecycle_policy_delete.rs"]

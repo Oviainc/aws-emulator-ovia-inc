@@ -183,9 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(index) = collection.indexes.get(&input.index_name) else {
             return Err(GetIndexErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "The index '{}' does not exist in the collection with Id '{}'.",
-                        input.index_name, input.id
+                    message: Some(crate::state::index_not_found_message(
+                        &input.index_name,
+                        &input.id,
                     )),
                 },
             )

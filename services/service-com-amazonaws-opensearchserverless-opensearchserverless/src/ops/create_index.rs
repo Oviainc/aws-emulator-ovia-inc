@@ -176,12 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::document_within_bounds(schema, crate::state::MAX_INDEX_SCHEMA_NODES) {
                 return Err(
                     CreateIndexErrorModeled::ValidationException(ValidationException {
-                        message: Some(format!(
-                            "indexSchema must not nest deeper than {} levels or carry more than \
-                             {} values",
-                            crate::state::MAX_DOCUMENT_DEPTH,
-                            crate::state::MAX_INDEX_SCHEMA_NODES
-                        )),
+                        message: Some(crate::state::index_schema_bounds_message()),
                     })
                     .into(),
                 );

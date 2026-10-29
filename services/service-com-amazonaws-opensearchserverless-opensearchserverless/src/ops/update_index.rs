@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replaces the `indexSchema` held on the `IndexRecord` the requested
+//! collection id and index name address, so `GetIndex` reports the updated schema back. A
+//! request that names no `indexSchema` leaves the stored one as it was. Refuses an index
+//! name the member's own documented rule rejects (`ValidationException`), a schema past
+//! the emulator's document bounds (`ValidationException`), and an id or a name that
+//! addresses no collection or no index (`ResourceNotFoundException`).
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +141,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIndex"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateIndexErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `IndexName` carries no `@pattern`, so the boundary validator does not narrow it;
+        // the rule belongs to the MEMBER, stated in its own documentation ("Index names
+        // must be lowercase and can't begin with underscores (_) or hyphens (-)"), so a
+        // name it refuses is invalid input here exactly as it is on the create and the
+        // read. Held by the one helper those use, so the three cannot disagree about one
+        // and the same string.
+        if let Err(reason) = crate::state::validate_index_name(&input.index_name) {
+            return Err(
+                UpdateIndexErrorModeled::ValidationException(ValidationException {
+                    message: Some(reason),
+                })
+                .into(),
+            );
+        }
+
+        // The replacement schema is STORED, so it is held to the same document bounds the
+        // create holds a stored schema to: an update cannot grow one past what a create
+        // could have written. See `crate::state::MAX_INDEX_SCHEMA_NODES`.
+        if let Some(schema) = &input.index_schema {
+            if !crate::state::document_within_bounds(schema, crate::state::MAX_INDEX_SCHEMA_NODES) {
+                return Err(
+                    UpdateIndexErrorModeled::ValidationException(ValidationException {
+                        message: Some(crate::state::index_schema_bounds_message()),
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        let Some(collection) = store.collections.get_mut(&input.id) else {
+            return Err(UpdateIndexErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::index_collection_not_found_message(&input.id)),
+                },
+            )
+            .into());
+        };
+        // This operation updates an EXISTING index (its own documentation), so a name that
+        // addresses none is the missing resource `ResourceNotFoundException` describes
+        // rather than an implicit create — worded by the one helper `GetIndex` answers
+        // with.
+        let Some(index) = collection.indexes.get_mut(&input.index_name) else {
+            return Err(UpdateIndexErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::index_not_found_message(
+                        &input.index_name,
+                        &input.id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Only the member the request NAMES is applied: `indexSchema` is "the updated JSON
+        // schema definition for the index", so a request carrying one replaces the stored
+        // definition with it, and a request carrying none asks for no schema change and
+        // leaves the stored one alone. Writing the same schema twice therefore lands the
+        // same state, which is what `@idempotent` on this operation asks for.
+        if let Some(schema) = input.index_schema {
+            index.index_schema = Some(schema);
+        }
+
+        // `UpdateIndexResponse` models no members: the updated index is what the call
+        // produced, and `GetIndex` is where it is read back.
+        Ok(UpdateIndexOutput {})
     }
 }

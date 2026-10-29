@@ -2060,10 +2060,32 @@ pub fn collection_not_found_message(id: &str) -> String {
     format!("Collection with ID {id} is not found")
 }
 
-/// How the index operations word a collection id that names no collection. `CreateIndex`
-/// and `GetIndex` address the COLLECTION by id, so the refusal names that collection.
+/// How the index operations word a collection id that names no collection. `CreateIndex`,
+/// `GetIndex` and `UpdateIndex` address the COLLECTION by id, so the refusal names that
+/// collection.
 pub fn index_collection_not_found_message(id: &str) -> String {
     format!("The Collection with Id '{id}' does not exist.")
+}
+
+/// How the index operations word an index that is not there, from the index name and the
+/// id of the collection it was looked for in.
+///
+/// `GetIndex` and `UpdateIndex` both address an existing index this way, so the wording of
+/// that one refusal is read off one place and the two cannot disagree about it.
+pub fn index_not_found_message(index_name: &str, collection_id: &str) -> String {
+    format!("The index '{index_name}' does not exist in the collection with Id '{collection_id}'.")
+}
+
+/// How the index operations word an `indexSchema` past the bounds this emulator stores a
+/// caller-supplied schema under ([`MAX_DOCUMENT_DEPTH`], [`MAX_INDEX_SCHEMA_NODES`]).
+///
+/// `CreateIndex` and `UpdateIndex` each store one, so the refusal that states the bound
+/// lives beside the bound rather than in each handler.
+pub fn index_schema_bounds_message() -> String {
+    format!(
+        "indexSchema must not nest deeper than {MAX_DOCUMENT_DEPTH} levels or carry more than \
+         {MAX_INDEX_SCHEMA_NODES} values"
+    )
 }
 
 /// How this service words a collection group that is not there, from its NAME — the way a
