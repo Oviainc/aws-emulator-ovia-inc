@@ -143,7 +143,7 @@ fn workspace_body(name: &str, extra: Value) -> Value {
 }
 
 /// Fold the members of `extra` into `body`.
-fn merge(body: &mut Value, extra: Value) {
+pub(crate) fn merge(body: &mut Value, extra: Value) {
     let object = body.as_object_mut().expect("an object body");
     for (member, value) in extra.as_object().expect("an object of extra members") {
         object.insert(member.clone(), value.clone());

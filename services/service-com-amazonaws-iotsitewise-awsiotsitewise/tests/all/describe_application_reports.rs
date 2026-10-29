@@ -134,7 +134,7 @@ fn store_snapshot(shared: &engine::InMemoryEngine) -> Vec<String> {
             format!(
                 "{id}|{arn}|{workspace}|{name}|{description:?}|{idc_instance:?}|\
                  {idc_application}|{subdomain}|{created:?}|{updated:?}|{active:?}|\
-                 {token:?}|{tags}",
+                 {tags}",
                 id = record.id,
                 arn = record.arn,
                 workspace = record.workspace_name,
@@ -146,7 +146,6 @@ fn store_snapshot(shared: &engine::InMemoryEngine) -> Vec<String> {
                 created = record.created_at,
                 updated = record.updated_at,
                 active = record.active_at,
-                token = record.client_token,
                 tags = tags.join(","),
             )
         })

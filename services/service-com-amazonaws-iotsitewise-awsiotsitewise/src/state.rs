@@ -8432,10 +8432,6 @@ pub struct ApplicationRecord {
     /// The instant the transition the clock owes — `CREATING` to `ACTIVE` —
     /// falls due.
     pub active_at: SystemTime,
-    /// The `clientToken` of the create that made this application, if it carried
-    /// one, so a retry of that same create replays its answer rather than
-    /// minting a second application.
-    pub client_token: Option<String>,
     pub tags: HashMap<String, String>,
 }
 

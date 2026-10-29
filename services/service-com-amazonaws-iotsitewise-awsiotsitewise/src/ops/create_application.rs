@@ -8,9 +8,11 @@
 //! falls due (the instant is stored, never slept on) and `ACTIVE` from then on.
 //!
 //! `clientToken` is honoured for idempotent replay: a retry carrying the token of a
-//! create this store already served, and naming the same application, answers from the
-//! application that create minted and stores nothing further; a token already spent on
-//! a different request is a conflict.
+//! create this store already served, with every member of that create unchanged, answers
+//! from the application that create minted and stores nothing further; a token already
+//! spent on a different request is a conflict. The spent token is remembered by the CALL
+//! that sent it, in the store's idempotency registry, so deleting the application a token
+//! made does not unspend it.
 //!
 //! The workspace named must be one this store holds, since the application is created in
 //! it.
@@ -226,42 +228,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `clientToken` is an `@idempotencyToken`: a retry carrying the token of a
         // create this store already served answers from the application THAT create
-        // minted and writes nothing. The retry has to be the SAME request, so the
-        // members that identify the application are compared too; a token already
-        // spent on a different request collides with the application it made,
-        // rather than answering from it.
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(existing) = store
-                .applications
-                .values()
-                .find(|record| record.client_token.as_deref() == Some(token))
-            {
-                if existing.workspace_name == input.workspace_name
-                    && existing.name == input.name
-                    && existing.idc_instance_arn == input.idc_instance_arn
-                    && existing.description == input.description
-                    // Every member the create carries, `tags` included: a retry
-                    // whose tags differ is a different request, so it collides
-                    // rather than silently dropping the tags it carried. A record
-                    // stores an absent `tags` as the empty set, which is what a
-                    // request carrying none asks for.
-                    && existing.tags == input.tags.clone().unwrap_or_default()
-                {
+        // minted and writes nothing. The token is resolved against the store's
+        // record of the tokens THIS operation has already served, the way every
+        // other idempotent write of this service resolves one: a token identifies
+        // the CALL that spent it, so a retry — the SAME request under that token,
+        // every member the create carries included — replays what that call left
+        // behind, while a DIFFERENT request reusing it belongs to another call and
+        // is the modelled conflict rather than a second application. Reading the
+        // token off the applications this store still holds would scope it to the
+        // application that call minted instead: a token would stop being spent the
+        // moment that application was deleted.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.workspace_name,
+                &input.name,
+                &input.idc_instance_arn,
+                &input.description,
+            ],
+            input.tags.as_ref(),
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // One deleted since leaves the retry nothing to answer from, so that
+                // retry is served as the fresh create it now is.
+                if let Some(existing) = store.applications.get(&replayed) {
                     return Ok(created(existing, now));
                 }
-                return Err(CreateApplicationError::Modeled(
-                    CreateApplicationErrorModeled::ConflictingOperationException(
-                        ConflictingOperationException {
-                            message: crate::state::already_using_message(
-                                crate::state::RESOURCE_APPLICATION,
-                                "clientToken",
-                            ),
-                            resource_id: existing.id.clone(),
-                            resource_arn: existing.arn.clone(),
-                        },
-                    ),
-                ));
             }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                // The ARN the conflict reports is the one the stored application
+                // CARRIES, read back from the record rather than rebuilt, so the
+                // refusal cannot name an ARN no application of this store has. One
+                // removed since the token was spent leaves only its id to build one
+                // from, and it is built for the region THIS request is signed for —
+                // the region every other ARN this call could report is built for,
+                // and the one convention the workspace writes already follow for a
+                // resource their spent token named and the store no longer holds.
+                let conflicting_arn = store
+                    .applications
+                    .get(&spent_on)
+                    .map(|application| application.arn.clone())
+                    .unwrap_or_else(|| crate::state::application_arn(&region, &spent_on));
+                return Err(token_spent(&spent_on, conflicting_arn));
+            }
+            crate::state::TokenVerdict::Serve => {}
         }
 
         // The store is bounded: a create is the only thing that adds an application
@@ -304,13 +314,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // on, so a caller reading the application straight after this call still
             // sees `CREATING`.
             active_at: now + crate::state::ACTIVATION_DELAY,
-            client_token: input.client_token.clone(),
             tags: input.tags.clone().unwrap_or_default(),
             id: application_id,
         };
 
         let output = created(&record, now);
-        store.applications.insert(record.id.clone(), record);
+        let application_id = record.id.clone();
+        store.applications.insert(application_id.clone(), record);
+        // The token is spent only now that the create has succeeded: a refused
+        // request created nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &application_id,
+            now,
+        );
 
         Ok(output)
     }
@@ -329,6 +348,25 @@ fn created(
         name: record.name.clone(),
         status: record.status(now),
     }
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the application that request
+/// created, so `resourceId`/`resourceArn` name it — the application the caller
+/// has to look at.
+fn token_spent(application_id: &str, resource_arn: String) -> CreateApplicationError {
+    CreateApplicationError::Modeled(
+        CreateApplicationErrorModeled::ConflictingOperationException(
+            ConflictingOperationException {
+                message: crate::state::already_using_message(
+                    crate::state::RESOURCE_APPLICATION,
+                    "clientToken",
+                ),
+                resource_id: application_id.to_string(),
+                resource_arn,
+            },
+        ),
+    )
 }
 
 /// HTTP 400 `InvalidRequestException` carrying `message` — "The request isn't

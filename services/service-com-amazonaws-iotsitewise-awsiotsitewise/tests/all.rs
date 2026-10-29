@@ -70,6 +70,13 @@ mod client_token_replay;
 #[path = "all/client_token_spent_by_another_request.rs"]
 mod client_token_spent_by_another_request;
 
+// `client_token_names_the_call` is declared HERE, beside the two token suites it
+// belongs with, for the reason their notes give: the sorted list and the END of
+// this file are both where every concurrent iotsitewise change puts a
+// declaration of its own. Fold it into the list once the churn settles.
+#[path = "all/client_token_names_the_call.rs"]
+mod client_token_names_the_call;
+
 // `ingest_storage_configuration` is declared HERE, beside the suites above, for
 // the reason their notes give: the sorted list and the END of this file are both
 // where every concurrent iotsitewise change puts a declaration of its own. Fold
