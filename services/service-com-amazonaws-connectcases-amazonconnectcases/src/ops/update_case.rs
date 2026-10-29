@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCase
-//! IMPLEMENTED: merges field values into the stored case in [`crate::state`].
+//! IMPLEMENTED: merges field values into the stored case in [`crate::state`], and
+//! records the edit in that case's audit history.
 //! It is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -146,13 +147,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateCaseErrorModeled::InternalServerException(
                 crate::state::state_unavailable(),
             )
             .into());
         };
+        let principal = crate::state::caller_principal_arn(ctx);
         let now = ::std::time::SystemTime::now();
 
         // Pure input validation, done BEFORE the store lock is taken so no
@@ -214,15 +215,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The edit this call makes, as the case's audit history records it:
+        // every field value it writes, each against the value the case held for
+        // that field before this call. Taken BEFORE the merge below, which is
+        // what makes the previous value readable at all.
+        let edited_fields = crate::state::audit_event_fields(
+            Some(&case.field_values),
+            input.fields.iter().map(|field| (field.id.as_str(), &field.value)),
+        );
+
         // A MERGE, not a replace: a supplied id overwrites the value stored for it
         // and every other stored value is left alone.
         for field in input.fields {
             case.field_values.insert(field.id, field.value);
         }
-        if let Some(performed_by) = input.performed_by {
-            case.performed_by = Some(performed_by);
+        let performed_by = input.performed_by;
+        if let Some(user) = performed_by.clone() {
+            case.performed_by = Some(user);
         }
         case.last_modified_time = now;
+
+        // An audit entry reports the field values an edit wrote, and an update
+        // that names none wrote nothing to report.
+        if !edited_fields.is_empty() {
+            case.record_audit_event(
+                crate::state::AUDIT_EVENT_CASE_UPDATED,
+                now,
+                principal,
+                performed_by,
+                edited_fields,
+            );
+        }
 
         Ok(UpdateCaseOutput {})
     }

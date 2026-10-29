@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCaseAuditEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCaseAuditEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCaseAuditEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the audit history [`crate::state`] holds for the case, one page
+//! at a time, and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +151,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCaseAuditEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCaseAuditEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCaseAuditEvents"))
+        // A read (`@readonly` in the model): it reports the edits already
+        // recorded against the case and writes nothing, so a later caller sees
+        // exactly what it would have seen had this call never happened. The
+        // history itself is written by the operations that EDIT the case.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetCaseAuditEventsErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // The page size this operation admits is its own, narrower than the
+        // listings': `maxResults` is `@range(1..25)` and the response's
+        // `auditEvents` is `@length(max: 25)`. It is re-checked here as well as
+        // at the boundary, so the bound on the answer's size does not rest on
+        // the boundary validator alone, and a request naming no `maxResults`
+        // gets the documented default, which is the same number.
+        let limit = input
+            .max_results
+            .unwrap_or(crate::state::MAX_AUDIT_EVENTS_PER_PAGE);
+        if !(1..=crate::state::MAX_AUDIT_EVENTS_PER_PAGE).contains(&limit) {
+            return Err(GetCaseAuditEventsErrorModeled::ValidationException(
+                crate::state::max_results_out_of_range(
+                    limit,
+                    crate::state::MAX_AUDIT_EVENTS_PER_PAGE,
+                ),
+            )
+            .into());
+        }
+
+        let store = state.lock();
+        let domain = store
+            .domain(&input.domain_id)
+            .map_err(GetCaseAuditEventsErrorModeled::ResourceNotFoundException)?;
+        let case = domain
+            .case(&input.case_id)
+            .map_err(GetCaseAuditEventsErrorModeled::ResourceNotFoundException)?;
+
+        // Every edit the case has recorded, most recent first, each rendered
+        // from the stored record of that edit.
+        let history: Vec<(String, AuditEvent)> = case
+            .audit_history_newest_first()
+            .into_iter()
+            .map(|(key, event)| (key, audit_event(event)))
+            .collect();
+
+        // The cursor is scoped to this history and this case, so a token from
+        // another read is refused rather than resumed at a key it never ordered.
+        let page = crate::state::page(
+            &crate::state::page_scope(
+                Self::NAME,
+                &format!("{}/{}", input.domain_id, input.case_id),
+                &[],
+            ),
+            history,
+            Some(limit),
+            input.next_token.as_deref(),
+        )
+        .map_err(|error| {
+            GetCaseAuditEventsErrorModeled::ValidationException(
+                crate::state::page_validation_exception(&error),
+            )
+        })?;
+
+        Ok(GetCaseAuditEventsOutput {
+            audit_events: page.items,
+            next_token: page.next_token,
+        })
+    }
+}
+
+/// One recorded edit of a case as this operation reports it.
+///
+/// `performedBy` is always present: the service attributes every edit to the IAM
+/// principal that made it ([`crate::state::caller_principal_arn`]), and names
+/// the entity the request itself declared as `user` when it declared one.
+fn audit_event(event: &crate::state::CaseAuditEvent) -> AuditEvent {
+    AuditEvent {
+        event_id: event.event_id.clone(),
+        r#type: event.event_type.clone(),
+        related_item_type: event.related_item_type.clone(),
+        performed_time: crate::state::timestamp(event.performed_time),
+        fields: event
+            .fields
+            .iter()
+            .map(|field| AuditEventField {
+                event_field_id: field.field_id.clone(),
+                old_value: field.old_value.as_ref().map(audit_event_field_value),
+                new_value: audit_event_field_value(&field.new_value),
+            })
+            .collect(),
+        performed_by: Some(AuditEventPerformedBy {
+            user: event.performed_by.clone(),
+            iam_principal_arn: event.iam_principal_arn.clone(),
+        }),
+    }
+}
+
+/// A stored field value as the audit history's own value union carries it.
+///
+/// `AuditEventFieldValueUnion` and `FieldValueUnion` declare the same five
+/// variants (`smithy_query(query="shape", shape="AuditEventFieldValueUnion,FieldValueUnion")`),
+/// so the variant a value was WRITTEN with is the variant its audit entry
+/// reports — an edit's record is not a re-encoding of what the caller wrote.
+fn audit_event_field_value(value: &FieldValueUnion) -> AuditEventFieldValueUnion {
+    match value {
+        FieldValueUnion::stringValue(text) => AuditEventFieldValueUnion::stringValue(text.clone()),
+        FieldValueUnion::doubleValue(number) => AuditEventFieldValueUnion::doubleValue(*number),
+        FieldValueUnion::booleanValue(flag) => AuditEventFieldValueUnion::booleanValue(*flag),
+        FieldValueUnion::emptyValue(empty) => AuditEventFieldValueUnion::emptyValue(empty.clone()),
+        FieldValueUnion::userArnValue(arn) => AuditEventFieldValueUnion::userArnValue(arn.clone()),
     }
 }

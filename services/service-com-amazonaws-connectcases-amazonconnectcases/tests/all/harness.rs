@@ -15,12 +15,17 @@ use service_com_amazonaws_connectcases_amazonconnectcases::ops::types::FIELD_TYP
 use service_com_amazonaws_connectcases_amazonconnectcases::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+/// The access key id the harness signs with unless a suite names another one.
+pub const DEFAULT_ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+
 /// A SigV4 `Authorization` header scoped to this service's signing name
 /// (`cases`, per the crate's `OPERATIONS.md`), which is what the router routes
-/// on and what the handlers read the ARN region from.
-pub fn authorization(region: &str) -> String {
+/// on and what the handlers read the ARN region from, signed by
+/// `access_key_id` — the id a handler attributes a stored record to, so a suite
+/// that needs two callers told apart names a second one.
+pub fn authorization_as(access_key_id: &str, region: &str) -> String {
     format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/cases/aws4_request, \
+        "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{region}/cases/aws4_request, \
          SignedHeaders=host;x-amz-date, Signature=deadbeef"
     )
 }
@@ -47,13 +52,25 @@ impl Emulator {
     }
 
     pub async fn send(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+        self.send_as(DEFAULT_ACCESS_KEY_ID, method, path, body)
+            .await
+    }
+
+    /// Send a call signed by `access_key_id` rather than [`DEFAULT_ACCESS_KEY_ID`].
+    pub async fn send_as(
+        &self,
+        access_key_id: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
         let payload = body
             .map(|body| serde_json::to_vec(&body).expect("serialize the request body"))
             .unwrap_or_default();
         let request = http::Request::builder()
             .method(method)
             .uri(format!("https://cases.{}.amazonaws.com{path}", self.region))
-            .header("authorization", authorization(&self.region))
+            .header("authorization", authorization_as(access_key_id, &self.region))
             .header("content-type", "application/json")
             .body(bytes::Bytes::from(payload))
             .expect("build the request");
@@ -70,7 +87,21 @@ impl Emulator {
 
     /// Send a call that must succeed, and hand back its parsed body.
     pub async fn ok(&self, case: &str, method: &str, path: &str, body: Value) -> Value {
-        let (status, json) = self.send(method, path, Some(body)).await;
+        self.ok_as(DEFAULT_ACCESS_KEY_ID, case, method, path, body)
+            .await
+    }
+
+    /// Send a call signed by `access_key_id` that must succeed, and hand back
+    /// its parsed body.
+    pub async fn ok_as(
+        &self,
+        access_key_id: &str,
+        case: &str,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> Value {
+        let (status, json) = self.send_as(access_key_id, method, path, Some(body)).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected HTTP 200, got {status} with body {json:?}"

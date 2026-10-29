@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCase
-//! IMPLEMENTED: stores a case under its domain in [`crate::state`].
+//! IMPLEMENTED: stores a case under its domain in [`crate::state`], and records
+//! its creation as the first entry of that case's audit history.
 //! It is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -181,6 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx);
+        let principal = crate::state::caller_principal_arn(ctx);
         let now = ::std::time::SystemTime::now();
 
         // Pure input validation, done BEFORE the store lock is taken so no
@@ -206,6 +208,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+
+        // The creation of a case is an edit of it, so it is the first entry of
+        // the case's audit history: every field value the request wrote, none of
+        // which can have a previous value. Built here, with the rest of the work
+        // whose size the caller chooses, rather than under the store lock.
+        let created_fields = crate::state::audit_event_fields(
+            None,
+            input
+                .fields
+                .iter()
+                .map(|field| (field.id.as_str(), &field.value)),
+        );
+        let performed_by = input.performed_by.clone();
 
         let mut store = state.lock();
 
@@ -303,7 +318,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 created_time: now,
                 last_modified_time: now,
                 performed_by: input.performed_by,
+                audit_events: ::std::collections::VecDeque::new(),
+                audit_events_recorded: 0,
             });
+        stored.record_audit_event(
+            crate::state::AUDIT_EVENT_CASE_CREATED,
+            now,
+            principal,
+            performed_by,
+            created_fields,
+        );
         let output = CreateCaseOutput {
             case_id: stored.case_id.clone(),
             case_arn: stored.case_arn.clone(),

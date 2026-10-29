@@ -13,7 +13,8 @@
 //! Every map here grows one entry per request, with caller-chosen contents, so
 //! each one carries an explicit ceiling: [`MAX_DOMAINS`],
 //! [`MAX_FIELDS_PER_DOMAIN`], [`MAX_TEMPLATES_PER_DOMAIN`],
-//! [`MAX_LAYOUTS_PER_DOMAIN`], [`MAX_CASES_PER_DOMAIN`] and
+//! [`MAX_LAYOUTS_PER_DOMAIN`], [`MAX_CASES_PER_DOMAIN`],
+//! [`MAX_AUDIT_EVENTS_PER_CASE`] and
 //! [`MAX_IDEMPOTENCY_TOKENS`]. Creating past a
 //! ceiling is refused with a modelled error, and the idempotency table evicts
 //! its oldest entry rather than growing, so no caller can grow this store
@@ -208,6 +209,30 @@ pub const MAX_EVENT_INCLUDED_FIELD_IDS: usize = 400;
 /// amplified into a long response.
 pub const MAX_IDS_NAMED_IN_A_REFUSAL: usize = 10;
 
+/// Most audit-history events one case keeps. Emulator-owned ceiling on
+/// request-driven growth, as [`MAX_IDEMPOTENCY_TOKENS`]: every accepted edit of
+/// a case appends one event to that case's history, so past this many the
+/// OLDEST event is dropped rather than the store growing with the number of
+/// edits a caller makes ([`Case::record_audit_event`]).
+pub const MAX_AUDIT_EVENTS_PER_CASE: usize = 100;
+
+/// Most audit events one page of a case's audit history carries, which is also
+/// the page size a request naming no `maxResults` gets. The model's own cap,
+/// stated twice: `GetCaseAuditEventsRequest$maxResults` is `@range(1..25)` and
+/// `GetCaseAuditEventsResponse$auditEvents` is `@length(max: 25)`
+/// (`smithy_query(query="operation", operation="GetCaseAuditEvents")`), and the
+/// model documents the same number as the default — "The maximum number of
+/// audit events to return. When no value is provided, 25 is the default."
+pub const MAX_AUDIT_EVENTS_PER_PAGE: i32 = 25;
+
+/// `AuditEventType` of the event a case's creation records.
+/// One of `AUDIT_EVENT_TYPE_VALUES`.
+pub const AUDIT_EVENT_CASE_CREATED: &str = "Case.Created";
+
+/// `AuditEventType` of the event an edit of a case's field values records.
+/// One of `AUDIT_EVENT_TYPE_VALUES`.
+pub const AUDIT_EVENT_CASE_UPDATED: &str = "Case.Updated";
+
 /// A Cases domain and everything scoped to it.
 #[derive(Debug, Clone)]
 pub struct Domain {
@@ -310,6 +335,52 @@ pub struct Case {
     pub created_time: SystemTime,
     pub last_modified_time: SystemTime,
     pub performed_by: Option<UserUnion>,
+    /// This case's audit history: one entry per accepted edit of the case, in
+    /// the order the edits were made (so the back is the most recent one).
+    /// Bounded by [`MAX_AUDIT_EVENTS_PER_CASE`] — a deque because the ceiling
+    /// drops the oldest event rather than refusing a further edit. It is part
+    /// of the case, so deleting the case takes its audit history with it, which
+    /// is what `DeleteCase` documents ("After a successful deletion, you cannot
+    /// ... Access audit history").
+    pub audit_events: VecDeque<CaseAuditEvent>,
+    /// How many audit events this case has recorded in all, including any the
+    /// ceiling has already dropped. It is what orders the history
+    /// ([`audit_order_key`]): two edits made in the same instant still have
+    /// distinct ordinals, so a page boundary in the history is stable.
+    pub audit_events_recorded: u64,
+}
+
+/// One recorded edit of a case: what a page of its audit history reports.
+#[derive(Debug, Clone)]
+pub struct CaseAuditEvent {
+    pub event_id: String,
+    /// One of `AUDIT_EVENT_TYPE_VALUES`.
+    pub event_type: String,
+    /// The `RelatedItemType` of the related item an event of the
+    /// `RelatedItem.*` types is about; absent for an edit of the case itself.
+    pub related_item_type: Option<String>,
+    pub performed_time: SystemTime,
+    /// The ordinal this event was recorded at, from
+    /// [`Case::audit_events_recorded`].
+    pub ordinal: u64,
+    /// The field values this edit wrote. Bounded by [`MAX_CASE_FIELD_IDS`],
+    /// the cap on the field list of the request it was built from.
+    pub fields: Vec<CaseAuditEventField>,
+    /// The entity the request that made this edit named as having performed it,
+    /// when it named one.
+    pub performed_by: Option<UserUnion>,
+    /// The IAM principal whose credentials made the edit
+    /// ([`caller_principal_arn`]).
+    pub iam_principal_arn: String,
+}
+
+/// One field an edit of a case wrote: the value the case held for it before the
+/// edit (absent when it held none) and the value the edit stored.
+#[derive(Debug, Clone)]
+pub struct CaseAuditEventField {
+    pub field_id: String,
+    pub old_value: Option<FieldValueUnion>,
+    pub new_value: FieldValueUnion,
 }
 
 /// A remembered `CreateCase` idempotency token: the domain it was used in and
@@ -586,6 +657,107 @@ impl Domain {
     }
 }
 
+/// A case's audit history: the record of the edits made to it.
+impl Case {
+    /// Append one recorded edit to this case's audit history, dropping the
+    /// OLDEST event once the history holds more than
+    /// [`MAX_AUDIT_EVENTS_PER_CASE`], so a caller cannot grow one case's
+    /// history without end.
+    ///
+    /// The ordinal keeps rising across a drop, so the order of what remains is
+    /// unaffected by eviction and a cursor into the history never points before
+    /// the first event the case still holds.
+    pub fn record_audit_event(
+        &mut self,
+        event_type: &str,
+        performed_time: SystemTime,
+        iam_principal_arn: String,
+        performed_by: Option<UserUnion>,
+        fields: Vec<CaseAuditEventField>,
+    ) {
+        let ordinal = self.audit_events_recorded;
+        self.audit_events_recorded = self.audit_events_recorded.saturating_add(1);
+        self.audit_events.push_back(CaseAuditEvent {
+            event_id: new_id(),
+            event_type: event_type.to_string(),
+            // Only an edit of a RELATED item carries one, and nothing records
+            // such an event until the related-item operations are implemented.
+            related_item_type: None,
+            performed_time,
+            ordinal,
+            fields,
+            performed_by,
+            iam_principal_arn,
+        });
+        while self.audit_events.len() > MAX_AUDIT_EVENTS_PER_CASE {
+            self.audit_events.pop_front();
+        }
+    }
+
+    /// This case's audit history most recent edit first, each event paired with
+    /// the key [`audit_order_key`] builds for it: what a page of the history
+    /// reports, in the order [`page`] needs it in.
+    pub fn audit_history_newest_first(&self) -> Vec<(String, &CaseAuditEvent)> {
+        self.audit_events
+            .iter()
+            .rev()
+            .map(|event| (audit_order_key(event.ordinal, &event.event_id), event))
+            .collect()
+    }
+}
+
+/// The key a case's audit history is ordered by: the ordinal of the recorded
+/// edit, COMPLEMENTED so that lexicographic order over this key is most-recent
+/// first, with the event's own id after it so two events can never share a key.
+///
+/// Reporting an event history newest first is what makes the first page the
+/// useful one for a caller that only wants the latest edits, and it is the order
+/// the emulator reports every page of a case's history in — the model states no
+/// order for `auditEvents`, so this is the emulator's choice, stated here once
+/// and applied to every page.
+pub fn audit_order_key(ordinal: u64, event_id: &str) -> String {
+    format!("{:020}#{event_id}", u64::MAX - ordinal)
+}
+
+/// The audit-history fields one edit of a case records: one entry per field
+/// value the request wrote, in the order the request named them, each carrying
+/// the value the case held for that field before the edit and the value the edit
+/// stored.
+///
+/// `before` is the case's field values as they stood before the edit; `None` is
+/// a case that did not exist yet, where no field can have held a previous value.
+/// Linear in the number of values written, and bounded with it by
+/// [`MAX_CASE_FIELD_IDS`].
+pub fn audit_event_fields<'a, I>(
+    before: Option<&HashMap<String, FieldValueUnion>>,
+    written: I,
+) -> Vec<CaseAuditEventField>
+where
+    I: IntoIterator<Item = (&'a str, &'a FieldValueUnion)>,
+{
+    written
+        .into_iter()
+        .map(|(field_id, new_value)| CaseAuditEventField {
+            field_id: field_id.to_string(),
+            old_value: before.and_then(|held| held.get(field_id)).cloned(),
+            new_value: new_value.clone(),
+        })
+        .collect()
+}
+
+/// The IAM principal an audit record attributes an edit to, as
+/// `AuditEventPerformedBy$iamPrincipalArn` carries it: the IAM user the caller's
+/// own SigV4 access key id stands for.
+///
+/// Derived from the credential scope of the request that made the edit, so the
+/// same caller is the same principal on every call and nothing in it is minted
+/// per request. It is stored with the event, so a later read reports the
+/// principal that made THAT edit rather than the one reading the history.
+pub fn caller_principal_arn(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    ::engine::emulator_arn("iam", "", &format!("user/{access_key_id}"))
+}
+
 /// Field options: the set a single-select field offers.
 impl Field {
     /// Refuse `adding` new options once the field would hold more than
@@ -844,19 +1016,30 @@ pub fn page_scope(operation: &str, container: &str, filters: &[String]) -> Strin
 /// The modelled 400 for paging arguments a listing cannot honour, naming the
 /// member a client has to fix.
 pub fn page_validation_exception(error: &PageError) -> ValidationException {
-    let message = match error {
+    match error {
         // The token is named, but only its leading characters: the model admits a
         // `nextToken` of up to 9000 characters, and a refusal does not echo a
         // whole request member back — the same discipline [`name_ids`] applies.
-        PageError::InvalidToken(token) => format!(
-            "nextToken {} is not a pagination token this service issued for this listing",
-            abbreviate(token)
-        ),
-        PageError::InvalidMaxResults(requested) => format!(
-            "maxResults must be between 1 and {MAX_PAGE_SIZE}, but was {requested}"
-        ),
-    };
-    ValidationException { message }
+        PageError::InvalidToken(token) => ValidationException {
+            message: format!(
+                "nextToken {} is not a pagination token this service issued for this listing",
+                abbreviate(token)
+            ),
+        },
+        PageError::InvalidMaxResults(requested) => {
+            max_results_out_of_range(*requested, MAX_PAGE_SIZE)
+        }
+    }
+}
+
+/// The modelled 400 for a page size outside `1..=cap`, which is the one message
+/// template this service refuses a page size with — the cap differs per
+/// operation (compare [`MAX_PAGE_SIZE`] with
+/// [`MAX_AUDIT_EVENTS_PER_PAGE`]), the wording does not.
+pub fn max_results_out_of_range(requested: i32, cap: i32) -> ValidationException {
+    ValidationException {
+        message: format!("maxResults must be between 1 and {cap}, but was {requested}"),
+    }
 }
 
 /// Most characters of a caller-supplied token a refusal repeats, so a refusal
