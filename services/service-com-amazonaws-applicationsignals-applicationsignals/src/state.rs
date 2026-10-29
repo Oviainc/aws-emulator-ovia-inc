@@ -1709,8 +1709,8 @@ pub fn filtered_window_token_tag(
 ///
 /// Each selector is fingerprinted on the identity the matcher resolves it to: the entries of
 /// an `Attributes` map in key order, a dependency on both of its members, a metric source on
-/// the key attributes alone (the additional attributes of that shape select nothing, so a
-/// request carrying them resumes a token issued without them), and the metric source types
+/// both of its members too — its key attributes and, as a half the request may leave out, the
+/// additional attributes beside them ([`same_metric_source`]) — and the metric source types
 /// sorted and deduplicated, since an objective is reported when its own type is ANY of them
 /// and so neither their order nor a type named twice picks out another set.
 ///
@@ -1736,6 +1736,9 @@ pub fn slo_selection_token_tag(
     }
     fields.extend(optional_attribute_fields(
         metric_source.map(|source| &source.metric_source_key_attributes),
+    ));
+    fields.extend(optional_attribute_fields(
+        metric_source.and_then(|source| source.metric_source_attributes.as_ref()),
     ));
     match metric_source_types {
         None => fields.push(None),
@@ -1938,6 +1941,30 @@ pub fn same_dependency(left: Option<&DependencyConfig>, right: &DependencyConfig
         left.dependency_operation_name == right.dependency_operation_name
             && left.dependency_key_attributes == right.dependency_key_attributes
     })
+}
+
+/// Whether a stored `MetricSource` passes a `MetricSource` selector.
+///
+/// The shape carries TWO members — the key attributes that identify the source and the
+/// additional attributes beside them — and each member the selector states is a further
+/// condition the stored source meets, compared by the rule of its own type: an `Attributes`
+/// map is matched by containment, since a map names as few of its entries as pins the source
+/// down ([`attributes_contain`]). A member the selector LEAVES OUT narrows nothing, which is
+/// the only half of a structure-valued selector that does; an absent stored source carries no
+/// entry at all, so it passes only a selector that names none.
+pub fn same_metric_source(stored: Option<&MetricSource>, filter: &MetricSource) -> bool {
+    attributes_contain(
+        stored.map(|source| &source.metric_source_key_attributes),
+        &filter.metric_source_key_attributes,
+    ) && filter
+        .metric_source_attributes
+        .as_ref()
+        .is_none_or(|additional| {
+            attributes_contain(
+                stored.and_then(|source| source.metric_source_attributes.as_ref()),
+                additional,
+            )
+        })
 }
 
 // =============================================================================

@@ -240,7 +240,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// Each selector names part of the entity an SLO's SLI identifies, so it is matched against
 /// the entity read out of the stored record — never against the request that created it.
-/// An absent selector filters nothing.
+/// An absent selector filters nothing — and so does a member a STRUCTURE-valued selector
+/// leaves out, since such a selector narrows by every member it DOES state
+/// ([`crate::state::same_dependency`], [`crate::state::same_metric_source`]).
 ///
 /// The selectors read here are the ones the page token's tag is a function of
 /// ([`crate::state::slo_selection_token_tag`]): they pick out the ordered set a cursor is a
@@ -267,11 +269,7 @@ fn matches_filters(
         }
     }
     if let Some(metric_source) = input.metric_source.as_ref() {
-        let stored = entity
-            .metric_source
-            .as_ref()
-            .map(|source| &source.metric_source_key_attributes);
-        if !crate::state::attributes_contain(stored, &metric_source.metric_source_key_attributes) {
+        if !crate::state::same_metric_source(entity.metric_source.as_ref(), metric_source) {
             return false;
         }
     }

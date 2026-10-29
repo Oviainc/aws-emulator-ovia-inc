@@ -13,13 +13,14 @@
 //!
 //! `paged_cursor_selection_binding` states the same rule for the reads whose cursor is an
 //! offset into a derived projection; this suite is the objective listing's row of it, whose
-//! cursor is a key of the store. Each row of the first table differs along WHICH of the five
-//! selectors varies (a key-attribute map, an operation name, a dependency, a metric source, a
-//! list of metric source types), and every row is arranged so that the replayed selection
-//! holds a matching objective sorting at or before the token's cursor: the entry a honoured
-//! token would silently drop. The rows of the second table differ along WHY the two requests
-//! state one selection (a list reordered and repeated, an attribute that narrows nothing, the
-//! linked-account flag, this account named explicitly).
+//! cursor is a key of the store. Each row of the first table differs along WHICH of the
+//! selectors varies (a key-attribute map, an operation name, a dependency, a metric source by
+//! its key attributes, the same metric source by the additional attributes beside them, a list
+//! of metric source types), and every row is arranged so that the replayed selection holds a
+//! matching objective sorting at or before the token's cursor: the entry a honoured token would
+//! silently drop. The rows of the second table differ along WHY the two requests state one
+//! selection (a list reordered and repeated, the linked-account flag, this account named
+//! explicitly).
 //!
 //! The harness is `slo_lifecycle`'s, so this suite speaks to the same mounted router as every
 //! other.
@@ -60,6 +61,14 @@ fn dependency(name: &str, operation: &str) -> Value {
 /// One `MetricSource`, naming a resource outside Application Signals.
 fn metric_source(kind: &str, name: &str) -> Value {
     json!({ "MetricSourceKeyAttributes": { "Type": kind, "Name": name } })
+}
+
+/// [`metric_source`] with the additional attributes beside its identity, which narrow the
+/// selection as its key attributes do.
+fn detailed_metric_source(kind: &str, name: &str, additional: Value) -> Value {
+    let mut source = metric_source(kind, name);
+    source["MetricSourceAttributes"] = additional;
+    source
 }
 
 /// An SLI metric config on an Application Signals service operation, optionally through a
@@ -120,6 +129,46 @@ fn seeds() -> Vec<(&'static str, Value)> {
         (
             "sel-92-rum-web-errors",
             json!({ "MetricSource": metric_source(APP_MONITOR_TYPE, "web") }),
+        ),
+        (
+            "sel-93-rum-web-cart",
+            json!({
+                "MetricSource": detailed_metric_source(
+                    APP_MONITOR_TYPE,
+                    "web",
+                    json!({ "Page": "cart" }),
+                )
+            }),
+        ),
+        (
+            "sel-94-rum-web-checkout",
+            json!({
+                "MetricSource": detailed_metric_source(
+                    APP_MONITOR_TYPE,
+                    "web",
+                    json!({ "Page": "checkout" }),
+                )
+            }),
+        ),
+        (
+            "sel-95-rum-web-cart-latency",
+            json!({
+                "MetricSource": detailed_metric_source(
+                    APP_MONITOR_TYPE,
+                    "web",
+                    json!({ "Page": "cart" }),
+                )
+            }),
+        ),
+        (
+            "sel-96-rum-web-checkout-latency",
+            json!({
+                "MetricSource": detailed_metric_source(
+                    APP_MONITOR_TYPE,
+                    "web",
+                    json!({ "Page": "checkout" }),
+                )
+            }),
         ),
     ]
 }
@@ -306,6 +355,29 @@ fn varied_selections() -> Vec<Case> {
             ),
         },
         Case {
+            facet: "the additional attributes of the metric source it names",
+            issuer: body_selection(
+                "the objectives on the app monitor's checkout page",
+                json!({
+                    "MetricSource": detailed_metric_source(
+                        APP_MONITOR_TYPE,
+                        "web",
+                        json!({ "Page": "checkout" }),
+                    )
+                }),
+            ),
+            other: body_selection(
+                "the objectives on the app monitor's cart page",
+                json!({
+                    "MetricSource": detailed_metric_source(
+                        APP_MONITOR_TYPE,
+                        "web",
+                        json!({ "Page": "cart" }),
+                    )
+                }),
+            ),
+        },
+        Case {
             facet: "the metric source types it admits",
             issuer: body_selection(
                 "the dependency objectives",
@@ -342,24 +414,6 @@ fn equivalent_spellings() -> Vec<Equivalent> {
                 "the same two types reordered and repeated",
                 json!({
                     "MetricSourceTypes": ["ServiceOperation", "ServiceDependency", "ServiceOperation"]
-                }),
-            ),
-        },
-        Equivalent {
-            // `MetricSource.MetricSourceAttributes` is additional context about the source, not
-            // part of the identity an objective is selected on, so it narrows nothing.
-            difference: "metric source attributes, which narrow nothing",
-            issuer: body_selection(
-                "the app monitor by its key attributes",
-                json!({ "MetricSource": metric_source(APP_MONITOR_TYPE, "web") }),
-            ),
-            resumed: body_selection(
-                "the same app monitor with further source attributes",
-                json!({
-                    "MetricSource": {
-                        "MetricSourceKeyAttributes": { "Type": APP_MONITOR_TYPE, "Name": "web" },
-                        "MetricSourceAttributes": { "Team": "web-platform" }
-                    }
                 }),
             ),
         },
