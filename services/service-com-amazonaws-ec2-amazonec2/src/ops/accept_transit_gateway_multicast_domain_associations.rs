@@ -219,11 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .transit_gateway_multicast_domains
             .get_mut(domain_id)
             .ok_or_else(|| {
-                state::id_not_found(
-                    state::INVALID_TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_NOT_FOUND,
-                    "transit gateway multicast domain ID",
-                    domain_id,
-                )
+                state::invalid_transit_gateway_multicast_domain_id_not_found(domain_id)
             })?;
 
         // The associations of this domain that belong to the named attachment. An

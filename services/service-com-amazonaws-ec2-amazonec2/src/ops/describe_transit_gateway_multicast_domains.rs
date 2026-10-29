@@ -274,9 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .transit_gateway_multicast_domains
                 .contains_key(domain_id.as_str())
         }) {
-            return Err(state::id_not_found(
-                state::INVALID_TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_NOT_FOUND,
-                "transit gateway multicast domain ID",
+            return Err(state::invalid_transit_gateway_multicast_domain_id_not_found(
                 unknown,
             ));
         }

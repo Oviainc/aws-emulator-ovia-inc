@@ -28468,6 +28468,45 @@ pub struct TransitGatewayMulticastDomainRecord {
     pub associations: Vec<MulticastDomainAssociationRecord>,
 }
 
+/// Refuse a request that named a transit gateway multicast domain id no domain of the
+/// account has: HTTP 400 [`INVALID_TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_NOT_FOUND`].
+///
+/// Worded the way the transit gateway family words a resource of it that is not there —
+/// [`invalid_transit_gateway_id_not_found`] for the gateway itself,
+/// [`invalid_transit_gateway_route_table_id_not_found`] for its route tables — and built
+/// from the id the REQUEST named. The ONE place this refusal is built, so every operation
+/// that resolves a `TransitGatewayMulticastDomainId` refuses an unknown one identically.
+pub fn invalid_transit_gateway_multicast_domain_id_not_found<E>(domain_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_NOT_FOUND,
+        400,
+        format!("Transit Gateway Multicast Domain {domain_id} was deleted or does not exist."),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The transit gateway multicast domain `domain_id` names, refusing a malformed id
+    /// first and an unknown one second — the order [`require_well_formed_id`] documents, so
+    /// "not a multicast domain id at all" is never reported as "no such multicast domain".
+    ///
+    /// The ONE place a `TransitGatewayMulticastDomainId` is resolved, on the contract of
+    /// [`Self::require_transit_gateway_policy_table`], so every operation that takes one
+    /// refuses the same id the same way.
+    pub fn require_transit_gateway_multicast_domain<E>(
+        &self,
+        domain_id: &str,
+    ) -> Result<&TransitGatewayMulticastDomainRecord, Scaffolded<E>> {
+        require_well_formed_id(
+            TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_PREFIX,
+            domain_id,
+            INVALID_TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_MALFORMED,
+        )?;
+        self.transit_gateway_multicast_domains
+            .get(domain_id)
+            .ok_or_else(|| invalid_transit_gateway_multicast_domain_id_not_found(domain_id))
+    }
+}
+
 /// One stored transit gateway route table announcement.
 #[derive(Debug, Clone)]
 pub struct TransitGatewayRouteTableAnnouncementRecord {

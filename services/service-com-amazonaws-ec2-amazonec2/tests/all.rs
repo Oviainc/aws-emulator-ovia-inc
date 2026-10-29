@@ -248,6 +248,11 @@ mod associate_address;
 mod associate_client_vpn_target_network;
 #[path = "all/associate_subnet_cidr_block.rs"]
 mod associate_subnet_cidr_block;
+// What `AssociateTransitGatewayMulticastDomain` persists: one association per subnet the
+// request names, through an `available` attachment, in the transient state the clock carries
+// to `associated` — and the refusal each resource it cannot resolve gets.
+#[path = "all/associate_transit_gateway_multicast_domain.rs"]
+mod associate_transit_gateway_multicast_domain;
 #[path = "all/authorize_security_group_egress.rs"]
 mod authorize_security_group_egress;
 #[path = "all/availability_zones.rs"]

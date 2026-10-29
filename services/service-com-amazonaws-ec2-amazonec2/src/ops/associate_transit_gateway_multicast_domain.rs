@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateTransitGatewayMulticastDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateTransitGatewayMulticastDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateTransitGatewayMulticastDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: associates the subnets the request names with the stored multicast domain
+//! it names, through the stored transit gateway attachment that reaches them, and answers
+//! with those associations in the transient state an association starts in. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +137,250 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateTransitGatewayMulticastDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateTransitGatewayMulticastDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it — the domain,
+        // the attachment and every subnet are each named by id. The store is reached through
+        // the engine held on `self`.
+        let _ = ctx;
+        use ::std::collections::BTreeSet;
+
+        use crate::state;
+
+        // "The IDs of the subnets to associate with the transit gateway multicast domain"
+        // (`SubnetIds`): the answer carries one subnet association per id, so a request that
+        // names no subnet asks for nothing this operation could do. The member is
+        // `@required`, so the boundary validator already refuses a request that leaves it
+        // out; this is the backstop that keeps an empty list from reading as a success
+        // whatever reaches the handler, worded as EC2 words a parameter the request left
+        // out.
+        if input.subnet_ids.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter SubnetIds",
+            ));
+        }
+        // The model publishes no bound on that list and every id named is resolved against
+        // the store, so the number of ids one request may name is capped here — the same
+        // ceiling the rest of this crate puts on a caller-chosen id list — before any work
+        // proportional to it is done.
+        if input.subnet_ids.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "SubnetIds carries {supplied} ids, above the maximum of {maximum}",
+                supplied = input.subnet_ids.len(),
+                maximum = state::MAX_RESOURCE_IDS,
+            )));
+        }
+
+        // The ids' own form next, in the order the operation's members name the two
+        // resources: an id that is not an id of its kind at all is refused as malformed, so
+        // "not an id of this kind" never reads as "no such resource" and is never answered
+        // by the DryRun arm below either.
+        state::require_well_formed_id(
+            state::TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_PREFIX,
+            &input.transit_gateway_multicast_domain_id,
+            state::INVALID_TRANSIT_GATEWAY_MULTICAST_DOMAIN_ID_MALFORMED,
+        )?;
+        state::require_well_formed_id(
+            state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
+            &input.transit_gateway_attachment_id,
+            state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
+        )?;
+        // Every value named for a subnet is read against the subnet id form as well, before
+        // anything is looked up: `InvalidSubnetID.Malformed` is the refusal EC2's error
+        // catalogue documents for a subnet id of the wrong form, so "not a subnet id at all"
+        // never reads as "no such subnet" here either. The list has already been capped
+        // above, so this scan is bounded.
+        if let Some(subnet_id) = input.subnet_ids.iter().find(|subnet_id| {
+            !state::prefixed_id_is_well_formed(state::SUBNET_ID_PREFIX, subnet_id)
+        }) {
+            return Err(state::invalid_subnet_id_malformed(subnet_id));
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // named resources, so it is answered once the request's own form has been checked
+        // and before anything is resolved; every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // An association whose own move has fallen due is already `associated`, so what this
+        // call is asked against is the state the store is ACTUALLY in.
+        store.materialize_due_transitions();
+
+        // The DOMAIN first: "Associates the specified subnets and transit gateway
+        // attachments WITH the specified transit gateway multicast domain" — the domain is
+        // the resource this call acts on and the operation's members name it first, so a
+        // request naming more than one unknown resource is told about the domain.
+        store.require_transit_gateway_multicast_domain(
+            &input.transit_gateway_multicast_domain_id,
+        )?;
+
+        // The attachment that reaches those subnets: an id naming no attachment of the
+        // account is refused with the attachment's own NotFound code rather than associating
+        // nothing.
+        let attachment = store
+            .transit_gateway_attachments
+            .get(&input.transit_gateway_attachment_id)
+            .ok_or_else(|| {
+                state::invalid_transit_gateway_attachment_id_not_found(
+                    &input.transit_gateway_attachment_id,
+                )
+            })?;
+
+        // "The transit gateway attachment must be in the available state before you can add
+        // a resource" (`AssociateTransitGatewayMulticastDomain`): an attachment in any other
+        // state is refused with `IncorrectState` and NOTHING is written — which is also what
+        // makes the acceptance an attachment is still waiting for a precondition of this
+        // call.
+        let attachment_state = attachment.view.state().unwrap_or_default().to_string();
+        if attachment_state != state::TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE {
+            return Err(state::incorrect_state_of(
+                state::RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT,
+                &input.transit_gateway_attachment_id,
+                &attachment_state,
+            ));
+        }
+
+        // What an association reports about the resource it associates is read off the
+        // STORED attachment, never off the request, which names neither that resource nor
+        // its owner (`TransitGatewayMulticastDomainAssociations$ResourceId` / `$ResourceType`
+        // / `$ResourceOwnerId`).
+        let resource_id = attachment.view.resource_id().unwrap_or_default().to_string();
+        let resource_type = attachment.view.resource_type().to_string();
+        // Every attachment this store holds belongs to the one account the emulator serves,
+        // so an attachment shape that carries no owner member of its own reports that
+        // account rather than leaving the association's owner blank.
+        let resource_owner_id = attachment
+            .view
+            .resource_owner_id()
+            .map(str::to_string)
+            .unwrap_or_else(|| ::engine::emulator_account_id().to_string());
+
+        // Each subnet named has to be a subnet of the resource that attachment attaches: the
+        // multicast domain reaches a subnet THROUGH the attachment, so a subnet this account
+        // does not hold — or one of another VPC, which this attachment cannot reach — is
+        // refused with the subnet's own NotFound code rather than associating nothing. A
+        // subnet named twice asks for ONE association, so the list is reduced to the subnets
+        // it names, in the order it names them.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateTransitGatewayMulticastDomain"))
+        // The subnets are held as an ordered SET beside that list, so the association scan
+        // below costs one lookup per stored association rather than a walk of everything the
+        // request named, and a repeated id cannot multiply the work either.
+        let mut requested: Vec<&str> = Vec::with_capacity(input.subnet_ids.len());
+        let mut named: BTreeSet<&str> = BTreeSet::new();
+        for subnet_id in &input.subnet_ids {
+            let reachable = store
+                .subnets
+                .get(subnet_id)
+                .is_some_and(|subnet| subnet.vpc_id.as_deref() == Some(resource_id.as_str()));
+            if !reachable {
+                return Err(state::invalid_subnet_id_not_found(subnet_id));
+            }
+            if named.insert(subnet_id.as_str()) {
+                requested.push(subnet_id.as_str());
+            }
+        }
+
+        // One subnet is associated with one multicast domain once: a second association of a
+        // subnet the domain already carries is refused with EC2's own
+        // `Resource.AlreadyAssociated` and NOTHING is written, whichever attachment holds
+        // the association it already has.
+        let domain = store.require_transit_gateway_multicast_domain(
+            &input.transit_gateway_multicast_domain_id,
+        )?;
+        if let Some(held) = domain
+            .associations
+            .iter()
+            .find(|association| named.contains(association.subnet_id.as_str()))
+        {
+            return Err(state::resource_already_associated(format!(
+                "The subnet '{subnet_id}' is already associated with the transit gateway \
+                 multicast domain '{domain_id}' through the attachment '{attachment_id}'",
+                subnet_id = held.subnet_id,
+                domain_id = input.transit_gateway_multicast_domain_id,
+                attachment_id = held.transit_gateway_attachment_id,
+            )));
+        }
+
+        // Each new association is in the non-terminal `associating` state now, with the
+        // clock owing it `associated`: the span is never zero, so a caller acting straight
+        // after this call still sees the transient state and the state errors that go with
+        // it.
+        let records: Vec<state::MulticastDomainAssociationRecord> = requested
+            .iter()
+            .map(|subnet_id| state::MulticastDomainAssociationRecord {
+                transit_gateway_attachment_id: input.transit_gateway_attachment_id.clone(),
+                resource_id: resource_id.clone(),
+                resource_type: resource_type.clone(),
+                resource_owner_id: resource_owner_id.clone(),
+                subnet_id: (*subnet_id).to_string(),
+                state: state::MULTICAST_ASSOCIATION_STATE_ASSOCIATING.to_string(),
+                pending: Some(state::PendingStateMove::starting_now(
+                    state::MULTICAST_ASSOCIATION_STATE_ASSOCIATED,
+                )),
+            })
+            .collect();
+
+        // Nothing reclaims a stored association, so the bytes these would hold are charged
+        // against the store's one byte budget before any of them is written: the fixed
+        // per-record overhead every stored record costs plus the ids each association keeps,
+        // which is exactly what this crate's writer of a multicast domain charges for the
+        // associations stored with it. A request the budget has no room for stores NONE of
+        // them rather than part of what it asked for.
+        let charge: usize = records
+            .iter()
+            .map(|record| {
+                state::STORED_RECORD_OVERHEAD_BYTES
+                    + record.transit_gateway_attachment_id.len()
+                    + record.resource_id.len()
+                    + record.subnet_id.len()
+            })
+            .sum();
+        if store.would_exceed_stored_bytes(charge) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {maximum} bytes of caller-supplied \
+                 data, so it cannot store another {count} multicast domain associations",
+                held = store.stored_bytes(),
+                maximum = state::MAX_STORED_BYTES,
+                count = records.len(),
+            )));
+        }
+
+        // "Information about the transit gateway multicast domain associations"
+        // (`Associations`): the associations this call just made, one entry per subnet, under
+        // the domain, the attachment and the resource that attachment attaches — all of it
+        // off the records the store is about to hold.
+        let subnets: Vec<SubnetAssociation> =
+            records.iter().map(|record| record.subnet_view()).collect();
+        let domain = store
+            .transit_gateway_multicast_domains
+            .get_mut(&input.transit_gateway_multicast_domain_id)
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the transit gateway multicast domain '{domain_id}' resolved a moment \
+                     ago is not in the store any more",
+                    domain_id = input.transit_gateway_multicast_domain_id,
+                ))
+            })?;
+        domain.associations.extend(records);
+        // Charged once the records are in the store, so the budget counts what is actually
+        // held.
+        store.add_stored_bytes(charge);
+
+        Ok(AssociateTransitGatewayMulticastDomainOutput {
+            associations: Some(TransitGatewayMulticastDomainAssociations {
+                transit_gateway_multicast_domain_id: Some(
+                    input.transit_gateway_multicast_domain_id.clone(),
+                ),
+                transit_gateway_attachment_id: Some(input.transit_gateway_attachment_id.clone()),
+                resource_id: Some(resource_id),
+                resource_type: Some(resource_type),
+                resource_owner_id: Some(resource_owner_id),
+                subnets: Some(subnets),
+            }),
+        })
     }
 }
