@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAppBundle
-//! Removes an app bundle from the store, with the ingestions it owns, and answers
+//! Removes an app bundle from the store, with what is stored under it, and answers
 //! 204 with no body: a later `GetAppBundle` on the same identifier is then
 //! `ResourceNotFoundException` and `ListAppBundles` no longer lists it.
+//!
+//! The removal is taken only once the precondition the operation documents holds:
+//! a bundle that still holds an app authorization is refused with the
+//! `ConflictException` it models (HTTP 409) and survives untouched.
 //!
 //! @idempotent, and this operation's model declares NO `ResourceNotFoundException`
 //! — unlike `DeleteAppAuthorization`/`DeleteIngestion`, which both do — so
@@ -151,23 +155,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // ONE lock for the whole decision: the precondition below and the
+        // removal that follows it are taken without releasing it, so an app
+        // authorization created in between cannot be destroyed with the bundle.
         let mut store = state.lock();
-        // Deleting the bundle deletes the ingestions it owns with it: they are
-        // stored under the bundle, which is the resource chain AppFabric models.
-        let outcome = if let Some(key) = store.bundle_key(&input.app_bundle_identifier) {
-            store.app_bundles.remove(&key);
-            "deleted"
-        } else {
-            // @idempotent, and this operation models no ResourceNotFoundException:
-            // deleting what is already gone is a success.
-            "already absent"
+        // ONE lookup of the record, by either `Identifier` form. @idempotent,
+        // and this operation models no ResourceNotFoundException: deleting what
+        // is already gone is a success.
+        let Some(bundle) = store.resolve_bundle(&input.app_bundle_identifier) else {
+            crate::state::audit_resource_change(
+                ctx.parts(),
+                Self::NAME,
+                "AppBundle",
+                &input.app_bundle_identifier,
+                "already absent",
+            );
+            return Ok(DeleteAppBundleOutput {});
         };
+        // The record's own key, read off the record the lookup resolved, so the
+        // remove below cannot name anything else.
+        let bundle_key = bundle.id.clone();
+
+        // The precondition the operation documents: "You must delete all
+        // associated app authorizations before you can delete an app bundle."
+        // It is checked against the STORE, so the delete is refused — and the
+        // bundle left whole — for as long as the bundle holds one.
+        if !bundle.app_authorizations.is_empty() {
+            return Err(DeleteAppBundleErrorModeled::ConflictException(
+                crate::state::app_authorizations_still_held(&bundle.arn),
+            )
+            .into());
+        }
+
+        // Past the precondition the bundle holds no app authorization, and an
+        // ingestion exists only for a pair its bundle holds a connected one for
+        // (`CreateIngestion`), which neither `DeleteAppAuthorization` nor
+        // `UpdateAppAuthorization` may break: so nothing the caller still has to
+        // delete goes with the record.
+        store.app_bundles.remove(&bundle_key);
         crate::state::audit_resource_change(
             ctx.parts(),
             Self::NAME,
             "AppBundle",
             &input.app_bundle_identifier,
-            outcome,
+            "deleted",
         );
         Ok(DeleteAppBundleOutput {})
     }

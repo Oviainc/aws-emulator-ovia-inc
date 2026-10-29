@@ -1858,6 +1858,30 @@ pub fn associated_ingestion_still_held(
     ))
 }
 
+/// A modelled `ConflictException` refusing a `DeleteAppBundle` of a bundle that
+/// still holds app authorizations.
+///
+/// The precondition is the one the operation documents ("You must delete all
+/// associated app authorizations before you can delete an app bundle"), and the
+/// message is that sentence: it has no variable part — it states the call the
+/// caller still owes, not which authorization is in the way — so two refusals of
+/// two different bundles read identically. The bundle travels in the shape's own
+/// required `resourceId` member, which is where a client reads it from.
+/// `ConflictException` (HTTP 409) is the precondition channel here: every member
+/// of the request is valid (the boundary validator accepted them all), so the
+/// refusal is about the STATE of the resource the request names rather than about
+/// a parameter — which is what the conflict this operation models states ("the
+/// request has created a conflict, check the request parameters and try again").
+pub fn app_authorizations_still_held(bundle_arn: &str) -> ConflictException {
+    ConflictException {
+        message: "You must delete all associated app authorizations before you can delete an \
+                  app bundle."
+            .to_string(),
+        resource_id: bundle_arn.to_string(),
+        resource_type: "AppBundle".to_string(),
+    }
+}
+
 /// A modelled `ResourceNotFoundException` for a tagging call whose `resourceArn`
 /// names no resource this store holds.
 ///

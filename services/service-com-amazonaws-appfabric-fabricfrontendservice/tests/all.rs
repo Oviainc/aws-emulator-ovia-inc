@@ -19,6 +19,8 @@ mod app_authorization_auth_url;
 mod app_authorization_deletion;
 #[path = "all/app_authorization_tenant_move_precondition.rs"]
 mod app_authorization_tenant_move_precondition;
+#[path = "all/app_bundle_delete_precondition.rs"]
+mod app_bundle_delete_precondition;
 #[path = "all/app_bundle_ingestion_lifecycle.rs"]
 mod app_bundle_ingestion_lifecycle;
 #[path = "all/app_bundle_refusal_wording.rs"]

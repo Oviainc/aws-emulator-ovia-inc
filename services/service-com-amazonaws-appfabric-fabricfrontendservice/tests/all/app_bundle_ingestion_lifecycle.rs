@@ -169,12 +169,12 @@ impl Emulator {
         arn_of(&created.body, "appBundle")
     }
 
-    async fn get_app_bundle(&self, identifier: &str) -> Answer {
+    pub(crate) async fn get_app_bundle(&self, identifier: &str) -> Answer {
         self.call("GET", &format!("/appbundles/{}", encode(identifier)), None)
             .await
     }
 
-    async fn delete_app_bundle(&self, identifier: &str) -> Answer {
+    pub(crate) async fn delete_app_bundle(&self, identifier: &str) -> Answer {
         self.call(
             "DELETE",
             &format!("/appbundles/{}", encode(identifier)),
@@ -185,6 +185,55 @@ impl Emulator {
 
     async fn list_app_bundles(&self, query: &str) -> Answer {
         self.call("GET", &format!("/appbundles{query}"), None).await
+    }
+
+    /// Delete every app authorization the bundle holds, which is the
+    /// precondition `DeleteAppBundle` documents ("You must delete all associated
+    /// app authorizations before you can delete an app bundle"). A test whose
+    /// subject is the BUNDLE uses this to satisfy that precondition, the way a
+    /// caller would.
+    pub(crate) async fn delete_app_authorizations(&self, bundle: &str) {
+        let listed = self
+            .call(
+                "GET",
+                &format!("/appbundles/{}/appauthorizations", encode(bundle)),
+                None,
+            )
+            .await;
+        let arns: Vec<String> = listed
+            .body
+            .get("appAuthorizationSummaryList")
+            .and_then(Value::as_array)
+            .map(|summaries| {
+                summaries
+                    .iter()
+                    .filter_map(|summary| {
+                        summary
+                            .get("appAuthorizationArn")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for arn in arns {
+            let deleted = self
+                .call(
+                    "DELETE",
+                    &format!(
+                        "/appbundles/{}/appauthorizations/{}",
+                        encode(bundle),
+                        encode(&arn)
+                    ),
+                    None,
+                )
+                .await;
+            assert_eq!(
+                deleted.status, 204,
+                "expected HTTP 204 deleting app authorization {arn:?}, got {} with body {}",
+                deleted.status, deleted.body
+            );
+        }
     }
 
     /// The dependency AppFabric's resource chain puts BEFORE an ingestion: the
@@ -1168,7 +1217,8 @@ async fn an_idempotency_token_replays_instead_of_creating_again() {
     );
 }
 
-/// RULE: deleting an app bundle removes it and the ingestions stored under it, in
+/// RULE: deleting an app bundle whose documented precondition is satisfied — it
+/// holds no app authorization — removes it and everything stored under it, in
 /// either identifier form, and a delete of a bundle that is already gone is still
 /// a success — the model declares no not-found error for this operation and it is
 /// @idempotent.
@@ -1195,6 +1245,16 @@ async fn deleting_an_app_bundle_removes_it_and_its_ingestions() {
         } else {
             uuid_of(&doomed)
         };
+
+        // The order AppFabric documents: the ingestion, then the app
+        // authorization it depends on, then the bundle.
+        let ingestion_deleted = emulator.delete_ingestion(&doomed, &ingestion).await;
+        assert_eq!(
+            ingestion_deleted.status, 204,
+            "case {case:?}: expected HTTP 204 from DeleteIngestion, got {} with body {}",
+            ingestion_deleted.status, ingestion_deleted.body
+        );
+        emulator.delete_app_authorizations(&doomed).await;
 
         let deleted = emulator.delete_app_bundle(&identifier).await;
         assert_eq!(
@@ -1575,6 +1635,11 @@ async fn state_changing_operations_write_an_audit_record() {
     emulator.delete_ingestion(&bundle, &ingestion).await;
     // Deleting what is already gone is a success, and is recorded as such.
     emulator.delete_ingestion(&bundle, &ingestion).await;
+
+    // The bundle's app authorization has to go before the bundle itself can, the
+    // precondition `DeleteAppBundle` documents. Its own audit record names the
+    // authorization, so it falls outside the ids this test asserts on below.
+    emulator.delete_app_authorizations(&bundle).await;
 
     emulator.delete_app_bundle(&bundle).await;
     // Deleting what is already gone is a success, and is recorded as such.

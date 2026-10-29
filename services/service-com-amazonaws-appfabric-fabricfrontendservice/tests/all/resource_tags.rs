@@ -447,13 +447,30 @@ async fn an_unknown_resource_arn_is_not_found() {
             .body,
         "ingestion",
     );
-    emulator
+    // The order AppFabric documents for taking a bundle apart: the ingestion,
+    // then the app authorization it depends on, then the bundle itself — which
+    // is refused for as long as the bundle holds an authorization.
+    let removed_ingestion = emulator
+        .delete_ingestion(&deleted_bundle, &deleted_ingestion)
+        .await;
+    assert_eq!(
+        removed_ingestion.status, 204,
+        "expected HTTP 204 from DeleteIngestion, got {} with body {}",
+        removed_ingestion.status, removed_ingestion.body
+    );
+    emulator.delete_app_authorizations(&deleted_bundle).await;
+    let removed = emulator
         .call(
             "DELETE",
             &format!("/appbundles/{}", encode(&deleted_bundle)),
             None,
         )
         .await;
+    assert_eq!(
+        removed.status, 204,
+        "expected HTTP 204 from DeleteAppBundle, got {} with body {}",
+        removed.status, removed.body
+    );
 
     // A UUID-shaped bundle ARN this emulator never minted, built on a live ARN
     // so only the id differs.

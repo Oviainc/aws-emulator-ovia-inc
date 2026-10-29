@@ -44,13 +44,13 @@ const AUTH_TYPES: &[&str] = &["apiKey", "oauth2"];
 /// Which of the two forms the model's `Identifier` shape accepts a table row
 /// names a resource by (`^arn:.+$|^[a-f0-9]{8}-…$`).
 #[derive(Debug, Clone, Copy)]
-enum Form {
+pub(crate) enum Form {
     Arn,
     Uuid,
 }
 
 /// An ARN rendered in the form a row asks for.
-fn as_form(arn: &str, form: Form) -> String {
+pub(crate) fn as_form(arn: &str, form: Form) -> String {
     match form {
         Form::Arn => arn.to_string(),
         Form::Uuid => uuid_of(arn),
@@ -87,7 +87,7 @@ fn credential_for(auth_type: &str) -> Value {
 }
 
 /// `POST /appbundles/{appBundleIdentifier}/appauthorizations`.
-async fn create_authorization(
+pub(crate) async fn create_authorization(
     emulator: &Emulator,
     bundle: &str,
     app: &str,
@@ -113,7 +113,7 @@ async fn create_authorization(
 
 /// `POST …/appauthorizations/{id}/connect`, carrying the OAuth2 `authRequest` an
 /// `oauth2` authorization requires and nothing for an `apiKey` one.
-async fn connect_authorization(
+pub(crate) async fn connect_authorization(
     emulator: &Emulator,
     bundle: &str,
     authorization: &str,
@@ -141,7 +141,11 @@ async fn connect_authorization(
 }
 
 /// `GET /appbundles/{appBundleIdentifier}/appauthorizations/{appAuthorizationIdentifier}`.
-async fn get_authorization(emulator: &Emulator, bundle: &str, authorization: &str) -> Answer {
+pub(crate) async fn get_authorization(
+    emulator: &Emulator,
+    bundle: &str,
+    authorization: &str,
+) -> Answer {
     emulator
         .call(
             "GET",
@@ -156,7 +160,11 @@ async fn get_authorization(emulator: &Emulator, bundle: &str, authorization: &st
 }
 
 /// `DELETE /appbundles/{appBundleIdentifier}/appauthorizations/{appAuthorizationIdentifier}`.
-async fn delete_authorization(emulator: &Emulator, bundle: &str, authorization: &str) -> Answer {
+pub(crate) async fn delete_authorization(
+    emulator: &Emulator,
+    bundle: &str,
+    authorization: &str,
+) -> Answer {
     emulator
         .call(
             "DELETE",
@@ -171,7 +179,7 @@ async fn delete_authorization(emulator: &Emulator, bundle: &str, authorization: 
 }
 
 /// The `appAuthorizationArn` a create (or get) answer reports.
-fn authorization_arn(answer: &Answer, case: &str) -> String {
+pub(crate) fn authorization_arn(answer: &Answer, case: &str) -> String {
     answer
         .body
         .get("appAuthorization")
@@ -188,7 +196,11 @@ fn authorization_arn(answer: &Answer, case: &str) -> String {
 
 /// The ARNs `ListAppAuthorizations` reports for one bundle, in the order it
 /// reports them.
-async fn authorization_arns(emulator: &Emulator, bundle: &str, case: &str) -> Vec<String> {
+pub(crate) async fn authorization_arns(
+    emulator: &Emulator,
+    bundle: &str,
+    case: &str,
+) -> Vec<String> {
     let answer = emulator
         .call(
             "GET",
@@ -232,7 +244,7 @@ async fn authorization_arns(emulator: &Emulator, bundle: &str, case: &str) -> Ve
 /// `bundle_index` picks the Region the bundle is created in, so a fixture needing
 /// two bundles at once gives them different indices: an account holds one app
 /// bundle per Region.
-async fn bundle_with_authorizations(
+pub(crate) async fn bundle_with_authorizations(
     emulator: &Emulator,
     bundle_index: usize,
     total: usize,
