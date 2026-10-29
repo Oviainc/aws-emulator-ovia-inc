@@ -9,10 +9,10 @@
 //!
 //! This is a REPORTING operation: it writes nothing, so two reads with no intervening
 //! Start/Update/Stop answer identically. An account that has never opted in has no
-//! configuration record, and is reported as `OptInStatus: DISABLED` with no
-//! preferences — the status enum's own "stopped" member, rather than an error, because
-//! Automatic Management is an account-level setting that is simply off until it is
-//! started.
+//! configuration record, and neither has one whose stop removed the configurations its
+//! opt-in carried; both are reported as `OptInStatus: DISABLED` with no preferences —
+//! the status enum's own "stopped" member, rather than an error, because Automatic
+//! Management is an account-level setting that is simply off until it is started.
 //!
 //! A code the catalog does not know is reported with its `QuotaCode` alone: the
 //! exclusion is the caller's own, so dropping it would under-report the configuration.
@@ -130,8 +130,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let quotas_state = state.lock();
         let Some(config) = quotas_state.auto_management() else {
-            // Never opted in: nothing is monitored and no preference was ever given,
-            // so the only thing to report is that Automatic Management is not running.
+            // No configuration on record: the account never opted in, or its stop
+            // removed the configurations the opt-in carried. Either way nothing is
+            // monitored and no preference is held, so the only thing to report is that
+            // Automatic Management is not running.
             return Ok(GetAutoManagementConfigurationOutput {
                 opt_in_status: Some(crate::state::OPT_IN_STATUS_DISABLED.to_string()),
                 ..GetAutoManagementConfigurationOutput::default()

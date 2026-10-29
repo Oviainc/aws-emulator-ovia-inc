@@ -27,9 +27,9 @@
 //!   it does name replaces the stored one outright;
 //! * an `OptInType` is stored as given whichever member of the enum it names, by BOTH
 //!   writers of the member, and switching the mode leaves `OptInStatus` as it was;
-//! * stopping moves the opt-in to `OptInStatus = DISABLED` and keeps the preferences,
-//!   after which the calls that need Automatic Management RUNNING are refused with the
-//!   modelled `NoSuchResourceException`;
+//! * stopping removes the whole configuration, so the read afterwards answers exactly
+//!   what an account that never opted in is answered, and the calls that need Automatic
+//!   Management RUNNING are refused with the modelled `NoSuchResourceException`;
 //! * the configuration is per ACCOUNT, not per region: a start or an update made at
 //!   one regional endpoint is what every endpoint reports;
 //! * a request that breaks a modelled constraint records nothing.
@@ -446,15 +446,16 @@ async fn updating_overwrites_only_the_members_it_names() {
     }
 }
 
-/// Stopping moves the opt-in to `DISABLED` and keeps the preferences on record; after
-/// that the calls that need Automatic Management RUNNING are refused, and starting
-/// again records a whole new configuration.
+/// Stopping removes the configurations the opt-in carried: the read afterwards reports
+/// `OptInStatus: DISABLED` and nothing else, whatever the stopped configuration held.
+/// After that the calls that need Automatic Management RUNNING are refused, and
+/// starting again records a whole new configuration.
 ///
 /// The rows differ in the configuration that was running when the stop arrived — how
 /// many of its optional members were set, and how large its exclusion list was —
 /// because the rule is the same for all of them.
 #[tokio::test]
-async fn stopping_disables_the_opt_in_and_keeps_the_preferences() {
+async fn stopping_removes_the_whole_configuration() {
     let rows = [
         StartCase {
             case: "a bare configuration",
@@ -512,22 +513,20 @@ async fn stopping_disables_the_opt_in_and_keeps_the_preferences() {
             "case {case}: StopAutoManagement models no output members, got {stopped}"
         );
 
-        // Only the status moved: the preferences the account chose are still reported.
+        // The whole configuration went with the stop: the only thing left to report is
+        // that Automatic Management is not running.
         let read = configuration(&client, case).await;
         assert_eq!(
             scalars(&read),
-            (
-                Some(ACCOUNT_LEVEL),
-                Some(opt_in_type(started_type)),
-                Some(OPT_IN_STATUS_DISABLED),
-                arn.as_deref(),
-            ),
-            "case {case}: stopping must only move OptInStatus to DISABLED, got {read}"
+            (None, None, Some(OPT_IN_STATUS_DISABLED), None),
+            "case {case}: stopping must remove the configuration it stopped, leaving \
+             OptInStatus DISABLED with no other member, got {read}"
         );
         assert_eq!(
             exclusion_codes(&read),
-            expected_codes(exclusions),
-            "case {case}: stopping must keep the exclusion list on record, got {read}"
+            None,
+            "case {case}: stopping must remove the exclusion list with the rest of the \
+             configuration, got {read}"
         );
 
         // Nothing is running, so the calls that need a running configuration are
@@ -925,13 +924,13 @@ async fn every_modeled_opt_in_type_is_stored_by_both_writers() {
 
 /// The Automatic Management lifecycle a client drives when it changes its mode: start on
 /// one member, switch to another with the partial writer — which must leave `OptInStatus`
-/// at `ENABLED`, since the opt-in type is not the status — and stop, which returns the
-/// configuration to `DISABLED` with the switched mode still on record.
+/// at `ENABLED`, since the opt-in type is not the status — and stop, which removes the
+/// configuration the switched mode was part of.
 ///
 /// The rows are every ORDERED pair of members the model declares, so each switch is
 /// driven in both directions as well as from a member to itself.
 #[tokio::test]
-async fn switching_the_opt_in_type_keeps_the_status_and_stops_back_to_disabled() {
+async fn switching_the_opt_in_type_keeps_the_status_and_a_stop_removes_the_configuration() {
     for started in OPT_IN_TYPE_VALUES {
         for switched in OPT_IN_TYPE_VALUES {
             let started = opt_in_type(started);
@@ -983,14 +982,9 @@ async fn switching_the_opt_in_type_keeps_the_status_and_stops_back_to_disabled()
             let read = configuration(&client, &case).await;
             assert_eq!(
                 scalars(&read),
-                (
-                    Some(ACCOUNT_LEVEL),
-                    Some(switched),
-                    Some(OPT_IN_STATUS_DISABLED),
-                    None,
-                ),
-                "case {case}: stopping must report DISABLED with the switched mode still \
-                 on record, got {read}"
+                (None, None, Some(OPT_IN_STATUS_DISABLED), None),
+                "case {case}: stopping must remove the configuration the switched mode \
+                 was part of, got {read}"
             );
         }
     }

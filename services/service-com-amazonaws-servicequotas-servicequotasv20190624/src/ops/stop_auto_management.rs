@@ -2,12 +2,14 @@
 
 //! @op StopAutoManagement
 //!
-//! Stops Automatic Management for the account: the opt-in moves to
-//! `OptInStatus = DISABLED`, and the record stays so the preferences the account
-//! chose are still reported (see [`crate::state::AutoManagementConfig`]). That is the
-//! state the `OptInStatus` member of that name describes, and it is what
-//! `GetAutoManagementConfiguration` reports once Automatic Management has been
-//! stopped. `StartAutoManagement` starts it again with a whole new configuration.
+//! Stops Automatic Management for the account AND removes the configurations
+//! associated with it: the whole stored record goes, with the `OptInLevel`,
+//! `OptInType`, `NotificationArn` and `ExclusionList` it carried (see
+//! [`crate::state::ComAmazonawsServicequotasServicequotasv20190624State::clear_auto_management`]).
+//! The account is then back to where it was before it ever opted in, which is what
+//! `GetAutoManagementConfiguration` reports as `OptInStatus = DISABLED` with no other
+//! member set. `StartAutoManagement` starts it again, and has to be given the whole
+//! configuration afresh.
 //!
 //! A stop for an account that is not running Automatic Management — one that never
 //! started it, or has already stopped it — is refused with `NoSuchResourceException`.
@@ -105,12 +107,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut quotas_state = state.lock();
         // Only a RUNNING configuration can be stopped: `None` is an account that never
-        // opted in, and a `DISABLED` record is one that opted out already.
+        // opted in, or one whose stop already removed the record it had.
         let running = quotas_state
             .auto_management()
-            .filter(|config| config.opt_in_status == crate::state::OPT_IN_STATUS_ENABLED)
-            .cloned();
-        let Some(mut config) = running else {
+            .is_some_and(|config| config.opt_in_status == crate::state::OPT_IN_STATUS_ENABLED);
+        if !running {
             return Err(
                 StopAutoManagementErrorModeled::NoSuchResourceException(NoSuchResourceException {
                     message: Some(
@@ -121,10 +122,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into(),
             );
-        };
+        }
 
-        config.opt_in_status = crate::state::OPT_IN_STATUS_DISABLED.to_string();
-        quotas_state.set_auto_management(config);
+        // Stopping removes all the configurations associated with Automatic Management,
+        // so nothing of the stopped opt-in is left on record to be reported or reused.
+        quotas_state.clear_auto_management();
 
         Ok(StopAutoManagementOutput {})
     }

@@ -494,9 +494,10 @@ pub struct AutoManagementConfig {
     /// one.
     pub opt_in_type: String,
     /// `OptInStatus` — [`OPT_IN_STATUS_ENABLED`] while Automatic Management is
-    /// started, [`OPT_IN_STATUS_DISABLED`] once it is stopped. Stopping keeps the
-    /// record, so the preferences a later start would otherwise have to be given
-    /// again are still reported.
+    /// started. Stopping it removes the whole record (see
+    /// [`ComAmazonawsServicequotasServicequotasv20190624State::clear_auto_management`]),
+    /// so an account with no record is the one reported as
+    /// [`OPT_IN_STATUS_DISABLED`].
     pub opt_in_status: String,
     /// `NotificationArn` — the User Notifications ARN, when one was given.
     pub notification_arn: Option<String>,
@@ -774,11 +775,18 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     }
 
     /// Record the account's Automatic Management configuration: what an opt-in
-    /// (`StartAutoManagement`), a change to it (`UpdateAutoManagement`) and an opt-out
-    /// (`StopAutoManagement`, which only moves `OptInStatus` to
-    /// [`OPT_IN_STATUS_DISABLED`]) write.
+    /// (`StartAutoManagement`) and a change to it (`UpdateAutoManagement`) write.
     pub fn set_auto_management(&mut self, config: AutoManagementConfig) {
         self.auto_management = Some(config);
+    }
+
+    /// Drop the account's Automatic Management configuration, with every preference it
+    /// carried: what an opt-out (`StopAutoManagement`) writes, since stopping Automatic
+    /// Management removes the configurations associated with it. The account is then
+    /// back to the state it was in before it ever opted in, which is what
+    /// `GetAutoManagementConfiguration` reports as [`OPT_IN_STATUS_DISABLED`].
+    pub fn clear_auto_management(&mut self) {
+        self.auto_management = None;
     }
 
     /// The stored exclusion list as `GetAutoManagementConfiguration` reports it:
