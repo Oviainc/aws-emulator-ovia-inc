@@ -91,103 +91,28 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The environment's request metrics and one of its instances' cover the same
+// window and are reported the same way, so the derivation they share lives in
+// `crate::state` rather than here.
+use crate::state::application_metrics;
 
 /// The `EnvironmentHealthAttribute` values this operation's response members are
 /// selected by (the full set is
-/// [`crate::ops::types::ENVIRONMENT_HEALTH_ATTRIBUTE_VALUES`]).
-const ALL: &str = "All";
-/// See [`ALL`].
+/// [`crate::ops::types::ENVIRONMENT_HEALTH_ATTRIBUTE_VALUES`]; `All` is
+/// [`crate::state::HEALTH_ATTRIBUTE_ALL`]).
 const STATUS: &str = "Status";
-/// See [`ALL`].
+/// See [`STATUS`].
 const COLOR: &str = "Color";
-/// See [`ALL`].
+/// See [`STATUS`].
 const CAUSES: &str = "Causes";
-/// See [`ALL`].
+/// See [`STATUS`].
 const APPLICATION_METRICS: &str = "ApplicationMetrics";
-/// See [`ALL`].
+/// See [`STATUS`].
 const INSTANCES_HEALTH: &str = "InstancesHealth";
-/// See [`ALL`].
+/// See [`STATUS`].
 const HEALTH_STATUS: &str = "HealthStatus";
-/// See [`ALL`].
+/// See [`STATUS`].
 const REFRESHED_AT: &str = "RefreshedAt";
-
-/// The window `ApplicationMetrics` covers, in seconds: "The amount of time that
-/// the metrics cover (usually 10 seconds)."
-const METRICS_DURATION_SECONDS: i32 = 10;
-
-/// Which response attributes a request asked for.
-///
-/// "Specify the response elements to return. To retrieve all attributes, set to
-/// `All`. If no attribute names are specified, returns the name of the
-/// environment." The boundary validator has already refused any value outside
-/// the modelled enum, so an attribute reaching here is one of the names above.
-struct Requested<'a> {
-    names: &'a [String],
-}
-
-impl<'a> Requested<'a> {
-    fn of(attribute_names: Option<&'a [String]>) -> Self {
-        Self {
-            names: attribute_names.unwrap_or(&[]),
-        }
-    }
-
-    fn wants(&self, attribute: &str) -> bool {
-        self.names
-            .iter()
-            .any(|name| name == attribute || name == ALL)
-    }
-}
-
-/// "Descriptions of the data that contributed to the environment's current
-/// health status": a healthy environment has none, and an environment whose
-/// health checks are suspended or not yet started reports the deployment state
-/// that suspended them.
-fn causes(environment: &crate::state::Environment) -> Vec<String> {
-    if environment.health == crate::state::HEALTH_GREEN {
-        return Vec::new();
-    }
-    vec![format!(
-        "Environment health is {}: the environment's status is {}.",
-        environment.health, environment.status
-    )]
-}
-
-/// The request metrics for this environment over the last
-/// [`METRICS_DURATION_SECONDS`]. This emulator serves no application traffic, so
-/// the window holds no request: the counts are zero and there are no latency
-/// percentiles to report over zero requests.
-fn application_metrics() -> ApplicationMetrics {
-    ApplicationMetrics {
-        duration: Some(METRICS_DURATION_SECONDS),
-        request_count: 0,
-        status_codes: Some(StatusCodes {
-            status2xx: Some(0),
-            status3xx: Some(0),
-            status4xx: Some(0),
-            status5xx: Some(0),
-        }),
-        latency: None,
-    }
-}
-
-/// The health summary over this environment's instances. Enhanced health is
-/// measured by an agent running on an instance against the application it
-/// serves; this emulator runs neither, so no instance of the environment falls
-/// in any health bucket and every bucket is zero rather than a count nothing
-/// measured.
-fn instance_health_summary() -> InstanceHealthSummary {
-    InstanceHealthSummary {
-        no_data: Some(0),
-        unknown: Some(0),
-        pending: Some(0),
-        ok: Some(0),
-        info: Some(0),
-        warning: Some(0),
-        degraded: Some(0),
-        severe: Some(0),
-    }
-}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -294,7 +219,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        let requested = Requested::of(input.attribute_names.as_deref());
+        let requested =
+            crate::state::RequestedHealthAttributes::of(input.attribute_names.as_deref());
         Ok(DescribeEnvironmentHealthOutput {
             // "If no attribute names are specified, returns the name of the
             // environment" — so the name is always reported.
@@ -315,15 +241,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             color: requested.wants(COLOR).then(|| environment.health.clone()),
             // "Descriptions of the data that contributed to the environment's
             // current health status."
-            causes: requested.wants(CAUSES).then(|| causes(environment)),
+            causes: requested
+                .wants(CAUSES)
+                .then(|| crate::state::environment_health_causes(environment)),
             // Request metrics over "the most recent time slice of 10 seconds".
             // This emulator serves no application traffic, so the slice is
             // empty: no requests, and no latency percentiles over zero requests.
             application_metrics: requested.wants(APPLICATION_METRICS).then(application_metrics),
-            // "Summary health information for the instances in the environment."
-            instances_health: requested
-                .wants(INSTANCES_HEALTH)
-                .then(instance_health_summary),
+            // "Summary health information for the instances in the environment"
+            // — counted over the very per-instance health
+            // `DescribeInstancesHealth` reports for this environment, so the
+            // summary and that report cannot disagree.
+            instances_health: requested.wants(INSTANCES_HEALTH).then(|| {
+                crate::state::instance_health_summary(
+                    &crate::state::environment_instance_health(environment),
+                )
+            }),
             // "The date and time that the health information was retrieved."
             refreshed_at: requested.wants(REFRESHED_AT).then(crate::state::now),
         })

@@ -462,6 +462,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // until a managed replacement of them is due starts; the field is
             // dated with the launch so the record never carries no date at all.
             instances_replaced_at: created,
+            // "This number increases by one each time that you deploy source
+            // code or change instance configuration settings": the launch is
+            // this environment's first deployment, which is what its instances
+            // report running.
+            deployment_id: 1,
             // Provisioned below, from the tier and the options this record now
             // carries, so the inventory is derived from the stored environment
             // rather than from the request a second time.

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstancesHealth
-//! Implemented: reports the per-instance health of the stored environment's instances.
-//! Per-instance health is what the enhanced-health agent on an instance measures from the
-//! application it runs; this emulator runs neither, so a found environment reports an
-//! empty instance list rather than health nothing measured — the environment's resource
-//! inventory itself is what `DescribeEnvironmentResources` reports. This is the ONLY file
-//! to touch for this operation.
+//! Implemented: reports one `SingleInstanceHealth` per Amazon EC2 instance the stored
+//! environment is made of — the instances its own inventory holds, which
+//! `DescribeEnvironmentResources` reports — carrying the members the request's
+//! `AttributeNames` selected. The health itself is derived from the environment's stored
+//! health in `crate::state`, which is also where `DescribeEnvironmentHealth`'s
+//! `InstancesHealth` summary is counted from, so the two reports cannot disagree. This is
+//! the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +90,28 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The `InstancesHealthAttribute` values one instance's health members are
+/// selected by (the full set is
+/// [`crate::ops::types::INSTANCES_HEALTH_ATTRIBUTE_VALUES`]; `All` is
+/// [`crate::state::HEALTH_ATTRIBUTE_ALL`]).
+const HEALTH_STATUS: &str = "HealthStatus";
+/// See [`HEALTH_STATUS`].
+const COLOR: &str = "Color";
+/// See [`HEALTH_STATUS`].
+const CAUSES: &str = "Causes";
+/// See [`HEALTH_STATUS`].
+const APPLICATION_METRICS: &str = "ApplicationMetrics";
+/// See [`HEALTH_STATUS`].
+const LAUNCHED_AT: &str = "LaunchedAt";
+/// See [`HEALTH_STATUS`].
+const SYSTEM: &str = "System";
+/// See [`HEALTH_STATUS`].
+const DEPLOYMENT: &str = "Deployment";
+/// See [`HEALTH_STATUS`].
+const AVAILABILITY_ZONE: &str = "AvailabilityZone";
+/// See [`HEALTH_STATUS`].
+const INSTANCE_TYPE: &str = "InstanceType";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -188,30 +211,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     DescribeInstancesHealthError::invalid_parameter_value(message)
                 }
             })?;
-        if !store.environments.contains_key(&environment_id) {
-            return Err(DescribeInstancesHealthError::invalid_parameter_value(
+        let environment = store.environments.get(&environment_id).ok_or_else(|| {
+            DescribeInstancesHealthError::invalid_parameter_value(
                 crate::state::missing_environment_message(Some(environment_id.as_str()), None),
-            ));
-        }
+            )
+        })?;
 
-        // "Specify the pagination token returned by a previous call." There is
-        // never a page after the first one here (see below), so no token this
-        // operation issued can come back — one that did not come from it is
-        // refused rather than silently ignored.
+        // "Specify the pagination token returned by a previous call." One
+        // environment's inventory is bounded
+        // ([`crate::state::MAX_ENVIRONMENT_INSTANCES`]), so its instances all
+        // fit in one page and there is never a page after the first: no token
+        // this operation issued can come back, and one that did not come from
+        // it is refused rather than silently ignored.
         if let Some(next_token) = input.next_token.as_deref() {
             return Err(DescribeInstancesHealthError::invalid_parameter_value(
                 format!("Invalid NextToken: {next_token}"),
             ));
         }
-        // `AttributeNames` selects which members of each instance's health are
-        // reported. This emulator runs no application and no enhanced-health
-        // agent on an environment's instances, so there is no measured
-        // per-instance health to select from: the list is empty whatever was
-        // asked for, and there is no further page.
-        let _ = &input.attribute_names;
+        // "Detailed health information about each instance": one entry per
+        // instance the environment is made of, with the members
+        // `AttributeNames` selected. "If no attribute names are specified,
+        // returns a list of instances" — the instance id is not one of the
+        // selectable attributes, so it is what such a request answers with.
+        let requested =
+            crate::state::RequestedHealthAttributes::of(input.attribute_names.as_deref());
+        let instance_health_list = crate::state::environment_instance_health(environment)
+            .into_iter()
+            .map(|instance| SingleInstanceHealth {
+                instance_id: instance.instance_id,
+                health_status: requested
+                    .wants(HEALTH_STATUS)
+                    .then_some(instance.health_status)
+                    .flatten(),
+                color: requested.wants(COLOR).then_some(instance.color).flatten(),
+                causes: requested.wants(CAUSES).then_some(instance.causes).flatten(),
+                launched_at: requested
+                    .wants(LAUNCHED_AT)
+                    .then_some(instance.launched_at)
+                    .flatten(),
+                application_metrics: requested
+                    .wants(APPLICATION_METRICS)
+                    .then_some(instance.application_metrics)
+                    .flatten(),
+                system: requested.wants(SYSTEM).then_some(instance.system).flatten(),
+                deployment: requested
+                    .wants(DEPLOYMENT)
+                    .then_some(instance.deployment)
+                    .flatten(),
+                availability_zone: requested
+                    .wants(AVAILABILITY_ZONE)
+                    .then_some(instance.availability_zone)
+                    .flatten(),
+                instance_type: requested
+                    .wants(INSTANCE_TYPE)
+                    .then_some(instance.instance_type)
+                    .flatten(),
+            })
+            .collect();
 
         Ok(DescribeInstancesHealthOutput {
-            instance_health_list: Some(Vec::new()),
+            instance_health_list: Some(instance_health_list),
             // "The date and time that the health information was retrieved."
             refreshed_at: Some(crate::state::now()),
             next_token: None,

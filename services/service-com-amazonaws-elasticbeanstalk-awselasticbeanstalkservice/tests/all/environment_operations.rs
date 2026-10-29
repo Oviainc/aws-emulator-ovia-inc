@@ -593,8 +593,7 @@ async fn describe_environment_health_reports_the_attributes_the_request_named() 
     }
 
     // What the reported values are: the environment's own stored status, health
-    // colour and health status, over an environment with no instance and no
-    // traffic.
+    // colour and health status, and the one instance it is made of.
     let all = emulator
         .call(
             "DescribeEnvironmentHealth",
@@ -625,8 +624,8 @@ async fn describe_environment_health_reports_the_attributes_the_request_named() 
     );
     assert_eq!(
         all.expect("InstancesHealth/Ok", case),
-        "0",
-        "case {case:?}: no enhanced health is measured on an instance here, so every bucket is zero, got {}",
+        "1",
+        "case {case:?}: the one instance of a green, Ready environment is counted in the green bucket, got {}",
         all.body
     );
     assert_eq!(
@@ -680,15 +679,30 @@ async fn describe_environment_health_reports_the_attributes_the_request_named() 
 }
 
 /// RULE: DescribeInstancesHealth reports the health of the environment's
-/// instances; enhanced health is measured by an agent on an instance against the
-/// application it serves, and this emulator runs neither, so a found environment
-/// answers with an empty instance list and the time the information was
-/// retrieved — never a continuation token for a page that does not exist, and
+/// instances — one entry per Amazon EC2 instance the environment is made of,
+/// always carrying that instance's id and carrying every other member only when
+/// the request's `AttributeNames` selected it — and the time the information was
+/// retrieved, never a continuation token for a page that does not exist, and
 /// never a token it did not issue.
 #[tokio::test]
 async fn describe_instances_health_reports_the_instances_an_environment_has() {
     let emulator = Emulator::new();
     fixture(&emulator, "instances-app", Some("instances-env-1")).await;
+
+    // The instances the SAME environment reports being made of, which the
+    // health report has to agree with.
+    let inventory = emulator
+        .call(
+            "DescribeEnvironmentResources",
+            &[("EnvironmentName", "instances-env-1")],
+        )
+        .await;
+    let instances = inventory.values_at("EnvironmentResources/Instances/member/Id");
+    assert!(
+        !instances.is_empty(),
+        "fixture: the environment reports the instances it is made of, got {}",
+        inventory.body
+    );
 
     // Rows differ along the attribute selection, from the modelled
     // `InstancesHealthAttribute` set
@@ -727,13 +741,33 @@ async fn describe_instances_health_reports_the_instances_an_environment_has() {
             "case {name}: expected a RefreshedAt, got {}",
             health.body
         );
-        assert!(
-            health
-                .values_at("InstanceHealthList/member/InstanceId")
-                .is_empty(),
-            "case {name}: no per-instance health is measured here, so none is reported, got {}",
+        // "If no attribute names are specified, returns a list of instances":
+        // the instance id is reported whatever was selected.
+        assert_eq!(
+            health.values_at("InstanceHealthList/member/InstanceId"),
+            instances,
+            "case {name}: the report covers the instances the environment is made of, got {}",
             health.body
         );
+        // Every other member is reported only when its own attribute was
+        // selected.
+        for attribute in [
+            "HealthStatus",
+            "Color",
+            "LaunchedAt",
+            "Deployment",
+            "InstanceType",
+            "AvailabilityZone",
+            "ApplicationMetrics",
+        ] {
+            let asked = selection.contains(&attribute) || selection.contains(&"All");
+            let reported = reports(&health.body, attribute);
+            assert_eq!(
+                reported, asked,
+                "case {name}: {attribute} reported={reported} but asked={asked} in {}",
+                health.body
+            );
+        }
         assert!(
             !reports(&health.body, "NextToken"),
             "case {name}: there is no further page to continue from, got {}",

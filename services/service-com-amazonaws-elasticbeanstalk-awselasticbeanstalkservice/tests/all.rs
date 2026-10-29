@@ -33,6 +33,8 @@ mod custom_platform_version_tags;
 mod describe_application_versions;
 #[path = "all/dns_availability.rs"]
 mod dns_availability;
+#[path = "all/enhanced_health.rs"]
+mod enhanced_health;
 #[path = "all/environment_draft_configuration.rs"]
 mod environment_draft_configuration;
 #[path = "all/environment_info.rs"]
