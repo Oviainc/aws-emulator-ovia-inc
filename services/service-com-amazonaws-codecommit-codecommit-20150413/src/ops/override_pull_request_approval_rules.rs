@@ -284,13 +284,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The rules are set aside only while the pull request is open: one that is
         // no longer open takes no further review, so it has no requirements left to
-        // set aside or to hold again.
+        // set aside or to hold again. The refusal is worded for THIS change — the
+        // approval status of a merged or closed pull request — rather than with the
+        // sentence the operations that update a pull request's own status carry.
         if pull_request.status != crate::state::PULL_REQUEST_STATUS_OPEN {
             return Err(
                 OverridePullRequestApprovalRulesErrorModeled::PullRequestAlreadyClosedException(
                     PullRequestAlreadyClosedException {
                         message: Some(
-                            crate::state::PULL_REQUEST_ALREADY_CLOSED_MESSAGE.to_string(),
+                            crate::state::PULL_REQUEST_APPROVAL_OVERRIDE_CANNOT_BE_CHANGED_MESSAGE
+                                .to_string(),
                         ),
                     },
                 )

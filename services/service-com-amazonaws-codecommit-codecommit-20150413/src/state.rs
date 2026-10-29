@@ -3330,7 +3330,14 @@ pub const CANNOT_DELETE_APPROVAL_RULE_FROM_TEMPLATE_MESSAGE: &str =
 
 /// `PullRequestAlreadyClosedException`'s message: the sentence the model documents
 /// for the shape, worded here once for every operation that refuses to change a
-/// pull request that is no longer open.
+/// pull request that is no longer open and has no sentence of its OWN.
+///
+/// CodeCommit words this code per the change the caller attempted, so an operation
+/// whose refusal the service words differently carries its own message instead of
+/// this one — see [`pull_request_text_cannot_be_changed_message`] for the
+/// title/description path and
+/// [`PULL_REQUEST_APPROVAL_OVERRIDE_CANNOT_BE_CHANGED_MESSAGE`] for the
+/// approval-rule override path.
 pub const PULL_REQUEST_ALREADY_CLOSED_MESSAGE: &str =
     "The pull request status cannot be updated because it is already closed.";
 
@@ -3349,6 +3356,19 @@ pub fn pull_request_text_cannot_be_changed_message(status: &str) -> String {
          update the title or description of a pull request after it has been closed."
     )
 }
+
+/// `PullRequestAlreadyClosedException`'s message for a request to SET ASIDE a pull
+/// request's approval rule requirements, or to hold them again.
+///
+/// CodeCommit words that code differently there too: it states that the pull
+/// request is already merged or closed, that the approval status of such a pull
+/// request is not overridden, and that the request is to be modified. FIXED text
+/// naming nothing from the request or from the stored record — neither the pull
+/// request, nor the revision, nor either status — so the whole sentence set is the
+/// message.
+pub const PULL_REQUEST_APPROVAL_OVERRIDE_CANNOT_BE_CHANGED_MESSAGE: &str =
+    "This pull request is already merged or closed. You cannot override the approval status of a \
+     merged or closed pull request. Modify your request, and then try again.";
 
 /// `TipOfSourceReferenceIsDifferentException`'s message: the sentences the model
 /// documents for the shape, echoing nothing from the request. Worded here once

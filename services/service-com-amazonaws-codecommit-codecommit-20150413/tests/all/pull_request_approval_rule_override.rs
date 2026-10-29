@@ -104,8 +104,14 @@ const INVALID_OVERRIDE_STATUS: &str =
     "The override status is not valid. Valid statuses are OVERRIDE and REVOKE.";
 const OVERRIDE_ALREADY_SET: &str =
     "The pull request has already had its approval rules set to override.";
-const ALREADY_CLOSED: &str = "The pull request status cannot be updated because it is already \
-                              closed.";
+/// The sentences this operation's refusal of a pull request that is no longer open
+/// carries — worded for the change it refuses (the approval status of a merged or
+/// closed pull request), not for an update of the pull request's own status. The
+/// sibling `pull_request_closed_refusal_messages` suite is where that wording is
+/// held apart from every other operation's.
+const ALREADY_CLOSED: &str = "This pull request is already merged or closed. You cannot override \
+                              the approval status of a merged or closed pull request. Modify your \
+                              request, and then try again.";
 const RULES_NOT_SATISFIED: &str = "You cannot merge the pull request because the requirements for \
                                    one or more approval rules have not been met. For details \
                                    about the approval rules that still have requirements, use \
