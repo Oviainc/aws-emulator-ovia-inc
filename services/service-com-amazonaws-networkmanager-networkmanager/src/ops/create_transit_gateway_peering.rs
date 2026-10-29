@@ -200,16 +200,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?
         .to_string();
-        if !core_network.topology().has_edge_location(&edge_location) {
-            return Err(CreateTransitGatewayPeeringErrorModeled::ValidationException(
-                crate::state::no_such_edge(
-                    crate::state::FIELD_TRANSIT_GATEWAY_ARN,
-                    &input.core_network_id,
-                    &edge_location,
-                ),
-            )
-            .into());
-        }
+        crate::state::check_edge_location(
+            crate::state::FIELD_TRANSIT_GATEWAY_ARN,
+            &input.core_network_id,
+            Some(core_network.topology()),
+            &edge_location,
+        )
+        .map_err(CreateTransitGatewayPeeringErrorModeled::ValidationException)?;
         let core_network_arn = core_network.arn.clone();
 
         // `ClientToken` is the operation's modelled `@idempotencyToken`, so a retry of the

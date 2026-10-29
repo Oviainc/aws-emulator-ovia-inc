@@ -248,6 +248,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
+        // The attachment is placed at the edge the peering peers at, and a core network's
+        // edges are the ones the policy IN FORCE on it configures: the peering's location
+        // was judged against the document in force when the peering was created, and a
+        // version put in force since can configure no edge there. So the location is judged
+        // again HERE, the way every create of this service that places a record at an edge
+        // judges it; otherwise the stored attachment would claim an edge this very core
+        // network reports none of, and the claim below would be decided against it. The
+        // request's own `PeeringId` is what carried the location, so the refusal names it.
+        crate::state::check_edge_location(
+            crate::state::FIELD_PEERING_ID,
+            &core_network_id,
+            Some(core_network.topology()),
+            &edge_location,
+        )
+        .map_err(CreateTransitGatewayRouteTableAttachmentErrorModeled::ValidationException)?;
+
         let claim = core_network
             .topology()
             .attachment_claim(&crate::state::AttachmentCandidate {

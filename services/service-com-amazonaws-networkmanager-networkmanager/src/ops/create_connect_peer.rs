@@ -219,6 +219,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
+        // The peer is placed at the edge its Connect attachment sits at, and a core
+        // network's edges are the ones the policy IN FORCE on it configures: that
+        // attachment's location was judged against the document in force when IT was
+        // created, and a version put in force since can configure no edge there. So the
+        // location is judged again here, the way every create of this service that places a
+        // record at an edge judges it; otherwise the peer would be stored at an edge this
+        // core network reports none of, and the ASN its own end of the BGP session reports
+        // would be read from an edge that does not exist. The request's own
+        // `ConnectAttachmentId` is what carried the location, so the refusal names it.
+        crate::state::check_edge_location(
+            crate::state::FIELD_CONNECT_ATTACHMENT_ID,
+            &core_network_id,
+            store
+                .core_networks
+                .get(&core_network_id)
+                .map(|core_network| core_network.topology()),
+            &edge_location,
+        )
+        .map_err(CreateConnectPeerErrorModeled::ValidationException)?;
+
         // The inside IP addresses the BGP session runs over are stored as the request listed
         // them, bounded and de-duplicated by the one rule that owns that list.
         let inside_cidr_blocks = input.inside_cidr_blocks.clone().unwrap_or_default();

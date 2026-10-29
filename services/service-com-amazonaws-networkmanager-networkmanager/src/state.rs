@@ -2330,6 +2330,35 @@ pub fn check_subnet_list(
 /// may repeat ([`check_edge_location_list`]), so a longer list could name no further edge.
 pub const MAX_EDGE_LOCATIONS_PER_ATTACHMENT: usize = 50;
 
+/// Check ONE edge location a record is about to be placed at against `topology`, the policy
+/// topology of the core network it hangs off (`None` where that core network holds none,
+/// which configures no edge at all).
+///
+/// A record that sits at a core network EDGE sits at an edge the policy IN FORCE configures
+/// ([`PolicyTopology::has_edge_location`]), and which edges those are moves with the
+/// document in force: a version put in force after a resource was created can configure no
+/// edge where an earlier one did. So the location is judged HERE, at the moment of the
+/// call, whether the request named it or the handler took it from a resource created
+/// earlier — otherwise the stored record would claim an edge the same core network reports
+/// none of. `member` is the request member that asked: the one carrying the location, or
+/// the reference the handler read it from.
+///
+/// ONE function owns that rule for every create and update of this service that places a
+/// record at a single edge, and [`check_edge_location_list`] below applies it per entry of
+/// a list, so no two of them can judge a location differently.
+pub fn check_edge_location(
+    member: &str,
+    core_network_id: &str,
+    topology: Option<&PolicyTopology>,
+    location: &str,
+) -> Result<(), ValidationException> {
+    if topology.is_some_and(|topology| topology.has_edge_location(location)) {
+        Ok(())
+    } else {
+        Err(no_such_edge(member, core_network_id, location))
+    }
+}
+
 /// Check an `EdgeLocations` list a request carries for a Direct Connect gateway attachment
 /// against `topology`, the policy topology of the core network the attachment belongs to
 /// (`None` where that core network holds none, which configures no edge at all).
@@ -2338,8 +2367,8 @@ pub const MAX_EDGE_LOCATIONS_PER_ATTACHMENT: usize = 50;
 /// no retention — is spent on a list already too long to be accepted
 /// ([`MAX_EDGE_LOCATIONS_PER_ATTACHMENT`]). Then the list must name at least one location,
 /// since an attachment joins its resource to at least one edge; every location it names
-/// must be one the policy in force configures an edge for
-/// ([`PolicyTopology::has_edge_location`]); and no location may repeat, since an attachment
+/// must be one the policy in force configures an edge for, which is
+/// [`check_edge_location`] per entry; and no location may repeat, since an attachment
 /// spans an edge once or not at all. Membership is tested through a set built once, so a
 /// list at the bound costs O(n log n).
 ///
@@ -2373,13 +2402,7 @@ pub fn check_edge_location_list(
     }
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for location in requested {
-        if !topology.is_some_and(|topology| topology.has_edge_location(location)) {
-            return Err(no_such_edge(
-                FIELD_EDGE_LOCATIONS,
-                core_network_id,
-                location,
-            ));
-        }
+        check_edge_location(FIELD_EDGE_LOCATIONS, core_network_id, topology, location)?;
         if !seen.insert(location.as_str()) {
             return Err(field_rejection(
                 FIELD_EDGE_LOCATIONS,

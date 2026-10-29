@@ -226,9 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A Connect attachment is carried BY its transport, so it sits at the same edge of
         // the core network: a request naming any other edge location describes a tunnel
-        // that cannot exist. Checking it against the transport also settles that the edge
-        // location is one the core network's policy configures, since the transport was
-        // only accepted at such an edge.
+        // that cannot exist.
         if input.edge_location != transport.edge_location {
             return Err(CreateConnectAttachmentErrorModeled::ValidationException(
                 crate::state::field_rejection(
@@ -243,6 +241,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let transport_arn = transport.arn.clone();
+
+        // Agreeing with the transport is not enough: the transport's location was judged
+        // against the document in force when IT was created, and a version put in force
+        // since can configure no edge there. So the location this attachment will carry is
+        // judged against the policy in force now, the way every create of this service that
+        // places a record at an edge judges it, and the refusal names the member that
+        // carried it.
+        crate::state::check_edge_location(
+            crate::state::FIELD_EDGE_LOCATION,
+            &input.core_network_id,
+            store
+                .core_networks
+                .get(&input.core_network_id)
+                .map(|core_network| core_network.topology()),
+            &input.edge_location,
+        )
+        .map_err(CreateConnectAttachmentErrorModeled::ValidationException)?;
 
         // What the policy in force on the core network decides about this attachment: the
         // `attachment-policies` rule that claims it, the segment or network function group
