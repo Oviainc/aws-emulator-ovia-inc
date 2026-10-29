@@ -47,8 +47,10 @@
 //! own `maxResults` ("Specifies the maximum number of results to display"). The
 //! opaque `nextToken` resumes at the next `componentTypeId` rather than at an
 //! offset, so a page boundary survives a component type being created or deleted
-//! between two pages; it is bound to the workspace it was minted for, and a token
-//! this listing did not mint is refused with the same `ValidationException`.
+//! between two pages; it is bound to the workspace it was minted for AND to the
+//! `filters` that decided which component types the page was of
+//! ([`crate::state::filters_token_scope`]), and a token this listing did not mint
+//! is refused with the same `ValidationException`.
 //!
 //! This is a REPORTING operation. The only thing it writes is the lifecycle
 //! transition the CLOCK already made due: a component type is stored in the
@@ -249,16 +251,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let filter = filters.first();
 
+        // The filter decides WHICH component types are in the sequence a page is
+        // of, so it is part of what the token below is bound to — and is
+        // rendered before the token is read, since reading one is deciding
+        // whether it belongs to THIS sequence.
+        let filters_scope = filters_token_scope(filter);
+
         // A `nextToken` carries the `componentTypeId` the page resumes AT
         // (inclusive), not an offset, so a page boundary survives a component
         // type being created or deleted between two pages. It is bound to the
-        // workspace it was minted for, so a token from another listing — or from
-        // this listing taken over another workspace — is refused rather than
-        // silently resumed.
+        // workspace AND the filter the page was taken under, so a token from
+        // another listing — or from this listing taken over another workspace or
+        // under another filter, whose sequence this one's resume key names no
+        // position in — is refused rather than silently resumed past the
+        // component types the new filter selects ahead of it.
         let resume_at = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                decode_next_token(token, &input.workspace_id)
+                decode_next_token(token, &input.workspace_id, &filters_scope)
                     .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
             ),
         };
@@ -323,11 +333,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token the next call resumes at: the first component type this page
         // left over. Absent on the last page, which is how a caller knows to
         // stop.
-        let next_token = matching
-            .next()
-            .map(|component_type| {
-                encode_next_token(&input.workspace_id, &component_type.component_type_id)
-            });
+        let next_token = matching.next().map(|component_type| {
+            encode_next_token(
+                &input.workspace_id,
+                &filters_scope,
+                &component_type.component_type_id,
+            )
+        });
 
         Ok(ListComponentTypesOutput {
             workspace_id: input.workspace_id.clone(),
@@ -384,8 +396,31 @@ fn matches_filter(
 /// hand — is recognisably not one of ours. The token itself is the shape every
 /// paginated operation of this service mints
 /// ([`crate::state::encode_page_token`]), scoped to the workspace whose page it
-/// is.
+/// is and to the filter that selected it.
 const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:componentTypes:1:";
+
+/// What the single accepted filter binds a token to: the member it filters on
+/// and the value it selects, under the one rule every filtered listing of this
+/// service binds its filters by ([`crate::state::filters_token_scope`]).
+///
+/// The filter is what decides which component types are in the listing at all
+/// ([`matches_filter`]), so a page resumed under a different one would skip
+/// every component type the new filter selects that sorts before the resume key.
+/// A request naming no filter has its own scope, distinct from any filtered one:
+/// the unfiltered sequence is a different sequence.
+fn filters_token_scope(filter: Option<&ListComponentTypesFilter>) -> String {
+    crate::state::filters_token_scope(filter.map(|filter| match filter {
+        ListComponentTypesFilter::extendsFrom(parent) => {
+            ("extendsFrom", ::serde_json::Value::from(parent.as_str()))
+        }
+        ListComponentTypesFilter::Namespace(namespace) => {
+            ("namespace", ::serde_json::Value::from(namespace.as_str()))
+        }
+        ListComponentTypesFilter::isAbstract(is_abstract) => {
+            ("isAbstract", ::serde_json::Value::from(*is_abstract))
+        }
+    }))
+}
 
 /// The top of the `maxResults` member's modelled `range` (0..200).
 ///
@@ -398,14 +433,19 @@ const MODELLED_MAX_RESULTS: usize = 200;
 const _: () = assert!(crate::state::MAX_PAGE_SIZE <= MODELLED_MAX_RESULTS);
 const _: () = assert!(crate::state::DEFAULT_PAGE_SIZE <= MODELLED_MAX_RESULTS);
 
-/// The opaque `nextToken` for a page of `workspace_id` starting at
-/// `component_type_id`.
-fn encode_next_token(workspace_id: &str, component_type_id: &str) -> String {
-    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id], component_type_id)
+/// The opaque `nextToken` for a page of `workspace_id` taken under
+/// `filters_scope`, starting at `component_type_id`.
+fn encode_next_token(workspace_id: &str, filters_scope: &str, component_type_id: &str) -> String {
+    crate::state::encode_page_token(
+        NEXT_TOKEN_PREFIX,
+        &[workspace_id, filters_scope],
+        component_type_id,
+    )
 }
 
-/// The component type id inside a `nextToken` minted for `workspace_id`, or
-/// `None` when the token is not one this listing minted for that workspace.
-fn decode_next_token(token: &str, workspace_id: &str) -> Option<String> {
-    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id], token)
+/// The component type id inside a `nextToken` minted for `workspace_id` under
+/// `filters_scope`, or `None` when the token is not one this listing minted for
+/// that workspace and that filter.
+fn decode_next_token(token: &str, workspace_id: &str, filters_scope: &str) -> Option<String> {
+    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id, filters_scope], token)
 }

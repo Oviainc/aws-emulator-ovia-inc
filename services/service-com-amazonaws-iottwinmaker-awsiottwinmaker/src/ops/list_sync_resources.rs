@@ -13,8 +13,10 @@
 //! resumes from a `nextToken` carrying the external id it starts AT (inclusive)
 //! rather than an offset: a page boundary survives the set changing between two
 //! pages. The token is bound to the workspace AND the sync source it was minted
-//! for, so a token from another listing — or from this listing taken over
-//! another job — is refused rather than silently resumed. This operation models
+//! for, and to the `filters` that decided which resources the page was of
+//! ([`crate::state::filters_token_scope`]), so a token from another listing — or
+//! from this listing taken over another job or under other filters — is refused
+//! rather than silently resumed. This operation models
 //! no `ResourceNotFoundException`, so a workspace or a sync job this service
 //! does not hold is refused with the `ValidationException` it does model,
 //! exactly as `ListSyncJobs` refuses the same miss.
@@ -293,16 +295,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The filters decide WHICH resources are in the sequence a page is of,
+        // so they are part of what the token below is bound to — and are
+        // rendered before the token is read, since reading one is deciding
+        // whether it belongs to THIS sequence.
+        let filters_scope = filters_token_scope(filters);
+
         // A `nextToken` carries the `externalId` the page resumes AT
         // (inclusive), not an offset, so a page boundary survives the
         // synchronised set changing between two pages. It is bound to the job it
-        // was minted over, so a token from another listing — or from this
-        // listing taken over another workspace or sync source — is refused
-        // rather than silently resumed.
+        // was minted over AND to the filters the page was taken under, so a
+        // token from another listing — or from this listing taken over another
+        // workspace or sync source, or under other filters, whose sequence this
+        // one's resume key names no position in — is refused rather than
+        // silently resumed past the resources the new filters select ahead of
+        // it.
         let resume_at = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                decode_next_token(token, &input.workspace_id, &input.sync_source)
+                decode_next_token(token, &input.workspace_id, &input.sync_source, &filters_scope)
                     .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
             ),
         };
@@ -362,6 +373,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             encode_next_token(
                 &input.workspace_id,
                 &input.sync_source,
+                &filters_scope,
                 &resource.external_id,
             )
         });
@@ -505,17 +517,60 @@ const _: () = assert!(DEFAULT_PAGE_SIZE <= crate::state::MAX_PAGE_SIZE);
 /// elsewhere — by another listing of this service, over another sync job, or by
 /// hand — is recognisably not one of ours. The token itself is the shape every
 /// paginated operation of this service mints
-/// ([`crate::state::encode_page_token`]), scoped to the job whose page it is.
+/// ([`crate::state::encode_page_token`]), scoped to the job whose page it is and
+/// to the filters that selected it.
 const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:syncResources:1:";
 
-/// The opaque `nextToken` for a page of the resources the sync job
-/// `workspace_id`/`sync_source` holds, starting at `external_id`.
-fn encode_next_token(workspace_id: &str, sync_source: &str, external_id: &str) -> String {
-    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id, sync_source], external_id)
+/// What a request's `filters` bind a token to: each filter as the member it
+/// filters on and the value it selects, under the one rule every filtered
+/// listing of this service binds its filters by
+/// ([`crate::state::filters_token_scope`]).
+///
+/// The filters are what decide which resources are in the listing at all
+/// ([`matches_filter`]), so a page resumed under other filters would skip every
+/// resource the new ones select that sorts before the resume key. A request
+/// naming no filter has its own scope, distinct from any filtered one: the
+/// unfiltered sequence is a different sequence.
+fn filters_token_scope(filters: &[SyncResourceFilter]) -> String {
+    crate::state::filters_token_scope(filters.iter().map(|filter| {
+        let value = match filter {
+            SyncResourceFilter::State(wanted)
+            | SyncResourceFilter::resourceType(wanted)
+            | SyncResourceFilter::resourceId(wanted)
+            | SyncResourceFilter::externalId(wanted) => wanted.as_str(),
+        };
+        (filter_member(filter), ::serde_json::Value::from(value))
+    }))
 }
 
-/// The external id inside a `nextToken` minted over this sync job, or `None`
-/// when the token is not one this listing minted for it.
-fn decode_next_token(token: &str, workspace_id: &str, sync_source: &str) -> Option<String> {
-    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id, sync_source], token)
+/// The opaque `nextToken` for a page of the resources the sync job
+/// `workspace_id`/`sync_source` holds, taken under `filters_scope` and starting
+/// at `external_id`.
+fn encode_next_token(
+    workspace_id: &str,
+    sync_source: &str,
+    filters_scope: &str,
+    external_id: &str,
+) -> String {
+    crate::state::encode_page_token(
+        NEXT_TOKEN_PREFIX,
+        &[workspace_id, sync_source, filters_scope],
+        external_id,
+    )
+}
+
+/// The external id inside a `nextToken` minted over this sync job under
+/// `filters_scope`, or `None` when the token is not one this listing minted for
+/// that job and those filters.
+fn decode_next_token(
+    token: &str,
+    workspace_id: &str,
+    sync_source: &str,
+    filters_scope: &str,
+) -> Option<String> {
+    crate::state::decode_page_token(
+        NEXT_TOKEN_PREFIX,
+        &[workspace_id, sync_source, filters_scope],
+        token,
+    )
 }

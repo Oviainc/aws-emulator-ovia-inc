@@ -23,8 +23,9 @@
 //! number of results to return, literally — and not a refusal this handler
 //! invents, exactly as the identically documented `ListScenes` serves it. The
 //! `nextToken` a truncated page carries is opaque and holds the id the next page
-//! resumes AT, bound to the ends the listing was taken over, exactly as
-//! `ListComponentTypes`' token is bound to its workspace.
+//! resumes AT, bound to the ends the listing was taken over and to the `filters`
+//! it was taken under ([`crate::state::filters_token_scope`]), exactly as
+//! `ListComponentTypes`' token is bound to its workspace and its filter.
 //!
 //! A reporting operation: the only thing it writes is the lifecycle transition
 //! the CLOCK had already made due — each job's outcome, owed at
@@ -272,17 +273,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The filters decide WHICH jobs are in the sequence a page is of, just
+        // as the ends do, so they are part of what the token below is bound to —
+        // and are rendered before the token is read, since reading one is
+        // deciding whether it belongs to THIS sequence.
+        let filters_scope = filters_token_scope(filters);
+
         // A `nextToken` carries the `metadataTransferJobId` the page resumes AT
         // (inclusive), not an offset, so a page boundary survives a job being
         // created between two pages. It is bound to the ends the listing was
-        // taken over, so a token from another listing — or from this listing
-        // taken over other ends, whose page would mean something else — is
-        // refused rather than silently resumed.
+        // taken over AND to the filters it was taken under, so a token from
+        // another listing — or from this listing taken over other ends or under
+        // other filters, whose sequence this one's resume key names no position
+        // in — is refused rather than silently resumed past the jobs the new
+        // filters select ahead of it.
         let resume_at = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                decode_next_token(token, &input.source_type, &input.destination_type)
-                    .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
+                decode_next_token(
+                    token,
+                    &input.source_type,
+                    &input.destination_type,
+                    &filters_scope,
+                )
+                .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
             ),
         };
 
@@ -363,6 +377,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             encode_next_token(
                 &input.source_type,
                 &input.destination_type,
+                &filters_scope,
                 &job.metadata_transfer_job_id,
             )
         });
@@ -492,25 +507,59 @@ const _: () =
 /// transfer, or by hand — is recognisably not one of ours. The token itself is
 /// the shape every paginated operation of this service mints
 /// ([`crate::state::encode_page_token`]), scoped to the ends the page was taken
-/// over.
+/// over and to the filters that selected it.
 const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:metadataTransferJobs:1:";
 
+/// What a request's `filters` bind a token to: each filter as the member it
+/// filters on and the value it selects, under the one rule every filtered
+/// listing of this service binds its filters by
+/// ([`crate::state::filters_token_scope`]).
+///
+/// The filters decide which jobs are in the listing at all ([`matches_filter`]),
+/// so a page resumed under other filters would skip every job the new ones
+/// select that sorts before the resume key. A request naming no filter has its
+/// own scope, distinct from any filtered one: the unfiltered sequence is a
+/// different sequence.
+fn filters_token_scope(filters: &[ListMetadataTransferJobsFilter]) -> String {
+    crate::state::filters_token_scope(filters.iter().map(|filter| match filter {
+        ListMetadataTransferJobsFilter::workspaceId(workspace_id) => (
+            "workspaceId",
+            ::serde_json::Value::from(workspace_id.as_str()),
+        ),
+        ListMetadataTransferJobsFilter::State(wanted) => {
+            ("state", ::serde_json::Value::from(wanted.as_str()))
+        }
+    }))
+}
+
 /// The opaque `nextToken` for a page of the jobs between `source_type` and
-/// `destination_type`, starting at `metadata_transfer_job_id`.
+/// `destination_type` taken under `filters_scope`, starting at
+/// `metadata_transfer_job_id`.
 fn encode_next_token(
     source_type: &str,
     destination_type: &str,
+    filters_scope: &str,
     metadata_transfer_job_id: &str,
 ) -> String {
     crate::state::encode_page_token(
         NEXT_TOKEN_PREFIX,
-        &[source_type, destination_type],
+        &[source_type, destination_type, filters_scope],
         metadata_transfer_job_id,
     )
 }
 
-/// The job id inside a `nextToken` minted for these ends, or `None` when the
-/// token is not one this listing minted for them.
-fn decode_next_token(token: &str, source_type: &str, destination_type: &str) -> Option<String> {
-    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[source_type, destination_type], token)
+/// The job id inside a `nextToken` minted for these ends under `filters_scope`,
+/// or `None` when the token is not one this listing minted for them and those
+/// filters.
+fn decode_next_token(
+    token: &str,
+    source_type: &str,
+    destination_type: &str,
+    filters_scope: &str,
+) -> Option<String> {
+    crate::state::decode_page_token(
+        NEXT_TOKEN_PREFIX,
+        &[source_type, destination_type, filters_scope],
+        token,
+    )
 }

@@ -4605,6 +4605,44 @@ pub fn decode_page_token(envelope: &str, scope: &[&str], token: &str) -> Option<
     (!key.is_empty()).then(|| key.to_string())
 }
 
+/// What a `nextToken` binds the `filters` of a LISTING to: the conjunction
+/// those filters stand for, as a value two requests share exactly when they
+/// select the same rows.
+///
+/// A resume key — a row's own key or its ordinal — only means something inside
+/// the ONE sequence it was taken from, so a listing that resumes at one binds
+/// its token to every request member that decides that sequence, and a filter
+/// decides it, since a row no filter selects is not in it. Resuming a filtered
+/// page under other filters would otherwise walk past every row the new filters
+/// select that sorts before the key, so a request whose filters are not the ones
+/// the token was minted under is refused ([`invalid_next_token_message`]) rather
+/// than answered a page with rows missing.
+///
+/// A `terms` entry is one filter as the member it names and the value that
+/// member compares against. Filters are applied as a CONJUNCTION, which neither
+/// the order they were listed in nor a repeated term changes, so the terms are
+/// taken sorted and de-duplicated; JSON is what renders them, so a free-text
+/// value delimits itself rather than depending on a separator the value could
+/// itself carry, and a value's TYPE is part of the rendering, so two filters one
+/// text spelling cannot tell apart are still told apart.
+///
+/// Shared by every paginated listing that filters, so one filter list reads as
+/// one scope wherever it is bound; a listing filtering on a property's VALUE
+/// binds its filters by [`property_filters_token_scope`] instead, that filter
+/// shape carrying an operator of its own.
+pub fn filters_token_scope<'a, I>(terms: I) -> String
+where
+    I: IntoIterator<Item = (&'a str, ::serde_json::Value)>,
+{
+    let mut rendered: Vec<String> = terms
+        .into_iter()
+        .map(|(member, value)| ::serde_json::json!([member, value]).to_string())
+        .collect();
+    rendered.sort();
+    rendered.dedup();
+    ::serde_json::Value::from(rendered).to_string()
+}
+
 /// What a `nextToken` that resumes at an ORDINAL binds a property FILTER list
 /// to: the conjunction those filters stand for, as a value two requests share
 /// exactly when they keep the same rows out of the same sequence.

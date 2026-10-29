@@ -77,6 +77,9 @@ mod execute_query;
 #[path = "all/execute_query_hierarchy.rs"]
 mod execute_query_hierarchy;
 
+#[path = "all/filtered_page_token_scope.rs"]
+mod filtered_page_token_scope;
+
 #[path = "all/harness.rs"]
 mod harness;
 
