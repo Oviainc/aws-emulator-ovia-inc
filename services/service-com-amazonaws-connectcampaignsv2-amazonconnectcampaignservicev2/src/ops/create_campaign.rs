@@ -197,10 +197,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Same reason for `communicationTimeConfig`: its `dailyHours` keys name days
-        // of the model's `DayOfWeek` catalog but sit behind the `OpenHours` union, so
-        // the shared check refuses a day naming no weekday here too, exactly as
-        // `UpdateCampaignCommunicationTime` does.
+        // `communicationTimeConfig` carries `dailyHours` maps whose KEYS name days of
+        // the model's `DayOfWeek` catalog, and a map key is the one leaf the
+        // centralized walk never validates, so the shared check refuses a day naming
+        // no weekday here too, exactly as `UpdateCampaignCommunicationTime` does.
         if let Some(message) = input
             .communication_time_config
             .as_ref()

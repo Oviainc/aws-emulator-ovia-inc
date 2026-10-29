@@ -423,6 +423,14 @@ pub fn enum_map_keys_violation<'k>(
 /// itself is weighed by [`enum_map_keys_violation`], shared with every other
 /// enum-keyed map this service accepts. `member` is the request path the refusal
 /// names, so the message is built from the request rather than fixed text.
+///
+/// A key is the ONLY leaf of a window this has to weigh: everything else behind the
+/// `OpenHours` and `RestrictedPeriods` unions is a structure, and the boundary walk
+/// descends into one — a union's own member schema carries no constraint traits, but
+/// the generated member schemas of the structure behind it do, so a `TimeRange` time
+/// and a `RestrictedPeriod` date are already held to the `@pattern` of the shape they
+/// target by the time a handler runs. `tests/all/communication_time_window_constraints.rs`
+/// pins that end to end, so a codegen change that stopped enforcing them fails there.
 pub fn communication_time_violation(
     member: &str,
     config: &CommunicationTimeConfig,
@@ -455,17 +463,21 @@ pub fn communication_time_violation(
 // The ARNs this service's unions carry
 // =============================================================================
 //
-// A constrained member reaches a handler already checked — unless a UNION stands
-// between it and the root of the request, because the generated member schemas of a
-// union carry no constraint traits, so the centralized walk has nothing to enforce
-// there and does not descend (the same reason the two checks above exist). The value
-// behind the union member is therefore judged HERE by that very walk, started one
-// level down: `aws_smithy_schema_server::constraints::validate` over a structure
-// behind a union member, whose generated member schemas DO carry the model's
-// `@length`/`@pattern`, and the walk's `ValidatingSerializer` over the one union
-// member that is a bare string. Same rules and same wording as the boundary, so no
-// record can come to hold — and no read project — an ARN the model's own shape
-// forbids.
+// A constrained member reaches a handler already checked — unless the UNION MEMBER
+// SCHEMA is the only thing that could have carried the constraint, because the
+// generated member schemas of a union carry no constraint traits and so the
+// centralized walk has nothing to enforce there. That is the case for a union member
+// that is a bare STRING, and for one whose own `@length` bounds a list (the reason
+// [`communication_limits_violation`] above exists). Where the union member is a
+// STRUCTURE, a LIST of structures or a MAP of them, the walk descends and judges each
+// structure against its own generated schema, whose member schemas DO carry the
+// model's `@length`/`@pattern`, so those leaves arrive checked — a map KEY stays the
+// exception, which is what [`communication_time_violation`] above weighs. The value
+// behind the union member is judged HERE by that very walk, started one level down:
+// `aws_smithy_schema_server::constraints::validate` over a structure behind a union
+// member, and the walk's `ValidatingSerializer` over the one union member that is a
+// bare string. Same rules and same wording as the boundary, so no record can come to
+// hold — and no read project — an ARN the model's own shape forbids.
 
 /// The modelled `Arn` rules, from `smithy_query(query="shape", shape="Arn")`:
 /// `@length(min: 20, max: 500)` with the ARN `@pattern`.

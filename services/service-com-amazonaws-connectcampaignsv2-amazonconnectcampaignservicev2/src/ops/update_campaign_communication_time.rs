@@ -176,9 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A `dailyHours` key names a day of the week, the model's own `DayOfWeek`
-        // catalog, and that map sits behind the `OpenHours` union, which the
-        // centralized constraint walk does not reach: a key naming no day is refused
-        // here as a bad request, before anything is looked up or stored.
+        // catalog, and a map KEY is the one leaf the centralized constraint walk never
+        // validates — it captures it as the path segment of that entry's value — so a
+        // key naming no day is refused here as a bad request, before anything is
+        // looked up or stored. Everything else behind the `OpenHours` and
+        // `RestrictedPeriods` unions is a structure the walk descends into and judges
+        // against its own generated schema, so it arrives already checked.
         if let Some(message) = crate::state::communication_time_violation(
             "communicationTimeConfig",
             &input.communication_time_config,

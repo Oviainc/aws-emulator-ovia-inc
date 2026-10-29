@@ -61,6 +61,8 @@ mod campaign_stop;
 mod common;
 #[path = "all/communication_limits_refusal_wording.rs"]
 mod communication_limits_refusal_wording;
+#[path = "all/communication_time_window_constraints.rs"]
+mod communication_time_window_constraints;
 #[path = "all/connect_instance_config_deletion.rs"]
 mod connect_instance_config_deletion;
 #[path = "all/connect_instance_integration_deletion.rs"]
