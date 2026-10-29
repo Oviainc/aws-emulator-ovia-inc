@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: takes the caller's stored parameter overrides back off the named group
+//! in [`crate::state`] — ALL of them when `AllParameters` is true, otherwise exactly the
+//! parameters `ParameterNames` names — so each reset parameter reports its family's
+//! engine default again (and `system` as its source) on a later `DescribeParameters`.
+//! The two selectors are exclusive and one of them is required, every name is checked
+//! against the group's FAMILY before anything is removed, and a refused reset writes
+//! NOTHING. An applied reset is recorded as a `parameter-group` event, which
+//! `DescribeEvents` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +153,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetParameterGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); the request is refused rather than
+            // reported as a reset nothing persisted.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        // The two selectors are EXCLUSIVE and one of them is required: "If AllParameters
+        // is true, do not use ParameterNames. If AllParameters is false, you must
+        // specify the name of at least one parameter to reset." An absent list and an
+        // empty one name nothing, so both read the same way. Checked before the group is
+        // resolved, as the sibling `UpdateParameterGroup` checks its own combination
+        // rules, so a request the service cannot act on is refused on its own terms.
+        let names = input.parameter_names.unwrap_or_default();
+        if input.all_parameters {
+            if !names.is_empty() {
+                return Err(
+                    ResetParameterGroupErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(
+                                "ParameterNames must not be specified when AllParameters \
+                                 is true."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        } else if names.is_empty() {
+            return Err(
+                ResetParameterGroupErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(
+                            "ParameterNames must supply the name of at least one parameter \
+                             to reset when AllParameters is false."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A parameter-group name is a case-insensitive identifier, so the name this
+        // request resets is folded exactly as the store is keyed.
+        let parameter_group_name = crate::state::fold_name(&input.parameter_group_name);
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        // Besides this reset's own write, the only ones: the status transitions the clock
+        // already owed the stored clusters, ACLs and users at this instant, and the
+        // resources the account ALREADY HAD before any call — among them the
+        // `default.<family>` parameter groups — materialised on first touch, so a reset
+        // naming an existing one is refused as immutable rather than as absent.
+        state.settle(std::time::Instant::now());
+        state.ensure_builtins(&region);
+
+        // The borrow checker needs the group looked up twice (once to read its family,
+        // once to write), so the not-found refusal is built HERE and cannot differ
+        // between the two sites.
+        let not_found = || {
+            ResetParameterGroupErrorModeled::ParameterGroupNotFoundFault(
+                ParameterGroupNotFoundFault {
+                    message: Some(crate::state::parameter_group_not_found_message(
+                        &parameter_group_name,
+                    )),
+                },
+            )
+        };
+        let Some(group) = state.parameter_groups.get(&parameter_group_name) else {
+            return Err(not_found().into());
+        };
+        let family = group.family.clone();
+
+        // A group MemoryDB itself provides already holds nothing but its family's engine
+        // defaults and is not the caller's to change, through the same rule every other
+        // write path over a parameter group reads.
+        if let Some(message) = crate::state::immutable_parameter_group_rejection(
+            &parameter_group_name,
+            crate::state::Mutation::Modify,
+        ) {
+            return Err(
+                ResetParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // EVERY name is checked against the group's family before ANY override is taken
+        // off, so a request carrying one name the family does not carry leaves the whole
+        // group unchanged rather than half-reset. A name repeated in one request asks for
+        // the one same outcome, so the set is what is reset — unlike an update, where two
+        // values for one parameter say two different things.
+        let mut reset: std::collections::BTreeSet<&'static str> =
+            std::collections::BTreeSet::new();
+        for name in &names {
+            // A name already resolved needs no second lookup, which also bounds the
+            // catalog lookups this request can ask for by the family's parameter count:
+            // the first name the family does not carry refuses the whole request, so a
+            // long list can only repeat names that are already in the set.
+            if reset.contains(name.as_str()) {
+                continue;
+            }
+            let Some(parameter) = crate::state::family_parameter(&family, name) else {
+                return Err(
+                    ResetParameterGroupErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(format!("Could not find parameter with name: {name}")),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            reset.insert(parameter.name);
+        }
+
+        let Some(group) = state.parameter_groups.get_mut(&parameter_group_name) else {
+            // The group was looked up under the same lock that is still held, so this
+            // cannot be reached; refusing beats answering with an unpersisted group.
+            return Err(not_found().into());
+        };
+        if input.all_parameters {
+            // "all parameters in the parameter group are reset to their default values":
+            // the group keeps no override at all, so every parameter it reports is its
+            // family's engine default again.
+            group.parameter_values.clear();
+        } else {
+            for name in reset {
+                // Taking the override OFF is what resets the parameter: a group that
+                // holds no value for a parameter reports its family's default for it,
+                // so removing the entry is the reset rather than storing the default.
+                group.parameter_values.remove(name);
+            }
+        }
+        let response = group.to_api();
+        // The change this call made, recorded against the parameter group it changed,
+        // so `DescribeEvents` reports it — the same way an update records its own.
+        state.record_event(
+            crate::state::event_source_type::PARAMETER_GROUP,
+            &parameter_group_name,
+            crate::state::EventKind::Modified,
+        );
+        Ok(ResetParameterGroupOutput {
+            parameter_group: Some(response),
+        })
     }
 }

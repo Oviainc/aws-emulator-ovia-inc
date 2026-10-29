@@ -37,6 +37,8 @@ mod page_size_window;
 mod page_size_windows;
 #[path = "all/parameter_catalog.rs"]
 mod parameter_catalog;
+#[path = "all/parameter_group_reset.rs"]
+mod parameter_group_reset;
 #[path = "all/parameter_groups.rs"]
 mod parameter_groups;
 #[path = "all/parameters.rs"]
