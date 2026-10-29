@@ -281,19 +281,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store is bounded: past its bound a send is refused rather than
         // adding another record, so no caller can grow this service's state
         // without end. The operation models no `ServiceQuotaExceededException`,
-        // so the refusal is its modelled `ThrottlingException`.
+        // so the refusal is its modelled `ThrottlingException`, built by the
+        // crate's one construction of that refusal
+        // (`crate::state::store_full`), which is the same body the sibling
+        // bounded send answers with.
         if store.payment_requests.len() >= crate::state::PAYMENT_REQUEST_QUOTA {
             return Err(SendAgreementPaymentRequestErrorModeled::ThrottlingException(
-                ThrottlingException {
-                    // "The unique identifier associated with the error": every
-                    // exception shape this service models carries it
-                    // (`crate::state::next_request_id`).
-                    request_id: Some(crate::state::next_request_id()),
-                    message: Some(format!(
-                        "this account already holds the maximum of {} payment requests",
-                        crate::state::PAYMENT_REQUEST_QUOTA
-                    )),
-                },
+                crate::state::store_full(
+                    crate::state::RESOURCE_TYPE_PAYMENT_REQUEST,
+                    crate::state::PAYMENT_REQUEST_QUOTA,
+                ),
             )
             .into());
         }

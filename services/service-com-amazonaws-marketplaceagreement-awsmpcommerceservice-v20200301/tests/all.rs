@@ -97,6 +97,8 @@ mod selector_values;
 mod seller_submitted_request_views;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/store_full_refusals.rs"]
+mod store_full_refusals;
 #[path = "all/time_windows.rs"]
 mod time_windows;
 #[path = "all/unknown_ids.rs"]
