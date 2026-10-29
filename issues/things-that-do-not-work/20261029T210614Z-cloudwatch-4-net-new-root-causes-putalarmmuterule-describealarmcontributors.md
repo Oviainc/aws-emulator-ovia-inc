@@ -1,0 +1,108 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudwatch.put-alarm-mute-rule-duration-exceeds-max-rejected cloudwatch.put-alarm-mute-rule-end-before-start-rejected cloudwatch.put-alarm-mute-rule-invalid-schedule-expression-rejected cloudwatch.alarm-mute-rule-timestamp-round-trip-preserved cloudwatch.describe-alarm-contributors-nonexistent-alarm-not-found cloudwatch.describe-alarm-contributors-nonexistent-composite-not-found cloudwatch.describe-alarm-contributors-nonexistent-resource cloudwatch.get-metric-widget-image-invalid-request-rejected cloudwatch.metric-data-high-resolution-storage-resolution
+Issue-Shape-Id: com.amazonaws.cloudwatch#GraniteServiceVersion20100801
+Issue-Key: cloudwatch.put-alarm-mute-rule-duration-exceeds-max-rejected|run#7|AssertionError|assert code == "ValidationError", f"expected ValidationError, got {code}"
+Issue-Key: cloudwatch.put-alarm-mute-rule-end-before-start-rejected|run#8|AssertionError|assert code == "ValidationError", f"expected ValidationError, got {code!r}"
+Issue-Key: cloudwatch.put-alarm-mute-rule-invalid-schedule-expression-rejected|run#5|AssertionError|assert code == "ValidationError", f"expected ValidationError, got {code!r}"
+Issue-Key: cloudwatch.alarm-mute-rule-timestamp-round-trip-preserved|run#12|AssertionError|assert error["Code"] == "ValidationError", f"unexpected code: {error['Code']!r}"
+Issue-Key: cloudwatch.describe-alarm-contributors-nonexistent-alarm-not-found|run#8|AssertionError|assert code == "ValidationError", f"expected ValidationError, got {code}"
+Issue-Key: cloudwatch.describe-alarm-contributors-nonexistent-composite-not-found|run#4|AssertionError|assert code == "ResourceNotFoundException", f"expected ResourceNotFoundException for missing alarm, got {code}"
+Issue-Key: cloudwatch.describe-alarm-contributors-nonexistent-resource|run#4|AssertionError|assert code_missing == "ResourceNotFoundException", f"expected ResourceNotFoundException, got {code_missing!r}"
+Issue-Key: cloudwatch.get-metric-widget-image-invalid-request-rejected|run#4|AssertionError|assert code == "ValidationError", (
+Issue-Key: cloudwatch.metric-data-high-resolution-storage-resolution|_poll_datapoints#12|Timeout|time.sleep(interval_s)
+Issue-Commit: 4bd656ceb6ae5ffdb198db72ede94ac7bf108594
+
+# cloudwatch: 4 net-new root causes — PutAlarmMuteRule, DescribeAlarmContributors and GetMetricWidgetImage answer NotImplemented instead of their modeled refusals, and StorageResolution is ignored so high-resolution datapoints are never queryable at a sub-minute Period
+
+> _Note: this issue was identified against the code base at commit `4bd656ceb6ae5ffdb198db72ede94ac7bf108594`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+PutAlarmMuteRule
+
+## Description
+Four distinct root causes in the CloudWatch emulator, all grounded in failing behavioral checks that the replay report did NOT mark ALREADY FILED or OWNED. Causes 1-3 are refusal-semantics divergences on operations whose handlers are still scaffold stubs; the open stub work items 20261025T020208Z-cloudwatch-putalarmmuterule-stub.md, 20261027T005601Z-cloudwatch-getalarmmuterule-stub.md and the GetMetricWidgetImage/DescribeAlarmContributors scaffold issues are PREREQUISITES for them, but none of those issues states the error codes, messages or the accept/reject rules below, so merely making the handlers return 200 will not close these checks. Cause 4 is a data-plane fidelity defect in the metric store itself. Four causes must be closed before submitting.
+
+=== Cause 1 of 4: PutAlarmMuteRule performs no request validation and refuses every call with NotImplemented ===
+AWS: PutAlarmMuteRule (Smithy: input Name @required @length 1..255, Rule @required, MuteTargets, Tags, StartDate/ExpireDate timestamps; modeled error LimitExceededFault -> awsQueryError code `LimitExceeded`, httpError 400). The cross-field and format rules are documented on the shapes rather than modeled as errors, and AWS enforces each one synchronously with HTTP 400 and error code `ValidationError`:
+  (a) Schedule.Duration is documented (Smithy doc on Schedule$Duration) as "ISO 8601 duration format with a minimum of 1 minute (PT1M) and maximum of 15 days (P15D)". A Duration above that cap is refused with message `The Alarm Mute Rule Duration cannot exceed 15 days.` — this text is entirely fixed, it interpolates nothing from the request.
+  (b) An ExpireDate earlier than StartDate is refused with message `The Alarm Mute Rule is expired.` — also entirely fixed text.
+  (c) A Schedule.Expression that is neither `cron(...)` nor `at(...)` syntax is refused with message `Schedule is malformed.` — entirely fixed text.
+  (d) A one-time `at(...)` Schedule.Expression combined with explicit StartDate/ExpireDate is refused with message `Can not set start or expire dates for At expressions` — entirely fixed text.
+In every one of those four cases the rule must NOT be created: a following GetAlarmMuteRule for that name must answer the modeled ResourceNotFoundException (Smithy: GetAlarmMuteRule errors ResourceNotFoundException, httpError 404) and, per the recorded behavior, with an EMPTY message string. When the request IS valid, PutAlarmMuteRule succeeds and GetAlarmMuteRule round-trips the stored values byte-for-byte: Rule.Schedule.Expression and Rule.Schedule.Duration come back exactly as submitted, StartDate/ExpireDate come back as the exact minute-aligned timestamps submitted with no rounding to a coarser granularity and no timezone drift, and Status is the computed lifecycle value (`SCHEDULED` when both dates are in the future; one of SCHEDULED/ACTIVE/EXPIRED in general — Smithy: AlarmMuteRuleStatus enum).
+Emulator: every PutAlarmMuteRule call is refused with error code `NotImplemented` (the scaffold stub's 501 envelope). The replayed assertions read `AssertionError: expected ValidationError, got NotImplemented` and `AssertionError: unexpected code: 'NotImplemented'`. No request is ever validated, no rule is ever stored, and so neither the refusal paths nor the GetAlarmMuteRule round trip and Status computation exist.
+Why: a client that drives mute windows gets the wrong code class on every call — `NotImplemented` is a server fault, so SDK retry policies treat it as retryable and the caller burns its retry budget instead of surfacing the operator's bad Duration/date/expression. Conversely, nothing distinguishes a request AWS would reject from one it would accept, so a configuration error that AWS blocks at write time silently "passes" in the emulator and only fails against real AWS. Tooling that reads back a created rule (Terraform/CDK drift detection, CLI confirmations) can never observe Status, Expression, Duration, StartDate or ExpireDate at all.
+Fix: the PutAlarmMuteRule handler plus its request validation, and the mute-rule state the GetAlarmMuteRule handler reads (services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/src/ops/put_alarm_mute_rule.rs, .../get_alarm_mute_rule.rs and the alarm-mute-rule state module). The four rules above are validation-layer checks; the Status value and the timestamp round trip belong in the state/serializer.
+Traces: cloudwatch.put-alarm-mute-rule-duration-exceeds-max-rejected, cloudwatch.put-alarm-mute-rule-end-before-start-rejected, cloudwatch.put-alarm-mute-rule-invalid-schedule-expression-rejected, cloudwatch.alarm-mute-rule-timestamp-round-trip-preserved.
+
+=== Cause 2 of 4: DescribeAlarmContributors answers NotImplemented instead of distinguishing a missing alarm from a wrong-typed alarm ===
+AWS: DescribeAlarmContributors (Smithy: input AlarmName @required @length 1..255 plus NextToken; output AlarmContributors @required; modeled errors InvalidNextToken httpError 400 and ResourceNotFoundException httpError 404). It separates two refusal classes:
+  (a) An AlarmName that does not exist at all -> HTTP 404, error code `ResourceNotFoundException`, message `No alarm for name <AlarmName> was found` — the fixed text is "No alarm for name " / " was found" and `<AlarmName>` is taken verbatim from the request.
+  (b) An AlarmName that DOES exist but is an ordinary single-metric alarm (not a contributor-based / multi-time-series alarm) -> HTTP 400, error code `ValidationError`, message `Alarm <AlarmName> is not a multi time series alarm` — fixed text "Alarm " / " is not a multi time series alarm", with `<AlarmName>` taken from the request. Critically this is NOT a not-found: the alarm is present (the checks prove it with a passing DescribeAlarms positive control first), it is the wrong alarm TYPE.
+Emulator: both classes are answered with error code `NotImplemented`. Replay shows `AssertionError: expected ResourceNotFoundException for missing alarm, got NotImplemented` and `AssertionError: expected ValidationError, got NotImplemented`.
+Why: a client cannot tell "this alarm does not exist" from "this alarm has no contributor breakdown" from "the service is broken". Both AWS answers are 4xx client errors the caller must handle and must not retry; `NotImplemented` is a 5xx-flavoured server fault, so callers retry and then report a service outage for what is a caller-side mistake. Contributor-insights dashboards that probe an alarm's type by calling this operation mis-detect every alarm.
+Fix: the DescribeAlarmContributors handler and its validation ordering — existence is checked first (404 ResourceNotFoundException), then the alarm's type (400 ValidationError) — in services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/src/ops/describe_alarm_contributors.rs.
+Traces: cloudwatch.describe-alarm-contributors-nonexistent-alarm-not-found, cloudwatch.describe-alarm-contributors-nonexistent-composite-not-found, cloudwatch.describe-alarm-contributors-nonexistent-resource.
+
+=== Cause 3 of 4: GetMetricWidgetImage answers NotImplemented instead of validating the widget spec and rendering a PNG ===
+AWS: GetMetricWidgetImage (Smithy: input MetricWidget @required (a JSON document) plus OutputFormat; output MetricWidgetImage blob; the model declares NO operation errors, so the refusal below is recorded behavior only). A structurally malformed metric-data spec — a `metrics` entry whose element is a single-element array rather than a metric tuple/object — is refused with error code `ValidationError` and message `MetricWidget/metrics/0/0 should be object`. That message is a JSON-pointer-style template: the fixed parts are the `MetricWidget/` prefix, the `should be object` suffix and the member path, while the index segments (`metrics/0/0`) are derived from the position of the offending element in the submitted document. A structurally WELL-FORMED widget must succeed even when the referenced metric has no published datapoints, returning a real image whose bytes begin with the PNG signature 89 50 4E 47 0D 0A 1A 0A — not a client error and not an empty/placeholder body.
+Emulator: the call is refused with error code `NotImplemented` for both the malformed and the well-formed widget. Replay shows `AssertionError: expected a validation-flavored rejection for a malformed MetricWidget spec, got NotImplemented`.
+Why: dashboard-snapshot and alarm-annotation tooling gets a server fault for every render, so it cannot distinguish an operator's malformed widget JSON (a 4xx the operator must fix) from a service failure (retry), and it never receives an image to embed.
+Fix: the GetMetricWidgetImage handler, its MetricWidget document validation, and the image serializer in services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/src/ops/get_metric_widget_image.rs.
+Traces: cloudwatch.get-metric-widget-image-invalid-request-rejected.
+
+=== Cause 4 of 4: StorageResolution is ignored — a high-resolution datapoint never becomes queryable at a sub-minute Period ===
+AWS: PutMetricData's MetricDatum$StorageResolution (Smithy doc: "Valid values are 1 and 60. Setting this to 1 specifies this metric as a high-resolution metric, so that CloudWatch stores the metric with sub-minute resolution down to one second. Setting this to 60 specifies this metric as a regular-resolution metric, which CloudWatch stores at 1-minute resolution... This field is optional, if you do not specify it the default of 60 is used"). The observable consequence, per the recorded behavior: GetMetricStatistics with Period=10 answers for BOTH storage classes, but the bucket each datapoint is reported under differs. A datum published with StorageResolution=1 is returned under the 10-second bucket containing its publish instant (the publish timestamp floored to a multiple of 10 seconds). A datum published with no StorageResolution (i.e. 60) is coalesced to the containing whole-minute bucket (the publish timestamp with seconds zeroed) and returns exactly one datapoint. Statistic values are unaffected — both answer Sum equal to the published value. The requirement is the bucket alignment, not the particular timestamps or value from any one run.
+Emulator: neither datum ever becomes queryable. GetMetricStatistics with Period=10 over a +/-30 s window around the publish instant returns an empty Datapoints list on every poll, and the check exhausts the 60 s harness budget (`Error: Check timed out after 60.0s`) before it can compare buckets. StorageResolution is therefore not honoured and, on this path, published data is not readable at a sub-minute Period at all.
+Why: a client that publishes high-resolution custom metrics (the standard pattern for sub-minute alarms and for 1-second application telemetry) sees its data vanish — no datapoint at Period=10 — so sub-minute alarms never evaluate and high-resolution dashboards stay blank. A client that relies on the coalescing contract to normalise standard-resolution series to whole-minute buckets gets no series to normalise. Because both storage classes behave identically (nothing returned), nothing in the emulator distinguishes the two storage classes, so code paths that branch on resolution are untestable.
+Fix: the metric store's datapoint bucketing — PutMetricData must retain StorageResolution per datum and the GetMetricStatistics read path must bucket by 10 s for resolution 1 and by 60 s for resolution 60 (services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/src/ops/put_metric_data.rs, .../get_metric_statistics.rs and the metric-store state module). Related but NOT covering this: the open issue 20261029T203422Z-monitoring-cloudwatch-published-metric-data-is-unqueryable-and-metric.md describes unqueryable published data generally; it does not state the StorageResolution bucket contract above.
+Traces: cloudwatch.metric-data-high-resolution-storage-resolution.
+
+## Evidence
+All quotes are the replayed assertion text from the behavioral suite (414/822 passed).
+
+Cause 1 — PutAlarmMuteRule:
+- cloudwatch.put-alarm-mute-rule-duration-exceeds-max-rejected [mismatch]: expected code `ValidationError` + message `The Alarm Mute Rule Duration cannot exceed 15 days.` for Rule.Schedule.Duration="P16D"; got `AssertionError: expected ValidationError, got NotImplemented`.
+- cloudwatch.put-alarm-mute-rule-end-before-start-rejected [mismatch]: expected code `ValidationError` + message `The Alarm Mute Rule is expired.` for ExpireDate < StartDate; got `AssertionError: expected ValidationError, got 'NotImplemented'`.
+- cloudwatch.put-alarm-mute-rule-invalid-schedule-expression-rejected [mismatch]: expected code `ValidationError` + message `Schedule is malformed.` for Expression="not a cron or at expression!!"; got `AssertionError: expected ValidationError, got 'NotImplemented'`.
+- cloudwatch.alarm-mute-rule-timestamp-round-trip-preserved [mismatch]: expected code `ValidationError` + message `Can not set start or expire dates for At expressions` for an at(...) expression plus StartDate/ExpireDate, then a cron(...) rule whose GetAlarmMuteRule returns the exact StartDate/ExpireDate and Status==`SCHEDULED`; got `AssertionError: unexpected code: 'NotImplemented'` at the first refusal, so the round trip was never reached.
+- In all four, the follow-up GetAlarmMuteRule for the never-created name must answer `ResourceNotFoundException` with an empty message — unreachable.
+
+Cause 2 — DescribeAlarmContributors (each check first proves the alarm exists with DescribeAlarms, which returns 1 MetricAlarm, so the refusal is attributable to the operation, not to a broken target):
+- cloudwatch.describe-alarm-contributors-nonexistent-alarm-not-found [mismatch]: expected `ValidationError` + `Alarm <alarmName> is not a multi time series alarm`; got `AssertionError: expected ValidationError, got NotImplemented`.
+- cloudwatch.describe-alarm-contributors-nonexistent-composite-not-found [mismatch]: expected `ResourceNotFoundException` + `No alarm for name <alarmName> was found`; got `AssertionError: expected ResourceNotFoundException for missing alarm, got NotImplemented`.
+- cloudwatch.describe-alarm-contributors-nonexistent-resource [mismatch]: expected `ResourceNotFoundException` + `No alarm for name <alarmName> was found`; got `AssertionError: expected ResourceNotFoundException, got 'NotImplemented'`.
+
+Cause 3 — GetMetricWidgetImage:
+- cloudwatch.get-metric-widget-image-invalid-request-rejected [mismatch]: for MetricWidget={"metrics":[["OnlyOneElement"]],"width":400,"height":300} expected `ValidationError` + `MetricWidget/metrics/0/0 should be object`; got `AssertionError: expected a validation-flavored rejection for a malformed MetricWidget spec, got NotImplemented`. The well-formed control widget ({"metrics":[["AWS/EC2","CPUUtilization"]],...}) must return bytes starting with the PNG signature; never reached.
+
+Cause 4 — StorageResolution:
+- cloudwatch.metric-data-high-resolution-storage-resolution [mismatch]: two datums published at the same instant into the same namespace, one with StorageResolution=1 and one with none. GetMetricStatistics(Period=10, Statistics=[Sum]) over publish-instant +/-30 s is polled for up to 120 s and returns an empty Datapoints list throughout; the check is killed by the harness with `Error: Check timed out after 60.0s`. Expected: Sum=42.0 for both, the high-resolution datapoint reported under the 10 s-aligned bucket containing the publish instant and the standard-resolution datapoint reported as exactly one datapoint under the whole-minute bucket.
+
+## Steps to Reproduce
+Against the emulator's cloudwatch endpoint (boto3 / AWS CLI):
+
+Cause 1 (PutAlarmMuteRule validation + round trip)
+1. PutMetricAlarm to create an ordinary metric alarm to use as a mute target.
+2. PutAlarmMuteRule(Name=<n>, Rule={"Schedule":{"Expression":"at(<future YYYY-MM-DDTHH:MM>)","Duration":"P16D"}}) -> expect 400 ValidationError "The Alarm Mute Rule Duration cannot exceed 15 days."; observe NotImplemented.
+3. PutAlarmMuteRule(..., Rule={"Schedule":{"Expression":"cron(0 2 * * ?)","Duration":"PT2H","Timezone":"UTC"}}, StartDate=now+2d, ExpireDate=now+1d) -> expect 400 ValidationError "The Alarm Mute Rule is expired."; observe NotImplemented.
+4. PutAlarmMuteRule(..., Rule={"Schedule":{"Expression":"not a cron or at expression!!","Duration":"PT1H"}}) -> expect 400 ValidationError "Schedule is malformed."; observe NotImplemented.
+5. PutAlarmMuteRule(..., Rule={"Schedule":{"Expression":"at(<future>)","Duration":"PT1H","Timezone":"UTC"}}, MuteTargets={"AlarmNames":[<alarm>]}, StartDate=<minute-aligned future>, ExpireDate=<later minute-aligned future>) -> expect 400 ValidationError "Can not set start or expire dates for At expressions"; observe NotImplemented.
+6. After each rejection, GetAlarmMuteRule(AlarmMuteRuleName=<n>) -> expect 404 ResourceNotFoundException with an empty message.
+7. PutAlarmMuteRule with a valid cron(...) Expression, Duration="PT1H" and minute-aligned StartDate/ExpireDate, then GetAlarmMuteRule -> expect the exact StartDate/ExpireDate back and Status=="SCHEDULED".
+
+Cause 2 (DescribeAlarmContributors)
+1. DescribeAlarmContributors(AlarmName=<name never created>) -> expect 404 ResourceNotFoundException "No alarm for name <name> was found"; observe NotImplemented.
+2. PutMetricAlarm to create an ordinary single-metric alarm; confirm with DescribeAlarms (returns 1 MetricAlarm).
+3. DescribeAlarmContributors(AlarmName=<that alarm>) -> expect 400 ValidationError "Alarm <that alarm> is not a multi time series alarm"; observe NotImplemented.
+
+Cause 3 (GetMetricWidgetImage)
+1. GetMetricWidgetImage(MetricWidget='{"metrics":[["OnlyOneElement"]],"width":400,"height":300}') -> expect 400 ValidationError "MetricWidget/metrics/0/0 should be object"; observe NotImplemented.
+2. GetMetricWidgetImage(MetricWidget='{"metrics":[["AWS/EC2","CPUUtilization"]],"width":400,"height":300,"start":"-PT1H","end":"PT0H"}') -> expect 200 with MetricWidgetImage whose first 8 bytes are the PNG signature; observe NotImplemented.
+
+Cause 4 (StorageResolution)
+1. ts = now (UTC, microsecond=0), chosen so ts.second is not 0.
+2. PutMetricData(Namespace=<unique>, MetricData=[{MetricName:"HighResValue",Timestamp:ts,Value:42.0,Unit:"Count",StorageResolution:1},{MetricName:"StdResValue",Timestamp:ts,Value:42.0,Unit:"Count"}]).
+3. Poll GetMetricStatistics(Namespace=<same>, MetricName="HighResValue", StartTime=ts-30s, EndTime=ts+30s, Period=10, Statistics=["Sum"]) -> expect one datapoint, Sum=42.0, Timestamp == ts floored to a 10-second boundary; observe Datapoints stays empty.
+4. Same poll for "StdResValue" -> expect exactly one datapoint, Sum=42.0, Timestamp == ts with seconds zeroed (and distinct from the high-resolution bucket); observe Datapoints stays empty.
