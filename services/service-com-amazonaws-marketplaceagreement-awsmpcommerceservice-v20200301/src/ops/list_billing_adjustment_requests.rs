@@ -197,6 +197,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The `agreementId` selector below is resolved against every agreement
+        // the store holds, so the end-date transitions already due are
+        // materialised over the whole store first — an agreement an end date
+        // created exists because that date passed, not because some unrelated
+        // call read it first.
+        store.settle_agreements(now);
+        // "The unique identifier of the agreement": an `agreementId` the store
+        // holds no agreement for names no agreement of this account, so it is
+        // not a valid value for the member rather than a filter that selects
+        // nothing. This operation models no `ResourceNotFoundException`, so the
+        // refusal is its modelled `ValidationException` carrying the
+        // `INVALID_AGREEMENT_ID` reason a client branches on.
+        //
+        // The selector is resolved BEFORE the page token below, as the sibling
+        // listings of this crate do: the token's scope is built from this
+        // selector, so no token names a page of a listing scoped to an
+        // agreement that does not exist, and reading the token first would
+        // report `nextToken` as the member at fault when the member actually at
+        // fault is `agreementId`.
+        if let Some(refusal) = store.unknown_agreement_refusal(input.agreement_id.as_deref()) {
+            return Err(
+                ListBillingAdjustmentRequestsErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+
         // The token resumes THIS listing: one minted for a different set of
         // filters would index into a different sequence.
         let scope = crate::state::billing_adjustment_scope(
@@ -225,27 +253,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
         };
-
-        let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-
-        // The `agreementId` selector below is resolved against every agreement
-        // the store holds, so the end-date transitions already due are
-        // materialised over the whole store first — an agreement an end date
-        // created exists because that date passed, not because some unrelated
-        // call read it first.
-        store.settle_agreements(now);
-        // "The unique identifier of the agreement": an `agreementId` the store
-        // holds no agreement for names no agreement of this account, so it is
-        // not a valid value for the member rather than a filter that selects
-        // nothing. This operation models no `ResourceNotFoundException`, so the
-        // refusal is its modelled `ValidationException` carrying the
-        // `INVALID_AGREEMENT_ID` reason a client branches on.
-        if let Some(refusal) = store.unknown_agreement_refusal(input.agreement_id.as_deref()) {
-            return Err(
-                ListBillingAdjustmentRequestsErrorModeled::ValidationException(refusal).into(),
-            );
-        }
 
         // A report, so the only write is the status change the clock had already
         // made due before this call: the processing of a submitted adjustment

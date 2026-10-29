@@ -193,6 +193,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        let store = state.lock();
+
+        // "The unique identifier of the agreement": the invoices reported are
+        // the invoices OF that agreement, so an id naming none is a reference to
+        // a resource that does not exist — the modelled not-found this operation
+        // declares, at the status this service answers every lookup that found
+        // nothing with.
+        //
+        // The agreement is resolved BEFORE the page token below, as the sibling
+        // per-agreement reads of this crate do: the listing a token resumes is a
+        // listing OF that agreement, so there is no page of it to name while the
+        // agreement itself does not exist. Were the token read first, a request
+        // naming no agreement and carrying any token would be answered about
+        // `nextToken` — the member that is not at fault, and in the error shape
+        // this service reserves for a refused value rather than the one it
+        // answers a lookup that found nothing with.
+        if !store.agreements.contains_key(&input.agreement_id) {
+            return Err(crate::state::not_found(
+                ListAgreementInvoiceLineItemsErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_not_found(&input.agreement_id),
+                ),
+            ));
+        }
+
         // The token resumes THIS listing: one minted for a different agreement
         // or a different set of filters would index into a different sequence.
         let scope = crate::state::invoice_line_item_scope(
@@ -218,21 +242,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
         };
-
-        let store = state.lock();
-
-        // "The unique identifier of the agreement": the invoices reported are
-        // the invoices OF that agreement, so an id naming none is a reference to
-        // a resource that does not exist — the modelled not-found this operation
-        // declares, at the status this service answers every lookup that found
-        // nothing with.
-        if !store.agreements.contains_key(&input.agreement_id) {
-            return Err(crate::state::not_found(
-                ListAgreementInvoiceLineItemsErrorModeled::ResourceNotFoundException(
-                    crate::state::agreement_not_found(&input.agreement_id),
-                ),
-            ));
-        }
 
         let mut matched: Vec<&crate::state::Invoice> = store
             .invoices_of(&input.agreement_id)

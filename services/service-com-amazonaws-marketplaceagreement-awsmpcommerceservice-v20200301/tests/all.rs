@@ -59,6 +59,8 @@ mod invoice_adjustments;
 mod invoice_line_item_listing;
 #[path = "all/license_arn_region.rs"]
 mod license_arn_region;
+#[path = "all/listing_resolution_order.rs"]
+mod listing_resolution_order;
 #[path = "all/page_token_scopes.rs"]
 mod page_token_scopes;
 #[path = "all/payment_request_approval.rs"]

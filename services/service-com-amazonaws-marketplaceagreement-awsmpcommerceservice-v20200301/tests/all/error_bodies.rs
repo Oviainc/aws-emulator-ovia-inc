@@ -95,7 +95,11 @@ fn send_body(agreement: &str, term_id: &str) -> Value {
 /// `AgreementId` forms that satisfy `^[A-Za-z0-9_/-]+$` and
 /// `@length(min: 1, max: 64)` — including both published bounds — and that this
 /// emulator's id minter never produces, so each names no agreement.
-fn unresolvable_agreement_ids() -> Vec<(&'static str, String)> {
+///
+/// `pub(crate)` because the suite over the order a paginated read resolves its
+/// agreement and its page token in (`tests/all/listing_resolution_order.rs`)
+/// spans the same forms rather than keeping a second copy of them.
+pub(crate) fn unresolvable_agreement_ids() -> Vec<(&'static str, String)> {
     vec![
         ("the shortest AgreementId, one character", "A".to_string()),
         (
