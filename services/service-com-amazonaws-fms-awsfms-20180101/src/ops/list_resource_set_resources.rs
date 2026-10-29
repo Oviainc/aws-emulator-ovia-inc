@@ -200,9 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
 
         // The set whose membership is being reported, named by its `Id` or by its
-        // ARN through the one shared resolver.
-        let Some(record) = crate::state::resolve_resource_set_id(&store, &input.identifier)
-            .and_then(|id| store.resource_sets.get(&id))
+        // ARN through the one shared resolver. The resolved `Id` is what the page
+        // is selected by, whichever form named it.
+        let Some((set_id, record)) = crate::state::resolve_resource_set_id(&store, &input.identifier)
+            .and_then(|id| store.resource_sets.get(&id).map(|record| (id, record)))
         else {
             return Err(
                 ListResourceSetResourcesErrorModeled::ResourceNotFoundException(
@@ -213,21 +214,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A token this service did not mint for a resource-membership page names
-        // no page boundary. The refusal is a bad request, not an invented page:
-        // the modelled `InvalidInputException` is exactly "the parameters of the
-        // request were invalid".
+        // no page boundary — and neither does one it minted for ANOTHER set's
+        // membership. This page is the resources THIS set holds, so a boundary of
+        // it is a member URI minted for this set: the token carries the set
+        // beside the URI ([`crate::state::encode_scoped_page_token`]). The
+        // refusal is a bad request, not an invented page: the modelled
+        // `InvalidInputException` is exactly "the parameters of the request were
+        // invalid".
         let start = match input.next_token.as_deref() {
-            Some(token) => match crate::state::decode_uri_page_token(token) {
+            Some(token) => match crate::state::decode_scoped_page_token(&set_id, token)
+                .filter(|uri| crate::state::parse_arn(uri).is_some())
+            {
                 Some(start) => Some(start),
                 None => {
                     return Err(
                         ListResourceSetResourcesErrorModeled::InvalidInputException(
                             InvalidInputException {
-                                message: Some(
+                                message: Some(format!(
                                     "NextToken is not a pagination token issued by \
-                                     ListResourceSetResources"
-                                        .to_string(),
-                                ),
+                                     ListResourceSetResources for resource set {set_id}"
+                                )),
                             },
                         )
                         .into(),
@@ -255,8 +261,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
         // A token only when a resource is left AFTER this page, so the last page
-        // carries none.
-        let next_token = remaining.next().map(|uri| crate::state::encode_key_token(uri));
+        // carries none. It names the URI the following page resumes at, under the
+        // set whose membership it is a boundary of.
+        let next_token = remaining
+            .next()
+            .map(|uri| crate::state::encode_scoped_page_token(&set_id, uri));
 
         Ok(ListResourceSetResourcesOutput { items, next_token })
     }

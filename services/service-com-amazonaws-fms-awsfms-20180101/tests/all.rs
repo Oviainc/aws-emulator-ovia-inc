@@ -21,6 +21,12 @@
 #[path = "all/third_party_firewall_firewall_policies.rs"]
 mod third_party_firewall_firewall_policies;
 
+// Declared beside it, for the same reason: this suite's name sorts right into
+// the contended region of the list below. The suite itself is an ordinary
+// `tests/all/<name>.rs` file.
+#[path = "all/narrowed_page_token_scoping.rs"]
+mod narrowed_page_token_scoping;
+
 // Declared beside it, and for the same reason: the sorted list below is the
 // contended region every late-sorting fms suite lands in.
 #[path = "all/third_party_firewall_association.rs"]

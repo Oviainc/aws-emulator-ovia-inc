@@ -53,7 +53,10 @@ const UNKNOWN_RESOURCE_SET_ID: &str = "0123456789AbCdEfGhIjKl";
 const MEMBER_ACCOUNTS: [&str; 2] = ["111111111111", "222222222222"];
 
 /// An EC2 instance ARN, whose resource field names only an id.
-fn instance(account: &str, index: usize) -> String {
+///
+/// `pub(crate)` so a sibling suite in this test target builds a member URI
+/// through this one helper rather than a second copy of the ARN form.
+pub(crate) fn instance(account: &str, index: usize) -> String {
     format!("arn:aws:ec2:{REGION}:{account}:instance/i-{index:017x}")
 }
 
@@ -168,7 +171,11 @@ fn cases() -> Vec<Case> {
 /// A fresh emulator with an administrator associated and a policy whose
 /// `IncludeMap` names [`MEMBER_ACCOUNTS`], which is what makes them accounts of
 /// the organization — and so makes their resources associable.
-async fn seeded_emulator() -> (MultiServiceRouter, std::sync::Arc<engine::InMemoryEngine>) {
+///
+/// `pub(crate)` so a sibling suite in this test target stands the same
+/// organization up through this one helper.
+pub(crate) async fn seeded_emulator() -> (MultiServiceRouter, std::sync::Arc<engine::InMemoryEngine>)
+{
     let (router, engine) = emulator_with_engine();
     associate_admin(&router).await;
     let mut scoped = minimal_policy("resource-set-resources-scope");
@@ -183,7 +190,10 @@ async fn seeded_emulator() -> (MultiServiceRouter, std::sync::Arc<engine::InMemo
 
 /// Create a resource set declaring `resource_types` and associate `members` with
 /// it, returning the minted `(Id, ResourceSetArn)`.
-async fn create_set_with_members(
+///
+/// `pub(crate)` so a sibling suite in this test target creates a populated set
+/// through this one writer rather than a second copy of it.
+pub(crate) async fn create_set_with_members(
     router: &MultiServiceRouter,
     case_name: &str,
     resource_types: &[&str],

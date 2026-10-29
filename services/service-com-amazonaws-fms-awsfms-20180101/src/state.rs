@@ -3098,11 +3098,18 @@ pub fn decode_key_token(token: &str) -> Option<String> {
 /// arbitrary key.
 pub fn decode_page_token(token: &str) -> Option<String> {
     let decoded = decode_key_token(token)?;
-    let is_minted_id = decoded.len() == 36
-        && decoded
+    is_minted_identifier(&decoded).then_some(decoded)
+}
+
+/// Whether `value` has the form of an identifier this service mints: 36
+/// characters matching `^[a-z0-9A-Z-]{36}$`, which the model gives both
+/// `com.amazonaws.fms#PolicyId` and `com.amazonaws.fms#ListId` — so one check
+/// serves the policy-keyed and the list-keyed pages.
+pub fn is_minted_identifier(value: &str) -> bool {
+    value.len() == 36
+        && value
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-');
-    is_minted_id.then_some(decoded)
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 /// Decode a `Base62Id`-keyed `PaginationToken` produced by
@@ -3154,6 +3161,53 @@ pub fn decode_uri_page_token(token: &str) -> Option<String> {
 pub fn decode_account_page_token(token: &str) -> Option<String> {
     let decoded = decode_key_token(token)?;
     is_account_id(&decoded).then_some(decoded)
+}
+
+/// Join the value a page was SELECTED by to a boundary inside it, the way this
+/// service's composite store keys are built (see [`shield_attack_key`]): the
+/// selecting value, the separator, then the key. Neither a `PolicyId` nor a
+/// `Base62Id` may contain the separator, so the join is unambiguous.
+fn scoped_page_key(scope: &str, key: &str) -> String {
+    format!("{scope}#{key}")
+}
+
+/// Encode a page boundary of a listing whose page set is SELECTED by a request
+/// member — the accounts one policy applies to, the members of one resource set,
+/// the lists of one namespace — as an opaque `PaginationToken` carrying the
+/// selecting value beside the boundary.
+///
+/// A boundary of such a page names nothing in another selection: the key may be
+/// absent there, or sort after items that selection does hold, so resuming from
+/// it would silently drop them. Carrying the selecting value is what lets
+/// [`decode_scoped_page_token`] tell a token minted for THIS page from one
+/// minted for another — the same check the listings whose store key already
+/// begins with the selecting member make against that key's prefix
+/// ([`shield_attack_key_prefix`], [`third_party_firewall_policy_key_prefix`]).
+///
+/// Hex for the same reasons as [`encode_key_token`], which does the encoding:
+/// the token stays inside the modelled `PaginationToken` pattern and length, and
+/// nothing in it is meaningful to a caller without decoding.
+pub fn encode_scoped_page_token(scope: &str, key: &str) -> String {
+    encode_key_token(&scoped_page_key(scope, key))
+}
+
+/// Decode a `PaginationToken` produced by [`encode_scoped_page_token`] for the
+/// page `scope` selects, yielding the boundary inside it. `None` when the token
+/// was not produced by this service, or was produced for ANOTHER selection:
+/// either way it names no boundary of this page, so the caller refuses it
+/// instead of resuming from an arbitrary key.
+///
+/// The token-to-key step is [`decode_key_token`]'s, like every other specialised
+/// decoder here, so this module expresses that rule once; this one adds only the
+/// selecting-value check and leaves the boundary's own shape to the page class
+/// that asked ([`is_account_id`] for an account-keyed page, [`parse_arn`] for a
+/// URI-keyed one, [`is_minted_identifier`] for one keyed by a minted id).
+pub fn decode_scoped_page_token(scope: &str, token: &str) -> Option<String> {
+    let decoded = decode_key_token(token)?;
+    let key = decoded
+        .strip_prefix(&scoped_page_key(scope, ""))?
+        .to_string();
+    (!key.is_empty()).then_some(key)
 }
 
 /// Mint a fresh service-owned identifier: 36 lowercase hex characters, which

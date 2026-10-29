@@ -191,16 +191,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The authorization gate, BEFORE the pagination token is examined.
         crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
 
-        // A token this service did not mint names no page boundary. The model
-        // declares no client-input error for ListAppsLists, so refuse it as a bad
-        // request rather than inventing a page.
+        // A token this service did not mint names no page boundary — and neither
+        // does one it minted for the OTHER namespace, whose lists share one id
+        // space with this namespace's. The page `DefaultLists` selects therefore
+        // mints a token carrying that namespace beside the `ListId`
+        // ([`crate::state::encode_scoped_page_token`]). The model declares no
+        // client-input error for ListAppsLists, so a token naming no boundary of
+        // the selected page is refused as a bad request rather than inventing a
+        // page.
+        let namespace = input.default_lists.to_string();
         let start = match input.next_token.as_deref() {
-            Some(token) => match crate::state::decode_page_token(token) {
+            Some(token) => match crate::state::decode_scoped_page_token(&namespace, token)
+                .filter(|list_id| crate::state::is_minted_identifier(list_id))
+            {
                 Some(start) => Some(start),
                 None => {
-                    return Err(crate::scaffolded::Scaffolded::validation(
-                        "NextToken is not a pagination token issued by ListAppsLists",
-                    ));
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "NextToken is not a pagination token issued by ListAppsLists for \
+                         DefaultLists {namespace}"
+                    )));
                 }
             },
             None => None,
@@ -230,10 +239,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|(_, record)| record.summary())
             .collect();
         // A token only when a list of the selected namespace is left AFTER this
-        // page, so the last page carries none.
+        // page, so the last page carries none. It names the id the following page
+        // resumes at, under the namespace whose page it is a boundary of.
         let next_token = remaining
             .next()
-            .map(|(list_id, _)| crate::state::encode_page_token(list_id));
+            .map(|(list_id, _)| crate::state::encode_scoped_page_token(&namespace, list_id));
 
         Ok(ListAppsListsOutput {
             apps_lists: Some(apps_lists),

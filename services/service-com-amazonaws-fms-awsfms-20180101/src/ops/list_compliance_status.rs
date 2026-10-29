@@ -191,21 +191,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A token this service did not mint names no page boundary. This page is
-        // keyed by member account, so only an account-keyed token names one; the
-        // model declares no client-input error for `ListComplianceStatus`, so a
-        // foreign token is refused as a bad request rather than resumed from as
-        // an arbitrary key — the refusal `ListMemberAccounts` states for the same
-        // token.
+        // A token this service did not mint names no page boundary — and
+        // neither does one it minted for ANOTHER policy's page. This page is the
+        // accounts THIS policy applies to, so a boundary of it is an account id
+        // minted for this policy: the token carries the policy beside the
+        // account
+        // ([`crate::state::encode_scoped_page_token`]), exactly as the page keys
+        // of the other `PolicyId`-narrowed listing carry it
+        // (`GetProtectionStatus`). The model declares no client-input error for
+        // `ListComplianceStatus`, so a token naming no boundary of this page is
+        // refused as a bad request rather than resumed from as an arbitrary key.
         let start = match input.next_token.as_deref() {
-            Some(token) => match crate::state::decode_account_page_token(token) {
-                Some(start) => Some(start),
-                None => {
-                    return Err(crate::scaffolded::Scaffolded::validation(
-                        "NextToken is not a pagination token issued by ListComplianceStatus",
-                    ));
+            Some(token) => {
+                match crate::state::decode_scoped_page_token(&input.policy_id, token)
+                    .filter(|account| crate::state::is_account_id(account))
+                {
+                    Some(start) => Some(start),
+                    None => {
+                        return Err(crate::scaffolded::Scaffolded::validation(format!(
+                            "NextToken is not a pagination token issued by ListComplianceStatus \
+                             for policy {}",
+                            input.policy_id
+                        )));
+                    }
                 }
-            },
+            }
             None => None,
         };
 
@@ -226,10 +236,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|account| store.policy_compliance_status(policy, account))
             .collect();
         // A token only when an account is left AFTER this page, so the last page
-        // carries none.
+        // carries none. It names the account the following page resumes at, under
+        // the policy whose page it is a boundary of.
         let next_token = remaining
             .next()
-            .map(|account| crate::state::encode_page_token(account));
+            .map(|account| crate::state::encode_scoped_page_token(&input.policy_id, account));
 
         Ok(ListComplianceStatusOutput {
             policy_compliance_status_list: Some(policy_compliance_status_list),
