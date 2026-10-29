@@ -154,16 +154,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The cursor is the (Outpost, endpoint) pair the next page starts at. It is
-        // decoded before the Outpost is resolved, so a token this service never
-        // issued is refused whatever the request named.
-        let resume = crate::state::endpoint_cursor(input.next_token.as_deref(), Self::NAME)
-            .map_err(ListSharedEndpointsErrorModeled::ValidationException)?;
-
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         let inventory = crate::state::outpost_inventory(&*self.engine, &store);
+
+        // The cursor is the (Outpost, endpoint) pair the next page starts at, read
+        // in the Region this listing walks: a token this listing never issued —
+        // one of another form, or one naming an Outpost this Region's walk has no
+        // order over — is refused rather than served as an arbitrary page. It is
+        // read before the Outpost the request named is resolved, so such a token is
+        // refused whatever the request named.
+        let resume = crate::state::endpoint_cursor(
+            input.next_token.as_deref(),
+            Self::NAME,
+            &inventory,
+            &region,
+        )
+        .map_err(ListSharedEndpointsErrorModeled::ValidationException)?;
 
         // The Outpost the request named, as this Region reaches it: an Outpost
         // installed in another Region is not one this Region's endpoint serves,

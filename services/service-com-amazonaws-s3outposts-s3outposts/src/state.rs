@@ -1139,8 +1139,12 @@ pub fn encode_endpoint_cursor(key: &(String, String)) -> String {
     format!("{}/{}", key.0, key.1)
 }
 
-/// The `(OutpostId, EndpointId)` pair an endpoint listing's cursor names, or
-/// `None` when the token is not one this service issued.
+/// The `(OutpostId, EndpointId)` pair an endpoint listing's cursor FORM names,
+/// or `None` when the token is not of the form these listings mint.
+///
+/// This is the form alone; which of those pairs a given listing could actually
+/// have minted is [`endpoint_cursor`]'s question, because it depends on the
+/// Region the walk is being resumed in.
 pub fn decode_endpoint_cursor(token: &str) -> Option<(String, String)> {
     let (outpost_id, endpoint_id) = token.split_once('/')?;
     (is_outpost_id(outpost_id) && is_endpoint_id(endpoint_id))
@@ -1148,12 +1152,33 @@ pub fn decode_endpoint_cursor(token: &str) -> Option<(String, String)> {
 }
 
 /// The key an endpoint listing resumes its walk at for `next_token`, or the
-/// refusal for a token this service never issued.
+/// refusal for a token this listing never issued — which a token naming a place
+/// outside the set this walk orders at all is.
+///
+/// A cursor is a position in ONE walk, so it is read in the scope that walk
+/// serves and not just checked for its form. The walk these listings share
+/// reports only endpoints whose parent Outpost the `inventory` holds in `region`
+/// ([`endpoint_page`]), and its key order is dominated by the `OutpostId` half
+/// ([`ComAmazonawsS3outpostsS3outpostsState::endpoints`]), so a token whose
+/// Outpost half names an Outpost of another Region — or none the inventory holds
+/// — names no place in this Region's order: resuming there would answer a page of
+/// whatever happens to sort after it (often an empty one, reporting that the
+/// account has no endpoints here) or ignore the cursor altogether and re-serve the
+/// first page. It is refused instead, exactly as a token of the wrong form is.
+///
+/// The ENDPOINT half is deliberately not resolved: the walk resumes at the first
+/// key at or after the cursor, so a page is still served when the endpoint the
+/// cursor named was deleted between pages.
 pub fn endpoint_cursor(
     next_token: Option<&str>,
     operation: &str,
+    inventory: &OutpostInventory,
+    region: &str,
 ) -> Result<Option<(String, String)>, ValidationException> {
-    list_cursor(next_token, operation, decode_endpoint_cursor)
+    list_cursor(next_token, operation, |token| {
+        decode_endpoint_cursor(token)
+            .filter(|(outpost_id, _)| outpost_region(inventory, outpost_id) == Some(region))
+    })
 }
 
 /// Whether `access_type` carries the `customer_owned_ipv4_pool` it requires, or

@@ -23,6 +23,8 @@ mod arn_patterns;
 mod control_plane_inventory;
 #[path = "all/endpoint_commitment_conflict.rs"]
 mod endpoint_commitment_conflict;
+#[path = "all/endpoint_cursor_scope.rs"]
+mod endpoint_cursor_scope;
 #[path = "all/endpoint_lifecycle.rs"]
 mod endpoint_lifecycle;
 #[path = "all/endpoint_paging.rs"]

@@ -150,17 +150,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The cursor is the (Outpost, endpoint) pair the next page starts at.
-        // A token this service never issued is refused rather than served as an
-        // arbitrary page.
-        let resume = crate::state::endpoint_cursor(input.next_token.as_deref(), Self::NAME)
-            .map_err(ListEndpointsErrorModeled::ValidationException)?;
-
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let caller = crate::state::caller_account();
         let mut store = state.lock();
         let inventory = crate::state::outpost_inventory(&*self.engine, &store);
+
+        // The cursor is the (Outpost, endpoint) pair the next page starts at, read
+        // in the Region this listing walks: a token this listing never issued —
+        // one of another form, or one naming an Outpost this Region's walk has no
+        // order over — is refused rather than served as an arbitrary page.
+        let resume = crate::state::endpoint_cursor(
+            input.next_token.as_deref(),
+            Self::NAME,
+            &inventory,
+            &region,
+        )
+        .map_err(ListEndpointsErrorModeled::ValidationException)?;
 
         // The walk, the page bound, the cursor and the Region a listing serves are
         // the one listing rule this service's listings follow, so they live in
