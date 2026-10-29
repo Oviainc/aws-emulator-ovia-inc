@@ -35,6 +35,8 @@ mod directory_limits;
 mod directory_networking_and_settings;
 #[path = "all/directory_unsharing.rs"]
 mod directory_unsharing;
+#[path = "all/domain_controller_resize.rs"]
+mod domain_controller_resize;
 #[path = "all/domain_controllers.rs"]
 mod domain_controllers;
 #[path = "all/error_envelopes.rs"]

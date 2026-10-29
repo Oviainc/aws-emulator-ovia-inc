@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNumberOfDomainControllers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateNumberOfDomainControllers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateNumberOfDomainControllers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resizes a directory's domain-controller set: the difference between the number the
+//! directory runs and the `DesiredNumber` the request asks for is placed or retired, so
+//! `DescribeDomainControllers` reports the new set. A number above this service's
+//! per-directory quota is refused with the modelled
+//! `DomainControllerLimitExceededException` and leaves the set as it was, a directory
+//! whose type runs no domain controller of the caller's domain with
+//! `UnsupportedOperationException`, one not in service with
+//! `DirectoryUnavailableException`, and an id naming no stored directory with
+//! `EntityDoesNotExistException`.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +152,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateNumberOfDomainControllers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateNumberOfDomainControllersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateNumberOfDomainControllers"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The quota the refusal below reports, and the only number a directory may be
+        // resized up to.
+        let limit = crate::state::MAX_DOMAIN_CONTROLLERS_PER_DIRECTORY;
+        // The modelled `DesiredNumberOfDomainControllers` carries `range { min: 2 }`,
+        // which the request walk refuses before this handler runs, so the number is a
+        // count here. A value no count could be is refused as the invalid parameter it
+        // is rather than read as one.
+        let desired = match usize::try_from(input.desired_number) {
+            Ok(desired) => desired,
+            Err(_) => {
+                return Err(invalid_parameter(format!(
+                    "DesiredNumber must name a number of domain controllers, got {requested}",
+                    requested = input.desired_number
+                )))
+            }
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        let directory = store.directories.get(&input.directory_id).ok_or_else(|| {
+            UpdateNumberOfDomainControllersErrorModeled::EntityDoesNotExistException(
+                crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
+            )
+        })?;
+
+        // A domain controller is a server of the directory's own domain, which only the
+        // types in `DOMAIN_CONTROLLER_DIRECTORY_TYPES` run for the caller, so a directory
+        // of any other type has no controller set to resize: the modelled refusal for a
+        // request a directory type does not support, the same one
+        // `DescribeDomainControllers` answers for reporting that set.
+        if !directory.manages_domain_controllers() {
+            return Err(
+                UpdateNumberOfDomainControllersErrorModeled::UnsupportedOperationException(
+                    crate::state::refusal(format!(
+                        "DirectoryId {id} names a {directory_type} directory; domain \
+                         controllers are run for {supported} directories only",
+                        id = input.directory_id,
+                        directory_type = directory.directory_type,
+                        supported = crate::state::DOMAIN_CONTROLLER_DIRECTORY_TYPES.join(" and ")
+                    )),
+                )
+                .into(),
+            );
+        }
+
+        // Resizing the set changes the directory's own servers, so it needs a directory
+        // that is in service: one still being built by the transition its create owes is
+        // unavailable, which is the modelled refusal for exactly that. The diagnostic is
+        // this service's shared one for a directory a call cannot reach.
+        if directory.stage != crate::state::STAGE_ACTIVE {
+            return Err(directory_unavailable(&input.directory_id));
+        }
+
+        // The quota is checked BEFORE anything is written, so a number past it leaves the
+        // directory running exactly the controllers it was running.
+        if desired > limit {
+            return Err(domain_controller_limit_exceeded(input.desired_number, limit));
+        }
+
+        // This operation's own documentation: "It may take up to 45 minutes for any new
+        // domain controllers to become fully active once the requested number of domain
+        // controllers is updated. During this time, you cannot make another update
+        // request." A controller with a transition still owed is a resize still running,
+        // so a second request is refused rather than compounded onto the first.
+        if directory
+            .domain_controllers
+            .values()
+            .any(|controller| controller.status_due_at.is_some())
+        {
+            return Err(directory_unavailable(&input.directory_id));
+        }
+
+        // "Based on the difference between current value and new value (provided through
+        // this API call), domain controllers will be added or removed": the difference,
+        // and nothing else, is what this call acts on — asking for the number the
+        // directory already runs changes none of them.
+        let current = directory.domain_controllers.len();
+        match desired.cmp(&current) {
+            ::std::cmp::Ordering::Greater => {
+                store.place_domain_controllers(&input.directory_id, desired - current, now)
+            }
+            ::std::cmp::Ordering::Less => {
+                store.retire_domain_controllers(&input.directory_id, current - desired, now)
+            }
+            ::std::cmp::Ordering::Equal => {}
+        }
+        if let Some(directory) = store.directories.get_mut(&input.directory_id) {
+            // The number the directory now desires is the number it was asked for, so
+            // `DescribeDirectories$DesiredNumberOfDomainControllers` and the controller
+            // listing stay two views of one stored record.
+            directory.desired_number_of_domain_controllers = Some(input.desired_number);
+        }
+
+        Ok(UpdateNumberOfDomainControllersOutput {})
     }
+}
+
+/// Refuse the request with the modelled `InvalidParameterException`, naming the member
+/// and the rule it broke so the caller can fix the request from the message alone.
+fn invalid_parameter(message: String) -> UpdateNumberOfDomainControllersError {
+    UpdateNumberOfDomainControllersErrorModeled::InvalidParameterException(crate::state::refusal(
+        message,
+    ))
+    .into()
+}
+
+/// Refuse the request with the modelled `DomainControllerLimitExceededException`: the
+/// sentence that error's own documentation states, with the quota taken from this
+/// service's per-directory limit and the number taken from the request.
+fn domain_controller_limit_exceeded(
+    requested: i32,
+    limit: usize,
+) -> UpdateNumberOfDomainControllersError {
+    UpdateNumberOfDomainControllersErrorModeled::DomainControllerLimitExceededException(
+        crate::state::refusal(format!(
+            "The maximum allowed number of domain controllers per directory was exceeded. \
+             The default limit per directory is {limit} domain controllers; {requested} \
+             were requested."
+        )),
+    )
+    .into()
+}
+
+/// Refuse the request with the modelled `DirectoryUnavailableException`, worded by this
+/// service's shared diagnostic for a directory a call cannot reach.
+fn directory_unavailable(directory_id: &str) -> UpdateNumberOfDomainControllersError {
+    UpdateNumberOfDomainControllersErrorModeled::DirectoryUnavailableException(
+        crate::state::refusal(crate::state::directory_unavailable(directory_id)),
+    )
+    .into()
 }

@@ -23,7 +23,8 @@
 //!   directory's LDAP security leaving `Enabling`, a
 //!   registered certificate leaving `Registering`, an organization directory share
 //!   leaving `Sharing` (and an unshared one leaving the store), a schema extension
-//!   leaving `Initializing`, a domain controller leaving `Creating`).
+//!   leaving `Initializing`, a domain controller leaving `Creating` (and a retired one
+//!   leaving the store)).
 //!   Every handler calls it before reading or writing, so a reporting operation reports
 //!   what the clock already owed and nothing more.
 //! * [`Directory::to_description`], the one place a stored directory is rendered as the
@@ -190,6 +191,14 @@ pub const DOMAIN_CONTROLLER_STATUS_CREATING: &str = "Creating";
 /// controller in service carries.
 pub const DOMAIN_CONTROLLER_STATUS_ACTIVE: &str = "Active";
 
+/// The `DomainControllerStatus` a controller carries while it is being taken out of the
+/// directory: the `Deleting` value of the same modelled enum.
+///
+/// A resize down answers before the controllers it retires are gone, so the removal is
+/// owed by the clock one [`TRANSITION_SPAN`] later and the controller is reported in this
+/// transient status until then — the same shape as an address block leaving a directory.
+pub const DOMAIN_CONTROLLER_STATUS_DELETING: &str = "Deleting";
+
 /// The most `DomainControllerIds` entries a single `DescribeDomainControllers` will
 /// resolve.
 ///
@@ -199,14 +208,16 @@ pub const DOMAIN_CONTROLLER_STATUS_ACTIVE: &str = "Active";
 /// scanned unbounded.
 pub const MAX_DOMAIN_CONTROLLER_IDS_PER_REQUEST: usize = 100;
 
-/// The most domain controllers this emulator will hold for one directory.
+/// Directory Service's default quota of domain controllers per directory, which
+/// `UpdateNumberOfDomainControllers` enforces.
 ///
-/// NOT an AWS quota: a resource guard, the same construction as
-/// [`MAX_COMPUTERS_PER_DIRECTORY`]. It is well above the
-/// [`MICROSOFT_AD_DOMAIN_CONTROLLERS`] a create places, and
+/// From the modelled `DomainControllerLimitExceededException`'s own documentation: "The
+/// maximum allowed number of domain controllers per directory was exceeded. The default
+/// limit per directory is 20 domain controllers." A `DesiredNumber` above it is refused
+/// with that error, and
 /// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::place_domain_controllers`]
-/// clamps what it places to it, so no number a later caller asks for can grow the store
-/// without end.
+/// clamps what it places to it, so it is also the ceiling of what the store holds for one
+/// directory.
 pub const MAX_DOMAIN_CONTROLLERS_PER_DIRECTORY: usize = 20;
 
 /// The `DirectoryType` of an AD Connector: the `ADConnector` value of the modelled
@@ -1257,12 +1268,13 @@ pub struct Directory {
     pub sso_enabled: bool,
     /// Reported only for AWS Managed Microsoft AD, so it stays `None` for Simple AD:
     /// `CreateMicrosoftAD` sets it to [`MICROSOFT_AD_DOMAIN_CONTROLLERS`] and
-    /// `UpdateNumberOfDomainControllers` (still scaffolded) is what changes it.
+    /// `UpdateNumberOfDomainControllers` is what changes it.
     pub desired_number_of_domain_controllers: Option<i32>,
     /// The domain controllers this service placed in the directory, keyed by
     /// `DomainControllerId`; `DescribeDomainControllers` reports them. Only a directory
     /// of a type in [`DOMAIN_CONTROLLER_DIRECTORY_TYPES`] has any: `CreateMicrosoftAD`
-    /// places [`Directory::desired_number_of_domain_controllers`] of them, so the records
+    /// places [`Directory::desired_number_of_domain_controllers`] of them and
+    /// `UpdateNumberOfDomainControllers` adds or retires them, so the records
     /// live on the directory record and deleting the directory takes them with it.
     pub domain_controllers: BTreeMap<String, DomainControllerRecord>,
     /// This directory's tags, keyed by tag key: a second `AddTagsToResource` with a key
@@ -2071,21 +2083,23 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// later, so a caller that describes them immediately still sees the transient
     /// status.
     ///
-    /// `count` is clamped to [`MAX_DOMAIN_CONTROLLERS_PER_DIRECTORY`], and nothing is
-    /// placed for an id that names no stored directory — there is nothing to place
-    /// controllers in.
+    /// The directory is never left holding more than
+    /// [`MAX_DOMAIN_CONTROLLERS_PER_DIRECTORY`] — the count is clamped against what the
+    /// directory already holds — and nothing is placed for an id that names no stored
+    /// directory: there is nothing to place controllers in.
     pub fn place_domain_controllers(&mut self, directory_id: &str, count: usize, now: SystemTime) {
-        let Some(subnets) = self
+        let Some((subnets, already_placed)) = self
             .directories
             .get(directory_id)
-            .map(|directory| directory.subnet_ids())
+            .map(|directory| (directory.subnet_ids(), directory.domain_controllers.len()))
         else {
             return;
         };
         // The number of controllers to place is clamped BEFORE anything is allocated from
-        // it, so a count that reaches here from a caller-supplied number cannot size the
-        // placement.
-        let count = count.min(MAX_DOMAIN_CONTROLLERS_PER_DIRECTORY);
+        // it, and against the controllers the directory ALREADY holds, so no sequence of
+        // calls carrying a caller-supplied number can take one directory's set past the
+        // per-directory limit.
+        let count = count.min(MAX_DOMAIN_CONTROLLERS_PER_DIRECTORY.saturating_sub(already_placed));
         // The ids and the placement ranks come from the service-wide seeds, so they are
         // minted before the directory is borrowed mutably below.
         let mut placed: Vec<DomainControllerRecord> = Vec::with_capacity(count);
@@ -2094,7 +2108,13 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
             let seq = self.next_seq();
             placed.push(DomainControllerRecord {
                 domain_controller_id,
-                subnet_id: subnets.get(index % subnets.len().max(1)).cloned(),
+                // The round over the subnets continues from the controllers the
+                // directory already holds, so a controller added to a directory in
+                // service lands in the next subnet rather than doubling up on the
+                // first one.
+                subnet_id: subnets
+                    .get((already_placed + index) % subnets.len().max(1))
+                    .cloned(),
                 status: DOMAIN_CONTROLLER_STATUS_CREATING.to_string(),
                 status_due_at: Some(now + TRANSITION_SPAN),
                 launch_time: now,
@@ -2109,6 +2129,39 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
             directory
                 .domain_controllers
                 .insert(record.domain_controller_id.clone(), record);
+        }
+    }
+
+    /// Take the `count` most recently placed domain controllers out of the directory
+    /// `directory_id`, as of `now`.
+    ///
+    /// The controllers placed LAST are the ones a resize down takes out, so the servers a
+    /// directory has been running longest are the ones it keeps. Each one moves to
+    /// [`DOMAIN_CONTROLLER_STATUS_DELETING`] with its removal owed by the clock one
+    /// [`TRANSITION_SPAN`] later, so a caller that describes the directory immediately
+    /// still sees the controller in that transient status before it leaves the store
+    /// ([`Self::advance_clock`]) — the same shape as an address block leaving a directory.
+    ///
+    /// A controller already on its way out is not retired twice, and nothing happens for
+    /// an id that names no stored directory.
+    pub fn retire_domain_controllers(&mut self, directory_id: &str, count: usize, now: SystemTime) {
+        let Some(directory) = self.directories.get_mut(directory_id) else {
+            return;
+        };
+        let retiring: Vec<String> = directory
+            .domain_controllers_in_placement_order()
+            .into_iter()
+            .filter(|controller| controller.status != DOMAIN_CONTROLLER_STATUS_DELETING)
+            .rev()
+            .take(count)
+            .map(|controller| controller.domain_controller_id.clone())
+            .collect();
+        for domain_controller_id in retiring {
+            if let Some(controller) = directory.domain_controllers.get_mut(&domain_controller_id) {
+                controller.status = DOMAIN_CONTROLLER_STATUS_DELETING.to_string();
+                controller.status_due_at = Some(now + TRANSITION_SPAN);
+                controller.status_last_updated = now;
+            }
         }
     }
 
@@ -2146,7 +2199,7 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// status when
     /// `StartADAssessment` ran, a directory's data-access status when
     /// `EnableDirectoryDataAccess` ran, a directory's LDAPS status when `EnableLDAPS`
-    /// ran, a domain controller's status when the create that placed it ran.
+    /// ran, a domain controller's status when the placement or the retirement of it ran.
     pub fn advance_clock(&mut self, now: SystemTime) {
         for directory in self.directories.values_mut() {
             if let Some(due) = directory.stage_due_at {
@@ -2230,12 +2283,13 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                     extension.status_due_at = None;
                 }
             }
-            // The status transition placing a domain controller owes: the transient
-            // `Creating` settles on `Active`, the status a controller in service carries.
-            // The statuses a controller being removed or rebuilt passes through belong to
-            // `UpdateNumberOfDomainControllers` / `RestoreFromSnapshot`, both still
-            // scaffolded, so they land with those handlers rather than as branches
-            // nothing can reach.
+            // The status transitions the domain-controller writes owe: the transient
+            // `Creating` a placement answers in settles on `Active`, the status a
+            // controller in service carries, and a controller whose removal has fallen
+            // due is gone — a controller the directory no longer runs is not one
+            // `DescribeDomainControllers` reports. The status a controller rebuilt from a
+            // snapshot passes through belongs to `RestoreFromSnapshot`, still scaffolded,
+            // so it lands with that handler rather than as a branch nothing can reach.
             for controller in directory.domain_controllers.values_mut() {
                 let Some(due) = controller.status_due_at else {
                     continue;
@@ -2245,7 +2299,14 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                     controller.status_last_updated = due;
                     controller.status_due_at = None;
                 }
+                // A controller being removed has no settled status to move to: it leaves
+                // the store below, so its due instant is left in place for that pass to
+                // find.
             }
+            directory.domain_controllers.retain(|_, controller| {
+                controller.status != DOMAIN_CONTROLLER_STATUS_DELETING
+                    || controller.status_due_at.is_some_and(|due| now < due)
+            });
         }
         for snapshot in self.snapshots.values_mut() {
             let Some(due) = snapshot.status_due_at else {
@@ -2709,6 +2770,7 @@ modeled_failures!(
     DirectoryLimitExceededException,
     DirectoryNotSharedException,
     DirectoryUnavailableException,
+    DomainControllerLimitExceededException,
     EntityAlreadyExistsException,
     EntityDoesNotExistException,
     InsufficientPermissionsException,
