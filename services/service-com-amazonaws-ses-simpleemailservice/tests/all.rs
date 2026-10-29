@@ -75,6 +75,8 @@ mod ses_receipt_rule_set_listing;
 mod ses_receipt_rule_sets;
 #[path = "all/ses_reorder_receipt_rule_set.rs"]
 mod ses_reorder_receipt_rule_set;
+#[path = "all/ses_send_bulk_templated_email.rs"]
+mod ses_send_bulk_templated_email;
 #[path = "all/ses_send_raw_email.rs"]
 mod ses_send_raw_email;
 #[path = "all/ses_send_templated_email.rs"]

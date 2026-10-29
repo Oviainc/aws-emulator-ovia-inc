@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendBulkTemplatedEmail
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendBulkTemplatedEmail`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendBulkTemplatedEmail::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Composes ONE message per destination from one of this account's email
+//! templates and accepts each for sending: the conditions that hold for the
+//! whole call — the account's and the named configuration set's sending state,
+//! the sending identity, the template the request names — are refused with this
+//! operation's modelled errors, while a condition of ONE destination is reported
+//! as that destination's own status, in request order, so a call can be partly
+//! accepted. Every accepted destination is appended to this account's send log
+//! with the id reported for it.
 //!
 //! ## Shape of an operation
 //!
@@ -186,6 +186,61 @@ impl From<SendBulkTemplatedEmailErrorModeled> for SendBulkTemplatedEmailError {
     }
 }
 
+/// The recipients ONE of this call's messages may address, from this
+/// operation's own documentation: "The message may not include more than 50
+/// recipients, across the To:, CC: and BCC: fields." The same ceiling every
+/// send of this service documents, so the number itself lives in one place
+/// ([`crate::state::MAX_RECIPIENTS`]).
+const MAX_RECIPIENTS: usize = crate::state::MAX_RECIPIENTS;
+
+/// The destinations ONE call may carry, from this operation's own
+/// documentation: "You can specify up to 50 Destination objects within a
+/// Destinations array" ([`crate::state::MAX_BULK_DESTINATIONS`]).
+const MAX_DESTINATIONS: usize = crate::state::MAX_BULK_DESTINATIONS;
+
+/// `BulkEmailStatus$Success`: "Amazon SES accepted the message, and attempts to
+/// deliver it to the recipients."
+const SUCCESS: &str = "Success";
+
+/// `BulkEmailStatus$InvalidParameterValue`: "One or more of the parameters you
+/// specified when calling this operation was invalid. See the error message for
+/// additional information." — how a destination whose own recipient set this
+/// service cannot send to is reported.
+const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+
+/// `BulkEmailStatus$AccountDailyQuotaExceeded`: "You have reached or exceeded
+/// the maximum number of emails you can send from your account in a 24-hour
+/// period."
+const ACCOUNT_DAILY_QUOTA_EXCEEDED: &str = "AccountDailyQuotaExceeded";
+
+/// Refuse the whole call, as `MessageRejected` (HTTP 400): "Indicates that the
+/// action failed, and the message could not be sent."
+fn rejected(message: String) -> SendBulkTemplatedEmailError {
+    SendBulkTemplatedEmailErrorModeled::MessageRejected(MessageRejected {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// One destination's entry of the reported `Status` list: the status it ended
+/// in, the error explaining a status that is not [`SUCCESS`], and the id of the
+/// message that was logged for it when one was.
+///
+/// "One object per intended recipient. Check each response object and retry any
+/// messages with a failure status. (Note that order of responses will be
+/// respective to order of destinations in the request.)"
+fn destination_status(
+    status: &str,
+    error: Option<String>,
+    message_id: Option<String>,
+) -> BulkEmailDestinationStatus {
+    BulkEmailDestinationStatus {
+        status: Some(status.to_string()),
+        error,
+        message_id,
+    }
+}
+
 /// The `SendBulkTemplatedEmail` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -222,18 +277,235 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendBulkTemplatedEmail` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendBulkTemplatedEmailErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendBulkTemplatedEmail"))
+        // `ctx` carries the request metadata the identity gate reports: SES
+        // identities are per-Region, so the Region this send is scoped to is part
+        // of the refusal naming an unverified sender.
+        let region = crate::state::region_from_request(ctx.parts());
+        let source = crate::state::addr_spec(&input.source).to_string();
+
+        // The request's own shape is read first, ahead of anything the account
+        // holds, as every send of this service reads its recipient set first:
+        // "You can specify up to 50 Destination objects within a Destinations
+        // array."
+        if input.destinations.len() > MAX_DESTINATIONS {
+            return Err(rejected(format!(
+                "Destinations may include at most {MAX_DESTINATIONS} Destination objects, got {}",
+                input.destinations.len()
+            )));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all. Every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SendBulkTemplatedEmail",
+            ));
+        };
+        let mut state = state.lock();
+
+        // One instant for the whole call, with the verification move the clock
+        // already owes each of this account's identities materialised against
+        // it: the sender gate below reads the status a caller reading the same
+        // identity at this instant is reported.
+        let now = std::time::SystemTime::now();
+        state.settle_identities(now);
+
+        // The conditions that hold for the CALL rather than for one destination
+        // are refused with this operation's modelled errors, in the order every
+        // send of this service reads them: the account-wide pause, then the
+        // configuration set it names, then the sending identity, and only then
+        // the template.
+        if !state.account.sending_enabled {
+            return Err(
+                SendBulkTemplatedEmailErrorModeled::AccountSendingPausedException(
+                    AccountSendingPausedException {
+                        message: Some(
+                            "Email sending is disabled for this account. Enable it with \
+                             UpdateAccountSendingEnabled."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Some(configuration_set_name) = input.configuration_set_name.as_deref() {
+            let Some(configuration_set) = state.configuration_sets.get(configuration_set_name)
+            else {
+                return Err(
+                    SendBulkTemplatedEmailErrorModeled::ConfigurationSetDoesNotExistException(
+                        ConfigurationSetDoesNotExistException {
+                            configuration_set_name: Some(configuration_set_name.to_string()),
+                            message: Some(format!(
+                                "Configuration set <{configuration_set_name}> does not exist."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            if !configuration_set.sending_enabled {
+                return Err(
+                    SendBulkTemplatedEmailErrorModeled::ConfigurationSetSendingPausedException(
+                        ConfigurationSetSendingPausedException {
+                            configuration_set_name: Some(configuration_set_name.to_string()),
+                            message: Some(format!(
+                                "Email sending is disabled for configuration set \
+                                 <{configuration_set_name}>."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "The message must be sent from a verified email address or domain" —
+        // the same gate, read the same way, as every other send of this service,
+        // and ahead of the template the request names: the sending identity is
+        // what SES authorises the call on.
+        if !state.is_verified_sender(&source) {
+            return Err(rejected(crate::state::unverified_identities_message(
+                &region,
+                &[source.as_str()],
+            )));
+        }
+
+        // "The call must refer to an existing email template. You can create
+        // email templates using CreateTemplate." — one template composes every
+        // message of the call, so a name this account's template store does not
+        // hold refuses the call rather than each destination of it, in the same
+        // words as every other operation that resolves a template by name.
+        let Some(template) = state.templates.get(&input.template) else {
+            return Err(
+                SendBulkTemplatedEmailErrorModeled::TemplateDoesNotExistException(
+                    TemplateDoesNotExistException {
+                        template_name: Some(input.template.clone()),
+                        message: Some(format!("Template {} does not exist.", input.template)),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The parts every message of this call is composed from, taken while the
+        // stored template is still borrowed: the log keeps a bounded prefix of
+        // each, as it does for a send that carries its own message.
+        let subject = crate::state::logged_text(template.subject_part.as_deref());
+        let body = crate::state::logged_text(
+            template
+                .text_part
+                .as_deref()
+                .or(template.html_part.as_deref()),
+        );
+
+        // A negative `Max24HourSend` "signifies an unlimited quota" (the
+        // member's own documentation).
+        let quota = state.account.max_24_hour_send;
+
+        // One message per destination, in request order, each accepted or
+        // refused on its own: "All of the recipients in a Destination receive
+        // the same version of the email", and a condition of ONE destination is
+        // reported as that destination's status instead of failing the call.
+        let mut statuses = Vec::with_capacity(input.destinations.len());
+        for bulk_destination in &input.destinations {
+            let recipients = crate::state::destination_recipients(&bulk_destination.destination);
+
+            // "Each Destination parameter must include at least one recipient
+            // email address."
+            if recipients.is_empty() {
+                statuses.push(destination_status(
+                    INVALID_PARAMETER_VALUE,
+                    Some(
+                        "Destination must include at least one recipient address, across the \
+                         ToAddresses, CcAddresses and BccAddresses fields"
+                            .to_string(),
+                    ),
+                    None,
+                ));
+                continue;
+            }
+            if recipients.len() > MAX_RECIPIENTS {
+                statuses.push(destination_status(
+                    INVALID_PARAMETER_VALUE,
+                    Some(format!(
+                        "Destination may include at most {MAX_RECIPIENTS} recipients across the \
+                         ToAddresses, CcAddresses and BccAddresses fields, got {}",
+                        recipients.len()
+                    )),
+                    None,
+                ));
+                continue;
+            }
+            // "If a recipient email address is invalid (that is, it is not in
+            // the format UserName@[SubDomain.]Domain.TopLevelDomain), the entire
+            // message is rejected, even if the message contains other recipients
+            // that are valid." The entire MESSAGE, which in a bulk send is this
+            // destination and not the destinations beside it.
+            if let Some(invalid) = recipients
+                .iter()
+                .find(|address| !crate::state::is_email_address(crate::state::addr_spec(address)))
+            {
+                statuses.push(destination_status(
+                    INVALID_PARAMETER_VALUE,
+                    Some(crate::state::illegal_address_message(invalid)),
+                    None,
+                ));
+                continue;
+            }
+
+            // The account's own 24-hour quota, which every recipient of every
+            // message of this call counts against: it is read again per
+            // destination because the destinations ahead of this one have
+            // already been counted, so a call that reaches the quota part way
+            // through accepts what fits and reports the rest as the quota.
+            let already_sent = state.sent_last_24_hours(now);
+            if quota >= 0.0 && already_sent + recipients.len() as f64 > quota {
+                statuses.push(destination_status(
+                    ACCOUNT_DAILY_QUOTA_EXCEEDED,
+                    Some(crate::state::daily_quota_exceeded_message(
+                        quota,
+                        already_sent,
+                    )),
+                    None,
+                ));
+                continue;
+            }
+
+            // The message is accepted: mint its id, log it, and report the id
+            // that was stored — never one computed from the request. The
+            // replacement values the destination carried are the caller's own,
+            // and a template this send could not render is still an ACCEPTED
+            // message: "because it already accepted the message, Amazon SES
+            // doesn't return a message stating that it was unable to send the
+            // email."
+            let message_id = state.new_message_id();
+            // `DefaultTags` are the tags "to apply to an email that you send to
+            // a destination using SendBulkTemplatedEmail", and a destination's
+            // own `ReplacementTags` are the tags of the email sent to THAT
+            // destination, so they stand in for the defaults where the
+            // destination carries them.
+            let tags = bulk_destination
+                .replacement_tags
+                .as_deref()
+                .or(input.default_tags.as_deref())
+                .unwrap_or_default()
+                .iter()
+                .map(|tag| (tag.name.clone(), tag.value.clone()))
+                .collect();
+            state.log_sent_message(crate::state::SentMessage {
+                message_id: message_id.clone(),
+                source: source.clone(),
+                destinations: recipients,
+                subject: subject.clone(),
+                body: body.clone(),
+                configuration_set: input.configuration_set_name.clone(),
+                tags,
+                sent_at: now,
+            });
+            statuses.push(destination_status(SUCCESS, None, Some(message_id)));
+        }
+
+        Ok(SendBulkTemplatedEmailOutput { status: statuses })
     }
 }

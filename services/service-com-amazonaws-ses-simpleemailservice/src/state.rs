@@ -116,6 +116,15 @@ pub const MAX_CONFIGURATION_SET_NAME: usize = 64;
 /// operations that share the rule cannot disagree about the number.
 pub const MAX_RECIPIENTS: usize = 50;
 
+/// The destinations ONE bulk send may address, each of which is a separate
+/// message.
+///
+/// `SendBulkTemplatedEmail` documents it: "You can specify up to 50 Destination
+/// objects within a Destinations array." It is a ceiling on the destinations of
+/// one call, which is not the [`MAX_RECIPIENTS`] ceiling on the recipients of
+/// one message: a bulk send may address 50 destinations of 50 recipients each.
+pub const MAX_BULK_DESTINATIONS: usize = 50;
+
 /// The bytes one raw message may carry, attachments included.
 ///
 /// `SendRawEmail` documents it: "The maximum message size, including
@@ -2787,8 +2796,9 @@ fn is_letters_digits_name(name: &str, max: usize) -> bool {
 /// They are flattened because SES treats them as one recipient set: the
 /// [`MAX_RECIPIENTS`] ceiling is "across the To:, CC: and BCC: fields", and each
 /// one counts once against the sending quota. One reading here, so every
-/// operation that carries a `Destination` — `SendEmail` and `SendTemplatedEmail`
-/// — resolves the same recipient set out of it.
+/// operation that carries a `Destination` — `SendEmail`, `SendTemplatedEmail`
+/// and each destination of `SendBulkTemplatedEmail` — resolves the same
+/// recipient set out of it.
 pub fn destination_recipients(destination: &crate::ops::types::Destination) -> Vec<String> {
     [
         destination.to_addresses.as_ref(),
