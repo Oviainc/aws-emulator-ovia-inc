@@ -35,6 +35,8 @@ mod export_refusal_classes;
 mod job_identifier_syntax;
 #[path = "all/owed_status_due_instants.rs"]
 mod owed_status_due_instants;
+#[path = "all/owed_transition_settle_step.rs"]
+mod owed_transition_settle_step;
 #[path = "all/page_context_filter_values.rs"]
 mod page_context_filter_values;
 #[path = "all/page_token_under_a_changing_filter.rs"]

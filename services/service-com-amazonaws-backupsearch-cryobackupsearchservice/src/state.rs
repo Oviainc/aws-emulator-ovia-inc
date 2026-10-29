@@ -118,8 +118,15 @@ pub const STOPPED: &str = "STOPPED";
 /// See [`RUNNING`].
 pub const FAILED: &str = "FAILED";
 
-/// The statuses a search job never leaves: a scan that ended, a stop that took effect,
-/// or a scan that failed. `CREATING`, `RUNNING` and `STOPPING` are the transient ones.
+/// The statuses a record of this service never leaves: a scan that ended, a stop that
+/// took effect, or a scan or an export that failed. `CREATING`, `RUNNING` and `STOPPING`
+/// are the transient ones, as is the `CREATED` an export job's own status vocabulary
+/// declares (`smithy_query(query="shape", shape="ExportJobSummary")`).
+///
+/// It governs BOTH record types, because it is what decides whether a transition the
+/// clock materialises writes a `CompletionTime` ([`settle_owed_statuses`]): the terminal
+/// statuses of an export job's vocabulary are spelled by the same two constants as a
+/// search job's.
 pub const TERMINAL_STATES: &[&str] = &[COMPLETED, STOPPED, FAILED];
 
 /// The status a recovery point's record reports for its backup INDEX while that index is
@@ -328,6 +335,87 @@ impl ClientToken {
 fn expire_client_token(token: &mut Option<ClientToken>, now: SystemTime) {
     if token.as_ref().is_some_and(|held| !held.is_valid_at(now)) {
         *token = None;
+    }
+}
+
+/// One transition the clock owes a record: the instant it is owed FROM, the status it
+/// moves the record to, and the `StatusMessage` that status comes with (`None` for one
+/// that needs no message).
+///
+/// The message is OWNED rather than a fixed sentence, because a status the service has to
+/// explain can need text counted from the record itself ([`scan_outcome`]) and not only
+/// one of this module's templates.
+pub type OwedTransition = (SystemTime, &'static str, Option<String>);
+
+/// The members one owed transition writes, borrowed from whichever record holds them.
+///
+/// What lets [`settle_owed_statuses`] write them ONCE for every record type of this store
+/// instead of once per record type.
+#[derive(Debug)]
+pub struct StatusMembers<'a> {
+    /// The status the record reports.
+    pub status: &'a mut String,
+    /// The `StatusMessage` that status comes with.
+    pub status_message: &'a mut Option<String>,
+    /// The instant the record reached a status it never leaves.
+    pub completion_time: &'a mut Option<DateTime>,
+}
+
+/// A record of this store whose status the CLOCK moves: the service owes it a later
+/// status without anybody calling again, and it can hold a `ClientToken` whose validity
+/// window the same clock closes.
+///
+/// Both record types this service persists are one ([`SearchJob`] and [`ExportJob`]), and
+/// both are settled by the single step below rather than by a copy of it each: a record
+/// states only WHERE its token, its owed transitions and its status members live, plus
+/// whatever else reaching a status does to it.
+pub trait OwedStatusRecord {
+    /// The `ClientToken` the request that minted this record carried, if any.
+    fn client_token_mut(&mut self) -> &mut Option<ClientToken>;
+
+    /// The next transition the clock owes this record, WITHOUT dropping it — `None` for a
+    /// record that is owed nothing more.
+    fn owed_transition(&self) -> Option<OwedTransition>;
+
+    /// Drop the transition [`OwedStatusRecord::owed_transition`] reported, now that it has
+    /// been materialised.
+    fn drop_owed_transition(&mut self);
+
+    /// Where this record's status, that status's message and its completion time live.
+    fn status_members(&mut self) -> StatusMembers<'_>;
+
+    /// Whatever else reaching `status` does to THIS record, applied once the members above
+    /// are written. Nothing by default: for a record whose status is all a transition
+    /// moves, there is nothing else to write.
+    fn on_status_reached(&mut self, _status: &'static str) {}
+}
+
+/// Materialise on `record` every transition the clock has already made due, in order — so
+/// a record nobody looked at while two of its spans passed reports the later status
+/// rather than catching up one call at a time — and drop a `ClientToken` the clock has
+/// carried past its window.
+///
+/// THE one place this store's owed-transition rule is written: every record type goes
+/// through it, so the rule cannot be spelled one way for one record type and another way
+/// for the next.
+pub fn settle_owed_statuses<R: OwedStatusRecord>(record: &mut R, now: SystemTime) {
+    expire_client_token(record.client_token_mut(), now);
+    while let Some((due, next, message)) = record.owed_transition() {
+        if now < due {
+            return;
+        }
+        record.drop_owed_transition();
+        let members = record.status_members();
+        *members.status = next.to_string();
+        // The status and the message that status comes with are written together, so a
+        // record can never explain a failure it has not reached, nor reach one silently.
+        *members.status_message = message;
+        // `CompletionTime` is when the record COMPLETED, so only a status it never leaves
+        // sets it: passing through a transient status completes nothing.
+        if TERMINAL_STATES.contains(&next) {
+            *members.completion_time = Some(timestamp(due));
+        }
+        record.on_status_reached(next);
     }
 }
 
@@ -852,7 +940,7 @@ pub struct SearchJob {
     /// the job was started (the same instant the scope itself was resolved, so a recovery
     /// point indexed later does not change a running scan's outcome).
     ///
-    /// [`SearchJob::settle`] moves them into [`SearchJob::results`] when the scan reaches
+    /// [`settle_owed_statuses`] moves them into [`SearchJob::results`] when the scan reaches
     /// [`COMPLETED`], which is the instant the progress reports them matched: a reader can
     /// page exactly the matches the progress counts, never more.
     pub scan_matches: Vec<ResultItem>,
@@ -889,11 +977,11 @@ pub struct SearchJob {
     /// whole span, and a client acting right after one call is never carried past the
     /// phase that call put the job in.
     ///
-    /// The message is OWNED rather than a fixed sentence, exactly as
-    /// [`ExportJob::next_status_due`]'s is: a terminal status the service has to explain
-    /// can need text counted from the job's own record ([`scan_outcome`]), not only one of
-    /// this module's templates.
-    pub owed_statuses: VecDeque<(SystemTime, &'static str, Option<String>)>,
+    /// Each entry is an [`OwedTransition`], exactly as [`ExportJob::next_status_due`]'s
+    /// one is: the message it carries is OWNED, because a terminal status the service has
+    /// to explain can need text counted from the job's own record ([`scan_outcome`]), not
+    /// only one of this module's templates.
+    pub owed_statuses: VecDeque<OwedTransition>,
 }
 
 impl SearchJob {
@@ -944,10 +1032,34 @@ impl SearchJob {
         self.owed_statuses.push_back((due, status, message));
     }
 
-    /// Apply every owed status transition the clock has already made due, in order — so a
-    /// job nobody looked at while two of its spans passed reports the later status rather
-    /// than catching up one call at a time.
-    ///
+}
+
+/// A search job's status is moved by the clock, so [`settle_owed_statuses`] moves it —
+/// including the one part of a transition that belongs to THIS record: the matches the
+/// scan recorded and the progress written with them.
+impl OwedStatusRecord for SearchJob {
+    fn client_token_mut(&mut self) -> &mut Option<ClientToken> {
+        &mut self.client_token
+    }
+
+    /// A scan owes a QUEUE of statuses ([`SearchJob::owed_statuses`]), so the next one due
+    /// is the front of it.
+    fn owed_transition(&self) -> Option<OwedTransition> {
+        self.owed_statuses.front().cloned()
+    }
+
+    fn drop_owed_transition(&mut self) {
+        self.owed_statuses.pop_front();
+    }
+
+    fn status_members(&mut self) -> StatusMembers<'_> {
+        StatusMembers {
+            status: &mut self.status,
+            status_message: &mut self.status_message,
+            completion_time: &mut self.completion_time,
+        }
+    }
+
     /// The scan's progress is brought to the scope it was given — a scan that ran to
     /// `COMPLETED` has scanned everything in scope and matched exactly the results it
     /// recorded; one that was `STOPPED` keeps the progress it had reached, and one that
@@ -957,45 +1069,25 @@ impl SearchJob {
     /// ([`SearchJob::scan_matches`] -> [`SearchJob::results`]), so what
     /// `ListSearchJobResults` pages and what the progress counts as matched are written at
     /// one instant and can never disagree.
-    fn settle(&mut self, now: SystemTime) {
-        expire_client_token(&mut self.client_token, now);
-        while let Some(&(due, _, _)) = self.owed_statuses.front() {
-            if now < due {
-                return;
-            }
-            let (_, next, message) = self
-                .owed_statuses
-                .pop_front()
-                .expect("the queue front was just observed");
-            self.status = next.to_string();
-            // The status and the message that status comes with are written together, so
-            // a record can never explain a failure it has not reached, nor reach one
-            // silently.
-            self.status_message = message;
-            // `CompletionTime` is when the job COMPLETED, so only a status the job never
-            // leaves sets it: passing through a transient status completes nothing.
-            if TERMINAL_STATES.contains(&next) {
-                self.completion_time = Some(timestamp(due));
-            }
-            if next == COMPLETED {
-                // A scan that got through its scope has RECORDED the matches it found, so
-                // they become readable at this instant and not before — and the progress
-                // is written from the same record, so the matched count and the results a
-                // reader pages cannot disagree.
-                self.results = std::mem::take(&mut self.scan_matches);
-                self.current_search_progress = CurrentSearchProgress {
-                    recovery_points_scanned_count: self
-                        .search_scope_summary
-                        .total_recovery_points_to_scan_count,
-                    items_scanned_count: self.search_scope_summary.total_items_to_scan_count,
-                    items_matched_count: Some(self.results.len() as i64),
-                };
-            } else if TERMINAL_STATES.contains(&next) {
-                // The scan ended without getting through its scope, so the matches it
-                // would have recorded are no longer owed to anybody: it keeps whatever it
-                // had already recorded and finds nothing more.
-                self.scan_matches = Vec::new();
-            }
+    fn on_status_reached(&mut self, status: &'static str) {
+        if status == COMPLETED {
+            // A scan that got through its scope has RECORDED the matches it found, so they
+            // become readable at this instant and not before — and the progress is written
+            // from the same record, so the matched count and the results a reader pages
+            // cannot disagree.
+            self.results = std::mem::take(&mut self.scan_matches);
+            self.current_search_progress = CurrentSearchProgress {
+                recovery_points_scanned_count: self
+                    .search_scope_summary
+                    .total_recovery_points_to_scan_count,
+                items_scanned_count: self.search_scope_summary.total_items_to_scan_count,
+                items_matched_count: Some(self.results.len() as i64),
+            };
+        } else if TERMINAL_STATES.contains(&status) {
+            // The scan ended without getting through its scope, so the matches it would
+            // have recorded are no longer owed to anybody: it keeps whatever it had already
+            // recorded and finds nothing more.
+            self.scan_matches = Vec::new();
         }
     }
 }
@@ -1090,28 +1182,35 @@ pub struct ExportJob {
     /// from: a repeat under the same `ClientToken` is idempotent, a different body under
     /// that token is a conflict.
     pub request_fingerprint: String,
-    /// The status the clock owes this export job, the instant it is owed from, and the
-    /// `StatusMessage` that status comes with (`None` for one that needs no message).
-    /// `None` once it has reached a status it never leaves.
-    pub next_status_due: Option<(SystemTime, &'static str, Option<String>)>,
+    /// The transition the clock owes this export job ([`OwedTransition`]): the status, the
+    /// instant it is owed from and the `StatusMessage` that status comes with. `None` once
+    /// the job has reached a status it never leaves.
+    pub next_status_due: Option<OwedTransition>,
 }
 
-impl ExportJob {
-    /// Apply the owed status transition if the clock has already made it due.
-    fn settle(&mut self, now: SystemTime) {
-        expire_client_token(&mut self.client_token, now);
-        let Some((due, next, message)) = self.next_status_due.clone() else {
-            return;
-        };
-        if now < due {
-            return;
-        }
-        self.status = next.to_string();
+/// An export job's status is moved by the clock exactly as a search job's is, so the same
+/// [`settle_owed_statuses`] moves it; nothing beyond its status members is written when it
+/// reaches one, so it overrides no more of the step than where its own members live.
+impl OwedStatusRecord for ExportJob {
+    fn client_token_mut(&mut self) -> &mut Option<ClientToken> {
+        &mut self.client_token
+    }
+
+    /// An export job owes at most ONE transition, so that is the next one due.
+    fn owed_transition(&self) -> Option<OwedTransition> {
+        self.next_status_due.clone()
+    }
+
+    fn drop_owed_transition(&mut self) {
         self.next_status_due = None;
-        self.completion_time = Some(timestamp(due));
-        // The status and the message it comes with are written together, so a record can
-        // never report a failure's text while it is still RUNNING.
-        self.status_message = message;
+    }
+
+    fn status_members(&mut self) -> StatusMembers<'_> {
+        StatusMembers {
+            status: &mut self.status,
+            status_message: &mut self.status_message,
+            completion_time: &mut self.completion_time,
+        }
     }
 }
 
@@ -1216,12 +1315,16 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// `ListTagsForResource`) are exempt — they reach a job's tag set by ARN, which no
     /// owed status transition touches, so settling could not change what they read or
     /// write.
+    ///
+    /// Both record types go through the ONE step that implements the rule
+    /// ([`settle_owed_statuses`]), so what a status transition writes cannot differ
+    /// between them.
     pub fn settle(&mut self, now: SystemTime) {
         for job in self.search_jobs.values_mut() {
-            job.settle(now);
+            settle_owed_statuses(job, now);
         }
         for job in self.export_jobs.values_mut() {
-            job.settle(now);
+            settle_owed_statuses(job, now);
         }
     }
 
