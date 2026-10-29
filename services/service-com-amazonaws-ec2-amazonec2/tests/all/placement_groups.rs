@@ -19,7 +19,10 @@
 //! TAKES THE GROUP IT NAMES OUT OF THE ACCOUNT: neither its name nor its id resolves for
 //! any later caller, the name is free for a new group, and a name the account holds no
 //! group under is refused with `InvalidPlacementGroup.Unknown` rather than reported as a
-//! deletion that happened.
+//! deletion that happened. A delete that happened answers the ec2Query envelope's success
+//! flag and NOTHING about the group it removed — the operation's modelled output shape
+//! declares no members — and a group any other group still names as its parent, at whatever
+//! depth of a chain, stays stored.
 //!
 //! Every table row is a distinct input along what that generalises over — the strategy (one
 //! row per member of the model's own `PlacementStrategy` catalog), the name's value, length
@@ -27,7 +30,7 @@
 //! spread level, the tag count and the signed Region — so the one case a recording happens
 //! to contain is one row among many rather than the specification.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, MAX_PLACEMENT_GROUPS, PlacementGroupSpec,
@@ -36,6 +39,9 @@ use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::ec2_query::{error_code, error_message, member};
+// The media type every response of this service declares, named from the suite that owns
+// that rule so the two cannot drift.
+use super::ec2_query_envelope::RESPONSE_CONTENT_TYPE;
 use super::wire::{child, child_text, document, is_long_id, param, Param};
 
 /// The Region most calls here are signed for.
@@ -1545,6 +1551,186 @@ async fn a_dry_run_delete_removes_nothing() {
     delete_ok(case, &router, "dry-delete").await;
     let (status, body) = describe(&router, &[param("GroupName.1", "dry-delete")]).await;
     assert_unknown_group(case, "dry-delete", status, &body);
+}
+
+/// The direct children a successful `DeletePlacementGroup` envelope carries — and the only
+/// ones it may. The operation's modelled output shape is `smithy.api#Unit`
+/// (`smithy_query(query="operation",operation="DeletePlacementGroup")`), which declares no
+/// members at all, so the whole answer is the correlation id every ec2Query response closes
+/// with and the envelope's success flag; a third element would be a member AWS publishes no
+/// rule for.
+const DELETE_ENVELOPE_CHILDREN: [&str; 2] = ["requestId", "return"];
+
+/// The names of the DIRECT children of a response envelope's root, in document order — read
+/// through the XML parser, so an element nested inside a reported resource is never counted
+/// as the envelope's own.
+fn envelope_child_names(case: &str, body: &str) -> Vec<String> {
+    let parsed = document(case, body);
+    parsed
+        .root_element()
+        .children()
+        .filter(|node| node.is_element())
+        .map(|node| node.tag_name().name().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_successful_delete_answers_the_envelope_s_success_flag_and_nothing_else() {
+    // The rule: a delete that happened reports the success of the call and nothing about the
+    // group it removed — the modelled output declares no members — in the media type every
+    // response of this service declares, under a correlation id generated per response.
+    // One row per member of the `PlacementStrategy` catalog plus the name and tag rows of
+    // [`delete_cases`], so the shape of the answer is pinned across the inputs a delete
+    // generalises over rather than for one name.
+    let router = emulator();
+    let mut seen_request_ids: BTreeSet<String> = BTreeSet::new();
+    for (case, group_name, extra) in delete_cases() {
+        let mut params = vec![param("GroupName", &group_name)];
+        params.extend(extra);
+        create_ok(case, &router, &params).await;
+
+        let (status, content_type, body) = super::ec2_query::call_with_content_type(
+            &router,
+            REGION,
+            "DeletePlacementGroup",
+            &[param("GroupName", &group_name)],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from DeletePlacementGroup, got {status} \
+             with body {body}"
+        );
+        assert_eq!(
+            content_type.as_deref(),
+            Some(RESPONSE_CONTENT_TYPE),
+            "case {case:?}: expected content-type {RESPONSE_CONTENT_TYPE:?}, got \
+             {content_type:?} with body {body}"
+        );
+
+        // Exactly one success flag, reading `true`: the operation's whole report of what it
+        // did. `envelope_children` pins the root element and its namespace on the way.
+        let flags = super::ec2_query::envelope_children(case, &body, "DeletePlacementGroup", "return");
+        assert_eq!(
+            flags,
+            vec!["true".to_string()],
+            "case {case:?}: expected exactly one <return>true</return>, got {flags:?} \
+             in {body}"
+        );
+
+        // Exactly one correlation id, non-empty and never repeated: it names THIS response.
+        let request_ids =
+            super::ec2_query::envelope_children(case, &body, "DeletePlacementGroup", "requestId");
+        assert_eq!(
+            request_ids.len(),
+            1,
+            "case {case:?}: expected exactly one <requestId>, got {request_ids:?} in {body}"
+        );
+        let request_id = request_ids.into_iter().next().expect("one request id");
+        assert!(
+            !request_id.is_empty(),
+            "case {case:?}: expected a non-empty <requestId>, got {request_id:?} in {body}"
+        );
+        assert!(
+            seen_request_ids.insert(request_id.clone()),
+            "case {case:?}: every response carries its own id, got {request_id:?} a second \
+             time in {body}"
+        );
+
+        // And nothing else: no member of the group that was removed is reported back.
+        let reported = envelope_child_names(case, &body);
+        let unexpected: Vec<String> = reported
+            .iter()
+            .filter(|name| !DELETE_ENVELOPE_CHILDREN.contains(&name.as_str()))
+            .cloned()
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "case {case:?}: expected only {DELETE_ENVELOPE_CHILDREN:?} under the envelope, \
+             got the extra {unexpected:?} in {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delete_refuses_every_group_a_deeper_chain_still_names_as_a_parent() {
+    // "You cannot delete a placement group that is a parent of a cluster placement group.
+    // Delete the cluster placement groups first" (`DeletePlacementGroup`) holds at every
+    // depth, not only for the group one level above a leaf: a chain of four groups, each
+    // naming the one before it as its parent, deletes ONLY from the leaf end, one level per
+    // call.
+    let router = emulator();
+    let case = "a chain of four cluster groups";
+    let chain = ["root", "middle", "lower", "leaf"];
+    let mut ids: Vec<String> = Vec::new();
+    for (position, group_name) in chain.iter().enumerate() {
+        let mut params = vec![param("GroupName", group_name), param("Strategy", "cluster")];
+        if let Some(parent_id) = ids.last() {
+            params.push(param("ParentGroupId", parent_id));
+        }
+        let created = create_ok(case, &router, &params).await;
+        let group = one_group(case, &created);
+        assert_eq!(
+            group.member("parentGroupId"),
+            ids.last().map(String::as_str),
+            "case {case:?}: group {position} must report the parent it was created under, \
+             got {:?}",
+            group.member("parentGroupId")
+        );
+        ids.push(group.required(case, "groupId").to_string());
+    }
+
+    // Every group but the leaf is a parent, so every one of them is refused — and the chain
+    // is still whole after each refusal.
+    let mut remaining: Vec<String> = ids.clone();
+    for (position, group_name) in chain.iter().enumerate().take(chain.len() - 1) {
+        let (status, body) = delete(&router, &[param("GroupName", group_name)]).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 deleting {group_name:?} at depth {position}, \
+             got {status} with body {body}"
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code, "InvalidPlacementGroup.InUse",
+            "case {case:?}: expected InvalidPlacementGroup.InUse for {group_name:?}, got \
+             {code:?} with body {body}"
+        );
+        // The refusal names the group the request named, whichever depth it sits at.
+        let message = error_message(&body);
+        let expected = format!("The placement group '{group_name}' is in use.");
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the message {expected:?}, got {message:?} with \
+             body {body}"
+        );
+        let listed = describe_ok(case, &router, &[]).await;
+        let mut reported = reported_ids(case, &listed);
+        reported.sort();
+        let mut expected_ids = remaining.clone();
+        expected_ids.sort();
+        assert_eq!(
+            reported, expected_ids,
+            "case {case:?}: a refused delete must remove nothing, got {reported:?} \
+             from {listed}"
+        );
+    }
+
+    // From the leaf end, each delete frees exactly the group above it and no more.
+    for group_name in chain.iter().rev() {
+        delete_ok(case, &router, group_name).await;
+        remaining.pop();
+        let listed = describe_ok(case, &router, &[]).await;
+        let mut reported = reported_ids(case, &listed);
+        reported.sort();
+        let mut expected_ids = remaining.clone();
+        expected_ids.sort();
+        assert_eq!(
+            reported, expected_ids,
+            "case {case:?}: after deleting {group_name:?} the account must hold \
+             {expected_ids:?}, got {reported:?} from {listed}"
+        );
+    }
 }
 
 #[tokio::test]
