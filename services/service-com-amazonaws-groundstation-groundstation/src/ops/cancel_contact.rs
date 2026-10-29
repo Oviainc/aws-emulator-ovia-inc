@@ -187,7 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // Accepted: the reservation is released. Before the pass that is CANCELLED
             // outright; during it the contact is STOPPED — CANCELLING while the stop is
-            // carried out, and the antenna time the pass already used stays spent.
+            // carried out, and the antenna time the pass already used stays spent against
+            // the account's usage. Either way the released reservation holds no antenna
+            // once the release has settled, so the antenna is free for another pass.
             contact.begin_cancellation(crate::state::now_timestamp());
         }
 

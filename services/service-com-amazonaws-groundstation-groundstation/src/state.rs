@@ -1430,6 +1430,9 @@ pub struct Contact {
     /// so those minutes stay spent however the status moves on afterwards: stopping a
     /// pass under way lands the contact on `CANCELLED`, and a release cannot give back
     /// antenna time the pass has already used (see [`Contact::holds_antenna_time`]).
+    ///
+    /// A record of minutes SPENT, not of an antenna held: which antennas a ground station
+    /// still has held is [`Contact::reserves_antenna`].
     pub antenna_time_spent: bool,
 }
 
@@ -1663,24 +1666,26 @@ impl ContactVersionRecord {
     }
 }
 
-/// The `ContactStatus` values in which a contact holds NO antenna time for the account,
-/// so its window counts no minutes against the account's monthly usage.
+/// The `ContactStatus` values in which a contact's reservation holds NO antenna at the
+/// ground station: the block of antenna time was never held on the account's behalf, or it
+/// has been given back.
 ///
 /// Source: the model's own enum, whose values are `SCHEDULING`, `FAILED_TO_SCHEDULE`,
 /// `SCHEDULED`, `CANCELLED`, `AWS_CANCELLED`, `PREPASS`, `PASS`, `POSTPASS`, `COMPLETED`,
 /// `FAILED`, `AVAILABLE`, `CANCELLING` and `AWS_FAILED` (`smithy_query(query="shape",
-/// shape="ContactStatus")`). The five listed here are the ones where the antenna was
-/// never held on the account's behalf: a window merely offered and never reserved
-/// (`AVAILABLE`), a reservation that never became a contact (`FAILED_TO_SCHEDULE`), one
-/// released before the pass by the customer or by AWS (`CANCELLED`, `AWS_CANCELLED`) and
-/// one the service itself failed (`AWS_FAILED`). Every other value is a contact the
-/// account holds or held the antenna for — including `CANCELLING`, whose release has not
-/// completed, and `FAILED`, whose antenna time was still reserved.
+/// shape="ContactStatus")`). The five listed here are the ones where the antenna is not
+/// held: a window merely offered and never reserved (`AVAILABLE`), a reservation that
+/// never became a contact (`FAILED_TO_SCHEDULE`), one released by the customer or by AWS
+/// (`CANCELLED`, `AWS_CANCELLED`) and one the service itself failed (`AWS_FAILED`). Every
+/// other value is a contact whose reservation still holds its antenna — including
+/// `CANCELLING`, whose release has not completed, and `FAILED`, whose antenna time was
+/// still reserved.
 ///
-/// A status in this list releases the minutes only when the antenna was never actually
-/// held: a contact STOPPED mid-pass lands on `CANCELLED` with its antenna time already
-/// spent, which [`Contact::antenna_time_spent`] records and [`Contact::holds_antenna_time`]
-/// honours.
+/// It answers TWO different questions, which [`Contact::reserves_antenna`] and
+/// [`Contact::holds_antenna_time`] keep apart: whether the antenna is held right now (the
+/// status alone decides it), and whether the account's minutes were spent (a pass already
+/// under way spent them, and a release cannot give them back —
+/// [`Contact::antenna_time_spent`]).
 ///
 /// CHOSEN classification: the API documents the member only as "total scheduled minutes",
 /// so which statuses release their minutes is this emulator's rule, applied in one place
@@ -1694,13 +1699,29 @@ pub const STATUSES_WITHOUT_ANTENNA_TIME: &[&str] = &[
 ];
 
 impl Contact {
+    /// Whether this contact's reservation holds its antenna at the ground station RIGHT
+    /// NOW, so that antenna is not free for another pass over the same window and the
+    /// reservation is one the ground station reports: its status is not one of
+    /// [`STATUSES_WITHOUT_ANTENNA_TIME`].
+    ///
+    /// The current status is the whole answer. Antenna time a pass already used
+    /// ([`Contact::antenna_time_spent`]) stays spent for the account's usage, but it is not
+    /// a hold on the antenna: a reservation that has been released holds nothing, so the
+    /// antenna it was on is free again even when the pass it was stopped mid-way through
+    /// had already used some of its time.
+    pub fn reserves_antenna(&self) -> bool {
+        !STATUSES_WITHOUT_ANTENNA_TIME.contains(&self.contact_status.as_str())
+    }
+
     /// Whether this contact holds (or held) antenna time for the account, so its minutes
-    /// count against the usage of the month it starts in: its status is not one of
-    /// [`STATUSES_WITHOUT_ANTENNA_TIME`], or its pass already spent the antenna time
+    /// count against the usage of the month it starts in: its reservation still holds its
+    /// antenna ([`Contact::reserves_antenna`]), or its pass already spent the antenna time
     /// ([`Contact::antenna_time_spent`]) and no later status move gives it back.
+    ///
+    /// A BILLING question, not a placement one — see [`Contact::reserves_antenna`] for
+    /// which antennas are held.
     pub fn holds_antenna_time(&self) -> bool {
-        self.antenna_time_spent
-            || !STATUSES_WITHOUT_ANTENNA_TIME.contains(&self.contact_status.as_str())
+        self.antenna_time_spent || self.reserves_antenna()
     }
 
     /// Whether a cancel still has something to release here: the reservation is live and
@@ -1763,7 +1784,9 @@ impl Contact {
     /// [`CONTACT_CANCELLED`] [`CANCELLATION_SETTLES_AFTER`] from now (materialised by
     /// `settle_due_contacts`). That pass already had the antenna on the account's behalf,
     /// so the stop also records the antenna time as spent: a release cannot give back
-    /// time the pass has already used.
+    /// time the pass has already used. Those spent minutes are a BILLING record only — the
+    /// released reservation holds no antenna once the stop has settled
+    /// ([`Contact::reserves_antenna`]).
     pub fn begin_cancellation(&mut self, now: DateTime) {
         if STATUSES_CANCELLABLE_DURING_PASS.contains(&self.contact_status.as_str()) {
             self.antenna_time_spent = true;
@@ -5118,7 +5141,7 @@ impl ComAmazonawsGroundstationGroundstationState {
     /// The antennas at `ground_station` that something already holds for any instant of
     /// `window` (`(start, end)` in epoch seconds): the ones a maintenance window AWS
     /// scheduled has taken out of service, and the ones a contact of this account whose
-    /// reservation still holds antenna time ([`Contact::holds_antenna_time`]) is placed on.
+    /// reservation still holds its antenna ([`Contact::reserves_antenna`]) is placed on.
     ///
     /// A released reservation holds nothing, so the antenna it was on is free again. Read
     /// in ONE pass over each store, so placing a pass does not rescan them per candidate
@@ -5142,7 +5165,7 @@ impl ComAmazonawsGroundstationGroundstationState {
             .contacts
             .values()
             .filter(|contact| contact.ground_station == ground_station)
-            .filter(|contact| contact.holds_antenna_time())
+            .filter(|contact| contact.reserves_antenna())
             .filter(|contact| {
                 windows_overlap(
                     (

@@ -21,7 +21,9 @@
 //! * every value of the model's `ReservationType` as a filter, singly, together, in either
 //!   order and named not at all;
 //! * every value of the model's `ContactStatus`, asserting which ones still hold the
-//!   antenna — and the same release through the front door, with `CancelContact`;
+//!   antenna — crossed with whether the contact's pass had already spent antenna time, which
+//!   is a billing record and so changes none of those answers — and the same release through
+//!   the front door, with `CancelContact`, from each side of the pass it can arrive on;
 //! * the placement rule: an antenna serves one pass at a time, so a table of overlapping
 //!   and disjoint windows lands on the antennas the rule requires, maintenance included,
 //!   and a pass at a ground station whose antennas this account HAS been told about is
@@ -45,8 +47,11 @@ use service_com_amazonaws_groundstation_groundstation::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::contact_cancellation::put_in_status;
 use crate::minute_usage::STATUS_HOLDS_ANTENNA_TIME;
-use crate::scheduling_loop::{create_mission_profile, harness_with_engine, list_pages, send, Reply};
+use crate::scheduling_loop::{
+    create_mission_profile, harness_with_engine, list_pages, send, Reply, AFTER_SETTLE,
+};
 
 /// The instant every window in this suite is measured from: a round epoch-seconds value
 /// in the future, as the other suites of this target use.
@@ -633,6 +638,202 @@ async fn cancelling_a_contact_releases_its_reservation_and_frees_the_antenna() {
         }],
         "case after-cancelling: the freed antenna takes the next pass, got {reused:#?}"
     );
+}
+
+/// The ground station one row of a table holds its pass at, named after the row.
+///
+/// A row's pass must be the only thing holding an antenna at its station — an antenna
+/// serves one pass at a time, so one row's hold would otherwise be what the next row
+/// observes. `GroundStationName` admits only ` a-zA-Z0-9-._:=`
+/// (`smithy_query(query="shape", shape="GroundStationName")`), so an underscore in a
+/// status name becomes a dash.
+fn row_station(case: &str) -> String {
+    format!("{STATION}-{}", case.replace('_', "-"))
+}
+
+#[tokio::test]
+async fn spent_antenna_time_does_not_keep_an_antenna_held() {
+    let (router, engine) = harness_with_engine();
+    let profile_arn = create_mission_profile(&router, "spent table", 60, None, None).await;
+    let window = (BASE, BASE + 1800);
+
+    // Rows span the whole `ContactStatus` enum crossed with whether the contact's pass had
+    // already spent antenna time on the account's behalf. The spent minutes are a BILLING
+    // record, not a hold on an antenna, so which antennas the ground station has held is
+    // decided by the status alone and every row of a status answers the same either way.
+    for (status, holds) in STATUS_HOLDS_ANTENNA_TIME {
+        for spent in [false, true] {
+            let case = format!("{status}-{}", if spent { "spent" } else { "unspent" });
+            let station = row_station(&case);
+            let contact_id =
+                reserve_pass_at(&router, &profile_arn, &station, &case, window).await;
+            {
+                // The statuses below are reached by the scheduler and the pass itself, and
+                // the spent flag by a pass the clock carried into its window — neither of
+                // which a request drives — so the stored contact is set directly.
+                let state = service_state(&*engine).expect("this service's state store");
+                let mut guard = state.lock();
+                let contact = guard
+                    .contacts
+                    .get_mut(&contact_id)
+                    .expect("the reserved contact");
+                contact.contact_status = (*status).to_string();
+                contact.antenna_time_spent = spent;
+                // The moves are applied, so no clock-owed move can take the status back.
+                contact.scheduling_settles_at = None;
+                contact.cancellation_settles_at = None;
+            }
+
+            let reported = reservations(&router, &station, WINDOW, &[]).await;
+            let expected_count = usize::from(*holds);
+            assert_eq!(
+                reported.len(),
+                expected_count,
+                "case {case}: a contact in this status holds {expected_count} reservation(s) \
+                 at the ground station, whatever antenna time its pass already spent, got \
+                 {reported:#?}"
+            );
+
+            // The placement answers the same question, so it must give the same answer:
+            // this station has one antenna, free for another pass over the same window
+            // exactly when nothing holds it.
+            let probe = reserve_reply(&router, &profile_arn, &station, window).await;
+            if *holds {
+                assert_eq!(
+                    probe.status, 431,
+                    "case {case}: the antenna is still held, so a second pass over the same \
+                     window is refused with the modelled InvalidParameterException status \
+                     431, got {} {}",
+                    probe.status, probe.body
+                );
+                assert_eq!(
+                    probe.error_code(),
+                    "InvalidParameterException",
+                    "case {case}: wrong error shape, got {}",
+                    probe.body
+                );
+            } else {
+                assert_eq!(
+                    probe.status, 200,
+                    "case {case}: this contact holds no antenna, so the window is reservable \
+                     again, got {} {}",
+                    probe.status, probe.body
+                );
+                let successor = probe.string("contactId");
+                let placed = reservations(&router, &station, WINDOW, &[CONTACT]).await;
+                assert_eq!(
+                    placed,
+                    vec![Reservation {
+                        reservation_type: CONTACT.to_string(),
+                        ground_station_id: station.clone(),
+                        antenna_name: antenna_name(1),
+                        start_time: window.0,
+                        end_time: window.1,
+                        details: format!("contact={successor}"),
+                    }],
+                    "case {case}: the freed antenna takes the next pass, and only that pass \
+                     is reported, got {placed:#?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_release_frees_the_antenna_from_whichever_side_of_the_pass_it_arrives_on() {
+    let (router, engine) = harness_with_engine();
+    let profile_arn = create_mission_profile(&router, "release table", 60, None, None).await;
+    let window = (BASE, BASE + 1800);
+
+    // Rows differ along where the contact stood when the cancel arrived: before its pass,
+    // where the reservation is released outright, and at each stage of a pass already under
+    // way, where the contact is STOPPED — which spends the antenna time the pass used and
+    // reports `CANCELLING` until the stop settles. Source of the statuses: the model's own
+    // `ContactStatus` (`smithy_query(query="shape", shape="ContactStatus")`), taken on the
+    // side of the pass `CancelContact`'s doc puts each one.
+    let rows: [(&str, bool); 5] = [
+        ("SCHEDULING", false),
+        ("SCHEDULED", false),
+        ("PREPASS", true),
+        ("PASS", true),
+        ("POSTPASS", true),
+    ];
+
+    let mut released: Vec<(&str, String, String)> = Vec::new();
+    for (status, stopped) in rows {
+        let station = row_station(status);
+        let contact_id = reserve_pass_at(&router, &profile_arn, &station, status, window).await;
+        put_in_status(&engine, &contact_id, status);
+
+        let before = reservations(&router, &station, WINDOW, &[]).await;
+        assert_eq!(
+            before.len(),
+            1,
+            "case {status}: before the cancel this contact holds its antenna, got {before:#?}"
+        );
+
+        let cancelled = send(&router, "DELETE", &format!("/contact/{contact_id}"), None).await;
+        assert_eq!(
+            cancelled.status, 200,
+            "case {status}: CancelContact expected 200, got {} {}",
+            cancelled.status, cancelled.body
+        );
+
+        if stopped {
+            // A release still being carried out has not given the antenna back yet, so the
+            // reservation is still reported while the stop is in flight.
+            let during = reservations(&router, &station, WINDOW, &[]).await;
+            assert_eq!(
+                during.len(),
+                1,
+                "case {status}: a release still being carried out keeps holding its antenna, \
+                 got {during:#?}"
+            );
+        }
+        released.push((status, station, contact_id));
+    }
+
+    // Every stop the cancels started is due by now, so each contact has settled.
+    std::thread::sleep(AFTER_SETTLE);
+
+    for (status, station, contact_id) in &released {
+        let described = send(&router, "GET", &format!("/contact/{contact_id}"), None).await;
+        assert_eq!(
+            described.status, 200,
+            "case {status}: DescribeContact expected 200, got {} {}",
+            described.status, described.body
+        );
+        assert_eq!(
+            described.string("contactStatus"),
+            "CANCELLED",
+            "case {status}: the release settles on CANCELLED, got {}",
+            described.body
+        );
+
+        let after = reservations(&router, station, WINDOW, &[]).await;
+        assert!(
+            after.is_empty(),
+            "case {status}: a released reservation holds no antenna, whatever antenna time \
+             its pass had already spent, got {after:#?}"
+        );
+
+        // And the antenna it was on is free again, so the next pass over the same window
+        // takes it rather than being refused for want of antenna time.
+        let successor = reserve_pass_at(&router, &profile_arn, station, status, window).await;
+        let reused = reservations(&router, station, WINDOW, &[]).await;
+        assert_eq!(
+            reused,
+            vec![Reservation {
+                reservation_type: CONTACT.to_string(),
+                ground_station_id: station.clone(),
+                antenna_name: antenna_name(1),
+                start_time: window.0,
+                end_time: window.1,
+                details: format!("contact={successor}"),
+            }],
+            "case {status}: the freed antenna takes the next pass, got {reused:#?}"
+        );
+    }
 }
 
 #[tokio::test]

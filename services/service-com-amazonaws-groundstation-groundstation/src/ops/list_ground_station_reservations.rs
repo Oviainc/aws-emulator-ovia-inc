@@ -281,12 +281,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     contact.start_time.as_secs_f64(),
                     contact.end_time.as_secs_f64(),
                 );
-                // A contact whose status holds no antenna time at the ground station
-                // reserves nothing there — a window that was only ever offered, a
-                // reservation that never became a contact, or one released before its
-                // pass — so there is no reservation of it to report.
+                // A contact whose status holds no antenna at the ground station reserves
+                // nothing there — a window that was only ever offered, a reservation that
+                // never became a contact, or one that has been released — so there is no
+                // reservation of it to report. Antenna time a stopped pass already spent
+                // stays spent for the account's usage, but it is not a hold on the
+                // antenna, so it is not reported as one either
+                // (`crate::state::Contact::reserves_antenna`).
                 if contact.ground_station != input.ground_station_id
-                    || !contact.holds_antenna_time()
+                    || !contact.reserves_antenna()
                     || !crate::state::windows_overlap(held, window)
                 {
                     continue;
