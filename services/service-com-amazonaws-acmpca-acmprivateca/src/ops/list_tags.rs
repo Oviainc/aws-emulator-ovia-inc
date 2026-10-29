@@ -83,8 +83,10 @@
 //! Reports the tag set `TagCertificateAuthority`, `UntagCertificateAuthority` and
 //! `CreateCertificateAuthority` persisted on the CA, in tag-key order, a page at a time:
 //! `MaxResults` tags per page, and a `NextToken` carrying the key the next page resumes
-//! after whenever tags are left over. A CA that holds no tags is reported with no `Tags`
-//! member, because `TagList` is modelled `len 1..50` and so has no empty value.
+//! after whenever tags are left over. The `Tags` member is always part of the answer: a CA
+//! that holds no tags is reported with it EMPTY, since `TagList`'s `len 1..50` bounds a
+//! tag list a request supplies and not the collection a read reports, and a client reads
+//! the member of a successful read without having to ask whether it is there.
 //!
 //! Reporting only: nothing here writes, beyond the CREATING -> PENDING_CERTIFICATE
 //! transition the clock already owed.
@@ -241,9 +243,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(ListTagsOutput {
-            // `Tags` is `len 1..50`: a CA with no tags, or a page that resumed past the
-            // last one, answers with the member absent rather than an empty list.
-            tags: (!page.is_empty()).then_some(page),
+            // The member is reported whatever the CA holds: a CA with no tags, and a page
+            // that resumed past the last one, answer with it empty rather than absent, so
+            // the response has one shape for every CA.
+            tags: Some(page),
             next_token,
         })
     }

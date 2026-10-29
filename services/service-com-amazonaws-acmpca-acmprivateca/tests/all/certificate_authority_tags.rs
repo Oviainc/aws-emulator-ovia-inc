@@ -320,16 +320,18 @@ async fn untagging_removes_a_key_by_itself_and_a_key_with_its_value() {
         );
     }
 
-    // A CA left with no tags reports no `Tags` member at all: `TagList` is modelled
-    // `len 1..50`, so it has no empty value.
+    // A CA left with no tags reports the `Tags` member EMPTY rather than omitting it:
+    // `TagList`'s `len 1..50` bounds a tag list a request supplies, not the collection a
+    // read reports, so a successful read has one shape whatever the CA holds.
     let case = "an untagged CA";
     let arn = created_ca(&emulator, "untagged-ca").await;
     let answer = emulator
         .ok(case, "ListTags", &json!({"CertificateAuthorityArn": arn}))
         .await;
-    assert!(
-        answer.get("Tags").is_none(),
-        "case {case:?}: expected no Tags member for a CA that holds none, got {answer:?}"
+    assert_eq!(
+        answer.get("Tags"),
+        Some(&json!([])),
+        "case {case:?}: expected an empty Tags member for a CA that holds none, got {answer:?}"
     );
     assert!(
         answer.get("NextToken").is_none(),

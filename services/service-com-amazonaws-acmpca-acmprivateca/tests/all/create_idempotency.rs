@@ -250,6 +250,120 @@ async fn one_token_with_the_same_configuration_replays_the_first_ca() {
     );
 }
 
+/// One token honoured for TWO requests remembers both: reusing it for another
+/// configuration mints a CA of its own and does NOT displace the record of the request the
+/// token was first honoured for, so the first request stays replayable for the rest of its
+/// window — and so does each later one.
+///
+/// The rows are the other configurations the token is reused with, differing in which part
+/// of the configuration changed; after each one, the FIRST request is repeated verbatim and
+/// has to answer the first CA again.
+#[tokio::test]
+async fn a_token_reused_for_another_configuration_keeps_replaying_the_first() {
+    let emulator = Emulator::new();
+
+    let first_arn = string(
+        &emulator
+            .ok(
+                "the first CA",
+                "CreateCertificateAuthority",
+                &create_with(&first_configuration()),
+            )
+            .await,
+        "CertificateAuthorityArn",
+        "the first CA",
+    );
+
+    let rows: [(&str, Value); 3] = [
+        (
+            "a different key algorithm",
+            json!({
+                "KeyAlgorithm": "RSA_4096",
+                "SigningAlgorithm": "SHA256WITHRSA",
+                "Subject": {"CommonName": "ca-a"},
+            }),
+        ),
+        (
+            "a different common name",
+            json!({
+                "KeyAlgorithm": "RSA_2048",
+                "SigningAlgorithm": "SHA256WITHRSA",
+                "Subject": {"CommonName": "ca-b"},
+            }),
+        ),
+        (
+            "a different signing algorithm",
+            json!({
+                "KeyAlgorithm": "RSA_2048",
+                "SigningAlgorithm": "SHA512WITHRSA",
+                "Subject": {"CommonName": "ca-a"},
+            }),
+        ),
+    ];
+
+    let mut minted: BTreeSet<String> = BTreeSet::new();
+    minted.insert(first_arn.clone());
+    for (case, configuration) in &rows {
+        let body = create_with(configuration);
+        let other = string(
+            &emulator.ok(case, "CreateCertificateAuthority", &body).await,
+            "CertificateAuthorityArn",
+            case,
+        );
+        assert!(
+            minted.insert(other.clone()),
+            "case {case:?}: another configuration must mint a CA of its own, got {other:?} \
+             again"
+        );
+
+        // The first request, verbatim, after the token was reused for this row: the record
+        // of the first configuration is still the token's answer for it.
+        let replayed = string(
+            &emulator
+                .ok(
+                    case,
+                    "CreateCertificateAuthority",
+                    &create_with(&first_configuration()),
+                )
+                .await,
+            "CertificateAuthorityArn",
+            case,
+        );
+        assert_eq!(
+            replayed, first_arn,
+            "case {case:?}: expected the first request to keep replaying {first_arn:?}, got \
+             {replayed:?}"
+        );
+
+        // And this row's own request replays its own CA, so the token remembers both.
+        let again = string(
+            &emulator.ok(case, "CreateCertificateAuthority", &body).await,
+            "CertificateAuthorityArn",
+            case,
+        );
+        assert_eq!(
+            again, other,
+            "case {case:?}: expected this configuration to replay {other:?}, got {again:?}"
+        );
+    }
+
+    // One CA per distinct configuration asked for, and no more: no repeat minted anything.
+    let listed = emulator
+        .ok("the CAs the emulator holds", "ListCertificateAuthorities", &json!({}))
+        .await;
+    let held: BTreeSet<String> = listed
+        .get("CertificateAuthorities")
+        .and_then(Value::as_array)
+        .unwrap_or(&Vec::new())
+        .iter()
+        .map(|authority| string(authority, "Arn", "the CAs the emulator holds"))
+        .collect();
+    assert_eq!(
+        held, minted,
+        "expected one CA per configuration asked for: {minted:?}, got {held:?}"
+    );
+}
+
 /// A token is not a handle to a resource: two DIFFERENT tokens carrying the same
 /// configuration are two calls, so each mints its own CA.
 #[tokio::test]

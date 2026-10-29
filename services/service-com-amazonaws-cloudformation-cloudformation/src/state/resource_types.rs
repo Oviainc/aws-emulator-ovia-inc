@@ -73,7 +73,10 @@
 //! template to this catalogue would refuse types the expansion would have produced. Such a
 //! template is admitted, and its resources are recorded as declared.
 
-use super::template::{DeclaredResource, Template, ACMPCA_CERTIFICATE_AUTHORITY};
+use super::template::{
+    DeclaredResource, Template, ACMPCA_CERTIFICATE, ACMPCA_CERTIFICATE_AUTHORITY,
+    ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION,
+};
 
 /// The namespace Amazon Web Services' own resource types live under: a type spelled with
 /// it is recognised exactly when [`AWS_RESOURCE_TYPES`] carries it.
@@ -125,13 +128,14 @@ const TEMPLATE_FORMAT_ERROR_PREFIX: &str = "Template format error: ";
 /// add it here, in its namespace's group, rather than to weaken the check to a shape test
 /// (`AWS::<anything>::<anything>`), which would admit `AWS::SWF::Domain` again.
 pub const AWS_RESOURCE_TYPES: &[&str] = &[
-    // Amazon Web Services Private CA. Only the certificate authority itself is created in
-    // the owning service (`super::provisioner`); the other three are recognised because
-    // the resource reference publishes them, and are left declared-only like every other
-    // catalogued type this emulator provisions nothing for.
-    "AWS::ACMPCA::Certificate",
+    // Amazon Web Services Private CA. The certificate authority itself, a certificate one
+    // of its CAs issues and the activation of a CA with such a certificate are created in
+    // the owning service (`super::provisioner`); `AWS::ACMPCA::Permission` is recognised
+    // because the resource reference publishes it, and is left declared-only like every
+    // other catalogued type this emulator provisions nothing for.
+    ACMPCA_CERTIFICATE,
     ACMPCA_CERTIFICATE_AUTHORITY,
-    "AWS::ACMPCA::CertificateAuthorityActivation",
+    ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION,
     "AWS::ACMPCA::Permission",
     // Amazon MQ
     "AWS::AmazonMQ::Broker",

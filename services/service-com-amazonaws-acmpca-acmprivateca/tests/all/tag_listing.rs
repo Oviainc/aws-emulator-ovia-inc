@@ -53,10 +53,14 @@ async fn ca_with_tags(emulator: &Emulator, case: &str, subject: &str, tags: &[Ta
 }
 
 /// The tags a `ListTags` response reports, as `(key, value)` pairs in the order they were
-/// returned. An absent `Tags` member is the empty set.
+/// returned. The `Tags` member is part of every successful answer
+/// ([`the_tags_member_is_present_whatever_the_ca_holds`]), so an answer that omits it is a
+/// failure of that rule rather than an empty set.
 fn reported_tags(case: &str, response: &Value) -> Vec<ReportedTag> {
     match response.get("Tags") {
-        None => Vec::new(),
+        None => panic!(
+            "case {case:?}: expected ListTags to report a Tags member, got {response:?}"
+        ),
         Some(Value::Array(items)) => items
             .iter()
             .map(|tag| {
@@ -350,5 +354,119 @@ async fn list_tags_refuses_a_continuation_token_it_did_not_issue() {
         actual, expected,
         "case {:?}: expected the rest of the listing {expected:?}, got {actual:?}",
         "the token's own listing"
+    );
+}
+
+/// Every successful `ListTags` carries the `Tags` member, EMPTY where the page holds no
+/// tags: the answer has one shape whatever the CA happens to hold, so a client reads the
+/// member of a 200 without first asking whether it is there.
+///
+/// The rows differ along every way a page can come out holding nothing: a CA created with
+/// no tags, one whose tags were all removed afterwards, and a page resumed past the last
+/// tag the listing had left. A CA that does hold tags is the control row, reporting the
+/// same member non-empty.
+#[tokio::test]
+async fn the_tags_member_is_present_whatever_the_ca_holds() {
+    let emulator = Emulator::new();
+
+    /// The `Tags` member of a response, which has to BE there and BE a list.
+    fn tags_member<'a>(case: &str, response: &'a Value) -> &'a Vec<Value> {
+        match response.get("Tags") {
+            Some(Value::Array(items)) => items,
+            other => panic!(
+                "case {case:?}: expected a present, list-valued Tags member, got {other:?} \
+                 in {response:?}"
+            ),
+        }
+    }
+
+    // A CA created with no tags at all.
+    let case = "a CA created with no tags";
+    let bare = ca_with_tags(&emulator, case, "member-bare", &[]).await;
+    let response = emulator
+        .ok(case, "ListTags", &json!({"CertificateAuthorityArn": bare}))
+        .await;
+    assert!(
+        tags_member(case, &response).is_empty(),
+        "case {case:?}: expected an empty Tags member, got {response:?}"
+    );
+    assert!(
+        response.get("NextToken").is_none(),
+        "case {case:?}: expected no NextToken for an untruncated listing, got {response:?}"
+    );
+
+    // A CA that held tags and holds none any more.
+    let case = "a CA whose tags were all removed";
+    let tags: Vec<TagRow> = vec![("alpha", Some("1")), ("beta", Some("2"))];
+    let emptied = ca_with_tags(&emulator, case, "member-emptied", &tags).await;
+    emulator
+        .ok(
+            case,
+            "UntagCertificateAuthority",
+            &json!({
+                "CertificateAuthorityArn": emptied,
+                "Tags": [{"Key": "alpha", "Value": "1"}, {"Key": "beta", "Value": "2"}],
+            }),
+        )
+        .await;
+    let response = emulator
+        .ok(case, "ListTags", &json!({"CertificateAuthorityArn": emptied}))
+        .await;
+    assert!(
+        tags_member(case, &response).is_empty(),
+        "case {case:?}: expected an empty Tags member once every tag was removed, got \
+         {response:?}"
+    );
+
+    // A page resumed past the last tag the listing had left: the token was issued while
+    // the CA still held the tag it resumes after, and that tag is gone by the time it is
+    // used, so the page comes out holding nothing.
+    let case = "a page resumed past the last tag";
+    let paged = ca_with_tags(&emulator, case, "member-paged", &tags).await;
+    let first_page = emulator
+        .ok(
+            case,
+            "ListTags",
+            &json!({"CertificateAuthorityArn": paged, "MaxResults": 1}),
+        )
+        .await;
+    let token = reported_token(case, &first_page).expect("a truncated page carries a token");
+    emulator
+        .ok(
+            case,
+            "UntagCertificateAuthority",
+            &json!({
+                "CertificateAuthorityArn": paged,
+                "Tags": [{"Key": "beta", "Value": "2"}],
+            }),
+        )
+        .await;
+    let response = emulator
+        .ok(
+            case,
+            "ListTags",
+            &json!({"CertificateAuthorityArn": paged, "NextToken": token}),
+        )
+        .await;
+    assert!(
+        tags_member(case, &response).is_empty(),
+        "case {case:?}: expected an empty Tags member for a page past the last tag, got \
+         {response:?}"
+    );
+    assert!(
+        response.get("NextToken").is_none(),
+        "case {case:?}: expected no NextToken past the end of the listing, got {response:?}"
+    );
+
+    // The control row: the same member, non-empty, for a CA that does hold tags.
+    let case = "a CA that holds tags";
+    let tagged = ca_with_tags(&emulator, case, "member-tagged", &tags).await;
+    let response = emulator
+        .ok(case, "ListTags", &json!({"CertificateAuthorityArn": tagged}))
+        .await;
+    assert_eq!(
+        tags_member(case, &response).len(),
+        tags.len(),
+        "case {case:?}: expected the CA's own tags in the member, got {response:?}"
     );
 }

@@ -6,6 +6,12 @@
 //! this service persists. Nothing here attaches or removes a policy: `PutPolicy` and
 //! `DeletePolicy` own that.
 //!
+//! The resolution is two-stage, as it is for every operation of this service that reads
+//! something OF a private CA: the ARN's shape, then the authority it names, then the
+//! policy attached to that authority. Each stage has its own sentence, so a caller can
+//! tell an ARN it mistyped from an authority that is gone from an authority that simply
+//! carries no policy yet.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -174,19 +180,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
+        // The AUTHORITY the ARN names is resolved first. "If either the private CA
+        // resource or the policy cannot be found, this action returns a
+        // ResourceNotFoundException" (this operation's docs) makes both absences that one
+        // code, and which RESOURCE could not be found is what the sentence says: a request
+        // naming no private CA of this service is answered about the CA, exactly as every
+        // other operation that resolves one answers it.
+        //
         // Reporting only: `certificate_authority_mut` materialises the CREATING ->
         // PENDING_CERTIFICATE change the clock already owed, which came due at the same
         // instant whether or not anybody read the policy. Reading a policy neither
         // attaches nor removes one, so a later caller sees exactly what this one saw.
-        let policy = state
-            .certificate_authority_mut(&resource_arn, ::std::time::SystemTime::now())
-            .and_then(|record| record.resource_policy.clone());
+        let Some(record) =
+            state.certificate_authority_mut(&resource_arn, ::std::time::SystemTime::now())
+        else {
+            return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
+        };
 
-        // "If either the private CA resource or the policy cannot be found, this action
-        // returns a ResourceNotFoundException" (this operation's docs): a CA that does
-        // not exist and a CA with no policy attached are the SAME refusal, about the
-        // policy this operation was asked for.
-        let Some(policy) = policy else {
+        // The authority exists, so the only thing left to resolve is the policy attached
+        // to it, and its absence is the policy's own sentence.
+        let Some(policy) = record.resource_policy.clone() else {
             return Err(not_found(
                 crate::state::POLICY_NOT_FOUND_MESSAGE.to_string(),
             ));

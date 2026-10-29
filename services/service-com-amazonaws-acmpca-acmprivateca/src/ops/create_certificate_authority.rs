@@ -241,7 +241,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // @idempotent: a repeat of the same token inside the five-minute window answers
         // with the CA the first call minted instead of minting a second one. A token
         // reused for a DIFFERENT configuration is not a repeat of that call, so it mints
-        // a CA of its own ([`crate::state::replay_idempotent`]).
+        // a CA of its own, and the record of the first configuration stays replayable for
+        // the rest of its window ([`crate::state::replay_idempotent`]).
         if let Some(arn) = crate::state::replay_idempotent(
             &mut state.create_idempotency,
             input.idempotency_token.as_ref(),
@@ -318,7 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_serial: 1,
             certificates: ::std::collections::HashMap::new(),
             permissions: ::std::vec::Vec::new(),
-            issue_idempotency: ::std::collections::HashMap::new(),
+            issue_idempotency: crate::state::IdempotencyRecords::new(),
             arn: arn.clone(),
         };
 

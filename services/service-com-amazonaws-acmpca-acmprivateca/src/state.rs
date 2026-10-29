@@ -157,6 +157,17 @@ pub const INVALID_ARN_MESSAGE: &str = "Not a valid arn.";
 /// one sentence about the certificate, the same for the certificate and for the chain.
 pub const MALFORMED_CERTIFICATE_MESSAGE: &str = "Malformed certificate.";
 
+/// The `CertificateAuthorityType` member of a CA that signs its own certificate: "ROOT"
+/// (`CreateCertificateAuthorityRequest$CertificateAuthorityType`). A `SUBORDINATE` CA's
+/// certificate is signed by another CA, so only this kind self-signs.
+pub const CA_TYPE_ROOT: &str = "ROOT";
+
+/// The `TemplateArn` segment of the certificate template that produces a ROOT CA's own
+/// certificate: `arn:aws:acm-pca:::template/RootCACertificate/V1` and any later version of
+/// it. Matched as the segment rather than as a whole ARN, because the version is the
+/// template's own and the rule is about which KIND of certificate was asked for.
+pub const ROOT_CA_CERTIFICATE_TEMPLATE: &str = ":template/RootCACertificate/";
+
 /// What Amazon Web Services Private CA answers when a CA is asked to issue a certificate
 /// in a state that does not allow issuance: one sentence about the CA, naming no request
 /// of its own.
@@ -202,14 +213,17 @@ pub const RESTORE_WITHOUT_RESTORATION_PERIOD_MESSAGE: &str =
 /// sentence is an example of the wording.
 pub const PERMISSION_NOT_FOUND_MESSAGE: &str = "Could not find a Permission for specified CA.";
 
-/// What Amazon Web Services Private CA answers when the resource-based policy a request
-/// asks for is not there.
+/// What Amazon Web Services Private CA answers when the private CA a request names is
+/// resolved and the resource-based policy asked for is not attached to it.
 ///
-/// `GetPolicy`'s docs make the two absences one refusal — "If either the private CA
-/// resource or the policy cannot be found, this action returns a
-/// ResourceNotFoundException" — so the sentence is about the POLICY, the thing the
-/// operation was asked for, and names no resource of the request's own. The corpus records
-/// it there (`acm-pca.get-policy-not-found`).
+/// `GetPolicy`'s docs make the two absences one CODE — "If either the private CA resource
+/// or the policy cannot be found, this action returns a ResourceNotFoundException" — and
+/// the sentence is what says WHICH resource was not found: this one is about the POLICY, so
+/// it is the answer for an authority that exists and carries none, while an ARN that names
+/// no authority of this service is answered with [`CA_NOT_FOUND_MESSAGE`]. Both are
+/// recorded (`acm-pca.get-policy-not-found` for a live CA with no policy,
+/// `acm-pca.ca-arn-validation-precedes-resource-lookup` for an ARN no CA answers to), and
+/// neither names a resource of the request's own.
 pub const POLICY_NOT_FOUND_MESSAGE: &str = "Could not find policy for specified resource.";
 
 /// `SigningAlgorithm`'s members in the order the model DECLARES them, which is the order
@@ -289,9 +303,10 @@ pub const MAX_CERTIFICATES_PER_CA: usize = 1_000;
 /// which names the quota.
 pub const MAX_PERMISSIONS_PER_CA: usize = 100;
 
-/// Most live idempotency tokens one map holds. Expired entries are swept on every
-/// record, and the oldest live entry is evicted at the ceiling, so a caller sending a
-/// fresh token per request cannot grow the map without limit.
+/// Most live idempotency records one map holds, across every token in it. Expired entries
+/// are swept on every record, and the oldest live entry is evicted at the ceiling, so a
+/// caller sending a fresh token per request — or one token with a fresh request each time —
+/// cannot grow the map without limit.
 pub const MAX_IDEMPOTENCY_TOKENS: usize = 128;
 
 /// Most items one page of a listing carries, whatever `MaxResults` asks for: "Although
@@ -849,7 +864,7 @@ pub struct CertificateAuthorityRecord {
     /// record: "if you call IssueCertificate multiple times with the same idempotency
     /// token … Amazon Web Services Private CA recognizes that you are requesting only one
     /// certificate and will issue only one" (`IssueCertificateRequest$IdempotencyToken`).
-    pub issue_idempotency: HashMap<String, IdempotencyEntry<()>>,
+    pub issue_idempotency: IdempotencyRecords<()>,
 }
 
 impl CertificateAuthorityRecord {
@@ -1000,6 +1015,43 @@ impl CertificateAuthorityRecord {
     /// certificate it was activated with.
     pub fn resolves_policies(&self) -> bool {
         self.ca_certificate_pem.is_some()
+    }
+
+    /// Whether this CA is being asked for the one certificate it can sign before it holds
+    /// a certificate of its own: its SELF-SIGNED ROOT certificate.
+    ///
+    /// A root CA's own certificate is signed by the CA itself, which is why the documented
+    /// procedure for creating one has `IssueCertificate` called on the CA that is still
+    /// waiting for a certificate — with that CA's OWN certification request, under the
+    /// root CA certificate template — and the certificate that comes back is what
+    /// `ImportCertificateAuthorityCertificate` then activates it with. So all four have to
+    /// hold: the CA waits for its certificate, it is a root, the request names the root CA
+    /// certificate template, and the certification request presented is the CA's own.
+    /// Anything else asked of a CA outside `ACTIVE` is the state refusal
+    /// ([`ISSUANCE_INVALID_STATE_MESSAGE`]).
+    pub fn signs_its_own_root_certificate(
+        &self,
+        template_arn: Option<&str>,
+        certification_request: &[u8],
+    ) -> bool {
+        self.status == STATUS_PENDING_CERTIFICATE
+            && self.ca_type == CA_TYPE_ROOT
+            && template_arn.is_some_and(|arn| arn.contains(ROOT_CA_CERTIFICATE_TEMPLATE))
+            && self.is_own_certification_request(certification_request)
+    }
+
+    /// Whether `presented` carries the very certification request this CA published
+    /// ([`derive_csr_pem`]), compared as the DER it frames so the PEM's own line breaks
+    /// and framing do not decide it.
+    fn is_own_certification_request(&self, presented: &[u8]) -> bool {
+        let own = parse_pem_block(&self.csr_pem, PEM_LABEL_CSR);
+        let presented = ::std::str::from_utf8(presented)
+            .ok()
+            .and_then(|text| parse_pem_block(text, PEM_LABEL_CSR));
+        match (own, presented) {
+            (Some(own), Some(presented)) => own == presented,
+            _ => false,
+        }
     }
 }
 
@@ -1345,41 +1397,54 @@ impl<R> IdempotencyEntry<R> {
     }
 }
 
-/// Look `token` up in an idempotency map, ignoring (and pruning) an expired entry.
+/// An idempotency map: for each token, what each REQUEST that token was honoured for
+/// minted.
+///
+/// A token is honoured per request, not per token, so the map holds one entry per distinct
+/// request a token has been seen with inside the window. That is what keeps the record of
+/// one call from being displaced by another call sharing its token: the first request stays
+/// replayable for the whole of its window however many other requests reuse the token in
+/// the meantime.
+pub type IdempotencyRecords<R> = HashMap<String, Vec<IdempotencyEntry<R>>>;
+
+/// Look `token` up in an idempotency map, ignoring (and pruning) expired entries.
 ///
 /// A token is a replay only of the request it was recorded for: an entry whose `request`
 /// is not the one being made is not this call's answer, so the caller goes on and creates
 /// a resource of its own rather than being handed a handle to someone else's. That is what
 /// keeps one token reused across two different requests from collapsing them into one
-/// resource — the token distinguishes retries of ONE call, it does not name a resource.
+/// resource — the token distinguishes retries of ONE call, it does not name a resource —
+/// and the request it does not match is left where it is, so a later retry of THAT request
+/// still replays what it minted.
 pub fn replay_idempotent<R: PartialEq>(
-    tokens: &mut HashMap<String, IdempotencyEntry<R>>,
+    tokens: &mut IdempotencyRecords<R>,
     token: Option<&String>,
     request: &R,
     now: SystemTime,
 ) -> Option<String> {
     let token = token?;
-    match tokens.get(token) {
-        Some(entry) if now < entry.expires_at => {
-            (entry.request == *request).then(|| entry.arn.clone())
-        }
-        Some(_) => {
-            tokens.remove(token);
-            None
-        }
-        None => None,
+    let entries = tokens.get_mut(token)?;
+    entries.retain(|entry| now < entry.expires_at);
+    if entries.is_empty() {
+        tokens.remove(token);
+        return None;
     }
+    entries
+        .iter()
+        .find(|entry| entry.request == *request)
+        .map(|entry| entry.arn.clone())
 }
 
-/// Remember that `token` minted `arn`, keeping the map bounded.
+/// Remember that `token` minted `arn` for `request`, keeping the map bounded.
 ///
 /// The five-minute window is enforced as a real eviction policy, not only when the same
 /// token comes back: every record sweeps the entries that have expired, and at
 /// [`MAX_IDEMPOTENCY_TOKENS`] live entries the oldest INSERTED entry (the lowest
-/// `sequence`) makes room. A caller sending a fresh token per request therefore cannot
-/// grow this map without limit, and an absent token is simply not remembered.
+/// `sequence`) makes room, whichever token holds it. A caller sending a fresh token per
+/// request — or one token with a fresh request each time — therefore cannot grow this map
+/// without limit, and an absent token is simply not remembered.
 pub fn record_idempotent<R>(
-    tokens: &mut HashMap<String, IdempotencyEntry<R>>,
+    tokens: &mut IdempotencyRecords<R>,
     token: Option<String>,
     request: R,
     arn: &str,
@@ -1388,18 +1453,51 @@ pub fn record_idempotent<R>(
     let Some(token) = token else {
         return;
     };
-    tokens.retain(|_, entry| now < entry.expires_at);
-    while tokens.len() >= MAX_IDEMPOTENCY_TOKENS {
-        let Some(oldest) = tokens
-            .iter()
-            .min_by_key(|(_, entry)| entry.sequence)
-            .map(|(token, _)| token.clone())
-        else {
-            break;
-        };
-        tokens.remove(&oldest);
+    for entries in tokens.values_mut() {
+        entries.retain(|entry| now < entry.expires_at);
     }
-    tokens.insert(token, IdempotencyEntry::new(arn, request, now));
+    tokens.retain(|_, entries| !entries.is_empty());
+    while recorded_requests(tokens) >= MAX_IDEMPOTENCY_TOKENS {
+        if !evict_oldest(tokens) {
+            break;
+        }
+    }
+    tokens
+        .entry(token)
+        .or_default()
+        .push(IdempotencyEntry::new(arn, request, now));
+}
+
+/// How many requests the map remembers across every token it holds, which is what
+/// [`MAX_IDEMPOTENCY_TOKENS`] bounds.
+fn recorded_requests<R>(tokens: &IdempotencyRecords<R>) -> usize {
+    tokens.values().map(Vec::len).sum()
+}
+
+/// Drop the entry inserted longest ago (the lowest `sequence`), and the token with it when
+/// it was that token's last. `false` when there was nothing left to drop.
+fn evict_oldest<R>(tokens: &mut IdempotencyRecords<R>) -> bool {
+    let Some((token, position)) = tokens
+        .iter()
+        .flat_map(|(token, entries)| {
+            entries
+                .iter()
+                .enumerate()
+                .map(move |(position, entry)| (entry.sequence, token.clone(), position))
+        })
+        .min_by_key(|(sequence, _, _)| *sequence)
+        .map(|(_, token, position)| (token, position))
+    else {
+        return false;
+    };
+    let Some(entries) = tokens.get_mut(&token) else {
+        return false;
+    };
+    entries.remove(position);
+    if entries.is_empty() {
+        tokens.remove(&token);
+    }
+    true
 }
 
 /// Per-service state for com-amazonaws-acmpca-acmprivateca. A handler reaches it through [`service_state`].
@@ -1407,10 +1505,11 @@ pub fn record_idempotent<R>(
 pub struct ComAmazonawsAcmpcaAcmprivatecaState {
     /// Every private CA, keyed by its ARN.
     pub certificate_authorities: HashMap<String, CertificateAuthorityRecord>,
-    /// `CreateCertificateAuthority` idempotency tokens -> the CA ARN they minted, with
+    /// `CreateCertificateAuthority` idempotency tokens -> the CA ARN each minted, with
     /// the configuration that CA was created from: a token is honoured as a replay only
-    /// of a request for the SAME configuration ([`replay_idempotent`]).
-    pub create_idempotency: HashMap<String, IdempotencyEntry<CertificateAuthorityConfiguration>>,
+    /// of a request for the SAME configuration, and it holds one record per configuration
+    /// it has been seen with ([`replay_idempotent`]).
+    pub create_idempotency: IdempotencyRecords<CertificateAuthorityConfiguration>,
 }
 
 impl ComAmazonawsAcmpcaAcmprivatecaState {

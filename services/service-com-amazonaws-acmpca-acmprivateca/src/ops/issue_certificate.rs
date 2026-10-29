@@ -259,11 +259,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Only a CA that holds its own certificate can sign with it. The CA's state is
-        // judged before the body of the request: whether this CA may issue at all does
-        // not depend on what was asked of it, and the service answers the state error
-        // for a CA that has not been activated whatever the request carries.
-        if record.status != crate::state::STATUS_ACTIVE {
+        // Only a CA that holds its own certificate can sign with it — with one exception,
+        // which is the certificate that MAKES it hold one: a root CA signs its OWN
+        // certification request under the root CA certificate template while it is still
+        // waiting for a certificate, which is the self-signed certificate its activation
+        // then imports (the documented root-CA procedure: create the CA, read its CSR,
+        // issue under `template/RootCACertificate/V1`, import the result). Every other
+        // issuance needs the CA active. The CA's state is judged before the body of the
+        // request is read apart from what decides that exception, so the service answers
+        // the state error for a CA that has not been activated whatever else the request
+        // carries.
+        if record.status != crate::state::STATUS_ACTIVE
+            && !record.signs_its_own_root_certificate(input.template_arn.as_deref(), &input.csr)
+        {
             return Err(IssueCertificateErrorModeled::InvalidStateException(
                 InvalidStateException {
                     message: Some(crate::state::ISSUANCE_INVALID_STATE_MESSAGE.to_string()),

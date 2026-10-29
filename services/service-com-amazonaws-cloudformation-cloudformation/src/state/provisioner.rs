@@ -435,7 +435,8 @@ use super::provisioning::{
     AWS_JSON_1_1,
 };
 use super::template::{
-    ACMPCA_CERTIFICATE_AUTHORITY, ACM_ACME_ENDPOINT, ACM_CERTIFICATE, AOSS_COLLECTION,
+    ACMPCA_CERTIFICATE, ACMPCA_CERTIFICATE_AUTHORITY, ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION,
+    ACM_ACME_ENDPOINT, ACM_CERTIFICATE, AOSS_COLLECTION,
     AOSS_SECURITY_POLICY, APIGATEWAYV2_API,
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
@@ -625,6 +626,16 @@ pub(super) enum Provisioner {
     /// Services Private CA, whose ARN that service mints — `CreateCertificateAuthority`
     /// creates it and `DeleteCertificateAuthority` deletes it.
     AcmPcaCertificateAuthority,
+    /// `AWS::ACMPCA::Certificate`: a certificate one of those CAs ISSUED, which
+    /// `IssueCertificate` creates and whose ARN that service mints. Amazon Web Services
+    /// Private CA publishes no call that un-issues one, so the type's deployment has
+    /// nothing to delete.
+    AcmPcaCertificate,
+    /// `AWS::ACMPCA::CertificateAuthorityActivation`: not a resource of that service's own
+    /// but the ACTIVATION of one of its CAs — `ImportCertificateAuthorityCertificate` puts
+    /// the issued certificate into the CA, and `UpdateCertificateAuthority` applies the
+    /// status the declaration asks for.
+    AcmPcaCertificateAuthorityActivation,
     Route53ResolverEndpoint,
     Route53ResolverRule,
     Route53ResolverRuleAssociation,
@@ -725,6 +736,10 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         ACM_ACME_ENDPOINT => Some(Provisioner::AcmAcmeEndpoint),
         ACM_CERTIFICATE => Some(Provisioner::AcmCertificate),
         ACMPCA_CERTIFICATE_AUTHORITY => Some(Provisioner::AcmPcaCertificateAuthority),
+        ACMPCA_CERTIFICATE => Some(Provisioner::AcmPcaCertificate),
+        ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION => {
+            Some(Provisioner::AcmPcaCertificateAuthorityActivation)
+        }
         ROUTE53RESOLVER_ENDPOINT => Some(Provisioner::Route53ResolverEndpoint),
         ROUTE53RESOLVER_RULE => Some(Provisioner::Route53ResolverRule),
         ROUTE53RESOLVER_RULE_ASSOCIATION => Some(Provisioner::Route53ResolverRuleAssociation),
@@ -961,6 +976,15 @@ impl Provisioner {
             Self::AcmCertificate => request_certificate(ctx, region, resource, propagated).await,
             Self::AcmPcaCertificateAuthority => {
                 create_certificate_authority(ctx, region, resource, propagated).await
+            }
+            // Neither `AWS::ACMPCA::Certificate` nor
+            // `AWS::ACMPCA::CertificateAuthorityActivation` publishes a `Tags` property:
+            // Amazon Web Services Private CA tags the certificate AUTHORITY, not a
+            // certificate it issued or the import of one, so no tags are propagated to
+            // either.
+            Self::AcmPcaCertificate => issue_certificate(ctx, region, resource).await,
+            Self::AcmPcaCertificateAuthorityActivation => {
+                activate_certificate_authority(ctx, region, resource).await
             }
             Self::Route53ResolverEndpoint => {
                 create_resolver_endpoint(ctx, region, resource, propagated).await
@@ -1670,6 +1694,18 @@ impl Provisioner {
             Self::AcmPcaCertificateAuthority => {
                 delete_certificate_authority(ctx, region, physical_resource_id).await
             }
+            // Amazon Web Services Private CA publishes no call that un-issues a
+            // certificate one of its CAs signed, so removing the resource that asked for
+            // it removes the stack's record of it and nothing else.
+            Self::AcmPcaCertificate => Ok(()),
+            // An activation is not a resource of that service's own: what it DID was put
+            // the CA's certificate into it and leave it able to issue. Removing it
+            // withdraws that, which is `UpdateCertificateAuthority` putting the CA back in
+            // `DISABLED` — the status a CA that holds a certificate but may not use it is
+            // in, and the one the CA's own resource can then be deleted from.
+            Self::AcmPcaCertificateAuthorityActivation => {
+                deactivate_certificate_authority(ctx, region, physical_resource_id).await
+            }
             Self::Route53ResolverEndpoint => {
                 delete_resolver_endpoint(ctx, region, physical_resource_id).await
             }
@@ -1943,6 +1979,19 @@ impl Provisioner {
             Self::AcmCertificate => describe_certificate(ctx, region, physical_resource_id).await,
             Self::AcmPcaCertificateAuthority => {
                 describe_certificate_authority(ctx, region, physical_resource_id).await
+            }
+            // None of the properties an `AWS::ACMPCA::Certificate` declares — the
+            // certification request it had signed, the template, the validity — is reported
+            // by any read Amazon Web Services Private CA publishes for an issued
+            // certificate, so what the check can establish about one is whether that
+            // service still holds it.
+            Self::AcmPcaCertificate => {
+                issued_certificate_configuration(ctx, region, physical_resource_id).await
+            }
+            // An activation's one declared property that is also READ back is the status it
+            // left the CA in, which `DescribeCertificateAuthority` reports.
+            Self::AcmPcaCertificateAuthorityActivation => {
+                activation_configuration(ctx, region, physical_resource_id).await
             }
             Self::Route53ResolverEndpoint => {
                 describe_resolver_endpoint(ctx, region, physical_resource_id).await
@@ -15210,13 +15259,447 @@ async fn create_certificate_authority(
                 .to_string(),
         });
     };
+    // The type's OTHER published return value: the certification request that service
+    // built for the CA, which is what an `AWS::ACMPCA::Certificate` of the same stack
+    // signs. That service serves it once the CA it accepted is created, so the provider
+    // asks until it does ([`certificate_authority_csr`]) rather than publishing an
+    // attribute it has not read.
+    let csr = certificate_authority_csr(ctx, region, arn).await?;
+    let mut attributes: ::std::collections::BTreeMap<String, String> =
+        super::template::arn_attributes(&resource.resource_type, arn)
+            .into_iter()
+            .collect();
+    attributes.insert("CertificateSigningRequest".to_string(), csr);
     Ok(Created {
         physical_resource_id: Some(arn.to_string()),
-        attributes: super::template::arn_attributes(&resource.resource_type, arn)
-            .into_iter()
-            .collect(),
+        attributes,
     })
 }
+
+/// How long a provider waits for a value Amazon Web Services Private CA only has once work
+/// it has already accepted has finished, and how often it asks for it.
+///
+/// Two of this service's values are owed on its own clock: the certification request of a
+/// CA it is still creating (its `RequestInProgressException`, because the request is not
+/// available while the CA is `CREATING`) and the body of a certificate it is still issuing.
+/// A provider cannot publish a return value it has not read — a resource of the same stack
+/// signs that request, and another imports that certificate — so it asks again until that
+/// service answers, exactly as the AWS Batch arms wait for a resource of theirs
+/// ([`BATCH_DELETION_CHECK_INTERVAL`]), and reports the wait running out as the failure it
+/// is rather than publishing a value nothing produced.
+const ACMPCA_PENDING_VALUE_INTERVAL: ::std::time::Duration =
+    ::std::time::Duration::from_millis(50);
+const ACMPCA_PENDING_VALUE_CHECKS: usize = 40;
+
+/// The error code Amazon Web Services Private CA answers while work it accepted is still
+/// going on.
+const ACMPCA_REQUEST_IN_PROGRESS: &str = "RequestInProgressException";
+
+/// The certification request Amazon Web Services Private CA built for the CA `ca_arn`,
+/// waited for while that service is still creating the CA.
+async fn certificate_authority_csr(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    ca_arn: &str,
+) -> Result<String, Refusal> {
+    let request = serde_json::json!({ "CertificateAuthorityArn": ca_arn });
+    for _ in 0..ACMPCA_PENDING_VALUE_CHECKS {
+        match call_json_rpc(
+            ctx,
+            ACMPCA_SIGNING_NAME,
+            region,
+            AWS_JSON_1_1,
+            &format!("{ACMPCA_TARGET_PREFIX}.GetCertificateAuthorityCsr"),
+            &request,
+        )
+        .await
+        {
+            Ok(reported) => {
+                return reported
+                    .get("Csr")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .ok_or_else(|| Refusal {
+                        code: UNIDENTIFIED_FAILURE.to_string(),
+                        message: "GetCertificateAuthorityCsr answered no Csr".to_string(),
+                    })
+            }
+            Err(refusal) if refusal.code == ACMPCA_REQUEST_IN_PROGRESS => {
+                ::tokio::time::sleep(ACMPCA_PENDING_VALUE_INTERVAL).await;
+            }
+            Err(refusal) => return Err(refusal),
+        }
+    }
+    Err(Refusal {
+        code: ACMPCA_REQUEST_IN_PROGRESS.to_string(),
+        message: format!(
+            "Amazon Web Services Private CA did not answer the certificate signing request \
+             of {ca_arn}"
+        ),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Amazon Web Services Private CA: AWS::ACMPCA::Certificate
+// ---------------------------------------------------------------------------
+
+/// The properties of `AWS::ACMPCA::Certificate` that are members of `IssueCertificate`
+/// under the same names: the CA asked to sign, the algorithm it signs with, the template
+/// that says what KIND of certificate this is, how long it is valid for, and the X.509
+/// fields the declaration passes through (`smithy_query(operation="IssueCertificate")`).
+const ACMPCA_CERTIFICATE_MEMBERS: &[(&str, &str)] = &[
+    ("CertificateAuthorityArn", "CertificateAuthorityArn"),
+    ("SigningAlgorithm", "SigningAlgorithm"),
+    ("TemplateArn", "TemplateArn"),
+    ("Validity", "Validity"),
+    ("ValidityNotBefore", "ValidityNotBefore"),
+    ("ApiPassthrough", "ApiPassthrough"),
+];
+
+/// Have the private CA a declaration names SIGN the certification request it carries, so
+/// the stack really holds the certificate the declaration asks for.
+///
+/// `IssueCertificate` takes the request as a BLOB (`Csr`), while the type publishes it as
+/// the PEM `CertificateSigningRequest` property — which is what an
+/// `Fn::GetAtt <Ca>.CertificateSigningRequest` of the same stack resolves to — so the
+/// property's text is what travels, base64 as the awsJson wire carries a blob.
+///
+/// The certificate's ARN is that service's OWN to mint (it carries the serial it
+/// allocated), so it is reported as the resource's physical id and as its `Arn` attribute;
+/// the BODY it signed is the type's other published return value, read back through
+/// `GetCertificate` once that service has finished issuing it, because the resource that
+/// ACTIVATES a CA with this certificate reads it off that attribute.
+async fn issue_certificate(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    let mut request = Map::new();
+    copy_members(&properties, ACMPCA_CERTIFICATE_MEMBERS, &mut request);
+    let Some(csr) = properties
+        .get("CertificateSigningRequest")
+        .and_then(Value::as_str)
+    else {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: "AWS::ACMPCA::Certificate declares no CertificateSigningRequest to sign"
+                .to_string(),
+        });
+    };
+    request.insert(
+        "Csr".to_string(),
+        Value::String(::aws_smithy_types::base64::encode(csr.as_bytes())),
+    );
+    let ca_arn = properties
+        .get("CertificateAuthorityArn")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let reported = call_json_rpc(
+        ctx,
+        ACMPCA_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ACMPCA_TARGET_PREFIX}.IssueCertificate"),
+        &Value::Object(request),
+    )
+    .await?;
+    let Some(certificate_arn) = reported.get("CertificateArn").and_then(Value::as_str) else {
+        return Err(Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "IssueCertificate answered no CertificateArn".to_string(),
+        });
+    };
+    let certificate = issued_certificate(ctx, region, &ca_arn, certificate_arn).await?;
+    let mut attributes: ::std::collections::BTreeMap<String, String> =
+        super::template::arn_attributes(&resource.resource_type, certificate_arn)
+            .into_iter()
+            .collect();
+    attributes.insert("Certificate".to_string(), certificate);
+    Ok(Created {
+        physical_resource_id: Some(certificate_arn.to_string()),
+        attributes,
+    })
+}
+
+/// The body of the certificate `certificate_arn` names, waited for while that service is
+/// still issuing it: issuance completes on that service's own clock, and `GetCertificate`
+/// answers its `RequestInProgressException` until the certificate is retrievable.
+async fn issued_certificate(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    ca_arn: &str,
+    certificate_arn: &str,
+) -> Result<String, Refusal> {
+    let request = serde_json::json!({
+        "CertificateAuthorityArn": ca_arn,
+        "CertificateArn": certificate_arn,
+    });
+    for _ in 0..ACMPCA_PENDING_VALUE_CHECKS {
+        match call_json_rpc(
+            ctx,
+            ACMPCA_SIGNING_NAME,
+            region,
+            AWS_JSON_1_1,
+            &format!("{ACMPCA_TARGET_PREFIX}.GetCertificate"),
+            &request,
+        )
+        .await
+        {
+            Ok(reported) => {
+                return reported
+                    .get("Certificate")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .ok_or_else(|| Refusal {
+                        code: UNIDENTIFIED_FAILURE.to_string(),
+                        message: "GetCertificate answered no Certificate".to_string(),
+                    })
+            }
+            Err(refusal) if refusal.code == ACMPCA_REQUEST_IN_PROGRESS => {
+                ::tokio::time::sleep(ACMPCA_PENDING_VALUE_INTERVAL).await;
+            }
+            Err(refusal) => return Err(refusal),
+        }
+    }
+    Err(Refusal {
+        code: ACMPCA_REQUEST_IN_PROGRESS.to_string(),
+        message: format!("Amazon Web Services Private CA did not finish issuing {certificate_arn}"),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Amazon Web Services Private CA: AWS::ACMPCA::CertificateAuthorityActivation
+// ---------------------------------------------------------------------------
+
+/// The `CertificateAuthorityStatus` member a CA that holds its own certificate is in, which
+/// is the status importing one leaves it in.
+const CERTIFICATE_AUTHORITY_ACTIVE: &str = "ACTIVE";
+
+/// Import the certificate a declaration carries INTO the private CA it names, and leave
+/// that CA in the status the declaration asks for — which is what makes a CA a stack
+/// declared able to issue anything at all.
+///
+/// `ImportCertificateAuthorityCertificate` takes the certificate and the chain as BLOBS,
+/// while this type publishes both as PEM properties — the `Certificate` one being what an
+/// `Fn::GetAtt <Certificate>.Certificate` of the same stack resolves to — so each
+/// property's text travels base64 as the awsJson wire carries a blob.
+///
+/// A CA is `ACTIVE` once it holds its certificate, so a declaration asking for that status
+/// needs nothing more; one asking for any other status (`DISABLED`) is applied through
+/// `UpdateCertificateAuthority`, the call that moves a CA between the statuses it can be
+/// put in. The resource's identity is the CA it activated, and its published return value
+/// is the complete chain that CA now presents.
+async fn activate_certificate_authority(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    let Some(ca_arn) = properties
+        .get("CertificateAuthorityArn")
+        .and_then(Value::as_str)
+    else {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: "AWS::ACMPCA::CertificateAuthorityActivation declares no \
+                      CertificateAuthorityArn to activate"
+                .to_string(),
+        });
+    };
+    let Some(certificate) = properties.get("Certificate").and_then(Value::as_str) else {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: "AWS::ACMPCA::CertificateAuthorityActivation declares no Certificate to \
+                      import"
+                .to_string(),
+        });
+    };
+    let chain = properties
+        .get("CertificateChain")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let mut request = Map::new();
+    request.insert(
+        "CertificateAuthorityArn".to_string(),
+        Value::String(ca_arn.to_string()),
+    );
+    request.insert(
+        "Certificate".to_string(),
+        Value::String(::aws_smithy_types::base64::encode(certificate.as_bytes())),
+    );
+    if let Some(chain) = chain.as_deref() {
+        request.insert(
+            "CertificateChain".to_string(),
+            Value::String(::aws_smithy_types::base64::encode(chain.as_bytes())),
+        );
+    }
+    call_json_rpc(
+        ctx,
+        ACMPCA_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ACMPCA_TARGET_PREFIX}.ImportCertificateAuthorityCertificate"),
+        &Value::Object(request),
+    )
+    .await?;
+    if let Some(status) = properties.get("Status").and_then(Value::as_str) {
+        if status != CERTIFICATE_AUTHORITY_ACTIVE {
+            call_json_rpc(
+                ctx,
+                ACMPCA_SIGNING_NAME,
+                region,
+                AWS_JSON_1_1,
+                &format!("{ACMPCA_TARGET_PREFIX}.UpdateCertificateAuthority"),
+                &serde_json::json!({
+                    "CertificateAuthorityArn": ca_arn,
+                    "Status": status,
+                }),
+            )
+            .await?;
+        }
+    }
+    let mut attributes: ::std::collections::BTreeMap<String, String> =
+        ::std::collections::BTreeMap::new();
+    attributes.insert(
+        "CompleteCertificateChain".to_string(),
+        match chain {
+            Some(chain) => format!("{certificate}{chain}"),
+            None => certificate.to_string(),
+        },
+    );
+    Ok(Created {
+        physical_resource_id: Some(ca_arn.to_string()),
+        attributes,
+    })
+}
+
+/// Whether Amazon Web Services Private CA still holds the certificate a stack had one of
+/// its CAs issue, for drift detection.
+///
+/// A certificate ARN carries the ARN of the CA that issued it as its prefix
+/// (`<ca arn>/certificate/<serial>`), which is what addresses the pair `GetCertificate`
+/// takes. A certificate that service no longer serves is one the stack's record is of
+/// nothing. The document is otherwise EMPTY: nothing a declaration of this type states is
+/// reported back, and a property the actual document does not carry is not evidence of
+/// anything (`super::drift::differs`).
+async fn issued_certificate_configuration(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    certificate_arn: &str,
+) -> Result<Option<Value>, Refusal> {
+    let Some((ca_arn, _)) = certificate_arn.split_once("/certificate/") else {
+        return Ok(None);
+    };
+    let request = serde_json::json!({
+        "CertificateAuthorityArn": ca_arn,
+        "CertificateArn": certificate_arn,
+    });
+    match call_json_rpc(
+        ctx,
+        ACMPCA_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ACMPCA_TARGET_PREFIX}.GetCertificate"),
+        &request,
+    )
+    .await
+    {
+        Ok(_) => Ok(Some(Value::Object(Map::new()))),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The status the activation of the private CA `ca_arn` names left that CA in, as Amazon
+/// Web Services Private CA reports it, for drift detection: the one property of this type
+/// that is also read back. A CA that service no longer holds was deleted, which takes its
+/// activation with it.
+async fn activation_configuration(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    ca_arn: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "CertificateAuthorityArn": ca_arn });
+    let reported = match call_json_rpc(
+        ctx,
+        ACMPCA_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ACMPCA_TARGET_PREFIX}.DescribeCertificateAuthority"),
+        &request,
+    )
+    .await
+    {
+        Ok(reported) => reported,
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    let Some(authority) = reported.get("CertificateAuthority") else {
+        return Ok(Some(Value::Object(Map::new())));
+    };
+    Ok(Some(reported_as_properties(
+        authority,
+        &[("Status", "Status")],
+    )))
+}
+
+/// Withdraw the activation of the private CA `physical_resource_id` names: the CA keeps the
+/// certificate it was activated with and stops being able to use it, which is
+/// `CertificateAuthorityStatus$DISABLED` ("the private CA is disabled and cannot issue
+/// certificates").
+///
+/// A CA that service no longer holds (`ResourceNotFoundException`) is already past this, so
+/// that answer is a success. So is a CA whose status cannot be changed to `DISABLED`
+/// (`InvalidStateException`) — a CA that was never activated, or one already on its way out
+/// — because the activation this withdraws is not in force either way. Every other refusal
+/// is that service's own and is reported.
+async fn deactivate_certificate_authority(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({
+        "CertificateAuthorityArn": physical_resource_id,
+        "Status": CERTIFICATE_AUTHORITY_DISABLED,
+    });
+    match call_json_rpc(
+        ctx,
+        ACMPCA_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ACMPCA_TARGET_PREFIX}.UpdateCertificateAuthority"),
+        &request,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal)
+            if refusal.code == RESOURCE_NOT_FOUND
+                || refusal.code == ACMPCA_INVALID_STATE =>
+        {
+            Ok(())
+        }
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The `CertificateAuthorityStatus` member a CA that holds its certificate but may not use
+/// it is in.
+const CERTIFICATE_AUTHORITY_DISABLED: &str = "DISABLED";
+
+/// The error code Amazon Web Services Private CA answers when a CA's status does not allow
+/// what was asked of it.
+const ACMPCA_INVALID_STATE: &str = "InvalidStateException";
 
 /// Whether Amazon Web Services Private CA has finished creating the CA a stack declared.
 ///

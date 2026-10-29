@@ -3,10 +3,11 @@
 //! `GetPolicy` reports the resource-based policy this service persists for a private CA.
 //!
 //! The rule under test: `GetPolicy` answers, byte for byte, the policy document
-//! persisted on the private CA its `ResourceArn` names; it refuses with
-//! `ResourceNotFoundException` whenever that CA or its policy is absent, with
-//! `InvalidArnException` when the ARN names no private CA of this service, and it leaves
-//! the stored policy exactly as it found it.
+//! persisted on the private CA its `ResourceArn` names; it resolves that CA BEFORE the
+//! policy, so an ARN naming no CA of this service is refused with
+//! `ResourceNotFoundException` naming the CA and a CA carrying no policy with the same
+//! code naming the policy; it refuses with `InvalidArnException` when the ARN names no
+//! private CA resource at all, and it leaves the stored policy exactly as it found it.
 //!
 //! The policy is ATTACHED here by writing the CA record in the shared engine rather than
 //! through `PutPolicy`: what is under test is `GetPolicy`'s REPORTING, over documents
@@ -21,7 +22,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_acmpca_acmprivateca::state::{
-    service_state, INVALID_ARN_MESSAGE, POLICY_NOT_FOUND_MESSAGE,
+    service_state, CA_NOT_FOUND_MESSAGE, INVALID_ARN_MESSAGE, POLICY_NOT_FOUND_MESSAGE,
 };
 use service_com_amazonaws_acmpca_acmprivateca::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -330,7 +331,9 @@ async fn each_private_ca_answers_only_its_own_policy() {
 }
 
 /// "If either the private CA resource or the policy cannot be found, this action returns
-/// a ResourceNotFoundException" — one refusal, about the policy, for every absence.
+/// a ResourceNotFoundException" — one CODE for both absences, and a sentence per STAGE:
+/// the authority is resolved first and named when it is the thing that is missing, and only
+/// an authority that exists reports its policy as the absent one.
 #[tokio::test]
 async fn get_policy_refuses_a_ca_or_a_policy_it_cannot_find() {
     let emulator = Emulator::new();
@@ -352,10 +355,14 @@ async fn get_policy_refuses_a_ca_or_a_policy_it_cannot_find() {
             + std::time::Duration::from_millis(250),
     );
 
-    let rows: Vec<(String, String)> = vec![
+    // Each row: the ARN read, and the sentence the stage that failed answers with — the
+    // policy's where the authority resolves, the CA's where no authority of this service
+    // answers to the ARN (every row below satisfies the modelled `Arn` pattern).
+    let rows: Vec<(String, String, &str)> = vec![
         (
             "a settled CA with no policy attached".to_string(),
             fresh.clone(),
+            POLICY_NOT_FOUND_MESSAGE,
         ),
         (
             "a CA that was never created".to_string(),
@@ -363,33 +370,33 @@ async fn get_policy_refuses_a_ca_or_a_policy_it_cannot_find() {
                 "arn:aws:acm-pca:{REGION}:{ACCOUNT}:certificate-authority/\
                  00000000-0000-4000-8000-000000000000"
             ),
+            CA_NOT_FOUND_MESSAGE,
         ),
         (
             "a CA id of another shape entirely".to_string(),
             format!("arn:aws:acm-pca:{REGION}:{ACCOUNT}:certificate-authority/not-a-uuid"),
+            CA_NOT_FOUND_MESSAGE,
         ),
         (
             "a well-formed CA ARN of another account".to_string(),
             format!("arn:aws:acm-pca:{REGION}:111122223333:certificate-authority/abcdef"),
+            CA_NOT_FOUND_MESSAGE,
         ),
         (
             "a well-formed CA ARN of another region".to_string(),
             format!("arn:aws:acm-pca:us-gov-west-1:{ACCOUNT}:certificate-authority/abcdef"),
+            CA_NOT_FOUND_MESSAGE,
         ),
         (
             "a well-formed CA ARN of another partition".to_string(),
             format!("arn:aws-cn:acm-pca:cn-north-1:{ACCOUNT}:certificate-authority/abcdef"),
+            CA_NOT_FOUND_MESSAGE,
         ),
     ];
 
-    for (case, resource_arn) in rows {
+    for (case, resource_arn, message) in rows {
         emulator
-            .refused(
-                &case,
-                &resource_arn,
-                "ResourceNotFoundException",
-                POLICY_NOT_FOUND_MESSAGE,
-            )
+            .refused(&case, &resource_arn, "ResourceNotFoundException", message)
             .await;
         assert_eq!(
             emulator.stored_policy(&resource_arn),

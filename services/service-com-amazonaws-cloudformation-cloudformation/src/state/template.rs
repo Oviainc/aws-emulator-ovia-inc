@@ -2867,6 +2867,9 @@ fn gateway_label_char(c: char) -> bool {
 /// (`AWS::CodePipeline::Pipeline`, whose `Ref` is the pipeline name, which is the default
 /// this module already gives every type).
 pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
+    ACMPCA_CERTIFICATE,
+    ACMPCA_CERTIFICATE_AUTHORITY,
+    ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION,
     APIGATEWAY_DEPLOYMENT,
     APIGATEWAY_RESOURCE,
     APIGATEWAY_REST_API,
@@ -4086,8 +4089,83 @@ fn return_values(
             attributes.insert("BackupVaultName".to_string(), name.to_string());
             (name.to_string(), attributes)
         }
+        // "Ref returns the Amazon Resource Name (ARN) of the private CA"; Fn::GetAtt: Arn,
+        // CertificateSigningRequest. Both are Amazon Web Services Private CA's OWN: it
+        // mints the ARN (`identity_is_service_assigned` names the type) and it builds the
+        // certification request from the key it generated, so neither is a value these
+        // naming rules can compute — each is a stand-in
+        // ([`super::provisioning::repoint_references`] re-points it at what that service
+        // answered once the CA has been created).
+        ACMPCA_CERTIFICATE_AUTHORITY => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    ACMPCA_ARN_NAMESPACE,
+                    region,
+                    &format!("certificate-authority/{name}"),
+                ),
+            );
+            attributes.insert(
+                "CertificateSigningRequest".to_string(),
+                service_assigned_document(name, "CertificateSigningRequest"),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the ARN of the issued certificate"; Fn::GetAtt: Arn, Certificate.
+        // The ARN carries the serial that service allocated and the body is the
+        // certificate it signed, so both are stand-ins here too.
+        ACMPCA_CERTIFICATE => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    ACMPCA_ARN_NAMESPACE,
+                    region,
+                    &format!("certificate-authority/{name}/certificate/{name}"),
+                ),
+            );
+            attributes.insert(
+                "Certificate".to_string(),
+                service_assigned_document(name, "Certificate"),
+            );
+            (name.to_string(), attributes)
+        }
+        // Fn::GetAtt: CompleteCertificateChain — the certificate the CA was activated with
+        // beside the chain above it, which is that service's to assemble. The resource IS
+        // the activation of ONE private CA, and `CertificateAuthorityArn` is the property
+        // naming it, so that ARN is what identifies the resource.
+        ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION => {
+            attributes.insert(
+                "CompleteCertificateChain".to_string(),
+                service_assigned_document(name, "CompleteCertificateChain"),
+            );
+            let identity = properties
+                .get("CertificateAuthorityArn")
+                .and_then(|declared| text(declared, scope, 0, budget))
+                .unwrap_or_else(|| name.to_string());
+            (identity, attributes)
+        }
         _ => (name.to_string(), attributes),
     }
+}
+
+/// The ARN namespace Amazon Web Services Private CA mints its resources under (that
+/// model's `awsService.arnNamespace`), which is `acm-pca` rather than the `ACMPCA` its
+/// resource types are spelled with.
+const ACMPCA_ARN_NAMESPACE: &str = "acm-pca";
+
+/// The stand-in a published return value only the OWNING SERVICE can produce — a
+/// certification request, a certificate body, a certificate chain — is resolved to before
+/// that service has been asked for it.
+///
+/// A document is not a value these naming rules can compute, and an output or another
+/// resource's property may name it before the resource exists, so the attribute carries a
+/// value that names the resource and the attribute it stands for.
+/// [`super::provisioning::repoint_references`] re-points it at what the owning service
+/// really answered, exactly as it re-points a minted identifier. It is deliberately NOT a
+/// well-formed PEM body: a request that reaches a service still carrying it is refused by
+/// that service rather than taken for a certificate.
+fn service_assigned_document(name: &str, attribute: &str) -> String {
+    format!("the {attribute} of {name} is not available until it has been created")
 }
 
 /// The NAMES of the `Fn::GetAtt` attributes a resource of this type publishes — the other
@@ -4109,6 +4187,9 @@ fn return_values(
 /// a document built from them is byte-for-byte the same on every read.
 pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str] {
     match resource_type {
+        ACMPCA_CERTIFICATE_AUTHORITY => &["Arn", "CertificateSigningRequest"],
+        ACMPCA_CERTIFICATE => &["Arn", "Certificate"],
+        ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION => &["CompleteCertificateChain"],
         BACKUP_VAULT => &["BackupVaultArn", "BackupVaultName"],
         "AWS::SNS::Topic" => &["TopicArn", "TopicName"],
         SQS_QUEUE => &["Arn", "QueueName", "QueueUrl"],
@@ -4306,6 +4387,12 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // Resource Name (ARN) of the private CA" — a template declares the CA's key, its
         // signing algorithm and its subject, never its id.
         || resource_type == ACMPCA_CERTIFICATE_AUTHORITY
+        // A certificate that private CA issued is one more: `IssueCertificate` takes no
+        // identifier and answers the `CertificateArn` it minted — which carries the SERIAL
+        // that service allocated, so no naming rule could compute it — and that type's
+        // `Ref` returns that ARN. A template declares the certification request and the
+        // validity, never the certificate's id.
+        || resource_type == ACMPCA_CERTIFICATE
         || resource_type == MSK_CLUSTER
         || resource_type == MSK_SERVERLESS_CLUSTER
         || resource_type == ROUTE53RESOLVER_ENDPOINT
@@ -4873,6 +4960,21 @@ pub const ACM_CERTIFICATE: &str = "AWS::CertificateManager::Certificate";
 /// the resource is the one `acm-pca DescribeCertificateAuthority` resolves ("Ref returns
 /// the Amazon Resource Name (ARN) of the private CA").
 pub const ACMPCA_CERTIFICATE_AUTHORITY: &str = "AWS::ACMPCA::CertificateAuthority";
+
+/// The certificate an `AWS::ACMPCA::Certificate` has a private CA issue (the same acm-pca
+/// model). `IssueCertificate` ASSIGNS its `CertificateArn` — "Ref returns the ARN of the
+/// issued certificate" — so the identifier a stack reports for the resource is the one
+/// `acm-pca GetCertificate` serves, and the certificate BODY it issued is this type's other
+/// published return value (`Fn::GetAtt Certificate`).
+pub const ACMPCA_CERTIFICATE: &str = "AWS::ACMPCA::Certificate";
+
+/// The activation of a private CA with a certificate issued for it (the same acm-pca
+/// model): the type whose deployment imports that certificate into the CA and puts the CA
+/// in the status the declaration asks for. Its identity IS the CA it activates — that is
+/// the one resource the activation exists about — and its published return value is the
+/// complete chain the CA then presents (`Fn::GetAtt CompleteCertificateChain`).
+pub const ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION: &str =
+    "AWS::ACMPCA::CertificateAuthorityActivation";
 
 /// An Amazon EventBridge rule's resource type (the EventBridge model:
 /// `cloudFormationName: Events`). This is a type `super::provisioning` creates in

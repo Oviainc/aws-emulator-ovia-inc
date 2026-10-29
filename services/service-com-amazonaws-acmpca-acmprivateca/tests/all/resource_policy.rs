@@ -9,11 +9,11 @@
 //! The rule under test: a policy operation resolves the resource-based policy of the
 //! private CA its ARN names — attaching replaces what was attached, reading hands the
 //! stored document back byte for byte, deleting removes it — and a request that resolves
-//! none is refused with HTTP 400 `ResourceNotFoundException`, naming the POLICY where the
-//! CA keeps policies at all and naming the CA where the request names no CA of this
-//! service, or one that does not hold its certificate yet and so keeps none. The recorded
-//! case (`DeletePolicy` against a CA still waiting for its certificate) is one row of the
-//! tables below.
+//! none is refused with HTTP 400 `ResourceNotFoundException`, naming the resource the stage
+//! that failed was about: the CA where the request names no CA of this service, or one that
+//! does not hold its certificate yet and so keeps no policy, and the POLICY where the CA is
+//! resolved and carries none. The recorded case (`DeletePolicy` against a CA still waiting
+//! for its certificate) is one row of the tables below.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_acmpca_acmprivateca::state::{
@@ -26,21 +26,6 @@ use crate::private_ca_lifecycle::{
 
 /// The three operations that read or write a CA's resource-based policy.
 const POLICY_OPERATIONS: [&str; 3] = ["GetPolicy", "PutPolicy", "DeletePolicy"];
-
-/// Which sentence `operation` answers when it resolves no policy for a CA this service
-/// does not hold.
-///
-/// `GetPolicy` is recorded making the two absences ONE refusal about the policy it was
-/// asked for (`acm-pca.get-policy-not-found`); the write and the delete name the CA, the
-/// resource they were asked to attach to or to clear
-/// (`acm-pca.delete-policy-on-pending-ca-is-noop`).
-fn absent_ca_message(operation: &str) -> &'static str {
-    if operation == "GetPolicy" {
-        POLICY_NOT_FOUND_MESSAGE
-    } else {
-        CA_NOT_FOUND_MESSAGE
-    }
-}
 
 /// The `message` an error body carries, under either casing a protocol may use for it.
 pub(crate) fn error_message(body: &Value, case: &str) -> String {
@@ -420,9 +405,12 @@ async fn an_arn_naming_no_ca_resolves_no_policy() {
                 )
                 .await;
             let message = error_message(&body, case);
+            // Every policy operation resolves the AUTHORITY before the policy, so all
+            // three answer about the CA here: the read's own recorded case is
+            // `acm-pca.ca-arn-validation-precedes-resource-lookup`, and the write and the
+            // delete name the CA they were asked to attach to or to clear.
             assert_eq!(
-                message,
-                absent_ca_message(operation),
+                message, CA_NOT_FOUND_MESSAGE,
                 "case {case:?}: expected {operation} to answer the not-found sentence of \
                  the resource it was asked about, got {message:?}"
             );
