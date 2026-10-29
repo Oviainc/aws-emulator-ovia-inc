@@ -209,7 +209,8 @@ fn definitions_rejection(
         // AWS-reserved prefix as well — a tag that is not the caller's to assign.
         // `crate::state::reserved_tag_key_rejection` is the one place that rule
         // lives, shared with every other member of this service that takes tag keys
-        // from the caller.
+        // from the caller. `TagsMap` is `@sensitive`, so the refusal it builds for
+        // this member renders no key out of the map.
         crate::state::reserved_tag_key_rejection(
             "Tags",
             input

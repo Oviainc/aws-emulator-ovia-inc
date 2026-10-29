@@ -341,17 +341,17 @@ pub fn quick_setup_type_entry(type_: &str) -> Option<&'static QuickSetupTypeEntr
 /// refused at validation rather than minting a manager that could never deploy.
 ///
 /// The one place the rule lives, so every member that names a configuration type
-/// refuses the same values. The message names the member, the requirement and the
-/// value, the way this service's other refusals do; the echoed value is bounded for
-/// the reason [`MAX_ECHOED_VALUE`] gives.
+/// refuses the same values. The message names the member and the requirement, the way
+/// this service's other refusals do, and renders the offending value only where
+/// [`echoed_clause`] allows.
 pub fn quick_setup_type_rejection(member: &str, value: &str) -> Option<String> {
     if quick_setup_type_entry(value).is_some() {
         return None;
     }
     Some(format!(
         "{member} must name a Quick Setup configuration type this service offers \
-         (one of the types ListQuickSetupTypes publishes), got '{}'",
-        echoed_value(value)
+         (one of the types ListQuickSetupTypes publishes){}",
+        echoed_clause(member, value)
     ))
 }
 
@@ -382,6 +382,9 @@ pub fn resolve_type_version(
     requested: Option<&str>,
 ) -> Result<String, String> {
     let Some(entry) = quick_setup_type_entry(type_) else {
+        // The value rendered here is the definition's `Type`, which the model marks
+        // neither `@sensitive` itself nor through any shape on the path to it
+        // (`SENSITIVE_MEMBERS`), so it stays echoable — bounded like any other echo.
         return Err(format!(
             "{member} cannot be resolved because '{}' is not a Quick Setup configuration \
              type this service offers",
@@ -397,10 +400,10 @@ pub fn resolve_type_version(
         .ok_or_else(|| {
             format!(
                 "{member} must name a configuration version this service publishes for \
-                 {} (one of [{}]) or the {TYPE_VERSION_LATEST} alias, got '{}'",
+                 {} (one of [{}]) or the {TYPE_VERSION_LATEST} alias{}",
                 entry.type_,
                 entry.versions.join(", "),
-                echoed_value(requested)
+                echoed_clause(member, requested)
             )
         })
 }
@@ -690,8 +693,8 @@ pub fn deployment_targets_rejection<P: ConfigurationParameters + ?Sized>(
     }) {
         return Some(format!(
             "{member}.{PARAMETER_TARGET_ACCOUNTS} must be a comma separated list of \
-             {ACCOUNT_ID_DIGITS}-digit Amazon Web Services account IDs, got '{}'",
-            echoed_value(malformed)
+             {ACCOUNT_ID_DIGITS}-digit Amazon Web Services account IDs{}",
+            echoed_clause(member, malformed)
         ));
     }
     // The bound is read off the deployments themselves rather than off a formula over
@@ -1446,9 +1449,9 @@ impl ComAmazonawsSsmquicksetupQuicksetupState {
 /// the same values: `UpdateServiceSettings$ExplorerEnablingRoleArn` and
 /// `ConfigurationDefinitionInput$LocalDeploymentAdministrationRoleArn`.
 ///
-/// The message names the member, the requirement and the value, the way the boundary
-/// validator's own refusals do. The echoed value is bounded for the reason
-/// [`MAX_ECHOED_VALUE`] gives.
+/// The message names the member and the requirement, the way the boundary
+/// validator's own refusals do, and renders the offending value only where
+/// [`echoed_clause`] allows.
 pub fn iam_role_arn_rejection(member: &str, value: &str) -> Option<String> {
     let fields: Vec<&str> = value.split(':').collect();
     let well_formed = match fields.as_slice() {
@@ -1463,8 +1466,8 @@ pub fn iam_role_arn_rejection(member: &str, value: &str) -> Option<String> {
     (!well_formed).then(|| {
         format!(
             "{member} must be the ARN of an IAM role \
-             (arn:<partition>:iam::<account>:role/<name>), got '{}'",
-            echoed_value(value)
+             (arn:<partition>:iam::<account>:role/<name>){}",
+            echoed_clause(member, value)
         )
     })
 }
@@ -1478,6 +1481,10 @@ const MAX_ECHOED_VALUE: usize = 256;
 
 /// `value` as it may appear in a refusal message: itself when short, otherwise a
 /// character-boundary-safe prefix plus the elision the framework's renderer appends.
+///
+/// Bounding only — whether a value may be rendered AT ALL is
+/// [`is_sensitive_member`]'s question, which [`echoed_clause`] asks for every refusal
+/// that ends in one.
 fn echoed_value(value: &str) -> String {
     if value.len() <= MAX_ECHOED_VALUE {
         return value.to_string();
@@ -1487,6 +1494,47 @@ fn echoed_value(value: &str) -> String {
         end -= 1;
     }
     format!("{}... [{} bytes]", &value[..end], value.len())
+}
+
+/// The request members of this service whose data the model marks `@sensitive`, so no
+/// value taken from one of them may be rendered on the wire outside the member it
+/// arrived on.
+///
+/// Source: the sensitive shapes this model declares are `TagsMap` (what both write
+/// paths' `Tags` member targets) and the `Tags`/`TagEntry` pair the tagging reader
+/// reports — `smithy_query(query="shape", shape="TagsMap,TagKeys")`, which also shows
+/// `TagKeys` carrying no sensitive trait anywhere in its path, so its values stay
+/// echoable. Every member of this service that takes a sensitive shape from the caller
+/// is named `Tags`.
+const SENSITIVE_MEMBERS: &[&str] = &["Tags"];
+
+/// Whether `member` names data the model marks `@sensitive`.
+///
+/// `member` is the request member path a refusal labels — a top-level member (`Tags`) or
+/// a nested one (`ConfigurationDefinitions.Parameters`). A path is sensitive when ANY of
+/// its segments names a sensitive member, because a value nested inside a sensitive
+/// shape is sensitive too.
+fn is_sensitive_member(member: &str) -> bool {
+    member
+        .split('.')
+        .any(|segment| SENSITIVE_MEMBERS.contains(&segment))
+}
+
+/// The trailing `, got '<value>'` clause a refusal about `member` carries, or the empty
+/// string when that member's data is sensitive.
+///
+/// A refusal always states the member and the requirement, both request-independent. It
+/// also echoes the offending value, so a caller can tell which of the values it sent was
+/// refused — EXCEPT when the value comes from a member the model marks `@sensitive`
+/// ([`is_sensitive_member`]): rendering it would carry sensitive data into the response
+/// body, and into anything that logs it, so such a refusal states the member and the
+/// requirement alone. The echoed value is bounded for the reason [`MAX_ECHOED_VALUE`]
+/// gives.
+fn echoed_clause(member: &str, value: &str) -> String {
+    if is_sensitive_member(member) {
+        return String::new();
+    }
+    format!(", got '{}'", echoed_value(value))
 }
 
 /// The tag-key prefix Amazon Web Services reserves for its own tags.
@@ -1520,8 +1568,10 @@ pub fn is_reserved_tag_key(key: &str) -> bool {
 ///
 /// The named key is the lexically first reserved one, so one request always answers the
 /// same way however the collection it came from is iterated. The message names the
-/// member, the requirement and the key, the way this service's other refusals do; the
-/// echoed key is bounded for the reason [`MAX_ECHOED_VALUE`] gives.
+/// member and the requirement, the way this service's other refusals do, and renders the
+/// offending key only where [`echoed_clause`] allows — so a refusal about a `Tags` map,
+/// whose shape the model marks `@sensitive`, carries no key out of it, while one about
+/// the non-sensitive `UntagResource$TagKeys` list names the key it refused.
 pub fn reserved_tag_key_rejection<'k>(
     member: &str,
     keys: impl IntoIterator<Item = &'k str>,
@@ -1533,8 +1583,8 @@ pub fn reserved_tag_key_rejection<'k>(
             format!(
                 "{member} must not name a tag key under the '{RESERVED_TAG_PREFIX}' prefix, \
                  which is reserved for Amazon Web Services use and cannot be edited or \
-                 deleted, got '{}'",
-                echoed_value(key)
+                 deleted{}",
+                echoed_clause(member, key)
             )
         })
 }

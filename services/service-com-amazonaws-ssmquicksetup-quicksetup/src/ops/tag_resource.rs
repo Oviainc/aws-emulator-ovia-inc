@@ -145,7 +145,9 @@ impl From<TagResourceErrorModeled> for TagResourceError {
 /// * the key pattern admits `:`, so it also admits a key under the AWS-reserved prefix,
 ///   which names a tag that is not the caller's to assign: that is refused by
 ///   `crate::state::reserved_tag_key_rejection` — the one place that rule lives, shared
-///   with every other member of this service that takes tag keys from the caller.
+///   with every other member of this service that takes tag keys from the caller. The
+///   refusal states this member and the prefix and nothing out of the map itself, since
+///   `TagsMap` is `@sensitive`.
 fn tags_rejection(tags: &::std::collections::HashMap<String, String>) -> Option<String> {
     if tags.len() > crate::state::MAX_TAGS {
         return Some(format!(

@@ -12,7 +12,10 @@
 //! `UntagResource$TagKeys` — refuses a request naming one with a 400
 //! `ValidationException` and leaves the stored tags exactly as they were. The prefix is
 //! reserved however its letters are cased, while a key that merely RESEMBLES it is an
-//! ordinary key the service stores, reports and removes like any other.
+//! ordinary key the service stores, reports and removes like any other. The refusal
+//! names the member and the prefix; whether it also names the offending key follows the
+//! member's sensitivity ([`KeyEcho`]), which `all/sensitive_refusal_messages.rs` is the
+//! suite for.
 //!
 //! The tables span what the rule generalises over: the casing of the prefix, what
 //! follows it (nothing, a plain tail, a punctuated tail, a multi-byte tail), where the
@@ -40,7 +43,7 @@ const UNKNOWN_MANAGER_ARN: &str =
      00000000-0000-4000-8000-000000000000";
 
 /// One emulator with an empty store, mounted exactly as the router mounts it.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -75,7 +78,7 @@ fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes
 }
 
 /// Status and parsed body of one call. An empty body reads as `Value::Null`.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -105,7 +108,7 @@ async fn call(
 }
 
 /// The modelled error shape a failed call reported.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -117,7 +120,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// The `Message` a refusal carries.
-fn error_message(body: &Value) -> String {
+pub(crate) fn error_message(body: &Value) -> String {
     body.get("Message")
         .and_then(Value::as_str)
         .unwrap_or("<no Message>")
@@ -153,7 +156,11 @@ fn query_value(value: &str) -> String {
 
 /// `DELETE /tags/{ResourceArn}?tagKeys=…` — `UntagResource`. `TagKeys` is an
 /// `@httpQuery` list, so each key travels as its own repeated `tagKeys=` parameter.
-async fn untag(router: &MultiServiceRouter, resource_arn: &str, keys: &[&str]) -> (u16, Value) {
+pub(crate) async fn untag(
+    router: &MultiServiceRouter,
+    resource_arn: &str,
+    keys: &[&str],
+) -> (u16, Value) {
     let query: Vec<String> = keys
         .iter()
         .map(|key| format!("tagKeys={}", query_value(key)))
@@ -163,7 +170,7 @@ async fn untag(router: &MultiServiceRouter, resource_arn: &str, keys: &[&str]) -
 }
 
 /// `PUT /tags/{ResourceArn}` — `TagResource`.
-async fn tag(
+pub(crate) async fn tag(
     router: &MultiServiceRouter,
     resource_arn: &str,
     tags: &BTreeMap<String, String>,
@@ -179,7 +186,7 @@ async fn tag(
 }
 
 /// A tag map as a restJson1 payload member.
-fn tag_object(tags: &BTreeMap<String, String>) -> Value {
+pub(crate) fn tag_object(tags: &BTreeMap<String, String>) -> Value {
     let mut map = Map::new();
     for (key, value) in tags {
         map.insert(key.clone(), Value::String(value.clone()));
@@ -188,7 +195,7 @@ fn tag_object(tags: &BTreeMap<String, String>) -> Value {
 }
 
 /// `POST /configurationManager` carrying `tags` — `CreateConfigurationManager`.
-async fn create(
+pub(crate) async fn create(
     router: &MultiServiceRouter,
     name: &str,
     tags: &BTreeMap<String, String>,
@@ -212,7 +219,7 @@ async fn create(
 }
 
 /// Create one configuration manager carrying `tags`, answering its ARN.
-async fn create_ok(
+pub(crate) async fn create_ok(
     router: &MultiServiceRouter,
     case: &str,
     tags: &BTreeMap<String, String>,
@@ -305,7 +312,7 @@ fn tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 /// The ordinary tags every case seeds its resource with, so a refusal can be shown to
 /// have left the stored set alone.
-fn seeded() -> BTreeMap<String, String> {
+pub(crate) fn seeded() -> BTreeMap<String, String> {
     tags(&[("Env", "prod"), ("Owner", "ops")])
 }
 
@@ -318,7 +325,7 @@ fn seeded() -> BTreeMap<String, String> {
 /// a plain word, one of the punctuation characters `TagsMap`'s key pattern admits
 /// (`smithy_query(query="shape",shape="TagsMap")`) and a multi-byte tail, which only
 /// `UntagResource$TagKeys` (a bare `list<String>`) can carry.
-fn reserved_keys() -> Vec<(String, String)> {
+pub(crate) fn reserved_keys() -> Vec<(String, String)> {
     let prefix = RESERVED_TAG_PREFIX;
     let upper = prefix.to_ascii_uppercase();
     // The prefix with only its first letter upper-cased, derived from the prefix itself.
@@ -393,8 +400,39 @@ fn lookalike_keys() -> Vec<(String, String)> {
     ]
 }
 
-/// Every refusal states the member, the reserved prefix and the offending key.
-fn assert_reserved_refusal(case: &str, member: &str, key: &str, status: u16, answer: &Value) {
+/// Whether a refusal about a member may render the offending tag key.
+///
+/// `TagsMap` — what both write paths' `Tags` member targets — is `@sensitive`, and the
+/// trait applies to the aggregate, so neither a key nor a value out of that map may be
+/// rendered on the wire; `UntagResource$TagKeys` is a bare `list<String>` with no
+/// sensitive trait anywhere in its path, so its refusal names the key it refused.
+/// Source: `smithy_query(query="shape", shape="TagsMap,TagKeys")`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KeyEcho {
+    /// The member's data is sensitive: no key out of it appears in the message.
+    Withheld,
+    /// The member's data is not sensitive: the refused key is named.
+    Named,
+}
+
+/// The part of a reserved `key` that is NOT the reserved prefix.
+///
+/// Every refusal states the prefix itself, so the tail is what tells a refusal that
+/// rendered the caller's key from one that only stated the requirement.
+pub(crate) fn key_tail(key: &str) -> &str {
+    key.get(RESERVED_TAG_PREFIX.len()..).unwrap_or("")
+}
+
+/// Every refusal states the member and the reserved prefix, and names the offending key
+/// only where the member's data is not sensitive.
+pub(crate) fn assert_reserved_refusal(
+    case: &str,
+    member: &str,
+    echo: KeyEcho,
+    key: &str,
+    status: u16,
+    answer: &Value,
+) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected 400, got {status} / {answer:?}"
@@ -414,10 +452,27 @@ fn assert_reserved_refusal(case: &str, member: &str, key: &str, status: u16, ans
         "case {case:?}: the refusal must name the reserved prefix {RESERVED_TAG_PREFIX:?}, \
          got {message:?}"
     );
-    assert!(
-        message.contains(key),
-        "case {case:?}: the refusal must name the key {key:?}, got {message:?}"
-    );
+    match echo {
+        KeyEcho::Named => assert!(
+            message.contains(key),
+            "case {case:?}: the refusal must name the key {key:?}, got {message:?}"
+        ),
+        KeyEcho::Withheld => {
+            // Nothing out of the map: neither the key's tail nor the clause a refusal
+            // about a non-sensitive member ends in.
+            assert!(
+                !message.contains(", got '"),
+                "case {case:?}: a refusal about the sensitive {member} map must render no \
+                 value at all, got {message:?}"
+            );
+            let tail = key_tail(key);
+            assert!(
+                tail.is_empty() || !message.contains(tail),
+                "case {case:?}: the refusal must render no key out of the sensitive \
+                 {member} map, but it carried {tail:?}: {message:?}"
+            );
+        }
+    }
 }
 
 /// `UntagResource` refuses a reserved key and removes nothing — alone, beside a key the
@@ -439,7 +494,7 @@ async fn untag_resource_refuses_a_reserved_tag_key() {
         ] {
             let case = format!("{case} {shape}");
             let (status, answer) = untag(&router, &arn, &keys).await;
-            assert_reserved_refusal(&case, "TagKeys", &key, status, &answer);
+            assert_reserved_refusal(&case, "TagKeys", KeyEcho::Named, &key, status, &answer);
 
             let left = stored_tags(&router, &case, &arn).await;
             assert_eq!(
@@ -468,7 +523,7 @@ async fn untag_resource_refuses_a_reserved_tag_key_before_resolving_the_resource
     for (case, key) in reserved_keys() {
         let case = format!("{case} on an unknown ARN");
         let (status, answer) = untag(&router, UNKNOWN_MANAGER_ARN, &[key.as_str()]).await;
-        assert_reserved_refusal(&case, "TagKeys", &key, status, &answer);
+        assert_reserved_refusal(&case, "TagKeys", KeyEcho::Named, &key, status, &answer);
     }
 }
 
@@ -521,7 +576,7 @@ async fn tag_resource_refuses_a_reserved_tag_key() {
         ] {
             let case = format!("{case} {shape}");
             let (status, answer) = tag(&router, &arn, &assign).await;
-            assert_reserved_refusal(&case, "Tags", &key, status, &answer);
+            assert_reserved_refusal(&case, "Tags", KeyEcho::Withheld, &key, status, &answer);
 
             let left = stored_tags(&router, &case, &arn).await;
             assert_eq!(
@@ -550,7 +605,7 @@ async fn list_tags_for_resource_reports_no_reserved_key_after_a_refused_assignme
         let arn = create_ok(&router, &case, &stored).await;
 
         let (status, answer) = tag(&router, &arn, &tags(&[(key.as_str(), "mine")])).await;
-        assert_reserved_refusal(&case, "Tags", &key, status, &answer);
+        assert_reserved_refusal(&case, "Tags", KeyEcho::Withheld, &key, status, &answer);
 
         let listed = listed_tags(&router, &case, &arn).await;
         assert_eq!(
@@ -608,7 +663,7 @@ async fn create_configuration_manager_refuses_a_reserved_tag_key() {
         ] {
             let case = format!("{case} {shape}");
             let (status, answer) = create(&router, "reserved-tag-create", &supplied).await;
-            assert_reserved_refusal(&case, "Tags", &key, status, &answer);
+            assert_reserved_refusal(&case, "Tags", KeyEcho::Withheld, &key, status, &answer);
 
             let after = manager_count(&router, &case).await;
             assert_eq!(
@@ -623,7 +678,7 @@ async fn create_configuration_manager_refuses_a_reserved_tag_key() {
 /// Every reserved key that is MORE than the reserved prefix itself, so a refusal naming
 /// one is distinguishable from the prefix every such message also states. Drawn from
 /// [`reserved_keys`], so the rows stay the ones that table spans.
-fn tailed_reserved_keys(ascii_only: bool) -> Vec<String> {
+pub(crate) fn tailed_reserved_keys(ascii_only: bool) -> Vec<String> {
     reserved_keys()
         .into_iter()
         .map(|(_, key)| key)
@@ -632,10 +687,10 @@ fn tailed_reserved_keys(ascii_only: bool) -> Vec<String> {
         .collect()
 }
 
-/// The one reserved key a refusal must name when a request carries several: the lexically
-/// first, so one request has ONE answer however the collection it travelled in is ordered
-/// or iterated.
-fn first_reserved_key(keys: &[String]) -> String {
+/// The one reserved key a refusal that MAY name a key must name when a request carries
+/// several: the lexically first, so one request has ONE answer however the collection it
+/// travelled in is ordered or iterated.
+pub(crate) fn first_reserved_key(keys: &[String]) -> String {
     keys.iter()
         .min()
         .expect("the reserved-key table is not empty")
@@ -660,15 +715,34 @@ fn assert_names_only(case: &str, message: &str, expected: &str, candidates: &[St
     }
 }
 
+/// A refusal about a SENSITIVE member renders NONE of `candidates`: neither the quoted
+/// form the service echoes a non-sensitive value in, nor the part of a key beyond the
+/// reserved prefix every such message states.
+pub(crate) fn assert_names_no_key(case: &str, message: &str, candidates: &[String]) {
+    for key in candidates {
+        assert!(
+            !message.contains(&format!("'{key}'")),
+            "case {case:?}: the refusal must render no key out of the sensitive map, but \
+             it named {key:?}: {message:?}"
+        );
+        let tail = key_tail(key);
+        assert!(
+            tail.is_empty() || !message.contains(tail),
+            "case {case:?}: the refusal must render no key out of the sensitive map, but \
+             it carried {tail:?}: {message:?}"
+        );
+    }
+}
+
 /// How many times a request whose answer must not vary is repeated. The handlers read
 /// `Tags` from a `HashMap`, whose iteration order differs from one map to the next, so
 /// repeating the identical request is what varies the order the keys are seen in.
 const REPEATS: usize = 8;
 
 /// A create naming SEVERAL reserved keys answers the same way every time: the same 400,
-/// naming the lexically first reserved key, and still creating nothing.
+/// rendering no key out of the sensitive map, and still creating nothing.
 #[tokio::test]
-async fn create_configuration_manager_names_one_reserved_key_however_tags_are_iterated() {
+async fn create_configuration_manager_answers_one_refusal_however_tags_are_iterated() {
     let router = emulator();
     let keys = tailed_reserved_keys(true);
     let expected = first_reserved_key(&keys);
@@ -677,12 +751,24 @@ async fn create_configuration_manager_names_one_reserved_key_however_tags_are_it
         .map(|key| (key.clone(), "mine".to_string()))
         .collect();
     let before = manager_count(&router, "several reserved keys in one create").await;
+    let mut answered: Option<String> = None;
 
     for attempt in 0..REPEATS {
         let case = format!("several reserved keys in one create, attempt {attempt}");
         let (status, answer) = create(&router, "reserved-tag-order", &supplied).await;
-        assert_reserved_refusal(&case, "Tags", &expected, status, &answer);
-        assert_names_only(&case, &error_message(&answer), &expected, &keys);
+        assert_reserved_refusal(&case, "Tags", KeyEcho::Withheld, &expected, status, &answer);
+        let message = error_message(&answer);
+        assert_names_no_key(&case, &message, &keys);
+        // The message carries nothing out of the request, so it cannot vary with the
+        // order the supplied map happens to be iterated in.
+        match &answered {
+            None => answered = Some(message),
+            Some(first) => assert_eq!(
+                &message, first,
+                "case {case:?}: the refusal must not vary with the iteration order, \
+                 expected {first:?}, got {message:?}"
+            ),
+        }
 
         let after = manager_count(&router, &case).await;
         assert_eq!(
@@ -696,7 +782,7 @@ async fn create_configuration_manager_names_one_reserved_key_however_tags_are_it
 /// The same for the assignment path: one answer however the supplied map is iterated, and
 /// the stored set untouched.
 #[tokio::test]
-async fn tag_resource_names_one_reserved_key_however_tags_are_iterated() {
+async fn tag_resource_answers_one_refusal_however_tags_are_iterated() {
     let router = emulator();
     let stored = seeded();
     let keys = tailed_reserved_keys(true);
@@ -706,12 +792,22 @@ async fn tag_resource_names_one_reserved_key_however_tags_are_iterated() {
         .map(|key| (key.clone(), "mine".to_string()))
         .collect();
     let arn = create_ok(&router, "several reserved keys in one assignment", &stored).await;
+    let mut answered: Option<String> = None;
 
     for attempt in 0..REPEATS {
         let case = format!("several reserved keys in one assignment, attempt {attempt}");
         let (status, answer) = tag(&router, &arn, &assign).await;
-        assert_reserved_refusal(&case, "Tags", &expected, status, &answer);
-        assert_names_only(&case, &error_message(&answer), &expected, &keys);
+        assert_reserved_refusal(&case, "Tags", KeyEcho::Withheld, &expected, status, &answer);
+        let message = error_message(&answer);
+        assert_names_no_key(&case, &message, &keys);
+        match &answered {
+            None => answered = Some(message),
+            Some(first) => assert_eq!(
+                &message, first,
+                "case {case:?}: the refusal must not vary with the iteration order, \
+                 expected {first:?}, got {message:?}"
+            ),
+        }
 
         let left = stored_tags(&router, &case, &arn).await;
         assert_eq!(
@@ -750,7 +846,7 @@ async fn untag_resource_names_one_reserved_key_however_tag_keys_are_ordered() {
         let case = format!("several reserved keys in one removal, ordered {ordering:?}");
         let named: Vec<&str> = ordering.iter().map(String::as_str).collect();
         let (status, answer) = untag(&router, &arn, &named).await;
-        assert_reserved_refusal(&case, "TagKeys", &expected, status, &answer);
+        assert_reserved_refusal(&case, "TagKeys", KeyEcho::Named, &expected, status, &answer);
         assert_names_only(&case, &error_message(&answer), &expected, &keys);
 
         let left = stored_tags(&router, &case, &arn).await;

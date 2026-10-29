@@ -45,6 +45,8 @@ mod region_scoping;
 mod reserved_tag_keys;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/sensitive_refusal_messages.rs"]
+mod sensitive_refusal_messages;
 #[path = "all/service_settings_and_types.rs"]
 mod service_settings_and_types;
 #[path = "all/service_settings_read_path.rs"]
