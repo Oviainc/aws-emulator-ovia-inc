@@ -65,9 +65,15 @@ pub const ACTION_PREFIX: &str = crate::state::SERVICE_SIGNING_NAME;
 /// names it: it belongs to STS's action namespace, not to this service's.
 pub const SERVICE_BEARER_TOKEN_ACTION: &str = "sts:GetServiceBearerToken";
 
-/// The resource an action that is not resource-scoped is judged against, as IAM writes it
-/// for such a request. `sts:GetServiceBearerToken` names no resource of its own.
-pub const ANY_RESOURCE: &str = "*";
+/// The resource a cross-service action that names no resource TYPE of its own is judged
+/// against: the CALLER'S own identity, because what such an action asks to act on is the
+/// credential presenting it (`sts:GetServiceBearerToken` mints a bearer credential for the
+/// calling session, and the IAM Service Authorization Reference lists no resource type for
+/// it). A policy that grants it for every resource still grants it, since `*` matches any
+/// ARN.
+fn judged_resource(caller: &Caller) -> &str {
+    &caller.arn
+}
 
 /// Authorize a token mint for `domain_arn`, the domain the request named.
 ///
@@ -88,10 +94,13 @@ pub fn authorize_token_mint<Eng: Send + Sync + 'static>(
     };
     // Both permissions, each judged against the resource IAM judges it against: the
     // operation's own action against the domain the request named, and the cross-service
-    // action against the resource it has none of.
+    // action against the caller's own identity ([`judged_resource`]).
     let required = [
         (format!("{ACTION_PREFIX}:{operation}"), domain_arn),
-        (SERVICE_BEARER_TOKEN_ACTION.to_string(), ANY_RESOURCE),
+        (
+            SERVICE_BEARER_TOKEN_ACTION.to_string(),
+            judged_resource(&caller),
+        ),
     ];
     for (action, resource) in required {
         // Identity-based documents state no `Principal` element, so the principal
@@ -117,27 +126,25 @@ pub fn authorize_token_mint<Eng: Send + Sync + 'static>(
     Ok(())
 }
 
-/// The refusal IAM states an authorization failure with: who was refused, which action and
-/// — for an action scoped to one — on which resource. Every value in it comes from the
-/// request and from the stored policies: the principal from the credential the request
-/// presented, the action from what the mint requires, the resource from the ARN it
-/// addressed.
+/// The refusal IAM states an authorization failure with: who was refused, which action, on
+/// which resource, and why. Every value in it comes from the request and from the stored
+/// policies: the principal from the credential the request presented, the action from what
+/// the mint requires, the resource from what that action was judged against — the ARN the
+/// request addressed, or the caller's own identity for an action that names no resource type
+/// of its own ([`judged_resource`]).
 ///
-/// An action that addresses no resource of its own is judged against [`ANY_RESOURCE`], and
-/// the sentence states no resource clause for it: there is nothing to name. `explicit_deny`
-/// states the clause IAM appends when a readable document DENIES the action rather than
-/// merely not allowing it.
+/// The resource clause is part of the sentence for EVERY refusal: an authorization decision
+/// is always reached against some resource, and the clause is what tells an operator (and
+/// any tooling parsing the message) which one the deny applies to. `explicit_deny` states
+/// the clause IAM appends when a readable document DENIES the action rather than merely not
+/// allowing it.
 fn not_authorized(
     principal: &str,
     action: &str,
     resource: &str,
     explicit_deny: bool,
 ) -> AccessDeniedException {
-    let on_resource = if resource == ANY_RESOURCE {
-        String::new()
-    } else {
-        format!(" on resource: {resource}")
-    };
+    let on_resource = format!(" on resource: {resource}");
     let because = if explicit_deny {
         " with an explicit deny in an identity-based policy".to_string()
     } else {
@@ -303,7 +310,10 @@ mod tests {
                 &format!("{ACTION_PREFIX}:GetAuthorizationToken"),
                 "arn:aws:codeartifact:us-east-1:000000000000:domain/acme",
             );
-            let bearer_reached = decide(SERVICE_BEARER_TOKEN_ACTION, ANY_RESOURCE);
+            let bearer_reached = decide(
+                SERVICE_BEARER_TOKEN_ACTION,
+                "arn:aws:sts::000000000000:assumed-role/ca-publisher/session-1",
+            );
             assert_eq!(
                 own_reached, *own,
                 "case {case:?}: expected the operation's own action allowed={own}, got \
@@ -349,9 +359,10 @@ mod tests {
         }
     }
 
-    /// RULE: the refusal names the principal and the action, with the resource clause only
-    /// for an action scoped to a resource and the explicit-deny clause only for a document
-    /// that denies.
+    /// RULE: the refusal names the principal, the action and the resource the action was
+    /// judged against — for the cross-service action that names no resource type of its own,
+    /// the caller's own identity — with the explicit-deny clause only for a document that
+    /// denies.
     #[test]
     fn the_refusal_names_the_principal_the_action_and_the_resource() {
         let principal = "arn:aws:sts::000000000000:assumed-role/ca-publisher/session-1";
@@ -373,23 +384,23 @@ mod tests {
             (
                 "the cross-service action, allowed by nothing",
                 SERVICE_BEARER_TOKEN_ACTION,
-                ANY_RESOURCE,
+                principal,
                 false,
                 format!(
                     "User: {principal} is not authorized to perform: \
-                     {SERVICE_BEARER_TOKEN_ACTION} because no identity-based policy allows the \
-                     {SERVICE_BEARER_TOKEN_ACTION} action"
+                     {SERVICE_BEARER_TOKEN_ACTION} on resource: {principal} because no \
+                     identity-based policy allows the {SERVICE_BEARER_TOKEN_ACTION} action"
                 ),
             ),
             (
                 "the cross-service action, explicitly denied",
                 SERVICE_BEARER_TOKEN_ACTION,
-                ANY_RESOURCE,
+                principal,
                 true,
                 format!(
                     "User: {principal} is not authorized to perform: \
-                     {SERVICE_BEARER_TOKEN_ACTION} with an explicit deny in an identity-based \
-                     policy"
+                     {SERVICE_BEARER_TOKEN_ACTION} on resource: {principal} with an explicit \
+                     deny in an identity-based policy"
                 ),
             ),
         ];

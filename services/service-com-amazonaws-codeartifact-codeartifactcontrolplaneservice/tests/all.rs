@@ -83,3 +83,7 @@ mod npm_registry_endpoint;
 mod authorization_token_caller_binding;
 #[path = "all/package_version_state_change_events.rs"]
 mod package_version_state_change_events;
+#[path = "all/upstream_chain_resolution.rs"]
+mod upstream_chain_resolution;
+#[path = "all/package_coordinate_refusals.rs"]
+mod package_coordinate_refusals;

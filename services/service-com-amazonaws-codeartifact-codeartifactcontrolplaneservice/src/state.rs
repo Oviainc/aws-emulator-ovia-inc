@@ -1627,10 +1627,14 @@ impl Package {
 
     /// Whether origin control permits a version of this package being INGESTED into the
     /// repository from elsewhere — an upstream repository or an external connection — as
-    /// `PutPackageOriginConfiguration`'s `upstream` restriction sets it.
+    /// `PutPackageOriginConfiguration`'s `upstream` restriction sets it ("the package origin
+    /// configuration that determines if new versions of the package can be added to the
+    /// repository from an external connection or upstream source").
     ///
     /// The companion of [`Self::publish_allowed`]: the two restrictions decide the two
-    /// ways a version comes to exist in a repository, so they are read the same way.
+    /// ways a version comes to exist in a repository, so they are read the same way. A
+    /// package the repository does not hold at all carries no restriction, so ingesting its
+    /// first version is permitted; this answers for a record that exists.
     pub fn upstream_allowed(&self) -> bool {
         self.origin_restrictions.upstream != ORIGIN_RESTRICTION_BLOCK
     }
@@ -2544,7 +2548,7 @@ pub fn package_group_not_found_message(
     )
 }
 
-/// The `ResourceNotFoundException` message `DescribePackageVersion` states for a
+/// The `ResourceNotFoundException` message every VERSION-addressing operation states for a
 /// COORDINATE the addressed repository holds no version of.
 ///
 /// A package version is addressed by its whole `(format, namespace, package, version)`
@@ -2552,9 +2556,17 @@ pub fn package_group_not_found_message(
 /// the sentence for "nothing is published at this coordinate": it names the format, the
 /// package, its namespace and the repository the version was looked for in. The namespace
 /// clause appears only where the request carried one, since a format whose versions carry
-/// no namespace component has none to name. Distinct from
-/// [`package_not_found_message`], which is the sentence the PACKAGE-scoped operations
-/// state for a package name the repository does not hold at all.
+/// no namespace component has none to name.
+///
+/// Stated by every operation that addresses a package's VERSIONS — whether it addresses one
+/// version (`DescribePackageVersion`, `GetPackageVersionAsset`,
+/// `ListPackageVersionAssets`, `ListPackageVersionDependencies`), a batch of them
+/// (`CopyPackageVersions`, `DeletePackageVersions`, `DisposePackageVersions`,
+/// `UpdatePackageVersionsStatus`) or all of them (`ListPackageVersions`) — because each of
+/// them was asked about versions IN one repository, and the repository is what distinguishes
+/// "absent from this repository" from "absent from the domain" when several hold the same
+/// package name. Distinct from [`package_not_found_message`], the sentence the
+/// PACKAGE-scoped operations state for a package name the repository does not hold at all.
 pub fn package_coordinate_not_found_message(
     format: &str,
     namespace: Option<&str>,
@@ -2593,8 +2605,12 @@ pub fn package_version_resource_id(
     }
 }
 
-/// The `ResourceNotFoundException` message for a package the addressed repository does not
-/// hold.
+/// The `ResourceNotFoundException` message the PACKAGE-scoped operations state for a
+/// package the addressed repository does not hold.
+///
+/// The sentence of the operations whose subject is the PACKAGE itself (`DescribePackage`),
+/// as opposed to the version-addressing ones, which state
+/// [`package_coordinate_not_found_message`].
 ///
 /// A package is addressed by its whole `(format, namespace, name)` triple, so the refusal
 /// states that whole triple: a caller that addressed the right name under the wrong format

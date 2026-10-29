@@ -34,13 +34,13 @@ use crate::domain_repository_lifecycle::create_repository;
 use crate::harness::{call, create_domain, emulator, emulator_with_engine, Answer, ACCOUNT, REGION};
 
 /// The npm endpoint path a repository publishes: `/<format>/<repository>/`.
-fn endpoint_path(repository: &str) -> String {
+pub fn endpoint_path(repository: &str) -> String {
     format!("/npm/{repository}")
 }
 
 /// The host `GetRepositoryEndpoint` hands out for a domain:
 /// `<domain>-<account>.d.codeartifact.<region>.amazonaws.com`.
-fn endpoint_host(domain: &str) -> String {
+pub fn endpoint_host(domain: &str) -> String {
     format!("{domain}-{ACCOUNT}.d.codeartifact.{REGION}.amazonaws.com")
 }
 
@@ -50,21 +50,21 @@ const EMULATOR_HOST: &str = "127.0.0.1:9297";
 
 /// One raw HTTP answer, reduced to what an npm client branches on.
 #[derive(Debug)]
-struct Raw {
-    status: u16,
-    content_type: Option<String>,
-    www_authenticate: Option<String>,
-    body: Vec<u8>,
+pub struct Raw {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub www_authenticate: Option<String>,
+    pub body: Vec<u8>,
 }
 
 impl Raw {
     /// The body parsed as JSON, or `Null` when it is not JSON (a tarball).
-    fn json(&self) -> Value {
+    pub fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
 
     /// The `error` member an npm registry states a refusal with.
-    fn error(&self) -> String {
+    pub fn error(&self) -> String {
         self.json()
             .get("error")
             .and_then(Value::as_str)
@@ -75,7 +75,7 @@ impl Raw {
 
 /// Send one raw registry request — no SigV4 credential, an npm bearer token instead — and
 /// reduce the answer to a [`Raw`].
-async fn registry(
+pub async fn registry(
     router: &MultiServiceRouter,
     method: &str,
     host: &str,
@@ -113,7 +113,7 @@ async fn registry(
 }
 
 /// `GetAuthorizationToken` for `domain`, returning the minted token.
-async fn token_for(router: &MultiServiceRouter, domain: &str) -> String {
+pub async fn token_for(router: &MultiServiceRouter, domain: &str) -> String {
     let answer = call(
         router,
         "POST",
@@ -154,7 +154,7 @@ async fn given_repository(
 
 /// The bytes a test publishes as a version's tarball. Opaque content: the registry stores
 /// and serves an asset's bytes verbatim, so what matters is that the bytes come back.
-fn tarball_bytes(package: &str, version: &str) -> Vec<u8> {
+pub fn tarball_bytes(package: &str, version: &str) -> Vec<u8> {
     format!("tarball of {package}@{version}").into_bytes()
 }
 
@@ -164,7 +164,7 @@ fn tarball_bytes(package: &str, version: &str) -> Vec<u8> {
 ///
 /// Written as TEXT rather than built from a map, because the order the manifest declares
 /// its dependencies in is part of what is under test and a map would re-order it.
-fn publish_document(display_name: &str, unscoped: &str, versions: &[&str]) -> Vec<u8> {
+pub fn publish_document(display_name: &str, unscoped: &str, versions: &[&str]) -> Vec<u8> {
     use base64::Engine as _;
 
     let manifests: Vec<String> = versions
@@ -244,7 +244,7 @@ async fn list_assets(
 }
 
 /// `ListPackageVersions` over the control plane.
-async fn list_versions(
+pub async fn list_versions(
     router: &MultiServiceRouter,
     domain: &str,
     repository: &str,
@@ -1461,8 +1461,8 @@ async fn a_refused_publish_stores_nothing() {
             "a package whose origin configuration blocks publishing",
             blocked.to_string(),
             publish_document(blocked, blocked, &["1.0.0"]),
-            403,
-            "origin configuration",
+            400,
+            "configured to block new versions from being published",
         ),
     ];
 

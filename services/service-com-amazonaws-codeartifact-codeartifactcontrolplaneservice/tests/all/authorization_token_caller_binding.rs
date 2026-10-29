@@ -19,6 +19,10 @@
 //!    without the other is refused `AccessDeniedException` (403) and is handed no token.
 //! 3. The cross-service permission is an IDENTITY permission: granting it in the domain's
 //!    own resource policy does not substitute for it.
+//! 4. The refusal is IAM's whole implicit-deny sentence: the principal, the action, the
+//!    RESOURCE the action was judged against — the domain for the operation's own action,
+//!    the caller's own identity for the cross-service action, which names no resource type —
+//!    and the reason, whether nothing allowed the action or a readable document denied it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -419,4 +423,93 @@ async fn minting_needs_both_the_services_own_action_and_the_cross_service_bearer
         "case \"the domain policy grants the cross-service action\": expected the mint to stay \
          refused, got {answer:?}"
     );
+}
+
+/// RULE 4: the refusal is IAM's whole implicit-deny sentence — the principal, the action,
+/// the RESOURCE the action was judged against and the reason — for each of the two
+/// permissions a mint needs, and for a document that denies one explicitly.
+///
+/// The resource clause is part of every one of them: an authorization decision is always
+/// reached against some resource, and for the cross-service action, which names no resource
+/// type of its own, that resource is the caller's own identity.
+#[tokio::test]
+async fn the_refusal_states_iams_whole_sentence_including_the_resource_it_was_judged_against() {
+    let emulator = Emulator::new();
+    let domain = "denial-sentence";
+    assert_eq!(
+        create_domain(&emulator.router, domain, None).await.status,
+        200,
+        "CreateDomain must succeed before a token is requested"
+    );
+    emulator.given_role();
+    emulator.given_session(3_600);
+
+    let session_arn = format!("arn:aws:sts::{ACCOUNT}:assumed-role/{ROLE}/publish-session");
+    let domain_arn = format!("arn:aws:codeartifact:{REGION}:{ACCOUNT}:domain/{domain}");
+    let own_action = "codeartifact:GetAuthorizationToken";
+    let bearer_action = "sts:GetServiceBearerToken";
+
+    let deny = |action: &str| {
+        json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                { "Effect": "Allow", "Action": [own_action, bearer_action], "Resource": "*" },
+                { "Effect": "Deny", "Action": action, "Resource": "*" }
+            ]
+        })
+    };
+
+    // Rows differ along WHICH permission is missing (so along the action named and the
+    // resource it is judged against) and along HOW it is missing — merely not allowed, or
+    // denied by a readable document.
+    let rows: [(&str, Value, String); 4] = [
+        (
+            "the cross-service action is allowed by nothing",
+            allow(json!(own_action)),
+            format!(
+                "User: {session_arn} is not authorized to perform: {bearer_action} on resource: \
+                 {session_arn} because no identity-based policy allows the {bearer_action} action"
+            ),
+        ),
+        (
+            "the operation's own action is allowed by nothing",
+            allow(json!(bearer_action)),
+            format!(
+                "User: {session_arn} is not authorized to perform: {own_action} on resource: \
+                 {domain_arn} because no identity-based policy allows the {own_action} action"
+            ),
+        ),
+        (
+            "the cross-service action is explicitly denied",
+            deny(bearer_action),
+            format!(
+                "User: {session_arn} is not authorized to perform: {bearer_action} on resource: \
+                 {session_arn} with an explicit deny in an identity-based policy"
+            ),
+        ),
+        (
+            "the operation's own action is explicitly denied",
+            deny(own_action),
+            format!(
+                "User: {session_arn} is not authorized to perform: {own_action} on resource: \
+                 {domain_arn} with an explicit deny in an identity-based policy"
+            ),
+        ),
+    ];
+
+    for (case, policy, expected) in &rows {
+        emulator.given_role_policy(Some(policy));
+        let answer = get_token_as(&emulator.router, SESSION_KEY_ID, domain, None).await;
+        assert_eq!(
+            (answer.status, answer.code()),
+            (403, "AccessDeniedException".to_string()),
+            "case {case:?}: expected the modelled refusal, got {answer:?}"
+        );
+        assert_eq!(
+            &answer.message(),
+            expected,
+            "case {case:?}: expected IAM's whole sentence, got {:?}",
+            answer.message()
+        );
+    }
 }

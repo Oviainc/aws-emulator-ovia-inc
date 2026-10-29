@@ -242,15 +242,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         // A package is identified by its whole `(format, namespace, name)` triple: the same
-        // name in another format, or under another namespace, is another package.
+        // name in another format, or under another namespace, is another package. Refused in
+        // the sentence the VERSION-addressing operations state for a package absent from the
+        // addressed repository (`crate::state::package_coordinate_not_found_message`).
         let Some(package) =
             repository.package(&input.format, input.namespace.as_deref(), &input.package)
         else {
             return Err(not_found(
-                crate::state::package_not_found_message(
+                crate::state::package_coordinate_not_found_message(
                     &input.format,
                     input.namespace.as_deref(),
                     &input.package,
+                    &input.repository,
                 ),
                 &input.package,
                 crate::state::PACKAGE_RESOURCE_TYPE,

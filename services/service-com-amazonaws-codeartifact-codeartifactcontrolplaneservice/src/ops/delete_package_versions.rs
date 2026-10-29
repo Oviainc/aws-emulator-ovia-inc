@@ -268,15 +268,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeletePackageVers
         // A package is addressed by its whole (format, namespace, name) triple, the same
         // key `DescribePackage` resolves: a request naming the right package name under a
         // different format or namespace addresses a DIFFERENT package, and that one is
-        // not found.
+        // not found — in the sentence the VERSION-addressing operations state for a package
+        // absent from the addressed repository.
         let key =
             crate::state::package_key(&input.format, input.namespace.as_deref(), &input.package);
         let Some(package) = repository.packages.get_mut(&key) else {
             return Err(not_found(
-                crate::state::package_not_found_message(
+                crate::state::package_coordinate_not_found_message(
                     &input.format,
                     input.namespace.as_deref(),
                     &input.package,
+                    &input.repository,
                 ),
                 &input.package,
                 "package",

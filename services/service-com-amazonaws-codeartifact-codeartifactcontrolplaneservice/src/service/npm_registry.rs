@@ -791,6 +791,24 @@ fn blocked_download(reason: String) -> Served {
     Served::json(400, &json!({ "error": reason }))
 }
 
+/// The refusal a publish into a package whose origin configuration BLOCKS new versions
+/// earns: `400`, with npm's `success`/`error` envelope and the sentence CodeArtifact's npm
+/// endpoint states for that control.
+///
+/// The sentence states the CONTROL and interpolates nothing — it is the same for whatever
+/// package was addressed — and the status is `400` rather than the `403` an authorization
+/// refusal carries: the credential was accepted and the repository reachable; what the
+/// request asked for is a version this package does not accept.
+fn publish_blocked() -> Served {
+    Served::json(
+        400,
+        &json!({
+            "success": false,
+            "error": "This package is configured to block new versions from being published."
+        }),
+    )
+}
+
 /// The refusal a publish document the registry cannot read earns.
 fn bad_request(reason: String) -> Served {
     Served::json(400, &json!({ "error": reason }))
@@ -798,6 +816,9 @@ fn bad_request(reason: String) -> Served {
 
 /// The packument of `package` in the addressed repository: what an npm client resolves a
 /// version range and a dist-tag against.
+///
+/// Read out of the addressed repository's OWN records: whatever its upstream chain resolves
+/// has already been retained there ([`retain_from_upstreams`]) by the time this runs.
 ///
 /// Only a version in [`crate::state::PACKAGE_VERSION_STATUS_PUBLISHED`] is listed. That is
 /// the one status in which a version is both listed and resolvable: an `Unlisted` version
@@ -910,6 +931,10 @@ fn version_manifest(package: &NpmPackage, version: &PackageVersion, endpoint: &s
 /// version's content is stored under is the format's fixed one
 /// ([`crate::state::NPM_TARBALL_ASSET`]).
 ///
+/// Read out of the addressed repository's OWN records, like every other answer here: a
+/// version its upstream chain resolves was retained in it before this ran
+/// ([`retain_from_upstreams`]).
+///
 /// A version's status decides whether its CONTENT is served, independently of whether the
 /// version is listed: `Published` and `Unlisted` are the two statuses in which a version's
 /// assets are downloadable ("an unlisted version … can still be downloaded"), and every
@@ -924,16 +949,19 @@ fn tarball(
     let Some(held) = held_package(store, resolved, package) else {
         return not_found(package_not_found(package));
     };
+    let asset_not_found = || {
+        not_found(format!(
+            "Package version not found in repository. Asset = {{format={PACKAGE_FORMAT_NPM}, \
+             name={}, asset={file_name}}}",
+            package.display_name()
+        ))
+    };
     let Some(version) = held
         .versions
         .values()
         .find(|version| package.tarball_file_name(&version.version) == file_name)
     else {
-        return not_found(format!(
-            "Package version not found in repository. Asset = {{format={PACKAGE_FORMAT_NPM}, \
-             name={}, asset={file_name}}}",
-            package.display_name()
-        ));
+        return asset_not_found();
     };
     if !downloadable(&version.status) {
         return blocked_download(format!(
@@ -944,11 +972,7 @@ fn tarball(
         ));
     }
     let Some(content) = version.assets.get(crate::state::NPM_TARBALL_ASSET) else {
-        return not_found(format!(
-            "Package version not found in repository. Asset = {{format={PACKAGE_FORMAT_NPM}, \
-             name={}, asset={file_name}}}",
-            package.display_name()
-        ));
+        return asset_not_found();
     };
     Served::bytes(content.content().to_vec())
 }
@@ -968,8 +992,10 @@ fn package_not_found(package: &NpmPackage) -> String {
 /// Every distribution tag `package` carries that a client can resolve: the tag map npm's
 /// `/-/package/<package>/dist-tags` route answers.
 ///
-/// A tag pointing at a version that is not listed is left out, for the same reason the
-/// packument leaves it out: a tag resolves to a version a client can fetch, or to nothing.
+/// Read out of the addressed repository's own records, like every other answer here: a tag
+/// its upstream chain resolves arrived with the retention ([`retain_from_upstreams`]). A tag
+/// pointing at a version that is not listed is left out, for the same reason the packument
+/// leaves it out: a tag resolves to a version a client can fetch, or to nothing.
 fn dist_tags(store: &CaState, resolved: &Resolved, package: &NpmPackage) -> Served {
     let Some(held) = held_package(store, resolved, package) else {
         return not_found(package_not_found(package));
@@ -1439,16 +1465,14 @@ fn publish(
 
     // Origin control decides whether this package accepts a direct publish at all, checked
     // against the STORED package: one that does not exist yet is created with publishing
-    // allowed, and `PutPackageOriginConfiguration` is what blocks it.
+    // allowed, while one whose first version arrived by ingestion is created with publishing
+    // blocked, and `PutPackageOriginConfiguration` is what moves either.
     if repository
         .packages
         .get(&key)
         .is_some_and(|existing| !existing.publish_allowed())
     {
-        return forbidden(format!(
-            "publishing {} is blocked by its package origin configuration",
-            package.display_name()
-        ));
+        return publish_blocked();
     }
     if !repository.packages.contains_key(&key)
         && repository.packages.len() >= crate::state::MAX_PACKAGES_PER_REPOSITORY
@@ -1640,7 +1664,25 @@ fn read_publish_document(
             "the publish document carries no version".to_string(),
         ));
     }
+    // The COUNT of versions is bounded before any attachment is decoded: each version the
+    // document declares costs a few bytes of the document budget and would materialise a
+    // whole decoded tarball, so a document naming more versions than a package may ever
+    // hold is refused here rather than after the copies exist. The same ceiling the store
+    // enforces per package, enforced on the way in.
+    if versions.len() > crate::state::MAX_PACKAGE_VERSIONS_PER_PACKAGE {
+        return Err(forbidden(format!(
+            "the publish document carries {} versions, more than the maximum of {} a package \
+             holds",
+            versions.len(),
+            crate::state::MAX_PACKAGE_VERSIONS_PER_PACKAGE
+        )));
+    }
     let attachments = wire.attachments.unwrap_or_default();
+    // What this document has decoded so far, so a multi-version document cannot materialise
+    // more content than the store could ever retain: the budget is checked as each version
+    // is decoded, so the first version past it refuses the request instead of the check
+    // happening once every copy is already in memory.
+    let mut decoded_bytes: i64 = 0;
 
     let mut published = Vec::new();
     for (version, manifest) in &versions {
@@ -1655,7 +1697,8 @@ fn read_publish_document(
                 )));
             }
         }
-        let Some(attachment) = attachment_of(&attachments, package, version) else {
+        let Some(attachment) = attachment_of(&attachments, package, version, versions.len())
+        else {
             return Err(bad_request(format!(
                 "the publish document attaches no tarball for version {version:?}"
             )));
@@ -1698,6 +1741,18 @@ fn read_publish_document(
                 }),
             ));
         }
+        // Counted BEFORE the copy is kept, so the budget bounds what this document has
+        // materialised rather than what it managed to retain.
+        decoded_bytes = decoded_bytes.saturating_add(
+            i64::try_from(tarball.len().saturating_add(manifest_text.len())).unwrap_or(i64::MAX),
+        );
+        if decoded_bytes > crate::state::MAX_STORED_ASSET_BYTES {
+            return Err(forbidden(format!(
+                "the publish document carries {decoded_bytes} bytes of package content, more \
+                 than this emulator's ceiling of {} bytes",
+                crate::state::MAX_STORED_ASSET_BYTES
+            )));
+        }
         published.push(PublishedVersion {
             version: version.clone(),
             manifest: manifest_text.to_string(),
@@ -1715,12 +1770,16 @@ fn read_publish_document(
 /// npm keys an attachment by the tarball's file name, which it writes with the package's
 /// FULL name — `@scope/name-1.0.0.tgz` for a scoped package and `name-1.0.0.tgz` otherwise
 /// — so both spellings are looked for. A document carrying exactly one attachment and
-/// naming it some third way is read as that version's, because a single-version publish
-/// document attaches exactly one tarball.
+/// naming it some third way is read as that version's ONLY when the document declares a
+/// single version (`declared_versions`), because that is the document a single-version
+/// publish sends: in a multi-version document the same attachment would otherwise be read as
+/// every version's, which both stores one version's content as another's and makes one
+/// attachment decode once per version.
 fn attachment_of<'a>(
     attachments: &'a ::std::collections::BTreeMap<String, WireAttachment>,
     package: &NpmPackage,
     version: &str,
+    declared_versions: usize,
 ) -> Option<&'a WireAttachment> {
     let candidates = [
         format!(
@@ -1729,10 +1788,10 @@ fn attachment_of<'a>(
         ),
         package.tarball_file_name(version),
     ];
-    candidates
-        .iter()
-        .find_map(|name| attachments.get(name))
-        .or_else(|| (attachments.len() == 1).then(|| attachments.values().next())?)
+    candidates.iter().find_map(|name| attachments.get(name)).or_else(|| {
+        (declared_versions == 1 && attachments.len() == 1)
+            .then(|| attachments.values().next())?
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -348,10 +348,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyPackageVersio
                 source.package(&input.format, input.namespace.as_deref(), &input.package)
             else {
                 return Err(not_found(
-                    crate::state::package_not_found_message(
+                    // The sentence the VERSION-addressing operations state for a package
+                    // absent from the repository they addressed — here the SOURCE
+                    // repository, the one the versions were looked for in.
+                    crate::state::package_coordinate_not_found_message(
                         &input.format,
                         input.namespace.as_deref(),
                         &input.package,
+                        &input.source_repository,
                     ),
                     &input.package,
                     "package",

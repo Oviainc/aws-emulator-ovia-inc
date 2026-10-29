@@ -243,17 +243,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A package is identified by its whole `(format, namespace, name)` triple: the same
         // name in another format, or under another namespace, is another package, and a
         // repository that holds no such package has no versions to list — reported as the
-        // missing PACKAGE, the resource the request addressed. A package the repository DOES
-        // hold lists what it holds, even when that is nothing: a package outlives its
-        // versions (`DeletePackage`, not `DeletePackageVersions`, is what removes one).
+        // missing PACKAGE, the resource the request addressed, in the sentence the
+        // VERSION-addressing operations state for a package absent from the addressed
+        // repository (`crate::state::package_coordinate_not_found_message`). A package the
+        // repository DOES hold lists what it holds, even when that is nothing: a package
+        // outlives its versions (`DeletePackage`, not `DeletePackageVersions`, is what
+        // removes one).
         let Some(package) =
             repository.package(&input.format, input.namespace.as_deref(), &input.package)
         else {
             return Err(not_found(
-                crate::state::package_not_found_message(
+                crate::state::package_coordinate_not_found_message(
                     &input.format,
                     input.namespace.as_deref(),
                     &input.package,
+                    &input.repository,
                 ),
                 &input.package,
                 crate::state::PACKAGE_RESOURCE_TYPE,
