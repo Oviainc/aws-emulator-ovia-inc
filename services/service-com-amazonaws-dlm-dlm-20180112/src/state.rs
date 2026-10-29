@@ -312,13 +312,26 @@ pub const POLICY_QUOTA: usize = 1_000;
 /// True when `details` configures an EVENT-BASED policy rather than a custom
 /// snapshot or AMI one.
 ///
-/// `PolicyDetails$PolicyType` names the type, and `EventSource` ("[Event-based
-/// policies only] The event that activates the event-based policy") is declared
-/// by that kind of policy alone, so either of them makes the configuration an
-/// event-based one.
+/// `PolicyDetails$PolicyType` is the ONE member that says which kind of policy a
+/// configuration describes — "The type of policy ... Specify
+/// `EVENT_BASED_POLICY` to create an event-based policy that performs specific
+/// actions when a defined event occurs" — and a configuration naming no type
+/// describes the kind its documented default names ([`DEFAULT_POLICY_TYPE`],
+/// "The default is `EBS_SNAPSHOT_MANAGEMENT`"), which is a snapshot policy. On
+/// an update the type the policy already holds is carried onto a replacement
+/// stating none first ([`carry_over_policy_type`]), so the member read here is
+/// the type the configuration will be stored with either way.
+///
+/// The kind is NEVER inferred from which OTHER members the configuration happens
+/// to carry. `EventSource` is documented "[Event-based policies only]", but that
+/// says where the member may be stated, not what the configuration's type is: a
+/// configuration carrying one and naming no type still describes a policy of the
+/// defaulted type, which is exactly the inference that default replaces. Reading
+/// it as the type instead would make one request mean two different things to
+/// two rules — the one that refuses a change of type, which reads the type
+/// member, and the one that asks which members the configuration must state.
 pub fn configures_event_based_policy(details: &PolicyDetails) -> bool {
     details.policy_type.as_deref() == Some(EVENT_BASED_POLICY_TYPE)
-        || details.event_source.is_some()
 }
 
 /// The `PolicyDetails` this service STORES for a policy whose configuration was
@@ -379,11 +392,6 @@ pub fn materialized_policy_details(
     }
     details.policy_language = Some(STANDARD_POLICY_LANGUAGE.to_string());
 
-    // Which kind of configuration this is, read BEFORE the type is stamped, so
-    // the stamped default cannot turn an event-based configuration into
-    // something else.
-    let event_based = configures_event_based_policy(&details);
-
     // `PolicyType` — the documented default for a configuration that names no
     // type: "The default is `EBS_SNAPSHOT_MANAGEMENT`." It is stamped here, so
     // the type is stored once and both reads report the same one, and it is
@@ -404,10 +412,12 @@ pub fn materialized_policy_details(
         .policy_type
         .get_or_insert_with(|| DEFAULT_POLICY_TYPE.to_string());
 
-    // Resource locations and schedules are `[Custom snapshot and AMI policies
-    // only]`; an event-based policy configures an `EventSource` and `Actions`
-    // instead, so it carries neither.
-    if event_based {
+    // Which kind of configuration this is: the kind its `PolicyType` names, now
+    // that a configuration which named none holds the type that member's
+    // documented default names. Resource locations and schedules are `[Custom
+    // snapshot and AMI policies only]`; an event-based policy configures an
+    // `EventSource` and `Actions` instead, so it carries neither.
+    if configures_event_based_policy(&details) {
         return details;
     }
     // `CreateRule$Location` is `[Custom snapshot policies only]`, so an AMI
@@ -1650,6 +1660,13 @@ fn schedule_path(position: usize) -> String {
 /// * An event-based policy is built from `EventSource` ("the event that
 ///   activates the event-based policy") and `Actions` ("the actions to be
 ///   performed when the event-based policy is activated") instead.
+///
+/// WHICH kind of policy a configuration describes is decided by its
+/// `PolicyType` alone ([`configures_event_based_policy`]), so the set of members
+/// required of it is fixed before any of them is read: a configuration that
+/// names no type describes a snapshot policy ("The default is
+/// `EBS_SNAPSHOT_MANAGEMENT`") and is required to state the members one is built
+/// from, whichever other members it happens to carry.
 ///
 /// A DEFAULT policy is configured from the `[Default policies only]` members,
 /// each of which documents a value the service fills in, so it requires none of
