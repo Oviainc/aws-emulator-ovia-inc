@@ -111,14 +111,38 @@ service's operations.
 This service is a DATA plane: it serves the rollouts of an AgenticRFT job that is
 already running, and its model binds no operation that creates, lists or deletes
 one. The `JobArn` every operation carries is therefore the ARN the caller's own job
-execution was handed, and the runtime keeps no registry of jobs to resolve it
-against: every value the member's modelled constraints admit (`@length` 1..256 and
-the ARN `@pattern`, which allow any partition, region, account and job name) names
-the job the call is served for, and a trajectory is keyed by the
-`(JobArn, TrajectoryId)` pair. A value that misses those constraints is still
-refused `400 ValidationException` by the front door (`Input arn … is malformed`).
+execution was handed, and it is resolved against the SHARED job directory the
+SageMaker control plane writes when it mints a job
+(`service_common::agentic_rft_jobs::JobDirectory`, reached from this crate through
+`state::job_directory` and `state::job_exists`): a create in that control plane is
+the only thing that makes a job addressable here, so its directory is the only place
+an ARN can be resolved. Which partition, Region and account an ARN was addressed
+through identifies no job, so a job the control plane created resolves however a
+caller addresses it, and a trajectory is keyed by the job that resolution identifies
+together with the request's `TrajectoryId` (`state::trajectory_key`).
 
-What a sampling call IS refused on is state this service owns: a trajectory
-`CompleteRollout` has already sealed, and the emulator's own store bounds
+A `JobArn` the member's own modelled constraints admit (`@length` 1..256 and the ARN
+`@pattern`, which allow any partition, region, account and job name) but that no
+create ever minted names no job, and EVERY operation of this data plane refuses such
+a call rather than serving it:
+
+- `Sample` and `SampleWithResponseStream` are refused `400 ValidationException`
+  carrying `state::job_not_found_message`, before any turn is captured, because the
+  turn can be routed to no model session (`state::serve_sampling_turn`);
+- `CompleteRollout` and `UpdateReward` are refused `404 ResourceNotFoundException`
+  carrying `state::trajectory_not_found_message`, because a trajectory lives inside
+  the job its key names, so the pair names no trajectory of it either
+  (`state::unresolved_job_trajectory_message`, reached through
+  `state::serve_rollout_trajectory`).
+
+A value that misses the modelled constraints never gets that far: it is refused
+`400 ValidationException` by the front door (`Input arn … is malformed`).
+
+Beside job resolution, a sampling call is refused on state this service owns: a
+trajectory `CompleteRollout` has already sealed, and the emulator's own store bounds
 (`state::MAX_TURNS_PER_TRAJECTORY`, `MAX_TRAJECTORIES`, `MAX_TURN_BODY_BYTES`,
 `MAX_RETAINED_BODY_BYTES`).
+
+This section states the rule `src/state.rs` implements, and
+`tests/all/job_resolution_is_documented_once.rs` reads it back and drives it over the
+wire on every operation, so the two statements of it cannot drift apart again.
