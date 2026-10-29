@@ -1,0 +1,44 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: s3control.batch-job-runs-to-completion-and-tags-objects
+Issue-Shape-Id: com.amazonaws.s3control#AWSS3ControlServiceV20180820
+Issue-Key: s3control.batch-job-runs-to-completion-and-tags-objects|_poll_terminal#14|Timeout|time.sleep(3)
+Issue-Commit: 5b71589754f95f05f88c1a0ee9ccd691bbc5f701
+
+# s3control Batch Operations: a ConfirmationRequired=false S3PutObjectTagging job never reaches a terminal status and never tags the manifest's object (1 cause)
+
+> _Note: this issue was identified against the code base at commit `5b71589754f95f05f88c1a0ee9ccd691bbc5f701`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DescribeJob
+
+## Description
+One root cause, grounded in one failing behavioral check of suite simparity-behavioral-aws-v1.
+
+Cause 1 of 1: a Batch Operations job submitted with ConfirmationRequired=false is never advanced by any engine, so DescribeJob never reports a terminal status, no ProgressSummary is produced, and the operation is never executed against the objects named in the manifest.
+
+AWS: Smithy com.amazonaws.s3control#CreateJob (POST /v20180820/jobs, 200, output JobId, pattern ^[a-zA-Z0-9\-\_]+$, length 5..36; required members Operation, Report, ClientRequestToken @idempotencyToken, Priority, RoleArn pattern ^arn:[^:]+:iam::\d{12}:role/) and com.amazonaws.s3control#DescribeJob (GET /v20180820/jobs/{JobId}, 200, output Job: JobDescriptor). JobDescriptor.Status targets enum com.amazonaws.s3control#JobStatus = Active|Cancelled|Cancelling|Complete|Completing|Failed|Failing|New|Paused|Pausing|Preparing|Ready|Suspended; JobDescriptor also models ProgressSummary (JobProgressSummary: TotalNumberOfTasks, NumberOfTasksSucceeded, NumberOfTasksFailed, Timers), FailureReasons and TerminationDate ("a timestamp indicating when this job terminated"), and documents SuspendedCause/SuspendedDate as reached only for a job created through the console that awaits confirmation. Recorded behavior: with ConfirmationRequired=false the job walks New -> Preparing -> Active -> Complete with no further input; for Operation S3PutObjectTagging the tasks really run, so each object named in the manifest ends up carrying exactly the job's TagSet (GetObjectTagging returns it where it returned an empty TagSet before the job), and the terminal ProgressSummary reports TotalNumberOfTasks=1, NumberOfTasksSucceeded=1, NumberOfTasksFailed=0. When the RoleArn cannot (yet) be assumed the job still settles — Status Failed with a FailureReasons entry whose FailureCode is AccessDenied and whose FailureReason names the role and the required trust for batchoperations.s3.amazonaws.com — i.e. in AWS the terminal status is always the observable, whichever way the job ends.
+
+Emulator: the job never reaches any of Complete/Failed/Cancelled. CreateJob answers 200 with a JobId, but the check's bounded DescribeJob poll (every 3 s, up to 90 attempts, wrapped in a 6-attempt role-propagation retry) never observes a terminal status and the check is killed by the suite's 60 s wall clock, so the assertions on Status == 'Complete', on ProgressSummary and on the target object's tags are never reached. Nothing ahead of the poll is slow: s3.create_bucket, two put_objects, get_object_tagging, sts.get_caller_identity, iam.create_role + put_role_policy and s3control.create_job all answer immediately. Hypothesis: the job record is persisted in a non-terminal status (an existing wire-corpus replay of the same surface observed Status 'Suspended' with SuspendedCause 'AwaitingConfirmation' even though ConfirmationRequired=false) with nothing advancing it and no task execution, rather than any single call hanging.
+
+Why: Batch Operations is only meaningful as execution over accumulated object state. A client that waits for a job waits forever; it can never read a ProgressSummary, consume a completion report, or distinguish success from the single most common Batch Operations failure (an unassumable job role), because both produce 'nothing happened'. Any workflow that tags, copies or restores objects through a job silently leaves the objects untouched while the control plane reports no error.
+
+Fix: the s3control crate's Batch Operations job state machine (advance a submitted ConfirmationRequired=false job New -> Preparing -> Active -> terminal, set TerminationDate, and populate FailureReasons with FailureCode AccessDenied when the RoleArn cannot be assumed) plus the per-task execution for S3PutObjectTagging and the DescribeJob response projection that must carry ProgressSummary. Related open issues describe the same family from other corpora and do NOT carry this check's replay key: 20261025T000830Z-s3control-an-s3-batch-operations-s3putobjecttagging-job-never-reaches.md, 20261025T031335Z-s3control-an-s3-batch-operations-s3putobjecttagging-job-never-reaches-d4a116.md, 20261029T184212Z-s3control-an-s3-batch-operations-job-created-with-an.md and Cause 2 of 20261029T192817Z-s3control-batch-operations-jobs-never-settle-and-refuse.md; whoever fixes the job engine should re-replay this check id too and can close them together.
+
+Traces: s3control.batch-job-runs-to-completion-and-tags-objects.
+
+## Evidence
+Expected (AWS): s3control.create_job(AccountId=<account>, ConfirmationRequired=False, Operation={'S3PutObjectTagging': {'TagSet': [{'Key': 'sim2real', 'Value': 'batchran'}]}}, Report={'Bucket': 'arn:aws:s3:::<bucket>', 'Format': 'Report_CSV_20180820', 'Enabled': True, 'Prefix': 'reports', 'ReportScope': 'AllTasks'}, Manifest={'Spec': {'Format': 'S3BatchOperations_CSV_20180820', 'Fields': ['Bucket', 'Key']}, 'Location': {'ObjectArn': 'arn:aws:s3:::<bucket>/manifest.csv', 'ETag': <manifest etag>}}, Priority=10, RoleArn=<role trusting batchoperations.s3.amazonaws.com>) -> 200 + JobId; then s3control.describe_job(AccountId, JobId)['Job'] reaches Status 'Complete' with ProgressSummary {'TotalNumberOfTasks': 1, 'NumberOfTasksSucceeded': 1, 'NumberOfTasksFailed': 0} and a TerminationDate (or, while the role is still propagating, Status 'Failed' with a FailureReasons entry FailureCode 'AccessDenied' whose FailureReason names the role and the batchoperations.s3.amazonaws.com trust requirement); then s3.get_object_tagging(Bucket=<bucket>, Key='obj/a.txt')['TagSet'] == [{'Key': 'sim2real', 'Value': 'batchran'}].
+
+Actual: 'Check timed out after 60.0s' on s3control.batch-job-runs-to-completion-and-tags-objects (verdict: mismatch). The check never left _poll_terminal (describe_job every 3 s until Status in {'Complete','Failed','Cancelled'}); no terminal status was ever observed, so `assert job['Status'] == 'Complete'`, the ProgressSummary assertions and the final get_object_tagging assertion were never evaluated. The target object was verified to carry an empty TagSet before the job ran, and every preceding call (create_bucket, put_object x2, get_object_tagging, get_caller_identity, create_role, put_role_policy, create_job) answered immediately — only the job's own progression is missing.
+
+## Steps to Reproduce
+1. Boot the emulator and point botocore at it.
+2. s3.create_bucket(Bucket=b); s3.put_object(Bucket=b, Key='obj/a.txt', Body=b'to-be-tagged'); assert s3.get_object_tagging(Bucket=b, Key='obj/a.txt')['TagSet'] == [].
+3. etag = s3.put_object(Bucket=b, Key='manifest.csv', Body=b'<b>,obj/a.txt\n')['ETag'].strip('"').
+4. iam.create_role with a trust policy for Principal {'Service': 'batchoperations.s3.amazonaws.com'} and an inline policy allowing s3:GetObject, s3:PutObjectTagging, s3:GetObjectTagging, s3:PutObject, s3:GetBucketLocation and s3:ListBucket on arn:aws:s3:::<b> and arn:aws:s3:::<b>/*.
+5. s3control.create_job(AccountId=<account>, ConfirmationRequired=False, Operation={'S3PutObjectTagging': {'TagSet': [{'Key':'sim2real','Value':'batchran'}]}}, Report={'Bucket':'arn:aws:s3:::<b>','Format':'Report_CSV_20180820','Enabled':True,'Prefix':'reports','ReportScope':'AllTasks'}, Manifest={'Spec':{'Format':'S3BatchOperations_CSV_20180820','Fields':['Bucket','Key']},'Location':{'ObjectArn':'arn:aws:s3:::<b>/manifest.csv','ETag':etag}}, Priority=10, RoleArn=<role arn>, Description='sim2real-behav batch execution', Tags=[{'Key':'sim2real','Value':'batchrun'}]) -> 200 + JobId.
+6. Poll s3control.describe_job(AccountId, JobId)['Job']['Status'] every 3 s: expect a terminal status (Complete, or Failed with FailureCode 'AccessDenied' naming the role) within seconds; observe it never becoming terminal (the job stays in a non-terminal status with no ProgressSummary and no TerminationDate).
+7. s3.get_object_tagging(Bucket=b, Key='obj/a.txt') -> expect [{'Key':'sim2real','Value':'batchran'}]; observe [].
+8. Re-replay s3control.batch-job-runs-to-completion-and-tags-objects.
