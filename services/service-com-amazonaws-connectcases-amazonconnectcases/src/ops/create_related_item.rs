@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRelatedItem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRelatedItem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRelatedItem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: associates a related item with a case in [`crate::state`], under
+//! its own identifier and ARN, and records the association in that case's audit
+//! history. It is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +172,248 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRelatedItem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRelatedItemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRelatedItem"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRelatedItemErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let principal = crate::state::caller_principal_arn(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // The content itself says which kind of item this is, so the request's
+        // `type` has to name the union member the content carries: the two
+        // describe ONE item, and a request where they disagree says two things
+        // at once rather than one.
+        let content_type = crate::state::related_item_content_type(&input.content);
+        if input.r#type != content_type {
+            return Err(
+                CreateRelatedItemErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "type {} does not describe the content given, which is the content of a \
+                         {content_type} related item; the accepted values are {}",
+                        input.r#type,
+                        RELATED_ITEM_TYPE_VALUES.join(", ")
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        // Pure input validation, done BEFORE the store lock is taken so no
+        // caller-sized work happens while every other request is blocked. A
+        // custom item's field list is held to its own ceiling here as well as at
+        // the boundary, so the scans below are bounded by this code, and one id
+        // carrying two values is refused rather than resolved by an arbitrary
+        // choice — exactly as a case's own field list is handled.
+        if let RelatedItemInputContent::Custom(custom) = &input.content {
+            if let Some(message) = crate::state::list_too_long(
+                "content.custom.fields",
+                custom.fields.len(),
+                crate::state::MAX_CUSTOM_RELATED_ITEM_FIELDS,
+            ) {
+                return Err(CreateRelatedItemErrorModeled::ValidationException(
+                    ValidationException { message },
+                )
+                .into());
+            }
+            let duplicates =
+                crate::state::duplicate_ids(custom.fields.iter().map(|field| field.id.as_str()));
+            if !duplicates.is_empty() {
+                return Err(CreateRelatedItemErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "content.custom.fields carries more than one value for field ids: {}",
+                            crate::state::name_ids(&duplicates)
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+        let domain = store
+            .domain_mut(&input.domain_id)
+            .map_err(CreateRelatedItemErrorModeled::ResourceNotFoundException)?;
+
+        // Every reference the content makes is resolved against the domain
+        // before anything is stored, so a refused association leaves the case
+        // exactly as it was. Taken here but reported after the case itself is
+        // resolved, so a request naming a case the domain does not hold is told
+        // about the case rather than about the content it carried for it.
+        let content_check = content_refusal(domain, &input.domain_id, &input.content);
+        let Some(case) = domain.cases.get_mut(&input.case_id) else {
+            return Err(CreateRelatedItemErrorModeled::ResourceNotFoundException(
+                crate::state::not_found("Case", &input.case_id),
+            )
+            .into());
+        };
+        content_check?;
+        // Bound request-driven growth: a caller cannot hang associations off one
+        // case without end.
+        case.related_item_capacity()
+            .map_err(CreateRelatedItemErrorModeled::ServiceQuotaExceededException)?;
+
+        // The item is a resource of its own: an opaque identifier, and an ARN
+        // addressing it under the case it is associated with.
+        let related_item_id = crate::state::new_id();
+        let related_item_arn = crate::state::related_item_arn(
+            &region,
+            &input.domain_id,
+            &input.case_id,
+            &related_item_id,
+        );
+
+        // A custom item writes field values, so its association records them in
+        // the case's audit history, each against the value held for that field
+        // before it — none, since the values belong to the new item rather than
+        // to the case. An item of any other type writes no field value and so
+        // records none.
+        let recorded_fields = match &input.content {
+            RelatedItemInputContent::Custom(custom) => crate::state::audit_event_fields(
+                None,
+                custom
+                    .fields
+                    .iter()
+                    .map(|field| (field.id.as_str(), &field.value)),
+            ),
+            _ => Vec::new(),
+        };
+        let performed_by = input.performed_by;
+
+        // The content is stored in the union variant it arrived in, so a later
+        // read hands back what was written rather than a re-encoding of it.
+        case.related_items.insert(
+            related_item_id.clone(),
+            crate::state::RelatedItem {
+                related_item_id: related_item_id.clone(),
+                related_item_arn: related_item_arn.clone(),
+                case_id: input.case_id,
+                item_type: input.r#type,
+                content: input.content,
+                association_time: now,
+                performed_by: performed_by.clone(),
+                tags: ::std::collections::HashMap::new(),
+            },
+        );
+        // Associating an item is an edit of the case, recorded as one: an event
+        // of the related-item kind, naming the type of the item it is about.
+        case.record_audit_event(
+            crate::state::AUDIT_EVENT_RELATED_ITEM_CREATED,
+            Some(content_type.to_string()),
+            now,
+            principal,
+            performed_by,
+            recorded_fields,
+        );
+
+        Ok(CreateRelatedItemOutput {
+            related_item_id,
+            related_item_arn,
+        })
     }
+}
+
+/// Every reference the content of an association makes, resolved against the
+/// domain the association is made in: `Ok(())` when each of them names something
+/// the domain holds, else the modelled refusal for the first that does not.
+///
+/// A related item "may or may not have an external identifier linking it to an
+/// external resource" (this operation's documentation), and the references into
+/// THIS service are the ones that can be resolved here: the case a `ConnectCase`
+/// item links to, the fields a `Custom` item writes values against, and the case
+/// field an `Sla` item tracks. A `Contact` and a `File` item link to a resource
+/// of another service, which this service does not hold, and a `Comment` names
+/// nothing beyond its own text.
+fn content_refusal(
+    domain: &crate::state::Domain,
+    domain_id: &str,
+    content: &RelatedItemInputContent,
+) -> Result<(), CreateRelatedItemErrorModeled> {
+    match content {
+        // "Cases, to capture related Amazon Connect Cases": the link names a
+        // case of the same domain, so one naming a case the domain does not hold
+        // links to nothing and is refused rather than stored.
+        RelatedItemInputContent::connectCase(connect_case) => {
+            if !domain.cases.contains_key(&connect_case.case_id) {
+                return Err(CreateRelatedItemErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found("Case", &connect_case.case_id),
+                ));
+            }
+        }
+        // A custom item's values are written against the domain's own field
+        // schema, exactly as a case's values are: an id the domain holds no live
+        // field for, or a value whose union variant is not a value of that
+        // field's declared type, is refused rather than stored under the wrong
+        // type.
+        RelatedItemInputContent::Custom(custom) => {
+            let unknown =
+                domain.unknown_field_ids(custom.fields.iter().map(|field| field.id.as_str()));
+            if !unknown.is_empty() {
+                return Err(CreateRelatedItemErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "content.custom.fields names field ids that do not exist in domain \
+                             {domain_id}: {}",
+                            crate::state::name_ids(&unknown)
+                        ),
+                    },
+                ));
+            }
+            let mismatched = domain.mismatched_field_values(
+                custom
+                    .fields
+                    .iter()
+                    .map(|field| (field.id.as_str(), &field.value)),
+            );
+            if !mismatched.is_empty() {
+                return Err(CreateRelatedItemErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "content.custom.fields: {}",
+                            crate::state::name_ids(&mismatched)
+                        ),
+                    },
+                ));
+            }
+        }
+        // An SLA of the one modelled `SlaType`, `CaseField`, tracks one field of
+        // the case towards a target, so the field it names has to be one the
+        // domain holds, and the values it targets have that field's declared
+        // type.
+        RelatedItemInputContent::Sla(SlaInputContent::slaInputConfiguration(sla)) => {
+            let Some(field_id) = sla.field_id.as_deref() else {
+                return Ok(());
+            };
+            if !domain.unknown_field_ids([field_id]).is_empty() {
+                return Err(CreateRelatedItemErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "content.sla.slaInputConfiguration.fieldId names a field id that does \
+                             not exist in domain {domain_id}: {field_id}"
+                        ),
+                    },
+                ));
+            }
+            let targets = sla.target_field_values.as_deref().unwrap_or_default();
+            let mismatched =
+                domain.mismatched_field_values(targets.iter().map(|value| (field_id, value)));
+            if !mismatched.is_empty() {
+                return Err(CreateRelatedItemErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "content.sla.slaInputConfiguration.targetFieldValues: {}",
+                            crate::state::name_ids(&mismatched)
+                        ),
+                    },
+                ));
+            }
+        }
+        RelatedItemInputContent::Comment(_)
+        | RelatedItemInputContent::File(_)
+        | RelatedItemInputContent::Contact(_) => {}
+    }
+    Ok(())
 }

@@ -29,6 +29,8 @@ mod harness;
 mod layout_deletion;
 #[path = "all/layout_lifecycle.rs"]
 mod layout_lifecycle;
+#[path = "all/related_items.rs"]
+mod related_items;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/system_fields.rs"]

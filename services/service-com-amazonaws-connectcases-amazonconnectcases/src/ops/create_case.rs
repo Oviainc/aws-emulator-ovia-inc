@@ -320,9 +320,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 performed_by: input.performed_by,
                 audit_events: ::std::collections::VecDeque::new(),
                 audit_events_recorded: 0,
+                related_items: ::std::collections::HashMap::new(),
             });
         stored.record_audit_event(
             crate::state::AUDIT_EVENT_CASE_CREATED,
+            // An edit of the case itself, about no related item.
+            None,
             now,
             principal,
             performed_by,

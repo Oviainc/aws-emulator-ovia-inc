@@ -240,6 +240,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !edited_fields.is_empty() {
             case.record_audit_event(
                 crate::state::AUDIT_EVENT_CASE_UPDATED,
+                // An edit of the case itself, about no related item.
+                None,
                 now,
                 principal,
                 performed_by,

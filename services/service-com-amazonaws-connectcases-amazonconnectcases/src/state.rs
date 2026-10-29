@@ -14,7 +14,7 @@
 //! each one carries an explicit ceiling: [`MAX_DOMAINS`],
 //! [`MAX_FIELDS_PER_DOMAIN`], [`MAX_TEMPLATES_PER_DOMAIN`],
 //! [`MAX_LAYOUTS_PER_DOMAIN`], [`MAX_CASES_PER_DOMAIN`],
-//! [`MAX_AUDIT_EVENTS_PER_CASE`] and
+//! [`MAX_RELATED_ITEMS_PER_CASE`], [`MAX_AUDIT_EVENTS_PER_CASE`] and
 //! [`MAX_IDEMPOTENCY_TOKENS`]. Creating past a
 //! ceiling is refused with a modelled error, and the idempotency table evicts
 //! its oldest entry rather than growing, so no caller can grow this store
@@ -22,7 +22,8 @@
 //!
 //! The per-request work is bounded the same way, and does not rest on the
 //! boundary validator alone: [`MAX_CASE_FIELD_IDS`],
-//! [`MAX_BATCH_FIELD_IDS`] and [`MAX_EVENT_INCLUDED_FIELD_IDS`] are re-checked
+//! [`MAX_BATCH_FIELD_IDS`], [`MAX_CUSTOM_RELATED_ITEM_FIELDS`] and
+//! [`MAX_EVENT_INCLUDED_FIELD_IDS`] are re-checked
 //! in the handler ([`list_too_long`]),
 //! the scans below are linear in the list length, and a refusal names at most
 //! [`MAX_IDS_NAMED_IN_A_REFUSAL`] ids. A list that carries the same id twice is
@@ -47,8 +48,8 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     BasicLayout, ConflictException, EventBridgeConfiguration, FieldAttributes, FieldOption,
     FieldValueUnion, InternalServerException, LayoutConfiguration, LayoutContent, LayoutSections,
-    RequiredField, ResourceNotFoundException, Section, ServiceQuotaExceededException,
-    TagPropagationConfiguration, UserUnion, ValidationException,
+    RelatedItemInputContent, RequiredField, ResourceNotFoundException, Section,
+    ServiceQuotaExceededException, TagPropagationConfiguration, UserUnion, ValidationException,
 };
 
 /// The ARN namespace (and SigV4 signing name / endpoint prefix) of this service,
@@ -154,6 +155,14 @@ pub const MAX_LAYOUT_SECTION_FIELDS: usize = 220;
 /// Most cases one domain holds. Emulator-owned ceiling, as [`MAX_DOMAINS`].
 pub const MAX_CASES_PER_DOMAIN: usize = 10_000;
 
+/// Most related items one case holds. Emulator-owned ceiling on request-driven
+/// growth, as [`MAX_CASES_PER_DOMAIN`]: every accepted `CreateRelatedItem`
+/// stores one more item under its case, with caller-chosen content, so past
+/// this many a further association is refused with the modelled quota error
+/// rather than the store growing with the number of associations one caller
+/// makes.
+pub const MAX_RELATED_ITEMS_PER_CASE: usize = 1_000;
+
 /// Most `CreateCase` idempotency tokens the store remembers. Emulator-owned
 /// ceiling, as [`MAX_DOMAINS`]: past it the oldest remembered token is
 /// forgotten, which is how a real idempotency window behaves — a replay after
@@ -174,6 +183,13 @@ pub const MAX_CASE_FIELD_IDS: usize = 220;
 /// `BatchGetFieldRequest$fields` cap of `1..50`, re-checked in the handler for
 /// the same reason as [`MAX_CASE_FIELD_IDS`].
 pub const MAX_BATCH_FIELD_IDS: usize = 50;
+
+/// Most field values one `Custom`-type related item may carry: the model's
+/// `CustomInputContent$fields` cap of `1..50`, which is the quota
+/// `CreateRelatedItem` documents ("There's a quota for the number of fields
+/// allowed in a Custom type related item"), re-checked in the handler for the
+/// same reason as [`MAX_CASE_FIELD_IDS`].
+pub const MAX_CUSTOM_RELATED_ITEM_FIELDS: usize = 50;
 
 /// Most field options one `BatchPutFieldOptions` request may carry: the model's
 /// `BatchPutFieldOptionsRequest$options` cap of `..50`, re-checked in the
@@ -232,6 +248,10 @@ pub const AUDIT_EVENT_CASE_CREATED: &str = "Case.Created";
 /// `AuditEventType` of the event an edit of a case's field values records.
 /// One of `AUDIT_EVENT_TYPE_VALUES`.
 pub const AUDIT_EVENT_CASE_UPDATED: &str = "Case.Updated";
+
+/// `AuditEventType` of the event the association of a related item with a case
+/// records. One of `AUDIT_EVENT_TYPE_VALUES`.
+pub const AUDIT_EVENT_RELATED_ITEM_CREATED: &str = "RelatedItem.Created";
 
 /// A Cases domain and everything scoped to it.
 #[derive(Debug, Clone)]
@@ -348,6 +368,37 @@ pub struct Case {
     /// ([`audit_order_key`]): two edits made in the same instant still have
     /// distinct ordinals, so a page boundary in the history is stable.
     pub audit_events_recorded: u64,
+    /// The related items associated with this case, keyed by `relatedItemId`.
+    /// Bounded by [`MAX_RELATED_ITEMS_PER_CASE`]. They belong to the case, so
+    /// deleting the case takes its associations with it.
+    pub related_items: HashMap<String, RelatedItem>,
+}
+
+/// One related item associated with a case: a resource of its own, with its own
+/// identifier and ARN, which "may or may not have an external identifier linking
+/// it to an external resource" (`CreateRelatedItem`'s documentation).
+#[derive(Debug, Clone)]
+pub struct RelatedItem {
+    pub related_item_id: String,
+    pub related_item_arn: String,
+    /// The case this item is associated with.
+    pub case_id: String,
+    /// The item's `RelatedItemType`, one of `RELATED_ITEM_TYPE_VALUES`. It is
+    /// also the member [`RelatedItem::content`] carries: a create whose `type`
+    /// does not name its content's member is refused, so the two agree.
+    pub item_type: String,
+    /// The content exactly as the association was written with it, in the union
+    /// variant it arrived in, so a read hands back the record rather than a
+    /// re-encoding of it.
+    pub content: RelatedItemInputContent,
+    /// When the item was associated with the case, which is what
+    /// `SearchRelatedItems` reports as its `associationTime`.
+    pub association_time: SystemTime,
+    /// The entity the request named as having performed the association, when it
+    /// named one: the item's creator.
+    pub performed_by: Option<UserUnion>,
+    /// Reserved for the tagging slice, as [`Field::tags`].
+    pub tags: HashMap<String, String>,
 }
 
 /// One recorded edit of a case: what a page of its audit history reports.
@@ -659,6 +710,16 @@ impl Domain {
 
 /// A case's audit history: the record of the edits made to it.
 impl Case {
+    /// Refuse a further association once the case holds
+    /// [`MAX_RELATED_ITEMS_PER_CASE`] related items.
+    pub fn related_item_capacity(&self) -> Result<(), ServiceQuotaExceededException> {
+        capacity(
+            self.related_items.len(),
+            MAX_RELATED_ITEMS_PER_CASE,
+            "related items on this case",
+        )
+    }
+
     /// Append one recorded edit to this case's audit history, dropping the
     /// OLDEST event once the history holds more than
     /// [`MAX_AUDIT_EVENTS_PER_CASE`], so a caller cannot grow one case's
@@ -670,6 +731,7 @@ impl Case {
     pub fn record_audit_event(
         &mut self,
         event_type: &str,
+        related_item_type: Option<String>,
         performed_time: SystemTime,
         iam_principal_arn: String,
         performed_by: Option<UserUnion>,
@@ -680,9 +742,9 @@ impl Case {
         self.audit_events.push_back(CaseAuditEvent {
             event_id: new_id(),
             event_type: event_type.to_string(),
-            // Only an edit of a RELATED item carries one, and nothing records
-            // such an event until the related-item operations are implemented.
-            related_item_type: None,
+            // Only an edit of a RELATED item carries one; an edit of the case
+            // itself is about no related item and reports none.
+            related_item_type,
             performed_time,
             ordinal,
             fields,
@@ -1214,6 +1276,41 @@ pub fn case_arn(region: &str, domain_id: &str, case_id: &str) -> String {
         region,
         &format!("domain/{domain_id}/case/{case_id}"),
     )
+}
+
+/// The ARN of a related item of a case: the item is a resource UNDER its case,
+/// so its ARN extends that case's own ([`case_arn`]) rather than standing beside
+/// it.
+pub fn related_item_arn(
+    region: &str,
+    domain_id: &str,
+    case_id: &str,
+    related_item_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("domain/{domain_id}/case/{case_id}/related-item/{related_item_id}"),
+    )
+}
+
+/// The `RelatedItemType` the content of an association belongs to: the member
+/// of the input union the request filled in.
+///
+/// The model names the six members of `RelatedItemInputContent` after the six
+/// values of `RelatedItemType`
+/// (`smithy_query(query="shape",shape="RelatedItemInputContent,RelatedItemType")`),
+/// so the content itself says which type it is, and a `type` that names another
+/// one contradicts it.
+pub fn related_item_content_type(content: &RelatedItemInputContent) -> &'static str {
+    match content {
+        RelatedItemInputContent::Contact(_) => "Contact",
+        RelatedItemInputContent::Comment(_) => "Comment",
+        RelatedItemInputContent::File(_) => "File",
+        RelatedItemInputContent::Sla(_) => "Sla",
+        RelatedItemInputContent::connectCase(_) => "ConnectCase",
+        RelatedItemInputContent::Custom(_) => "Custom",
+    }
 }
 
 /// A layout's `content` in the COMPLETE form the service keeps it in: a
