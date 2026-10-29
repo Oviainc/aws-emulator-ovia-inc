@@ -160,6 +160,22 @@ pub(crate) fn servable_window_to_end() -> String {
     )
 }
 
+/// `bytes` read as the one document they hold, in WHICHEVER encoding they are written in.
+///
+/// Ion's text encoding is a superset of JSON, so a JSON text and the binary Ion encoding
+/// of the same document read back as the same Ion value — which is how a suite compares a
+/// served aggregated profile that is a COMBINATION of several stored profiles: such an
+/// answer is a document this service wrote out, not a copy of any one upload's bytes.
+/// `pub(crate)` so every suite in this target reads a served document one way.
+pub(crate) fn element_of(bytes: &[u8]) -> ion_rs::Element {
+    ion_rs::Element::read_one(bytes).unwrap_or_else(|error| {
+        panic!(
+            "expected one document, got {error}: {:?}",
+            String::from_utf8_lossy(bytes)
+        )
+    })
+}
+
 /// One HTTP answer, reduced to what these tests assert on. `pub(crate)` so the other
 /// suites in this test target drive the same harness instead of forking it.
 pub(crate) struct Answer {
@@ -1200,9 +1216,8 @@ async fn posting_profiles_stays_inside_the_per_group_retention_bound() {
             "{label}: create must succeed"
         );
 
-        let mut last = Vec::new();
         for post in 0..posts {
-            last = json_profile(
+            let posted = json_profile(
                 PROFILE_START_MILLIS + i64::try_from(post).unwrap_or(0),
                 payload_bytes,
             );
@@ -1212,7 +1227,7 @@ async fn posting_profiles_stays_inside_the_per_group_retention_bound() {
                         &case.name,
                         "application/json",
                         Some(&format!("ptok-{post}")),
-                        last.clone(),
+                        posted,
                     )
                     .await
                     .status,
@@ -1255,10 +1270,20 @@ async fn posting_profiles_stays_inside_the_per_group_retention_bound() {
             fetched.status,
             String::from_utf8_lossy(&fetched.body)
         );
+        // The aggregated profile of the window holds every profile the group still
+        // retains: these posts differ only in the start each profile states, so the
+        // combination states the earliest start among the retained ones — which is also
+        // how the newest profile's data reaches the answer — and carries their padding.
+        let (retained, _, _) = harness.retained(&case.name);
+        let expected = json_profile(
+            PROFILE_START_MILLIS + i64::try_from(posts - retained).unwrap_or(0),
+            payload_bytes,
+        );
         assert_eq!(
-            fetched.body, last,
-            "{label}: GetProfile must return the profile posted last ({} bytes)",
-            last.len()
+            element_of(&fetched.body),
+            element_of(&expected),
+            "{label}: expected the {retained} retained profiles combined, got {}",
+            element_of(&fetched.body)
         );
     }
 }

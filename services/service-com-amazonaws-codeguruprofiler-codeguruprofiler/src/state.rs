@@ -1322,7 +1322,7 @@ impl ProfilingGroup {
     ///
     /// A profile whose aggregation is not due yet ([`AgentProfile::is_aggregated`]) is in
     /// no aggregated profile, so it is in no analysed span either — the same gate
-    /// [`ProfilingGroup::latest_profile_in`] and
+    /// [`ProfilingGroup::aggregated_profiles_in`] and
     /// [`ProfilingGroup::aggregated_profile_starts`] apply, so one instant's reads of a
     /// group's profile data agree about which profiles exist.
     ///
@@ -1407,30 +1407,43 @@ impl ProfilingGroup {
         self.ordered_findings_reports(|report| !daily_only || report.is_daily())
     }
 
-    /// The most recently received AGGREGATED profile whose receipt time falls in
-    /// `[start, end]` (either bound absent means unbounded), as of `at`.
+    /// EVERY AGGREGATED profile whose receipt time falls in `[start, end]` (either bound
+    /// absent means unbounded) as of `at`, oldest first.
+    ///
+    /// All of them, because the aggregated profile of a range is what the profiles of
+    /// that range were collected INTO: "Amazon CodeGuru Profiler collects posted agent
+    /// profiles for a profiling group into aggregated profiles", and an aggregation
+    /// period's profile "contains profiles posted by the agent starting at this time for
+    /// an aggregation period specified by the period property". So a reader of the
+    /// aggregated data of a range reads every profile the range holds — the same set
+    /// [`ProfilingGroup::aggregated_profile_starts`] collapses into one profile time per
+    /// aligned window and [`ProfilingGroup::profiles_in`] hands a step's reader — rather
+    /// than one profile picked out of them.
     ///
     /// A profile the service has received but not yet collected into an aggregated
-    /// profile ([`AgentProfile::is_aggregated`]) is not one `GetProfile` can serve: the
-    /// operation reports the aggregated profile of a window, and there is none covering
-    /// a profile whose aggregation is still pending.
+    /// profile ([`AgentProfile::is_aggregated`]) is in no aggregated profile, so it is in
+    /// nothing this reports: the operations that report aggregated data report the same
+    /// absence for it.
     ///
     /// Both inclusive-bound tests go through [`instant_key`], so a receipt time a
     /// fraction of a microsecond outside the requested window is excluded rather than
     /// comparing equal to the bound.
-    pub fn latest_profile_in(
+    pub fn aggregated_profiles_in(
         &self,
         start: Option<DateTime>,
         end: Option<DateTime>,
         at: DateTime,
-    ) -> Option<&AgentProfile> {
+    ) -> Vec<&AgentProfile> {
         let (lower, upper) = (start.map(instant_key), end.map(instant_key));
-        self.profiles.iter().rfind(|profile| {
-            let received = instant_key(profile.received_at);
-            profile.is_aggregated(at)
-                && lower.is_none_or(|s| received >= s)
-                && upper.is_none_or(|e| received <= e)
-        })
+        self.profiles
+            .iter()
+            .filter(|profile| {
+                let received = instant_key(profile.received_at);
+                profile.is_aggregated(at)
+                    && lower.is_none_or(|s| received >= s)
+                    && upper.is_none_or(|e| received <= e)
+            })
+            .collect()
     }
 }
 

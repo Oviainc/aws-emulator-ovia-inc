@@ -26,7 +26,7 @@ use crate::frame_metric_data::{
 };
 use crate::interval_validation::create_group;
 use crate::profile_times::place_receipts;
-use crate::profiling_group_lifecycle::Harness;
+use crate::profiling_group_lifecycle::{Harness, element_of};
 
 /// The media types the model's `GetProfile$accept` doc names: "application/json —
 /// standard JSON format" and "application/x-amzn-ion — the Amazon Ion data format".
@@ -83,23 +83,8 @@ impl Representation {
     }
 }
 
-/// `bytes` read as the one document they hold, in WHICHEVER encoding they are written in.
-///
-/// Every expectation below is stated once, as a JSON document, and compared in this one
-/// form: Ion's text encoding is a superset of JSON, so a JSON text and the binary Ion
-/// encoding of the same document read back as the same Ion value. The documents here hold
-/// integers only, because Ion text reads a number with a fraction as a decimal where
-/// JSON's data model has a float.
-fn element_of(bytes: &[u8]) -> Element {
-    Element::read_one(bytes).unwrap_or_else(|error| {
-        panic!(
-            "expected one document, got {error}: {:?}",
-            String::from_utf8_lossy(bytes)
-        )
-    })
-}
-
-/// The expectation `document` states, in the one form [`element_of`] compares in.
+/// The expectation `document` states, in the one form a served document is compared in
+/// ([`element_of`], the shared reader every suite in this target reads one through).
 fn expected_element(document: &serde_json::Value) -> Element {
     element_of(&serde_json::to_vec(document).expect("a serializable document"))
 }

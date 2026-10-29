@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/agent_reported_state.rs"]
 mod agent_reported_state;
+#[path = "all/aggregated_profile_combination.rs"]
+mod aggregated_profile_combination;
 #[path = "all/analysis_list_presence.rs"]
 mod analysis_list_presence;
 #[path = "all/anomaly_feedback.rs"]

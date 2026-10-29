@@ -80,7 +80,12 @@ use ::ion_rs::{Element, IonType, Value as IonValue};
 /// The member a submitted profile has to carry: a profile states the start of the period
 /// it covers, which is what an aggregated profile is assembled by, so profiling data
 /// without it says nothing about when it was collected.
-const PROFILE_START_MEMBER: &str = "start";
+///
+/// `pub(crate)` because the member naming a profile's period start is not only this
+/// operation's business: an aggregated profile combining several posted profiles covers
+/// the periods of all of them, so `GetProfile` reads this member rather than adding the
+/// instants up ([`super::get_profile`]).
+pub(crate) const PROFILE_START_MEMBER: &str = "start";
 
 /// Why submitted profiling data is not an agent profile.
 ///

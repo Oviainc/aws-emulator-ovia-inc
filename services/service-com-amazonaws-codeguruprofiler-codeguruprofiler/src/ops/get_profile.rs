@@ -4,10 +4,14 @@
 //! Returns the AGGREGATED profile of a group over a requested window — named with a
 //! combination of the window members the operation's doc allows, and no wider than the
 //! maximum time range it allows — in the
-//! representation the request accepts and bounded to the call-stack depth it asks for:
-//! the bytes exactly as `PostAgentProfile` uploaded them when the caller accepts the
-//! representation their bytes are a document in and asks for no depth bound, and
-//! otherwise the same document re-encoded in an accepted representation, carrying no
+//! representation the request accepts and bounded to the call-stack depth it asks for.
+//! The aggregated profile of the window is EVERY profile the group holds in it combined
+//! into one document: the window's profiles were collected into one aggregated profile,
+//! so the answer carries the frames and counts of all of them ([`combined`]). A window
+//! holding ONE readable profile is that profile: its bytes exactly as `PostAgentProfile`
+//! uploaded them when the caller accepts the representation their bytes are a document in
+//! and asks for no depth bound, and otherwise the same document re-encoded in an accepted
+//! representation, carrying no
 //! frame nested deeper than `maxDepth`. A profile the group has received but that the service has not
 //! yet collected into an aggregated profile is not servable, so a window covered by no
 //! aggregated profile is the operation's 404. Reporting only: it writes nothing.
@@ -121,6 +125,7 @@
 use super::types::*;
 
 use ::std::cmp::Ordering;
+use ::std::collections::{HashMap, VecDeque};
 use ::std::time::Duration;
 
 use ::base64::Engine as _;
@@ -446,10 +451,6 @@ fn served_profile(
     accept: Option<&str>,
     max_depth: Option<i32>,
 ) -> (Vec<u8>, String) {
-    // The modelled range is 1..10000, so the boundary validator has already refused
-    // anything else; a value outside it bounds nothing rather than panicking here.
-    let keep = max_depth.and_then(|depth| u32::try_from(depth).ok());
-
     let Some((stored, document)) = stored_document(profile) else {
         // Bytes that are a document in neither representation: served as stored, and
         // announced under the representation this service serves that their stored media
@@ -466,26 +467,341 @@ fn served_profile(
     // answer whenever the document itself is not to be changed, and the one left when a
     // document that was read cannot be written back out.
     let as_read = || (profile.bytes.clone(), stored.media_type().to_string());
-    let wanted = accept
-        .and_then(|accept| negotiated(accept, Some(stored)))
-        .unwrap_or(stored);
 
     // The caller accepts the representation the profile already is a document in and asks
     // for no depth bound: nothing is to be done to the document, so the stored bytes
     // themselves are the answer.
-    if keep.is_none() && wanted == stored {
+    if kept_depth(max_depth).is_none() && wanted_representation(stored, accept) == stored {
         return as_read();
     }
+    written(&document, stored, accept, max_depth).unwrap_or_else(as_read)
+}
+
+/// The call-stack depth a request bounds the served profile to, as a count of container
+/// levels, or `None` when it bounds none.
+///
+/// The modelled range is 1..10000, so the boundary validator has already refused anything
+/// else; a value outside it bounds nothing rather than panicking here.
+fn kept_depth(max_depth: Option<i32>) -> Option<u32> {
+    max_depth.and_then(|depth| u32::try_from(depth).ok())
+}
+
+/// The representation a profile already a document in `stored` is served in for a request
+/// whose `Accept` is `accept`: the one that header asks for, and `stored` where it asks
+/// for neither of the two this service serves (including when there is no header at all).
+fn wanted_representation(stored: Representation, accept: Option<&str>) -> Representation {
+    accept
+        .and_then(|accept| negotiated(accept, Some(stored)))
+        .unwrap_or(stored)
+}
+
+/// `document` written out for a request that accepts `accept` and bounds the call-stack
+/// depth to `max_depth`, with the media type the written bytes are announced under — or
+/// `None` when the document cannot be bounded or written out at all.
+///
+/// `stored` is the representation the document is already a document in, which is the one
+/// it is written in where the request accepts it. This is the one place the two members
+/// saying what to DO with an aggregated profile are applied, so a single stored profile
+/// ([`served_profile`]) and a combination of several ([`served_aggregate`]) honour them
+/// identically.
+fn written(
+    document: &Element,
+    stored: Representation,
+    accept: Option<&str>,
+    max_depth: Option<i32>,
+) -> Option<(Vec<u8>, String)> {
+    let wanted = wanted_representation(stored, accept);
     // No `maxDepth` bounds no depth, so the whole document is kept — up to the nesting
     // this operation reads at all.
-    let Some(document) = bounded(&document, keep.unwrap_or(u32::MAX), DOCUMENT_NESTING_LIMIT)
-    else {
-        return as_read();
+    let keep = kept_depth(max_depth).unwrap_or(u32::MAX);
+    let document = bounded(document, keep, DOCUMENT_NESTING_LIMIT)?;
+    Some((
+        encoded(&document, wanted)?,
+        wanted.media_type().to_string(),
+    ))
+}
+
+/// The bytes to serve and the media type to announce them under, for the aggregated
+/// profile the stored profiles `profiles` — every profile the requested range holds,
+/// oldest first — were collected into, read with the request's `accept` and `max_depth`.
+///
+/// The aggregated profile of a range is ALL of them, not one of them: the service
+/// "collects posted agent profiles for a profiling group into aggregated profiles", an
+/// aggregation period's profile "contains profiles posted by the agent" during that
+/// period, and a range covering several of them is answered with "existing aggregated
+/// profiles from the requested time range and return them as one aggregated profile". So
+/// the profiles' documents are combined ([`combined`]) and the combination is the
+/// aggregated profile the request's `accept` and `maxDepth` are then applied to by the one
+/// writer a single stored profile goes through ([`written`]).
+///
+/// A range holding ONE profile this service can read as a document has nothing to combine
+/// that profile with, so it is served as [`served_profile`] serves it — its stored bytes
+/// where the request asks for nothing to be done to them. A profile whose bytes are a
+/// document in neither representation holds no frames this service can see, so it
+/// contributes none to the combination; where NOT ONE of the range's profiles is readable
+/// there is no combination to write out, and the most recently received of them is served
+/// as it is stored.
+fn served_aggregate(
+    profiles: &[crate::state::AgentProfile],
+    accept: Option<&str>,
+    max_depth: Option<i32>,
+) -> (Vec<u8>, String) {
+    let read: Vec<(&crate::state::AgentProfile, Representation, Element)> = profiles
+        .iter()
+        .filter_map(|profile| {
+            stored_document(profile)
+                .map(|(representation, document)| (profile, representation, document))
+        })
+        .collect();
+
+    // The answer for a range with nothing to combine: the one profile the aggregated
+    // profile is built from, served as [`served_profile`] serves it — the readable one
+    // where there is one, and otherwise the most recently received of the profiles the
+    // range holds, whose bytes are no document this service can combine anything with.
+    let alone = || {
+        let single = read
+            .first()
+            .map(|(profile, _, _)| *profile)
+            .or_else(|| profiles.last());
+        match single {
+            Some(profile) => served_profile(profile, accept, max_depth),
+            // Unreachable: a range holding no profile at all is the operation's 404,
+            // answered before anything is read. An empty range still has an empty answer
+            // rather than a panic, announced under the representation nothing else names.
+            None => (Vec::new(), Representation::DEFAULT.media_type().to_string()),
+        }
     };
-    match encoded(&document, wanted) {
-        Some(bytes) => (bytes, wanted.media_type().to_string()),
-        None => as_read(),
+    let Some(newest) = read.last().filter(|_| read.len() > 1) else {
+        return alone();
+    };
+    // The range's most recent contributing profile: its representation is what a request
+    // accepting both leaves the combination in — a combination of several documents has no
+    // stored bytes of its own to keep — and it is the profile left to serve where the
+    // combination cannot be written out at all.
+    let (newest_profile, stored) = (newest.0, newest.1);
+    let latest = || served_profile(newest_profile, accept, max_depth);
+
+    // The combination, folded oldest first, so the value a later profile reports for
+    // something two of them cannot both state is the one that stands. Its size is the sum
+    // of the documents' own, which the store's per-group retention caps bound, and its
+    // nesting is bounded by [`DOCUMENT_NESTING_LIMIT`] — the bound both documents were
+    // read within.
+    let mut combination: Option<Element> = None;
+    for (_, _, document) in &read {
+        combination = Some(match combination {
+            None => document.clone(),
+            Some(earlier) => match combined(&earlier, document, DOCUMENT_NESTING_LIMIT, true) {
+                Some(next) => next,
+                // Unreachable for documents this operation read at all: both were read
+                // within the nesting bound, so their combination is within it too. A
+                // combination that is not is no document to serve.
+                None => return latest(),
+            },
+        });
     }
+    let Some(document) = combination else {
+        return latest();
+    };
+
+    // What the request asks be done with the aggregated profile, applied to the
+    // combination by the one writer a single stored profile goes through ([`written`]).
+    written(&document, stored, accept, max_depth).unwrap_or_else(latest)
+}
+
+/// `into` and `from` combined into the ONE value an aggregated profile states for them, or
+/// `None` when the combination nests deeper than `budget` container levels.
+///
+/// `from` is the value the MORE RECENTLY received profile states, and `root` says whether
+/// the two values ARE the profile documents (so their members are what a profile states
+/// about itself) rather than values inside them.
+///
+/// The call stacks of a profile are its nested frames and the numbers a frame carries are
+/// the samples observed for it, so combining two profiles is combining what they observed:
+/// frames keyed by name are the same frame when the names match, so their contents combine
+/// member by member ([`combined_struct`]); frames listed rather than keyed are each in the
+/// combination, so the sequences join; and the counts two profiles recorded for one frame
+/// are samples of the same frame, so numbers inside a profile add ([`added`]). A pair that
+/// is neither — two different strings for one member, or two values of different kinds — is
+/// one value a document cannot state twice, so the more recently reported one stands. So
+/// does a value only one of the two profiles states at all: it is in the combination
+/// unchanged.
+fn combined(into: &Element, from: &Element, budget: u32, root: bool) -> Option<Element> {
+    // A null value states nothing to combine, so what the other one states is the
+    // combination.
+    if from.is_null() {
+        return Some(into.clone());
+    }
+    if into.is_null() {
+        return Some(from.clone());
+    }
+    let value = match (into.value(), from.value()) {
+        (IonValue::Struct(earlier), IonValue::Struct(later)) => {
+            IonValue::Struct(combined_struct(earlier, later, budget.checked_sub(1)?, root)?)
+        }
+        (IonValue::List(earlier), IonValue::List(later)) => IonValue::List(joined(earlier, later)),
+        (IonValue::SExp(earlier), IonValue::SExp(later)) => IonValue::SExp(joined(earlier, later)),
+        _ => {
+            // Two counts of samples of one frame, or a pair no document can state twice:
+            // their sum, or the more recently reported value — each carrying the
+            // annotations the combination carries.
+            return Some(match added(into, from) {
+                Some(sum) => sum.with_annotations(combined_annotations(into, from)),
+                None => from.clone(),
+            });
+        }
+    };
+    Some(Element::from(value).with_annotations(combined_annotations(into, from)))
+}
+
+/// Two frames of one name combined: every member of either, with the members they share
+/// combined in turn.
+///
+/// `later` is the more recently received profile's frame. The combination keeps the order
+/// the earlier frame states its members in and appends the later frame's own, so the
+/// combination of a profile with itself is that profile. An Ion struct may state one member
+/// name twice, so each member of `later` combines with ONE member of `earlier` of that
+/// name; a member whose name has unknown text names nothing another member can be the same
+/// member as, so it combines with none and is appended.
+///
+/// `root` says whether this struct IS the profile document, whose own members are what the
+/// profile states ABOUT itself rather than frames it observed ([`stated_number`]). Below
+/// the root every member is part of a call stack, so this is false for every nested frame
+/// — including one keyed with the name a profile states its period's start under, which is
+/// a frame like any other.
+fn combined_struct(
+    earlier: &Struct,
+    later: &Struct,
+    budget: u32,
+    root: bool,
+) -> Option<Struct> {
+    let mut members: Vec<(::ion_rs::Symbol, Element)> = earlier
+        .fields()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    // Where each member name sits, so a member of `later` finds the member it combines
+    // with in one lookup however many members the two frames state.
+    let mut positions: HashMap<String, VecDeque<usize>> = HashMap::new();
+    for (at, (name, _)) in members.iter().enumerate() {
+        if let Some(text) = name.text() {
+            positions.entry(text.to_string()).or_default().push_back(at);
+        }
+    }
+    for (name, value) in later.fields() {
+        let text = name.text();
+        let at = text
+            .and_then(|text| positions.get_mut(text))
+            .and_then(VecDeque::pop_front);
+        match at {
+            // The earlier frame states a member of this name: the two are the same member,
+            // so the combination states them combined. `at` came out of the positions this
+            // function recorded for the members it holds, so there is always a member
+            // there.
+            Some(at) => {
+                if let Some(member) = members.get_mut(at) {
+                    let stated = if root {
+                        stated_number(text, &member.1, value)
+                    } else {
+                        None
+                    };
+                    let next = match stated {
+                        Some(stated) => stated,
+                        None => combined(&member.1, value, budget, false)?,
+                    };
+                    member.1 = next;
+                }
+            }
+            // A member only the later frame states: it is in the combination as it is.
+            None => members.push((name.clone(), value.clone())),
+        }
+    }
+    Some(Struct::from_iter(members))
+}
+
+/// `earlier` and `later` joined: every element of both, in that order, since a frame
+/// listed by one profile and a frame listed by another are two frames the combination
+/// holds rather than one frame to combine.
+fn joined(earlier: &Sequence, later: &Sequence) -> Sequence {
+    let elements: Vec<Element> = earlier
+        .elements()
+        .chain(later.elements())
+        .cloned()
+        .collect();
+    Sequence::new(elements)
+}
+
+/// The annotations the combination of `into` and `from` carries: the more recently
+/// reported ones, and the ones already in the combination where the later value carries
+/// none.
+fn combined_annotations(into: &Element, from: &Element) -> Vec<::ion_rs::Symbol> {
+    let later: Vec<::ion_rs::Symbol> = from.annotations().iter().cloned().collect();
+    if later.is_empty() {
+        into.annotations().iter().cloned().collect()
+    } else {
+        later
+    }
+}
+
+/// The two counts `into` and `from` state added together, or `None` when either states no
+/// number — so no count of samples — at all.
+///
+/// Two whole counts add up to a whole count, which is what keeps a combination of profiles
+/// recording whole numbers of samples a document of whole numbers; a sum that no longer
+/// fits one, and any other pair of numbers, adds up as the only number left to state it
+/// with.
+fn added(into: &Element, from: &Element) -> Option<Element> {
+    if let (IonValue::Int(left), IonValue::Int(right)) = (into.value(), from.value()) {
+        if let (Ok(left), Ok(right)) = (left.expect_i64(), right.expect_i64()) {
+            if let Some(sum) = left.checked_add(right) {
+                return Some(Element::from(sum));
+            }
+        }
+    }
+    let sum = document_number(into)? + document_number(from)?;
+    sum.is_finite().then(|| Element::from(sum))
+}
+
+/// The value the combination states for the ROOT member `name`, where both profiles state
+/// a NUMBER for it — and `None` where they do not, so the member combines the way every
+/// value inside a profile does.
+///
+/// A number a profile document itself states is about the profile rather than about a
+/// frame: when the period it covers began, how long collecting it took, how many of
+/// something it holds. None of those is a count of samples of one frame, so none of them
+/// adds up over a combination. The one whose value the combination follows from is the
+/// start of the period the profile covers — the member `PostAgentProfile` requires of
+/// every profile it accepts, [`super::post_agent_profile::PROFILE_START_MEMBER`] — since
+/// the combination covers the periods of every profile it combines and so starts at the
+/// EARLIEST of their starts. Any other such number is one value the combination cannot
+/// state twice, so the most recently reported one stands, exactly as a pair of differing
+/// strings does.
+fn stated_number(name: Option<&str>, into: &Element, from: &Element) -> Option<Element> {
+    let (earlier, later) = (document_number(into)?, document_number(from)?);
+    if name == Some(super::post_agent_profile::PROFILE_START_MEMBER) && earlier <= later {
+        return Some(into.clone());
+    }
+    Some(from.clone())
+}
+
+/// The number `element` states, or `None` when it states no number, or none a document can
+/// carry (infinite, or not a number).
+///
+/// `pub(crate)` because reading a number out of a stored profile document is not only this
+/// operation's business: a frame metric reads the sample counts a document records out of
+/// the same values ([`super::batch_get_frame_metric_data`]), so both read a number the
+/// same way.
+pub(crate) fn document_number(element: &Element) -> Option<f64> {
+    let number = match element.value() {
+        IonValue::Int(integer) => integer.expect_i64().ok().map(|value| value as f64)?,
+        IonValue::Float(float) => *float,
+        // Ion writes a decimal exponent with `d`, where Rust writes it with `e`.
+        IonValue::Decimal(decimal) => decimal
+            .to_string()
+            .replace(['d', 'D'], "e")
+            .parse::<f64>()
+            .ok()?,
+        _ => return None,
+    };
+    number.is_finite().then_some(number)
 }
 
 /// `bytes` read as a document in the representation `from`, or `None` when they are not
@@ -832,11 +1148,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let (start, end) = requested_window(&input)?;
 
-        // The stored profile is taken out of the store and the guard released before the
-        // document is read or written: re-encoding or bounding a document a caller posted
-        // is work whose size that caller chose, and holding the store's lock across it
-        // would make one profile's size every other caller's latency.
-        let stored = {
+        // The stored profiles are taken out of the store and the guard released before any
+        // document is read or written: re-encoding, combining or bounding documents a
+        // caller posted is work whose size that caller chose, and holding the store's lock
+        // across it would make one profile's size every other caller's latency.
+        let stored: Vec<crate::state::AgentProfile> = {
             let guard = state.lock();
             let group = guard.groups.get(&input.profiling_group_name).ok_or_else(|| {
                 GetProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
@@ -851,32 +1167,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // same absence. That is a different refusal from a missing group, and the
             // service states it with its own fixed text — the only thing distinguishing
             // the two, since both are 404 `ResourceNotFoundException`.
-            group
-                .latest_profile_in(start, end, crate::state::now())
-                .ok_or_else(|| {
-                    GetProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            let profiles: Vec<crate::state::AgentProfile> = group
+                .aggregated_profiles_in(start, end, crate::state::now())
+                .into_iter()
+                .cloned()
+                .collect();
+            if profiles.is_empty() {
+                return Err(GetProfileErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
                         message: crate::state::NO_PROFILES_IN_TIME_RANGE.to_string(),
-                    })
-                })?
-                .clone()
+                    },
+                )
+                .into());
+            }
+            profiles
         };
 
         // What the caller asked the service to do with the aggregated profile: serve it
         // in a representation the request accepts, carrying no frame deeper than
-        // `maxDepth`. Both are stated once, in [`served_profile`].
+        // `maxDepth`. Both are stated once, in [`served_profile`], over the aggregated
+        // profile the window's profiles combine into ([`served_aggregate`]).
         //
-        // Reading and writing the document is CPU work over a payload whose size the
-        // caller chose (bounded by the store's retention caps and by
+        // Reading, combining and writing the documents is CPU work over payloads whose
+        // size the caller chose (bounded by the store's retention caps and by
         // [`DOCUMENT_NESTING_LIMIT`]), so it runs on the blocking pool instead of on the
         // async worker serving this request — and `spawn_blocking(..).await` is a real
         // await point, so a health check, a timeout and a shutdown all still land while
-        // one profile is being written out. The stored profile was copied out of the
+        // one profile is being written out. The stored profiles were copied out of the
         // store above, so the task owns everything it reads.
         let accept = input.accept.clone();
         let max_depth = input.max_depth;
-        let served =
-            ::tokio::task::spawn_blocking(move || served_profile(&stored, accept.as_deref(), max_depth))
-                .await;
+        let served = ::tokio::task::spawn_blocking(move || {
+            served_aggregate(&stored, accept.as_deref(), max_depth)
+        })
+        .await;
         let (bytes, content_type) = served.map_err(|_| {
             GetProfileErrorModeled::InternalServerException(InternalServerException {
                 message: "reading the stored profile did not complete".to_string(),

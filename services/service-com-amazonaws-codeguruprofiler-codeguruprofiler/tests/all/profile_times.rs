@@ -563,7 +563,7 @@ async fn a_reported_profile_time_names_a_window_get_profile_can_serve() {
         DAY_START + 930,
     ];
     let name = "times-roundtrip";
-    let payloads = group_with_receipts(&harness, name, &receipts).await;
+    group_with_receipts(&harness, name, &receipts).await;
 
     let listed = list_profile_times(
         &harness,
@@ -584,15 +584,26 @@ async fn a_reported_profile_time_names_a_window_get_profile_can_serve() {
     );
 
     for start in times {
-        // The newest profile whose receipt falls in this window is the one the window's
-        // aggregated profile is built from, and the one `GetProfile` must serve for it.
-        let expected = receipts
+        // Every profile whose receipt falls in this window is in the window's ONE
+        // aggregated profile, so what `GetProfile` serves for it holds all of them: these
+        // payloads state one start and one name each, so the combination states the
+        // earliest start of them and the name the most recently posted one states.
+        let in_window: Vec<usize> = receipts
             .iter()
             .enumerate()
             .filter(|(_, at)| **at >= start && **at < start + 300)
-            .map(|(index, _)| payloads[index].clone())
-            .next_back()
+            .map(|(index, _)| index)
+            .collect();
+        let first = *in_window
+            .first()
             .unwrap_or_else(|| panic!("window {start} was reported with no profile in it"));
+        let last = *in_window
+            .last()
+            .unwrap_or_else(|| panic!("window {start} was reported with no profile in it"));
+        let expected = serde_json::json!({
+            "start": 1_000 + first,
+            "profile": format!("{name}-{last}"),
+        });
         let answer = harness
             .get_profile(name, &format!("?startTime={}&period=PT5M", iso(start)))
             .await;
@@ -603,11 +614,15 @@ async fn a_reported_profile_time_names_a_window_get_profile_can_serve() {
             answer.status,
             String::from_utf8_lossy(&answer.body)
         );
+        let served: serde_json::Value = serde_json::from_slice(&answer.body).unwrap_or_else(|error| {
+            panic!(
+                "window {start}: expected a JSON profile, got {error}: {}",
+                String::from_utf8_lossy(&answer.body)
+            )
+        });
         assert_eq!(
-            answer.body,
-            expected,
-            "window {start}: expected the profile posted in that window, got {}",
-            String::from_utf8_lossy(&answer.body)
+            served, expected,
+            "window {start}: expected the profiles posted in that window combined, got {served}"
         );
     }
 }

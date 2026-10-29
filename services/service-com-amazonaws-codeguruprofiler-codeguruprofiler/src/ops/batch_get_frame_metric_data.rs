@@ -403,19 +403,13 @@ fn tally_into(
 /// `element` as a sample COUNT — the number a frame carries for one thread state — or
 /// `None` when it is no number, or no number a count of samples can be (negative,
 /// infinite or not a number).
+///
+/// The number itself is read the one way this crate reads a number out of a stored
+/// profile document (`crate::ops::get_profile::document_number`); what this adds is which
+/// of those numbers a count of samples can be.
 fn sample_count(element: &Element) -> Option<f64> {
-    let count = match element.value() {
-        IonValue::Int(integer) => integer.expect_i64().ok().map(|value| value as f64)?,
-        IonValue::Float(float) => *float,
-        // Ion writes a decimal exponent with `d`, where Rust writes it with `e`.
-        IonValue::Decimal(decimal) => decimal
-            .to_string()
-            .replace(['d', 'D'], "e")
-            .parse::<f64>()
-            .ok()?,
-        _ => return None,
-    };
-    (count.is_finite() && count >= 0.0).then_some(count)
+    let count = crate::ops::get_profile::document_number(element)?;
+    (count >= 0.0).then_some(count)
 }
 
 /// The datum each requested frame metric is reported with: one value per PROCESSED step,

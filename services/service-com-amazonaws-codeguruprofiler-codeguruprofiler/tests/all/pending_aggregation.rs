@@ -13,7 +13,7 @@
 //! `ResourceNotFoundException` with the fixed no-data text and `ListProfileTimes` reports
 //! no profile time for it — while the group still records that the profile was RECEIVED
 //! (`profilingStatus.latestAgentProfileReportedAt`). Once the aggregation is due, the
-//! same requests serve the stored bytes.
+//! same requests serve the aggregated profile the window's profiles were collected into.
 //!
 //! Rows vary what the rule generalises over: how the requested window is expressed (no
 //! parameters, each of the three modelled aggregation periods alone, both bounds, each
@@ -24,8 +24,8 @@
 //! aggregation is let fall due through the one shared helper every suite uses.
 
 use crate::profiling_group_lifecycle::{
-    Answer, Harness, PROFILE_START_MILLIS, ion_profile, json_profile, servable_window,
-    servable_window_from_start, servable_window_to_end,
+    Answer, Harness, PROFILE_START_MILLIS, element_of, ion_profile, json_profile,
+    servable_window, servable_window_from_start, servable_window_to_end,
 };
 
 /// The fixed text a 404 about absent profile DATA carries
@@ -190,7 +190,6 @@ async fn a_posted_profile_is_served_only_once_its_aggregation_is_due() {
             String::from_utf8_lossy(&before.body)
         );
 
-        let mut last = Vec::new();
         for post in 0..row.posts {
             let bytes = row.posted_bytes(post);
             assert_eq!(
@@ -206,7 +205,6 @@ async fn a_posted_profile_is_served_only_once_its_aggregation_is_due() {
                 204,
                 "case {case:?}: post {post} must answer 204"
             );
-            last = bytes;
         }
 
         // The post was RECEIVED — the group says so — and is still not aggregated.
@@ -267,8 +265,9 @@ async fn a_posted_profile_is_served_only_once_its_aggregation_is_due() {
         }
 
         // Once the aggregation its window owes has fallen due, the SAME request serves
-        // the stored bytes — so the 404 above is about the pending aggregation and not
-        // about a profile the store never kept.
+        // the aggregated profile the window's profiles were collected into — so the 404
+        // above is about the pending aggregation and not about a profile the store never
+        // kept.
         harness.complete_aggregation(&name);
         let served = harness.get_profile(&name, &row.query).await;
         assert_eq!(
@@ -277,11 +276,26 @@ async fn a_posted_profile_is_served_only_once_its_aggregation_is_due() {
             served.status,
             String::from_utf8_lossy(&served.body)
         );
-        assert_eq!(
-            served.body, last,
-            "case {case:?}: GetProfile must return the bytes posted last ({} bytes)",
-            last.len()
-        );
+        // A row's posts differ only in the start each profile states, so the document the
+        // window's profiles combine into is the one the FIRST of them states (the earliest
+        // start, which is what the combination covers from), and a row posting one profile
+        // is served that profile's bytes exactly as they were uploaded.
+        let expected = row.posted_bytes(0);
+        if row.posts == 1 {
+            assert_eq!(
+                served.body, expected,
+                "case {case:?}: GetProfile must return the posted bytes ({} bytes)",
+                expected.len()
+            );
+        } else {
+            assert_eq!(
+                element_of(&served.body),
+                element_of(&expected),
+                "case {case:?}: expected the {} posted profiles combined, got {}",
+                row.posts,
+                element_of(&served.body)
+            );
+        }
         for period in ["PT5M", "PT1H", "P1D"] {
             let times = list_profile_times(&harness, &name, period).await;
             assert!(
