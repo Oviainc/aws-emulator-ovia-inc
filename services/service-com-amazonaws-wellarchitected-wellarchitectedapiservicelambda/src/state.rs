@@ -1790,6 +1790,57 @@ pub fn tag_ceiling_constraint(subject: &str) -> String {
     format!("Member must not raise {subject}'s tag count above {MAX_TAGS_PER_RESOURCE}")
 }
 
+/// How a tag write is refused when a pair it would store is one the modelled `Tag`
+/// STRUCTURE cannot carry, or `None` when every pair can be carried.
+///
+/// The two tag shapes of this service are NOT interchangeable: a `TagMap` value
+/// (`TagValue`) is `@length(max: 256)` with no minimum and no pattern, while `Tag$value` is
+/// `@required` with `@length(min: 1, max: 256)` over a character class
+/// (`smithy_query(query="shape", shape="Tag,TagMap")`). A resource whose own reads project
+/// its tags as `Tag` structures
+/// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::tags_reported_as_tag_structures`])
+/// therefore cannot be given a pair only a `TagMap` carries — the empty value, or a value
+/// outside that class — because a later read of it would report a member value the model
+/// says that member cannot hold.
+///
+/// The rule is READ OFF THE MODEL rather than restated here: each pair is walked against
+/// `Tag`'s own schema by the framework's constraint walk — the same code, in the same
+/// words, that refuses the pair when a create carries it as a `Tags` list entry — and each
+/// finding is re-pathed onto the map entry the request sent the pair in, which is the path
+/// that walk gives a map value that itself failed and where the caller has to fix it.
+/// `member` is the `TagMap` member that carried the pairs. They are judged in key order and
+/// the FIRST pair that cannot be carried is reported, so the refusal neither depends on the
+/// request map's iteration order nor grows with the number of pairs.
+///
+/// The KEY needs no rule of its own: `TagMap`'s `TagKey` and `Tag$key` declare the same
+/// `@length(1, 128)` over the same class, so a key the request boundary admitted is a key
+/// the structure carries — the walk below covers it anyway, because it judges the whole
+/// pair.
+pub fn tag_structure_refusal(
+    member: &str,
+    requested: &BTreeMap<String, String>,
+) -> Option<String> {
+    use ::aws_smithy_schema_server::constraints::{envelope, path, validate, Violation};
+
+    let member_path = path::member(member);
+    requested.iter().find_map(|(key, value)| {
+        let findings: Vec<Violation> = validate(
+            &Tag {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            &Tag::SCHEMA,
+        )
+        .into_iter()
+        .map(|finding| Violation {
+            path: format!("{member_path}.{key}"),
+            ..finding
+        })
+        .collect();
+        envelope(&findings)
+    })
+}
+
 /// One profile associated with a workload: "The profile associated with a workload"
 /// (`smithy_query(query="shape", shape="WorkloadProfile")`).
 ///
@@ -6617,6 +6668,29 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             TaggedResource::Lens => self
                 .lens_by_alias_mut(resource_arn)
                 .map(|record| &mut record.tags),
+        }
+    }
+
+    /// Whether the resource this ARN names also reports its stored tags through the
+    /// modelled `Tag` STRUCTURE, not only through the `TagMap` a tag operation carries.
+    ///
+    /// An agent profile is the one resource of this store whose own reads project its tag
+    /// map that way ([`AgentProfileRecord::tag_list`], reported by `CreateAgentProfile`,
+    /// `GetAgentProfile`, `UpdateAgentProfile` and `ListAgentProfiles`); every other
+    /// taggable resource reports its tags only as a `TagMap`, which asks nothing of a value
+    /// beyond what the request boundary already applied. What that difference COSTS a tag
+    /// write is [`tag_structure_refusal`]; this is only which resources it applies to, so a
+    /// resource type added to [`TaggedResource`] has to answer the question.
+    pub fn tags_reported_as_tag_structures(&self, resource_arn: &str) -> bool {
+        match self.tagged_resource(resource_arn) {
+            Some(TaggedResource::AgentProfile) => true,
+            Some(
+                TaggedResource::Workload(_)
+                | TaggedResource::ReviewTemplate
+                | TaggedResource::Profile
+                | TaggedResource::Lens,
+            )
+            | None => false,
         }
     }
 

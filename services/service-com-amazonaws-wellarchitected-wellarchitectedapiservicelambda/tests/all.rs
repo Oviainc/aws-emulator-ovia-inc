@@ -407,3 +407,9 @@ mod shared_page_size;
 // workload suite falls in a crowded run of this list.
 #[path = "all/workload_paging_stability.rs"]
 mod workload_paging_stability;
+
+// Appended at the end of this list rather than inserted among the other agent suites, for
+// the reason the notes above give: the sorted position for an agent suite is the one gap of
+// this list every new agent suite lands in.
+#[path = "all/agent_profile_tag_writes.rs"]
+mod agent_profile_tag_writes;

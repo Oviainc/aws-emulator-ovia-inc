@@ -9,8 +9,10 @@
 //! resource" — so a key the resource already carries takes the request's value and every
 //! other key it carries survives, which is what [`crate::ops::list_tags_for_resource`]
 //! reports back. An ARN that names no resource this store holds answers
-//! `ResourceNotFoundException`, and a request that would push the resource past
-//! `TagMap`'s maximum is refused before anything is written.
+//! `ResourceNotFoundException`, a request carrying a pair the resource's own tag shape
+//! cannot hold is refused 400 (see [`crate::state::tag_structure_refusal`]), and a request
+//! that would push the resource past `TagMap`'s maximum is refused before anything is
+//! written.
 //!
 //! ## Shape of an operation
 //!
@@ -149,6 +151,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags: std::collections::BTreeMap<String, String> = input.tags.into_iter().collect();
 
         let mut store = state.lock();
+
+        // Which tag shapes the resource's own reads project this map through — resolved
+        // BEFORE the tag map is borrowed mutably below, and from the same resolution the
+        // write itself uses, so the rule applied is the rule of the resource written to.
+        let reports_tag_structures = store.tags_reported_as_tag_structures(&input.workload_arn);
+
         let stored = store
             .resource_tags_mut(&input.workload_arn)
             .ok_or_else(|| {
@@ -156,6 +164,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::tagged_resource_not_found(&input.workload_arn),
                 )
             })?;
+
+        // A tag has to be READABLE BACK off the resource it is written to, and this
+        // service's two tag shapes do not admit the same values: a resource that reports
+        // its tags as `Tag` structures cannot hold a pair only a `TagMap` carries — the
+        // empty value, or a value outside `Tag`'s character class — so such a request is
+        // refused here instead of storing a tag the resource's own reads could only report
+        // outside the modelled constraints. Judged and worded by the shared helper beside
+        // `MAX_TAGS_PER_RESOURCE`, which walks the pair against the model's own `Tag`
+        // schema, and checked BEFORE anything is written, so a refused request leaves the
+        // resource's tags exactly as they were.
+        if reports_tag_structures {
+            if let Some(message) =
+                crate::state::tag_structure_refusal(crate::state::TAGS_MEMBER, &tags)
+            {
+                // Same 400 `ValidationException` channel as the ceiling refusal below, and
+                // for the same reason: this operation models no client-input error, and the
+                // request is one the service cannot serve rather than one nobody wrote.
+                return Err(crate::scaffolded::Scaffolded::validation(message));
+            }
+        }
 
         // A resource holds at most `TagMap`'s own maximum of tags — the boundary
         // enforces that on the map a REQUEST carries, and the same ceiling bounds what

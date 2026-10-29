@@ -45,7 +45,12 @@ const MAX_RESULTS_MAX: i64 = 1_000;
 /// `GET /api/v1/agent-profiles`, with the paging members bound to the query string
 /// (`maxResults` / `nextToken` are `@httpQuery`). `query` is passed as sent, empty for a
 /// request that names none.
-async fn list_profiles(client: &Client, query: &str) -> Answer {
+///
+/// `pub(crate)` because `super::agent_profile_tag_writes` reads a tagged profile back
+/// through the LIST as well as through the single-profile read, and a profile is listed by
+/// exactly one operation: the two suites must not disagree about how that request is
+/// spelled.
+pub(crate) async fn list_profiles(client: &Client, query: &str) -> Answer {
     let uri = if query.is_empty() {
         "/api/v1/agent-profiles".to_string()
     } else {

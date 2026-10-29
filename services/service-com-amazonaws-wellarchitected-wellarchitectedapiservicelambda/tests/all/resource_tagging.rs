@@ -143,6 +143,23 @@ const KINDS: [Kind; 5] = [
     Kind::AgentProfile,
 ];
 
+impl Kind {
+    /// Whether a tag pair only a `TagMap` can carry can be RECORDED on this kind of
+    /// resource.
+    ///
+    /// An agent profile also reports its tags as modelled `Tag` structures, whose `value`
+    /// is `@length(min: 1, max: 256)` over a character class where a `TagMap` value is
+    /// `@length(max: 256)` with no minimum and no pattern
+    /// (`smithy_query(query="shape", shape="Tag,TagMap")`) — so a value only a `TagMap`
+    /// carries is refused for a profile rather than stored where its own reads could only
+    /// report it outside the modelled constraints. `super::agent_profile_tag_writes` pins
+    /// that rule over the whole class of such values; the rows below name which of them
+    /// are of that class.
+    fn carries_tag_map_only_rows(self) -> bool {
+        !matches!(self, Kind::AgentProfile)
+    }
+}
+
 /// Mint a resource of `kind` through the operation that mints one, and answer its ARN.
 /// `label` keeps the resources of one test apart, because a workload name and a review
 /// template name are unique within an account and Region.
@@ -246,6 +263,10 @@ async fn resource_arn(client: &Client, kind: Kind, label: &str) -> String {
     }
 }
 
+/// One row of rule 1's table: what it is called, the tag map the write carries, and
+/// whether only a `TagMap` can carry it (see [`Kind::carries_tag_map_only_rows`]).
+type TagMapRow = (String, BTreeMap<String, String>, bool);
+
 /// The tag maps rule 1 is asserted over.
 ///
 /// Rows differ along the SHAPE of the map rather than along its values: the pair count,
@@ -253,10 +274,11 @@ async fn resource_arn(client: &Client, kind: Kind, label: &str) -> String {
 /// `@length(1, 128)` with `@pattern("^[\p{L}\p{N}\p{Z}_.:/=+@-]+$")` and `TagValue` is
 /// `@length(max: 256)` with no minimum, so an empty value, a key of letters outside
 /// ASCII and a key or value at its length bound all have to round-trip
-/// (`smithy_query(query="shape", shape="TagMap")`).
-fn tag_map_rows() -> Vec<(String, BTreeMap<String, String>)> {
-    let mut rows: Vec<(String, BTreeMap<String, String>)> = vec![
-        ("one pair".to_string(), tags(&[("env", "production")])),
+/// (`smithy_query(query="shape", shape="TagMap")`) — on a resource whose tags are reported
+/// through that map alone.
+fn tag_map_rows() -> Vec<TagMapRow> {
+    let mut rows: Vec<TagMapRow> = vec![
+        ("one pair".to_string(), tags(&[("env", "production")]), false),
         (
             "three pairs".to_string(),
             tags(&[
@@ -264,17 +286,22 @@ fn tag_map_rows() -> Vec<(String, BTreeMap<String, String>)> {
                 ("owner", "platform-team"),
                 ("cost:center", "4711"),
             ]),
+            false,
         ),
         (
             "an empty value, which TagValue's @length has no minimum for".to_string(),
             tags(&[("marker", "")]),
+            true,
         ),
         (
             "every character class the TagKey pattern admits".to_string(),
             tags(&[(
                 "Ünïcode Lëttérs 09_.:/=+@-",
+                // The comma in this value is a character `Tag$value`'s pattern does not
+                // admit, so only a `TagMap` carries the pair.
                 "a value with spaces, punctuation and =+@-/ in it",
             )]),
+            true,
         ),
     ];
     // The published bounds of the key and the value, and the map's own maximum: a value
@@ -284,12 +311,14 @@ fn tag_map_rows() -> Vec<(String, BTreeMap<String, String>)> {
         [("k".repeat(128), "at the key length bound".to_string())]
             .into_iter()
             .collect(),
+        false,
     ));
     rows.push((
         "a value at TagValue's 256-character maximum".to_string(),
         [("long-value".to_string(), "v".repeat(256))]
             .into_iter()
             .collect(),
+        false,
     ));
     rows.push((
         format!(
@@ -297,6 +326,7 @@ fn tag_map_rows() -> Vec<(String, BTreeMap<String, String>)> {
             state::MAX_TAGS_PER_RESOURCE
         ),
         numbered_tags(0, state::MAX_TAGS_PER_RESOURCE),
+        false,
     ));
     rows
 }
@@ -315,7 +345,7 @@ fn numbered_tags(first: usize, count: usize) -> BTreeMap<String, String> {
 async fn tags_recorded_on_a_resource_are_reported_back_for_every_resource_kind() {
     for kind in KINDS {
         let client = Client::new();
-        for (index, (shape, requested)) in tag_map_rows().into_iter().enumerate() {
+        for (index, (shape, requested, tag_map_only)) in tag_map_rows().into_iter().enumerate() {
             let case = format!("{kind:?}/{shape}");
             let arn = resource_arn(&client, kind, &format!("tagged-{index}")).await;
 
@@ -332,6 +362,25 @@ async fn tags_recorded_on_a_resource_are_reported_back_for_every_resource_kind()
                 reported(&before)
             );
 
+            // A pair only a `TagMap` carries is refused for a resource that also reports
+            // its tags as `Tag` structures, and records nothing: the rule and the whole
+            // class of such values live in `super::agent_profile_tag_writes`.
+            if tag_map_only && !kind.carries_tag_map_only_rows() {
+                let refused = tag(&client, &arn, &requested).await;
+                assert_eq!(
+                    (refused.status, refused.error_code.as_str()),
+                    (400, "ValidationException"),
+                    "case {case:?}: a pair this resource's own tag shape cannot carry must \
+                     be refused, got {refused:?}"
+                );
+                let after = list_tags(&client, &arn).await;
+                assert!(
+                    reported(&after).is_empty(),
+                    "case {case:?}: a refused tag must record nothing, got {after:?}"
+                );
+                continue;
+            }
+
             let stored = tag_then_read(&client, &case, &arn, &requested).await;
             assert_eq!(
                 stored, requested,
@@ -341,13 +390,15 @@ async fn tags_recorded_on_a_resource_are_reported_back_for_every_resource_kind()
     }
 }
 
-/// One merge row: what it is called, the tags of the first request, of the second, and
-/// the set the resource must end up carrying.
+/// One merge row: what it is called, the tags of the first request, of the second, the
+/// set the resource must end up carrying, and whether the SECOND request's tags are ones
+/// only a `TagMap` carries (see [`Kind::carries_tag_map_only_rows`]).
 type MergeRow = (
     &'static str,
     BTreeMap<String, String>,
     BTreeMap<String, String>,
     BTreeMap<String, String>,
+    bool,
 );
 
 /// Rule 2: a second `TagResource` adds to what the resource carries, overwriting only
@@ -360,36 +411,41 @@ async fn tagging_merges_into_the_tags_a_resource_already_carries() {
             tags(&[("env", "production")]),
             tags(&[("owner", "platform-team")]),
             tags(&[("env", "production"), ("owner", "platform-team")]),
+            false,
         ),
         (
             "a key the resource carries takes the new value",
             tags(&[("env", "production"), ("owner", "platform-team")]),
             tags(&[("env", "staging")]),
             tags(&[("env", "staging"), ("owner", "platform-team")]),
+            false,
         ),
         (
             "the same pair again changes nothing",
             tags(&[("env", "production")]),
             tags(&[("env", "production")]),
             tags(&[("env", "production")]),
+            false,
         ),
         (
             "several keys at once, some new and some overwritten",
             tags(&[("a", "1"), ("b", "2"), ("c", "3")]),
             tags(&[("b", "9"), ("d", "4")]),
             tags(&[("a", "1"), ("b", "9"), ("c", "3"), ("d", "4")]),
+            false,
         ),
         (
             "an existing key overwritten with an empty value",
             tags(&[("env", "production")]),
             tags(&[("env", "")]),
             tags(&[("env", "")]),
+            true,
         ),
     ];
 
     for kind in KINDS {
         let client = Client::new();
-        for (index, (shape, first, second, expected)) in rows.iter().enumerate() {
+        for (index, (shape, first, second, expected, tag_map_only)) in rows.iter().enumerate() {
             let case = format!("{kind:?}/{shape}");
             let arn = resource_arn(&client, kind, &format!("merged-{index}")).await;
 
@@ -398,6 +454,27 @@ async fn tagging_merges_into_the_tags_a_resource_already_carries() {
                 &after_first, first,
                 "case {case:?}: expected the first request's tags, got {after_first:?}"
             );
+
+            // A second request whose pairs only a `TagMap` carries is refused for a
+            // resource that also reports its tags as `Tag` structures, and leaves the tags
+            // the first request recorded exactly as they were.
+            if *tag_map_only && !kind.carries_tag_map_only_rows() {
+                let refused = tag(&client, &arn, second).await;
+                assert_eq!(
+                    (refused.status, refused.error_code.as_str()),
+                    (400, "ValidationException"),
+                    "case {case:?}: a pair this resource's own tag shape cannot carry must \
+                     be refused, got {refused:?}"
+                );
+                let after = list_tags(&client, &arn).await;
+                assert_eq!(
+                    &reported(&after),
+                    first,
+                    "case {case:?}: a refused merge must change nothing, got {after:?}"
+                );
+                continue;
+            }
+
             let after_second = tag_then_read(&client, &case, &arn, second).await;
             assert_eq!(
                 &after_second, expected,
