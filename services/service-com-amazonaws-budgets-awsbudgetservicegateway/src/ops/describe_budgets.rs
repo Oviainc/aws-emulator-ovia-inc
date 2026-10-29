@@ -130,6 +130,11 @@ impl From<DescribeBudgetsErrorModeled> for DescribeBudgetsError {
 /// caller that leaves `MaxResults` out still paginates.
 const DEFAULT_MAX_RESULTS: i32 = 100;
 
+/// The largest page this operation can report: `MaxResultsDescribeBudgets` is
+/// `@range(min: 1, max: 1000)`, so a caller asking for more than the documented default
+/// is served as much as that ceiling allows and a `NextToken` for the rest.
+const MAX_RESULTS_CEILING: i32 = 1000;
+
 /// The `DescribeBudgets` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -191,7 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let budgets = crate::state::budgets_for_account(&store, &input.account_id, now);
         let (page, next_token) = crate::state::page(
             &budgets,
-            Some(input.max_results.unwrap_or(DEFAULT_MAX_RESULTS)),
+            Some(crate::state::page_size(
+                input.max_results,
+                Some(DEFAULT_MAX_RESULTS),
+                MAX_RESULTS_CEILING,
+            )),
             input.next_token.as_deref(),
         )
         .ok_or_else(|| {

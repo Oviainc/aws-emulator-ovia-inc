@@ -148,12 +148,6 @@ impl<Eng> DescribeBudgetActionHistories<Eng> {
     }
 }
 
-/// The biggest page this operation can report: `ActionHistories` is
-/// `@length(max: 100)`, so a caller that named no `MaxResults` still gets at most that
-/// many records and a `NextToken` for the rest. (It is also `MaxResults`' own
-/// `@range(max: 100)`.)
-const ACTION_HISTORIES_MAX_PAGE: i32 = 100;
-
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for DescribeBudgetActionHistories<Eng>
 {
@@ -250,9 +244,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // named no window gets the whole history.
         let records = crate::state::action_history_in_period(held, input.time_period.as_ref());
 
+        // `MaxResults` documents no default here, so an absent one is served the biggest
+        // page this operation can report: `ActionHistories` is `@length(max: 100)`, which
+        // is also `MaxResults`' own `@range(max: 100)`
+        // ([`crate::state::MAX_RESULTS_CEILING`]).
         let (page, next_token) = crate::state::page(
             &records,
-            Some(input.max_results.unwrap_or(ACTION_HISTORIES_MAX_PAGE)),
+            Some(crate::state::page_size(
+                input.max_results,
+                None,
+                crate::state::MAX_RESULTS_CEILING,
+            )),
             input.next_token.as_deref(),
         )
         .ok_or_else(|| {

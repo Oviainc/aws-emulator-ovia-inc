@@ -79,6 +79,8 @@ mod notification_deletion;
 mod notification_lifecycle;
 #[path = "all/notification_update.rs"]
 mod notification_update;
+#[path = "all/page_size_resolution.rs"]
+mod page_size_resolution;
 #[path = "all/percentage_budget_limit_amount.rs"]
 mod percentage_budget_limit_amount;
 #[path = "all/request_borne_refusal_precedence.rs"]

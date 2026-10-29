@@ -146,12 +146,6 @@ pub struct DescribeBudgetPerformanceHistory<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
-/// The biggest page this operation reports to a caller that named no `MaxResults`:
-/// `MaxResults`' own `@range(max: 100)` — "an integer that represents how many entries a
-/// paginated response contains. The maximum is 100" — so a longer history is paged with a
-/// `NextToken` for the rest rather than reported whole.
-const PERFORMANCE_HISTORY_MAX_PAGE: i32 = 100;
-
 impl<Eng> DescribeBudgetPerformanceHistory<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -301,9 +295,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|period| crate::state::amounts_in_period(stored, period))
             .collect();
 
+        // `MaxResults` documents no default here, so an absent one is served the biggest
+        // page this operation can report: `MaxResults`' own `@range(max: 100)` — "The
+        // maximum is 100" ([`crate::state::MAX_RESULTS_CEILING`]) — so a longer history is
+        // paged with a `NextToken` for the rest rather than reported whole.
         let (page, next_token) = crate::state::page(
             &records,
-            Some(input.max_results.unwrap_or(PERFORMANCE_HISTORY_MAX_PAGE)),
+            Some(crate::state::page_size(
+                input.max_results,
+                None,
+                crate::state::MAX_RESULTS_CEILING,
+            )),
             input.next_token.as_deref(),
         )
         .ok_or_else(|| {

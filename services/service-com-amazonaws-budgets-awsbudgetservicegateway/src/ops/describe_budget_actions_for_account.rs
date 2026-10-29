@@ -137,13 +137,6 @@ impl<Eng> DescribeBudgetActionsForAccount<Eng> {
     }
 }
 
-/// The biggest page this operation can report: `Actions` is `@length(max: 100)`, so a
-/// caller that named no `MaxResults` still gets at most that many actions and a
-/// `NextToken` for the rest, and no page can exceed what the output shape holds. (It is
-/// also `MaxResults`' own `@range(max: 100)` — "The maximum is 100" — which the boundary
-/// validator enforces before this handler runs.)
-const ACTIONS_MAX_PAGE: i32 = 100;
-
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for DescribeBudgetActionsForAccount<Eng>
 {
@@ -207,14 +200,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .flat_map(|stored| crate::state::actions_for_budget(stored, now))
             .collect();
 
+        // `MaxResults` documents no default here, so an absent one is served the biggest
+        // page this operation can report: `Actions` is `@length(max: 100)`, which is also
+        // `MaxResults`' own `@range(max: 100)` ([`crate::state::MAX_RESULTS_CEILING`]).
         let (page, next_token) = crate::state::page(
             &actions,
-            Some(
-                input
-                    .max_results
-                    .unwrap_or(ACTIONS_MAX_PAGE)
-                    .clamp(1, ACTIONS_MAX_PAGE),
-            ),
+            Some(crate::state::page_size(
+                input.max_results,
+                None,
+                crate::state::MAX_RESULTS_CEILING,
+            )),
             input.next_token.as_deref(),
         )
         .ok_or_else(|| {

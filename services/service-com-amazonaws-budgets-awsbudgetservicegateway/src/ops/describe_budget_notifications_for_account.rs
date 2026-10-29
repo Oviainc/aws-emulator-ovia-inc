@@ -124,6 +124,11 @@ impl From<DescribeBudgetNotificationsForAccountErrorModeled> for DescribeBudgetN
 /// model).
 const DEFAULT_MAX_RESULTS: i32 = 50;
 
+/// The largest page this operation can report: `MaxResultsBudgetNotifications` is
+/// `@range(min: 1, max: 1000)`, which is also the `@length(max)` of
+/// `BudgetNotificationsForAccountList`, so no page exceeds what the output shape holds.
+const MAX_RESULTS_CEILING: i32 = 1000;
+
 /// The `DescribeBudgetNotificationsForAccount` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -202,7 +207,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for is projected rather than every notification the account holds.
         let (page, next_token) = crate::state::page(
             &found,
-            Some(input.max_results.unwrap_or(DEFAULT_MAX_RESULTS)),
+            Some(crate::state::page_size(
+                input.max_results,
+                Some(DEFAULT_MAX_RESULTS),
+                MAX_RESULTS_CEILING,
+            )),
             input.next_token.as_deref(),
         )
         .ok_or_else(|| {

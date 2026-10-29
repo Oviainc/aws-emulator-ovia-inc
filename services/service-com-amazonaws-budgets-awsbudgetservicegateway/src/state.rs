@@ -1551,15 +1551,14 @@ pub fn decode_next_token(token: &str) -> Option<usize> {
 
 /// One page of `items`, plus the token for the page after it.
 ///
-/// `max_results` is the EFFECTIVE page size: the modelled `@paginated` page size
-/// (already range-checked at the boundary), resolved by the calling handler against
-/// whatever default its own `MaxResults` member documents. An operation whose model
-/// documents a default page size resolves an absent `MaxResults` to that default before
-/// calling, so the page it serves is one AWS can produce; only an operation whose model
-/// documents no default passes `None` here, which means "every remaining item".
-/// `next_token` is the token a previous page returned. `None` is returned when
-/// `next_token` does not decode, or decodes to an offset this list never had a page at —
-/// which the caller reports as `InvalidNextTokenException`.
+/// `max_results` is the EFFECTIVE page size: the modelled `@paginated` page size (already
+/// range-checked at the boundary), resolved by [`page_size`] against the default and the
+/// ceiling the calling operation's own `MaxResults` member documents, so the page it
+/// serves is one AWS can produce. `None` means "every remaining item", which is what a
+/// list with no page size at all is served. `next_token` is the token a previous page
+/// returned. `None` is returned when `next_token` does not decode, or decodes to an
+/// offset this list never had a page at — which the caller reports as
+/// `InvalidNextTokenException`.
 pub fn page<T: Clone>(
     items: &[T],
     max_results: Option<i32>,
@@ -1578,16 +1577,48 @@ pub fn page<T: Clone>(
         }
         None => 0,
     };
-    let page_size = match max_results {
+    let per_page = match max_results {
         // At least one item per page: a zero page would hand back a token pointing at
         // the same offset, which is a caller loop that never terminates. The modelled
         // `@range(min: 1)` already makes this unreachable from the wire.
         Some(max) => usize::try_from(max).unwrap_or(1).max(1),
         None => items.len(),
     };
-    let end = start.saturating_add(page_size).min(items.len());
+    let end = start.saturating_add(per_page).min(items.len());
     let next = (end < items.len()).then(|| encode_next_token(end));
     Some((items[start..end].to_vec(), next))
+}
+
+/// The modelled ceiling of the `MaxResults` member the per-budget and per-account
+/// listings of this service share: `@range(min: 1, max: 100)` — "An integer that
+/// represents how many entries a paginated response contains. The maximum is 100." It is
+/// also the `@length(max)` of each list those operations page, so no page of theirs can
+/// exceed it.
+pub const MAX_RESULTS_CEILING: i32 = 100;
+
+/// The EFFECTIVE page size one paginated read serves, handed to [`page`] — the ONE home
+/// for that resolution, so every paginated read of this service resolves it the same way.
+///
+/// `max_results` is the page size the caller named, if any. `documented_default` is the
+/// page size that operation's own `MaxResults` member documents a default for, and `None`
+/// where the model documents none — in which case a request naming no `MaxResults` is
+/// served a full `modelled_max`-sized page, the largest page that operation can report.
+/// `modelled_max` is the member's `@range(max)`, which is also the `@length(max)` of the
+/// list being paged, so the page never exceeds what the output shape holds; a named size
+/// above it is clamped down to it, and the result is never below one entry (a zero page
+/// would mint a token pointing back at its own offset). Both clamps are no-ops for the
+/// sizes the boundary validator already admits, so they only keep a page inside the
+/// output shape when nothing else would.
+pub fn page_size(
+    max_results: Option<i32>,
+    documented_default: Option<i32>,
+    modelled_max: i32,
+) -> i32 {
+    let ceiling = modelled_max.max(1);
+    max_results
+        .or(documented_default)
+        .unwrap_or(ceiling)
+        .clamp(1, ceiling)
 }
 
 /// Whether the clock has already made `stored`'s deletion due.
