@@ -204,7 +204,22 @@ pub const MAX_IMAGE_SET_VERSIONS: usize = 128;
 /// without limit. Past the cap the update is refused with its own
 /// `ServiceQuotaExceededException` (HTTP 402). The modelled attributes need no such cap:
 /// there are sixteen of them, whatever is written.
+///
+/// EVERY writer of these attributes is bounded by it, counted over what the image set would
+/// hold once the write had landed ([`ImageSetAttributes::written_attributes`]) and refused
+/// before anything is written: the metadata update that writes them, and the COPY that
+/// delivers them into a destination that already holds some of its own.
 pub const MAX_IMAGE_SET_EXTRA_ATTRIBUTES: usize = 512;
+
+/// The `ServiceQuotaExceededException` message every writer of the attributes outside the
+/// modelled ones is refused past [`MAX_IMAGE_SET_EXTRA_ATTRIBUTES`] with — one wording,
+/// because it reports one bound.
+pub fn extra_attributes_quota_message() -> String {
+    format!(
+        "this emulator holds at most {MAX_IMAGE_SET_EXTRA_ATTRIBUTES} attributes per image \
+         set beyond the ones the service models"
+    )
+}
 
 /// How many `@idempotencyToken` entries the ledger keeps.
 ///
@@ -1095,6 +1110,130 @@ pub struct ImageSetAttributes {
     pub extra_attributes: ::serde_json::Map<String, ::serde_json::Value>,
 }
 
+impl ImageSetAttributes {
+    /// DELIVER `delivered` into these attributes: every attribute the delivery carries
+    /// lands, taking the place of whatever sat at that attribute's own place, and every
+    /// attribute held that the delivery carries nothing for stays where it was.
+    ///
+    /// The rule a delivery of content follows, in both halves of the attribute state and
+    /// for the pixel data alike: content is delivered PER ITEM — a frame lands under the
+    /// image frame id it is stored by ([`PendingImageSetTransition::delivered_image_frames`]),
+    /// an attribute lands at its own path — so what an image set holds after a delivery is
+    /// what was delivered together with what it already held and the delivery did not
+    /// describe. Attributes holding nothing take the delivered ones whole, which is what a
+    /// freshly minted copy destination reports.
+    pub fn merge(&mut self, delivered: ImageSetAttributes) {
+        merge_dicom_tags(&mut self.dicom_tags, delivered.dicom_tags);
+        merge_written_attributes(&mut self.extra_attributes, delivered.extra_attributes);
+    }
+
+    /// How many attributes outside the modelled ones these attributes hold — what
+    /// [`MAX_IMAGE_SET_EXTRA_ATTRIBUTES`] bounds, for every writer of them.
+    ///
+    /// An attribute is a LEAF of the aggregated metadata document: a level of the document
+    /// is an object, and anything else is one attribute's value, so an array (the image
+    /// frames of one SOP instance) counts as the one attribute it is.
+    pub fn written_attributes(&self) -> usize {
+        count_written_attributes(&self.extra_attributes)
+    }
+}
+
+/// The recursive half of [`ImageSetAttributes::written_attributes`].
+fn count_written_attributes(attributes: &::serde_json::Map<String, ::serde_json::Value>) -> usize {
+    attributes
+        .values()
+        .map(|value| match value {
+            ::serde_json::Value::Object(level) => count_written_attributes(level),
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Deliver `delivered` into the modelled attributes `held`, ELEMENT BY ELEMENT: an element
+/// the delivery carries takes the place of the one held, and an element it carries nothing
+/// for leaves what was held where it was.
+///
+/// The two study counts are modelled as plain numbers rather than optional ones, so zero is
+/// what an image set nothing has stored a count for holds — absent, not a count of none —
+/// which is the reading every other caller of these two members gives them.
+fn merge_dicom_tags(held: &mut DICOMTags, delivered: DICOMTags) {
+    fn text(held: &mut Option<String>, delivered: Option<String>) {
+        if delivered.is_some() {
+            *held = delivered;
+        }
+    }
+    text(&mut held.dicom_patient_id, delivered.dicom_patient_id);
+    text(&mut held.dicom_patient_name, delivered.dicom_patient_name);
+    text(
+        &mut held.dicom_patient_birth_date,
+        delivered.dicom_patient_birth_date,
+    );
+    text(&mut held.dicom_patient_sex, delivered.dicom_patient_sex);
+    text(
+        &mut held.dicom_study_instance_uid,
+        delivered.dicom_study_instance_uid,
+    );
+    text(&mut held.dicom_study_id, delivered.dicom_study_id);
+    text(
+        &mut held.dicom_study_description,
+        delivered.dicom_study_description,
+    );
+    text(&mut held.dicom_study_date, delivered.dicom_study_date);
+    text(&mut held.dicom_study_time, delivered.dicom_study_time);
+    text(
+        &mut held.dicom_accession_number,
+        delivered.dicom_accession_number,
+    );
+    text(
+        &mut held.dicom_series_instance_uid,
+        delivered.dicom_series_instance_uid,
+    );
+    text(&mut held.dicom_series_modality, delivered.dicom_series_modality);
+    text(
+        &mut held.dicom_series_body_part,
+        delivered.dicom_series_body_part,
+    );
+    if delivered.dicom_number_of_study_related_series != 0 {
+        held.dicom_number_of_study_related_series = delivered.dicom_number_of_study_related_series;
+    }
+    if delivered.dicom_number_of_study_related_instances != 0 {
+        held.dicom_number_of_study_related_instances =
+            delivered.dicom_number_of_study_related_instances;
+    }
+    if delivered.dicom_series_number.is_some() {
+        held.dicom_series_number = delivered.dicom_series_number;
+    }
+}
+
+/// Deliver `delivered` into the attributes kept as written `held`, ATTRIBUTE BY ATTRIBUTE:
+/// a delivered attribute takes the place of whatever was held at its own path, and a path
+/// the delivery says nothing about keeps what was written there.
+///
+/// Descends wherever both sides hold a LEVEL of the document, so a level the delivery
+/// describes in part gains what it carries without losing the rest, and a level it does not
+/// mention at all is untouched. Where one side holds a level and the other an attribute's
+/// value, the delivered shape stands: what a path names is decided by what was last written
+/// there, exactly as writing an attribute into the document decides it.
+fn merge_written_attributes(
+    held: &mut ::serde_json::Map<String, ::serde_json::Value>,
+    delivered: ::serde_json::Map<String, ::serde_json::Value>,
+) {
+    for (name, delivered_value) in delivered {
+        match (held.remove(&name), delivered_value) {
+            (
+                Some(::serde_json::Value::Object(mut held_level)),
+                ::serde_json::Value::Object(delivered_level),
+            ) => {
+                merge_written_attributes(&mut held_level, delivered_level);
+                held.insert(name, ::serde_json::Value::Object(held_level));
+            }
+            (_, delivered_value) => {
+                held.insert(name, delivered_value);
+            }
+        }
+    }
+}
+
 impl ImageSetVersion {
     /// The version identifier as `ImageSetExternalVersionId` spells it (`^\d+$`).
     pub fn wire_version_id(&self) -> String {
@@ -1119,7 +1258,9 @@ pub struct PendingImageSetTransition {
     /// [`PendingImageSetTransition::delivered_image_frames`]: a copy carries its
     /// source's DICOM content to its destination, so the destination answers a search
     /// over those attributes exactly when the copy that delivered them completed, and
-    /// not before.
+    /// not before. Delivered attribute by attribute, as the frames are delivered frame
+    /// by frame ([`ImageSet::merge_attributes`]) — these are the attributes the delivery
+    /// DESCRIBES, not the whole attribute state the image set is to hold.
     pub delivered_attributes: Option<ImageSetAttributes>,
     /// Whether this transition RETIRES the image set — the landing of the delete a
     /// `DeleteImageSet` call started. The record stays readable afterwards, because
@@ -1323,9 +1464,23 @@ impl ImageSet {
     /// Replace the DICOM attributes this image set holds, both halves together, so the
     /// modelled attributes a search filters on and the attributes a metadata document
     /// reports always describe the same content.
+    ///
+    /// For a caller that computed the WHOLE attribute state the image set is to hold. A
+    /// DELIVERY of content into the image set carries only the attributes it describes, so
+    /// it lands through [`ImageSet::merge_attributes`] instead.
     pub fn set_attributes(&mut self, attributes: ImageSetAttributes) {
         self.dicom_tags = attributes.dicom_tags;
         self.extra_attributes = attributes.extra_attributes;
+    }
+
+    /// DELIVER `delivered` into the DICOM attributes this image set holds
+    /// ([`ImageSetAttributes::merge`]): every attribute the delivery carries lands here,
+    /// taking the place of whatever sat at that attribute's own place, and every attribute
+    /// the image set held that the delivery carries nothing for stays where it was.
+    pub fn merge_attributes(&mut self, delivered: ImageSetAttributes) {
+        let mut merged = self.attributes();
+        merged.merge(delivered);
+        self.set_attributes(merged);
     }
 
     /// The DICOM attributes the version `wire_version_id` (`^\d+$`) held, or `None` when
@@ -1403,9 +1558,12 @@ impl ImageSet {
         }
         // The DICOM attributes the transition owed land with it too, so what
         // `SearchImageSets` filters on and reports for this image set only ever
-        // describes content the image set already holds.
+        // describes content the image set already holds. Delivered attribute by
+        // attribute, by the rule the delivered frames follow: a delivery describes the
+        // content it carries, so it takes the place of what it describes and leaves
+        // what it does not ([`ImageSet::merge_attributes`]).
         if let Some(delivered) = pending.delivered_attributes {
-            self.set_attributes(delivered);
+            self.merge_attributes(delivered);
         }
         // A deletion the clock owed lands the same way, at the DUE instant rather than at
         // `now`, so `deletedAt` does not move between reads — and the content this image

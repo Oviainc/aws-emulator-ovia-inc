@@ -33,6 +33,8 @@ mod image_set_access_time;
 mod image_set_capacity;
 #[path = "all/image_set_copy.rs"]
 mod image_set_copy;
+#[path = "all/image_set_copy_into_held_content.rs"]
+mod image_set_copy_into_held_content;
 #[path = "all/image_set_copy_subsets.rs"]
 mod image_set_copy_subsets;
 #[path = "all/image_set_copy_tombstones.rs"]

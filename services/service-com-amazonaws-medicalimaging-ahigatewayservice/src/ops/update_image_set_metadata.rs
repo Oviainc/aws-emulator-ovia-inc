@@ -733,17 +733,13 @@ fn updated_attributes(
     // What a caller may accumulate in one image set is bounded: each update persists the
     // attributes it named, and every version the image set keeps holds a snapshot of them
     // (`crate::state::MAX_IMAGE_SET_EXTRA_ATTRIBUTES`). Counted AFTER the removals, so an
-    // update that replaces attributes rather than adding any is never refused for it.
-    let held = attributes_of(&attributes.extra_attributes).len();
-    if held > crate::state::MAX_IMAGE_SET_EXTRA_ATTRIBUTES {
+    // update that replaces attributes rather than adding any is never refused for it —
+    // through the same counter every writer of these attributes is bounded by.
+    if attributes.written_attributes() > crate::state::MAX_IMAGE_SET_EXTRA_ATTRIBUTES {
         return Err(
             UpdateImageSetMetadataErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
-                    message: format!(
-                        "this emulator holds at most {} attributes per image set beyond the \
-                         ones the service models",
-                        crate::state::MAX_IMAGE_SET_EXTRA_ATTRIBUTES
-                    ),
+                    message: crate::state::extra_attributes_quota_message(),
                 },
             )
             .into(),

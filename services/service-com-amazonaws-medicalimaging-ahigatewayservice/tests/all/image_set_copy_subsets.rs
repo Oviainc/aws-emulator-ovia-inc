@@ -49,7 +49,7 @@ use crate::image_set_copy::{copy_image_set, information};
 use crate::image_set_metadata::{document, get_image_set_metadata};
 
 /// The Series Instance UID the seeded source holds — the series its instances sit in.
-const SERIES_UID: &str = "1.2.840.113619.2.1.1";
+pub(crate) const SERIES_UID: &str = "1.2.840.113619.2.1.1";
 
 /// A Series Instance UID the seeded source does NOT hold, used to prove a selector
 /// locates an instance by the instance's own UID: a SOP Instance UID identifies the
@@ -57,9 +57,9 @@ const SERIES_UID: &str = "1.2.840.113619.2.1.1";
 const OTHER_SERIES_UID: &str = "1.2.840.113619.2.9.9";
 
 /// The three SOP instances the seeded source holds pixel data for.
-const INSTANCE_ONE: &str = "1.2.840.113619.2.1.1.1";
-const INSTANCE_TWO: &str = "1.2.840.113619.2.1.1.2";
-const INSTANCE_THREE: &str = "1.2.840.113619.2.1.1.3";
+pub(crate) const INSTANCE_ONE: &str = "1.2.840.113619.2.1.1.1";
+pub(crate) const INSTANCE_TWO: &str = "1.2.840.113619.2.1.1.2";
+pub(crate) const INSTANCE_THREE: &str = "1.2.840.113619.2.1.1.3";
 
 /// A SOP Instance UID no seeded image set holds.
 const UNHELD_INSTANCE: &str = "1.2.840.113619.2.1.1.404";
@@ -68,14 +68,14 @@ const UNHELD_INSTANCE: &str = "1.2.840.113619.2.1.1.404";
 /// Instance Number (0020,0013), which the service's own `DICOMTags` does not name, so it
 /// is persisted at the document path it was written at — which is what makes an
 /// instance's ATTRIBUTES, and not only its pixel data, observable at the destination.
-const INSTANCE_ATTRIBUTE: &str = "InstanceNumber";
+pub(crate) const INSTANCE_ATTRIBUTE: &str = "InstanceNumber";
 
 /// One frame to seed: the SOP instance its pixel data came from (`None` for pixel data
 /// stored under no instance) and how many bytes it holds.
 #[derive(Debug, Clone, Copy)]
-struct FrameSeed {
-    sop_instance_uid: Option<&'static str>,
-    pixel_len: usize,
+pub(crate) struct FrameSeed {
+    pub(crate) sop_instance_uid: Option<&'static str>,
+    pub(crate) pixel_len: usize,
 }
 
 /// The frames the source of every copy suite holds: two of one instance, one each of two
@@ -160,7 +160,7 @@ fn source_extra_attributes(instances: &[&str]) -> Map<String, Value> {
 /// Built with the crate's own `ImageSet::new` and `ImageFrame`, and every identifier minted
 /// by the same `mint_id` the handlers mint with, so a seeded image set is shaped exactly
 /// like one a handler holds.
-fn seed_image_set_holding(
+pub(crate) fn seed_image_set_holding(
     emulator: &Emulator,
     datastore_id: &str,
     tags: DICOMTags,
@@ -232,7 +232,7 @@ struct SubsetCase {
 
 /// A `copiableAttributes` document naming `instances` under `series_uid`, written in the
 /// shape of the aggregated metadata document.
-fn selector(series_uid: &str, instances: &[&str]) -> String {
+pub(crate) fn selector(series_uid: &str, instances: &[&str]) -> String {
     let mut named = Map::new();
     for uid in instances {
         named.insert((*uid).to_string(), json!({}));

@@ -70,6 +70,14 @@
 //! releases it, so `GetImageFrame` serves them from the destination once the copy has
 //! completed and finds nothing there before that.
 //!
+//! What that transition delivers is ADDED to the destination rather than put in place of
+//! what it held: the content a copy carries is delivered item by item — a frame under the
+//! image frame id it is stored by, an attribute at its own path in the metadata document —
+//! so the destination ends up holding what was copied into it together with everything of
+//! its own the copy describes nothing about ([`crate::state::ImageSet::merge_attributes`]).
+//! That is what makes the premise of the consistency check below hold: an element only one
+//! of the two sides holds is no disagreement BECAUSE neither side loses it.
+//!
 //! Because the copy carries that content, a `DELETED` image set named as its source or as
 //! its destination is what is ABSENT rather than what is busy: the deletion took the pixel
 //! data and the DICOM attributes with it, so the copy answers 404
@@ -84,6 +92,13 @@
 //! content, so it takes no place and its deletion gives its place back. What a tombstone
 //! does keep is its RECORD, which is still reported, so the records are bounded in their
 //! own right ([`crate::state::MAX_IMAGE_SET_RECORDS_PER_DATASTORE`]).
+//!
+//! A copy into an EXISTING destination is bounded by what that one image set accumulates
+//! instead: the versions it keeps ([`crate::state::MAX_IMAGE_SET_VERSIONS`]) and the
+//! attributes outside the modelled ones the delivery would leave it holding
+//! ([`crate::state::MAX_IMAGE_SET_EXTRA_ATTRIBUTES`], the bound every writer of those
+//! attributes answers to) — each refused with the same modelled
+//! `ServiceQuotaExceededException`, before anything is written.
 //!
 //! ---
 //!
@@ -667,6 +682,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
+                // A copy DELIVERS attributes into the destination rather than putting them
+                // in place of what it held, so it is a writer of the attributes outside the
+                // modelled ones and is bounded by the same cap the metadata update is
+                // (`crate::state::MAX_IMAGE_SET_EXTRA_ATTRIBUTES`), with the same wording:
+                // every version the destination keeps holds a snapshot of them, so without
+                // it a run of copies could grow one image set without limit. Counted over
+                // what the destination WOULD hold once this copy had landed, while the
+                // request is still being checked, so no admitted copy lands an image set
+                // past the bound.
+                let mut delivered_into = held.attributes();
+                delivered_into.merge(copied_attributes.clone());
+                if delivered_into.written_attributes()
+                    > crate::state::MAX_IMAGE_SET_EXTRA_ATTRIBUTES
+                {
+                    return Err(CopyImageSetErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: crate::state::extra_attributes_quota_message(),
+                        },
+                    )
+                    .into());
+                }
                 DestinationPlan::Version(destination.image_set_id.clone())
             }
             None => {
@@ -730,7 +766,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             delivered_image_frames: Some(copied_image_frames),
             // The destination describes the source's patient, study and series from the
             // same instant: the attributes a search filters on are delivered with the
-            // content they describe.
+            // content they describe. Delivered attribute by attribute, as the frames are
+            // delivered frame by frame, so a destination that already held DICOM content
+            // keeps every attribute of its own this copy carries nothing for.
             delivered_attributes: Some(copied_attributes),
             // A copy does not retire an image set: both the source and the destination
             // are still there once it has landed.
