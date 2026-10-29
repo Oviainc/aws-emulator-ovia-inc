@@ -3,7 +3,10 @@
 //! @op GetMicrovmImage
 //!
 //! Reports the persisted [`crate::state::MicrovmImage`] the `imageIdentifier` names, by
-//! name or by ARN, after materialising any build the clock has already made due.
+//! name or by ARN, after materialising any build the clock has already made due — for an
+//! identifier this account holds a record of. The authorization verdict comes first, so
+//! an identifier the account was never granted is refused without the read ever looking
+//! it up.
 //!
 //! ## Shape of an operation
 //!
@@ -170,33 +173,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due(::std::time::Instant::now());
 
-        // The AUTHORIZATION verdict, decided BEFORE the own-account lookup: an
-        // identifier in the AWS-OWNED namespace names a resource of AWS's own
-        // catalogue, which this account may discover through the managed operations but
-        // not read through the customer API — so it is DENIED rather than reported
-        // missing. Deciding it first is the point: a 404 would tell a caller with no
-        // permission on the identifier whether it exists, and would tell it the base
-        // image the service itself advertises does not.
-        if crate::state::is_managed_microvm_image_arn(&input.image_identifier) {
-            return Err(GetMicrovmImageErrorModeled::AccessDeniedException(
-                AccessDeniedException {
-                    message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
-
-        // `MicrovmImageIdentifier` is "The ARN or ID of the MicroVmImage", so the
-        // identifier is resolved as an id this account holds and, failing that, read as
-        // an ARN. The three outcomes mean different things to a caller, and a client
-        // polling for an image it believes is being built has to be able to tell them
-        // apart: a malformed identifier is a request that can NEVER succeed (400), and
-        // only a well-formed identifier naming nothing is the not-yet-created condition
-        // a poll may retry (404).
-        let image = match store.resolve_image_reference(&input.image_identifier) {
-            crate::state::ImageReference::Resolved(name) => store.images.get(&name),
-            crate::state::ImageReference::Absent => None,
-            crate::state::ImageReference::Malformed => {
+        // `MicrovmImageIdentifier` is "The ARN or ID of the MicroVmImage", and what the
+        // read answers for one is decided by AUTHORIZATION BEFORE EXISTENCE
+        // (`crate::state::resolve_image_access`): an identifier this account holds no
+        // record of, now or before — a resource of AWS's own catalogue, another
+        // account's, another partition's — is DENIED, whether or not it names anything,
+        // so the read never tells a caller with no permission on an identifier whether
+        // it exists. Only an identifier of this account's own gets an answer about
+        // existence, and the remaining answers mean different things to a client polling
+        // an image it believes is being built or deleted: a malformed identifier is a
+        // request that can NEVER succeed (400) and this account's own record being gone
+        // is the condition a poll may retry (404).
+        let image = match store.resolve_image_access(&input.image_identifier) {
+            crate::state::ImageAccess::Granted(name) => store.images.get(&name),
+            crate::state::ImageAccess::Absent => None,
+            crate::state::ImageAccess::Denied => {
+                return Err(GetMicrovmImageErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            crate::state::ImageAccess::Malformed => {
                 return Err(GetMicrovmImageErrorModeled::ValidationException(
                     ValidationException {
                         message: Some(crate::state::invalid_arn_format_message(

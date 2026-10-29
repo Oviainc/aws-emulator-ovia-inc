@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     base_image_not_found_message, default_log_group, image_name_conflict_message,
     image_not_found_message, invalid_arn_format_message, managed_base_image_arn,
-    CODE_ARTIFACT_URI_REQUIREMENT, DEFAULT_CPU_ARCHITECTURE, DEFAULT_MINIMUM_MEMORY_IN_MIB,
-    MANAGED_BASE_IMAGE_IDS,
+    ACCESS_DENIED_MESSAGE, CODE_ARTIFACT_URI_REQUIREMENT, DEFAULT_CPU_ARCHITECTURE,
+    DEFAULT_MINIMUM_MEMORY_IN_MIB, MANAGED_BASE_IMAGE_IDS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -309,8 +309,11 @@ async fn a_base_image_reference_that_resolves_to_nothing_is_refused() {
 /// RULE: `GetMicrovmImage` resolves its `imageIdentifier` — "The ARN or ID of the
 /// MicroVmImage" — as an id this account holds and, failing that, as an ARN: a value
 /// that is neither addresses nothing this API can name and is refused 400
-/// `ValidationException`, while a well-formed ARN this account holds nothing under is
-/// the 404 `ResourceNotFoundException` a poll may legitimately retry.
+/// `ValidationException`, a well-formed identifier this account holds no record of (now
+/// or before) is the 403 `AccessDeniedException` the authorization verdict answers, and
+/// only this account's OWN record being gone is the 404 `ResourceNotFoundException` a
+/// poll may legitimately retry (the authorization boundary
+/// `image_read_authorization` owns).
 #[tokio::test]
 async fn an_image_lookup_separates_a_malformed_identifier_from_an_absent_one() {
     let router = emulator();
@@ -320,26 +323,41 @@ async fn an_image_lookup_separates_a_malformed_identifier_from_an_absent_one() {
     assert_eq!(status, 201, "create the image: got {created}");
     let held_arn = expected_image_arn(held);
 
-    // Rows span the three outcomes, and within the refusal every way an ARN can be
-    // malformed that `service_common::arn` names: a missing field, an empty partition,
-    // an empty resource, and no `arn:` prefix at all.
+    // An image this account creates and then deletes: its ARN stays an identifier the
+    // account holds a record of, so the lookup reports the record's ABSENCE.
+    let released = "released-image";
+    let (status, created) = create_image(&router, image_body(released, json!({}))).await;
+    assert_eq!(status, 201, "create the released image: got {created}");
+    let released_arn = expected_image_arn(released);
+    let (status, deleted) = delete_image(&router, &released_arn).await;
+    assert_eq!(status, 200, "delete the released image: got {deleted}");
+    tokio::time::sleep(PAST_THE_SPAN).await;
+
+    // Rows span the four outcomes, and within the malformed refusal every way an ARN
+    // can be malformed that `service_common::arn` names: a missing field, an empty
+    // partition, an empty resource, and no `arn:` prefix at all.
     let rows: Vec<(&str, String, u16)> = vec![
         ("an id this account holds", held.to_string(), 200),
         ("the ARN this account minted", held_arn.clone(), 200),
         (
+            "the ARN of a record this account deleted",
+            released_arn.clone(),
+            404,
+        ),
+        (
             "a well-formed ARN naming no image",
             expected_image_arn("never-created"),
-            404,
+            403,
         ),
         (
             "a well-formed ARN of another partition",
             format!("arn:aws-us-gov:lambda:{REGION}:000000000000:microvm-image:{held}"),
-            404,
+            403,
         ),
         (
             "a well-formed ARN of another vendor",
             format!("arn:aws:s3:{REGION}:000000000000:microvm-image:{held}"),
-            404,
+            403,
         ),
         ("a bare id this account holds none of", "no-such-id".to_string(), 400),
         ("too few fields", "arn:aws:lambda".to_string(), 400),
@@ -373,6 +391,19 @@ async fn an_image_lookup_separates_a_malformed_identifier_from_an_absent_one() {
                 Some(held_arn.as_str()),
                 "case {case:?}: expected the stored image, got {body}"
             ),
+            403 => {
+                assert_eq!(
+                    body["__type"].as_str(),
+                    Some("AccessDeniedException"),
+                    "case {case:?}: expected AccessDeniedException, got {body}"
+                );
+                assert_eq!(
+                    body["message"].as_str(),
+                    Some(ACCESS_DENIED_MESSAGE),
+                    "case {case:?}: expected the modelled denial sentence, got {:?}",
+                    body["message"]
+                );
+            }
             404 => {
                 assert_eq!(
                     body["__type"].as_str(),

@@ -1026,19 +1026,30 @@ async fn unknown_identifiers_answer_resource_not_found() {
     let router = emulator();
     built_image(&router, "present").await;
 
+    // An image this account created and then deleted: the identifier names a record the
+    // account holds, so its lookup reports that record's absence.
+    let gone_arn = built_image(&router, "gone").await;
+    let (status, deleted) = call(
+        &router,
+        "DELETE",
+        &format!("/2025-09-09/microvm-images/{}", as_uri_value(&gone_arn)),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "delete the gone image: got {status} {deleted}");
+    tokio::time::sleep(PAST_THE_SPAN).await;
+
     // Rows span every operation in the slice that resolves an identifier, and both
     // identifier forms. An IMAGE identifier that is neither an id this account holds
-    // nor a well-formed ARN is a REFUSAL rather than a not-found (see
+    // nor a well-formed ARN is a REFUSAL rather than a not-found, and one this account
+    // holds no record of is the authorization refusal (see
     // `image_request_validation::an_image_lookup_separates_a_malformed_identifier_from_an_absent_one`),
-    // so an absent image is addressed here by the ARN form.
+    // so a missing image is addressed here by the ARN of a record this account owns.
     let rows: Vec<(&str, &str, String)> = vec![
         (
-            "get an absent image by ARN",
+            "get a deleted image by ARN",
             "GET",
-            format!(
-                "/2025-09-09/microvm-images/{}",
-                as_uri_value(&expected_image_arn("absent"))
-            ),
+            format!("/2025-09-09/microvm-images/{}", as_uri_value(&gone_arn)),
         ),
         (
             "get an absent MicroVM",

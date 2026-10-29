@@ -23,6 +23,8 @@ mod image_build_scope;
 mod image_configuration_update;
 #[path = "all/image_listing.rs"]
 mod image_listing;
+#[path = "all/image_read_authorization.rs"]
+mod image_read_authorization;
 #[path = "all/image_request_validation.rs"]
 mod image_request_validation;
 #[path = "all/image_version_listing.rs"]

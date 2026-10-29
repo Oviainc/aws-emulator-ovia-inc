@@ -117,6 +117,17 @@ pub const MAX_MICROVM_IMAGES: usize = 500;
 /// and chosen for the same reasons as [`MAX_MICROVM_IMAGES`], on `RunMicrovm`.
 pub const MAX_ACTIVE_MICROVMS: usize = 500;
 
+/// How many of this account's REMOVED image ARNs the store remembers — see
+/// [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::removed_image_arns`], which is what
+/// keeps a read of an image this account created and then deleted reporting absence.
+///
+/// The figure is chosen, like [`MAX_MICROVM_IMAGES`]: generous against the images one
+/// account can hold at a time, and finite, so an account that creates and deletes
+/// images forever cannot grow the store without bound. Reaching it drops the oldest
+/// removal, whose ARN is then judged like any other identifier this account holds no
+/// record of.
+pub const MAX_REMOVED_IMAGE_ARNS: usize = 10 * MAX_MICROVM_IMAGES;
+
 /// How many versions one MicroVM image may hold.
 ///
 /// The model declares `ServiceQuotaExceededException` on `UpdateMicrovmImage` — the
@@ -436,6 +447,27 @@ pub enum ImageReference {
     Resolved(String),
     /// A well-formed ARN (or a bare id) that this account holds no image under.
     Absent,
+    /// Neither an id this account holds nor a well-formed ARN.
+    Malformed,
+}
+
+/// What a customer-facing call addressed at a `MicrovmImageIdentifier` is answered
+/// with once the AUTHORIZATION verdict is taken — see
+/// [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::resolve_image_access`].
+///
+/// The four outcomes are client-visible and mean different things: a denial says the
+/// caller may not read the identifier at all (and says NOTHING about whether it names
+/// anything), an absence says this account's own record is not there — the condition a
+/// poll may legitimately retry — and a malformed identifier is a request that can never
+/// succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageAccess {
+    /// The `name` key of the image to serve.
+    Granted(String),
+    /// An identifier of this account's own that names no record of it any more.
+    Absent,
+    /// An identifier this account holds no record of, now or before.
+    Denied,
     /// Neither an id this account holds nor a well-formed ARN.
     Malformed,
 }
@@ -864,8 +896,9 @@ pub struct IdempotencyRecord {
 /// Per-service state for com-amazonaws-lambdamicrovms-lambdamicrovms. A handler reaches it through [`service_state`].
 ///
 /// Every map here is bounded: `images` by [`MAX_MICROVM_IMAGES`], `microvms` by
-/// [`MAX_ACTIVE_MICROVMS`] plus the [`TERMINATED_MICROVM_RETENTION`] reclaim, and
-/// `idempotency` by [`MAX_IDEMPOTENCY_RECORDS`] and [`IDEMPOTENCY_RETENTION`].
+/// [`MAX_ACTIVE_MICROVMS`] plus the [`TERMINATED_MICROVM_RETENTION`] reclaim,
+/// `removed_image_arns` by [`MAX_REMOVED_IMAGE_ARNS`], and `idempotency` by
+/// [`MAX_IDEMPOTENCY_RECORDS`] and [`IDEMPOTENCY_RETENTION`].
 #[derive(Debug)]
 pub struct ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     /// Images by `name` (`ImageName` is unique within the account).
@@ -877,6 +910,14 @@ pub struct ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     pub microvms: BTreeMap<String, Microvm>,
     /// MicroVM ARN -> `microvmId`, so an identifier resolves by ARN or by id.
     pub microvm_arn_index: BTreeMap<String, String>,
+    /// The `imageArn`s of images this account HELD and whose records the clock's
+    /// deletion has since removed, each with the instant it went.
+    ///
+    /// A record this account created is one the account is granted, whether or not it
+    /// still exists, so a call addressed at one may REPORT ITS ABSENCE rather than
+    /// refuse access — see [`Self::resolve_image_access`]. Bounded by
+    /// [`MAX_REMOVED_IMAGE_ARNS`], oldest removal first.
+    pub removed_image_arns: BTreeMap<String, Instant>,
     /// `clientToken` -> the resource that token already minted.
     pub idempotency: BTreeMap<String, IdempotencyRecord>,
     /// The live authentication tokens a published MicroVM endpoint accepts, keyed by
@@ -911,6 +952,7 @@ impl Default for ComAmazonawsLambdamicrovmsLambdamicrovmsState {
             arn_index: BTreeMap::new(),
             microvms: BTreeMap::new(),
             microvm_arn_index: BTreeMap::new(),
+            removed_image_arns: BTreeMap::new(),
             idempotency: BTreeMap::new(),
             auth_tokens: BTreeMap::new(),
             microvm_proxy: None,
@@ -1022,6 +1064,10 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
         for name in removed {
             if let Some(image) = self.images.remove(&name) {
                 self.arn_index.remove(&image.image_arn);
+                // The record is gone, but it was THIS account's: the ARN it was minted
+                // under stays an identifier the account is granted, so a later call
+                // addressed at it reports the absence instead of refusing access.
+                self.remember_removed_image(image.image_arn, now);
             }
         }
 
@@ -1197,6 +1243,60 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
             return ImageReference::Absent;
         }
         ImageReference::Malformed
+    }
+
+    /// Remember that the image minted under `image_arn` was removed at `removed_at`,
+    /// dropping the oldest removal when the store is at [`MAX_REMOVED_IMAGE_ARNS`].
+    fn remember_removed_image(&mut self, image_arn: String, removed_at: Instant) {
+        if !self.removed_image_arns.contains_key(&image_arn)
+            && self.removed_image_arns.len() >= MAX_REMOVED_IMAGE_ARNS
+        {
+            let evict = self
+                .removed_image_arns
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(arn, _)| arn.clone());
+            if let Some(arn) = evict {
+                self.removed_image_arns.remove(&arn);
+            }
+        }
+        self.removed_image_arns.insert(image_arn, removed_at);
+    }
+
+    /// Whether this account holds, or has held, the MicroVM image `identifier` names.
+    ///
+    /// This is the grant a call on a `MicrovmImageIdentifier` is judged against: the
+    /// records an account created are the ones it is permitted to read, and a record it
+    /// created does not stop being its own when the record itself goes
+    /// ([`Self::removed_image_arns`]). An identifier of another namespace — AWS's own
+    /// ([`is_managed_microvm_image_arn`]), another account's, another partition's or
+    /// another vendor's — names nothing this account was ever granted.
+    pub fn grants_microvm_image(&self, identifier: &str) -> bool {
+        self.resolve_image_name(identifier).is_some()
+            || self.removed_image_arns.contains_key(identifier)
+    }
+
+    /// What a customer-facing call addressed at the `MicrovmImageIdentifier`
+    /// `identifier` answers, AUTHORIZATION first.
+    ///
+    /// The service decides access before it looks anything up, so it never reports the
+    /// absence of an identifier the caller is not permitted to read: an identifier this
+    /// account neither holds nor held ([`Self::grants_microvm_image`]) is
+    /// [`ImageAccess::Denied`] whether or not it names a resource, and only an
+    /// identifier of this account's own gets an answer about existence —
+    /// [`ImageAccess::Granted`] while the record is there and [`ImageAccess::Absent`]
+    /// once it is gone. A value that is no identifier of this API at all
+    /// ([`ImageReference::Malformed`]) is a bad REQUEST, which is decided on the input
+    /// rather than on any grant.
+    pub fn resolve_image_access(&self, identifier: &str) -> ImageAccess {
+        match self.resolve_image_reference(identifier) {
+            ImageReference::Malformed => ImageAccess::Malformed,
+            reference => match (self.grants_microvm_image(identifier), reference) {
+                (false, _) => ImageAccess::Denied,
+                (true, ImageReference::Resolved(name)) => ImageAccess::Granted(name),
+                (true, _) => ImageAccess::Absent,
+            },
+        }
     }
 
     /// The image `identifier` names, by ARN or by name.

@@ -234,6 +234,16 @@ async fn every_not_found_carries_only_the_request_derived_message() {
     built_image(&router, "present").await;
     let absent_arn = expected_image_arn("absent");
 
+    // An image this account created and then deleted. Its ARN stays an identifier the
+    // account holds a record of, so the image lookup REPORTS THE ABSENCE of that record
+    // rather than answering the authorization refusal an identifier of a namespace this
+    // account was never granted gets (`managed_namespace_authorization` and
+    // `image_read_authorization` own that verdict).
+    let gone_arn = built_image(&router, "gone").await;
+    let (status, deleted) = delete_image(&router, &gone_arn).await;
+    assert_eq!(status, 200, "delete the gone image: got {status} {deleted}");
+    tokio::time::sleep(PAST_THE_SPAN).await;
+
     // Rows span every operation on these paths that resolves an identifier, both
     // identifier forms, and the two message templates: an image lookup, a MicroVM
     // lookup, and `RunMicrovm`'s active-version resolution. An IMAGE identifier that
@@ -243,11 +253,11 @@ async fn every_not_found_carries_only_the_request_derived_message() {
     let token_body = json!({"expirationInMinutes": 15, "allowedPorts": [{"allPorts": {}}]});
     let rows: Vec<(&str, &str, String, Option<Value>, String)> = vec![
         (
-            "get an absent image by ARN",
+            "get a record this account deleted, by ARN",
             "GET",
-            format!("/2025-09-09/microvm-images/{}", as_uri_value(&absent_arn)),
+            format!("/2025-09-09/microvm-images/{}", as_uri_value(&gone_arn)),
             None,
-            format!("MicroVMImage not found for MicroVMImageID: {absent_arn}"),
+            format!("MicroVMImage not found for MicroVMImageID: {gone_arn}"),
         ),
         (
             "get an absent MicroVM by id",
