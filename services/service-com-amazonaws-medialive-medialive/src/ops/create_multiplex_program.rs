@@ -6,8 +6,10 @@
 //! `programs` of that multiplex's record in the `multiplexes` slice of [`crate::state`])
 //! and every value the response carries is read back out of the stored record or derived
 //! from the rest of the store, never built from the request in flight. A retry carrying
-//! the same `@idempotencyToken` `RequestId` answers with the program the first call
-//! created.
+//! the same `@idempotencyToken` `RequestId` to the SAME multiplex's endpoint answers with
+//! the program the first call created; the same token presented for another multiplex is
+//! a different create, because the multiplex is part of the endpoint the token was
+//! presented to.
 //!
 //! ## Shape of an operation
 //!
@@ -170,12 +172,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle(now);
 
         // A retried create (same `@idempotencyToken` `RequestId`) must answer
-        // with the program the first one created, not a second program.
-        if let Some((multiplex_id, program_name)) =
-            state.multiplex_program_for_token(&input.request_id)
+        // with the program the first one created, not a second program. The
+        // token is scoped to the multiplex whose endpoint it was presented to:
+        // a token spent on another multiplex's program names a program this
+        // call was not asked for, and answering with it would report a resource
+        // the request did not ask to exist while storing nothing in the
+        // multiplex the path named.
+        if let Some(program_name) = state
+            .multiplex_program_for_token(&input.multiplex_id, &input.request_id)
+            .map(str::to_string)
         {
             let program = state
-                .multiplex_program_description(&multiplex_id, &program_name)
+                .multiplex_program_description(&input.multiplex_id, &program_name)
                 .ok_or_else(unavailable)?;
             return Ok(CreateMultiplexProgramOutput {
                 multiplex_program: Some(program),
@@ -199,8 +207,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // gone (`multiplex_program_for_token` answers only for a program that
         // exists).
         state.record_multiplex_program_token(
-            input.request_id,
             &input.multiplex_id,
+            input.request_id,
             &input.program_name,
         );
 

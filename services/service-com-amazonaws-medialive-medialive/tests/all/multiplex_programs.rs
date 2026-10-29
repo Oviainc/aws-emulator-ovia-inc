@@ -669,6 +669,159 @@ async fn a_retried_create_returns_the_program_the_first_one_created() {
     }
 }
 
+/// One row of the idempotency-scope table: the case name, which of the two
+/// multiplexes each create is addressed to together with the `RequestId` and the
+/// `ProgramName` it carries, and whether the second create must answer with the
+/// program the first one created.
+type ProgramRetryRow<'a> = (
+    &'a str,
+    (usize, &'a str, &'a str),
+    (usize, &'a str, &'a str),
+    bool,
+);
+
+/// Rule: a `RequestId` (`@idempotencyToken`) is idempotent only for the endpoint
+/// it was presented to, and `CreateMultiplexProgram` is addressed to one
+/// multiplex (`POST /prod/multiplexes/{MultiplexId}/programs`) — so a retry
+/// replays the first create's program only when it names the SAME multiplex, and
+/// the same token presented for another multiplex is a create of its own, which
+/// stores a program in the multiplex that request named.
+///
+/// The rows differ along the tokens, along the multiplexes the two creates are
+/// addressed to, along the program names they carry and along the order the two
+/// multiplexes are used in — which is what the rule generalises over.
+#[tokio::test]
+async fn a_retried_create_is_idempotent_only_for_the_multiplex_it_was_addressed_to() {
+    // (case, first (multiplex, token, program name), second (likewise), replayed?)
+    let rows: [ProgramRetryRow<'_>; 6] = [
+        (
+            "the same token and name, one multiplex",
+            (0, "token-a", "news"),
+            (0, "token-a", "news"),
+            true,
+        ),
+        (
+            "the same token, two names, one multiplex",
+            (0, "token-a", "news"),
+            (0, "token-a", "sports"),
+            true,
+        ),
+        (
+            "two tokens, one multiplex",
+            (0, "token-a", "news"),
+            (0, "token-b", "sports"),
+            false,
+        ),
+        (
+            "the same token and name, two multiplexes",
+            (0, "token-a", "news"),
+            (1, "token-a", "news"),
+            false,
+        ),
+        (
+            "the same token, two names, two multiplexes",
+            (0, "token-a", "news"),
+            (1, "token-a", "sports"),
+            false,
+        ),
+        (
+            "the same token, two multiplexes, in the other order",
+            (1, "token-a", "news"),
+            (0, "token-a", "news"),
+            false,
+        ),
+    ];
+
+    for (
+        case,
+        (first_multiplex, first_token, first_name),
+        (second_multiplex, second_token, second_name),
+        replayed,
+    ) in rows
+    {
+        let router = medialive();
+        let multiplexes = [
+            multiplex(&router, case, "retry-scope-a").await,
+            multiplex(&router, case, "retry-scope-b").await,
+        ];
+
+        let (status, one) = create_program(
+            &router,
+            &multiplexes[first_multiplex],
+            first_name,
+            first_token,
+            program_settings(1),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: the first create: expected 201, got {status}: {one}"
+        );
+        let (status, two) = create_program(
+            &router,
+            &multiplexes[second_multiplex],
+            second_name,
+            second_token,
+            program_settings(2),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: the second create: expected 201, got {status}: {two}"
+        );
+
+        if replayed {
+            assert_eq!(
+                two, one,
+                "case {case:?}: expected the retry to answer with the first program, got {two}"
+            );
+        } else {
+            assert_eq!(
+                two["programName"],
+                json!(second_name),
+                "case {case:?}: expected the second create to answer with its own program, got {two}"
+            );
+            assert_eq!(
+                two["multiplexProgramSettings"]["programNumber"],
+                json!(2),
+                "case {case:?}: expected the second create to answer with its own settings, got {two}"
+            );
+            let (status, described) =
+                describe_program(&router, &multiplexes[second_multiplex], second_name).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: DescribeMultiplexProgram of the second program: expected 200, got {status}: {described}"
+            );
+            assert_eq!(
+                described["multiplexProgramSettings"]["programNumber"],
+                json!(2),
+                "case {case:?}: expected the second program to be stored in the multiplex its request named, got {described}"
+            );
+        }
+
+        // Each multiplex counts exactly the programs its OWN endpoint was asked
+        // for: a replay stores no second program, and every other pair stores
+        // one program per create.
+        for (index, multiplex_id) in multiplexes.iter().enumerate() {
+            let mut expected = usize::from(first_multiplex == index);
+            if !replayed {
+                expected += usize::from(second_multiplex == index);
+            }
+            let (status, described) = describe_multiplex(&router, multiplex_id).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: DescribeMultiplex {multiplex_id}: expected 200, got {status}: {described}"
+            );
+            assert_eq!(
+                described["programCount"],
+                json!(expected),
+                "case {case:?}: multiplex {multiplex_id}: expected programCount {expected}, got {:?}",
+                described["programCount"]
+            );
+        }
+    }
+}
+
 /// Rule: a `MultiplexId` that names no stored multiplex cannot carry a program —
 /// `DescribeMultiplexProgram` answers `NotFoundException` for it and for a
 /// `ProgramName` the named multiplex does not hold, and

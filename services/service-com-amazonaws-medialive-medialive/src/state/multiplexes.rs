@@ -1692,29 +1692,43 @@ impl ComAmazonawsMedialiveMedialiveState {
         Ok(program)
     }
 
-    /// Record `token` as having created the program `program_name` of the
-    /// multiplex `multiplex_id`, evicting the oldest token first if that would
-    /// push the map past [`MAX_MULTIPLEX_PROGRAM_TOKENS`].
+    /// Record `token`, as presented for the multiplex `multiplex_id`, as having
+    /// created the program `program_name`, evicting the oldest token first if
+    /// that would push the map past [`MAX_MULTIPLEX_PROGRAM_TOKENS`].
     pub fn record_multiplex_program_token(
         &mut self,
-        token: String,
         multiplex_id: &str,
+        token: String,
         program_name: &str,
     ) {
         self.multiplex_program_tokens.record(
-            token,
-            &multiplex_program_key(multiplex_id, program_name),
+            multiplex_program_token_key(multiplex_id, &token),
+            program_name,
             MAX_MULTIPLEX_PROGRAM_TOKENS,
         );
     }
 
-    /// The program a stored `RequestId` created \u2014 the multiplex's id and the
-    /// program's name \u2014 if that program still exists.
-    pub fn multiplex_program_for_token(&self, request_id: &str) -> Option<(String, String)> {
-        let key = self.multiplex_program_tokens.created(request_id)?;
-        let (multiplex_id, program_name) = key.split_once(MULTIPLEX_PROGRAM_KEY_SEPARATOR)?;
-        let program = self.multiplexes.get(multiplex_id)?.programs.get(program_name)?;
-        Some((multiplex_id.to_string(), program.program_name.clone()))
+    /// The name of the program a stored `RequestId` created in `multiplex_id`,
+    /// if that multiplex still holds it.
+    ///
+    /// The multiplex is part of the key AND re-checked on the record: a token
+    /// presented to one multiplex's endpoint says nothing about another's, so a
+    /// replay can only ever surface a program of the multiplex the request
+    /// named.
+    pub fn multiplex_program_for_token(
+        &self,
+        multiplex_id: &str,
+        request_id: &str,
+    ) -> Option<&str> {
+        let program_name = self
+            .multiplex_program_tokens
+            .created(&multiplex_program_token_key(multiplex_id, request_id))?;
+        let program = self
+            .multiplexes
+            .get(multiplex_id)?
+            .programs
+            .get(program_name)?;
+        Some(program.program_name.as_str())
     }
 
     /// The full `MultiplexProgram` description of one stored program, or `None`
@@ -1941,20 +1955,34 @@ fn multiplex_alert_output(alert: &MultiplexAlertRecord) -> MultiplexAlert {
     }
 }
 
-/// What separates the two halves of a multiplex program's idempotency-token key.
+/// What separates the two halves of a key naming a multiplex program.
 ///
 /// A program is identified by the multiplex it lives in and its name rather than
-/// by an id, so the token map records both. `ProgramName` is a URI path label
+/// by an id, so both halves are named. `ProgramName` is a URI path label
 /// (`smithy_query(query="operation", operation="DescribeMultiplexProgram")`:
 /// `/prod/multiplexes/{MultiplexId}/programs/{ProgramName}`) and a multiplex id
-/// is a numeric string, so a `/` cannot appear in the first half and the split
-/// is unambiguous.
+/// is a numeric string, so a `/` cannot appear in the first half and the pair is
+/// unambiguous.
 const MULTIPLEX_PROGRAM_KEY_SEPARATOR: char = '/';
 
-/// The key [`ComAmazonawsMedialiveMedialiveState::record_multiplex_program_token`]
-/// records a token against, read back by `multiplex_program_for_token`.
+/// The multiplex and the program name, composed into the one identifier a
+/// refusal about a program names.
 fn multiplex_program_key(multiplex_id: &str, program_name: &str) -> String {
     format!("{multiplex_id}{MULTIPLEX_PROGRAM_KEY_SEPARATOR}{program_name}")
+}
+
+/// The key the multiplex-program idempotency-token map records a token against.
+///
+/// A program is created against ONE multiplex's endpoint (`POST
+/// /prod/multiplexes/{MultiplexId}/programs`) and is named by that multiplex
+/// together with its own name, so the multiplex is part of the key: two
+/// multiplexes using the same `RequestId` each keep their own entry instead of
+/// overwriting one another's. The multiplex is re-checked on the record the
+/// token resolves to
+/// ([`ComAmazonawsMedialiveMedialiveState::multiplex_program_for_token`]), so
+/// the key's shape carries no invariant of its own.
+fn multiplex_program_token_key(multiplex_id: &str, token: &str) -> String {
+    format!("{multiplex_id}{MULTIPLEX_PROGRAM_KEY_SEPARATOR}{token}")
 }
 
 /// The message a refusal about a multiplex PROGRAM that is not there carries.

@@ -2357,10 +2357,11 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// `CreateMultiplex`'s `RequestId` (`@idempotencyToken`) -> the multiplex it
     /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
     multiplex_tokens: IdempotencyTokens,
-    /// `CreateMultiplexProgram`'s `RequestId` (`@idempotencyToken`) -> the
-    /// program it created, keyed by the multiplex slice's
-    /// `multiplex_program_key` because a program is named by its multiplex and
-    /// its own name rather than by an id. PRIVATE for the same reason as
+    /// `CreateMultiplexProgram`'s `RequestId` (`@idempotencyToken`) -> the NAME
+    /// of the program it created, keyed per multiplex by the multiplex slice's
+    /// `multiplex_program_token_key` because a program is created against one
+    /// multiplex's endpoint and is named by that multiplex together with its own
+    /// name rather than by an id. PRIVATE for the same reason as
     /// [`Self::channel_tokens`].
     multiplex_program_tokens: IdempotencyTokens,
     /// Every input device this account has claimed, keyed by the device id the
