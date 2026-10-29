@@ -504,10 +504,6 @@ pub struct Destination {
 /// as [`MANAGED_THING_RESOURCE_TYPE`] is for a managed thing.
 pub const DESTINATION_RESOURCE_TYPE: &str = "Destination";
 
-/// The destination resource as a READ's reason names it: the resource's name in words
-/// ([`resource_not_found_message`]).
-pub const DESTINATION_RESOURCE_NAME: &str = "Destination";
-
 /// The destination resource as a MUTATION's and a CONFLICT's reason names it: the subject
 /// of the sentence those paths state ([`cannot_be_found_message`],
 /// [`already_exists_message`]), as [`CONNECTOR_DESTINATION_RESOURCE_SUBJECT`] is for a
@@ -544,10 +540,6 @@ pub struct NotificationConfiguration {
 
 /// The `ResourceType` this service reports a notification configuration under.
 pub const NOTIFICATION_CONFIGURATION_RESOURCE_TYPE: &str = "NotificationConfiguration";
-
-/// The notification-configuration resource as a READ's reason names it: the resource's
-/// name in words ([`resource_not_found_message`]).
-pub const NOTIFICATION_CONFIGURATION_RESOURCE_NAME: &str = "Notification Configuration";
 
 /// The most notification configurations one store holds — one per `EventType` per region,
 /// so this bound only caps how many REGIONS a caller can spread them over, on the same
@@ -2141,6 +2133,27 @@ fn resource_not_found(resource_type: &str, identifier: &str) -> ResourceNotFound
     }
 }
 
+/// The modelled `ResourceNotFoundException` with NONE of its members set: the status and
+/// the wire error code alone, and an otherwise empty body.
+///
+/// WHICH members a 404 carries belongs to the RESOURCE whose absence is being stated, not
+/// to the operation that resolved it: `Message`, `ResourceId` and `ResourceType` are all
+/// optional on the shape (`smithy_query(query="shape",
+/// shape="ResourceNotFoundException")`), and the recorded 404s of the destination surface
+/// (`GetDestination`, `UpdateDestination`, `DeleteDestination`) and of the
+/// notification-configuration surface (`GetNotificationConfiguration`,
+/// `UpdateNotificationConfiguration`) carry none of the three, where a managed thing's
+/// carry all of them ([`managed_thing_not_found_on_read`]). A resource stated this way is
+/// stated this way by EVERY operation that resolves one and finds none, read and mutation
+/// alike, so those two surfaces reach for this and not for a reason of their own.
+pub fn bare_resource_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: None,
+        resource_id: None,
+        resource_type: None,
+    }
+}
+
 /// The modelled `ResourceNotFoundException` a READ answers for a cloud connector the
 /// store does not hold under the identifier a request named, worded by the same read-path
 /// sentence every read of this service uses ([`resource_not_found_message`]).
@@ -2357,29 +2370,6 @@ pub fn account_association_not_found_on_read(identifier: &str) -> ResourceNotFou
     }
 }
 
-/// The modelled `ResourceNotFoundException` a READ answers for a destination the caller's
-/// region holds none of under the `Name` a request named: the read path's reason
-/// ([`resource_not_found_message`]) plus the `ResourceId` and `ResourceType` members every
-/// 404 of this service reports the same way.
-pub fn destination_not_found_on_read(name: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(resource_not_found_message(DESTINATION_RESOURCE_NAME)),
-        ..resource_not_found(DESTINATION_RESOURCE_TYPE, name)
-    }
-}
-
-/// The modelled `ResourceNotFoundException` a MUTATION answers for a destination the
-/// caller's region holds none of under the `Name` a request named: the sentence every
-/// mutation of a NAME-addressed resource of this service states
-/// ([`cannot_be_found_message`]) plus the `ResourceId` and `ResourceType` members every 404
-/// of this service reports the same way.
-pub fn destination_not_found_on_mutation(name: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(cannot_be_found_message(DESTINATION_RESOURCE_SUBJECT)),
-        ..resource_not_found(DESTINATION_RESOURCE_TYPE, name)
-    }
-}
-
 /// How a CREATE states that the resource it was to mint is already there: the resource as
 /// the sentence's subject, and that it exists.
 ///
@@ -2423,17 +2413,6 @@ pub const DELIVERY_DESTINATION_REGION_MISMATCH_MESSAGE: &str =
 /// read is not refused here: its form is the modelled `@pattern`'s to judge.
 pub fn delivery_destination_is_cross_region(region: &str, arn: &str) -> bool {
     arn_region(arn).is_some_and(|arn_region| arn_region != region)
-}
-
-/// The modelled `ResourceNotFoundException` a READ answers for an event type the caller's
-/// region holds no notification configuration for, worded by the same read-path sentence.
-pub fn notification_configuration_not_found_on_read(event_type: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(resource_not_found_message(
-            NOTIFICATION_CONFIGURATION_RESOURCE_NAME,
-        )),
-        ..resource_not_found(NOTIFICATION_CONFIGURATION_RESOURCE_TYPE, event_type)
-    }
 }
 
 /// The modelled `ResourceNotFoundException` a read of the device-discovery surface answers

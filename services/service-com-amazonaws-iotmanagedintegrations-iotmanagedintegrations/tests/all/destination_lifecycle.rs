@@ -10,7 +10,9 @@
 //! record's `UpdatedAt` while its `CreatedAt` stays where the create put it, so
 //! `GetDestination` reports exactly the merged record. `DeleteDestination` (DELETE
 //! `/destinations/{Name}`, success 200) removes it, after which the name resolves to
-//! nothing on an independent read and a mutation of it fails the same way. A create for a
+//! nothing on an independent read and a mutation of it fails the same way — every
+//! operation of the surface states an absent name with the BARE modelled
+//! `ResourceNotFoundException`, carrying none of its optional members. A create for a
 //! name the region already holds a destination under is the modelled `ConflictException`
 //! (HTTP 409) and leaves the stored destination untouched, while a distinct name still
 //! succeeds. A destination delivers to a target of the SAME region as the call, so a
@@ -37,9 +39,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::ops::types::DELIVERY_DESTINATION_TYPE_VALUES;
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::state::{
-    already_exists_message, cannot_be_found_message, resource_not_found_message,
-    DELIVERY_DESTINATION_REGION_MISMATCH_MESSAGE, DESTINATION_RESOURCE_NAME,
-    DESTINATION_RESOURCE_SUBJECT, DESTINATION_RESOURCE_TYPE,
+    already_exists_message, DELIVERY_DESTINATION_REGION_MISMATCH_MESSAGE,
+    DESTINATION_RESOURCE_SUBJECT,
 };
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -224,7 +225,16 @@ async fn delete_destination_in(router: &MultiServiceRouter, region: &str, name: 
     .await
 }
 
-/// Assert `reply` is the modelled refusal `code` with `status`.
+/// The members the modelled `ResourceNotFoundException` declares, all optional
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")` -> `Message`,
+/// `ResourceId`, `ResourceType`, `httpError` 404) — none of which a destination's 404
+/// carries.
+const NOT_FOUND_MEMBERS: [&str; 3] = ["Message", "ResourceId", "ResourceType"];
+
+/// Assert `reply` is the modelled refusal `code` with `status`. A `ResourceNotFoundException`
+/// of this surface is the BARE exception — the status and the error code alone, with none of
+/// [`NOT_FOUND_MEMBERS`] on the body a client reads — so every 404 asserted here is checked
+/// for that too.
 fn assert_refused(case: &str, reply: &Reply, status: u16, code: &str) {
     assert_eq!(
         reply.status, status,
@@ -238,6 +248,16 @@ fn assert_refused(case: &str, reply: &Reply, status: u16, code: &str) {
         reply.error_type,
         reply.body
     );
+    if code == NOT_FOUND {
+        for member in NOT_FOUND_MEMBERS {
+            assert!(
+                reply.member(member).is_none(),
+                "case {case:?}: a destination's 404 carries no {member}, got {:?} in body {:?}",
+                reply.member(member),
+                reply.body
+            );
+        }
+    }
 }
 
 /// Create the destination `name` in `region`, asserting the modelled 201.
@@ -455,29 +475,9 @@ async fn a_deleted_destination_is_gone_and_its_name_is_unusable() {
         deleted.status, deleted.body
     );
 
-    // Gone on an independent read, which reports the read path's reason, the resource type
-    // and the name the request carried.
+    // Gone on an independent read, which states the absence with the bare exception.
     let read = get_destination_in(&router, REGION, name).await;
     assert_refused("delete/read", &read, 404, NOT_FOUND);
-    assert_eq!(
-        read.message(),
-        resource_not_found_message(DESTINATION_RESOURCE_NAME),
-        "case \"delete/read\": expected the read path's reason, got {:?}",
-        read.body
-    );
-    assert_eq!(
-        read.string("ResourceType"),
-        Some(DESTINATION_RESOURCE_TYPE),
-        "case \"delete/read\": expected the 404 to name the resource type, got {:?}",
-        read.body
-    );
-    assert_eq!(
-        read.string("ResourceId"),
-        Some(name),
-        "case \"delete/read\": expected the 404 to report the name the request carried, got \
-         {:?}",
-        read.body
-    );
 
     // And unusable: every mutation of the dead name fails the same way. The rows differ
     // along the operation the dead name is addressed with.
@@ -491,21 +491,6 @@ async fn a_deleted_destination_is_gone_and_its_name_is_unusable() {
     assert_refused("delete/update", &update, 404, NOT_FOUND);
     let again = delete_destination_in(&router, REGION, name).await;
     assert_refused("delete/delete", &again, 404, NOT_FOUND);
-    for (label, reply) in [("delete/update", &update), ("delete/delete", &again)] {
-        assert_eq!(
-            reply.message(),
-            cannot_be_found_message(DESTINATION_RESOURCE_SUBJECT),
-            "case {label:?}: expected the mutating path's reason, got {:?}",
-            reply.body
-        );
-        assert_eq!(
-            reply.string("ResourceId"),
-            Some(name),
-            "case {label:?}: expected the 404 to report the name the request carried, got \
-             {:?}",
-            reply.body
-        );
-    }
 
     // Deleting one destination leaves every other one alone, and the freed name can be
     // created again.

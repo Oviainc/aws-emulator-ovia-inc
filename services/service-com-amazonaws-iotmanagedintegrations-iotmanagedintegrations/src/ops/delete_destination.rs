@@ -197,11 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if removed.is_none() {
             audit(&akid, &region, "not-found");
-            // A mutation states the reason through the one formatter every mutating path of
-            // this service shares, so a delete of a name nothing holds reads exactly the
-            // way an update of it does.
+            // Every operation of the destination surface states an absent name the same
+            // way: the BARE exception, carrying none of the shape's optional members, so a
+            // delete of a name nothing holds reads exactly the way a read or an update of
+            // it does.
             return Err(DeleteDestinationErrorModeled::ResourceNotFoundException(
-                crate::state::destination_not_found_on_mutation(&input.name),
+                crate::state::bare_resource_not_found(),
             )
             .into());
         }

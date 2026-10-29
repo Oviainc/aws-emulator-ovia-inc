@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_association_lifecycle.rs"]
 mod account_association_lifecycle;
+#[path = "all/bare_not_found_bodies.rs"]
+mod bare_not_found_bodies;
 #[path = "all/cloud_connector_lifecycle.rs"]
 mod cloud_connector_lifecycle;
 #[path = "all/connector_destination_lifecycle.rs"]

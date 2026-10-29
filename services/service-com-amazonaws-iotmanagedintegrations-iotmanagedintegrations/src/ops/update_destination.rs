@@ -247,9 +247,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             drop(store);
             audit(&akid, &region, "not-found");
             return Err(UpdateDestinationErrorModeled::ResourceNotFoundException(
-                // A mutation states the reason through the one formatter every mutating
-                // path of this service shares.
-                crate::state::destination_not_found_on_mutation(&input.name),
+                // Every operation of the destination surface states an absent name the same
+                // way: the BARE exception, carrying none of the shape's optional members.
+                crate::state::bare_resource_not_found(),
             )
             .into());
         };

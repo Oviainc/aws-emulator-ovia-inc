@@ -168,10 +168,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         let destination = store.destination_in(&region, &input.name).ok_or_else(|| {
-            // A read reports WHICH KIND of resource was not found; the name the request
-            // carried is reported on `ResourceId`.
+            // The destination surface states an absent name with the BARE exception: the
+            // status and the error code alone, carrying none of the shape's optional
+            // members.
             GetDestinationErrorModeled::ResourceNotFoundException(
-                crate::state::destination_not_found_on_read(&input.name),
+                crate::state::bare_resource_not_found(),
             )
         })?;
 

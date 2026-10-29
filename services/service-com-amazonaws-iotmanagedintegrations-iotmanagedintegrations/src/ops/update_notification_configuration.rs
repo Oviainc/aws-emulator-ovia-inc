@@ -212,7 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             audit(&akid, &region, &input.event_type, "not-found");
             return Err(
                 UpdateNotificationConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::notification_configuration_not_found_on_read(&input.event_type),
+                    // Every operation of this surface states an event type it holds nothing
+                    // for the same way: the BARE exception, carrying none of the shape's
+                    // optional members.
+                    crate::state::bare_resource_not_found(),
                 )
                 .into(),
             );

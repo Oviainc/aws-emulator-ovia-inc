@@ -15,7 +15,9 @@
 //! no `ResourceNotFoundException` for this operation — and creates nothing, so
 //! `GetNotificationConfiguration` (GET `/notification-configurations/{EventType}`,
 //! `@readonly`) still reports the modelled `ResourceNotFoundException` (HTTP 404) for that
-//! event type. Against a destination the account does have, the create is accepted and the
+//! event type — stated BARE, carrying none of the exception's optional members, as every
+//! 404 of this surface and of the destination surface is. Against a destination the account
+//! does have, the create is accepted and the
 //! get reports the event type, the destination it was pointed at and its timestamps. One
 //! configuration exists per event type, so a second create for the same event type is the
 //! modelled `ConflictException` (HTTP 409), while a retry carrying the `ClientToken`
@@ -37,9 +39,6 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::state::{
-    DESTINATION_RESOURCE_TYPE, NOTIFICATION_CONFIGURATION_RESOURCE_TYPE,
-};
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::ops::types::{
     DELIVERY_DESTINATION_TYPE_VALUES, EVENT_TYPE_VALUES,
 };
@@ -253,7 +252,16 @@ async fn update_configuration(
     .await
 }
 
-/// Assert one answer is the modelled refusal `status`/`code` carrying a reason.
+/// The members the modelled `ResourceNotFoundException` declares, all optional
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")` -> `Message`,
+/// `ResourceId`, `ResourceType`, `httpError` 404) — none of which a 404 of the
+/// notification-configuration or the destination surface carries.
+const NOT_FOUND_MEMBERS: [&str; 3] = ["Message", "ResourceId", "ResourceType"];
+
+/// Assert one answer is the modelled refusal `status`/`code`. Every refusal of this surface
+/// states a reason on the modelled `Message` member EXCEPT the 404 for a resource the region
+/// holds none of, which is the BARE exception — the status and the error code alone, with
+/// none of [`NOT_FOUND_MEMBERS`] on the body a client reads.
 fn assert_refused(case: &str, reply: &Reply, status: u16, code: &str) {
     assert_eq!(
         reply.status, status,
@@ -266,11 +274,22 @@ fn assert_refused(case: &str, reply: &Reply, status: u16, code: &str) {
         "case {case:?}: expected the modelled {code} code, got {:?}",
         reply.error_type
     );
-    assert!(
-        !reply.message().is_empty(),
-        "case {case:?}: expected the modelled Message member to carry a reason, got body {:?}",
-        reply.body
-    );
+    if code == NOT_FOUND {
+        for member in NOT_FOUND_MEMBERS {
+            assert!(
+                reply.member(member).is_none(),
+                "case {case:?}: a 404 of this surface carries no {member}, got {:?} in body {:?}",
+                reply.member(member),
+                reply.body
+            );
+        }
+    } else {
+        assert!(
+            !reply.message().is_empty(),
+            "case {case:?}: expected the modelled Message member to carry a reason, got body {:?}",
+            reply.body
+        );
+    }
 }
 
 /// Assert one get reports the configuration of `event_type` pointed at `destination`.
@@ -376,13 +395,6 @@ async fn a_create_against_an_existing_destination_round_trips() {
         for other in EVENT_TYPE_VALUES.iter().filter(|other| *other != event_type) {
             let read = get_configuration(&router, other).await;
             assert_refused(&format!("{case}/{other} unconfigured"), &read, 404, NOT_FOUND);
-            assert_eq!(
-                read.string("ResourceType"),
-                Some(NOTIFICATION_CONFIGURATION_RESOURCE_TYPE),
-                "case {case:?}: expected the 404 to name the notification-configuration \
-                 resource type, got {:?}",
-                read.string("ResourceType")
-            );
         }
     }
 }
@@ -712,22 +724,10 @@ async fn a_destination_round_trips_and_its_name_identifies_it() {
         );
     }
 
-    // A name this region holds no destination under is the modelled 404, reporting the
-    // resource type and the name the request carried.
+    // A name this region holds no destination under is the modelled 404, stated with the
+    // BARE exception: none of the shape's optional members is on the body.
     for name in ["nothing.here", "plain.stream.2", "z"] {
         let missing = get_destination_in(&router, REGION, name).await;
         assert_refused(name, &missing, 404, NOT_FOUND);
-        assert_eq!(
-            missing.string("ResourceType"),
-            Some(DESTINATION_RESOURCE_TYPE),
-            "case {name:?}: expected the 404 to name the destination resource type, got {:?}",
-            missing.string("ResourceType")
-        );
-        assert_eq!(
-            missing.string("ResourceId"),
-            Some(name),
-            "case {name:?}: expected the 404 to report the name the request carried, got {:?}",
-            missing.string("ResourceId")
-        );
     }
 }

@@ -174,10 +174,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let configuration = store
             .notification_configuration_in(&region, &input.event_type)
             .ok_or_else(|| {
-                // A read reports WHICH KIND of resource was not found; the event type the
-                // request carried is reported on `ResourceId`.
+                // The notification-configuration surface states an event type it holds
+                // nothing for with the BARE exception: the status and the error code alone,
+                // carrying none of the shape's optional members.
                 GetNotificationConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::notification_configuration_not_found_on_read(&input.event_type),
+                    crate::state::bare_resource_not_found(),
                 )
             })?;
 
