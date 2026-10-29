@@ -34780,10 +34780,34 @@ pub fn spot_fleet_request_id_malformed_message(request_id: &str) -> String {
     invalid_id_message(request_id)
 }
 
-/// The message EC2 refuses a Spot Fleet request id this account holds no fleet for with, and
-/// the one the per-fleet [`CANCEL_BATCH_FLEET_REQUEST_ID_DOES_NOT_EXIST`] carries.
+/// The message the per-fleet [`CANCEL_BATCH_FLEET_REQUEST_ID_DOES_NOT_EXIST`] carries: one
+/// fleet of a batch answer, named on its own.
+///
+/// A REQUEST-level refusal words the same fact differently, because it names every id the
+/// request could not resolve at once — see
+/// [`spot_fleet_request_ids_not_found_message`].
 pub fn spot_fleet_request_not_found_message(request_id: &str) -> String {
     format!("The spot fleet request ID '{request_id}' does not exist")
+}
+
+/// The message EC2 refuses a REQUEST that named Spot Fleet request ids this account holds no
+/// fleet for with: one sentence naming every unresolved id, in the order the request gave
+/// them, so an operation that takes one id and one that takes a list word it the same way.
+///
+/// Recorded in the wire corpus for a `DescribeSpotFleetInstances` naming a Spot Fleet request
+/// id of no fleet, which AWS answers
+/// `InvalidSpotFleetRequestId.NotFound` with. Each id is named through
+/// [`echoed_resource_id`], the one bound this crate puts on a refusal that quotes a value the
+/// caller chose.
+pub fn spot_fleet_request_ids_not_found_message(request_ids: &[&str]) -> String {
+    let named: Vec<String> = request_ids
+        .iter()
+        .map(|request_id| echoed_resource_id(request_id))
+        .collect();
+    format!(
+        "The SpotFleetRequestId(s) {} do not exist.",
+        named.join(", ")
+    )
 }
 
 /// The message the per-fleet [`CANCEL_BATCH_FLEET_REQUEST_NOT_IN_CANCELLABLE_STATE`] carries:
@@ -34803,14 +34827,52 @@ pub fn invalid_spot_fleet_request_id_malformed<E>(request_id: &str) -> Scaffolde
     )
 }
 
-/// Refuse a well-formed Spot Fleet request id this account holds no fleet for: HTTP 400
-/// [`INVALID_SPOT_FLEET_REQUEST_ID_NOT_FOUND`].
-pub fn invalid_spot_fleet_request_id_not_found<E>(request_id: &str) -> Scaffolded<E> {
+/// Refuse a request that named well-formed Spot Fleet request ids this account holds no fleet
+/// for: HTTP 400 [`INVALID_SPOT_FLEET_REQUEST_ID_NOT_FOUND`], naming every one of them
+/// ([`spot_fleet_request_ids_not_found_message`]).
+pub fn invalid_spot_fleet_request_ids_not_found<E>(request_ids: &[&str]) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_SPOT_FLEET_REQUEST_ID_NOT_FOUND,
         400,
-        spot_fleet_request_not_found_message(request_id),
+        spot_fleet_request_ids_not_found_message(request_ids),
     )
+}
+
+/// Refuse a well-formed Spot Fleet request id this account holds no fleet for: the
+/// request-level refusal [`invalid_spot_fleet_request_ids_not_found`] makes, for an operation
+/// that names ONE fleet.
+pub fn invalid_spot_fleet_request_id_not_found<E>(request_id: &str) -> Scaffolded<E> {
+    invalid_spot_fleet_request_ids_not_found(&[request_id])
+}
+
+/// Refuse `request_id` unless it is a well-formed Spot Fleet request id, BEFORE any lookup:
+/// the question "is this a Spot Fleet request id at all" is asked ahead of "does this account
+/// hold it", so "not an id of this kind" is never reported as "no such fleet".
+///
+/// A handler calls this to refuse a malformed id WITHOUT taking the state lock;
+/// [`require_known_spot_fleet_request`] asks it again, so the ordering holds even for a caller
+/// that goes straight to the lookup.
+pub fn require_well_formed_spot_fleet_request_id<E>(
+    request_id: &str,
+) -> Result<(), Scaffolded<E>> {
+    if spot_fleet_request_id_is_well_formed(request_id) {
+        return Ok(());
+    }
+    Err(invalid_spot_fleet_request_id_malformed(request_id))
+}
+
+/// The Spot Fleet request `request_id` names, refusing a malformed id first and an id this
+/// account holds no fleet for second — the order every named-resource lookup of this module
+/// establishes.
+pub fn require_known_spot_fleet_request<'a, E>(
+    store: &'a ComAmazonawsEc2Amazonec2State,
+    request_id: &str,
+) -> Result<&'a SpotFleetRequestRecord, Scaffolded<E>> {
+    require_well_formed_spot_fleet_request_id(request_id)?;
+    store
+        .spot_fleet_requests
+        .get(request_id)
+        .ok_or_else(|| invalid_spot_fleet_request_id_not_found(request_id))
 }
 
 /// The move the clock owes one Spot Fleet request: a [`ClockTransition`] to the `BatchState`
@@ -34991,6 +35053,41 @@ pub fn spot_fleet_has_running_instances(
                 .get(instance_id)
                 .is_some_and(|instance| instance.state != InstanceStateName::Terminated)
         })
+}
+
+/// The RUNNING instances of one Spot Fleet request, as the modelled
+/// [`ActiveInstance`](crate::ops::types::ActiveInstance) shape.
+///
+/// "Describes the running instances for the specified Spot Fleet"
+/// (`DescribeSpotFleetInstances`), so an instance the fleet placed that the instance store
+/// reports in any other state — one still `pending`, one `stopped`, one the account has
+/// terminated — is not an active instance, and one the store no longer holds at all is not one
+/// either.
+///
+/// Reached through the Spot Instance requests the fleet placed ([`spot_fleet_instance_ids`] is
+/// the same walk for the ids alone) and projected from the INSTANCE store by the one
+/// projection both kinds of fleet report through ([`active_instances`]), so the type reported
+/// for an instance here is the one `DescribeInstances` reports for it. The caller sees them in
+/// placement order; a report that pages puts them in id order itself.
+pub fn spot_fleet_active_instances<'a>(
+    store: &'a ComAmazonawsEc2Amazonec2State,
+    record: &'a SpotFleetRequestRecord,
+) -> Vec<crate::ops::types::ActiveInstance> {
+    active_instances(
+        store,
+        record.placements.iter().filter_map(|placement| {
+            let instance_id = store
+                .spot_instance_requests
+                .get(&placement.spot_instance_request_id)?
+                .view
+                .instance_id
+                .as_deref()?;
+            Some((
+                instance_id,
+                Some(placement.spot_instance_request_id.as_str()),
+            ))
+        }),
+    )
 }
 
 /// How many Spot Instances each pool of a Spot Fleet places to cover `spot_target` capacity
@@ -39431,6 +39528,35 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 }
 
+/// The instances `launched` names that are RUNNING, as the modelled
+/// [`ActiveInstance`](crate::ops::types::ActiveInstance) shape.
+///
+/// `launched` names each instance a fleet placed, with the Spot Instance request it was placed
+/// through when it was placed through one. The ONE projection of an active instance, so an EC2
+/// Fleet ([`fleet_active_instances`]) and a Spot Fleet request
+/// ([`spot_fleet_active_instances`]) cannot report one instance two ways: "the running
+/// instances" are the ones the INSTANCE store holds in `running`, with the type that store
+/// holds for them, and an instance it no longer holds is not reported at all.
+pub fn active_instances<'a>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    launched: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+) -> Vec<crate::ops::types::ActiveInstance> {
+    launched
+        .into_iter()
+        .filter_map(|(instance_id, spot_instance_request_id)| {
+            let instance = store.instances.get(instance_id)?;
+            (instance.state == InstanceStateName::Running).then(|| {
+                crate::ops::types::ActiveInstance {
+                    instance_id: Some(instance.instance_id.clone()),
+                    instance_type: Some(instance.instance_type.clone()),
+                    spot_instance_request_id: spot_instance_request_id.map(str::to_string),
+                    instance_health: Some(INSTANCE_HEALTH_HEALTHY.to_string()),
+                }
+            })
+        })
+        .collect()
+}
+
 /// The running instances of `record`, as the modelled
 /// [`ActiveInstance`](crate::ops::types::ActiveInstance) shape.
 ///
@@ -39447,21 +39573,15 @@ pub fn fleet_active_instances(
     store: &ComAmazonawsEc2Amazonec2State,
     record: &FleetRecord,
 ) -> Vec<crate::ops::types::ActiveInstance> {
-    record
-        .instances
-        .iter()
-        .filter_map(|launched| {
-            let instance = store.instances.get(&launched.instance_id)?;
-            (instance.state == InstanceStateName::Running).then(|| {
-                crate::ops::types::ActiveInstance {
-                    instance_id: Some(instance.instance_id.clone()),
-                    instance_type: Some(instance.instance_type.clone()),
-                    spot_instance_request_id: launched.spot_instance_request_id.clone(),
-                    instance_health: Some(INSTANCE_HEALTH_HEALTHY.to_string()),
-                }
-            })
-        })
-        .collect()
+    active_instances(
+        store,
+        record.instances.iter().map(|launched| {
+            (
+                launched.instance_id.as_str(),
+                launched.spot_instance_request_id.as_deref(),
+            )
+        }),
+    )
 }
 
 /// Refuse a request that named something that is not an EC2 Fleet id: HTTP 400

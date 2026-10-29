@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSpotFleetInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSpotFleetInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSpotFleetInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the RUNNING instances of the one Spot Fleet request the call names,
+//! projected from [`crate::state`]'s instance store through the Spot Instance requests the
+//! fleet placed, and cut into `MaxResults`-sized pages in `InstanceId` order. It reports the
+//! instances as the instance store holds them, so this operation and `DescribeInstances`
+//! cannot describe one instance differently. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +140,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSpotFleetInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSpotFleetInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSpotFleetInstances"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            MAX_PAGE_SIZE, decode_page_token, encode_page_token, invalid_pagination_token_for,
+            require_known_spot_fleet_request, require_service_state,
+            require_well_formed_spot_fleet_request_id, spot_fleet_active_instances,
+        };
+
+        // `ctx` carries request metadata only; the store holds Spot Fleet requests and the
+        // instances they placed per account, so the Region a request was signed for does not
+        // narrow them. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The ID of the Spot Fleet request"
+        // (`DescribeSpotFleetInstancesRequest$SpotFleetRequestId`): something that is not a
+        // Spot Fleet request id at all is refused BEFORE any lookup, so a caller can tell a
+        // typo from a fleet the account does not hold. The lookup below asks the same question
+        // again through [`require_known_spot_fleet_request`], so neither path can skip it.
+        require_well_formed_spot_fleet_request_id(&input.spot_fleet_request_id)?;
+
+        // `MaxResults` targets `DescribeSpotFleetInstancesMaxResults`, whose modelled `@range`
+        // is 1..1000, so a page size outside it is already refused before this handler runs
+        // and the only thing left to do with one is read it as a page size.
+
+        // "The token to include in another request to get the next page of items"
+        // (`DescribeSpotFleetInstancesRequest$NextToken`) — anything else is refused rather
+        // than read as an instance id.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The clock first: a Spot Instance request whose fulfillment has fallen due has
+        // already launched its instance, and an instance whose `pending` -> `running` move has
+        // fallen due is already `running`, so which of the fleet's instances are RUNNING is
+        // asked of the states they are ACTUALLY in. Each move was owed at this instant whether
+        // or not anybody called, so this read changes nothing a later caller would not have
+        // seen anyway.
+        store.materialize_due_transitions();
+
+        // "The ID of the Spot Fleet request": an id that names no fleet of the account is an
+        // error, not an empty report.
+        let record = require_known_spot_fleet_request(&store, &input.spot_fleet_request_id)?;
+
+        // DryRun sits AFTER every parameter has been validated and the named fleet resolved:
+        // the flag asks whether the request WOULD have succeeded, so one that would have been
+        // refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "The running instances" (`DescribeSpotFleetInstancesResponse$ActiveInstances`),
+        // projected from the instance store so the type reported here is the one
+        // `DescribeInstances` reports for the same instance.
+        let mut selected = spot_fleet_active_instances(&store, record);
+        let spot_fleet_request_id = record.spot_fleet_request_id().to_string();
+
+        // Page in `InstanceId` order, which the cursor below names a position in: an instance
+        // id is the one value every active instance carries, so it is what a token can name.
+        selected.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected
+                .partition_point(|active| {
+                    active.instance_id.as_deref().unwrap_or_default() < cursor
+                }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // A request that names no page size gets the largest page this service serves, so the
+        // `NextToken` path behaves the same whether or not a page size was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // A token only when an instance follows this page: "this value is null when there are
+        // no more items to return" (`DescribeSpotFleetInstancesResponse$NextToken`). The id is
+        // read the way the cursor comparison above reads it, so a token is issued whenever an
+        // instance follows, rather than the report being truncated without one.
+        let next_token = page
+            .get(limit)
+            .map(|active| encode_page_token(active.instance_id.as_deref().unwrap_or_default()));
+
+        Ok(DescribeSpotFleetInstancesOutput {
+            active_instances: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+            // "The ID of the Spot Fleet request"
+            // (`DescribeSpotFleetInstancesResponse$SpotFleetRequestId`): the fleet the report
+            // is of, as the store holds it.
+            spot_fleet_request_id: Some(spot_fleet_request_id),
+        })
     }
 }

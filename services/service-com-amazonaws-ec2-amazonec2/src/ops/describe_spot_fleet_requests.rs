@@ -142,7 +142,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             MAX_PAGE_SIZE, MAX_RESOURCE_IDS, decode_page_token, encode_page_token,
             invalid_pagination_token_for, invalid_spot_fleet_request_id_malformed,
-            invalid_spot_fleet_request_id_not_found, require_service_state,
+            invalid_spot_fleet_request_ids_not_found, require_service_state,
             spot_fleet_request_id_is_well_formed,
         };
 
@@ -203,12 +203,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The IDs of the Spot Fleet requests" names fleets to report, so a well-formed id no
         // fleet of the account has is an error rather than an absent row — the answer this
-        // service gives for every named-resource describe.
-        if let Some(unknown) = requested_ids
+        // service gives for every named-resource describe. The refusal names EVERY id that
+        // could not be resolved, in the order the request gave them, rather than stopping at
+        // the first.
+        let unknown: Vec<&str> = requested_ids
             .iter()
-            .find(|request_id| !store.spot_fleet_requests.contains_key(request_id.as_str()))
-        {
-            return Err(invalid_spot_fleet_request_id_not_found(unknown));
+            .map(String::as_str)
+            .filter(|request_id| !store.spot_fleet_requests.contains_key(*request_id))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(invalid_spot_fleet_request_ids_not_found(&unknown));
         }
 
         // DryRun sits AFTER every parameter has been validated and every named fleet resolved:

@@ -635,6 +635,9 @@ mod security_groups;
 mod snapshot_block_public_access;
 #[path = "all/spot_datafeed_subscription.rs"]
 mod spot_datafeed_subscription;
+// The running instances `DescribeSpotFleetInstances` reports for one Spot Fleet request.
+#[path = "all/spot_fleet_instances.rs"]
+mod spot_fleet_instances;
 // What `CancelSpotFleetRequests` does to one Spot Fleet request and the Spot Instance requests
 // it placed, and what it reports per fleet.
 #[path = "all/spot_fleet_request_cancellation.rs"]
