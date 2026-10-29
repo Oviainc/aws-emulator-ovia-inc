@@ -16,7 +16,8 @@
 //! `componentPath` its create addressed it by. A component's SCHEMA is resolved
 //! against the component type it instantiates: every property and property
 //! group that type (or a type it extends) defines is reported on the component,
-//! marked `isInherited` unless the entity declared it inline, and `definedIn`
+//! marked `isInherited` because it reaches the component through that type
+//! whether or not the entity also restated it, and `definedIn`
 //! names the component type the inherited definition set came from.
 //! The `status.error` structure and the `description` string are
 //! reported PRESENT-but-empty for an entity that carries no error and no
@@ -401,8 +402,9 @@ fn composite_component_summary(
 /// property says the same thing here as it does through `ListProperties` and
 /// `GetPropertyValue`: the definition that gives the property its meaning —
 /// the component's own where it declared one, else the one it inherits from the
-/// component type it instantiates, marked `isInherited` when it is the latter
-/// ([`crate::state::property_definition_is_inherited`]) — the value the
+/// component type it instantiates, marked `isInherited` whenever the type it
+/// instantiates or a type that type extends declares the property
+/// ([`crate::state::Workspace::property_definition_is_inherited`]) — the value the
 /// property reads as ([`crate::state::latest_property_value`]), and whether
 /// every value of a list- or map-typed one was reported
 /// ([`crate::state::all_property_values_returned`]).
@@ -420,7 +422,7 @@ fn property_response(
         definition: definition.as_ref().and_then(|definition| {
             crate::state::property_definition_response(
                 definition,
-                crate::state::property_definition_is_inherited(properties, property_name),
+                workspace.property_definition_is_inherited(component_type_id, property_name),
             )
         }),
         are_all_property_values_returned: Some(crate::state::all_property_values_returned(

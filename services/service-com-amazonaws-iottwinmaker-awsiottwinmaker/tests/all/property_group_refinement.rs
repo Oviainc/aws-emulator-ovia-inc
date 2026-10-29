@@ -104,8 +104,10 @@ struct Case {
     group_type: &'static str,
     /// The `propertyNames` the reader has to report, in order.
     property_names: Vec<&'static str>,
-    /// Whether the reported group is inherited: a group the component declares
-    /// itself is its own, even where it only refines the inherited one.
+    /// Whether the reported group is inherited: a group the component type the
+    /// component instantiates — or a type that type extends — declares reaches
+    /// the component through that type, whether or not the component also
+    /// restates it; a group only the component declares is its own.
     is_inherited: bool,
 }
 
@@ -122,7 +124,7 @@ fn cases() -> Vec<Case> {
             group_name: GROUP,
             group_type: "TABULAR",
             property_names: vec!["Serial", "Tag"],
-            is_inherited: false,
+            is_inherited: true,
         },
         Case {
             what: "restatingOnlyTheNamesSetsThemAndKeepsTheInheritedGroupType",
@@ -134,7 +136,7 @@ fn cases() -> Vec<Case> {
             group_name: GROUP,
             group_type: "TABULAR",
             property_names: vec!["Pressure"],
-            is_inherited: false,
+            is_inherited: true,
         },
         Case {
             what: "restatingBothMembersReplacesBoth",
@@ -146,7 +148,7 @@ fn cases() -> Vec<Case> {
             group_name: GROUP,
             group_type: "TABULAR",
             property_names: vec!["Pressure", "Serial"],
-            is_inherited: false,
+            is_inherited: true,
         },
         Case {
             what: "restatingNothingReportsTheTypesGroupWhole",
@@ -167,7 +169,7 @@ fn cases() -> Vec<Case> {
             group_name: GROUP,
             group_type: "TABULAR",
             property_names: vec!["Serial", "Tag"],
-            is_inherited: false,
+            is_inherited: true,
         },
         Case {
             what: "aTypeThatRestatesOnlyTheGroupTypeStillGivesItsInstanceTheNames",

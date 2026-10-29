@@ -383,9 +383,11 @@ fn component_at_path<'a>(
 /// property says the same thing here as it does through `GetEntity` and
 /// `GetPropertyValue`: the definition that gives the property its meaning —
 /// the component's own, else the one it inherits from the component type it
-/// instantiates, marked `isInherited` when it is the latter — the value the
-/// property reads as, and whether every value of a list- or map-typed one was
-/// reported.
+/// instantiates, marked `isInherited` whenever the type it instantiates or a
+/// type that type extends declares the property
+/// ([`crate::state::Workspace::property_definition_is_inherited`]) — the value
+/// the property reads as, and whether every value of a list- or map-typed one
+/// was reported.
 fn property_summary(
     workspace: &crate::state::Workspace,
     component: &AddressedComponent<'_>,
@@ -404,10 +406,8 @@ fn property_summary(
         definition: definition.as_ref().and_then(|definition| {
             crate::state::property_definition_response(
                 definition,
-                crate::state::property_definition_is_inherited(
-                    component.properties,
-                    &property_name,
-                ),
+                workspace
+                    .property_definition_is_inherited(component.component_type_id, &property_name),
             )
         }),
         property_name,

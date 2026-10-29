@@ -6,8 +6,9 @@
 //! component effectively has — every property and property group the component
 //! type it instantiates, or a type that type extends, defines, merged under the
 //! ones the entity declared inline — with each one marked `isInherited` exactly
-//! when it reached the component through its component type rather than being
-//! declared on the entity, and `definedIn` naming the component type the
+//! when the component type it instantiates, or a type that type extends,
+//! declares it (whether or not the entity also restated it), and `definedIn`
+//! naming the component type the
 //! inherited definition set came from (absent when nothing was resolved). Every
 //! reader of a component answers alike: `GetEntity`, `ListComponents` and
 //! `ListProperties`.
@@ -91,7 +92,7 @@ async fn seed(emulator: &Emulator) {
 
 /// One property the component must report: its name, the `dataType.type` the
 /// reported definition has to carry, and whether the definition is INHERITED —
-/// i.e. whether the entity declared it inline.
+/// i.e. whether the component's inheritance chain declares the property.
 type ExpectedProperty = (&'static str, &'static str, bool);
 
 /// One case of the rule: the component the entity's create carries, and the
@@ -152,8 +153,8 @@ fn cases() -> Vec<Case> {
                     "Readings": {"groupType": "TABULAR", "propertyNames": ["Serial"]},
                 },
             }),
-            properties: vec![("Serial", "LONG", false), ("Tag", "STRING", true)],
-            groups: vec![("Readings", false)],
+            properties: vec![("Serial", "LONG", true), ("Tag", "STRING", true)],
+            groups: vec![("Readings", true)],
             defined_in: Some(BASE),
         },
         Case {
@@ -244,7 +245,7 @@ fn reported_groups(component: &Value) -> BTreeMap<String, Option<bool>> {
 /// RULE: `GetEntity` reports every property and property group the component
 /// effectively has — the entity's own declarations merged over the ones its
 /// component type (or a type that type extends) defines — each marked
-/// `isInherited` exactly when it came from the type, and `definedIn` names the
+/// `isInherited` exactly when that chain declares it, and `definedIn` names the
 /// component type the inherited definition set came from.
 #[tokio::test]
 async fn a_component_reports_the_whole_schema_of_the_type_it_instantiates() {

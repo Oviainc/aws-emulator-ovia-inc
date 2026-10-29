@@ -26,6 +26,9 @@ mod component_listing;
 #[path = "all/component_path_resolution.rs"]
 mod component_path_resolution;
 
+#[path = "all/component_refined_definition.rs"]
+mod component_refined_definition;
+
 #[path = "all/component_type_create_references.rs"]
 mod component_type_create_references;
 

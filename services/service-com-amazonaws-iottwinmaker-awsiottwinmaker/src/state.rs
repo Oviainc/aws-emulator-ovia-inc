@@ -1629,6 +1629,76 @@ impl Workspace {
         ))
     }
 
+    /// Whether some component type the component's `component_type_id` reaches
+    /// — the type itself or one it extends — declares an entry named `name` in
+    /// the part of its schema `keyed` selects.
+    ///
+    /// The one test both of a component's `isInherited` flags
+    /// ([`property_definition_is_inherited`](Self::property_definition_is_inherited),
+    /// [`property_group_is_inherited`](Self::property_group_is_inherited)) are
+    /// decided by, so a definition and a group answer the question the same way,
+    /// over the same walk every reader of inherited structure shares
+    /// ([`component_type_chain`](Self::component_type_chain)). `false` when the
+    /// component instantiates no component type, or names one this workspace
+    /// does not hold: then nothing reaches it through a type.
+    fn component_type_chain_declares<Entry>(
+        &self,
+        component_type_id: Option<&str>,
+        name: &str,
+        keyed: impl Fn(&ComponentType) -> &BTreeMap<String, Entry>,
+    ) -> bool {
+        component_type_id.is_some_and(|component_type_id| {
+            self.component_type_chain(component_type_id)
+                .iter()
+                .any(|component_type| keyed(component_type).contains_key(name))
+        })
+    }
+
+    /// Whether the definition
+    /// [`effective_property_definition`](Self::effective_property_definition)
+    /// resolves for `property_name` is INHERITED: the component type the
+    /// component instantiates, or a component type that type extends, declares
+    /// the property, so the definition reaches the component through the type it
+    /// instantiates whether or not the component's own record also REFINES it.
+    ///
+    /// A component's own declaration need not REPLACE the inherited definition:
+    /// every member of `PropertyDefinitionRequest` is optional, so a declaration
+    /// can restate only the members it changes and the definition reported then
+    /// carries the inherited values of every member it left alone
+    /// ([`refined_property_definition`]). `isInherited` reports where the
+    /// reported definition comes from, and for such a refinement it still comes
+    /// through the inheritance chain — the same rule `GetComponentType` applies
+    /// to a component type that refines a definition its `extendsFrom` chain
+    /// declares. A property no component type on the chain declares is the
+    /// component's own and nothing else's; one whose record carries a value but
+    /// no definition is the type's, the value being the component's.
+    pub fn property_definition_is_inherited(
+        &self,
+        component_type_id: Option<&str>,
+        property_name: &str,
+    ) -> bool {
+        self.component_type_chain_declares(component_type_id, property_name, |component_type| {
+            &component_type.property_definitions
+        })
+    }
+
+    /// Whether the group
+    /// [`effective_property_group`](Self::effective_property_group) resolves for
+    /// `group_name` is INHERITED — the same question
+    /// [`property_definition_is_inherited`](Self::property_definition_is_inherited)
+    /// answers for a definition, asked of a component's property groups, and
+    /// answered by the same test: a group the inheritance chain declares is
+    /// inherited whether or not the component also refines it.
+    pub fn property_group_is_inherited(
+        &self,
+        component_type_id: Option<&str>,
+        group_name: &str,
+    ) -> bool {
+        self.component_type_chain_declares(component_type_id, group_name, |component_type| {
+            &component_type.property_groups
+        })
+    }
+
     /// Every property a component HAS: the ones it stores itself, plus the ones
     /// the component type it instantiates — or a type that type extends —
     /// defines and it never restated.
@@ -2426,10 +2496,11 @@ pub const TABULAR_GROUP_TYPE: &str = "TABULAR";
 /// group stored without one reports [`TABULAR_GROUP_TYPE`].
 ///
 /// `is_inherited` is what the caller resolved the group through
-/// ([`property_group_is_inherited`]): a group the component declares itself is
-/// its own, and one that reaches it only because of the component type it
-/// instantiates is inherited. A component TYPE's own groups are a different
-/// modelled shape (`PropertyGroupResponse`), which `GetComponentType` builds.
+/// ([`Workspace::property_group_is_inherited`]): a group that reaches the
+/// component through the component type it instantiates is inherited, and one
+/// no component type on that chain declares is the component's own. A component
+/// TYPE's own groups are a different modelled shape (`PropertyGroupResponse`),
+/// which `GetComponentType` builds.
 pub fn component_property_group_response(
     group: &PropertyGroupRecord,
     is_inherited: bool,
@@ -2469,41 +2540,11 @@ pub fn component_property_groups_response(
                 workspace.effective_property_group(component_type_id, property_groups, &group_name)?;
             let response = component_property_group_response(
                 &group,
-                property_group_is_inherited(property_groups, &group_name),
+                workspace.property_group_is_inherited(component_type_id, &group_name),
             );
             Some((group_name, response))
         })
         .collect()
-}
-
-/// Whether the definition [`Workspace::effective_property_definition`] resolves
-/// for `property_name` is INHERITED: it came from the component type the
-/// component instantiates rather than from the component itself.
-///
-/// A component's own record carries a definition only for a property its
-/// entity's create or update DECLARED inline; every other property of the
-/// component reaches it through the component type, which is exactly what
-/// `isInherited` reports. A property record that carries a value but no
-/// definition is one of those: the value is the component's, the definition
-/// giving it meaning is the type's.
-pub fn property_definition_is_inherited(
-    properties: &BTreeMap<String, PropertyRecord>,
-    property_name: &str,
-) -> bool {
-    properties
-        .get(property_name)
-        .is_none_or(|property| property.definition.is_none())
-}
-
-/// Whether the group [`Workspace::effective_property_group`] resolves for
-/// `group_name` is INHERITED — the same question
-/// [`property_definition_is_inherited`] answers for a definition, asked of a
-/// component's property groups.
-pub fn property_group_is_inherited(
-    property_groups: &BTreeMap<String, PropertyGroupRecord>,
-    group_name: &str,
-) -> bool {
-    !property_groups.contains_key(group_name)
 }
 
 /// Whether storing this property definition would leave a component type that
@@ -3139,9 +3180,10 @@ pub fn refined_property_group<'a>(
 /// does not define.
 ///
 /// `is_inherited` is what the caller resolved this definition through: a
-/// definition the component or component type declared itself is its own, and
-/// one that reaches a component only because of the component type it
-/// instantiates is inherited ([`property_definition_is_inherited`]). Nothing
+/// definition that reaches the component or component type through its
+/// inheritance is inherited whether or not the reader also refines it, and one
+/// nothing on that chain declares is its own
+/// ([`Workspace::property_definition_is_inherited`]). Nothing
 /// imports or finalises a definition yet: `isImported` and `isFinal` describe a
 /// definition projected from an external data store and one that cannot be
 /// updated, neither of which this service produces.
