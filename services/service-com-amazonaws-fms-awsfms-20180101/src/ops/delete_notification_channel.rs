@@ -5,7 +5,8 @@
 //! Removes the SNS notification channel `PutNotificationChannel` designated, so
 //! `GetNotificationChannel` no longer reports one. A MUTATING operation: there
 //! is ONE channel per account/Region and this request names nothing, so the
-//! channel it removes is that one.
+//! channel it removes is the one the Region it is signed for designated — and
+//! every other Region's channel is left exactly as it was.
 //!
 //! The channel is a resource of this service like any other, so a delete that
 //! finds none to remove is the modelled `ResourceNotFoundException` — the same
@@ -167,8 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // `DeleteNotificationChannel` takes no members: the channel it removes is
-        // the one the account/Region has.
+        // the one the account/Region has, so the Region the request was signed
+        // for is what selects it.
         let _ = &input;
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteNotificationChannelErrorModeled::InternalErrorException(
                 InternalErrorException {
@@ -180,14 +183,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         // The authorization gate, BEFORE the channel is looked up or touched.
-        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+        crate::state::require_administrator(&store, &region)?;
 
-        // Taking the channel out of the store IS the delete: that record is the
-        // only copy, so a following `GetNotificationChannel` finds nothing. With
-        // no channel stored there is no channel resource to remove, which is
-        // `ResourceNotFoundException` — and `take()` on an empty slot leaves the
-        // store untouched, so the refusal writes nothing.
-        if store.notification_channel.take().is_none() {
+        // Taking this Region's channel out of the store IS the delete: that
+        // record is the only copy, so a following `GetNotificationChannel` in the
+        // same Region finds nothing while another Region's channel is untouched.
+        // With no channel stored for the Region there is no channel resource to
+        // remove, which is `ResourceNotFoundException` — and removing an absent
+        // key leaves the store untouched, so the refusal writes nothing.
+        if store.notification_channels.remove(&region).is_none() {
             return Err(
                 DeleteNotificationChannelErrorModeled::ResourceNotFoundException(
                     crate::state::resource_not_found(),

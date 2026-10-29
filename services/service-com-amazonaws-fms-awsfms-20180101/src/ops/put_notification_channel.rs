@@ -4,8 +4,11 @@
 //!
 //! Designates the SNS topic and the IAM role Firewall Manager records its logs
 //! through, which `GetNotificationChannel` reads back. A MUTATING operation:
-//! there is ONE channel per account/Region, so a second call replaces the first
-//! rather than adding a second channel.
+//! there is ONE channel per account/Region, so a second call in the SAME Region
+//! replaces the first rather than adding a second channel, while a call in
+//! another Region designates that Region's own channel and leaves this one as it
+//! was. The request models no member that could name a channel, so the Region it
+//! is signed for is what selects the one it writes.
 //!
 //! Administrator-gated, like every organisation-scoped Firewall Manager
 //! operation: with no Firewall Manager default administrator association in this
@@ -13,6 +16,12 @@
 //! [`crate::state::require_administrator`] BEFORE anything is stored, so a
 //! refused call leaves NO channel behind and a following
 //! `GetNotificationChannel` is refused identically.
+//!
+//! The number of Regions that may each hold a channel is bounded
+//! ([`MAX_NOTIFICATION_CHANNEL_REGIONS`]), so the per-Region store cannot grow
+//! with the number of distinct Regions a caller signs for; a designation that
+//! replaces an existing Region's channel adds no record and is never refused by
+//! that bound.
 //!
 //! ## Shape of an operation
 //!
@@ -138,6 +147,26 @@ impl From<PutNotificationChannelErrorModeled> for PutNotificationChannelError {
     }
 }
 
+/// The number of Regions of this account that may hold a notification channel
+/// before this service refuses to designate another.
+///
+/// An EMULATOR-CHOSEN bound, not an AWS-documented quota: Firewall Manager
+/// publishes no limit on how many Regions may each designate a channel — the
+/// real service's limit is the number of Regions the account has enabled. It is
+/// deliberately larger than the number of Regions AWS operates, so no caller
+/// addressing real Regions can reach it, and it is what keeps a store keyed by a
+/// value read out of the request ([`crate::state::request_region`]) from growing
+/// with the number of distinct Regions a caller signs for. The same bound every
+/// other store in this crate carries (`put_policy`, `put_resource_set`,
+/// `put_apps_list`, `put_protocols_list`, `put_admin_account`).
+///
+/// A designation in a Region that ALREADY holds a channel replaces it and is
+/// never refused: it adds no entry.
+///
+/// `pub` so this crate's test suite asserts the bound the handler enforces
+/// rather than a second copy of the number.
+pub const MAX_NOTIFICATION_CHANNEL_REGIONS: usize = 64;
+
 /// The `PutNotificationChannel` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -183,9 +212,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The Region the request was signed for is what says WHICH channel this
+        // call designates: the request models no member that could select one.
+        let region = crate::state::request_region(ctx.parts());
+
         let mut store = state.lock();
         // The authorization gate, BEFORE the payload is stored.
-        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+        crate::state::require_administrator(&store, &region)?;
+
+        // A channel in a Region that holds none is a new record, so it is what
+        // the store's bound weighs; replacing the channel of a Region that
+        // already holds one adds nothing and is never refused. The refusal is
+        // `InvalidOperationException` because that is the error this operation
+        // models for a request it cannot carry out (`LimitExceededException` is
+        // not in its modelled error set).
+        if !store.notification_channels.contains_key(&region)
+            && store.notification_channels.len() >= MAX_NOTIFICATION_CHANNEL_REGIONS
+        {
+            return Err(PutNotificationChannelErrorModeled::InvalidOperationException(
+                InvalidOperationException {
+                    message: Some(format!(
+                        "the maximum of {MAX_NOTIFICATION_CHANNEL_REGIONS} Regions of account {} \
+                         already have a Firewall Manager notification channel designated",
+                        ::engine::emulator_account_id()
+                    )),
+                },
+            )
+            .into());
+        }
 
         // Both members are modelled `ResourceArn`s and are stored exactly as the
         // caller sent them: Firewall Manager's own checks on them (that the topic
@@ -193,11 +247,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // fms.amazonaws.com) are about resources of OTHER services, which this
         // emulator does not hold, so there is nothing here to validate beyond the
         // modelled length and pattern the boundary already enforced.
-        store.notification_channel = Some(crate::state::NotificationChannelRecord {
-            sns_topic_arn: input.sns_topic_arn.clone(),
-            sns_role_name: input.sns_role_name.clone(),
-            configured_at: ::std::time::SystemTime::now(),
-        });
+        //
+        // The insert replaces the channel of THIS Region only, so a second call
+        // in another Region designates that Region's own channel instead of
+        // overwriting this one.
+        store.notification_channels.insert(
+            region,
+            crate::state::NotificationChannelRecord {
+                sns_topic_arn: input.sns_topic_arn.clone(),
+                sns_role_name: input.sns_role_name.clone(),
+                configured_at: ::std::time::SystemTime::now(),
+            },
+        );
         Ok(PutNotificationChannelOutput)
     }
 }

@@ -2,8 +2,9 @@
 
 //! @op GetNotificationChannel
 //!
-//! Reports the SNS notification channel `PutNotificationChannel` persisted. A
-//! REPORTING operation: it writes nothing.
+//! Reports the SNS notification channel `PutNotificationChannel` persisted for
+//! the Region the request is signed for. A REPORTING operation: it writes
+//! nothing.
 //!
 //! Administrator-gated, like every organisation-scoped Firewall Manager
 //! operation: with no Firewall Manager default administrator association in this
@@ -11,7 +12,8 @@
 //! BEFORE the channel is looked up, so the refusal says the same thing whether or
 //! not a channel is configured. With an administrator associated and no channel
 //! configured there is no channel resource to report, which is
-//! `ResourceNotFoundException`.
+//! `ResourceNotFoundException` — which is also what a Region that designated no
+//! channel of its own answers, however many other Regions have one.
 //!
 //! ## Shape of an operation
 //!
@@ -147,8 +149,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // `GetNotificationChannel` takes no members: the channel is the one the
-        // account/Region has.
+        // account/Region has, so the Region the request was signed for is what
+        // selects it.
         let _ = &input;
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetNotificationChannelErrorModeled::InternalErrorException(
                 InternalErrorException {
@@ -160,9 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         // The authorization gate, BEFORE the channel is read.
-        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+        crate::state::require_administrator(&store, &region)?;
 
-        let Some(channel) = store.notification_channel.as_ref() else {
+        let Some(channel) = store.notification_channels.get(&region) else {
             return Err(
                 GetNotificationChannelErrorModeled::ResourceNotFoundException(
                     crate::state::resource_not_found(),

@@ -419,7 +419,7 @@ async fn a_refused_gated_call_leaves_no_state_behind() {
                 && store.apps_lists.is_empty()
                 && store.protocols_lists.is_empty()
                 && store.policies.is_empty()
-                && store.notification_channel.is_none()
+                && store.notification_channels.is_empty()
                 && store.third_party_firewalls.is_empty(),
             "a refused gated call must write nothing, store holds {store:?}"
         );

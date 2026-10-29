@@ -23,8 +23,9 @@ use crate::ops::types::{
     ViolationDetail,
 };
 
-/// The Region an emulated service reports when the request carries no SigV4
-/// credential scope to read one from (an unsigned request).
+/// The Region an emulated service reports when the request names none to read:
+/// an unsigned request, or one whose SigV4 credential scope carries a Region
+/// that is not a Region name ([`is_region_name`]).
 const DEFAULT_REGION: &str = "us-east-1";
 
 /// The ARN namespace / signing name of this service, per its Smithy model
@@ -533,7 +534,16 @@ impl PolicyRecord {
 
 /// The Firewall Manager SNS notification channel: the topic Firewall Manager
 /// records its activity to, and the role that lets it publish there. ONE per
-/// account/Region, which is why it is an `Option` rather than a map.
+/// account/Region, which is why it is held in a map keyed by Region
+/// ([`ComAmazonawsFmsAwsfms20180101State::notification_channels`]) rather than
+/// in a single slot: an `Option` could only ever hold one channel for the whole
+/// account.
+///
+/// The record carries no `region` member — unlike [`PolicyRecord::region`] and
+/// [`ResourceSetRecord::region`], which belong to records keyed by an identifier
+/// the service minted — because the channel has no identifier of its own: the
+/// Region IS its key, so a field holding it could only be a second copy of the
+/// key that could drift from it.
 #[derive(Debug, Clone)]
 pub struct NotificationChannelRecord {
     pub sns_topic_arn: String,
@@ -1263,8 +1273,18 @@ pub struct ComAmazonawsFmsAwsfms20180101State {
     pub apps_lists: BTreeMap<String, AppsListRecord>,
     /// Stored protocols lists, keyed by `ListId`.
     pub protocols_lists: BTreeMap<String, ProtocolsListRecord>,
-    /// The single SNS notification channel, if one was configured.
-    pub notification_channel: Option<NotificationChannelRecord>,
+    /// The SNS notification channel each Region of this account has designated,
+    /// keyed by the Region the designating request was signed for
+    /// ([`request_region`]).
+    ///
+    /// Keyed by Region because the channel is a REGIONAL configuration and its
+    /// three operations model no member that could select one: the Region the
+    /// request is signed for is the only thing that says which channel the call
+    /// acts on, so a Region that designated nothing must hold nothing — and a
+    /// write or a delete in one Region must leave every other Region's channel
+    /// alone. A `BTreeMap` for the same reason as [`Self::policies`]: the keys
+    /// are in a total order.
+    pub notification_channels: BTreeMap<String, NotificationChannelRecord>,
     /// The third-party firewall associations, keyed by the `ThirdPartyFirewall`
     /// enum value. An absent entry is `NOT_EXIST`, not an error.
     pub third_party_firewalls: BTreeMap<String, ThirdPartyFirewallRecord>,
@@ -2760,12 +2780,48 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsFmsAwsfms20180101State>)
 }
 
+/// The longest Region name [`is_region_name`] accepts.
+///
+/// An EMULATOR-CHOSEN bound, generous against the Region names AWS publishes:
+/// the longest of them (`ap-southeast-7`, `us-gov-east-1`) is half this. It is
+/// what keeps the Region a request addresses — a value read out of the request's
+/// own credential scope, and so a value its sender chooses — from sizing
+/// anything the service derives from it: the Region segment of a minted ARN, a
+/// refusal's message, and the key a per-Region record is held under
+/// ([`ComAmazonawsFmsAwsfms20180101State::notification_channels`]).
+const MAX_REGION_NAME_LEN: usize = 32;
+
+/// Whether `value` has the form of an AWS Region name: lowercase letters, digits
+/// and hyphens, at most [`MAX_REGION_NAME_LEN`] of them.
+///
+/// Every Region this emulator can address has that form, and so does the Region
+/// segment of every ARN it mints, so a credential scope carrying anything else
+/// names no Region this service could answer for.
+fn is_region_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_REGION_NAME_LEN
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 /// The Region this request was signed for, which is the Region whose resources
 /// the request addresses — so it is the Region segment of any ARN the response
-/// carries. Falls back to [`DEFAULT_REGION`] for an unsigned request.
+/// carries. Falls back to [`DEFAULT_REGION`] for an unsigned request, and for a
+/// credential scope whose Region is not a Region name ([`is_region_name`]):
+/// such a scope addresses no Region this service serves, exactly as an unsigned
+/// request names none.
+///
+/// Reading a scope that names no Region as "no Region named" is deliberately the
+/// SAME reading as an unsigned request's, so two such scopes address the Region
+/// a request naming none addresses rather than each keying state of its own.
+/// Whether a presented scope may sign a request at all is the emulator's own
+/// check, ahead of every handler — a service never inspects a signature — so
+/// there is nothing here to refuse it with.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
+        .filter(|region| is_region_name(region))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 

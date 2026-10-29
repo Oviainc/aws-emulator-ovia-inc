@@ -37,7 +37,10 @@ use crate::policy_lifecycle::{call, call_in, emulator_with_engine, error_code, A
 
 /// A second Region to sign a request for, so the administrator refusal is
 /// asserted for more than one credential scope.
-const OTHER_REGION: &str = "eu-central-1";
+///
+/// `pub(crate)` so the cross-Region suite signs for the SAME second Region
+/// rather than naming one of its own.
+pub(crate) const OTHER_REGION: &str = "eu-central-1";
 
 /// The published upper bound of `com.amazonaws.fms#ResourceArn` (length 1..1024,
 /// pattern `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`), from
@@ -45,15 +48,18 @@ const OTHER_REGION: &str = "eu-central-1";
 const RESOURCE_ARN_MAX: usize = 1024;
 
 /// One row of the table: the pair of values a client designates.
-struct Case {
+///
+/// `pub(crate)` so the cross-Region suite designates the SAME class of values
+/// rather than inventing a second table.
+pub(crate) struct Case {
     /// Names the row in every assertion message.
-    name: String,
-    topic: String,
-    role: String,
+    pub(crate) name: String,
+    pub(crate) topic: String,
+    pub(crate) role: String,
 }
 
 /// The channel class the rules are asserted over.
-fn cases() -> Vec<Case> {
+pub(crate) fn cases() -> Vec<Case> {
     vec![
         Case {
             name: "service-linked role, topic in the signed Region".to_string(),
@@ -117,13 +123,20 @@ async fn delete_channel(router: &MultiServiceRouter) -> (u16, Value) {
     call(router, "DeleteNotificationChannel", &json!({})).await
 }
 
-/// The stored channel, as the pair of values it holds — read through the same
-/// seam a handler uses, so a wire assertion is backed by persisted state.
-fn stored_channel(engine: &std::sync::Arc<engine::InMemoryEngine>) -> Option<(String, String)> {
+/// The channel stored for `region`, as the pair of values it holds — read
+/// through the same seam a handler uses, so a wire assertion is backed by
+/// persisted state.
+///
+/// `pub(crate)` so the cross-Region suite reads the store through this one
+/// accessor rather than a second copy of it.
+pub(crate) fn stored_channel(
+    engine: &std::sync::Arc<engine::InMemoryEngine>,
+    region: &str,
+) -> Option<(String, String)> {
     with_store(engine, |store| {
         store
-            .notification_channel
-            .as_ref()
+            .notification_channels
+            .get(region)
             .map(|channel| (channel.sns_topic_arn.clone(), channel.sns_role_name.clone()))
     })
 }
@@ -159,7 +172,7 @@ async fn deleting_the_channel_removes_it_and_frees_the_slot() {
             "case {name:?}: expected DeleteNotificationChannel to answer 200, got {status} with \
              {body}"
         );
-        let stored = stored_channel(&engine);
+        let stored = stored_channel(&engine, REGION);
         assert_eq!(
             stored, None,
             "case {name:?}: the deleted channel must be gone from state, got {stored:?}"
@@ -182,7 +195,7 @@ async fn deleting_the_channel_removes_it_and_frees_the_slot() {
                 "case {name:?} attempt {attempt}: a channel cannot be deleted twice, got {status} \
                  with {body}"
             );
-            let stored = stored_channel(&engine);
+            let stored = stored_channel(&engine, REGION);
             assert_eq!(
                 stored, None,
                 "case {name:?} attempt {attempt}: a refused delete must write nothing, got \
@@ -198,7 +211,7 @@ async fn deleting_the_channel_removes_it_and_frees_the_slot() {
             "case {name:?}: the channel must be designatable again after a delete, got {status} \
              with {body}"
         );
-        let stored = stored_channel(&engine);
+        let stored = stored_channel(&engine, REGION);
         assert_eq!(
             stored,
             Some((case.role.clone(), case.topic.clone())),
@@ -209,7 +222,7 @@ async fn deleting_the_channel_removes_it_and_frees_the_slot() {
             status, 200,
             "case {name:?}: the re-designated channel must delete too, got {status} with {body}"
         );
-        let stored = stored_channel(&engine);
+        let stored = stored_channel(&engine, REGION);
         assert_eq!(
             stored, None,
             "case {name:?}: the re-designated channel must be gone after its delete, got \
@@ -241,7 +254,7 @@ async fn deleting_a_channel_that_was_never_designated_is_refused() {
         (400, "ResourceNotFoundException"),
         "deleting a channel that was never designated must be refused, got {status} with {body}"
     );
-    let stored = stored_channel(&engine);
+    let stored = stored_channel(&engine, REGION);
     assert_eq!(
         stored, None,
         "the refused delete must have written nothing, got {stored:?}"
@@ -277,11 +290,14 @@ async fn deleting_the_channel_is_administrator_gated() {
             // Seeded through the store, because designating a channel is gated
             // by the very association this case withholds.
             with_store(&engine, |store| {
-                store.notification_channel = Some(state::NotificationChannelRecord {
-                    sns_topic_arn: case.topic.clone(),
-                    sns_role_name: case.role.clone(),
-                    configured_at: SystemTime::now(),
-                });
+                store.notification_channels.insert(
+                    region.to_string(),
+                    state::NotificationChannelRecord {
+                        sns_topic_arn: case.topic.clone(),
+                        sns_role_name: case.role.clone(),
+                        configured_at: SystemTime::now(),
+                    },
+                );
             });
 
             let (status, body) =
@@ -291,7 +307,7 @@ async fn deleting_the_channel_is_administrator_gated() {
                 (400, "AccessDeniedException"),
                 "case {name:?}: an ungated delete must be refused, got {status} with {body}"
             );
-            let stored = stored_channel(&engine);
+            let stored = stored_channel(&engine, region);
             assert_eq!(
                 stored,
                 Some((case.topic.clone(), case.role.clone())),
@@ -307,7 +323,7 @@ async fn deleting_the_channel_is_administrator_gated() {
                 "case {name:?}: expected the gated delete to succeed once an administrator is \
                  associated, got {status} with {body}"
             );
-            let stored = stored_channel(&engine);
+            let stored = stored_channel(&engine, region);
             assert_eq!(
                 stored, None,
                 "case {name:?}: the channel must be gone after the delete, got {stored:?}"
@@ -333,7 +349,7 @@ async fn a_value_past_the_published_bound_designates_no_channel_to_delete() {
         "a SnsTopicArn of {} characters is past the published maximum, got {status} with {body}",
         too_long.chars().count()
     );
-    let stored = stored_channel(&engine);
+    let stored = stored_channel(&engine, REGION);
     assert_eq!(
         stored, None,
         "the refused designation must have stored no channel, got {stored:?}"
