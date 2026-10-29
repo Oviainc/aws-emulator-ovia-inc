@@ -219,10 +219,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.tags.unwrap_or_default().into_iter().collect();
         let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
             "Description": &input.description,
-            // The lenses as this request applies them: two requests whose lists differ
-            // only in naming one lens twice ask for the SAME template, so one token over
-            // both is a retry rather than a conflict.
-            "Lenses": &lenses,
+            // The lenses as this request applies them, each taken as the LENS it names
+            // rather than as the spelling it was named by
+            // (`crate::state::lens_identities`): two requests whose lists differ only in
+            // naming one lens twice, or in which spelling names one of them, ask for the
+            // SAME template, so one token over both is a retry rather than a conflict.
+            "Lenses": crate::state::lens_identities(&lenses),
             "Notes": &input.notes,
             "Tags": &tags,
             "TemplateName": &input.template_name,

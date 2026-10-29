@@ -27,6 +27,13 @@
 //!    minted instead of a second share or a conflict.
 //! 5. `CreateLensVersion` follows it too: the retry answers the version the original publish
 //!    recorded instead of a second version or a conflict.
+//! 6. `ImportLens` follows it for the lens an update imports over: the retry answers the
+//!    `LensArn` the original import updated instead of a conflict, and imports no second
+//!    lens — while the same token over a DIFFERENT document is still another request.
+//! 7. `CreateWorkload` follows it for the lenses it attaches: the retry naming one of them
+//!    the other way answers the `WorkloadId` the original create minted instead of a second
+//!    workload or a conflict.
+//! 8. `CreateReviewTemplate` follows it for the lenses it applies, the same way.
 //!
 //! Requests go through the real `MultiServiceRouter`, so routing, restJson1
 //! (de)serialization, boundary constraint validation and the handler all run as they do in
@@ -44,9 +51,12 @@ use super::custom_lens_import::{
 use super::custom_lens_versions::create_version;
 use super::lens_share_deletion::delete_share;
 use super::lens_shares::{create_share, created_share_id, stored_shares};
-use super::workload_harness::Client;
+use super::workload_harness::{
+    created_arn, created_id, minimal_create, minimal_template, official_lens_arn,
+    stored_lens_count, stored_template_count, stored_workload_count, Client, SIGNED_REGION,
+};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
 
@@ -74,6 +84,42 @@ const LENS_SPELLINGS: [&str; 3] = ["plain-arn", "version-pinned-arn", "bare-lens
 /// refuse with a 400 (rules 3 and 4 assert that refusal). `DeleteLensShare` takes all three
 /// spellings of [`LENS_SPELLINGS`], because it resolves the SHARE the lens holds.
 const ARN_SPELLINGS: [&str; 2] = ["plain-arn", "version-pinned-arn"];
+
+/// The alias of the AWS Well-Architected Framework lens, the Amazon Web Services official
+/// lens the operations that APPLY lenses are exercised with here.
+const FRAMEWORK_LENS: &str = "wellarchitected";
+
+/// The spellings that all name ONE Amazon Web Services official lens.
+///
+/// SOURCE: the `LensAlias` doc — "for Amazon Web Services official lenses, this is either
+/// the lens alias, such as `serverless`, or the lens ARN, such as
+/// `arn:aws:wellarchitected:us-east-1::lens/serverless`" — plus that ARN with a version
+/// pinned after it, the third form this crate resolves a lens by.
+const OFFICIAL_LENS_SPELLINGS: [&str; 3] = [
+    "bare-alias",
+    "official-arn",
+    "version-pinned-official-arn",
+];
+
+/// The version a version-pinned official lens ARN pins. It is a lens version string rather
+/// than one this emulator publishes, because what a row varies is the NAME the request
+/// spells the lens by.
+const OFFICIAL_LENS_VERSION: &str = "2024-10-03";
+
+/// The official lens `alias` written the way `spelling` names it.
+fn spelled_official(alias: &str, spelling: &str) -> String {
+    match spelling {
+        "bare-alias" => alias.to_string(),
+        "official-arn" => official_lens_arn(SIGNED_REGION, alias),
+        "version-pinned-official-arn" => {
+            format!(
+                "{}/{OFFICIAL_LENS_VERSION}",
+                official_lens_arn(SIGNED_REGION, alias)
+            )
+        }
+        other => panic!("unknown official lens spelling {other:?}"),
+    }
+}
 
 /// The lens `arn` written the way `spelling` names it.
 fn spelled(arn: &str, spelling: &str) -> String {
@@ -540,6 +586,188 @@ async fn a_version_create_retry_replays_under_every_spelling_of_the_same_lens() 
             stored_versions(&client, arn),
             vec![PUBLISHED_VERSION.to_string(), next_version.to_string()],
             "case {case:?}: the replay must publish no second version"
+        );
+    }
+}
+
+/// Rule 6. `ImportLens` keys its retry the same way for the lens an update imports OVER
+/// ("to update an existing custom lens, specify its ARN as the `LensAlias`"): however the
+/// landed update spelled that lens, a retry under the same token naming it the other way
+/// answers the lens the original import updated rather than a conflict, and imports no
+/// second lens. The same token over a DIFFERENT document is still another request under
+/// every spelling, so taking the lens as the lens it names does not flatten the fingerprint.
+#[tokio::test]
+async fn an_import_retry_replays_under_every_spelling_of_the_same_lens() {
+    let pairs = spelling_pairs(&ARN_SPELLINGS);
+
+    let client = Client::new();
+    let arns = published_lenses(&client, "import-update", pairs.len()).await;
+
+    for ((updated_as, retried_as), arn) in pairs.into_iter().zip(&arns) {
+        let case = format!("updated-{updated_as}-retried-{retried_as}");
+        let document = lens_document(
+            &format!("Updated-{case}-lens"),
+            Some("the document the update under test imports"),
+            &[("security", 2, 3)],
+        )
+        .to_string();
+        let token = format!("import-{case}");
+
+        let landed = import(
+            &client,
+            &document,
+            Some(&spelled(arn, updated_as)),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(
+            (landed.status, member(&landed, "LensArn")),
+            (200, arn.as_str()),
+            "case {case:?}: the update under test must land on the lens it names first, got \
+             {landed:?}"
+        );
+        let lenses_before = stored_lens_count(&client);
+
+        let retry = import(
+            &client,
+            &document,
+            Some(&spelled(arn, retried_as)),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(
+            (retry.status, retry.error_code.as_str()),
+            (200, ""),
+            "case {case:?}: both spellings name the same lens, so the retry must replay the \
+             landed import, got {retry:?}"
+        );
+        assert_eq!(
+            member(&retry, "LensArn"),
+            arn.as_str(),
+            "case {case:?}: the retry must answer the lens the original import updated, got \
+             {retry:?}"
+        );
+        assert_eq!(
+            stored_lens_count(&client),
+            lenses_before,
+            "case {case:?}: the replay must import no second lens"
+        );
+
+        // The same token over another document is a DIFFERENT request however it spells the
+        // lens: the parameters the fingerprint takes as resolved are still compared.
+        let other_document = lens_document(
+            &format!("Other-{case}-lens"),
+            None,
+            &[("cost", 1, 2)],
+        )
+        .to_string();
+        let conflict = import(
+            &client,
+            &other_document,
+            Some(&spelled(arn, retried_as)),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(
+            (conflict.status, conflict.error_code.as_str()),
+            (409, "ConflictException"),
+            "case {case:?}: the token over another document must stay a conflict, got \
+             {conflict:?}"
+        );
+        assert_eq!(
+            stored_lens_count(&client),
+            lenses_before,
+            "case {case:?}: the refused retry must import nothing"
+        );
+    }
+}
+
+/// Rule 7. `CreateWorkload` keys its retry the same way for the lenses it attaches: however
+/// the landed create spelled a lens, a retry under the same token naming that lens the other
+/// way answers the workload the original create minted rather than minting a second one or
+/// reporting a conflict.
+#[tokio::test]
+async fn a_workload_create_retry_replays_under_every_spelling_of_the_same_lens() {
+    let client = Client::new();
+
+    for (index, (created_as, retried_as)) in spelling_pairs(&OFFICIAL_LENS_SPELLINGS)
+        .into_iter()
+        .enumerate()
+    {
+        let case = format!("created-{created_as}-retried-{retried_as}");
+        let name = format!("Workload-{case}");
+        let token = format!("workload-{case}");
+
+        let mut body = minimal_create(&name, &token);
+        body["Lenses"] = json!([spelled_official(FRAMEWORK_LENS, created_as)]);
+        let created = client.create(body).await;
+        let workload_id = created_id(&created, &case);
+
+        let mut retry_body = minimal_create(&name, &token);
+        retry_body["Lenses"] = json!([spelled_official(FRAMEWORK_LENS, retried_as)]);
+        let retry = client.create(retry_body).await;
+        assert_eq!(
+            (retry.status, retry.error_code.as_str()),
+            (200, ""),
+            "case {case:?}: both spellings name the same lens, so the retry must replay the \
+             original create, got {retry:?}"
+        );
+        assert_eq!(
+            member(&retry, "WorkloadId"),
+            workload_id.as_str(),
+            "case {case:?}: the retry must answer the workload the original request minted, got \
+             {retry:?}"
+        );
+        assert_eq!(
+            stored_workload_count(&client),
+            index + 1,
+            "case {case:?}: the replay must mint no second workload"
+        );
+    }
+}
+
+/// Rule 8. `CreateReviewTemplate` keys its retry the same way for the lenses it applies: the
+/// retry naming one of them the other way answers the template the original create minted
+/// rather than minting a second one or reporting a conflict.
+#[tokio::test]
+async fn a_template_create_retry_replays_under_every_spelling_of_the_same_lens() {
+    let client = Client::new();
+
+    for (index, (created_as, retried_as)) in spelling_pairs(&OFFICIAL_LENS_SPELLINGS)
+        .into_iter()
+        .enumerate()
+    {
+        let case = format!("created-{created_as}-retried-{retried_as}");
+        let name = format!("Template-{case}");
+        let token = format!("template-{case}");
+
+        let mut body = minimal_template(&name, &token);
+        body["Lenses"] = json!([spelled_official(FRAMEWORK_LENS, created_as)]);
+        let created = client.create_review_template(body).await;
+        let template_arn = created_arn(&created, &case);
+
+        let mut retry_body = minimal_template(&name, &token);
+        retry_body["Lenses"] = json!([spelled_official(FRAMEWORK_LENS, retried_as)]);
+        let retry = client.create_review_template(retry_body).await;
+        assert_eq!(
+            (retry.status, retry.error_code.as_str()),
+            (200, ""),
+            "case {case:?}: both spellings name the same lens, so the retry must replay the \
+             original create, got {retry:?}"
+        );
+        assert_eq!(
+            member(&retry, "TemplateArn"),
+            template_arn.as_str(),
+            "case {case:?}: the retry must answer the template the original request minted, got \
+             {retry:?}"
+        );
+        assert_eq!(
+            stored_template_count(&client),
+            index + 1,
+            "case {case:?}: the replay must mint no second template"
         );
     }
 }

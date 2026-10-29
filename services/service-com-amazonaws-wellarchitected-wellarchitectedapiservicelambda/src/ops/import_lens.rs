@@ -187,9 +187,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let tags: std::collections::BTreeMap<String, String> =
             input.tags.unwrap_or_default().into_iter().collect();
+        // The lens this request imports OVER, as the lens it NAMES rather than as the
+        // spelling it was named by: "to update an existing custom lens, specify its ARN as
+        // the LensAlias. If no ARN is specified, a new custom lens is created"
+        // (`ImportLens` doc), so what this parameter asks for is resolved exactly the way
+        // the import below resolves it — an alias that is no ARN asks for a new lens
+        // (`None`), and an ARN names the lens the store resolves it to
+        // (`crate::state::lens_alias`, which takes an ARN with a version pinned after it
+        // as naming the same lens). A retry under the same token that spells that lens the
+        // other way is therefore the SAME request and replays the original import.
+        let updated_lens = input
+            .lens_alias
+            .as_deref()
+            .filter(|alias| is_arn(alias))
+            .map(|alias| crate::state::lens_alias(alias).to_string());
         let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
             "JSONString": &input.json_string,
-            "LensAlias": &input.lens_alias,
+            "LensAlias": &updated_lens,
             "Tags": &tags,
         }));
 

@@ -832,6 +832,23 @@ pub(crate) fn stored_workload_count(client: &Client) -> usize {
     store.workloads.len()
 }
 
+/// How many review templates the store holds, the counterpart of
+/// [`stored_workload_count`] — the one template counter this crate's suites share.
+pub(crate) fn stored_template_count(client: &Client) -> usize {
+    let state = client.store();
+    let store = state.lock();
+    store.review_templates.len()
+}
+
+/// How many custom lenses the store holds, the counterpart of [`stored_workload_count`] —
+/// the one lens counter this crate's suites share. It is what tells a replayed import from
+/// a second one, which no read of one lens can answer.
+pub(crate) fn stored_lens_count(client: &Client) -> usize {
+    let state = client.store();
+    let store = state.lock();
+    store.lenses.len()
+}
+
 /// The `Workload$Profiles` a workload reports, empty for a workload that reports none.
 pub(crate) async fn profiles_of(client: &Client, workload_id: &str, case: &str) -> Vec<Value> {
     stored_workload(client, workload_id, case)

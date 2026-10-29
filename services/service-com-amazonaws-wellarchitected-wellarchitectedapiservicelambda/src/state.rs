@@ -4079,6 +4079,25 @@ pub fn lens_alias(lens: &str) -> &str {
     alias.split('/').next().unwrap_or(alias)
 }
 
+/// The lenses a list names, each as the LENS it names rather than as the spelling it was
+/// named by, in the list's own order.
+///
+/// This is the form a lens list takes inside a [`parameter_fingerprint`]: "if you retry a
+/// request with the same client request token and the same parameters after the original
+/// request has completed successfully, the result of the original request is returned"
+/// (`ClientRequestToken` doc), and the parameter a lens list carries is the set of lenses
+/// the request applies — resolved through [`lens_alias`], the identity every read of those
+/// lenses is resolved through — so a retry that spells one of them the other way carries
+/// the SAME parameters and replays. Order is kept, because the order a request names its
+/// lenses in is the order the resource stores and reports them in, so a reordered list asks
+/// for a different resource.
+///
+/// One place, because every `@idempotencyToken` operation that applies a list of lenses
+/// fingerprints that list, and two of them cannot disagree about which lens is one lens.
+pub fn lens_identities(lenses: &[String]) -> Vec<&str> {
+    lenses.iter().map(|lens| lens_alias(lens)).collect()
+}
+
 /// Whether `alias` names `record`: an ARN must agree with the lens's own ARN (so the
 /// account and Region it carries have to match), optionally pinning a version after it;
 /// a bare id names the lens whose id it is.

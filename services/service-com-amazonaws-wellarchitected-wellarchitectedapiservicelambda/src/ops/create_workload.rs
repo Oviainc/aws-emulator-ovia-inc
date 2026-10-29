@@ -361,10 +361,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "Industry": &input.industry,
             "IndustryType": &input.industry_type,
             "JiraConfiguration": jira_configuration_fingerprint(input.jira_configuration.as_ref()),
-            // The lenses as this request attaches them: two requests whose lists differ
-            // only in naming one lens twice ask for the SAME workload, so one token over
-            // both is a retry rather than a conflict.
-            "Lenses": &lenses,
+            // The lenses as this request attaches them, each taken as the LENS it names
+            // rather than as the spelling it was named by
+            // (`crate::state::lens_identities`): two requests whose lists differ only in
+            // naming one lens twice, or in which spelling names one of them, ask for the
+            // SAME workload, so one token over both is a retry rather than a conflict.
+            "Lenses": crate::state::lens_identities(&lenses),
             "NonAwsRegions": &non_aws_regions,
             "Notes": &input.notes,
             "PillarPriorities": &pillar_priorities,

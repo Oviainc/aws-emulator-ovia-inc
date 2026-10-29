@@ -80,11 +80,10 @@ fn workload_request(name: &str, token: &str, lenses: &[String]) -> Value {
 
 /// How many review templates the store holds, read off the shared state — the assertion
 /// is about what a refused create RECORDED, not about a list projection of it; every
-/// request the test asserts about still crosses the HTTP boundary.
+/// request the test asserts about still crosses the HTTP boundary. Delegated to the one
+/// counter this crate's suites share (`super::workload_harness::stored_template_count`).
 fn stored_templates(client: &Client) -> usize {
-    let state = client.store();
-    let store = state.lock();
-    store.review_templates.len()
+    super::workload_harness::stored_template_count(client)
 }
 
 /// How many workloads the store holds, the counterpart of [`stored_templates`] — the one
