@@ -2,6 +2,15 @@
 
 //! @op CreateBulkImportJob
 //!
+//! Implemented: the handler below resolves the destination the request names —
+//! the session dataset of a workspace, or the time series outside one the
+//! account's warm or cold tier is the precondition for — records the job, and
+//! answers with the lifecycle the create owes it. A job whose destination is a
+//! session dataset also records that dataset's data segments: one per file whose
+//! alias names a stream this store holds, covering the data it holds for that
+//! stream from the instant the file states. Nothing is read from Amazon S3 and no
+//! sample is invented.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -336,6 +345,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             job_status: record.status(now).to_string(),
         };
         store.bulk_import_jobs.insert(record.job_id.clone(), record);
+
+        // "The ID of the session dataset to ingest data into": what the import
+        // this create accepted brings into that dataset is the dataset's own data
+        // segments — a session dataset "contains data segments of time series
+        // data" — so they are recorded with the job, each file naming the time
+        // series its alias identifies and the instant its data begins. The files
+        // are in Amazon S3, which this emulator does not reach, so no sample is
+        // read or invented: a segment covers the data this store really holds for
+        // that stream, and a file naming nothing this store holds brings in
+        // nothing (`crate::state::ingest_data_segments`).
+        //
+        // The write lands now and the dataset reports `UPDATING` until the
+        // transition it owes falls due, exactly as every other accepted write to
+        // a dataset does; the job's own `jobStatus` records the lifecycle the
+        // import was owed.
+        if let Some((_, dataset_id)) = dataset {
+            if store.ingest_data_segments(dataset_id, &input.files) > 0 {
+                if let Some(dataset) = store.datasets.get_mut(dataset_id) {
+                    dataset.begin_update(now);
+                }
+            }
+        }
 
         Ok(output)
     }

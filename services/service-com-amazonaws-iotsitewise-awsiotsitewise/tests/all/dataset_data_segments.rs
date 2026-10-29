@@ -568,9 +568,11 @@ async fn describe_dataset(router: &MultiServiceRouter, dataset_id: &str) -> Valu
 }
 
 /// Seed `spans` as the data segments of `dataset_id`, through the producer entry
-/// point the state exposes — the operations that associate or ingest a dataset's
-/// segments are not implemented yet, so this is where a dataset's segments come
-/// from today.
+/// point the state exposes — the one writer every producer path goes through, so
+/// a suite that is about the DELETION alone starts from the segments it needs
+/// without driving an import for each row (the import that records a session
+/// dataset's segments over the wire has its own suite,
+/// `session_dataset_data_segment_ingestion`).
 fn seed_segments(
     engine: &Arc<engine::InMemoryEngine>,
     dataset_id: &str,

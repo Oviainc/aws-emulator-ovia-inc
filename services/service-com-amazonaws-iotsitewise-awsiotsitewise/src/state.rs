@@ -650,6 +650,27 @@ fn is_modelled_time(at: &TimeInNanos) -> bool {
         && (0..=MAX_OFFSET_IN_NANOS).contains(&at.offset_in_nanos.unwrap_or(0))
 }
 
+/// The instant ONE nanosecond after `at`, or `None` when that is past what the
+/// modelled `TimeInNanos` can express.
+///
+/// `TimeInNanos` is nanosecond-precision, so this is the smallest instant later
+/// than `at`: what the HALF-OPEN end of a span that has to cover `at` is.
+fn next_nanosecond(at: &TimeInNanos) -> Option<TimeInNanos> {
+    let offset = at.offset_in_nanos.unwrap_or(0);
+    let next = if offset >= MAX_OFFSET_IN_NANOS {
+        TimeInNanos {
+            time_in_seconds: at.time_in_seconds.checked_add(1)?,
+            offset_in_nanos: Some(0),
+        }
+    } else {
+        TimeInNanos {
+            time_in_seconds: at.time_in_seconds,
+            offset_in_nanos: Some(offset + 1),
+        }
+    };
+    is_modelled_time(&next).then_some(next)
+}
+
 /// One scope's logging options and the instant they were set.
 ///
 /// The instant is what the bound on
@@ -1734,8 +1755,9 @@ impl DatasetRecord {
 /// The one writer of a dataset's segments is
 /// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::put_dataset_data_segment`] — the
 /// entry point every producer path (`BatchAssociateDataSegmentsToDataset`, the
-/// bulk import of time series data into a session dataset, or a test seeding a
-/// dataset) calls — and the removers are
+/// bulk import of time series data into a session dataset
+/// ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::ingest_data_segments`]), or a
+/// test seeding a dataset) calls — and the removers are
 /// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::delete_dataset_data_segment`]
 /// and
 /// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::disassociate_dataset_data_segment`],
@@ -4591,9 +4613,10 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// This is the PRODUCER-side entry point — the one writer of a dataset's
     /// segments, which `BatchDeleteDatasetDataSegments` then removes from:
     /// `BatchAssociateDataSegmentsToDataset` stores every segment it accepts
-    /// here, and a test seeding a dataset directly reaches the same writer, so
-    /// everything a read or a deletion can find was written here and nowhere
-    /// else.
+    /// here, [`Self::ingest_data_segments`] stores the ones a bulk import
+    /// brings into a session dataset, and a test seeding a dataset directly
+    /// reaches the same writer, so everything a read or a deletion can find was
+    /// written here and nowhere else.
     ///
     /// The log stays sorted by [`data_segment_key`] and single-valued on it:
     /// storing the same series' same span again REPLACES the entry held for it
@@ -4630,27 +4653,108 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         true
     }
 
-    /// The ASSOCIATION of `time_series_id` whose span shares an instant with
-    /// the half-open span `[start, end)`: the dataset that holds it, paired with
-    /// the segment itself, or `None` when no dataset holds one.
+    /// Record the data segments a bulk import into the SESSION dataset
+    /// `dataset_id` brings in from `files`, answering how many it stored.
+    ///
+    /// The PRODUCER of a session dataset's own segments. A session dataset
+    /// "contains data segments of time series data" (the `CreateDataset` model
+    /// doc) and an import names it as "the session dataset to ingest data into"
+    /// (the `CreateBulkImportJob` doc), so an accepted import is what puts
+    /// segments on one: each file names the time series its `alias` identifies
+    /// ("the alias associated with the file's time series") and the instant its
+    /// data begins ("the nanosecond-precision start time for the file data"),
+    /// which is the span of that stream the dataset comes to hold.
+    ///
+    /// The files themselves are in Amazon S3, which this emulator does not
+    /// reach, so nothing is read from them and NO sample is invented (see
+    /// [`BulkImportJobRecord`]): the data a segment covers is the data this
+    /// store really holds for the stream the file names. A file naming no
+    /// alias, an alias no stored stream answers to, or an instant past every
+    /// sample that stream holds therefore brings in nothing and records no
+    /// segment.
+    ///
+    /// A span overlapping a segment this store already holds of that series
+    /// records nothing either — "Data segments that belong to the same time
+    /// series can't overlap in time, regardless of which dataset they belong
+    /// to" (the `BatchAssociateDataSegmentsToDataset` doc) — which is also what
+    /// makes a second import of the same file add no second segment.
+    pub fn ingest_data_segments(&mut self, dataset_id: &str, files: &[File]) -> usize {
+        let mut stored = 0usize;
+        for file in files {
+            let Some(segment) = self.imported_data_segment(dataset_id, file) else {
+                continue;
+            };
+            if self
+                .overlapping_data_segment(
+                    &segment.time_series_id,
+                    &segment.start_timestamp,
+                    &segment.end_timestamp,
+                )
+                .is_some()
+            {
+                continue;
+            }
+            if self.put_dataset_data_segment(dataset_id, segment) {
+                stored += 1;
+            }
+        }
+        stored
+    }
+
+    /// The segment the import of `file` into `dataset_id` brings in, or `None`
+    /// when it brings in nothing at all; see [`Self::ingest_data_segments`] for
+    /// the rule.
+    ///
+    /// The span is HALF-OPEN, as every segment's span is, so it ends ONE
+    /// nanosecond past the last sample it covers — the smallest instant the
+    /// modelled `TimeInNanos` can express past it, so the segment covers that
+    /// sample and no further data. Its start is the instant the file states, and
+    /// the first covered sample's own instant for a file that states none.
+    fn imported_data_segment(&self, dataset_id: &str, file: &File) -> Option<DataSegmentRecord> {
+        let stream = self.resolve_alias_series(file.alias.as_deref()?)?;
+        let time_series_id = self.series_time_series_id(&stream)?;
+        let samples = self.series(&stream);
+        let from = file.start_time.as_ref().map(timestamp_key);
+        // The samples are kept sorted ascending, so the first one inside the
+        // window is the one the span starts at and the series' last sample is
+        // the one it ends after.
+        let first = samples
+            .iter()
+            .map(|sample| &sample.timestamp)
+            .find(|at| from.is_none_or(|from| timestamp_key(at) >= from))?;
+        let start = match &file.start_time {
+            Some(start) => start.clone(),
+            None => first.clone(),
+        };
+        let end = next_nanosecond(&samples.last()?.timestamp)?;
+        Some(DataSegmentRecord {
+            // A session dataset's own ingested data came from the dataset that
+            // holds it, which is what tells it apart from a segment another
+            // dataset's data was selected into.
+            source_dataset_id: dataset_id.to_string(),
+            time_series_id,
+            start_timestamp: start,
+            end_timestamp: end,
+        })
+    }
+
+    /// Every data segment of `time_series_id` this store holds whose span
+    /// shares an instant with the half-open span `[start, end)`, paired with
+    /// the dataset holding it.
     ///
     /// "Data segments that belong to the same time series can't overlap in
     /// time, regardless of which dataset they belong to" (the
     /// `BatchAssociateDataSegmentsToDataset` model doc), so the search spans
-    /// EVERY dataset's segments rather than the one a request names, and
-    /// answers the first in dataset-then-span order so one store answers one
-    /// way whatever order its map iterates in.
-    ///
-    /// A segment whose data came from the dataset that HOLDS it is a source
-    /// dataset's own data — what an association selects a slice of (see
-    /// [`DataSegmentRecord::source_dataset_id`]) — rather than an association
-    /// of it, so it is not one of the segments this rule compares.
-    pub fn overlapping_data_segment_association(
-        &self,
-        time_series_id: &str,
+    /// EVERY dataset's segments rather than the one a request names.
+    fn overlapping_data_segments<'a, 'k>(
+        &'a self,
+        time_series_id: &'k str,
         start: &TimeInNanos,
         end: &TimeInNanos,
-    ) -> Option<(&str, &DataSegmentRecord)> {
+    ) -> impl Iterator<Item = (&'a str, &'a DataSegmentRecord)> + 'k
+    where
+        'a: 'k,
+    {
         let (start, end) = (timestamp_key(start), timestamp_key(end));
         self.dataset_data_segments
             .iter()
@@ -4658,15 +4762,58 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                 held.iter()
                     .map(move |segment| (dataset_id.as_str(), segment))
             })
-            .filter(|(dataset_id, segment)| {
+            .filter(move |(_, segment)| {
                 segment.time_series_id == time_series_id
-                    && segment.source_dataset_id != *dataset_id
                     // Two half-open spans overlap exactly when each starts
                     // before the other ends, so spans that merely touch at one
                     // instant — the end of one, the start of the next — do not.
                     && timestamp_key(&segment.start_timestamp) < end
                     && timestamp_key(&segment.end_timestamp) > start
             })
+    }
+
+    /// The data segment of `time_series_id` ANY dataset holds whose span shares
+    /// an instant with the half-open span `[start, end)`: the dataset that
+    /// holds it, paired with the segment itself, or `None` when none does.
+    ///
+    /// What a PRODUCER of a segment reads the no-overlap rule through — a
+    /// session dataset's own ingested data included, which is why this one asks
+    /// about every segment and [`Self::overlapping_data_segment_association`]
+    /// asks only about the associations. Answered in dataset-then-span order,
+    /// so one store answers one way whatever order its map iterates in.
+    pub fn overlapping_data_segment(
+        &self,
+        time_series_id: &str,
+        start: &TimeInNanos,
+        end: &TimeInNanos,
+    ) -> Option<(&str, &DataSegmentRecord)> {
+        self.overlapping_data_segments(time_series_id, start, end)
+            .min_by(|(left_id, left), (right_id, right)| {
+                (*left_id, data_segment_key(left)).cmp(&(*right_id, data_segment_key(right)))
+            })
+    }
+
+    /// The ASSOCIATION of `time_series_id` whose span shares an instant with
+    /// the half-open span `[start, end)`: the dataset that holds it, paired with
+    /// the segment itself, or `None` when no dataset holds one.
+    ///
+    /// The no-overlap rule [`Self::overlapping_data_segment`] reads, narrowed to
+    /// the segments an association put there: a segment whose data came from the
+    /// dataset that HOLDS it is a source dataset's own data — what an
+    /// association selects a slice of (see
+    /// [`DataSegmentRecord::source_dataset_id`]) — rather than an association
+    /// of it, so it is not one of the segments this rule compares.
+    ///
+    /// Answered in dataset-then-span order, so one store answers one way
+    /// whatever order its map iterates in.
+    pub fn overlapping_data_segment_association(
+        &self,
+        time_series_id: &str,
+        start: &TimeInNanos,
+        end: &TimeInNanos,
+    ) -> Option<(&str, &DataSegmentRecord)> {
+        self.overlapping_data_segments(time_series_id, start, end)
+            .filter(|(dataset_id, segment)| segment.source_dataset_id != *dataset_id)
             .min_by(|(left_id, left), (right_id, right)| {
                 (*left_id, data_segment_key(left)).cmp(&(*right_id, data_segment_key(right)))
             })
@@ -4874,6 +5021,29 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .values()
             .find(|series| series.time_series_id == time_series_id)
             .map(|series| SeriesKey::Disassociated(series.alias.clone()))
+    }
+
+    /// The `TimeSeriesId` of the stream `key` names, or `None` when this store
+    /// holds no such stream.
+    ///
+    /// The inverse of [`Self::series_by_time_series_id`], through the same two
+    /// identities: the `(assetId, propertyId)` pair of a stream an asset
+    /// property owns ([`time_series_id`]), and the id minted for a stream no
+    /// property owns. One derivation, so a producer that records a stream's id
+    /// and a reader that resolves it back cannot disagree about which stream it
+    /// names.
+    pub fn series_time_series_id(&self, key: &SeriesKey) -> Option<String> {
+        match key {
+            SeriesKey::Property(asset_id, property_id) => self
+                .assets
+                .get(asset_id)
+                .filter(|asset| asset.property(property_id).is_some())
+                .map(|_| time_series_id(asset_id, property_id)),
+            SeriesKey::Disassociated(alias) => self
+                .disassociated_time_series
+                .get(alias)
+                .map(|series| series.time_series_id.clone()),
+        }
     }
 
     /// Forget every sample of the stream `key` names whose timestamp falls inside
@@ -8766,10 +8936,13 @@ pub const RESOURCE_BULK_IMPORT_JOB: &str = "Bulk Import Job";
 ///
 /// That status is a RECORD of the lifecycle the create owed, not a report on
 /// work something performed: the files a job names live in Amazon S3, which this
-/// emulator does not reach, so nothing reads them and no property value appears
-/// because a job ran. An operation that comes to ingest a job's files must take
-/// them from somewhere this emulator really holds, never synthesise values to
-/// match the status reached here.
+/// emulator does not reach, so nothing is read from them and no sample appears
+/// because a job ran. What an accepted import DOES record is the destination
+/// session dataset's data segments, taken from the data this store really holds
+/// for the stream each file names ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::ingest_data_segments`]);
+/// an operation that comes to ingest a job's files must likewise take them from
+/// somewhere this emulator really holds, never synthesise values to match the
+/// status reached here.
 #[derive(Debug, Clone)]
 pub struct BulkImportJobRecord {
     /// The `jobId` this job was minted with ([`new_id`]).
