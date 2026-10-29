@@ -29,7 +29,10 @@
 //!
 //! * `AWS::KinesisFirehose::DeliveryStream`'s properties ARE `CreateDeliveryStream`'s own
 //!   members, so the evaluated property document is the request, passed through verbatim
-//!   with the one member CloudFormation decides (the name) set on the way out;
+//!   with the one member CloudFormation decides (the name) set on the way out. That create
+//!   is asynchronous and leaves the stream in a status in which it takes no data, so the
+//!   resource's creation is held open until Amazon Data Firehose reports the stream `ACTIVE`
+//!   ([`delivery_stream_readiness`]);
 //! * `AWS::Glue::Job`'s are `CreateJob`'s own members the same way, with its tags the map
 //!   that call takes; the `JobUpdate` that call's sibling `UpdateJob` "completely
 //!   overwrites" a job definition with is that same document less the job's name, so one
@@ -1213,6 +1216,16 @@ impl Provisioner {
             Self::OpenSearchServiceDomain => {
                 domain_readiness(ctx, region, physical_resource_id).await
             }
+            // `CreateDeliveryStream` "is an asynchronous operation that immediately
+            // returns. The initial status of the Firehose stream is CREATING. After the
+            // Firehose stream is created, its status is ACTIVE and it now accepts data …
+            // Attempts to send data to a delivery stream that is not in the ACTIVE state
+            // cause an exception", so a stream the create has just answered for cannot take
+            // the data a client writes to it and the resource's creation is finished once
+            // that service reports it `ACTIVE`.
+            Self::FirehoseDeliveryStream => {
+                delivery_stream_readiness(ctx, region, physical_resource_id).await
+            }
             _ => Ok(Readiness::Ready),
         }
     }
@@ -2082,6 +2095,63 @@ async fn delete_delivery_stream(
         // CODE, never on the message, which carries the request's own resource name.
         Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
         Err(refusal) => Err(refusal),
+    }
+}
+
+/// The `DeliveryStreamStatus` a stream takes data in: "After the Firehose stream is created,
+/// its status is ACTIVE and it now accepts data" (`CreateDeliveryStream`).
+const DELIVERY_STREAM_ACTIVE: &str = "ACTIVE";
+
+/// The `DeliveryStreamStatus` a created stream starts in: "The initial status of the Firehose
+/// stream is CREATING" (`CreateDeliveryStream`).
+const DELIVERY_STREAM_CREATING: &str = "CREATING";
+
+/// Whether Amazon Data Firehose has finished bringing up the stream a stack created.
+///
+/// `CreateDeliveryStream` "is an asynchronous operation that immediately returns. The initial
+/// status of the Firehose stream is CREATING. After the Firehose stream is created, its status
+/// is ACTIVE and it now accepts data. If the Firehose stream creation fails, the status
+/// transitions to CREATING_FAILED" — so `ACTIVE` is the state the resource's creation is
+/// finished in, `CREATING` the state it is still coming up in, and every other status is one
+/// no wait will bring a stream out of: a creation that failed, which "doesn't change", and a
+/// stream being deleted. A stream Firehose no longer holds is in the same position, since
+/// nothing is going to create it.
+async fn delivery_stream_readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Readiness, Refusal> {
+    let Some(description) = describe_delivery_stream(ctx, region, physical_resource_id).await?
+    else {
+        return Ok(Readiness::Failed(format!(
+            "Amazon Data Firehose holds no stream {physical_resource_id}"
+        )));
+    };
+    let status = description
+        .get("DeliveryStreamStatus")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match status {
+        DELIVERY_STREAM_ACTIVE => Ok(Readiness::Ready),
+        DELIVERY_STREAM_CREATING => Ok(Readiness::Pending(DELIVERY_STREAM_CREATING.to_string())),
+        other => {
+            // `DeliveryStreamDescription$FailureDescription` carries "a message providing
+            // details about the error that caused the failure" where Firehose reported one,
+            // and the status speaks for itself otherwise.
+            let details = description
+                .get("FailureDescription")
+                .and_then(|failure| failure.get("Details"))
+                .and_then(Value::as_str);
+            Ok(Readiness::Failed(match details {
+                Some(details) => format!(
+                    "Amazon Data Firehose reports stream {physical_resource_id} as \
+                     {other}: {details}"
+                ),
+                None => format!(
+                    "Amazon Data Firehose reports stream {physical_resource_id} as {other}"
+                ),
+            }))
+        }
     }
 }
 

@@ -37,6 +37,11 @@ mod bedrock_model_customization_pass_role;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `c…` span (where every cloudformation suite lands) are both regions
 // concurrently landing suites add their line to.
+#[path = "all/cloudformation_firehose_stream_stabilisation.rs"]
+mod cloudformation_firehose_stream_stabilisation;
+// Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `c…` span (where every cloudformation suite lands) are both regions
+// concurrently landing suites add their line to.
 #[path = "all/cloudformation_provisions_opensearch_domains.rs"]
 mod cloudformation_provisions_opensearch_domains;
 // Declared here, at the head, for the reason the entry above records: the appended tail and

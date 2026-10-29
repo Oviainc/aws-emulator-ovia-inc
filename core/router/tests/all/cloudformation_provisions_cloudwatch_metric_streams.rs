@@ -58,6 +58,13 @@ const ACCOUNT_ID: &str = "000000000000";
 /// it `running`.
 const PAST_BOTH_SPANS: Duration = Duration::from_millis(1_200);
 
+/// How often a deployment is asked whether it has settled, and how long it goes on being
+/// asked: a stack whose resource an owning service has not reported ready yet completes from
+/// the instant that service does, which no fixed span names, and a loaded machine is slower
+/// than these services' spans without the rule being any different.
+const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const SETTLE_POLLS: usize = 400;
+
 /// CloudWatch's `X-Amz-Target` prefix, from its model's service shape
 /// (`GraniteServiceVersion20100801`), and the signing name its credential scope carries
 /// (`sigv4Name: monitoring`).
@@ -191,7 +198,11 @@ fn outputs_of(xml: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Create a stack, wait past the clock-owed spans, and answer the `DescribeStacks` body.
+/// Create a stack and answer the `DescribeStacks` body of the first SETTLED observation of
+/// it: a deployment whose resources their owning services report as still coming up (the
+/// Firehose stream each template below declares) completes from the instant those services
+/// report them ready, so the operation is polled to its terminal status rather than waited
+/// out for a span (`cloudformation_firehose_stream_stabilisation.rs` holds that rule itself).
 async fn create_and_settle(
     router: &MultiServiceRouter,
     case: &str,
@@ -215,8 +226,24 @@ async fn create_and_settle(
         status, 200,
         "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"
     );
-    tokio::time::sleep(PAST_BOTH_SPANS).await;
-    describe_stack(router, case, stack_name).await
+    let mut described = describe_stack(router, case, stack_name).await;
+    for _ in 0..SETTLE_POLLS {
+        if is_settled(&described) {
+            return described;
+        }
+        tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
+        described = describe_stack(router, case, stack_name).await;
+    }
+    described
+}
+
+/// Whether the `DescribeStacks` answer reports a stack no operation is still in flight on —
+/// "A last known stable state includes any status in a `*_COMPLETE`" beside the failed ones
+/// a refused resource leaves behind.
+fn is_settled(described: &str) -> bool {
+    opt_element(described, "StackStatus").is_some_and(|status| {
+        status.ends_with("_COMPLETE") || status.ends_with("_FAILED")
+    })
 }
 
 /// The one stack `stack_name` names, as the response body.

@@ -670,11 +670,20 @@ async fn a_stack_provisions_the_firehose_stream_its_template_declares() {
             "case {case:?}: expected the stack id to name the stack, got {stack_id:?}"
         );
 
-        // The stack's resources are created by the call itself; the stack reports the
-        // outputs of the template it deployed once that create COMPLETES, so the case
-        // waits past both clock-owed spans before reading them.
-        tokio::time::sleep(PAST_BOTH_SPANS).await;
-        let body = describe_stack(&router, case, &stack_name).await;
+        // The stack's resources are created by the call itself; the stream Firehose is still
+        // bringing up holds the operation open, so the stack reports the outputs of the
+        // template it deployed once that create COMPLETES — which is owed from the instant
+        // Firehose reports the stream ready and not from the call that started it, so the
+        // case waits for the status rather than for a span
+        // (`cloudformation_firehose_stream_stabilisation.rs` holds that rule itself).
+        let body =
+            crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status(
+                &router,
+                &stack_name,
+                "CREATE_COMPLETE",
+            )
+            .await
+            .1;
         assert_eq!(
             xml_text(&body, "StackStatus").as_deref(),
             Some("CREATE_COMPLETE"),
@@ -1074,7 +1083,14 @@ async fn an_update_creates_the_streams_it_declares_and_deletes_the_ones_it_drops
     };
 
     create_stack(&router, case, stack_name, &template("updated-stack-before"), &[]).await;
-    tokio::time::sleep(PAST_BOTH_SPANS).await;
+    // The create completes once Firehose reports the streams it declared ready, which is
+    // what the update below needs: a stack still in progress cannot be updated.
+    crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status(
+        &router,
+        stack_name,
+        "CREATE_COMPLETE",
+    )
+    .await;
 
     let (status, body) = cloudformation(
         &router,
@@ -1089,9 +1105,15 @@ async fn an_update_creates_the_streams_it_declares_and_deletes_the_ones_it_drops
         status, 200,
         "case {case:?}: expected HTTP 200 from UpdateStack, got {status} with body {body}"
     );
-    tokio::time::sleep(PAST_BOTH_SPANS).await;
-
-    let body = describe_stack(&router, case, stack_name).await;
+    // The update created a stream of its own, so its completion is owed from the instant
+    // Firehose reports THAT stream ready.
+    let body = crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status(
+        &router,
+        stack_name,
+        "UPDATE_COMPLETE",
+    )
+    .await
+    .1;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
         Some("UPDATE_COMPLETE"),
@@ -1174,7 +1196,14 @@ async fn an_update_that_would_change_an_existing_resource_in_place_fails_the_sta
     };
 
     create_stack(&router, case, stack_name, &template("GZIP"), &[]).await;
-    tokio::time::sleep(PAST_BOTH_SPANS).await;
+    // The create completes once Firehose reports the stream it declared ready: a stack still
+    // in progress cannot be updated.
+    crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status(
+        &router,
+        stack_name,
+        "CREATE_COMPLETE",
+    )
+    .await;
 
     let (status, body) = cloudformation(
         &router,
