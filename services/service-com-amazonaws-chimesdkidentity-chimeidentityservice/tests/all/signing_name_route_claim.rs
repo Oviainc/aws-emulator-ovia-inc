@@ -250,11 +250,11 @@ async fn a_request_naming_no_endpoint_is_claimed_only_inside_this_model_s_path_s
             expect: Expect::Member(201, "AppInstanceUserArn"),
         },
         Row {
-            case: "list app instance bots, an owned segment whose operation is scaffolded",
+            case: "list app instance bots, a collection route under a segment only this model binds",
             method: "GET",
             uri: format!("/app-instance-bots?app-instance-arn={encoded}"),
             body: None,
-            expect: Expect::Code(501, "NotImplemented"),
+            expect: Expect::Member(200, "AppInstanceBots"),
         },
         Row {
             case: "retention settings, a two-label route whose operation is still scaffolded",

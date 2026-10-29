@@ -178,8 +178,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
-        // Deleting an AppInstance deletes everything it owns, so the users it holds go
-        // with it and a later Describe of one of them resolves to nothing.
+        // Deleting an AppInstance deletes everything it owns, so the users and bots it
+        // holds go with it and a later Describe of one of them resolves to nothing.
         let Some(removed) = state.remove_app_instance(&input.app_instance_arn) else {
             return Err(DeleteAppInstanceErrorModeled::BadRequestException(
                 BadRequestException {
@@ -193,12 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The cascade reaches the tags too: the instance's own and those of every user it
-        // took with it.
+        // The cascade reaches the tags too: the instance's own and those of every child
+        // it took with it.
         let mut tags = tag_directory.lock();
         tags.forget(&input.app_instance_arn);
-        for user_arn in removed.users.keys() {
-            tags.forget(user_arn);
+        for child_arn in removed.users.keys().chain(removed.bots.keys()) {
+            tags.forget(child_arn);
         }
         drop(tags);
 

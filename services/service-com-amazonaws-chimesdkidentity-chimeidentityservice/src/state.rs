@@ -5,10 +5,12 @@
 //! The `AppInstance` is this service's root resource: every other identity resource
 //! (users, bots, admins, endpoints, retention settings) hangs off exactly one of them.
 //! State is therefore a single `BTreeMap` of app instances keyed by ARN, with each
-//! instance owning its users, plus two index maps:
+//! instance owning its users and its bots, plus three index maps:
 //!
 //! * `users_by_arn` — a user ARN to its owning instance ARN, because
 //!   `DescribeAppInstanceUser` / `DeleteAppInstanceUser` are keyed only by the user ARN.
+//! * `bots_by_arn` — the same index for the bots an instance owns, because the bot
+//!   operations are keyed only by the bot ARN.
 //! * `idempotency` — a create operation's `ClientRequestToken` to the ARN that token
 //!   already minted, so repeating one token never mints a second resource.
 //!
@@ -25,7 +27,7 @@ use std::hash::BuildHasher as _;
 use std::ops::Bound;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::ExpirationSettings;
+use crate::ops::types::{Configuration, ExpirationSettings};
 
 /// The region used for a minted ARN when the request carries no SigV4 credential
 /// scope to read one from (an unsigned or presigned request).
@@ -58,6 +60,10 @@ pub const MAX_APP_INSTANCES: usize = 100;
 /// See [`MAX_APP_INSTANCES`].
 pub const MAX_APP_INSTANCE_USERS: usize = 500;
 
+/// How many `AppInstanceBot`s one `AppInstance` holds; see [`MAX_APP_INSTANCES`] for
+/// why the store is bounded at all.
+pub const MAX_APP_INSTANCE_BOTS: usize = 100;
+
 /// The ceiling on
 /// [`idempotency`](ComAmazonawsChimesdkidentityChimeidentityserviceState::idempotency).
 ///
@@ -67,7 +73,8 @@ pub const MAX_APP_INSTANCE_USERS: usize = 500;
 /// uuid), and it is released again when that resource is deleted. This constant is
 /// the structural ceiling that keeps the map bounded even if a future create path
 /// records a token without minting anything: past it, a token is not recorded.
-pub const MAX_IDEMPOTENCY_TOKENS: usize = MAX_APP_INSTANCES * (1 + MAX_APP_INSTANCE_USERS);
+pub const MAX_IDEMPOTENCY_TOKENS: usize =
+    MAX_APP_INSTANCES * (1 + MAX_APP_INSTANCE_USERS + MAX_APP_INSTANCE_BOTS);
 
 /// A persisted `AppInstanceUser`.
 #[derive(Debug, Clone)]
@@ -84,6 +91,25 @@ pub struct AppInstanceUserRecord {
     /// an [`AppInstanceRecord`], whose stamp appears only on a real update.
     pub last_updated_timestamp: SystemTime,
     pub expiration_settings: Option<ExpirationSettings>,
+}
+
+/// A persisted `AppInstanceBot`: an Amazon Lex V2 chat bot created under an
+/// `AppInstance`.
+#[derive(Debug, Clone)]
+pub struct AppInstanceBotRecord {
+    pub arn: String,
+    pub app_instance_arn: String,
+    /// `Name` is optional on `CreateAppInstanceBot`, so a bot may carry none.
+    pub name: Option<String>,
+    pub metadata: Option<String>,
+    /// The bot's data-processing instructions, reported back verbatim by the
+    /// operations that describe it.
+    pub configuration: Configuration,
+    pub created_timestamp: SystemTime,
+    /// When this bot was last written. Like an [`AppInstanceUserRecord`] and unlike an
+    /// [`AppInstanceRecord`], a bot carries a last-updated instant from the moment it
+    /// is created, which every operation that changes it re-stamps.
+    pub last_updated_timestamp: SystemTime,
 }
 
 /// A persisted `AppInstance` and everything it owns.
@@ -103,6 +129,8 @@ pub struct AppInstanceRecord {
     pub last_updated_timestamp: Option<SystemTime>,
     /// This instance's users, keyed by `AppInstanceUserArn`.
     pub users: BTreeMap<String, AppInstanceUserRecord>,
+    /// This instance's bots, keyed by `AppInstanceBotArn`.
+    pub bots: BTreeMap<String, AppInstanceBotRecord>,
 }
 
 /// What [`ComAmazonawsChimesdkidentityChimeidentityserviceState::insert_user`] did, so
@@ -121,6 +149,20 @@ pub enum InsertUser {
     AtCapacity,
 }
 
+/// What [`ComAmazonawsChimesdkidentityChimeidentityserviceState::insert_bot`] did, so
+/// the handler maps each outcome to the error the model declares for it. The variants
+/// mirror [`InsertUser`]'s, minus the already-exists case: a bot ARN carries a freshly
+/// minted id rather than one the caller chose, so it cannot collide with a stored bot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertBot {
+    /// The bot was stored under its parent.
+    Stored,
+    /// The named `AppInstanceArn` does not exist; nothing was written.
+    NoSuchAppInstance,
+    /// The parent already holds [`MAX_APP_INSTANCE_BOTS`] bots; nothing was written.
+    AtCapacity,
+}
+
 /// Per-service state for com-amazonaws-chimesdkidentity-chimeidentityservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsChimesdkidentityChimeidentityserviceState {
@@ -128,6 +170,8 @@ pub struct ComAmazonawsChimesdkidentityChimeidentityserviceState {
     pub app_instances: BTreeMap<String, AppInstanceRecord>,
     /// `AppInstanceUserArn` -> owning `AppInstanceArn`.
     pub users_by_arn: BTreeMap<String, String>,
+    /// `AppInstanceBotArn` -> owning `AppInstanceArn`.
+    pub bots_by_arn: BTreeMap<String, String>,
     /// `<operation>:<ClientRequestToken>` -> the ARN that token minted.
     pub idempotency: BTreeMap<String, String>,
 }
@@ -147,6 +191,29 @@ impl ComAmazonawsChimesdkidentityChimeidentityserviceState {
             .get_mut(&instance_arn)?
             .users
             .get_mut(user_arn)
+    }
+
+    /// The bot with this ARN, resolved through the `bots_by_arn` index in one hop.
+    pub fn bot(&self, bot_arn: &str) -> Option<&AppInstanceBotRecord> {
+        let instance_arn = self.bots_by_arn.get(bot_arn)?;
+        self.app_instances.get(instance_arn)?.bots.get(bot_arn)
+    }
+
+    /// Store a bot under its parent instance and index it.
+    ///
+    /// As with [`insert_user`](Self::insert_user) the parent lookup here is the ONLY one
+    /// a caller needs, and nothing is written on either refusal.
+    pub fn insert_bot(&mut self, record: AppInstanceBotRecord) -> InsertBot {
+        let Some(instance) = self.app_instances.get_mut(&record.app_instance_arn) else {
+            return InsertBot::NoSuchAppInstance;
+        };
+        if instance.bots.len() >= MAX_APP_INSTANCE_BOTS {
+            return InsertBot::AtCapacity;
+        }
+        self.bots_by_arn
+            .insert(record.arn.clone(), record.app_instance_arn.clone());
+        instance.bots.insert(record.arn.clone(), record);
+        InsertBot::Stored
     }
 
     /// Store a user under its parent instance and index it.
@@ -170,6 +237,17 @@ impl ComAmazonawsChimesdkidentityChimeidentityserviceState {
         InsertUser::Stored
     }
 
+    /// Remove a bot from its parent instance and from the index.
+    pub fn remove_bot(&mut self, bot_arn: &str) -> Option<AppInstanceBotRecord> {
+        let instance_arn = self.bots_by_arn.remove(bot_arn)?;
+        let removed = self
+            .app_instances
+            .get_mut(&instance_arn)
+            .and_then(|instance| instance.bots.remove(bot_arn))?;
+        self.forget_idempotency_for(&[bot_arn]);
+        Some(removed)
+    }
+
     /// Remove a user from its parent instance and from the index.
     pub fn remove_user(&mut self, user_arn: &str) -> Option<AppInstanceUserRecord> {
         let instance_arn = self.users_by_arn.remove(user_arn)?;
@@ -181,14 +259,18 @@ impl ComAmazonawsChimesdkidentityChimeidentityserviceState {
         Some(removed)
     }
 
-    /// Remove an app instance and cascade to everything it owns: its users go with it,
-    /// so a later `DescribeAppInstanceUser` on one of them resolves to nothing. The
-    /// idempotency tokens that minted the instance and its users are released too.
+    /// Remove an app instance and cascade to everything it owns: its users and bots go
+    /// with it, so a later `DescribeAppInstanceUser` or `ListAppInstanceBots` on one of
+    /// them resolves to nothing. The idempotency tokens that minted the instance and
+    /// its children are released too.
     pub fn remove_app_instance(&mut self, arn: &str) -> Option<AppInstanceRecord> {
         let instance = self.app_instances.remove(arn)?;
         self.users_by_arn
             .retain(|_, owning_arn| owning_arn.as_str() != arn);
+        self.bots_by_arn
+            .retain(|_, owning_arn| owning_arn.as_str() != arn);
         let mut gone: BTreeSet<&str> = instance.users.keys().map(String::as_str).collect();
+        gone.extend(instance.bots.keys().map(String::as_str));
         gone.insert(arn);
         self.idempotency
             .retain(|_, minted| !gone.contains(minted.as_str()));
@@ -206,7 +288,9 @@ impl ComAmazonawsChimesdkidentityChimeidentityserviceState {
 
     /// True when `arn` still names a live resource of this service.
     pub fn resource_exists(&self, arn: &str) -> bool {
-        self.app_instances.contains_key(arn) || self.users_by_arn.contains_key(arn)
+        self.app_instances.contains_key(arn)
+            || self.users_by_arn.contains_key(arn)
+            || self.bots_by_arn.contains_key(arn)
     }
 
     /// Whether a tagging call may address `arn`.
@@ -413,6 +497,15 @@ fn new_uuid_v4() -> String {
 /// appended, so a user ARN carries its parent and the id the caller chose.
 pub fn app_instance_user_arn(app_instance_arn: &str, app_instance_user_id: &str) -> String {
     format!("{app_instance_arn}/user/{app_instance_user_id}")
+}
+
+/// A fresh `AppInstanceBotArn`: its instance's ARN with `/bot/<uuid>` appended.
+///
+/// `CreateAppInstanceBot` takes no caller-chosen id, so the bot segment is a freshly
+/// minted uuid (the same source as an `AppInstanceArn`'s) rather than anything derived
+/// from the request.
+pub fn new_app_instance_bot_arn(app_instance_arn: &str) -> String {
+    format!("{app_instance_arn}/bot/{}", new_uuid_v4())
 }
 
 /// A stored instant as the wire timestamp the model declares (`Timestamp`).

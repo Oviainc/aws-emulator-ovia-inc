@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAppInstanceBot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAppInstanceBot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAppInstanceBot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -166,20 +157,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAppInstanceBot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAppInstanceBotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAppInstanceBot"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAppInstanceBotErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the AppInstance store is unavailable".to_string()),
+            })
+        })?;
+        // The tags given at create time go in the family's shared, ARN-keyed tag
+        // directory, which is where the tagging operations read them from; resolved
+        // before anything is written so a create cannot half-succeed.
+        let tag_directory = crate::state::chime_tags(&*self.engine).ok_or_else(|| {
+            CreateAppInstanceBotErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Chime tag directory is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // `TagList` is `@length(min: 1)`, so the member is either absent or non-empty.
+        // Sorted, because a tag set is unordered: the same tags in another order are the
+        // same request.
+        let mut tags: Vec<(String, String)> = input
+            .tags
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        tags.sort();
+
+        // Idempotency (`@idempotencyToken` on `ClientRequestToken`): one token names one
+        // bot, so a RETRY — the same token presented with the same request — answers with
+        // the ARN the first call minted and creates nothing new. A token already
+        // associated with a bot but presented with a DIFFERENT request is not a retry of
+        // anything, and is refused with the modelled conflict rather than silently
+        // answering about a resource the caller did not ask for.
+        if let Some(existing) = state.idempotent_arn(Self::NAME, &input.client_request_token) {
+            let replays = state.bot(&existing).is_some_and(|bot| {
+                bot.app_instance_arn == input.app_instance_arn
+                    && bot.name == input.name
+                    && bot.metadata == input.metadata
+                    && same_configuration(&bot.configuration, &input.configuration)
+                    && tag_directory.lock().tags_of(&existing) == tags
+            });
+            if replays {
+                return Ok(CreateAppInstanceBotOutput {
+                    app_instance_bot_arn: Some(existing),
+                });
+            }
+            return Err(CreateAppInstanceBotErrorModeled::ConflictException(
+                ConflictException {
+                    code: Some("Conflict".to_string()),
+                    message: Some(
+                        "The provided ClientRequestToken is already associated with an existing \
+                         resource."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A bot exists only under an AppInstance, and the store is bounded —
+        // `insert_bot` does the ONE parent lookup and reports which of the two modelled
+        // refusals applies. In either refusal nothing is written.
+        let now = ::std::time::SystemTime::now();
+        // The bot id is not a caller input, so the ARN is minted here rather than
+        // derived from the request.
+        let arn = crate::state::new_app_instance_bot_arn(&input.app_instance_arn);
+        let record = crate::state::AppInstanceBotRecord {
+            arn: arn.clone(),
+            app_instance_arn: input.app_instance_arn.clone(),
+            name: input.name,
+            metadata: input.metadata,
+            configuration: input.configuration,
+            created_timestamp: now,
+            // A bot carries a last-updated instant from the moment it is created.
+            last_updated_timestamp: now,
+        };
+
+        match state.insert_bot(record) {
+            crate::state::InsertBot::Stored => {}
+            // This operation models no 404 shape, so an unknown parent is refused with
+            // the modelled `BadRequestException` carrying the `NotFound` error code.
+            crate::state::InsertBot::NoSuchAppInstance => {
+                return Err(CreateAppInstanceBotErrorModeled::BadRequestException(
+                    BadRequestException {
+                        code: Some("NotFound".to_string()),
+                        message: Some(format!(
+                            "AppInstance {} does not exist",
+                            input.app_instance_arn
+                        )),
+                    },
+                )
+                .into());
+            }
+            crate::state::InsertBot::AtCapacity => {
+                return Err(
+                    CreateAppInstanceBotErrorModeled::ResourceLimitExceededException(
+                        ResourceLimitExceededException {
+                            code: Some("ResourceLimitExceeded".to_string()),
+                            message: Some(format!(
+                                "AppInstance {} already holds the maximum of {} AppInstanceBots",
+                                input.app_instance_arn,
+                                crate::state::MAX_APP_INSTANCE_BOTS
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The bot is stored either way; at the structural token ceiling the token is
+        // simply not recorded, so the map cannot grow past it.
+        let _recorded = state.record_idempotency(Self::NAME, &input.client_request_token, &arn);
+        if !tags.is_empty() {
+            tag_directory.lock().tag(&arn, tags);
+        }
+
+        Ok(CreateAppInstanceBotOutput {
+            app_instance_bot_arn: Some(arn),
+        })
     }
+}
+
+/// Whether two bot configurations ask for the same thing, member by member.
+///
+/// This is what decides a replay from a mismatched token reuse: `Configuration` is a
+/// structure of plain scalars (`LexConfiguration` plus its optional `InvokedBy`), so
+/// equality is member-wise over every one of them.
+fn same_configuration(stored: &Configuration, requested: &Configuration) -> bool {
+    let (stored, requested) = (&stored.lex, &requested.lex);
+    stored.lex_bot_alias_arn == requested.lex_bot_alias_arn
+        && stored.locale_id == requested.locale_id
+        && stored.responds_to == requested.responds_to
+        && stored.welcome_intent == requested.welcome_intent
+        && match (&stored.invoked_by, &requested.invoked_by) {
+            (Some(stored), Some(requested)) => {
+                stored.standard_messages == requested.standard_messages
+                    && stored.targeted_messages == requested.targeted_messages
+            }
+            (None, None) => true,
+            _ => false,
+        }
 }

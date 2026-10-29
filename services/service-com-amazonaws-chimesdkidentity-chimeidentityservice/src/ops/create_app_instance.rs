@@ -221,6 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // to report; the first operation that changes it sets one.
             last_updated_timestamp: None,
             users: ::std::collections::BTreeMap::new(),
+            bots: ::std::collections::BTreeMap::new(),
         };
 
         state.app_instances.insert(arn.clone(), record);
