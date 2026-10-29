@@ -1500,25 +1500,68 @@ pub fn preview_selection_violation(
 /// and the whole selection it was taken with.
 ///
 /// Bound into the token ([`PageCursor::filter_fingerprint`]) so that resuming a
-/// walk with a different rule type, scope, action-type list or criteria — or
-/// with the other preview operation's token — is refused instead of answered
-/// with a page of a different result set. It digests exactly the members
-/// [`previewed_actions`] selects by, so the two preview operations cannot
-/// disagree about which requests continue one walk.
+/// walk with a different account scope, action-type list or criteria — or with
+/// the other preview operation's token — is refused instead of answered with a
+/// page of a different result set.
+///
+/// What it digests is the selection as [`previewed_actions`] PERFORMS it: the
+/// accounts the rule type and `organizationScope` derive to
+/// ([`preview_account_scope`]), and the criteria after defaulting and with every
+/// criterion that constrains nothing spelled one way ([`canonical_criteria`]) —
+/// never the raw optional request members. Two spellings of one selection
+/// therefore digest to one fingerprint and continue one walk (`criteria` absent,
+/// `criteria: {}` and a criterion holding no condition all constrain nothing; a
+/// scope carrying no `accountIds` covers the same accounts as no scope at all),
+/// while a selection that really is different digests differently. The two
+/// preview operations are handed the same values they select by, so they cannot
+/// disagree about which requests continue one walk, and the normalisation
+/// matches every other paginated listing of this service, which digests its
+/// optional query member after `unwrap_or_default`.
 pub fn preview_selection_fingerprint(
     operation: &str,
-    rule_type: &str,
-    organization_scope: Option<&OrganizationScope>,
+    scope: Option<&[String]>,
     recommended_action_types: &[String],
-    criteria: Option<&Criteria>,
+    criteria: &Criteria,
 ) -> String {
     fingerprint(&(
         operation,
-        rule_type,
-        organization_scope,
+        scope,
         recommended_action_types,
-        criteria,
+        canonical_criteria(criteria),
     ))
+}
+
+/// `criteria` with every criterion that constrains nothing spelled the ONE way
+/// the selection reads it: absent.
+///
+/// A criterion the caller left out and a criterion present but holding no
+/// condition select identically — [`action_matches_criteria`] requires every
+/// condition of a criterion to hold, and a criterion with no condition has
+/// nothing to fail — so the two spellings name one selection and digest to one
+/// fingerprint. Only a criterion spelled as nothing is normalised: a criterion
+/// that carries conditions is digested as the request spells it, so a selection
+/// that constrains anything differently is still a different fingerprint.
+fn canonical_criteria(criteria: &Criteria) -> Criteria {
+    let mut canonical = criteria.clone();
+    drop_unconstraining(&mut canonical.region);
+    drop_unconstraining(&mut canonical.resource_arn);
+    drop_unconstraining(&mut canonical.ebs_volume_type);
+    drop_unconstraining(&mut canonical.ebs_volume_size_in_gib);
+    drop_unconstraining(&mut canonical.estimated_monthly_savings);
+    drop_unconstraining(&mut canonical.resource_tag);
+    drop_unconstraining(&mut canonical.look_back_period_in_days);
+    drop_unconstraining(&mut canonical.restart_needed);
+    canonical
+}
+
+/// Spell a criterion that holds no condition the way an absent one is spelled.
+fn drop_unconstraining<T>(criterion: &mut Option<Vec<T>>) {
+    if criterion
+        .as_ref()
+        .is_some_and(|conditions| conditions.is_empty())
+    {
+        *criterion = None;
+    }
 }
 
 /// One group of summarised items a summaries list reports as a row — of

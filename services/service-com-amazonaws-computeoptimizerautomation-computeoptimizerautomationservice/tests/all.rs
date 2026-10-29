@@ -65,6 +65,8 @@ mod organization_rule_scope_gate;
 mod page_size_rule;
 #[path = "all/page_token_refusals.rs"]
 mod page_token_refusals;
+#[path = "all/preview_page_token_selection.rs"]
+mod preview_page_token_selection;
 #[path = "all/preview_selection_guard.rs"]
 mod preview_selection_guard;
 #[path = "all/recommended_action_inventory.rs"]

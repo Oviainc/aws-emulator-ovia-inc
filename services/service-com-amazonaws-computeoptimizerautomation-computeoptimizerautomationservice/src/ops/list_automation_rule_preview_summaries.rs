@@ -35,8 +35,9 @@
 //! * a `criteria` this service cannot evaluate (a condition with no `comparison`, no
 //!   `values`, an operator from the wrong family, or a `resourceTag` condition with no
 //!   `key`);
-//! * a `nextToken` that does not decode, or that was taken with a different rule type,
-//!   scope, action-type list or criteria — or from another operation, including
+//! * a `nextToken` that does not decode, or that was taken with a different account
+//!   scope (what the rule type and `organizationScope` cover),
+//!   action-type list or criteria — or from another operation, including
 //!   `ListAutomationRulePreview`, whose pages are single actions rather than groups.
 //!
 //! NOT enforced here, deliberately: `ruleType`'s prose says only the management account
@@ -211,16 +212,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(report));
         }
 
-        // The page token carries the operation and the selection it was taken
-        // with, so resuming a walk with a different scope, action-type list or
-        // criteria — or with another operation's token — is refused instead of
-        // answered with a page of a different result set.
-        let selection_fingerprint = crate::state::preview_selection_fingerprint(
-            Self::NAME,
+        // The selection this request names, derived exactly as
+        // `crate::state::previewed_actions` performs it below: the accounts the
+        // rule type and `organizationScope` cover, and the criteria after
+        // defaulting — a caller that sends no criteria constrains nothing, so
+        // every action in scope carrying a requested action type is summarised.
+        let scope = crate::state::preview_account_scope(
             &input.rule_type,
             input.organization_scope.as_ref(),
+        );
+        let criteria = input.criteria.unwrap_or_default();
+
+        // The page token carries the operation and that DERIVED selection, so
+        // resuming a walk with a different scope, action-type list or criteria —
+        // or with another operation's token — is refused instead of answered
+        // with a page of a different result set, while two spellings of one
+        // selection continue one walk: `crate::state::preview_selection_fingerprint`.
+        let selection_fingerprint = crate::state::preview_selection_fingerprint(
+            Self::NAME,
+            scope.as_deref(),
             &input.recommended_action_types,
-            input.criteria.as_ref(),
+            &criteria,
         );
         let offset = match input.next_token.as_deref() {
             None => 0,
@@ -249,14 +261,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // every paginated listing here, including the floor against a
         // non-advancing zero page: `crate::state::page_size`.
         let page_size = crate::state::page_size(input.max_results);
-
-        let scope = crate::state::preview_account_scope(
-            &input.rule_type,
-            input.organization_scope.as_ref(),
-        );
-        // A caller that sends no criteria constrains nothing, so every action in
-        // scope carrying a requested action type is summarised.
-        let criteria = input.criteria.unwrap_or_default();
 
         let guard = state.lock();
         // The service-wide enrollment gate, AHEAD of the inventory walk: an
