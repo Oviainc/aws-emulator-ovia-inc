@@ -73,6 +73,8 @@ mod core_network_segment_actions;
 mod create_connect_peer_bounds;
 #[path = "all/create_connection_bounds.rs"]
 mod create_connection_bounds;
+#[path = "all/create_time_tag_keys.rs"]
+mod create_time_tag_keys;
 #[path = "all/create_vpc_attachment_bounds.rs"]
 mod create_vpc_attachment_bounds;
 #[path = "all/customer_gateway_association_lifecycle.rs"]

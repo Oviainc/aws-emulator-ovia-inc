@@ -6226,7 +6226,10 @@ pub fn no_such_segment(
 ///
 /// Refuses an empty or over-long key, an over-long value, and any key carrying the
 /// AWS-reserved prefix. A key repeated inside one request is NOT an error: tag keys are
-/// unique per resource, so the last value for a key wins (see [`merge_tags`]).
+/// unique per resource, so the last value for a key wins — through [`merge_tags`] on the
+/// `TagResource` path and through [`tags_to_store`] for the `Tags` of a create. Every
+/// entry is checked, including one a repeat later replaces, so a request carrying a tag
+/// that breaks a rule is refused whether or not that entry would survive the merge.
 pub fn validate_tags(tags: &[Tag]) -> Result<(), TagRejection> {
     const MEMBER: &str = FIELD_TAGS;
     for tag in tags {
@@ -6303,6 +6306,19 @@ pub fn merge_tags(existing: &mut Vec<Tag>, requested: Vec<Tag>) {
             None => existing.push(tag),
         }
     }
+}
+
+/// The tag list a resource is STORED with for the `Tags` a create carried.
+///
+/// A resource's tags are a key-to-value map, so a key one request names more than once is
+/// stored ONCE: the first occurrence keeps its position and the last value given for that
+/// key wins — the very merge [`merge_tags`] performs for a `TagResource`, and the one
+/// [`tag_count_after_merge`] already grades the create's quota by. Without it a create
+/// could store two entries for one key, which no later write could repair.
+pub fn tags_to_store(requested: Option<Vec<Tag>>) -> Vec<Tag> {
+    let mut stored = Vec::new();
+    merge_tags(&mut stored, requested.unwrap_or_default());
+    stored
 }
 
 /// Remove every tag whose key `keys` names. A key the resource does not carry is ignored,

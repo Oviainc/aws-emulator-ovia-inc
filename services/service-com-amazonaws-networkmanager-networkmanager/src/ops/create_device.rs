@@ -317,7 +317,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing has reconfigured this device yet, so no `UPDATING` transition is
             // outstanding on it.
             updating_until: None,
-            tags: input.tags.unwrap_or_default(),
+            // A resource's tags are a key-to-value map, so the stored list holds each
+            // requested key once, with the last value the request gave for it.
+            tags: crate::state::tags_to_store(input.tags),
         };
         let device = record.to_shape(now);
         store.devices.insert(id, record);

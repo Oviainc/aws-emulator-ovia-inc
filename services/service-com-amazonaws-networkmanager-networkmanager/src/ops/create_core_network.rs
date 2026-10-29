@@ -136,7 +136,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
@@ -193,6 +193,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A resource's tags are a key-to-value map, so the list the record is stored with
+        // holds each requested key once, with the last value the request gave for it; the
+        // idempotency comparison below is against that same list.
+        let tags = crate::state::tags_to_store(input.tags.take());
+
         // A core network is part of a global network, so an unknown parent is refused
         // rather than stored with a dangling back-reference. Like every create of this
         // service, the refusal is the field-validation failure on the member that carried
@@ -224,10 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     && existing.description == input.description
                     && existing.created_policy_document()
                         == policy.as_ref().map(|(document, _)| document.as_str())
-                    && crate::state::same_tags(
-                        &existing.tags,
-                        input.tags.as_deref().unwrap_or_default(),
-                    )
+                    && crate::state::same_tags(&existing.tags, &tags)
             },
             |existing| crate::state::ClientTokenConflict {
                 effect: format!("created core network {}", existing.id),
@@ -279,7 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updating_until: None,
             created_with_policy_document: policy.is_some(),
             client_token,
-            tags: input.tags.unwrap_or_default(),
+            tags,
         };
         // The document a create carries becomes the core network's FIRST policy version,
         // and the create executes its change set itself — that is what makes the topology

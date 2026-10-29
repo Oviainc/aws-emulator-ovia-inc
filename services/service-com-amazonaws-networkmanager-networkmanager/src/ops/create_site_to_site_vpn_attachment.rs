@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
@@ -176,6 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // A resource's tags are a key-to-value map, so the list the record is stored with
+        // holds each requested key once, with the last value the request gave for it; the
+        // policy decision and the idempotency comparison below both read that same list.
+        let tags = crate::state::tags_to_store(input.tags.take());
 
         // "Creates an Amazon Web Services site-to-site VPN attachment on an edge location
         // of a core network" (`smithy_query query="doc"
@@ -232,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 edge_location: &edge_location,
                 resource_arn: &input.vpn_connection_arn,
                 account_id: ::engine::emulator_account_id(),
-                tags: input.tags.as_deref().unwrap_or_default(),
+                tags: &tags,
             });
 
         // `ClientToken` is the operation's modelled `@idempotencyToken`, so a retry of the
@@ -256,10 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         existing.detail,
                         crate::state::AttachmentDetail::SiteToSiteVpn
                     )
-                    && crate::state::same_tags(
-                        &existing.tags,
-                        input.tags.as_deref().unwrap_or_default(),
-                    )
+                    && crate::state::same_tags(&existing.tags, &tags)
             },
             |existing| crate::state::ClientTokenConflict {
                 effect: format!("created attachment {}", existing.id),
@@ -343,7 +345,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             segment_name: claim.segment_name,
             network_function_group_name: claim.network_function_group_name,
             client_token,
-            tags: input.tags.unwrap_or_default(),
+            tags,
             detail: crate::state::AttachmentDetail::SiteToSiteVpn,
         };
         // The attachment waits for its acceptance where the policy asked for one, and is

@@ -193,7 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             available_at: now + crate::state::SETTLE_DELAY,
             updating_until: None,
-            tags: input.tags.unwrap_or_default(),
+            // A resource's tags are a key-to-value map, so the stored list holds each
+            // requested key once, with the last value the request gave for it.
+            tags: crate::state::tags_to_store(input.tags),
         };
         // A newly created global network is `PENDING` until the settle span the clock
         // owes elapses, so the response reports the state the stored record is in now.

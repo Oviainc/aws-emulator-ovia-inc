@@ -147,7 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
@@ -169,6 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // A resource's tags are a key-to-value map, so the list the record is stored with
+        // holds each requested key once, with the last value the request gave for it; the
+        // idempotency comparison below is against that same list.
+        let tags = crate::state::tags_to_store(input.tags.take());
 
         // The peer hangs off the Connect attachment the request names; like every create of
         // this service, a reference that resolves to nothing is a FIELD failure on the
@@ -292,10 +297,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     && existing.inside_cidr_blocks == inside_cidr_blocks
                     && existing.peer_asn == peer_asn
                     && existing.subnet_arn == subnet_arn
-                    && crate::state::same_tags(
-                        &existing.tags,
-                        input.tags.as_deref().unwrap_or_default(),
-                    )
+                    && crate::state::same_tags(&existing.tags, &tags)
             },
             |existing| crate::state::ClientTokenConflict {
                 effect: format!("created Connect peer {}", existing.id),
@@ -358,7 +360,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             available_at: now + crate::state::SETTLE_DELAY,
             client_token,
-            tags: input.tags.unwrap_or_default(),
+            tags,
         };
         // The peer is `CREATING` until the settle span the clock owes elapses, so the
         // response reports the state the stored record is in now.
