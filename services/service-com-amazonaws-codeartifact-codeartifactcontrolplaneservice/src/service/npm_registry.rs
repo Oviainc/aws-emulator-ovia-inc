@@ -1204,7 +1204,8 @@ fn retain_from_upstreams(
     let already: ::std::collections::BTreeSet<String> = held
         .map(|held| held.versions.keys().cloned().collect())
         .unwrap_or_default();
-    let resolved_upstream = upstream_chain(domain, &resolved.repository)
+    let resolved_upstream = domain
+        .upstream_chain(&resolved.repository)
         .into_iter()
         .filter_map(|name| domain.repositories.get(&name))
         .find_map(|upstream| {
@@ -1313,37 +1314,6 @@ fn retain_from_upstreams(
         "a repository retained package versions resolved from an upstream repository"
     );
     record_created(store, resolved, package, &retained, now);
-}
-
-/// Every repository of `domain` that the repository `from` reaches through its upstream
-/// chain, nearest first and each named once.
-///
-/// Breadth first, in each repository's own upstream order, because that is the order a
-/// repository's upstreams are searched in and a nearer copy wins over a further one. The
-/// visited set is what makes a chain that names a repository twice (or loops back) stop,
-/// so the walk is bounded by the repositories the domain holds.
-fn upstream_chain(domain: &crate::state::Domain, from: &str) -> Vec<String> {
-    let mut seen: ::std::collections::BTreeSet<String> =
-        ::std::collections::BTreeSet::from([from.to_string()]);
-    let mut frontier: ::std::collections::VecDeque<String> =
-        ::std::collections::VecDeque::from([from.to_string()]);
-    let mut chain: Vec<String> = Vec::new();
-    while let Some(name) = frontier.pop_front() {
-        let Some(repository) = domain.repositories.get(&name) else {
-            continue;
-        };
-        for upstream in &repository.upstreams {
-            let Some(next) = upstream.repository_name.as_deref() else {
-                continue;
-            };
-            if !seen.insert(next.to_string()) {
-                continue;
-            }
-            chain.push(next.to_string());
-            frontier.push_back(next.to_string());
-        }
-    }
-    chain
 }
 
 /// Record the state change each version in `versions` just underwent in the addressed

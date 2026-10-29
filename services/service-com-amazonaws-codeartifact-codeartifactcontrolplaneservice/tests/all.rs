@@ -87,3 +87,5 @@ mod package_version_state_change_events;
 mod upstream_chain_resolution;
 #[path = "all/package_coordinate_refusals.rs"]
 mod package_coordinate_refusals;
+#[path = "all/copy_from_upstream.rs"]
+mod copy_from_upstream;

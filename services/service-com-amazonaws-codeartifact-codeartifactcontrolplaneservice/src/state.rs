@@ -940,6 +940,42 @@ impl Domain {
         i32::try_from(self.repositories.len()).unwrap_or(i32::MAX)
     }
 
+    /// Every repository of this domain that the repository `from` reaches through its
+    /// upstream chain, nearest first and each named once. `from` itself is NOT in the
+    /// answer: it is the repository the chain is searched on behalf of.
+    ///
+    /// Breadth first, in each repository's own upstream order, because that is the order a
+    /// repository's upstreams are searched in ("the order of the upstream repositories in
+    /// the list determines their priority order when CodeArtifact looks for a requested
+    /// package version" — `UpstreamRepository`) and a nearer copy wins over a further one.
+    /// The visited set is what makes a chain that names a repository twice (or loops back)
+    /// stop, so the walk is bounded by the repositories the domain holds.
+    ///
+    /// This is the ONE traversal every operation that resolves a package through upstreams
+    /// uses — a repository endpoint serving a version it does not hold itself, and a copy
+    /// asked to include the versions upstream of its source.
+    pub fn upstream_chain(&self, from: &str) -> Vec<String> {
+        let mut seen: BTreeSet<String> = BTreeSet::from([from.to_string()]);
+        let mut frontier: VecDeque<String> = VecDeque::from([from.to_string()]);
+        let mut chain: Vec<String> = Vec::new();
+        while let Some(name) = frontier.pop_front() {
+            let Some(repository) = self.repositories.get(&name) else {
+                continue;
+            };
+            for upstream in &repository.upstreams {
+                let Some(next) = upstream.repository_name.as_deref() else {
+                    continue;
+                };
+                if !seen.insert(next.to_string()) {
+                    continue;
+                }
+                chain.push(next.to_string());
+                frontier.push_back(next.to_string());
+            }
+        }
+        chain
+    }
+
     /// The package group most closely associated with the package `path`
     /// ([`package_path`]): of the groups whose pattern matches that path, the MOST
     /// SPECIFIC one — the one matching on the longest literal, with an exact pattern

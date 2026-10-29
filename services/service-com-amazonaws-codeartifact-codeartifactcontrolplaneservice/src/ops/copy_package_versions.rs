@@ -12,7 +12,7 @@
 //!   caller does not hold is `ResourceNotFoundException` (404);
 //! * each named version is decided on its own and reported in ONE of the two modelled
 //!   maps, because this operation answers 200 with a per-version outcome: a version the
-//!   source repository does not hold is `NOT_FOUND`, a version whose stored revision is
+//!   source side does not hold is `NOT_FOUND`, a version whose stored revision is
 //!   not the one `versionRevisions` pinned is `MISMATCHED_REVISION`, a version the
 //!   destination already holds is `ALREADY_EXISTS` unless `allowOverwrite` is set, and a
 //!   destination package whose origin configuration blocks new versions is `NOT_ALLOWED`;
@@ -26,11 +26,13 @@
 //! * the destination package record is created on demand when the copy writes the first
 //!   version of it, and not otherwise — a copy that materializes nothing leaves the
 //!   destination exactly as it was;
-//! * `includeFromUpstream` changes nothing here, and deliberately: this emulator holds a
-//!   package version only in the repository it was published into, and no operation
-//!   resolves a version through a repository's upstreams, so a version the SOURCE
-//!   repository does not itself hold is reported `NOT_FOUND` rather than copied from a
-//!   place nothing was fetched from.
+//! * `includeFromUpstream` widens WHERE the source version is looked for: with the flag set
+//!   the copy resolves the package and each named version through the source repository's
+//!   upstream chain, nearest first, so a version only an upstream repository holds is copied
+//!   with the same per-version reporting, and the whole call is refused
+//!   `ResourceNotFoundException` only when neither the source repository nor any repository
+//!   it reaches holds the package at all; with the flag absent or false the source
+//!   repository's own records are the only place searched.
 //!
 //! ## Shape of an operation
 //!
@@ -333,7 +335,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyPackageVersio
         // taken mutably while the source is still borrowed.
         // ------------------------------------------------------------------
         let candidates = {
-            let Some(source) = domain.repositories.get(&input.source_repository) else {
+            if !domain.repositories.contains_key(&input.source_repository) {
                 return Err(not_found(
                     crate::state::repository_not_found_message(
                         &input.domain,
@@ -343,14 +345,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyPackageVersio
                     &input.source_repository,
                     "repository",
                 ));
+            }
+            // The repositories upstream of the source, which a copy searches only when the
+            // request asked it to: "Set to true to copy packages from repositories that are
+            // upstream from the source repository to the destination repository. The default
+            // setting is false" (`CopyPackageVersionsRequest$includeFromUpstream`). They come
+            // back in the priority order a package resolution walks them in, so the version a
+            // nearer repository holds is the one copied.
+            let upstreams: Vec<String> = if input.include_from_upstream.unwrap_or(false) {
+                domain.upstream_chain(&input.source_repository)
+            } else {
+                Vec::new()
             };
-            let Some(source_package) =
-                source.package(&input.format, input.namespace.as_deref(), &input.package)
-            else {
+            // Where this copy may find the package, NEAREST FIRST: the source repository's
+            // own records, then each reachable upstream's. A repository that does not hold
+            // the package contributes nothing to the search rather than ending it.
+            let source_packages: Vec<&crate::state::Package> =
+                ::std::iter::once(input.source_repository.as_str())
+                    .chain(upstreams.iter().map(String::as_str))
+                    .filter_map(|name| domain.repositories.get(name))
+                    .filter_map(|repository| {
+                        repository.package(
+                            &input.format,
+                            input.namespace.as_deref(),
+                            &input.package,
+                        )
+                    })
+                    .collect();
+            if source_packages.is_empty() {
                 return Err(not_found(
                     // The sentence the VERSION-addressing operations state for a package
                     // absent from the repository they addressed — here the SOURCE
-                    // repository, the one the versions were looked for in.
+                    // repository, the one the versions were looked for through.
                     crate::state::package_coordinate_not_found_message(
                         &input.format,
                         input.namespace.as_deref(),
@@ -360,7 +386,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyPackageVersio
                     &input.package,
                     "package",
                 ));
-            };
+            }
 
             let mut candidates: Vec<(String, crate::state::PackageVersion)> = Vec::new();
             // The versions already decided, as a SET: the answers are maps keyed by
@@ -373,7 +399,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyPackageVersio
                     continue;
                 }
 
-                let Some(stored) = source_package.versions.get(version) else {
+                let Some(stored) = source_packages
+                    .iter()
+                    .find_map(|package| package.versions.get(version))
+                else {
                     failed.insert(
                         version.clone(),
                         version_error(
