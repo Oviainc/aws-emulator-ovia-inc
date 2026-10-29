@@ -16,9 +16,10 @@
 //!   transient 409 a retry could win;
 //! * a value that breaks the `@pattern` or `@length` declared on a BODY member never
 //!   reaches the operation: the request-body validator refuses it with
-//!   `BadRequestException` (400), stating the declared regex or bound and the value that
-//!   failed it. The same layer's clause for a value outside an enumerated SET is pinned by
-//!   `tests/all/body_enum_refusals.rs`.
+//!   `BadRequestException` (400), stating the regex it measures that member against or the
+//!   declared bound, and the value that failed it. Which regex it states for which member
+//!   is the rule `tests/all/reported_regex.rs` spans; the same layer's clause for a value
+//!   outside an enumerated SET is pinned by `tests/all/body_enum_refusals.rs`.
 
 use std::time::Duration;
 
@@ -37,14 +38,19 @@ const ARN_PREFIX: &str = "arn:aws:route53-recovery-control::000000000000:";
 /// request made after it works on a fully deployed tree.
 const PAST_DEPLOYMENT: Duration = Duration::from_millis(900);
 
-/// The regex the model declares for every name and token member in this service's
-/// request bodies: `__stringMin1Max64PatternS` / `__stringMin0Max256PatternS`
-/// (`smithy_query(query="operation",operation="CreateCluster")`).
-const NAME_PATTERN: &str = r"^\S+$";
+/// The regex the request-body validator reports for a string member of this service's
+/// general-purpose string type — every name, client token and tag value a request body
+/// carries (`__stringMin1Max64PatternS` / `__stringMin0Max256PatternS`,
+/// `smithy_query(query="operation",operation="CreateCluster")`, published as `^\S+$`):
+/// the printable-ASCII class that published expression generalises. Restated here
+/// independently of the service's own code; `tests/all/reported_regex.rs` spans the rule
+/// that picks it.
+const VALIDATED_STRING_CLASS: &str = r#"^((?![;'\s<>&"])[\u0021-\u007E])+$"#;
 
 /// The regex the model declares for the ARN members a request body carries:
 /// `__stringMin1Max256PatternAZaZ09`
-/// (`smithy_query(query="operation",operation="UpdateCluster")`).
+/// (`smithy_query(query="operation",operation="UpdateCluster")`) — already a concrete
+/// character class, which the validator reports as published.
 const ARN_PATTERN: &str = r"^[A-Za-z0-9:\/_-]*$";
 
 /// The sentence the request-body validator refuses a value outside a declared regex
@@ -698,11 +704,12 @@ async fn a_delete_is_refused_while_dependents_remain() {
 }
 
 /// A body value outside the `@pattern` or `@length` the model declares for its member is
-/// refused by the request-body validator: `BadRequestException` (400), stating the
-/// declared rule and the value that failed it, with nothing created.
+/// refused by the request-body validator: `BadRequestException` (400), stating the regex
+/// it measured the value against or the declared bound, and the value that failed it, with
+/// nothing created.
 ///
-/// Rows span the two declared patterns (the name/token one and the ARN one), both
-/// `@length` bounds, the member kinds a body carries (a plain member, a map value, a
+/// Rows span the two string types a body carries (the name/token one and the ARN one),
+/// both `@length` bounds, the member kinds a body carries (a plain member, a map value, a
 /// member on a create and on an update) and several forms of offending whitespace.
 #[tokio::test]
 async fn a_body_value_outside_a_declared_string_constraint_is_a_bad_request() {
@@ -724,21 +731,21 @@ async fn a_body_value_outside_a_declared_string_constraint_is_a_bad_request() {
             "POST",
             "/cluster",
             json!({ "ClusterName": "has a space" }),
-            regex_clause(NAME_PATTERN, "has a space"),
+            regex_clause(VALIDATED_STRING_CLASS, "has a space"),
         ),
         (
             "ClusterName with a tab",
             "POST",
             "/cluster",
             json!({ "ClusterName": "has\ta tab" }),
-            regex_clause(NAME_PATTERN, "has\ta tab"),
+            regex_clause(VALIDATED_STRING_CLASS, "has\ta tab"),
         ),
         (
             "an empty ClusterName",
             "POST",
             "/cluster",
             json!({ "ClusterName": "" }),
-            regex_clause(NAME_PATTERN, ""),
+            regex_clause(VALIDATED_STRING_CLASS, ""),
         ),
         (
             "ClusterName one past the length maximum",
@@ -752,14 +759,14 @@ async fn a_body_value_outside_a_declared_string_constraint_is_a_bad_request() {
             "POST",
             "/cluster",
             json!({ "ClusterName": "tokened", "ClientToken": "two words" }),
-            regex_clause(NAME_PATTERN, "two words"),
+            regex_clause(VALIDATED_STRING_CLASS, "two words"),
         ),
         (
             "a Tags value with a space",
             "POST",
             "/cluster",
             json!({ "ClusterName": "tagged", "Tags": { "team": "two words" } }),
-            regex_clause(NAME_PATTERN, "two words"),
+            regex_clause(VALIDATED_STRING_CLASS, "two words"),
         ),
         (
             "ControlPanelName one past the length maximum",
@@ -773,14 +780,14 @@ async fn a_body_value_outside_a_declared_string_constraint_is_a_bad_request() {
             "POST",
             "/controlpanel",
             json!({ "ClusterArn": cluster_arn, "ControlPanelName": "two\nlines" }),
-            regex_clause(NAME_PATTERN, "two\nlines"),
+            regex_clause(VALIDATED_STRING_CLASS, "two\nlines"),
         ),
         (
             "RoutingControlName with a space",
             "POST",
             "/routingcontrol",
             json!({ "ClusterArn": cluster_arn, "RoutingControlName": "has a space" }),
-            regex_clause(NAME_PATTERN, "has a space"),
+            regex_clause(VALIDATED_STRING_CLASS, "has a space"),
         ),
         (
             "a ClusterArn outside the ARN pattern, on an update",

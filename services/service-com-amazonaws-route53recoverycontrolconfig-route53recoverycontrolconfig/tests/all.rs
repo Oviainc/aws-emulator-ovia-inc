@@ -25,6 +25,8 @@ mod not_found_message;
 mod recovery_control_lifecycle;
 #[path = "all/rejection_error_classes.rs"]
 mod rejection_error_classes;
+#[path = "all/reported_regex.rs"]
+mod reported_regex;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_cluster.rs"]

@@ -56,6 +56,9 @@
 //! schema, and it quotes the value the CALLER submitted — neither is reachable from the
 //! `override_refusal` seam, which is handed the violations alone.
 //!
+//! A regex clause quotes the expression THAT VALIDATOR measures the member against, which
+//! is not always the one the model publishes for it: see [`validated_expression`].
+//!
 //! Everything else is this SERVICE's own refusal, and every operation of this model
 //! declares `ValidationException` (400) for it — the code the framework's default
 //! already names — so it keeps the framework's wording: a `@range` on a `@httpQuery`
@@ -73,6 +76,45 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The two expressions the MODEL publishes for this service's general-purpose string type
+/// — the type every name, client token and tag value in a request body targets
+/// (`__stringMin1Max32PatternS` / `__stringMin1Max64PatternS` /
+/// `__stringMin0Max256PatternS` carry the first, `__stringMin1Max8096PatternS` the second;
+/// `smithy_query(query="shape",shape="<type>")`).
+///
+/// Both spell one published class — a run of non-whitespace characters, which the
+/// documentation states as "any non-white space character" — and both are GENERALISATIONS
+/// of the class the request-body validator actually applies to such a member, which is
+/// [`VALIDATED_STRING_CLASS`].
+const PUBLISHED_UNRESTRICTED_STRING: [&str; 2] = [r"^\S+$", r"^[\S]*$"];
+
+/// The expression this service's request-body validator measures a string member of that
+/// general-purpose type against, and therefore the one its clause quotes: a non-empty run
+/// of printable ASCII (U+0021..U+007E) with the characters it refuses outright excluded.
+///
+/// Strictly narrower than either published spelling, and it rejects every value they do —
+/// the empty string, and any value carrying whitespace, since no whitespace character is
+/// printable ASCII — so the clause it builds states a mismatch that holds of the value it
+/// quotes.
+const VALIDATED_STRING_CLASS: &str = r#"^((?![;'\s<>&"])[\u0021-\u007E])+$"#;
+
+/// The expression the regex clause quotes for a member whose declared `@pattern` the
+/// submitted value broke: the one the VALIDATOR measures it against.
+///
+/// For this service's general-purpose string type that is [`VALIDATED_STRING_CLASS`] and
+/// not either published spelling of [`PUBLISHED_UNRESTRICTED_STRING`], so a caller
+/// repairing a value against the quoted expression gets one the service accepts. Every
+/// other type's declared expression is already a concrete character class the validator
+/// applies as published (the ARN members' `^[A-Za-z0-9:\/_-]*$`), so it is quoted as the
+/// model writes it.
+fn validated_expression(declared: &str) -> &str {
+    if PUBLISHED_UNRESTRICTED_STRING.contains(&declared) {
+        VALIDATED_STRING_CLASS
+    } else {
+        declared
+    }
+}
+
 /// The clause this service's front door states for one body violation, or `None` when it
 /// states none.
 ///
@@ -88,8 +130,11 @@ fn clause(violation: &Violation, echo: &SubmittedEcho) -> Option<String> {
         return None;
     };
     match &violation.kind {
-        // The expression as the MODEL writes it, and the string the caller submitted.
-        ViolationKind::Pattern(pattern) => Some(pattern_mismatch(pattern, value)),
+        // The expression the VALIDATOR measures the member against, and the string the
+        // caller submitted.
+        ViolationKind::Pattern(pattern) => {
+            Some(pattern_mismatch(validated_expression(pattern), value))
+        }
         // `@length` counts CHARACTERS, which is what the constraint walk counted. Every
         // `@length` in this model sits on a string shape — no list or map member of any
         // input declares one (`smithy_query(query="closure", ...)`) — so a length clause
@@ -107,12 +152,12 @@ fn clause(violation: &Violation, echo: &SubmittedEcho) -> Option<String> {
 }
 
 /// How this service's front door words a body it refused: the validator's class and its
-/// bracketed list of clauses, every variable part — the declared regex or bound, and the
-/// value that failed it — taken from the request and the model.
+/// bracketed list of clauses, every variable part — the regex or bound it measured the
+/// value against, and the value that failed it — taken from the request and the validator.
 ///
 /// A member that broke its `@pattern` as well as a `@length` bound is stated once, by the
-/// regex clause: the declared pattern is what the validator measures such a value against
-/// (`^\S+$` already excludes the empty string that a `@length` minimum of 1 does).
+/// regex clause: the regex is what the validator measures such a value against, and the
+/// class it admits already excludes the empty string that a `@length` minimum of 1 does.
 ///
 /// `None` when any violation is one this layer states no clause for: such a request is
 /// left whole to the service's own `ValidationException` rather than reported half in one
