@@ -36,6 +36,11 @@
 //!   database: list, create-or-replace, read, change and delete.
 //! * `/pools` and `/pools/{name}` — its slot pools, seeded with Apache Airflow's own
 //!   `default_pool`: list, create, read, change and delete.
+//! * Neither collection holds a sub-resource, so the entity a path addresses is named by
+//!   the WHOLE remainder of that path after the collection's own segment: a key that
+//!   itself carries the path separator addresses the entity stored under it, and the
+//!   writes refuse a key no such path can name, so nothing is stored that a later read,
+//!   change or delete cannot reach.
 //! * `GET /dags` — the environment's DAG inventory, which is EMPTY and whose
 //!   `total_entries` is therefore 0, so every path under `/dags/{dag_id}` resolves to
 //!   nothing: a DAG and its `dag_id` are defined by the Python DAG file the environment
@@ -292,7 +297,7 @@ impl<'r> Call<'r> {
             path: input.path.as_str(),
             segments: input
                 .path
-                .split('/')
+                .split(SEPARATOR)
                 .filter(|segment| !segment.is_empty())
                 .collect(),
             query: input.query_parameters.as_ref(),
@@ -319,6 +324,11 @@ struct AirflowAnswer {
     status: i32,
     document: Option<Document>,
 }
+
+/// What an Apache Airflow REST API path is built from, and so also what a stored entity
+/// key is addressed through: the path is split on it, and the segments after a
+/// collection's own are rejoined with it to name the entity inside that collection.
+const SEPARATOR: &str = "/";
 
 /// Apache Airflow's `GET` method, the only one its read-only endpoints serve.
 const GET: &str = "GET";
@@ -370,23 +380,32 @@ fn serve(environment: &mut EnvironmentRecord, call: &Call<'_>) -> AirflowAnswer 
             POST => set_variable(&mut environment.airflow, call),
             _ => method_not_allowed(call),
         },
-        ["variables", key] => match call.method {
-            GET => read_variable(&environment.airflow, key),
-            PATCH => change_variable(&mut environment.airflow, key, call),
-            DELETE => delete_variable(&mut environment.airflow, key),
-            _ => method_not_allowed(call),
-        },
+        // Every segment after `variables` belongs to the KEY, because this collection
+        // holds no sub-resource a further segment could address: see [`entity_key`].
+        ["variables", key @ ..] => {
+            let key = entity_key(key);
+            match call.method {
+                GET => read_variable(&environment.airflow, &key),
+                PATCH => change_variable(&mut environment.airflow, &key, call),
+                DELETE => delete_variable(&mut environment.airflow, &key),
+                _ => method_not_allowed(call),
+            }
+        }
         ["pools"] => match call.method {
             GET => list_pools(&environment.airflow, call),
             POST => create_pool(&mut environment.airflow, call),
             _ => method_not_allowed(call),
         },
-        ["pools", name] => match call.method {
-            GET => read_pool(&environment.airflow, name),
-            PATCH => change_pool(&mut environment.airflow, name, call),
-            DELETE => delete_pool(&mut environment.airflow, name),
-            _ => method_not_allowed(call),
-        },
+        // A pool's name is addressed the same way, and for the same reason.
+        ["pools", name @ ..] => {
+            let name = entity_key(name);
+            match call.method {
+                GET => read_pool(&environment.airflow, &name),
+                PATCH => change_pool(&mut environment.airflow, &name, call),
+                DELETE => delete_pool(&mut environment.airflow, &name),
+                _ => method_not_allowed(call),
+            }
+        }
         ["dags"] => match call.method {
             GET => list_dags(call),
             _ => method_not_allowed(call),
@@ -645,6 +664,20 @@ fn delete_pool(metadata: &mut AirflowMetadata, name: &str) -> AirflowAnswer {
     }
 }
 
+/// The key the entity a path addresses is stored under: the segments after its
+/// collection's own, rejoined with the [`SEPARATOR`] the path was split on.
+///
+/// An Apache Airflow variable key and a pool name are free text that may itself carry
+/// that separator, and neither collection holds a sub-resource a further segment could
+/// address, so every segment after the collection's own is part of the one key — which is
+/// what makes every key a write stores addressable by the very path grammar that stored
+/// it. Empty segments were dropped when the path was split, so a doubled or trailing
+/// separator addresses the same entity the plain path does, and the writes refuse a key
+/// that would need one ([`addressable`]).
+fn entity_key(segments: &[&str]) -> String {
+    segments.join(SEPARATOR)
+}
+
 /// The answer to a call on a path this API serves with a method it does not.
 fn method_not_allowed(call: &Call<'_>) -> AirflowAnswer {
     AirflowAnswer::problem(
@@ -773,6 +806,7 @@ fn requested_variable(body: Option<&Document>) -> Result<AirflowVariable, Airflo
     let value = required_text(body, "value")?;
     let description = optional_text(body, "description")?;
     bounded(&key, "key", crate::state::MAX_AIRFLOW_KEY_LENGTH)?;
+    addressable(&key, "key")?;
     bounded(&value, "value", crate::state::MAX_AIRFLOW_VALUE_LENGTH)?;
     if let Some(description) = description.as_deref() {
         bounded(
@@ -806,6 +840,7 @@ fn requested_pool(body: Option<&Document>) -> Result<AirflowPool, AirflowAnswer>
     }
     let description = optional_text(body, "description")?;
     bounded(&name, "name", crate::state::MAX_AIRFLOW_KEY_LENGTH)?;
+    addressable(&name, "name")?;
     if let Some(description) = description.as_deref() {
         bounded(
             description,
@@ -859,6 +894,25 @@ fn optional_text(body: &Document, name: &str) -> Result<Option<String>, AirflowA
             "the member {name:?} must be a string"
         ))),
     }
+}
+
+/// Refuse a key this API could store but no path of it could name again.
+///
+/// An entity is addressed by the segments of its path, which carry no empty one
+/// ([`Call::new`]), so a key with an empty [`SEPARATOR`]-delimited segment — one that
+/// opens or closes with the separator, or carries two in a row — is a key no path splits
+/// into: storing it would put an entity in the collection that the API's own read, change
+/// and delete could never reach, and whose slot nothing could free. Every other key,
+/// including one that carries the separator between segments, is addressable and taken.
+fn addressable(value: &str, name: &str) -> Result<(), AirflowAnswer> {
+    if value.split(SEPARATOR).any(str::is_empty) {
+        return Err(AirflowAnswer::bad_request(format!(
+            "the {name} {value:?} is not one this API could address again: a {name} must \
+             neither begin nor end with {SEPARATOR:?} nor carry an empty segment between \
+             two of them"
+        )));
+    }
+    Ok(())
 }
 
 /// Refuse a value this store will not hold at that length.
