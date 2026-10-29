@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPORTS the resource-based policy stored on the Kinesis resource the request's
+//! `ResourceARN` names, inside the region the request was signed for, as the modelled
+//! `Policy` — the document `PutResourcePolicy` attached to that very resource, byte for
+//! byte, since that is what "a policy attached to the specified data stream or consumer" is.
+//! A pure read: nothing it does changes what a later caller sees.
+//!
+//! One lookup spans every resource kind a `ResourceARN` may name
+//! (`^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`), the same one the attach and the
+//! detach resolve through
+//! ([`crate::state::ComAmazonawsKinesisKinesis20131202State::resource_policy_by_arn`]), so a
+//! read reports the policy of the resource a write wrote it to. There is nothing to report
+//! for an ARN this account and region hold no resource under, and nothing to report for a
+//! resource that carries no policy: both are the modelled `ResourceNotFoundException`, each
+//! in its own wording.
 //!
 //! ## Shape of an operation
 //!
@@ -94,7 +100,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kinesis-kinesis-2013120
 // here — hence the `GetResourcePolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#GetResourcePolicy")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#GetResourcePolicy",
+    // `InternalFailureException` is widened in with `extra_errors`, exactly as
+    // `ListTagsForResource` widens it: this SERVICE models it ("The processing of the request
+    // failed because of an unknown error, exception, or failure"), the operation shape does
+    // not list it, and it is the only honest answer for a service mounted on an engine that
+    // holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum GetResourcePolicyErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -102,6 +116,7 @@ pub enum GetResourcePolicyErrorModeled {
     LimitExceededException(LimitExceededException),
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -117,6 +132,16 @@ impl From<GetResourcePolicyErrorModeled> for GetResourcePolicyError {
     fn from(modeled: GetResourcePolicyErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The modelled refusal this read answers with when there is nothing to report: the one
+/// error class the model gives it for an absence, carrying the sentence the caller is told
+/// what was not found by.
+fn not_found(message: String) -> GetResourcePolicyError {
+    GetResourcePolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
 }
 
 /// The `GetResourcePolicy` operation.
@@ -155,18 +180,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourcePolicy"))
+        // A Kinesis resource "is also scoped by Amazon Web Services Region", so the region
+        // the request was signed for is the region whose resources it addresses.
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetResourcePolicyError::from(GetResourcePolicyErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the stream store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let store = state.lock();
+        // `StreamId` is documented "Not Implemented. Reserved for future use", so no resource
+        // carries one and it names nothing: the `ResourceARN` is what this operation
+        // addresses a resource by, whichever kind that ARN names.
+        let attached = store
+            .resource_policy_by_arn(
+                ::std::time::SystemTime::now(),
+                &region,
+                input.resource_arn.as_str(),
+            )
+            .ok_or_else(|| {
+                not_found(crate::state::resource_not_found_message(&input.resource_arn))
+            })?
+            .clone();
+
+        // `Policy` is a REQUIRED output member, so a resource carrying none has nothing this
+        // operation could answer with: the absent policy is reported as absent rather than as
+        // an empty document.
+        let policy = attached.ok_or_else(|| {
+            not_found(crate::state::resource_policy_not_found_message(
+                &input.resource_arn,
+            ))
+        })?;
+
+        Ok(GetResourcePolicyOutput { policy })
     }
 }

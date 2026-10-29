@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ATTACHES the request's `Policy` to the Kinesis resource its `ResourceARN` names, inside
+//! the region the request was signed for: the document is stored on that resource as it
+//! arrived, replacing whatever policy the resource carried, and that stored document is what
+//! `GetResourcePolicy` then reports and `DeleteResourcePolicy` removes. ONE policy per
+//! resource, resolved through the one lookup all three share
+//! ([`crate::state::ComAmazonawsKinesisKinesis20131202State::resource_policy_by_arn_mut`]),
+//! so an attach writes the slot a read reports — whichever resource kind a `ResourceARN` may
+//! name (`^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`).
+//!
+//! An ARN this account and region hold no resource under is the modelled
+//! `ResourceNotFoundException` ("If you receive a ResourceNotFoundException, check to see if
+//! you passed a valid stream or consumer resource"), and a `Policy` that is no policy
+//! document — not a JSON object, or larger than this emulator retains — is the modelled
+//! `InvalidArgumentException`.
 //!
 //! ## Shape of an operation
 //!
@@ -119,7 +125,15 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutResourcePolicyOutput 
 // here — hence the `PutResourcePolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#PutResourcePolicy")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#PutResourcePolicy",
+    // `InternalFailureException` is widened in with `extra_errors`, exactly as
+    // `ListTagsForResource` widens it: this SERVICE models it ("The processing of the request
+    // failed because of an unknown error, exception, or failure"), the operation shape does
+    // not list it, and it is the only honest answer for a service mounted on an engine that
+    // holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum PutResourcePolicyErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -127,6 +141,7 @@ pub enum PutResourcePolicyErrorModeled {
     LimitExceededException(LimitExceededException),
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -142,6 +157,87 @@ impl From<PutResourcePolicyErrorModeled> for PutResourcePolicyError {
     fn from(modeled: PutResourcePolicyErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the resource lives in, and how the call
+/// ended. No resource ARN and no policy: a log sink needs neither to attribute the change,
+/// and a policy document is caller data.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "PutResourcePolicy",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
+/// The modelled refusal for a `Policy` this service could never report back as a policy:
+/// "A specified parameter exceeds its restrictions, is not supported, or can't be used"
+/// (`InvalidArgumentException`).
+fn invalid_argument(message: String) -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Check the request's `Policy` is a policy document this service can store and report
+/// back: bounded in size, and a JSON object, since a resource-based policy "is formatted as
+/// a JSON string" naming "the identity of the principal and the actions allowed on this
+/// resource" (`PutResourcePolicyInput$Policy`).
+///
+/// The size is checked BEFORE the document is parsed, so an oversized one is refused without
+/// being walked.
+fn check_policy_document(policy: &str) -> Result<(), PutResourcePolicyError> {
+    if policy.len() > crate::state::MAX_RESOURCE_POLICY_BYTES {
+        return Err(invalid_argument(crate::state::policy_too_large_message(
+            policy.len(),
+        )));
+    }
+    match ::serde_json::from_str::<::serde_json::Value>(policy) {
+        Ok(::serde_json::Value::Object(_)) => Ok(()),
+        Ok(_) => Err(invalid_argument(crate::state::policy_not_json_message(
+            "the value sent is not a JSON object",
+        ))),
+        // What is wrong with the text is stated as the SERVICE states it: the parser's own
+        // diagnostic is a detail of the crate that read the document, not of this API.
+        Err(_) => Err(invalid_argument(crate::state::policy_not_json_message(
+            "the value sent is not valid JSON",
+        ))),
+    }
+}
+
+/// Attach the request's policy to the resource its ARN names, or answer the modelled refusal
+/// that stands in the way. The whole write lives here so the caller holds the store's lock
+/// for exactly this long.
+fn apply_attachment(
+    store: &mut crate::state::ComAmazonawsKinesisKinesis20131202State,
+    region: &str,
+    now: ::std::time::SystemTime,
+    input: &PutResourcePolicyInput,
+) -> Result<(), PutResourcePolicyError> {
+    // `StreamId` is documented "Not Implemented. Reserved for future use", so no resource
+    // carries one and it names nothing: the `ResourceARN` is what this operation addresses a
+    // resource by, whichever kind that ARN names.
+    let slot = store
+        .resource_policy_by_arn_mut(now, region, input.resource_arn.as_str())
+        .ok_or_else(|| {
+            PutResourcePolicyError::from(PutResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(&input.resource_arn)),
+                },
+            ))
+        })?;
+
+    // A resource carries ONE policy, so an attach REPLACES the document it carried: "a
+    // policy attached to the specified data stream or consumer" (`GetResourcePolicy`) is
+    // what the last attach wrote. Stored as it arrived, so a read reports the caller's own
+    // document rather than one this service re-rendered.
+    *slot = Some(input.policy.clone());
+    Ok(())
 }
 
 /// The `PutResourcePolicy` operation.
@@ -180,18 +276,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region whose resources this request
+        // addresses, since a Kinesis resource "is also scoped by Amazon Web Services Region".
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            PutResourcePolicyError::from(PutResourcePolicyErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the stream store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // The document is checked before the store is reached, so a refused request takes no
+        // lock and leaves nothing behind.
+        if let Err(refusal) = check_policy_document(&input.policy) {
+            audit(&akid, &region, "refused");
+            return Err(refusal);
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let outcome = apply_attachment(&mut store, &region, now, &input);
+        drop(store);
+
+        audit(
+            &akid,
+            &region,
+            if outcome.is_ok() { "attached" } else { "refused" },
+        );
+        // `PutResourcePolicy` models no output members, so a served request answers the
+        // modelled empty body.
+        outcome.map(|()| PutResourcePolicyOutput)
     }
 }

@@ -470,6 +470,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // No consumer is registered with the stream until `RegisterStreamConsumer`
             // registers one.
             consumers: Vec::new(),
+            // A resource-based policy is `PutResourcePolicy`'s to attach, so a stream this
+            // call has just minted carries none.
+            policy: None,
         };
 
         store.streams.insert(

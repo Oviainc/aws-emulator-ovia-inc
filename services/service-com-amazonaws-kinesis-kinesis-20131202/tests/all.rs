@@ -47,6 +47,8 @@ mod max_record_size;
 mod merge_adjacency;
 #[path = "all/record_flow.rs"]
 mod record_flow;
+#[path = "all/resource_policies.rs"]
+mod resource_policies;
 #[path = "all/resource_tag_listing.rs"]
 mod resource_tag_listing;
 #[path = "all/resource_tags.rs"]

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! DETACHES the resource-based policy stored on the Kinesis resource the request's
+//! `ResourceARN` names, inside the region the request was signed for: the document
+//! `PutResourcePolicy` attached is removed, so the resource carries none again and
+//! `GetResourcePolicy` reports none. Resolved through the one lookup all three resource-policy
+//! operations share
+//! ([`crate::state::ComAmazonawsKinesisKinesis20131202State::resource_policy_by_arn_mut`]), so
+//! a detach clears the slot a read reports — whichever resource kind a `ResourceARN` may name
+//! (`^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`).
+//!
+//! There is nothing to delete for an ARN this account and region hold no resource under, and
+//! nothing to delete for a resource that carries no policy: both are the modelled
+//! `ResourceNotFoundException`, each in its own wording.
 //!
 //! ## Shape of an operation
 //!
@@ -108,7 +112,15 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteResourcePolicyOutp
 // here — hence the `DeleteResourcePolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#DeleteResourcePolicy")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#DeleteResourcePolicy",
+    // `InternalFailureException` is widened in with `extra_errors`, exactly as
+    // `ListTagsForResource` widens it: this SERVICE models it ("The processing of the request
+    // failed because of an unknown error, exception, or failure"), the operation shape does
+    // not list it, and it is the only honest answer for a service mounted on an engine that
+    // holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum DeleteResourcePolicyErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -116,6 +128,7 @@ pub enum DeleteResourcePolicyErrorModeled {
     LimitExceededException(LimitExceededException),
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -131,6 +144,58 @@ impl From<DeleteResourcePolicyErrorModeled> for DeleteResourcePolicyError {
     fn from(modeled: DeleteResourcePolicyErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the resource lives in, and how the call
+/// ended. No resource ARN and no policy: a log sink needs neither to attribute the change,
+/// and a policy document is caller data.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "DeleteResourcePolicy",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
+/// The modelled refusal this delete answers with when there is nothing to delete: the one
+/// error class the model gives it for an absence, carrying the sentence the caller is told
+/// what was not found by.
+fn not_found(message: String) -> DeleteResourcePolicyError {
+    DeleteResourcePolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Take the policy off the resource the request's ARN names, or answer the modelled refusal
+/// that stands in the way. The whole write lives here so the caller holds the store's lock
+/// for exactly this long.
+fn apply_detachment(
+    store: &mut crate::state::ComAmazonawsKinesisKinesis20131202State,
+    region: &str,
+    now: ::std::time::SystemTime,
+    input: &DeleteResourcePolicyInput,
+) -> Result<(), DeleteResourcePolicyError> {
+    // `StreamId` is documented "Not Implemented. Reserved for future use", so no resource
+    // carries one and it names nothing: the `ResourceARN` is what this operation addresses a
+    // resource by, whichever kind that ARN names.
+    let slot = store
+        .resource_policy_by_arn_mut(now, region, input.resource_arn.as_str())
+        .ok_or_else(|| not_found(crate::state::resource_not_found_message(&input.resource_arn)))?;
+
+    // A resource that carries no policy has none to delete, which is the absence refusal
+    // rather than a served no-op: the delete is "a policy for the specified data stream or
+    // consumer" (`DeleteResourcePolicy`), and there is no such policy.
+    if slot.take().is_none() {
+        return Err(not_found(crate::state::resource_policy_not_found_message(
+            &input.resource_arn,
+        )));
+    }
+    Ok(())
 }
 
 /// The `DeleteResourcePolicy` operation.
@@ -169,18 +234,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region whose resources this request
+        // addresses, since a Kinesis resource "is also scoped by Amazon Web Services Region".
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            DeleteResourcePolicyError::from(
+                DeleteResourcePolicyErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some("the stream store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let outcome = apply_detachment(&mut store, &region, now, &input);
+        drop(store);
+
+        audit(
+            &akid,
+            &region,
+            if outcome.is_ok() { "detached" } else { "refused" },
+        );
+        // `DeleteResourcePolicy` models no output members, so a served request answers the
+        // modelled empty body.
+        outcome.map(|()| DeleteResourcePolicyOutput)
     }
 }

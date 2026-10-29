@@ -848,6 +848,11 @@ pub struct ConsumerRecord {
     /// The tags the registration carried: "Tags will take effect from the CREATING status
     /// of the consumer" (`RegisterStreamConsumer`).
     pub tags: HashMap<String, String>,
+    /// The resource-based policy attached to this consumer, `None` while none is
+    /// ([`ComAmazonawsKinesisKinesis20131202State::resource_policy_by_arn`]): a policy is
+    /// "attached to the specified data stream or consumer" (`GetResourcePolicy`), so the
+    /// consumer it governs is where it is stored, and it is gone when the consumer is.
+    pub policy: Option<String>,
 }
 
 impl ConsumerRecord {
@@ -867,6 +872,9 @@ impl ConsumerRecord {
             // is due is stored rather than slept on.
             active_at: at + CONSUMER_ACTIVATION_DELAY,
             tags,
+            // A resource-based policy is `PutResourcePolicy`'s to attach, so a consumer a
+            // registration has just minted carries none.
+            policy: None,
         }
     }
 
@@ -976,6 +984,10 @@ pub struct Stream {
     /// once its removal falls due: "When you delete a stream, any shards in that stream are
     /// also deleted" (`DeleteStream`), and a consumer is registered with the stream.
     pub consumers: Vec<ConsumerRecord>,
+    /// The resource-based policy attached to the stream itself, `None` while none is: a
+    /// policy is "attached to the specified data stream or consumer" (`GetResourcePolicy`),
+    /// so the stream it governs is where it is stored, and it is gone when the stream is.
+    pub policy: Option<String>,
 }
 
 impl Stream {
@@ -1419,6 +1431,15 @@ impl Stream {
         self.consumers.iter().find(|consumer| consumer.arn == arn)
     }
 
+    /// [`Self::consumer_by_arn`] for a caller that WRITES the record it finds — the lookup a
+    /// resource-policy write makes, so the consumer a write attaches a policy to is the one a
+    /// read of that policy reports.
+    pub fn consumer_by_arn_mut(&mut self, arn: &str) -> Option<&mut ConsumerRecord> {
+        self.consumers
+            .iter_mut()
+            .find(|consumer| consumer.arn == arn)
+    }
+
     /// Every consumer registered with the stream, ordered by name.
     ///
     /// A listing of them is paged by an opaque cursor that names the consumer the next page
@@ -1699,6 +1720,12 @@ pub struct Channel {
     /// change is applied, Amazon Kinesis Data Streams sets the channel back to the ACTIVE
     /// state" (`UpdateChannel`). `None` on a channel no change has been accepted for.
     pub updating_until: Option<SystemTime>,
+    /// The resource-based policy attached to the channel, `None` while none is. A
+    /// `ResourceARN` the resource-policy operations address a resource by names a resource of
+    /// either kind this service holds
+    /// (`^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`), so a channel holds one the
+    /// same way a stream does.
+    pub policy: Option<String>,
 }
 
 impl Channel {
@@ -2314,6 +2341,69 @@ impl ComAmazonawsKinesisKinesis20131202State {
             .map(Stream::tags_ordered)
             .or_else(|| self.channel_by_arn(region, arn).map(Channel::tags_ordered))
     }
+
+    /// The resource-policy slot of the Kinesis resource `arn` names at `now` — `Some(None)`
+    /// for a resource carrying no policy — or `None` when this account and region hold no
+    /// resource under that ARN.
+    ///
+    /// A policy is "attached to the specified data stream or consumer"
+    /// (`GetResourcePolicy`) and the `ResourceARN` it is addressed by names a resource of
+    /// either kind this ARN may name
+    /// (`^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`), so ONE lookup spans every
+    /// kind of resource this service holds, exactly as [`Self::resource_tags_by_arn`] does:
+    /// whichever kind the ARN names, the policy answered is the one stored on that very
+    /// resource.
+    pub fn resource_policy_by_arn(
+        &self,
+        now: SystemTime,
+        region: &str,
+        arn: &str,
+    ) -> Option<&Option<String>> {
+        if let Some(channel) = self.channel_by_arn(region, arn) {
+            return Some(&channel.policy);
+        }
+        self.streams
+            .values()
+            .filter(|stream| stream.region == region && stream.is_held(now))
+            .find_map(|stream| {
+                if stream.arn == arn {
+                    Some(&stream.policy)
+                } else {
+                    stream.consumer_by_arn(arn).map(|consumer| &consumer.policy)
+                }
+            })
+    }
+
+    /// [`Self::resource_policy_by_arn`] for a caller that WRITES the slot it finds: one rule,
+    /// one lookup, so a policy an attach writes and a detach clears is the very one a read
+    /// reports.
+    pub fn resource_policy_by_arn_mut(
+        &mut self,
+        now: SystemTime,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut Option<String>> {
+        // Which kind the ARN names is decided through the immutable lookups, so a write
+        // addresses a resource by exactly the rule a read does; only the record it resolved
+        // is then borrowed mutably.
+        if self.channel_by_arn(region, arn).is_some() {
+            return self
+                .channel_by_arn_mut(region, arn)
+                .map(|channel| &mut channel.policy);
+        }
+        self.streams
+            .values_mut()
+            .filter(|stream| stream.region == region && stream.is_held(now))
+            .find_map(|stream| {
+                if stream.arn == arn {
+                    Some(&mut stream.policy)
+                } else {
+                    stream
+                        .consumer_by_arn_mut(arn)
+                        .map(|consumer| &mut consumer.policy)
+                }
+            })
+    }
 }
 
 /// Why a write places a record in no shard of the stream it addresses. The operation maps
@@ -2897,16 +2987,66 @@ pub fn channel_not_found_message(identifier: &str) -> String {
 }
 
 /// How a read states that this account and region hold no Kinesis resource under the ARN
-/// the request named, for an operation whose `ResourceARN` addresses a resource of EITHER
-/// kind (`^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`): the sentence this service
-/// already states for the kind that ARN names, so one ARN is refused in one wording whatever
-/// operation it reached.
+/// the request named, for an operation whose `ResourceARN` addresses a resource of ANY kind
+/// it may name (`^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`, which a `ConsumerARN`
+/// satisfies too): the sentence this service already states for the kind that ARN names, so
+/// one ARN is refused in one wording whatever operation it reached.
 pub fn resource_not_found_message(arn: &str) -> String {
     if arn_names_channel(arn) {
         channel_not_found_message(arn)
+    } else if arn_names_consumer(arn) {
+        // A consumer's ARN is its stream's ARN extended (`…stream/<name>/consumer/<name>:<ts>`),
+        // so the thing not found is the CONSUMER that ARN names, under the stream it extends.
+        consumer_not_found_message(arn, arn)
     } else {
         stream_not_found_message(arn)
     }
+}
+
+/// Whether `arn`'s resource segment names a CONSUMER registered with a stream, which a
+/// `ResourceARN` may address too: a `ConsumerARN` continues its stream's resource segment
+/// with `/consumer/<name>:<timestamp>` ([`consumer_arn`] builds it).
+fn arn_names_consumer(arn: &str) -> bool {
+    stream_name_in_arn(arn).is_some_and(|_| arn.contains("/consumer/"))
+}
+
+/// The most bytes of policy document this emulator retains for one resource. A CHOSEN
+/// ceiling, not an AWS-documented limit (`Policy` carries no modelled `@length`): one
+/// document is kept per resource for the life of the process, so what a single request may
+/// make the store grow by is bounded, and a document past it is refused rather than stored
+/// ([`policy_too_large_message`]).
+pub const MAX_RESOURCE_POLICY_BYTES: usize = 20 * 1024;
+
+/// How an attach refuses a document larger than this emulator retains: the modelled "A
+/// specified parameter exceeds its restrictions" refusal (`InvalidArgumentException`). Built
+/// FROM the request, so the size at fault and the ceiling it exceeded name it.
+pub fn policy_too_large_message(sent: usize) -> String {
+    format!(
+        "Policy must be at most {MAX_RESOURCE_POLICY_BYTES} bytes; the document sent is \
+         {sent} bytes."
+    )
+}
+
+/// How an attach refuses a `Policy` that is no policy document at all: a resource-based
+/// policy "is formatted as a JSON string" (`PutResourcePolicyInput$Policy`) and names "the
+/// identity of the principal and the actions allowed on this resource", which is a JSON
+/// object — anything else is the modelled "a specified parameter ... is not supported, or
+/// can't be used" refusal. Built FROM the request: `detail` says what the value sent was
+/// instead.
+pub fn policy_not_json_message(detail: &str) -> String {
+    format!("Policy must be a JSON policy document: {detail}.")
+}
+
+/// How a read or a delete states that the resource the request named carries no policy to
+/// report or remove, worded with the fixed tail this service states every not-found with
+/// ("... under account `<account>` not found."): the thing not found is the POLICY of that
+/// resource, and the resource is named the way the request addressed it — by its
+/// `ResourceARN`, the only identifier these operations have.
+pub fn resource_policy_not_found_message(arn: &str) -> String {
+    format!(
+        "Policy for resource {arn} under account {} not found.",
+        ::engine::emulator_account_id()
+    )
 }
 
 /// Whether `arn`'s resource segment names a CHANNEL, which is the other resource kind a

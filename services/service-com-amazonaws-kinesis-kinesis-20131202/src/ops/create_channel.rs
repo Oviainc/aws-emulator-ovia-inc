@@ -541,6 +541,9 @@ fn create_channel(
         // No configuration change has been accepted for a channel this call has just minted,
         // so the only transition it is owed is the one to `ACTIVE` above.
         updating_until: None,
+        // A resource-based policy is `PutResourcePolicy`'s to attach, so a channel this call
+        // has just minted carries none.
+        policy: None,
     };
 
     let description = channel.to_description(now);
