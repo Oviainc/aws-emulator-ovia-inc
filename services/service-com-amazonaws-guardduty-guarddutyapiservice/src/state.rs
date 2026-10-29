@@ -2049,6 +2049,36 @@ pub const ROLE_MEMBER: &str = "role";
 /// [`DESTINATION_ARN_MEMBER`] is.
 pub const SCAN_CONFIGURATION_ROLE_MEMBER: &str = "scanConfiguration.role";
 
+/// The wire path of the `BackupVaultName` a malware-scan start carries inside its
+/// `ScanConfiguration.RecoveryPoint` (`smithy_query(shape="RecoveryPoint")` renders
+/// the member `backupVaultName`, under the request's
+/// `scanConfiguration.recoveryPoint`). Dotted the way this service names a nested
+/// member in a rejection, as [`SCAN_CONFIGURATION_ROLE_MEMBER`] is.
+pub const SCAN_CONFIGURATION_RECOVERY_POINT_VAULT_MEMBER: &str =
+    "scanConfiguration.recoveryPoint.backupVaultName";
+
+/// The length bounds of `NonEmptyString` (`smithy_query(shape="NonEmptyString")`:
+/// len 1..200) — the type a malware scan's configuration is REPORTED through
+/// (`ScanConfigurationRecoveryPoint$BackupVaultName`,
+/// `ScanConfiguration$Role`, `IncrementalScanDetails$BaselineResourceArn`).
+pub const NON_EMPTY_STRING_MIN_LEN: usize = 1;
+/// See [`NON_EMPTY_STRING_MIN_LEN`].
+pub const NON_EMPTY_STRING_MAX_LEN: usize = 200;
+
+/// Can `value` be carried by a `NonEmptyString` member — is its length within
+/// [`NON_EMPTY_STRING_MIN_LEN`]..=[`NON_EMPTY_STRING_MAX_LEN`]?
+///
+/// A length bound counts Unicode code points, not bytes, so a multi-byte name is
+/// measured the way the model measures it — the same counting
+/// [`is_filter_name`] applies to the filter-name bounds. ONE reader for every
+/// member of that type, so the bound cannot drift between the paths that must
+/// honour it: where a request member the service persists is modelled LESS
+/// constrained than the member a read reports the same fact through, the handler
+/// is the only place the reporting member's bound can be honoured.
+pub fn fits_non_empty_string(value: &str) -> bool {
+    (NON_EMPTY_STRING_MIN_LEN..=NON_EMPTY_STRING_MAX_LEN).contains(&value.chars().count())
+}
+
 /// The wire name of the `ProtectedResource` member, for the same reason.
 pub const PROTECTED_RESOURCE_MEMBER: &str = "protectedResource";
 

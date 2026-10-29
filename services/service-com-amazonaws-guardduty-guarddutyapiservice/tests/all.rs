@@ -121,6 +121,8 @@ mod malware_scan_description;
 mod malware_scan_lifecycle;
 #[path = "all/malware_scan_page_window.rs"]
 mod malware_scan_page_window;
+#[path = "all/malware_scan_recovery_point_vault.rs"]
+mod malware_scan_recovery_point_vault;
 #[path = "all/malware_scan_role_arn.rs"]
 mod malware_scan_role_arn;
 #[path = "all/malware_scan_settings.rs"]
