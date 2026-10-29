@@ -113,6 +113,8 @@ mod function_lifecycle;
 mod function_recursion_config;
 #[path = "all/function_scaling_config.rs"]
 mod function_scaling_config;
+#[path = "all/function_scaling_config_capacity_provider.rs"]
+mod function_scaling_config_capacity_provider;
 #[path = "all/function_scaling_config_convergence.rs"]
 mod function_scaling_config_convergence;
 #[path = "all/function_scaling_config_default.rs"]

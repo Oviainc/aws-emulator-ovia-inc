@@ -11,12 +11,16 @@
 //!
 //! The qualifier is read exactly as the write reads it (see
 //! [`crate::state::FunctionRecord::published_qualifier`]), so the two operations agree on
-//! which qualifiers exist, and one naming none is refused the modelled 404. A qualifier
-//! that exists but has had no `PutFunctionScalingConfig` call is not an error: the
-//! function is there, so the answer reports the configuration the SERVICE scales that
-//! qualifier by — a Managed Instances function is scaled from the moment it exists, so its
-//! requested configuration is the service-managed one, while a function that runs on no
-//! capacity provider is scaled by no such configuration and none is invented for it (see
+//! which qualifiers exist, and one naming none is refused the modelled 404 — the service's
+//! canonical [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`] sentence, which is also what a
+//! name that names no function is refused here. What it
+//! reports on is a *Lambda Managed Instances* function, so a qualifier whose configuration
+//! names no capacity provider is outside the surface this operation serves and the call is
+//! REFUSED rather than answered for (see
+//! [`crate::state::FunctionRecord::require_capacity_provider_configuration`]). A qualifier
+//! that is served but has had no `PutFunctionScalingConfig` call is not an error: the
+//! answer reports the configuration the SERVICE scales that qualifier by, because a
+//! Managed Instances function is scaled from the moment it exists (see
 //! [`crate::state::FunctionRecord::reported_function_scaling_config`]).
 //!
 //! ## Shape of an operation
@@ -179,15 +183,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::resolve_function(&mut store, &input.function_name, None, &region, now)
                 .map_err(|failure| match failure {
                     crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
-                    crate::state::ResolveFailure::NotFound(message) => not_found(message),
+                    // The resolution's own `Function not found: <arn>` wording is not what
+                    // this operation answers: a name that names no function is refused the
+                    // service's canonical `ResourceNotFoundException` sentence, the same
+                    // one a qualifier naming no version gets below, so the two 404s of this
+                    // resource read alike.
+                    crate::state::ResolveFailure::NotFound(_) => not_found(),
                 })?;
 
         let Some(qualifier) = record.published_qualifier(&input.qualifier) else {
-            return Err(not_found(format!(
-                "Function not found: {}",
-                record.versioned_arn(&input.qualifier)
-            )));
+            return Err(not_found());
         };
+
+        // "Retrieves the scaling configuration for a Lambda Managed Instances function":
+        // the qualifier has to run on a capacity provider before there is a scaling
+        // configuration to report at all, so one that runs on none is refused here rather
+        // than answered with a configuration-free success a client cannot tell from a
+        // function with no bounds.
+        record.require_capacity_provider_configuration(&qualifier)?;
 
         // Answered out of the record, so a configuration that was accepted but never
         // persisted reports nothing here, and the bounds a qualifier nobody configured
@@ -208,11 +221,13 @@ fn invalid_parameter(message: String) -> GetFunctionScalingConfigError {
     .into()
 }
 
-/// The modelled 404 for a name and qualifier that name no function or no such version.
-fn not_found(message: String) -> GetFunctionScalingConfigError {
+/// The modelled 404 for a name or qualifier that names no function or no such version:
+/// this operation answers the service's canonical sentence for a resource that does not
+/// exist, which names nothing of the request.
+fn not_found() -> GetFunctionScalingConfigError {
     GetFunctionScalingConfigErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         r#type: None,
-        message: Some(message),
+        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

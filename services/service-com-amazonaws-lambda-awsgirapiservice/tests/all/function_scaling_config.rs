@@ -6,7 +6,7 @@
 //!
 //! The rule under test: a scaling configuration is ONE pair of execution-environment
 //! bounds per QUALIFIER of a function — a published version number, or the published view
-//! of the unpublished configuration (`$LATEST.PUBLISHED`) — absent until a
+//! of the unpublished configuration (`$LATEST.PUBLISHED`) — the service-managed one until a
 //! `PutFunctionScalingConfig` call sets one on THAT qualifier, from then on exactly the
 //! bounds of the most recent such call on it (replacing rather than merging), reported as
 //! the REQUESTED configuration while that request is still outstanding and as the APPLIED
@@ -24,8 +24,11 @@
 //! alone, neither), the kind of qualifier (the published view of the unpublished
 //! configuration and published version numbers, written raw and percent-encoded), the
 //! documented `FunctionName` form the requests address the function by, and how many calls
-//! have been made (none, one, several). The clock-driven half is exercised by moving the
-//! stored due instant into the past, so nothing here sleeps.
+//! have been made (none, one, several). Every function here runs on a capacity provider,
+//! because that is the only kind of function these two operations serve; the refusal of
+//! one that runs on none is covered by `function_scaling_config_capacity_provider.rs`. The
+//! clock-driven half is exercised by moving the stored due instant into the past, so
+//! nothing here sleeps.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -38,6 +41,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// Where `CreateFunction` is bound.
 const FUNCTIONS_URI: &str = "/2015-03-31/functions";
+
+/// Where `CreateCapacityProvider` is bound, from
+/// `smithy_query(query="operation", operation="CreateCapacityProvider")`.
+const CAPACITY_PROVIDERS_URI: &str = "/2025-11-30/capacity-providers";
 
 /// A SigV4 credential scope naming this service's signing name (`lambda`) in
 /// `us-east-1`, which is what routes a request here and what region the ARNs carry.
@@ -55,6 +62,13 @@ const ACCOUNT: &str = "000000000000";
 /// A well-formed execution role ARN, satisfying the model's `RoleArn` pattern.
 const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 
+/// A well-formed capacity-provider operator role ARN.
+const OPERATOR_ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-capacity";
+
+/// The capacity provider every function here runs on: both function-scaling operations
+/// serve a Lambda Managed Instances function, so every function under test names one.
+const FLEET: &str = "fleet-scaled";
+
 /// The published view of the unpublished configuration, one of the two forms the model's
 /// `PublishedFunctionQualifier` admits
 /// (`smithy_query(query="shape", shape="PublishedFunctionQualifier")`:
@@ -70,9 +84,16 @@ const ENVIRONMENTS_MIN: i64 = 0;
 /// See [`ENVIRONMENTS_MIN`].
 const ENVIRONMENTS_MAX: i64 = 15_000;
 
-/// The `State` the function every row creates reports once its activation is due, from
-/// `smithy_query(query="shape", shape="State")`.
-const STATE_ACTIVE: &str = "Active";
+/// The `State` the unpublished configuration of the function every row creates reports
+/// once its activation is due, from `smithy_query(query="shape", shape="State")`: a
+/// function that runs on a capacity provider settles into the non-invocable one.
+const STATE_ACTIVE_NON_INVOCABLE: &str = "ActiveNonInvocable";
+
+/// The minimum number of execution environments the service itself keeps a Managed
+/// Instances function's qualifier at while no call has asked for anything else. Written as
+/// the number itself rather than as a crate constant, so a changed floor fails here; it
+/// sits inside the modelled `0..15000` range of both `FunctionScalingConfig` members.
+const SERVICE_MANAGED_MINIMUM: i64 = 3;
 
 /// What a dispatched request answered.
 struct Answer {
@@ -208,14 +229,44 @@ async fn get_scaling(router: &MultiServiceRouter, reference: &str, qualifier: &s
     .await
 }
 
-/// Create a function with `versions` published versions, and bring it out of the
-/// `Pending` state creation leaves it in.
+/// The ARN a capacity provider of `name` carries, as the model's `CapacityProviderArn`
+/// pattern spells it.
+fn provider_arn(name: &str) -> String {
+    format!("arn:aws:lambda:{REGION}:{ACCOUNT}:capacity-provider:{name}")
+}
+
+/// `CreateCapacityProvider` with the smallest request the model admits.
+async fn create_provider(router: &MultiServiceRouter, name: &str) {
+    let answer = call(
+        router,
+        "POST",
+        CAPACITY_PROVIDERS_URI,
+        &json!({
+            "CapacityProviderName": name,
+            "VpcConfig": { "SubnetIds": ["subnet-10000000"], "SecurityGroupIds": [] },
+            "PermissionsConfig": { "CapacityProviderOperatorRoleArn": OPERATOR_ROLE },
+        }),
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        202,
+        "provider {name:?}: CreateCapacityProvider must answer 202, got {} {}",
+        answer.status,
+        answer.text()
+    );
+}
+
+/// Create a Managed Instances function with `versions` published versions — the only kind
+/// of function the function-scaling operations serve — and bring it out of the `Pending`
+/// state creation leaves it in.
 async fn create_function_with_versions(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     name: &str,
     versions: u32,
 ) {
+    create_provider(router, FLEET).await;
     let package: Vec<u8> = (0..64u16)
         .map(|byte| u8::try_from(byte % 251).unwrap_or(0))
         .collect();
@@ -230,6 +281,11 @@ async fn create_function_with_versions(
             "Handler": "index.handler",
             "Publish": versions >= 1,
             "Code": { "ZipFile": base64::engine::general_purpose::STANDARD.encode(&package) },
+            "CapacityProviderConfig": {
+                "LambdaManagedInstancesCapacityProviderConfig": {
+                    "CapacityProviderArn": provider_arn(FLEET),
+                },
+            },
         }),
     )
     .await;
@@ -411,8 +467,8 @@ async fn stored_bounds_round_trip_through_get() {
             .reference
             .map_or_else(|| function.to_string(), |build| build(function));
 
-        // Nothing is configured until a call sets something: the qualifier exists, so the
-        // read succeeds and reports no configuration at all.
+        // Nothing a CALL has asked for until one sets something: the qualifier is scaled
+        // by the service, so the read succeeds and reports the service-managed floor.
         let before = get_scaling(&router, &reference, case.qualifier).await;
         assert_eq!(
             before.status,
@@ -424,8 +480,9 @@ async fn stored_bounds_round_trip_through_get() {
         );
         assert_eq!(
             before.at("/RequestedFunctionScalingConfig"),
-            Value::Null,
-            "case {:?}: an unconfigured qualifier must report no requested configuration, got {}",
+            json!({ "MinExecutionEnvironments": SERVICE_MANAGED_MINIMUM }),
+            "case {:?}: an unconfigured qualifier must report the service-managed \
+             configuration, got {}",
             case.name,
             before.text()
         );
@@ -456,7 +513,7 @@ async fn stored_bounds_round_trip_through_get() {
             );
             assert_eq!(
                 answer.string("/FunctionState").as_deref(),
-                Some(STATE_ACTIVE),
+                Some(STATE_ACTIVE_NON_INVOCABLE),
                 "case {:?}: the answer must report the function's own state, got {}",
                 case.name,
                 answer.text()
@@ -596,11 +653,12 @@ async fn bounds_that_describe_no_range_are_refused_and_store_nothing() {
                 );
             }
 
-            // Nothing was stored by the refusal.
+            // Nothing was stored by the refusal: the qualifier still reports what the
+            // service, and no call, manages for it.
             let read = get_scaling(&router, function, qualifier).await;
             assert_eq!(
                 read.at("/RequestedFunctionScalingConfig"),
-                Value::Null,
+                json!({ "MinExecutionEnvironments": SERVICE_MANAGED_MINIMUM }),
                 "bounds {bounds:?} on {qualifier:?} must store nothing, got {}",
                 read.text()
             );

@@ -13,7 +13,12 @@
 //! version number, which names a version only once it has been published, and
 //! [`crate::state::VERSION_LATEST_PUBLISHED`], the published view of the unpublished
 //! configuration every function has. A qualifier naming neither is refused the modelled
-//! 404.
+//! 404 — the service's canonical [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`] sentence,
+//! which is also what a name that names no function is refused here — and one that runs on
+//! no capacity provider is refused the service's authorization error: the operation "Sets
+//! the scaling configuration for a Lambda Managed Instances function", so a function that
+//! runs on no provider is outside the surface it serves (see
+//! [`crate::state::FunctionRecord::require_capacity_provider_configuration`]).
 //!
 //! The bounds are a RANGE: "the minimum and maximum number of execution environments",
 //! so a request whose minimum is above its maximum describes no range at all and is
@@ -211,18 +216,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::resolve_function(&mut store, &input.function_name, None, &region, now)
                 .map_err(|failure| match failure {
                     crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
-                    crate::state::ResolveFailure::NotFound(message) => not_found(message),
+                    // The resolution's own `Function not found: <arn>` wording is not what
+                    // this operation answers: a name that names no function is refused the
+                    // service's canonical `ResourceNotFoundException` sentence, the same one
+                    // a qualifier naming no version gets below, so the read and the write of
+                    // this resource word their 404 alike.
+                    crate::state::ResolveFailure::NotFound(_) => not_found(),
                 })?;
 
         // The qualifier has to name something before a configuration can be set on it: a
         // published version exists only once it has been published, while the published
         // view of the unpublished configuration always does.
         let Some(qualifier) = record.published_qualifier(&input.qualifier) else {
-            return Err(not_found(format!(
-                "Function not found: {}",
-                record.versioned_arn(&input.qualifier)
-            )));
+            return Err(not_found());
         };
+
+        // "Sets the scaling configuration for a Lambda Managed Instances function": the
+        // qualifier has to run on a capacity provider before any such configuration can be
+        // set on it, so one that runs on none is refused here and stores nothing — the same
+        // refusal the read of this resource answers.
+        record.require_capacity_provider_configuration(&qualifier)?;
 
         // "Sets the scaling configuration": the bounds this call asked for replace
         // whatever the qualifier held, as the requested configuration, and the move to
@@ -257,11 +270,13 @@ fn invalid_parameter(message: String) -> PutFunctionScalingConfigError {
     .into()
 }
 
-/// The modelled 404 for a name and qualifier that name no function or no such version.
-fn not_found(message: String) -> PutFunctionScalingConfigError {
+/// The modelled 404 for a name or qualifier that names no function or no such version:
+/// this operation answers the service's canonical sentence for a resource that does not
+/// exist, which names nothing of the request.
+fn not_found() -> PutFunctionScalingConfigError {
     PutFunctionScalingConfigErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         r#type: None,
-        message: Some(message),
+        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

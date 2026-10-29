@@ -15,7 +15,8 @@
 //! Every assertion is over real HTTP requests through the router, across each surface that
 //! reports the state — `CreateFunction`'s own answer, `GetFunctionConfiguration`
 //! unqualified and at each qualifier, `GetFunction`,
-//! `PutFunctionScalingConfig`'s `FunctionState` and
+//! `PutFunctionScalingConfig`'s `FunctionState` (a surface only a function that names a
+//! capacity provider has, because that operation serves no other kind) and
 //! `ListFunctionVersionsByCapacityProvider` — so one surface disagreeing with the others
 //! fails here. (`ListFunctions` is not among them: the model states that it "returns a
 //! subset of the FunctionConfiguration fields" and names `State` as one of those it does
@@ -287,9 +288,24 @@ async fn every_surface_reports_one_state_for_a_capacity_provider_managed_functio
 
         // "The current state of the function after applying the scaling configuration":
         // the state a read of the FUNCTION reports, whichever published qualifier the
-        // bounds were set on, because that state belongs to the function.
+        // bounds were set on, because that state belongs to the function. The operation
+        // "Sets the scaling configuration for a Lambda Managed Instances function", so a
+        // function that runs on no capacity provider is refused instead of reporting a
+        // state at all.
         for qualifier in ["1", "$LATEST.PUBLISHED"] {
             let applied = put_scaling_config(&router, case.function, qualifier).await;
+            if case.provider.is_none() {
+                assert_eq!(
+                    applied.status,
+                    403,
+                    "case {:?}: PutFunctionScalingConfig at {qualifier} must be refused 403, \
+                     got {} {}",
+                    case.case,
+                    applied.status,
+                    String::from_utf8_lossy(&applied.body)
+                );
+                continue;
+            }
             assert_eq!(
                 (applied.status, applied.string("FunctionState")),
                 (202, Some(case.settled.to_string())),

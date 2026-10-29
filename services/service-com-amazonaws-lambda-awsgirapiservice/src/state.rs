@@ -109,7 +109,10 @@
 //! is reported only while one is (see [`FunctionScalingConfigRecord::reported`]). A
 //! qualifier nobody has configured still reports what the SERVICE scales it by, because a
 //! Managed Instances function is scaled from the moment it exists (see
-//! [`FunctionRecord::reported_function_scaling_config`]).
+//! [`FunctionRecord::reported_function_scaling_config`]), and a qualifier that runs on no
+//! capacity provider is outside the surface both operations serve, so the call is refused
+//! rather than answered for (see
+//! [`FunctionRecord::require_capacity_provider_configuration`]).
 //!
 //! What those same records come to at the account level is also METERED, with no client
 //! action at all: Lambda publishes how much of the Region's concurrency the account has
@@ -1359,8 +1362,9 @@ pub fn pattern_violation_message(path: &str, value: &str, pattern: &str) -> Stri
 /// resource), a code signing configuration an operation on the configuration itself named
 /// ([`code_signing_config_gone_message`]) and the configuration-shaped refusals below.
 /// Every other 404 in this service — a function URL, a layer version READ, an event source
-/// mapping, a resource addressed by its TAGS, a function carrying no resource-based policy
-/// — answers this.
+/// mapping, a resource addressed by its TAGS, a function carrying no resource-based policy,
+/// and the function-scaling operations, which word both the name and the qualifier they
+/// could not resolve with this sentence — answers this.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The resource you requested does not exist.";
 
 /// The refusal a `RevisionId` precondition that did not hold gets on `AddPermission` and
@@ -1635,6 +1639,18 @@ pub const FUNCTION_SCALING_APPLY_DELAY: Duration = Duration::from_millis(500);
 /// the model's `FunctionScalingConfigExecutionEnvironments` range (`0..15000`), and no
 /// maximum goes with it, because nothing caps the function until a caller asks for a cap.
 pub const DEFAULT_MIN_EXECUTION_ENVIRONMENTS: i32 = 3;
+
+/// The refusal every function-scaling operation answers for a qualifier whose
+/// configuration names no capacity provider.
+///
+/// Both operations are documented for a Lambda Managed Instances function — one that runs
+/// on a capacity provider — so a function that runs on none is outside the surface they
+/// serve: the call is refused rather than answered for, which is what lets a client tell
+/// "this is not a Managed Instances function" from "this function has no scaling bounds".
+/// The sentence names nothing of the request: the caller already names the function it
+/// asked about.
+pub const NO_CAPACITY_PROVIDER_MESSAGE: &str =
+    "The function provided by the arn does not contain a capacity provider configuration";
 
 /// The scaling configuration a Managed Instances function's qualifier carries until a
 /// `PutFunctionScalingConfig` call stores one of its own: the service-managed floor of
@@ -2694,14 +2710,14 @@ impl FunctionRecord {
     /// A qualifier a `PutFunctionScalingConfig` call has set bounds on reports that record
     /// ([`FunctionScalingConfigRecord::reported`]). A qualifier nobody has configured
     /// reports the configuration the SERVICE manages for it: a Managed Instances function
-    /// — one whose configuration names a capacity provider — is scaled by the service from
-    /// the moment it exists, so its requested configuration is
-    /// [`service_managed_function_scaling_config`], while a function that runs on no
-    /// capacity provider has no scaling configuration of any kind and none is invented for
-    /// it. Neither reports an APPLIED configuration before one is in effect.
+    /// is scaled by the service from the moment it exists, so its requested configuration
+    /// is [`service_managed_function_scaling_config`]. Neither reports an APPLIED
+    /// configuration before one is in effect.
     ///
     /// Read it only after [`Self::materialize`], so bounds the clock has already applied
-    /// are not reported as still only requested.
+    /// are not reported as still only requested, and only through a qualifier
+    /// [`Self::require_capacity_provider_configuration`] has admitted, which is what
+    /// establishes that the service scales this qualifier at all.
     #[must_use]
     pub fn reported_function_scaling_config(
         &self,
@@ -2711,16 +2727,37 @@ impl FunctionRecord {
         if let Some(stored) = self.function_scaling_configs.get(published_qualifier) {
             return stored.reported(function_arn);
         }
-        let service_managed = self
-            .published_qualifier_config(published_qualifier)
-            .and_then(configured_capacity_provider)
-            .is_some();
         GetFunctionScalingConfigOutput {
             function_arn: Some(function_arn),
             applied_function_scaling_config: None,
-            requested_function_scaling_config: service_managed
-                .then(service_managed_function_scaling_config),
+            requested_function_scaling_config: Some(service_managed_function_scaling_config()),
         }
+    }
+
+    /// Admit a function-scaling call on the qualifier it resolved, or refuse it because
+    /// that qualifier runs on no capacity provider.
+    ///
+    /// Both function-scaling operations are documented for a Lambda Managed Instances
+    /// function — one whose configuration names a capacity provider — so this is the
+    /// AUTHORIZATION step they share: it runs once the function and the qualifier have
+    /// resolved, and a qualifier whose configuration names no provider is refused
+    /// [`NO_CAPACITY_PROVIDER_MESSAGE`] rather than answered for. The configuration read
+    /// is the QUALIFIER's own, because a published version froze the one it was published
+    /// from.
+    pub fn require_capacity_provider_configuration(
+        &self,
+        published_qualifier: &str,
+    ) -> Result<(), crate::scaffolded::AccessDeniedException> {
+        if self
+            .published_qualifier_config(published_qualifier)
+            .and_then(configured_capacity_provider)
+            .is_some()
+        {
+            return Ok(());
+        }
+        Err(crate::scaffolded::AccessDeniedException::new(
+            NO_CAPACITY_PROVIDER_MESSAGE,
+        ))
     }
 
     /// The configuration of `version`, or `None` when this function has no such

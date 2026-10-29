@@ -7,20 +7,20 @@
 //! from the moment the function exists, so every qualifier of a function whose
 //! configuration names a capacity provider reports a requested scaling configuration
 //! straight away — the service-managed floor of execution environments, with no maximum,
-//! because nothing caps the function until a caller asks for a cap — while a function that
-//! runs on no capacity provider is scaled by no such configuration and reports none at
-//! all. Neither reports an APPLIED configuration until one is in effect, a
-//! `PutFunctionScalingConfig` call on a qualifier REPLACES what the service manages for
-//! that qualifier alone, and reading changes nothing a later caller sees.
+//! because nothing caps the function until a caller asks for a cap. No qualifier reports an
+//! APPLIED configuration until one is in effect, a `PutFunctionScalingConfig` call on a
+//! qualifier REPLACES what the service manages for that qualifier alone, and reading
+//! changes nothing a later caller sees. (A function that runs on no capacity provider is
+//! outside the surface these operations serve at all; its refusal is covered by
+//! `function_scaling_config_capacity_provider.rs`.)
 //!
 //! Every row drives real HTTP requests through the router, and the configurations that
 //! replace a default are read back through `GetFunctionScalingConfig`, so a value that was
 //! answered but never stored fails here. The rows differ along what the rule generalises
-//! over: whether the function's configuration names a capacity provider, the kind of
-//! qualifier (the published view of the unpublished configuration, written raw and
-//! percent-encoded, and published version numbers — single- and multi-digit), how many
-//! versions the function has published, and the documented `FunctionName` form the
-//! requests address the function by.
+//! over: the kind of qualifier (the published view of the unpublished configuration,
+//! written raw and percent-encoded, and published version numbers — single- and
+//! multi-digit), how many versions the function has published, and the documented
+//! `FunctionName` form the requests address the function by.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -218,33 +218,31 @@ async fn create_provider(router: &MultiServiceRouter, name: &str) {
     );
 }
 
-/// Create a function with `versions` published versions, running on `provider` when one is
-/// named, and bring it out of the `Pending` state creation leaves it in.
+/// Create a Managed Instances function with `versions` published versions, running on
+/// `provider`, and bring it out of the `Pending` state creation leaves it in.
 async fn create_function_with_versions(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     name: &str,
-    provider: Option<&str>,
+    provider: &str,
     versions: u32,
 ) {
     let package: Vec<u8> = (0..64u16)
         .map(|byte| u8::try_from(byte % 251).unwrap_or(0))
         .collect();
-    let mut body = json!({
+    let body = json!({
         "FunctionName": name,
         "Role": ROLE,
         "Runtime": "python3.12",
         "Handler": "index.handler",
         "Publish": versions >= 1,
         "Code": { "ZipFile": base64::engine::general_purpose::STANDARD.encode(&package) },
-    });
-    if let Some(provider) = provider {
-        body["CapacityProviderConfig"] = json!({
+        "CapacityProviderConfig": {
             "LambdaManagedInstancesCapacityProviderConfig": {
                 "CapacityProviderArn": provider_arn(provider),
             },
-        });
-    }
+        },
+    });
     let created = call(router, "POST", FUNCTIONS_URI, &body).await;
     assert_eq!(
         created.status,
@@ -302,9 +300,8 @@ fn make_scaling_applied(engine: &Arc<engine::InMemoryEngine>) {
 /// One row of the default-reporting table.
 struct Case {
     name: &'static str,
-    /// The capacity provider the function's configuration names; `None` for a function
-    /// that runs on no provider.
-    provider: Option<&'static str>,
+    /// The capacity provider the function's configuration names.
+    provider: &'static str,
     /// How many versions the function publishes.
     versions: u32,
     /// The qualifier every call under test addresses, as the request writes it.
@@ -315,16 +312,15 @@ struct Case {
     reference: Option<fn(&str) -> String>,
 }
 
-/// The rows. Between them they cover a function that names a capacity provider and one
-/// that names none, the published view of the unpublished configuration (raw and
-/// percent-encoded) and single- and multi-digit published version numbers as the
+/// The rows. Between them they cover the published view of the unpublished configuration
+/// (raw and percent-encoded) and single- and multi-digit published version numbers as the
 /// qualifier, functions with no published version and with many, and each documented
 /// `FunctionName` form.
 fn cases() -> Vec<Case> {
     vec![
         Case {
             name: "managed instances, published view of latest, bare name",
-            provider: Some(FLEET),
+            provider: FLEET,
             versions: 0,
             qualifier: LATEST_PUBLISHED,
             decoded_qualifier: LATEST_PUBLISHED,
@@ -332,7 +328,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "managed instances, published view of latest percent-encoded, full ARN",
-            provider: Some(FLEET),
+            provider: FLEET,
             versions: 0,
             qualifier: "%24LATEST.PUBLISHED",
             decoded_qualifier: LATEST_PUBLISHED,
@@ -340,7 +336,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "managed instances, version 1, partial ARN",
-            provider: Some(FLEET),
+            provider: FLEET,
             versions: 1,
             qualifier: "1",
             decoded_qualifier: "1",
@@ -348,38 +344,18 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "managed instances, version 11, name with the resource-type prefix",
-            provider: Some(FLEET),
+            provider: FLEET,
             versions: 12,
             qualifier: "11",
             decoded_qualifier: "11",
             reference: Some(|name| format!("function:{name}")),
         },
-        Case {
-            name: "no capacity provider, published view of latest, bare name",
-            provider: None,
-            versions: 0,
-            qualifier: LATEST_PUBLISHED,
-            decoded_qualifier: LATEST_PUBLISHED,
-            reference: None,
-        },
-        Case {
-            name: "no capacity provider, version 2, full ARN",
-            provider: None,
-            versions: 2,
-            qualifier: "2",
-            decoded_qualifier: "2",
-            reference: Some(|name| format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:{name}")),
-        },
     ]
 }
 
-/// The requested configuration a row expects before any `PutFunctionScalingConfig` call:
-/// the service-managed floor for a Managed Instances function, and nothing at all for a
-/// function that runs on no capacity provider.
-fn expected_default(case: &Case) -> Value {
-    if case.provider.is_none() {
-        return Value::Null;
-    }
+/// The requested configuration every row expects before any `PutFunctionScalingConfig`
+/// call: the service-managed floor, with no maximum.
+fn expected_default() -> Value {
     json!({ "MinExecutionEnvironments": SERVICE_MANAGED_MINIMUM })
 }
 
@@ -409,10 +385,10 @@ async fn unconfigured_qualifier_reports_the_service_managed_configuration() {
         );
         assert_eq!(
             answer.at("/RequestedFunctionScalingConfig"),
-            expected_default(&case),
+            expected_default(),
             "case {:?}: expected the requested configuration {}, got {}",
             case.name,
-            expected_default(&case),
+            expected_default(),
             answer.text()
         );
         assert_eq!(
@@ -444,9 +420,9 @@ async fn unconfigured_qualifier_reports_the_service_managed_configuration() {
     }
 }
 
-/// Every row that names a capacity provider: a `PutFunctionScalingConfig` call replaces
-/// the service-managed configuration on the qualifier it addressed and on no other, and
-/// the bounds it asked for are in effect once the clock makes that due.
+/// Every row: a `PutFunctionScalingConfig` call replaces the service-managed configuration
+/// on the qualifier it addressed and on no other, and the bounds it asked for are in effect
+/// once the clock makes that due.
 #[tokio::test]
 async fn an_explicit_configuration_replaces_the_service_managed_one() {
     let bounds = (1_i64, 9_i64);
@@ -454,7 +430,7 @@ async fn an_explicit_configuration_replaces_the_service_managed_one() {
         "MinExecutionEnvironments": bounds.0,
         "MaxExecutionEnvironments": bounds.1,
     });
-    for case in cases().into_iter().filter(|case| case.provider.is_some()) {
+    for case in cases() {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let router = router_on(&engine);
         let function = "managed-function";

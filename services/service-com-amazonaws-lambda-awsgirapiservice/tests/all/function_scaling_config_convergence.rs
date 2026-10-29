@@ -19,8 +19,9 @@
 //! published bound of the modelled range, values between, equal bounds, one bound alone,
 //! neither), the qualifier the configuration is set on (the published view of the
 //! unpublished configuration and published version numbers), and how many requests have
-//! been made. The clock-driven half is exercised by moving the stored due instant into the
-//! past, so nothing here sleeps.
+//! been made. Every function here runs on a capacity provider, because that is the only
+//! kind of function these two operations serve. The clock-driven half is exercised by
+//! moving the stored due instant into the past, so nothing here sleeps.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -33,6 +34,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// Where `CreateFunction` is bound.
 const FUNCTIONS_URI: &str = "/2015-03-31/functions";
+
+/// Where `CreateCapacityProvider` is bound, from
+/// `smithy_query(query="operation", operation="CreateCapacityProvider")`.
+const CAPACITY_PROVIDERS_URI: &str = "/2025-11-30/capacity-providers";
 
 /// A SigV4 credential scope naming this service's signing name (`lambda`) in `us-east-1`,
 /// which is what routes a request here and what region the minted ARNs carry. Nothing in
@@ -49,6 +54,13 @@ const ACCOUNT: &str = "000000000000";
 
 /// A well-formed execution role ARN, satisfying the model's `RoleArn` pattern.
 const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
+
+/// A well-formed capacity-provider operator role ARN.
+const OPERATOR_ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-capacity";
+
+/// The capacity provider every function here runs on: both function-scaling operations
+/// serve a Lambda Managed Instances function, so every function under test names one.
+const FLEET: &str = "fleet-converging";
 
 /// The published view of the unpublished configuration, one of the two forms the model's
 /// `PublishedFunctionQualifier` admits
@@ -183,14 +195,44 @@ async fn get_scaling(router: &MultiServiceRouter, reference: &str, qualifier: &s
     .await
 }
 
-/// Create a function with `versions` published versions, and bring it out of the
-/// `Pending` state creation leaves it in.
+/// The ARN a capacity provider of `name` carries, as the model's `CapacityProviderArn`
+/// pattern spells it.
+fn provider_arn(name: &str) -> String {
+    format!("arn:aws:lambda:{REGION}:{ACCOUNT}:capacity-provider:{name}")
+}
+
+/// `CreateCapacityProvider` with the smallest request the model admits.
+async fn create_provider(router: &MultiServiceRouter, name: &str) {
+    let answer = call(
+        router,
+        "POST",
+        CAPACITY_PROVIDERS_URI,
+        &json!({
+            "CapacityProviderName": name,
+            "VpcConfig": { "SubnetIds": ["subnet-10000000"], "SecurityGroupIds": [] },
+            "PermissionsConfig": { "CapacityProviderOperatorRoleArn": OPERATOR_ROLE },
+        }),
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        202,
+        "provider {name:?}: CreateCapacityProvider must answer 202, got {} {}",
+        answer.status,
+        answer.text()
+    );
+}
+
+/// Create a Managed Instances function with `versions` published versions — the only kind
+/// of function the function-scaling operations serve — and bring it out of the `Pending`
+/// state creation leaves it in.
 async fn create_function_with_versions(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     name: &str,
     versions: u32,
 ) {
+    create_provider(router, FLEET).await;
     let package: Vec<u8> = (0..64u16)
         .map(|byte| u8::try_from(byte % 251).unwrap_or(0))
         .collect();
@@ -205,6 +247,11 @@ async fn create_function_with_versions(
             "Handler": "index.handler",
             "Publish": versions >= 1,
             "Code": { "ZipFile": base64::engine::general_purpose::STANDARD.encode(&package) },
+            "CapacityProviderConfig": {
+                "LambdaManagedInstancesCapacityProviderConfig": {
+                    "CapacityProviderArn": provider_arn(FLEET),
+                },
+            },
         }),
     )
     .await;
