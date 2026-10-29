@@ -11,6 +11,10 @@
 //! `AppointmentTime`, then the waypoint's `ServiceDuration`), and the totals summed over
 //! those connections.
 //!
+//! A request must say where the journey GOES, not only where it starts: `Origin` is the
+//! model's only `@required` member, and a request that sets neither `Destination` nor a
+//! non-empty `Waypoints` is refused rather than answered with a route to nowhere.
+//!
 //! `Before` is HONOURED where it can be: a waypoint another unvisited waypoint requires
 //! to come after it is not eligible for the next step, so the computed sequence satisfies
 //! the constraint whenever the constraints are satisfiable at all. Constraints that name a
@@ -272,6 +276,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // `Origin` is the only `@required` member, so the boundary validator enforces it
+        // alone; that a journey must also have somewhere to go — a `Destination`, a
+        // `Waypoints` list, or both — is a rule between two optional members that no model
+        // can express, so it is enforced here. A `Waypoints` list with no entry sets no
+        // waypoint, so it is no more "somewhere to go" than an absent one.
+        if input.destination.is_none() && input.waypoints.as_deref().unwrap_or_default().is_empty() {
+            return Err(invalid(
+                MUTUALLY_SUFFICIENT_MEMBERS[0],
+                state::at_least_one_of(&MUTUALLY_SUFFICIENT_MEMBERS),
+            ));
+        }
+
         let travel_mode = match input.travel_mode.as_deref() {
             // `Default value: Car`.
             None => TravelMode::Car,
@@ -373,7 +389,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every connection names its endpoints by id, so two stops sharing one id would
         // make the answer ambiguous: a duplicate among the ids the CALLER supplied is
         // refused, and an id this service has to make up for a stop the caller left
-        // unnamed is chosen so that it cannot collide with one of them.
+        // unnamed is chosen so that it cannot collide with one of them. The refusal names
+        // the OFFENDING stop's own `Id` member — the member that carries it, the element's
+        // position in it when that member is a list, and `Id` itself — so a client can
+        // point at the duplicate rather than at the whole list.
         let supplied_origin_id = input
             .origin_options
             .as_ref()
@@ -382,21 +401,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .destination_options
             .as_ref()
             .and_then(|options| options.id.clone());
-        let supplied: Vec<String> = [supplied_origin_id.clone()]
-            .into_iter()
-            .chain(submitted.iter().map(|waypoint| waypoint.id.clone()))
-            .chain([supplied_destination_id.clone()])
-            .flatten()
-            .collect();
-        for (index, id) in supplied.iter().enumerate() {
-            if supplied[index + 1..].contains(id) {
-                return Err(invalid(
-                    "Waypoints",
-                    format!("waypoint ids must be unique within a request; {id} is used more than once"),
-                ));
+        let id_slots: Vec<(String, String)> = [(
+            format!("{}.Id", ID_BEARING_MEMBERS[0]),
+            supplied_origin_id.clone(),
+        )]
+        .into_iter()
+        .chain(submitted.iter().enumerate().map(|(index, waypoint)| {
+            (
+                format!("{}[{index}].Id", ID_BEARING_MEMBERS[1]),
+                waypoint.id.clone(),
+            )
+        }))
+        .chain([(
+            format!("{}.Id", ID_BEARING_MEMBERS[2]),
+            supplied_destination_id.clone(),
+        )])
+        .filter_map(|(path, id)| id.map(|id| (path, id)))
+        .collect();
+        for (position, (path, id)) in id_slots.iter().enumerate() {
+            if id_slots[..position].iter().any(|(_, earlier)| earlier == id) {
+                return Err(invalid(path, ids_must_be_unique()));
             }
         }
-        let mut taken = supplied;
+        let mut taken: Vec<String> = id_slots.into_iter().map(|(_, id)| id).collect();
         let origin_id = assign_id(supplied_origin_id, "Origin", &mut taken);
         let waypoint_ids: Vec<String> = submitted
             .iter()
@@ -408,7 +435,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The origin, every waypoint and the destination, as the sequencer sees them.
         let origin = Stop {
             id: origin_id,
-            position: state::validate_position("Origin", &input.origin)
+            position: state::validate_position(&input.origin)
                 .map_err(|message| invalid("Origin", message))?,
             service_duration_s: 0,
             appointment: None,
@@ -420,7 +447,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let member = format!("Waypoints[{index}].Position");
             waypoints.push(Stop {
                 id: waypoint_ids[index].clone(),
-                position: state::validate_position(&member, &waypoint.position)
+                position: state::validate_position(&waypoint.position)
                     .map_err(|message| invalid(&member, message))?,
                 service_duration_s: waypoint.service_duration,
                 appointment: match &waypoint.appointment_time {
@@ -449,7 +476,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let options = input.destination_options.as_ref();
                 Some(Stop {
                     id: destination_id,
-                    position: state::validate_position("Destination", position)
+                    position: state::validate_position(position)
                         .map_err(|message| invalid("Destination", message))?,
                     service_duration_s: options.map_or(0, |options| options.service_duration),
                     appointment: match options.and_then(|options| options.appointment_time.clone()) {
@@ -678,27 +705,13 @@ const HEADING_BOUNDS: (f64, f64) = (0.0, 360.0);
 
 /// Refuse a service duration outside the range the model declares for it.
 fn check_service_duration(member: &str, seconds: i64) -> Result<(), OptimizeWaypointsError> {
-    if (0..=MAX_SERVICE_DURATION_S).contains(&seconds) {
-        return Ok(());
-    }
-    Err(invalid(
-        member,
-        format!("ServiceDuration must be in [0, {MAX_SERVICE_DURATION_S}] seconds; got {seconds}"),
-    ))
+    state::check_range(member, (0.0, MAX_SERVICE_DURATION_S as f64), seconds as f64)
+        .map_err(|message| invalid(member, message))
 }
 
 /// Refuse a heading outside the range the model declares for it.
 fn check_heading(member: &str, heading: f64) -> Result<(), OptimizeWaypointsError> {
-    if heading.is_finite() && (HEADING_BOUNDS.0..=HEADING_BOUNDS.1).contains(&heading) {
-        return Ok(());
-    }
-    Err(invalid(
-        member,
-        format!(
-            "Heading must be in [{}, {}] degrees; got {heading}",
-            HEADING_BOUNDS.0, HEADING_BOUNDS.1
-        ),
-    ))
+    state::check_range(member, HEADING_BOUNDS, heading).map_err(|message| invalid(member, message))
 }
 
 /// The id of a stop: the one the caller supplied, or `preferred` made unique against the
@@ -791,6 +804,23 @@ fn impeding_waypoint(stop: &Stop, constraint: &str, reason: String) -> WaypointO
         id: stop.id.clone(),
         position: state::position_to_vec(stop.position),
     }
+}
+
+/// The members that are each sufficient on their own to say where this journey goes.
+/// `Origin` is `@required`; one of these must be set beside it.
+const MUTUALLY_SUFFICIENT_MEMBERS: [&str; 2] = ["Destination", "Waypoints"];
+
+/// The members of this operation's input that carry a stop's `Id`, in request order.
+const ID_BEARING_MEMBERS: [&str; 3] = ["OriginOptions", "Waypoints", "DestinationOptions"];
+
+/// The sentence for the rule that a stop's id must not repeat: it names the `Id` member
+/// and the members an id can come from, and quotes no value out of the request — which
+/// member the duplicate sits in is reported in the refusal's `fieldList` instead.
+fn ids_must_be_unique() -> String {
+    format!(
+        "'Id' must be unique across {}.",
+        state::quoted_members(&ID_BEARING_MEMBERS)
+    )
 }
 
 /// The model's own `ValidationException` (HTTP 400) for a request member this service

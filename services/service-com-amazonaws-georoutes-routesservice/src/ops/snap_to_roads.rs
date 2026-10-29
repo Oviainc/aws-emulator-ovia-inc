@@ -199,15 +199,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the service applies is 300 metres. The modeled range (`0..10000`) is not
         // enforced on a defaulted member, so the handler refuses anything outside it
         // rather than reading it as "unset".
-        if !(0..=state::MAX_SNAP_RADIUS_M).contains(&input.snap_radius) {
-            return Err(invalid(
-                "SnapRadius",
-                format!(
-                    "SnapRadius must be in [0, {}] metres; got {}",
-                    state::MAX_SNAP_RADIUS_M, input.snap_radius
-                ),
-            ));
-        }
+        state::check_range(
+            "SnapRadius",
+            (0.0, state::MAX_SNAP_RADIUS_M as f64),
+            input.snap_radius as f64,
+        )
+        .map_err(|message| invalid("SnapRadius", message))?;
         let snap_radius_m = if input.snap_radius == 0 {
             state::DEFAULT_SNAP_RADIUS_M as f64
         } else {
@@ -218,20 +215,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // network", 2..5000 on `TracePoints`). They are enforced HERE rather than relied on
         // from the boundary validator, so the per-request work below is bounded whatever
         // the generated validator does with the member's length.
-        if !(MIN_TRACE_POINTS..=MAX_TRACE_POINTS).contains(&input.trace_points.len()) {
-            return Err(invalid(
-                "TracePoints",
-                format!(
-                    "TracePoints must carry between {MIN_TRACE_POINTS} and {MAX_TRACE_POINTS} points; got {}",
-                    input.trace_points.len()
-                ),
-            ));
-        }
+        state::check_length(
+            "TracePoints",
+            (MIN_TRACE_POINTS, MAX_TRACE_POINTS),
+            input.trace_points.len(),
+        )
+        .map_err(|message| invalid("TracePoints", message))?;
         let mut positions = Vec::with_capacity(input.trace_points.len());
         for (index, trace_point) in input.trace_points.iter().enumerate() {
             let member = format!("TracePoints[{index}].Position");
             positions.push(
-                state::validate_position(&member, &trace_point.position)
+                state::validate_position(&trace_point.position)
                     .map_err(|message| invalid(&member, message))?,
             );
         }

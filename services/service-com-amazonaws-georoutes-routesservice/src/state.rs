@@ -1230,31 +1230,121 @@ pub fn route_key(
     key
 }
 
-/// A position read off a model member, or a message naming the member and the rule it
-/// broke. `member` is the member's path in the request, as the boundary validator words it.
-pub fn validate_position(member: &str, value: &[f64]) -> Result<Position, String> {
+/// A position read off a model member, or the sentence for the rule it broke.
+///
+/// The sentence carries NO member path: which member was refused is reported by the
+/// caller in the `ValidationException`'s `fieldList`, and the sentence states the rule —
+/// the coordinate component, the degree domain it has to lie in, and the value the
+/// request set.
+pub fn validate_position(value: &[f64]) -> Result<Position, String> {
     let [lon, lat] = match value {
         [lon, lat] => [*lon, *lat],
         other => {
             return Err(format!(
-                "{member} must be a position of exactly 2 values, [longitude, latitude]; got {} values",
+                "A position must be set to 2 values, [longitude, latitude], but was set to {} values.",
                 other.len()
             ))
         }
     };
-    if !lon.is_finite() || lon < LONGITUDE_BOUNDS.0 || lon > LONGITUDE_BOUNDS.1 {
-        return Err(format!(
-            "{member} longitude must be in [{}, {}]; got {lon}",
-            LONGITUDE_BOUNDS.0, LONGITUDE_BOUNDS.1
-        ));
-    }
-    if !lat.is_finite() || lat < LATITUDE_BOUNDS.0 || lat > LATITUDE_BOUNDS.1 {
-        return Err(format!(
-            "{member} latitude must be in [{}, {}]; got {lat}",
-            LATITUDE_BOUNDS.0, LATITUDE_BOUNDS.1
-        ));
-    }
+    check_degrees("Longitude", LONGITUDE_BOUNDS, lon)?;
+    check_degrees("Latitude", LATITUDE_BOUNDS, lat)?;
     Ok([lon, lat])
+}
+
+/// One coordinate against its degree domain: `Ok` inside it, else the sentence for a
+/// coordinate outside it.
+fn check_degrees(component: &str, bounds: (f64, f64), value: f64) -> Result<(), String> {
+    if value.is_finite() && value >= bounds.0 && value <= bounds.1 {
+        return Ok(());
+    }
+    Err(must_be_between(component, bounds, "degrees", value))
+}
+
+/// The sentence for a value outside the degree domain a coordinate component lies in:
+/// fixed text names the component, both bounds and the unit they are in, and the only part
+/// taken from the request is the value it set.
+fn must_be_between(
+    component: &str,
+    bounds: (f64, f64),
+    unit: &str,
+    value: impl std::fmt::Display,
+) -> String {
+    format!(
+        "{component} must be between {} and {} {unit}, but was set to {value}.",
+        bounds.0, bounds.1
+    )
+}
+
+/// The sentence for a rule no model can express: a set of otherwise-optional members of
+/// which a request must set at least one. The members are the only variable part, and the
+/// member the refusal names in its `fieldList` is the first of them.
+pub fn at_least_one_of(members: &[&str]) -> String {
+    format!(
+        "At least one of the following fields must be set: {}.",
+        members.join(", ")
+    )
+}
+
+/// Member names as a refusal lists them: each quoted, separated by commas, with the last
+/// one joined by `and` — `'A'`, `'A' and 'B'`, `'A', 'B' and 'C'`.
+pub fn quoted_members(members: &[&str]) -> String {
+    let quoted: Vec<String> = members.iter().map(|member| format!("'{member}'")).collect();
+    match quoted.split_last() {
+        None => String::new(),
+        Some((last, &[])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// `'{member}' {rule}` — the shape of a refusal that names the member at fault. The
+/// member is single-quoted and spelled the way the refusal's `fieldList` names it: the
+/// model's own spelling, with the position of the offending element where it is one.
+pub fn member_rule(member: &str, rule: &str) -> String {
+    format!("'{member}' {rule}")
+}
+
+/// A value below the minimum of the range its member allows.
+pub fn must_not_be_less_than(member: &str, minimum: impl std::fmt::Display) -> String {
+    member_rule(member, &format!("must not be less than {minimum}"))
+}
+
+/// A value above the maximum of the range its member allows.
+pub fn must_not_be_greater_than(member: &str, maximum: impl std::fmt::Display) -> String {
+    member_rule(member, &format!("must not be greater than {maximum}"))
+}
+
+/// A numeric member against the range it allows, stated by the bound the value broke and
+/// never quoting the value back.
+///
+/// Bounds are taken as `f64` so one rule covers an integral member and a floating-point
+/// one; an integral bound renders without a decimal point. A value that is not a number at
+/// all cannot be inside the range, so it is reported against the maximum.
+pub fn check_range(member: &str, bounds: (f64, f64), value: f64) -> Result<(), String> {
+    if value.is_finite() && value >= bounds.0 && value <= bounds.1 {
+        return Ok(());
+    }
+    if value < bounds.0 {
+        return Err(must_not_be_less_than(member, bounds.0));
+    }
+    Err(must_not_be_greater_than(member, bounds.1))
+}
+
+/// A collection member against the length it allows, stated by the bound it broke. Worded
+/// as a LENGTH rather than in entries, because the same rule applies to a string.
+pub fn check_length(member: &str, bounds: (usize, usize), length: usize) -> Result<(), String> {
+    if length < bounds.0 {
+        return Err(member_rule(
+            member,
+            &format!("must have a length of at least {}", bounds.0),
+        ));
+    }
+    if length > bounds.1 {
+        return Err(member_rule(
+            member,
+            &format!("must have a length of at most {}", bounds.1),
+        ));
+    }
+    Ok(())
 }
 
 /// The geometry format a request asked for, or the documented default. `Err` names the

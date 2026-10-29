@@ -567,15 +567,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // different number of routes than was asked for would let a caller read an invalid
         // request as a served one.
         let alternatives = input.max_alternatives.unwrap_or(0);
-        if !(0..=state::MAX_ALTERNATIVES).contains(&alternatives) {
-            return Err(invalid(
-                "MaxAlternatives",
-                format!(
-                    "MaxAlternatives must be in [0, {}]; got {alternatives}",
-                    state::MAX_ALTERNATIVES
-                ),
-            ));
-        }
+        state::check_range(
+            "MaxAlternatives",
+            (0.0, f64::from(state::MAX_ALTERNATIVES)),
+            f64::from(alternatives),
+        )
+        .map_err(|message| invalid("MaxAlternatives", message))?;
 
         // Documented on `Waypoints`: "Max length: 23". The member carries no modeled
         // length constraint, so the cap is the handler's to apply, and it is what bounds
@@ -595,7 +592,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The requested sequence: origin, every waypoint, destination.
         let mut sequence = vec![SequencePoint {
-            position: state::validate_position("Origin", &input.origin)
+            position: state::validate_position(&input.origin)
                 .map_err(|message| invalid("Origin", message))?,
             matched_position: None,
             waypoint_index: None,
@@ -603,22 +600,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stop_duration_s: 0,
         }];
         for (index, waypoint) in submitted_waypoints.iter().enumerate() {
-            let member = format!("Waypoints[{index}].Position");
             // `StopDuration`'s modeled range is `0..49999`, which the boundary validator
             // does not enforce on a defaulted member, so the handler does: the value is
             // added to the route's clock, which must not be driven anywhere by it.
-            if !(0..=MAX_STOP_DURATION_S).contains(&waypoint.stop_duration) {
-                let member = format!("Waypoints[{index}].StopDuration");
-                return Err(invalid(
-                    &member,
-                    format!(
-                        "StopDuration must be in [0, {MAX_STOP_DURATION_S}] seconds; got {}",
-                        waypoint.stop_duration
-                    ),
-                ));
-            }
+            let stop_duration_member = format!("Waypoints[{index}].StopDuration");
+            state::check_range(
+                &stop_duration_member,
+                (0.0, MAX_STOP_DURATION_S as f64),
+                waypoint.stop_duration as f64,
+            )
+            .map_err(|message| invalid(&stop_duration_member, message))?;
+            let member = format!("Waypoints[{index}].Position");
             sequence.push(SequencePoint {
-                position: state::validate_position(&member, &waypoint.position)
+                position: state::validate_position(&waypoint.position)
                     .map_err(|message| invalid(&member, message))?,
                 matched_position: None,
                 waypoint_index: Some(index),
@@ -627,7 +621,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
         sequence.push(SequencePoint {
-            position: state::validate_position("Destination", &input.destination)
+            position: state::validate_position(&input.destination)
                 .map_err(|message| invalid("Destination", message))?,
             matched_position: None,
             waypoint_index: None,

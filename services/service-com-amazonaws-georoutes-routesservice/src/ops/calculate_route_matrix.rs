@@ -291,14 +291,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (index, origin) in input.origins.iter().enumerate() {
             let member = format!("Origins[{index}].Position");
             origins.push(
-                state::validate_position(&member, &origin.position).map_err(|message| invalid(&member, message))?,
+                state::validate_position(&origin.position).map_err(|message| invalid(&member, message))?,
             );
         }
         let mut destinations = Vec::with_capacity(input.destinations.len());
         for (index, destination) in input.destinations.iter().enumerate() {
             let member = format!("Destinations[{index}].Position");
             destinations.push(
-                state::validate_position(&member, &destination.position)
+                state::validate_position(&destination.position)
                     .map_err(|message| invalid(&member, message))?,
             );
         }
@@ -576,17 +576,17 @@ fn resolve_geometry(
     }
 
     if let Some(circle) = &geometry.circle {
-        let center = state::validate_position("RoutingBoundary.Geometry.Circle.Center", &circle.center)
+        let center = state::validate_position(&circle.center)
             .map_err(|message| invalid("RoutingBoundary.Geometry.Circle.Center", message))?;
-        if !circle.radius.is_finite() || circle.radius < 0.0 || circle.radius > MAX_BOUNDARY_RADIUS_M {
-            return Err(invalid(
-                "RoutingBoundary.Geometry.Circle.Radius",
-                format!(
-                    "Circle.Radius must be in [0, {MAX_BOUNDARY_RADIUS_M}] meters; got {}",
-                    circle.radius
-                ),
-            ));
-        }
+        // `Circle.Radius` carries no modeled range; its documented one is "Valid Range:
+        // Minimum value of 0. Maximum value of 200000." — the same class of rule, so it is
+        // stated the same way.
+        state::check_range(
+            "RoutingBoundary.Geometry.Circle.Radius",
+            (0.0, MAX_BOUNDARY_RADIUS_M),
+            circle.radius,
+        )
+        .map_err(|message| invalid("RoutingBoundary.Geometry.Circle.Radius", message))?;
         return Ok((
             Boundary::Circle {
                 center,
@@ -615,8 +615,8 @@ fn resolve_geometry(
                 ),
             ));
         }
-        let south_west = state::validate_position(member, &bounding_box[..2]).map_err(|message| invalid(member, message))?;
-        let north_east = state::validate_position(member, &bounding_box[2..]).map_err(|message| invalid(member, message))?;
+        let south_west = state::validate_position(&bounding_box[..2]).map_err(|message| invalid(member, message))?;
+        let north_east = state::validate_position(&bounding_box[2..]).map_err(|message| invalid(member, message))?;
         // The second pair is the north-east corner, so its latitude cannot be south of the
         // first pair's. A longitude that runs the other way is the antimeridian wrap the
         // containment test honours.
@@ -677,7 +677,7 @@ fn resolve_geometry(
     let mut positions = Vec::with_capacity(ring.len());
     for (index, position) in ring.iter().enumerate() {
         let member = format!("{member}[0][{index}]");
-        positions.push(state::validate_position(&member, position).map_err(|message| invalid(&member, message))?);
+        positions.push(state::validate_position(position).map_err(|message| invalid(&member, message))?);
     }
     if positions.first() != positions.last() {
         return Err(invalid(
@@ -714,6 +714,11 @@ fn centroid(positions: &[Position]) -> Position {
 
 /// The documented limits on how large a matrix may be, which depend on whether the
 /// routing boundary is a geometry or unbounded.
+///
+/// A cap the model does not carry is stated as a rule, not as a complaint about the
+/// request: the sentence names what is capped, the cap itself and the boundary member and
+/// mode the cap applies under — so a caller can see that another boundary allows more —
+/// and quotes none of the request's own counts back.
 fn check_matrix_size(
     boundary: &Boundary,
     origins: usize,
@@ -724,26 +729,36 @@ fn check_matrix_size(
     } else {
         UNBOUNDED_LIMITS
     };
+    let under = boundary_clause(boundary);
     if origins > max_origins {
         return Err(invalid(
             "Origins",
-            format!("at most {max_origins} origins are allowed for this routing boundary; got {origins}"),
+            format!("The number of origins must be less than or equal to {max_origins} {under}"),
         ));
     }
     if destinations > max_destinations {
         return Err(invalid(
             "Destinations",
-            format!("at most {max_destinations} destinations are allowed for this routing boundary; got {destinations}"),
+            format!("The number of destinations must be less than or equal to {max_destinations} {under}"),
         ));
     }
     if origins.saturating_mul(destinations) > max_pairs {
         return Err(invalid(
             "Origins",
-            format!(
-                "the total matrix size must not exceed {max_pairs} for this routing boundary; got {}",
-                origins.saturating_mul(destinations)
-            ),
+            format!("The total number of routes to calculate must be less than or equal to {max_pairs} {under}"),
         ));
     }
     Ok(())
+}
+
+/// How a cap sentence names the boundary mode it applies under. `Unbounded` is a boolean,
+/// so its clause names the value it has — which is also the mode a request that sets no
+/// boundary at all is answered under; a geometry boundary is named by the member that
+/// carries the geometry.
+fn boundary_clause(boundary: &Boundary) -> &'static str {
+    if boundary.is_geometry() {
+        "when 'RoutingBoundary.Geometry' is set."
+    } else {
+        "when 'RoutingBoundary.Unbounded' has value true."
+    }
 }
