@@ -33,6 +33,8 @@ mod default_page_size;
 mod delete_resource_policy_existence;
 #[path = "all/documented_entity_types.rs"]
 mod documented_entity_types;
+#[path = "all/entity_lock_in_flight.rs"]
+mod entity_lock_in_flight;
 #[path = "all/entity_reads.rs"]
 mod entity_reads;
 #[path = "all/entity_type_projections.rs"]

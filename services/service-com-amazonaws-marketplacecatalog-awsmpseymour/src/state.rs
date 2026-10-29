@@ -3622,6 +3622,24 @@ pub fn in_use(message: impl Into<String>) -> ResourceInUseException {
     }
 }
 
+/// The modelled `ResourceInUseException` payload for an entity a still-running
+/// change set holds, naming the entity the lock covers and the change set that
+/// holds it.
+///
+/// `StartChangeSet` documents both the lock and this refusal: "when a ChangeSet
+/// is running, all the entities targeted by the different changes are locked
+/// until the change set has completed … If you try to start a change set
+/// containing a change against an entity that is already locked, you will
+/// receive a ResourceInUseException error." The holder comes from
+/// [`ComAmazonawsMarketplacecatalogAwsmpseymourState::locking_change_set`], so
+/// the id in the message is one the caller can read back with
+/// `DescribeChangeSet`.
+pub fn entity_locked(entity_id: &str, holder: &str) -> ResourceInUseException {
+    in_use(format!(
+        "entity {entity_id} is locked by the running change set {holder}"
+    ))
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

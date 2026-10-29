@@ -571,6 +571,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             // it — which is what a refusal for an absent entity
                             // names too.
                             let entity_id = crate::state::entity_id_of(identifier);
+                            // "when a ChangeSet is running, all the entities
+                            // targeted by the different changes are locked until
+                            // the change set has completed … If you try to start
+                            // a change set containing a change against an entity
+                            // that is already locked, you will receive a
+                            // ResourceInUseException error."
+                            //
+                            // The lock is held on the entity ID, and a running
+                            // change set holds the ids of the entities it is
+                            // still CREATING as well as the ids of the ones it
+                            // found: a change set writes its entities into the
+                            // catalog only once it succeeds. So the lock is
+                            // consulted BEFORE the catalog is read — an id a
+                            // change set in flight holds names an entity being
+                            // worked on, not a missing one.
+                            if let Some(holder) = store.locking_change_set(entity_id) {
+                                return Err(StartChangeSetErrorModeled::ResourceInUseException(
+                                    crate::state::entity_locked(entity_id, holder),
+                                )
+                                .into());
+                            }
                             let Some(entity) = store.resolve_identifier(identifier) else {
                                 return Err(
                                     StartChangeSetErrorModeled::ResourceNotFoundException(
@@ -616,19 +637,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
-                // "when a ChangeSet is running, all the entities targeted by
-                // the different changes are locked until the change set has
-                // completed … If you try to start a change set containing a
-                // change against an entity that is already locked, you will
-                // receive a ResourceInUseException error."
-                if let Some(holder) = store.locking_change_set(entity_id) {
-                    return Err(StartChangeSetErrorModeled::ResourceInUseException(
-                        crate::state::in_use(format!(
-                            "entity {entity_id} is locked by the running change set {holder}"
-                        )),
-                    )
-                    .into());
-                }
+                // The lock is judged where the entity is resolved, above: an id
+                // this call MINTED is held by nothing (`mint_entity_id` skips
+                // every id a running change set reserved), and an id a change
+                // NAMED was refused there if a change set in flight holds it.
             }
 
             changes.push(crate::state::ChangeRecord {
