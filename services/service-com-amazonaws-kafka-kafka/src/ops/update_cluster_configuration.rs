@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateClusterConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateClusterConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies an MSK configuration revision to the brokers of a provisioned cluster.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateClusterConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The call is ACCEPTED, not completed: it records a cluster operation, moves the
+//! cluster to `UPDATING` and hands it the change the clock applies at
+//! [`crate::state::CLUSTER_UPDATE_DELAY`], which is also when the cluster's next
+//! `CurrentVersion` is generated. The operation this returns is readable through
+//! `DescribeClusterOperation`, and the applied configuration through
+//! `DescribeCluster`'s `CurrentBrokerSoftwareInfo`.
+//!
+//! A request this region holds no cluster for is a `NotFoundException` whatever its
+//! body asks for: the resource named in the URI is resolved before anything in the
+//! body is judged.
+//!
+//! The `ConfigurationInfo` must resolve to a revision this region holds, refused
+//! through [`crate::state::configuration_arn_not_found`] — the one refusal every
+//! operation of the configuration family answers an unresolvable reference with.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +158,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateClusterConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateClusterConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateClusterConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateClusterConfigurationErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(
+                UpdateClusterConfigurationErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK cluster ARN.",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        // The cluster is resolved FIRST: an update against an ARN this region
+        // holds no cluster for is a resource that cannot be found, whatever the
+        // body asks for. The settling lookup materialises only the transitions
+        // the clock already owed THIS cluster, so the checks below judge the
+        // configuration it is actually running.
+        let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
+            return Err(
+                UpdateClusterConfigurationErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        };
+        // Copied out of the record: the checks below are followed by a write, so
+        // the borrow of the registry has to end here.
+        let cluster_state = cluster.state.clone();
+        let current_version = cluster.current_version.clone();
+        let is_serverless = cluster.is_serverless();
+
+        // A custom configuration configures the cluster's own brokers, and a
+        // serverless cluster has none: MSK Serverless manages the broker
+        // configuration itself.
+        if is_serverless {
+            return Err(
+                UpdateClusterConfigurationErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::PROVISIONED_ONLY_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // Only a cluster whose brokers are serving can take an update: one still
+        // being provisioned, or already applying a change, has no settled
+        // configuration to update from.
+        if cluster_state != crate::state::CLUSTER_STATE_ACTIVE {
+            return Err(
+                UpdateClusterConfigurationErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "The cluster is in the {cluster_state} state; it must be {} to be updated.",
+                        crate::state::CLUSTER_STATE_ACTIVE
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The version is the one the caller is updating FROM, so a stale one
+        // means the caller has not seen the cluster's current configuration.
+        if input.current_version != current_version {
+            return Err(
+                UpdateClusterConfigurationErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("currentVersion".to_string()),
+                    message: Some(format!(
+                        "The cluster's current version is {current_version}, not {}.",
+                        input.current_version
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The revision the request names has to be one this region actually
+        // holds: the stored reference is what every reader then reports as the
+        // cluster's `ConfigurationArn` and `ConfigurationRevision`.
+        // A reference that does not resolve is the configuration family's one
+        // unresolvable-reference bad request, whether the `Arn` names no
+        // configuration of this region or the configuration it names holds no
+        // revision of the number given: the same refusal the configuration
+        // readers answer, so the two cannot drift apart.
+        let resolved = state
+            .configuration_in(&region, &input.configuration_info.arn)
+            .and_then(|configuration| {
+                configuration.revision(input.configuration_info.revision)
+            });
+        if resolved.is_none() {
+            return Err(UpdateClusterConfigurationErrorModeled::BadRequestException(
+                crate::state::configuration_arn_not_found(),
+            )
+            .into());
+        }
+
+        // The registry starts the operation: it records what changes, moves the
+        // cluster to UPDATING and stores the instant the change comes due.
+        let Some(operation_arn) = state.start_configuration_update(
+            &region,
+            &input.cluster_arn,
+            now,
+            input.configuration_info,
+        ) else {
+            return Err(
+                UpdateClusterConfigurationErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some(
+                            "the cluster vanished while its update was starting".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(UpdateClusterConfigurationOutput {
+            cluster_arn: Some(input.cluster_arn),
+            cluster_operation_arn: Some(operation_arn),
+        })
     }
 }

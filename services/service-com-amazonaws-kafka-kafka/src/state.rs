@@ -55,7 +55,8 @@
 //!
 //! A cluster's configuration also changes after creation: an update operation
 //! (`UpdateConnectivity`, `UpdateStorage`, `UpdateBrokerStorage`,
-//! `UpdateClusterKafkaVersion`, `UpdateSecurity`) records a
+//! `UpdateClusterKafkaVersion`, `UpdateClusterConfiguration`,
+//! `UpdateSecurity`) records a
 //! [`PendingUpdate`] on the cluster, and [`Cluster::settle`] folds it into the
 //! record once the clock owes its completion — so one place decides what every
 //! reader then reports. The operation itself is kept in the cluster-operation
@@ -204,6 +205,10 @@ pub const OPERATION_TYPE_UPDATE_CONNECTIVITY: &str = "UPDATE_CONNECTIVITY";
 /// The `OperationType` an `UpdateClusterKafkaVersion` call records, in the same
 /// form.
 pub const OPERATION_TYPE_UPDATE_CLUSTER_KAFKA_VERSION: &str = "UPDATE_CLUSTER_KAFKA_VERSION";
+
+/// The `OperationType` an `UpdateClusterConfiguration` call records, in the same
+/// form.
+pub const OPERATION_TYPE_UPDATE_CLUSTER_CONFIGURATION: &str = "UPDATE_CLUSTER_CONFIGURATION";
 
 /// The `OperationType` an `UpdateSecurity` call records, in the same form.
 pub const OPERATION_TYPE_UPDATE_SECURITY: &str = "UPDATE_SECURITY";
@@ -1133,6 +1138,10 @@ pub enum ClusterChange {
         kafka_version: String,
         configuration_info: Option<ConfigurationInfo>,
     },
+    /// `UpdateClusterConfiguration`: the MSK configuration revision the brokers
+    /// run their Apache Kafka version with. The request always names one, so
+    /// there is nothing optional about this change.
+    Configuration { configuration_info: ConfigurationInfo },
     /// `UpdateSecurity`: the client authentication the cluster accepts, the
     /// encryption it runs with, or both. `None` means the request left that
     /// setting alone.
@@ -3155,6 +3164,34 @@ impl ComAmazonawsKafkaKafkaState {
         )
     }
 
+    /// Start a configuration update: the brokers move to the MSK configuration
+    /// revision `configuration_info` names once the clock owes the operation its
+    /// completion.
+    pub fn start_configuration_update(
+        &mut self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+        configuration_info: ConfigurationInfo,
+    ) -> Option<String> {
+        self.start_cluster_update(
+            region,
+            arn,
+            now,
+            OPERATION_TYPE_UPDATE_CLUSTER_CONFIGURATION,
+            |cluster| {
+                let source_cluster_info = cluster.configuration_cluster_info();
+                let target_cluster_info =
+                    configuration_cluster_info(Some(configuration_info.clone()));
+                (
+                    source_cluster_info,
+                    target_cluster_info,
+                    ClusterChange::Configuration { configuration_info },
+                )
+            },
+        )
+    }
+
     /// Start a connectivity update: the broker access configuration, the
     /// ZooKeeper access setting, or both, as the request named them.
     pub fn start_connectivity_update(
@@ -4836,6 +4873,16 @@ impl Cluster {
         kafka_version_cluster_info(&self.kafka_version, self.configuration_info.clone())
     }
 
+    /// The configuration revision the brokers run, as the `MutableClusterInfo`
+    /// a cluster operation reports: the one attribute an
+    /// `UpdateClusterConfiguration` call changes, and only that — the same rule
+    /// [`Self::storage_cluster_info`] follows. `None` where the cluster runs no
+    /// custom configuration at all, which is what a cluster created without one
+    /// does.
+    pub fn configuration_cluster_info(&self) -> MutableClusterInfo {
+        configuration_cluster_info(self.configuration_info.clone())
+    }
+
     /// The cluster's broker access configuration and ZooKeeper access setting
     /// as the `MutableClusterInfo` a cluster operation reports: the attributes
     /// an `UpdateConnectivity` call changes, and only those — the same rule
@@ -4999,6 +5046,12 @@ impl Cluster {
                 if let Some(info) = configuration_info {
                     self.configuration_info = Some(info);
                 }
+            }
+            ClusterChange::Configuration { configuration_info } => {
+                // The brokers now run the revision the update named, which is
+                // what every reader derives the cluster's `ConfigurationArn` and
+                // `ConfigurationRevision` from.
+                self.configuration_info = Some(configuration_info);
             }
             ClusterChange::Security {
                 client_authentication,
@@ -5467,6 +5520,19 @@ fn kafka_version_cluster_info(
 ) -> MutableClusterInfo {
     MutableClusterInfo {
         kafka_version: Some(kafka_version.to_string()),
+        configuration_info,
+        ..MutableClusterInfo::default()
+    }
+}
+
+/// The configuration revision a cluster operation reports, as
+/// `MutableClusterInfo`.
+///
+/// `ConfigurationInfo` is the only member an `UpdateClusterConfiguration` call
+/// touches, so it is the only one set — the same rule [`storage_cluster_info`]
+/// follows.
+fn configuration_cluster_info(configuration_info: Option<ConfigurationInfo>) -> MutableClusterInfo {
+    MutableClusterInfo {
         configuration_info,
         ..MutableClusterInfo::default()
     }
