@@ -214,18 +214,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The policy is about a Monitor resource, so a resource this store does not
-        // hold is an absence this operation's modelled 404 states. Resolved for the
-        // portal form, which this store holds; a project is accepted unchecked
-        // because no operation of this crate stores one yet (`CreateProject` is
-        // still a scaffold), so there is nothing a check could consult. Reported
-        // after the policy's own absence: the request addresses the policy, so an id
-        // that names no policy is what a caller is told about first.
-        let missing_portal = input
-            .access_policy_resource
-            .portal
-            .as_ref()
-            .filter(|portal| !store.portals.contains_key(&portal.id))
-            .map(|portal| portal.id.clone());
+        // hold is an absence this operation's modelled 404 states. BOTH alternatives
+        // a `Resource` can take name a resource this service holds, so each is
+        // resolved against the map that holds it, from the one place
+        // `CreateAccessPolicy` resolves it too. Reported after the policy's own
+        // absence: the request addresses the policy, so an id that names no policy
+        // is what a caller is told about first.
+        let missing_resource = store
+            .missing_monitor_resource(&input.access_policy_resource)
+            .map(|(resource, requested)| (resource, requested.to_string()));
 
         let policy = store
             .access_policies
@@ -237,8 +234,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
-        if let Some(portal_id) = missing_portal {
-            return Err(not_found(crate::state::RESOURCE_PORTAL, &portal_id));
+        if let Some((resource, requested)) = missing_resource {
+            return Err(not_found(resource, &requested));
         }
 
         // Every member this operation carries is required, so the request states the

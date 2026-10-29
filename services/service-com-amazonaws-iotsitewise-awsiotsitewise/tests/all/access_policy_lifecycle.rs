@@ -18,8 +18,10 @@
 //! * an identity or a Monitor resource that does not name EXACTLY ONE
 //!   alternative is refused `InvalidRequestException`, on the create and on the
 //!   update alike, and stores nothing;
-//! * an id that resolves to no stored access policy, and a policy about a portal
-//!   this store does not hold, are modelled 404s rather than fabricated answers.
+//! * an id that resolves to no stored access policy, and a policy about a
+//!   Monitor resource this store does not hold — in EITHER form a `Resource`
+//!   takes, a portal or a project — are modelled 404s rather than fabricated
+//!   answers.
 //!
 //! The one refusal these suites do NOT exercise is the `MAX_ACCESS_POLICIES`
 //! ceiling: the bound is 1000 policies, so covering it would mean a thousand
@@ -36,6 +38,7 @@ use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::asset_lifecycle::{call, error_code, is_modelled_id, router, REGION};
+use crate::project_lifecycle::{create_body as project_create_body, PROJECTS};
 
 /// Where every access-policy request goes, as `OPERATIONS.md` reports the routes:
 /// `POST /access-policies`, `GET|PUT /access-policies/{accessPolicyId}`.
@@ -72,18 +75,20 @@ const PERMISSIONS: [&str; 2] = ["ADMINISTRATOR", "VIEWER"];
 const RESOURCE_KINDS: [&str; 2] = ["portal", "project"];
 
 /// A modelled `ID` built from `seed`: a lowercase hyphenated UUID that is not the
-/// all-zero one the pattern refuses. Used for the resources this suite names but
-/// does not create (a project, whose create is still a scaffold) and for the ids
-/// it expects to resolve to nothing.
+/// all-zero one the pattern refuses. Used for the ids this suite expects to
+/// resolve to nothing, and for the resources a request refused before anything is
+/// read names without ever reaching the store.
 fn modelled_id(seed: u32) -> String {
     format!("{seed:08x}-1c2d-4e5f-8a9b-0c1d2e3f4a5b")
 }
 
-/// The `accessPolicyResource` of `kind`, about `portal_id` for the portal form.
-fn resource_json(kind: &str, portal_id: &str, seed: u32) -> Value {
+/// The `accessPolicyResource` of `kind`: the portal form about `portal_id`, the
+/// project form about `project_id`. Both name a resource the store really holds,
+/// because an access policy is about a Monitor resource that exists.
+fn resource_json(kind: &str, portal_id: &str, project_id: &str) -> Value {
     match kind {
         "portal" => json!({ "portal": { "id": portal_id } }),
-        "project" => json!({ "project": { "id": modelled_id(seed) } }),
+        "project" => json!({ "project": { "id": project_id } }),
         other => panic!("unknown resource kind {other:?}"),
     }
 }
@@ -106,7 +111,7 @@ struct PolicyCase {
 /// alternative — with tags on every third row and a `clientToken` on every
 /// second, so the table also spans "carries the optional members" and "carries
 /// none of them".
-fn policy_cases(portal_id: &str) -> Vec<PolicyCase> {
+fn policy_cases(portal_id: &str, project_id: &str) -> Vec<PolicyCase> {
     let mut cases = Vec::new();
     for (identity_label, identity) in identity_catalog() {
         for permission in PERMISSIONS {
@@ -115,7 +120,7 @@ fn policy_cases(portal_id: &str) -> Vec<PolicyCase> {
                 cases.push(PolicyCase {
                     label: format!("{identity_label}-{permission}-{kind}"),
                     identity: identity.clone(),
-                    resource: resource_json(kind, portal_id, at + 1),
+                    resource: resource_json(kind, portal_id, project_id),
                     permission,
                     tags: at.is_multiple_of(3).then(|| {
                         json!({ "stage": "test", "slot": format!("{at}") })
@@ -177,6 +182,37 @@ pub(crate) async fn create_portal(router: &MultiServiceRouter, name: &str) -> St
         .to_string()
 }
 
+/// Create a project in `portal_id` and return its id: the OTHER Monitor resource
+/// a policy can be about, and the one every project-scoped row of this suite
+/// names.
+///
+/// `pub(crate)` beside [`create_portal`] because the sibling access-policy suites
+/// need the same two Monitor resources, so they share one definition rather than
+/// drifting apart. The create body comes from the project suite, which owns it.
+pub(crate) async fn create_project(
+    router: &MultiServiceRouter,
+    portal_id: &str,
+    name: &str,
+) -> String {
+    let (status, created) = call(
+        router,
+        "POST",
+        PROJECTS,
+        Some(project_create_body(portal_id, name, None)),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {name:?}: CreateProject expected 201, got {status} {created}"
+    );
+    let id = created["projectId"].as_str().unwrap_or_default().to_string();
+    assert!(
+        is_modelled_id(&id),
+        "case {name:?}: projectId must be a modelled UUID, got {created}"
+    );
+    id
+}
+
 /// `CreateAccessPolicy` with `body`.
 async fn create_policy(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
     call(router, "POST", ACCESS_POLICIES, Some(body)).await
@@ -208,9 +244,10 @@ async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
 async fn created_access_policy_reads_back_through_describe_for_every_input_shape() {
     let router = router();
     let portal_id = create_portal(&router, "portal-for-access-policies").await;
+    let project_id = create_project(&router, &portal_id, "project-for-access-policies").await;
     let mut seen_ids: BTreeSet<String> = BTreeSet::new();
 
-    for case in policy_cases(&portal_id) {
+    for case in policy_cases(&portal_id, &project_id) {
         let body = create_body(&case);
         let (status, created) = create_policy(&router, body.clone()).await;
         assert_eq!(
@@ -328,7 +365,8 @@ async fn created_access_policy_reads_back_through_describe_for_every_input_shape
 async fn update_replaces_every_caller_owned_member_and_keeps_the_policy_s_identity() {
     let router = router();
     let portal_id = create_portal(&router, "portal-for-access-policy-updates").await;
-    let cases = policy_cases(&portal_id);
+    let project_id = create_project(&router, &portal_id, "project-for-access-policy-updates").await;
+    let cases = policy_cases(&portal_id, &project_id);
 
     for (at, case) in cases.iter().enumerate() {
         let created_body = create_body(case);
@@ -618,6 +656,293 @@ async fn an_id_that_resolves_to_nothing_is_a_modelled_not_found() {
             refused["message"].as_str().unwrap_or_default(),
             expected,
             "case {absent_portal:?}: unexpected refusal message in {refused}"
+        );
+    }
+}
+
+/// `DeletePortal` on `id`, the way a portal this store once held stops being held:
+/// `DELETE /portals/{portalId} -> 202`, as `OPERATIONS.md` reports the route.
+async fn delete_portal(router: &MultiServiceRouter, id: &str) {
+    let (status, body) = call(router, "DELETE", &format!("{PORTALS}/{id}"), None).await;
+    assert_eq!(
+        status, 202,
+        "DeletePortal on {id} expected 202, got {status} {body}"
+    );
+}
+
+/// `DeleteProject` on `id`: `DELETE /projects/{projectId} -> 204`.
+async fn delete_project(router: &MultiServiceRouter, id: &str) {
+    let (status, body) = call(router, "DELETE", &format!("{PROJECTS}/{id}"), None).await;
+    assert_eq!(
+        status, 204,
+        "DeleteProject on {id} expected 204, got {status} {body}"
+    );
+}
+
+/// How many access policies the store holds, read through `ListAccessPolicies`
+/// (`GET /access-policies`) — the only way to see that a refused write stored
+/// nothing at all, and well under the listing's default page size here.
+async fn stored_policy_count(router: &MultiServiceRouter) -> usize {
+    let (status, listed) = call(router, "GET", ACCESS_POLICIES, None).await;
+    assert_eq!(
+        status, 200,
+        "ListAccessPolicies expected 200, got {status} {listed}"
+    );
+    listed["accessPolicySummaries"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or_default()
+}
+
+/// The resource kind a not-found refusal names each `Resource` alternative by.
+/// Source: every not-found refusal of this service states the absence as
+/// `<Resource> with ID <id> not found`, with `Portal` and `Project` as the kinds
+/// of the two alternatives `smithy_query(query="shape", shape="Resource")`
+/// declares.
+fn resource_kind_label(form: &str) -> &'static str {
+    match form {
+        "portal" => "Portal",
+        "project" => "Project",
+        other => panic!("unknown resource kind {other:?}"),
+    }
+}
+
+/// One row of the absent-Monitor-resource table: how the request names the
+/// resource (`portal` or `project`), the identifier it names it by, and why that
+/// identifier resolves to nothing.
+#[derive(Debug)]
+struct AbsentResourceCase {
+    label: String,
+    form: &'static str,
+    id: String,
+}
+
+impl AbsentResourceCase {
+    /// The `accessPolicyResource` this row sends.
+    fn resource(&self) -> Value {
+        resource_json(self.form, &self.id, &self.id)
+    }
+
+    /// The refusal message this row must draw.
+    fn expected_message(&self) -> String {
+        format!(
+            "{} with ID {} not found",
+            resource_kind_label(self.form),
+            self.id
+        )
+    }
+}
+
+#[tokio::test]
+async fn a_monitor_resource_the_store_does_not_hold_is_a_modelled_not_found_in_either_form() {
+    let router = router();
+    let portal_id = create_portal(&router, "portal-the-store-holds").await;
+    let project_id = create_project(&router, &portal_id, "project-the-store-holds").await;
+
+    // A portal and a project the store really held and holds no longer, plus a
+    // project that went with its portal: an absence the store arrived at by a
+    // delete rather than by never having minted the id.
+    let emptied_portal = create_portal(&router, "portal-deleted-since").await;
+    let project_of_emptied_portal =
+        create_project(&router, &emptied_portal, "project-of-the-deleted-portal").await;
+    delete_portal(&router, &emptied_portal).await;
+    let deleted_project = create_project(&router, &portal_id, "project-deleted-since").await;
+    delete_project(&router, &deleted_project).await;
+
+    // The rows span both alternatives a `Resource` takes and every way an
+    // identifier of one comes to resolve to nothing: never minted, minted and
+    // deleted, taken away with its portal, and an id the OTHER map holds — which
+    // is the same id SHAPE, so only the map consulted can tell the rows apart.
+    let cases = vec![
+        AbsentResourceCase {
+            label: "portal-never-minted".to_string(),
+            form: "portal",
+            id: modelled_id(0xa0),
+        },
+        AbsentResourceCase {
+            label: "project-never-minted".to_string(),
+            form: "project",
+            id: modelled_id(0xa1),
+        },
+        AbsentResourceCase {
+            label: "portal-deleted-since".to_string(),
+            form: "portal",
+            id: emptied_portal,
+        },
+        AbsentResourceCase {
+            label: "project-deleted-since".to_string(),
+            form: "project",
+            id: deleted_project,
+        },
+        AbsentResourceCase {
+            label: "project-taken-with-its-portal".to_string(),
+            form: "project",
+            id: project_of_emptied_portal,
+        },
+        AbsentResourceCase {
+            label: "a-projects-id-in-the-portal-form".to_string(),
+            form: "portal",
+            id: project_id.clone(),
+        },
+        AbsentResourceCase {
+            label: "a-portals-id-in-the-project-form".to_string(),
+            form: "project",
+            id: portal_id.clone(),
+        },
+    ];
+
+    // A stored policy the update rows address, so a refusal cannot be the policy's
+    // own absence.
+    let identity = json!({ "iamRole": { "arn": "arn:aws:iam::123456789012:role/monitor-admin" } });
+    let (status, created) = create_policy(
+        &router,
+        json!({
+            "accessPolicyIdentity": identity.clone(),
+            "accessPolicyResource": { "portal": { "id": portal_id } },
+            "accessPolicyPermission": "VIEWER",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "the seed create expected 201, got {status} {created}"
+    );
+    let id = created["accessPolicyId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let (status, before) = describe_policy(&router, &id).await;
+    assert_eq!(
+        status, 200,
+        "the seeded policy expected 200, got {status} {before}"
+    );
+    let policies_before = stored_policy_count(&router).await;
+
+    for case in &cases {
+        let body = json!({
+            "accessPolicyIdentity": identity.clone(),
+            "accessPolicyResource": case.resource(),
+            "accessPolicyPermission": "ADMINISTRATOR",
+        });
+        let expected = case.expected_message();
+
+        let (status, refused) = create_policy(&router, body.clone()).await;
+        assert_eq!(
+            status, 404,
+            "case {:?}: CreateAccessPolicy expected 404, got {status} {refused}",
+            case.label
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ResourceNotFoundException",
+            "case {:?}: unexpected error code in {refused}",
+            case.label
+        );
+        assert_eq!(
+            refused["message"].as_str().unwrap_or_default(),
+            expected,
+            "case {:?}: unexpected refusal message in {refused}",
+            case.label
+        );
+
+        let (status, refused) = update_policy(&router, &id, body).await;
+        assert_eq!(
+            status, 404,
+            "case {:?}: UpdateAccessPolicy expected 404, got {status} {refused}",
+            case.label
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ResourceNotFoundException",
+            "case {:?}: unexpected error code in {refused}",
+            case.label
+        );
+        assert_eq!(
+            refused["message"].as_str().unwrap_or_default(),
+            expected,
+            "case {:?}: unexpected refusal message in {refused}",
+            case.label
+        );
+
+        let (status, unchanged) = describe_policy(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the seeded policy expected 200, got {status} {unchanged}",
+            case.label
+        );
+        assert_eq!(
+            unchanged, before,
+            "case {:?}: a refused update must leave the stored policy alone, got {unchanged}",
+            case.label
+        );
+    }
+
+    // A refused create stored nothing: the store holds exactly the policies it
+    // held before the table ran.
+    let policies_after = stored_policy_count(&router).await;
+    assert_eq!(
+        policies_after, policies_before,
+        "a refused create must store no access policy, got {policies_after} \
+         where {policies_before} were held"
+    );
+
+    // The same check ADMITS what the store does hold, in either form: the project
+    // every refused row above names a neighbour of is a Monitor resource a policy
+    // can be created about and updated to.
+    for form in RESOURCE_KINDS {
+        let resource = resource_json(form, &portal_id, &project_id);
+        let (status, accepted) = create_policy(
+            &router,
+            json!({
+                "accessPolicyIdentity": identity.clone(),
+                "accessPolicyResource": resource.clone(),
+                "accessPolicyPermission": "ADMINISTRATOR",
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {form:?}: a policy about a stored Monitor resource expected 201, \
+             got {status} {accepted}"
+        );
+        let accepted_id = accepted["accessPolicyId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (status, described) = describe_policy(&router, &accepted_id).await;
+        assert_eq!(
+            status, 200,
+            "case {form:?}: DescribeAccessPolicy expected 200, got {status} {described}"
+        );
+        assert_eq!(
+            described["accessPolicyResource"], resource,
+            "case {form:?}: the read must report the Monitor resource the create named, \
+             got {described}"
+        );
+
+        let (status, updated) = update_policy(
+            &router,
+            &id,
+            json!({
+                "accessPolicyIdentity": identity.clone(),
+                "accessPolicyResource": resource.clone(),
+                "accessPolicyPermission": "VIEWER",
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {form:?}: UpdateAccessPolicy expected 200, got {status} {updated}"
+        );
+        let (status, described) = describe_policy(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {form:?}: the read after the update expected 200, got {status} {described}"
+        );
+        assert_eq!(
+            described["accessPolicyResource"], resource,
+            "case {form:?}: the read must report the Monitor resource the update named, \
+             got {described}"
         );
     }
 }

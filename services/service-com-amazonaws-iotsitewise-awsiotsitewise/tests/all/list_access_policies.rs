@@ -16,18 +16,17 @@
 //! and the listing answers from stored state rather than from a create's input.
 //!
 //! The HTTP harness (`call`, `router_with_engine`, `error_code`, `hex_token`,
-//! `is_modelled_id`) is the one the asset suite already has, the portal helper the
-//! access-policy suite has and the project create body the project suite has; this
-//! suite reuses all of them rather than growing a second copy.
+//! `is_modelled_id`) is the one the asset suite already has, and the portal and
+//! project helpers are the ones the access-policy suite has; this suite reuses
+//! all of them rather than growing a second copy.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_iotsitewise_awsiotsitewise::state::service_state;
 
-use crate::access_policy_lifecycle::create_portal;
+use crate::access_policy_lifecycle::{create_portal, create_project};
 use crate::asset_lifecycle::{call, error_code, hex_token, is_modelled_id, router_with_engine};
-use crate::project_lifecycle::{create_body as project_create_body, PROJECTS};
 
 /// Where every access-policy request goes, as `OPERATIONS.md` reports the routes:
 /// `GET /access-policies`, `POST /access-policies`,
@@ -230,27 +229,6 @@ fn policy_rows() -> Vec<(&'static str, IdentityRef, ResourceRef, &'static str)> 
             ADMINISTRATOR,
         ),
     ]
-}
-
-/// Create one project in `portal_id` and return its id.
-async fn create_project(router: &MultiServiceRouter, portal_id: &str, name: &str) -> String {
-    let (status, created) = call(
-        router,
-        "POST",
-        PROJECTS,
-        Some(project_create_body(portal_id, name, None)),
-    )
-    .await;
-    assert_eq!(
-        status, 201,
-        "case {name:?}: CreateProject expected 201, got {status} {created}"
-    );
-    let id = created["projectId"].as_str().unwrap_or_default().to_string();
-    assert!(
-        is_modelled_id(&id),
-        "case {name:?}: projectId must be a modelled UUID, got {created}"
-    );
-    id
 }
 
 /// Create the two portals, the two projects and every policy row.

@@ -5494,6 +5494,37 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         Some(record)
     }
 
+    /// The IoT SiteWise Monitor resource an access policy is about, resolved
+    /// against this store: `Some((kind, requested))` when the alternative the
+    /// request names holds no record here, `None` when it resolves.
+    ///
+    /// A `Resource` names a portal OR a project — [`check_access_policy_resource`]
+    /// is what holds a request to exactly one of them — and BOTH are resources
+    /// this service holds, so each alternative is resolved against the map that
+    /// holds it. The returned kind is the [`RESOURCE_PORTAL`] /
+    /// [`RESOURCE_PROJECT`] label a not-found refusal names the absent resource
+    /// by, and the identifier is the one the REQUEST supplied, so the caller is
+    /// told which half of the choice resolved to nothing.
+    ///
+    /// The one place this resolution is stated: `CreateAccessPolicy` and
+    /// `UpdateAccessPolicy` both ask it, so the two cannot drift.
+    pub fn missing_monitor_resource<'a>(
+        &self,
+        resource: &'a Resource,
+    ) -> Option<(&'static str, &'a str)> {
+        if let Some(portal) = resource.portal.as_ref() {
+            if !self.portals.contains_key(&portal.id) {
+                return Some((RESOURCE_PORTAL, portal.id.as_str()));
+            }
+        }
+        if let Some(project) = resource.project.as_ref() {
+            if !self.projects.contains_key(&project.id) {
+                return Some((RESOURCE_PROJECT, project.id.as_str()));
+            }
+        }
+        None
+    }
+
     /// Forget an asset model, its external-id entry and every interface
     /// relationship it stood on either side of.
     ///

@@ -25,6 +25,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_iotsitewise_awsiotsitewise::state::service_state;
 
+use crate::access_policy_lifecycle::create_project;
 use crate::asset_lifecycle::{call, error_code, is_modelled_id, router_with_engine, REGION};
 
 /// Where every access-policy request goes, as `OPERATIONS.md` reports the route:
@@ -34,13 +35,6 @@ const ACCESS_POLICIES: &str = "/access-policies";
 /// Where every portal request goes — the Monitor resource a portal-scoped policy
 /// is about.
 const PORTALS: &str = "/portals";
-
-/// A project id of the modelled `ID` form, for a policy about a project.
-///
-/// Nothing in this service creates a project yet, so a project-scoped policy
-/// names one the store cannot resolve; the policy is still a resource of its own,
-/// and the delete of it is this suite's subject.
-const PROJECT_ID: &str = "11111111-2222-4333-8444-555555555555";
 
 /// Create a portal and return its id, so a policy can be about a Monitor
 /// resource this store really holds.
@@ -154,12 +148,14 @@ fn delete_cases() -> Vec<DeleteCase> {
     ]
 }
 
-/// The body one row's create sends.
-fn create_body(case: &DeleteCase, portal_id: &str) -> Value {
+/// The body one row's create sends. A policy is about a Monitor resource this
+/// store holds, so the project-scoped rows name the project created in the
+/// portal beside them rather than an id nothing minted.
+fn create_body(case: &DeleteCase, portal_id: &str, project_id: &str) -> Value {
     let resource = if case.about_portal {
         json!({ "portal": { "id": portal_id } })
     } else {
-        json!({ "project": { "id": PROJECT_ID } })
+        json!({ "project": { "id": project_id } })
     };
     let mut body = json!({
         "accessPolicyIdentity": case.identity.clone(),
@@ -182,6 +178,7 @@ fn client_token(label: &str) -> String {
 async fn a_delete_removes_the_one_policy_it_names_and_leaves_every_other_one() {
     let (router, engine) = router_with_engine();
     let portal_id = create_portal(&router, "portal-for-access-policy-deletes").await;
+    let project_id = create_project(&router, &portal_id, "project-for-access-policy-deletes").await;
 
     // Every row is created first, so each delete happens with siblings in the
     // store to be left alone.
@@ -192,7 +189,7 @@ async fn a_delete_removes_the_one_policy_it_names_and_leaves_every_other_one() {
             &router,
             "POST",
             ACCESS_POLICIES,
-            Some(create_body(case, &portal_id)),
+            Some(create_body(case, &portal_id, &project_id)),
         )
         .await;
         assert_eq!(

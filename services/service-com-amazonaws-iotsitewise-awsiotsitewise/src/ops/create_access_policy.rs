@@ -239,14 +239,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The policy is about a Monitor resource, so a resource this store does not
-        // hold is the absence this operation's modelled 404 states. Checked for the
-        // portal form, which this store holds; a project is accepted unchecked
-        // because no operation of this crate stores one yet (`CreateProject` is
-        // still a scaffold), so there is nothing a check could consult.
-        if let Some(portal) = input.access_policy_resource.portal.as_ref() {
-            if !store.portals.contains_key(&portal.id) {
-                return Err(portal_not_found(&portal.id));
-            }
+        // hold is the absence this operation's modelled 404 states. BOTH
+        // alternatives a `Resource` can take name a resource this service holds, so
+        // each is resolved against the map that holds it — the same check
+        // `CreateDashboard` makes of the project it is given, asked from the one
+        // place `UpdateAccessPolicy` asks it too.
+        if let Some((resource, requested)) =
+            store.missing_monitor_resource(&input.access_policy_resource)
+        {
+            return Err(not_found(resource, requested));
         }
 
         // The store is bounded: a create is the only thing that adds an access
@@ -308,12 +309,13 @@ fn invalid_request(message: String) -> CreateAccessPolicyError {
     ))
 }
 
-/// HTTP 404 `ResourceNotFoundException` naming the portal the policy would have
-/// been about, in the one wording every not-found refusal in this service carries.
-fn portal_not_found(portal_id: &str) -> CreateAccessPolicyError {
+/// HTTP 404 `ResourceNotFoundException` naming the resource kind the policy would
+/// have been about and the identifier that resolved to nothing, in the one wording
+/// every not-found refusal in this service carries.
+fn not_found(resource: &str, requested: &str) -> CreateAccessPolicyError {
     CreateAccessPolicyError::Modeled(CreateAccessPolicyErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: crate::state::not_found_message(crate::state::RESOURCE_PORTAL, portal_id),
+            message: crate::state::not_found_message(resource, requested),
         },
     ))
 }
