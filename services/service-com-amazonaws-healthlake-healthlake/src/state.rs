@@ -1739,7 +1739,7 @@ pub struct ComAmazonawsHealthlakeHealthlakeState {
     /// Every FHIR export job, by `JobId`. A `BTreeMap` so
     /// `ListFHIRExportJobs` pages in a stable, resumable order. A job's record
     /// is dropped with the data store it belongs to, by this state's own
-    /// `forget_export_jobs_for`. Bounded by [`MAX_EXPORT_JOBS`], which
+    /// `drop_datastore`. Bounded by [`MAX_EXPORT_JOBS`], which
     /// `StartFHIRExportJob` — the only operation that mints one — refuses past.
     pub export_jobs: BTreeMap<String, ExportJob>,
     /// How many FHIR export jobs have been started, mixed into the next `JobId`
@@ -1748,7 +1748,7 @@ pub struct ComAmazonawsHealthlakeHealthlakeState {
     /// Every FHIR import job, by `JobId`. A `BTreeMap` so
     /// `ListFHIRImportJobs` pages in a stable, resumable order. A job's record
     /// is dropped with the data store it belongs to, by
-    /// this state's own `forget_import_jobs_for`. The ceiling on how many job
+    /// this state's own `drop_datastore`. The ceiling on how many job
     /// records there can be belongs with the operation that MINTS them
     /// (`StartFHIRImportJob`, still a scaffold stub), which is the only place a
     /// job count can be refused.
@@ -1824,18 +1824,42 @@ impl ComAmazonawsHealthlakeHealthlakeState {
     /// idempotency tokens that named it, so a deleted data store does not
     /// outlive its own retention.
     fn reap_expired_records(&mut self, now: Instant) {
+        self.reap_datastores_where(|datastore| datastore.reap_at.is_some_and(|at| now >= at));
+    }
+
+    /// Drop every held data store `select` picks out, each with everything this
+    /// state holds on its behalf.
+    ///
+    /// The body the reapers share: they differ only in WHICH records they
+    /// select, so the selection is the parameter here and the removal is
+    /// [`Self::drop_datastore`]. Collected first, because the walk that selects
+    /// borrows the registry the removal writes to. Bounded by
+    /// [`MAX_DATASTORES`].
+    fn reap_datastores_where(&mut self, select: impl Fn(&Datastore) -> bool) {
         let reaped: Vec<String> = self
             .datastores
             .iter()
-            .filter(|(_, datastore)| datastore.reap_at.is_some_and(|at| now >= at))
+            .filter(|(_, datastore)| select(datastore))
             .map(|(id, _)| id.clone())
             .collect();
         for id in reaped {
-            self.datastores.remove(&id);
-            self.forget_client_tokens_for(&id);
-            self.forget_export_jobs_for(&id);
-            self.forget_import_jobs_for(&id);
+            self.drop_datastore(&id);
         }
+    }
+
+    /// Drop the data store `datastore_id` and everything held for it: the
+    /// registry entry, the idempotency tokens that named it, its export jobs
+    /// and its import jobs.
+    ///
+    /// The ONE place that says what dropping a data store MEANS — the shape
+    /// [`Self::remove_profile`] takes for a profile — so a per-data-store
+    /// collection this module gains later is forgotten by every path that drops
+    /// a record rather than by whichever path its author remembered.
+    fn drop_datastore(&mut self, datastore_id: &str) {
+        self.datastores.remove(datastore_id);
+        self.forget_client_tokens_for(datastore_id);
+        self.forget_export_jobs_for(datastore_id);
+        self.forget_import_jobs_for(datastore_id);
     }
 
     /// The tag map a tagging MUTATION may write to for `arn`, or the fixed
@@ -1893,18 +1917,7 @@ impl ComAmazonawsHealthlakeHealthlakeState {
     /// full store, taken before a create is refused, so a caller that deletes
     /// what it created can always create again.
     pub fn reap_terminal_records(&mut self) {
-        let reaped: Vec<String> = self
-            .datastores
-            .iter()
-            .filter(|(_, datastore)| datastore.status == DatastoreStatus::Deleted)
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in reaped {
-            self.datastores.remove(&id);
-            self.forget_client_tokens_for(&id);
-            self.forget_export_jobs_for(&id);
-            self.forget_import_jobs_for(&id);
-        }
+        self.reap_datastores_where(|datastore| datastore.status == DatastoreStatus::Deleted);
     }
 
     /// Materialise every export job transition the clock has ALREADY made due.
@@ -2175,9 +2188,9 @@ impl ComAmazonawsHealthlakeHealthlakeState {
     /// the record that went (or `None` when no record holds that id).
     ///
     /// The ONE way a profile leaves the store, so a removal cannot drop the
-    /// record and forget its idempotency tokens — the shape the data-store
-    /// reapers take, which remove the record and call
-    /// [`Self::forget_client_tokens_for`] together.
+    /// record and forget its idempotency tokens — the shape
+    /// [`Self::drop_datastore`] takes for a data store, which both reapers
+    /// route their removals through.
     pub fn remove_profile(&mut self, profile_id: &str) -> Option<DataTransformationProfile> {
         let profile = self.profiles.remove(profile_id)?;
         self.forget_profile_client_tokens_for(profile_id);

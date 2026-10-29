@@ -23,6 +23,8 @@ mod data_transformation_profile;
 mod datastore_backup_restore_window;
 #[path = "all/datastore_encryption_and_preload.rs"]
 mod datastore_encryption_and_preload;
+#[path = "all/datastore_reaping.rs"]
+mod datastore_reaping;
 #[path = "all/datastore_state_conflict.rs"]
 mod datastore_state_conflict;
 #[path = "all/datastore_transition_conflict_sentence.rs"]
