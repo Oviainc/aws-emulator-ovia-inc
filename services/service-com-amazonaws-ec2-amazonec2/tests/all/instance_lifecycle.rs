@@ -1069,8 +1069,10 @@ async fn describe_instances_resolves_each_supported_filter() {
 
     // Real EC2 filter names this slice stores no value for are refused for the same
     // reason as a name that is not an EC2 filter at all: answering 200 with an empty
-    // set would report absence as success.
-    for name in ["not-a-filter", "vpc-id", "root-device-type", "hypervisor"] {
+    // set would report absence as success. (`vpc-id` is NOT one of them: the slice stores
+    // the instance's subnet and that subnet's VPC, so the filter resolves — see
+    // `describe_instances_vpc_and_network_interfaces`.)
+    for name in ["not-a-filter", "root-device-type", "hypervisor"] {
         let unsupported = ec2
             .call(
                 "DescribeInstances",

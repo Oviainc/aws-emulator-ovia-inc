@@ -17,6 +17,31 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The primary network interface a launch gives its instance, the subnet and VPC it puts the
+// instance in, and the filters that select on them. Declared beside `prefix_lists` for the
+// reason the note above gives: the sorted neighbourhood and the tail of this file are where
+// every new ec2 suite inserts its lines.
+#[path = "all/instance_network_interfaces.rs"]
+mod instance_network_interfaces;
+// How `DescribeInstances` pages: the instances `MaxResults` caps and the token that walks to
+// the full set, over stores whose instances are spread differently over reservations.
+// Declared beside `prefix_lists` for the reason the note above gives.
+#[path = "all/describe_instances_pages.rs"]
+mod describe_instances_pages;
+// The EBS-optimized performance, the NVMe-for-EBS answer and the hibernation support
+// `DescribeInstanceTypes` reports, across families, generations and sizes. Declared beside
+// `prefix_lists` for the reason the note above gives.
+#[path = "all/instance_type_ebs_and_hibernation.rs"]
+mod instance_type_ebs_and_hibernation;
+// The deprecated images of the published AMI catalog: their age, when they were deprecated,
+// and what a name-filtered `DescribeImages` does with them. Declared beside `prefix_lists`
+// for the reason the note above gives.
+#[path = "all/deprecated_catalog_images.rs"]
+mod deprecated_catalog_images;
+// The code and the request id a refusal of the instance read and write paths carries.
+// Declared beside `prefix_lists` for the reason the note above gives.
+#[path = "all/instance_read_path_refusals.rs"]
+mod instance_read_path_refusals;
 // What EC2 refuses about a REQUEST before it reads any state: a page size beside an id
 // selection, a Capacity Block search that names both dimensions or neither, an idempotency
 // token replayed with different parameters, and an AMI id a launch could not have been

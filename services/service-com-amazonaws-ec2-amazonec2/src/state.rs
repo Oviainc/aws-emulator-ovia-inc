@@ -1509,9 +1509,13 @@ use crate::ops::types::{
     DescribeFastLaunchImagesSuccessItem, DiskInfo, DisableFastLaunchOutput,
     VolumeModification,
     EbsBlockDevice,
-    EbsInfo, EfaInfo, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
+    EbsInfo, EbsOptimizedInfo, EfaInfo, EnableFastLaunchOutput, GroupIdentifier, Host,
+    INSTANCE_TYPE_VALUES, Image,
     ImageCriterion, ImportSnapshotTask, Instance, InstanceApplicationStatus, InstanceStorageInfo,
     InstanceTypeInfo,
+    ConnectionTrackingSpecificationResponse, InstanceIpv4Prefix, InstanceIpv6Address,
+    InstanceIpv6Prefix, InstanceNetworkInterface, InstanceNetworkInterfaceAttachment,
+    InstancePrivateIpAddress,
     Ipam, IpamInternetRegistryAssociation, IpamOperatingRegion, IpamPolicy, IpamPool,
     IpamResourceDiscovery, IpamResourceDiscoveryAssociation, IpamResourceTag,
     IpamRoutingPolicyRegistration, IpamRoutingPolicyRegistrationDelta, IpamScope,
@@ -1633,6 +1637,11 @@ pub use snapshots::*;
 /// The EBS root volume a LAUNCH creates for the instance it stores, restored from the AMI's
 /// root block device mapping — one method on the state, in a module of its own.
 mod launched_root_volumes;
+
+/// The PRIMARY network interface a LAUNCH creates for the instance it stores, in the subnet
+/// the launch places it in — one method on the state, in a module of its own, beside the
+/// root volume the same launch creates.
+mod launched_primary_interfaces;
 
 /// The associations between the account's instances and the IAM instance profiles they run
 /// as — the store, the form of an association id, its ceiling, its refusals and the two
@@ -1772,10 +1781,22 @@ impl MatchBudget {
 
     /// Charge one step; `false` once the budget is gone.
     pub fn spend(&mut self) -> bool {
-        if self.remaining == 0 {
+        self.spend_steps(1)
+    }
+
+    /// Charge `steps` steps at once, for a piece of work whose size is known before it
+    /// runs — a projection over a store, where charging per item afterwards would mean the
+    /// work was already done. `false` once the budget cannot cover it, and the budget is
+    /// then spent to nothing rather than partly: a request whose filtering does not fit is
+    /// INCOMPLETE however little of the budget is left, so the caller stops on
+    /// [`Self::exhausted`] exactly as it does for a single step. Charging nothing always
+    /// succeeds, which is what a projection that found nothing costs.
+    pub fn spend_steps(&mut self, steps: u64) -> bool {
+        if steps > self.remaining {
+            self.remaining = 0;
             return false;
         }
-        self.remaining -= 1;
+        self.remaining -= steps;
         true
     }
 
@@ -1894,10 +1915,29 @@ pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
     "spot-instance-request-id",
     "subnet-id",
     "tag-key",
+    "vpc-id",
+    // The interfaces attached to the instance, which the launch's own primary interface
+    // means every instance has: the members of each one that this slice stores.
+    "network-interface.network-interface-id",
+    "network-interface.subnet-id",
+    "network-interface.vpc-id",
+    "network-interface.mac-address",
+    "network-interface.private-ip-address",
+    "network-interface.status",
+    "network-interface.attachment.attachment-id",
+    "network-interface.attachment.device-index",
+    "network-interface.attachment.status",
+    "network-interface.attachment.delete-on-termination",
 ];
 
 /// The prefix of the `tag:<key>` filter family.
 pub const TAG_FILTER_PREFIX: &str = "tag:";
+
+/// The prefix of the `network-interface.*` `DescribeInstances` filter family — the names
+/// whose value is read off the interfaces attached to the instance rather than off the
+/// instance record, so one question decides whether a request needs that projection at
+/// all ([`ComAmazonawsEc2Amazonec2State::instance_matches`]).
+pub const NETWORK_INTERFACE_FILTER_PREFIX: &str = "network-interface.";
 
 /// Tag keys starting with this prefix are reserved for AWS and cannot be set
 /// through `CreateTags`.
@@ -3137,6 +3177,19 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// until something asks for one (`CreateNetworkInterface`, a launch, a NAT gateway, a
     /// load balancer), unlike the default VPC, its subnets and its security group.
     pub network_interfaces: BTreeMap<String, NetworkInterface>,
+    /// Which network interfaces each INSTANCE holds, by `InstanceId` — the index of the
+    /// attachment [`Self::network_interfaces`] records on the interface itself.
+    ///
+    /// "Which interfaces does this instance have" is asked on every instance report
+    /// ([`Self::instance_network_interfaces`], and through it the instance's own `SubnetId`
+    /// and `VpcId`) and by every `network-interface.*` filter, so answering it by scanning
+    /// the interface store would make one request's cost the PRODUCT of the two stores'
+    /// ceilings. It is written by exactly the two seams that create and destroy an
+    /// attachment — [`Self::insert_network_interface`] and
+    /// [`Self::remove_network_interface`] — so it cannot drift from the attachment it
+    /// indexes, and a reader still reads the interface RECORD rather than this index, which
+    /// only narrows which records to look at.
+    pub network_interfaces_by_instance: BTreeMap<String, BTreeSet<String>>,
     /// A `CreateNetworkInterface` `ClientToken` and the interface id it minted, so a repeat
     /// of the same request answers with that interface instead of creating a second one.
     pub network_interface_client_tokens: HashMap<String, String>,
@@ -4080,6 +4133,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // default network below seeds.
             network_acls: BTreeMap::new(),
             network_interfaces: BTreeMap::new(),
+            network_interfaces_by_instance: BTreeMap::new(),
             network_interface_client_tokens: HashMap::new(),
             // A fresh account has granted nothing over an interface it does not have yet.
             network_interface_permissions: BTreeMap::new(),
@@ -6886,8 +6940,10 @@ impl ComAmazonawsEc2Amazonec2State {
         Some(address)
     }
 
-    /// Store a launched instance, appending it to its reservation — and create the EBS root
-    /// volume the launch gives it ([`Self::mint_launched_root_volume`]).
+    /// Store a launched instance, appending it to its reservation — and create the two
+    /// resources the launch gives it: the EBS root volume
+    /// ([`Self::mint_launched_root_volume`]) and the primary network interface
+    /// ([`Self::mint_launched_primary_interface`]).
     pub fn insert_instance(&mut self, record: InstanceRecord) {
         if let Some(reservation) = self.reservations.get_mut(&record.reservation_id) {
             reservation.instance_ids.push(record.instance_id.clone());
@@ -6899,6 +6955,7 @@ impl ComAmazonawsEc2Amazonec2State {
         let instance_id = record.instance_id.clone();
         self.instances.insert(record.instance_id.clone(), record);
         self.mint_launched_root_volume(&instance_id);
+        self.mint_launched_primary_interface(&instance_id);
     }
 
     /// Start the termination of the instance `instance_id` names, as of `at`, and answer the
@@ -7068,6 +7125,14 @@ impl ComAmazonawsEc2Amazonec2State {
                 instance.pending_transition = None;
             }
         }
+        // An instance that has reached `terminated` no longer holds the network interfaces
+        // its attachments are marked to delete with it — "indicates whether the network
+        // interface is deleted when the instance is terminated"
+        // (`InstanceNetworkInterfaceAttachment$DeleteOnTermination`) — so those interfaces
+        // were deleted at the instant the termination completed, whether or not anybody
+        // called again, and with them the subnet addresses and security group references
+        // they held.
+        self.delete_interfaces_of_terminated_instances();
         let vpcs = &mut self.vpcs;
         self.vpc_available_at.retain(|vpc_id, due_at| {
             if now < *due_at {
@@ -8164,6 +8229,82 @@ impl ComAmazonawsEc2Amazonec2State {
         })
     }
 
+    /// The subnet the instance `instance` runs in: the one its launch named, or — for a
+    /// launch that named none, which AWS places "in a default subnet from your default VPC"
+    /// (`RunInstances`) — the subnet of its own primary network interface.
+    ///
+    /// Read off that interface rather than re-derived, because the interface is where the
+    /// placement was RECORDED: "the ID of the subnet" an instance reports
+    /// (`Instance$SubnetId`) is the subnet of the interface at device index 0, so the
+    /// instance report, the interface report and the `subnet-id` filter all answer from one
+    /// record.
+    pub fn instance_subnet_id(&self, instance: &InstanceRecord) -> Option<String> {
+        if let Some(subnet_id) = instance.subnet_id.clone() {
+            return Some(subnet_id);
+        }
+        self.instance_network_interfaces(&instance.instance_id)
+            .into_iter()
+            .find(|interface| {
+                interface
+                    .attachment
+                    .as_ref()
+                    .and_then(|attachment| attachment.device_index)
+                    == Some(PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX)
+            })
+            .and_then(|interface| interface.subnet_id)
+    }
+
+    /// The VPC the instance `instance` runs in: the VPC of its own subnet.
+    ///
+    /// The ONE reading of an instance's VPC, so the instance report
+    /// ([`Self::instance_view`]), the `vpc-id` filter ([`Self::filter_values`]) and
+    /// [`Self::instance_is_in_vpc`] cannot disagree about which VPC holds an instance. An
+    /// instance whose subnet this store does not hold is in no VPC this store knows, and
+    /// reports none rather than an invented id.
+    pub fn instance_vpc_id(&self, instance: &InstanceRecord) -> Option<String> {
+        self.subnets
+            .get(&self.instance_subnet_id(instance)?)?
+            .vpc_id
+            .clone()
+    }
+
+    /// The network interfaces attached to the instance `instance_id`, in device-index order
+    /// (so the primary interface, at index 0, comes first).
+    ///
+    /// Projected from the ONE interface store, so what an instance reports and what
+    /// `DescribeNetworkInterfaces` reports about one interface is the same record, and
+    /// narrowed to this instance's own interfaces through
+    /// [`Self::network_interfaces_by_instance`] rather than by scanning that store, so the
+    /// cost is the interfaces this instance holds rather than every interface the account
+    /// has. An attachment that has reached `detached` holds nothing, so the interface it
+    /// belongs to is no longer one of the instance's — the same reading
+    /// [`Self::network_interface_attachment`] takes.
+    pub fn instance_network_interfaces(&self, instance_id: &str) -> Vec<InstanceNetworkInterface> {
+        let Some(held) = self.network_interfaces_by_instance.get(instance_id) else {
+            return Vec::new();
+        };
+        let mut attached: Vec<(i32, InstanceNetworkInterface)> = held
+            .iter()
+            .filter_map(|network_interface_id| {
+                let interface = self.network_interfaces.get(network_interface_id)?;
+                let attachment = interface
+                    .attachment
+                    .as_ref()
+                    .filter(|attachment| !attachment_is_detached(attachment))
+                    .filter(|attachment| attachment.instance_id.as_deref() == Some(instance_id))?;
+                Some((
+                    attachment.device_index.unwrap_or_default(),
+                    instance_network_interface_view(interface, attachment),
+                ))
+            })
+            .collect();
+        attached.sort_by_key(|(device_index, _)| *device_index);
+        attached
+            .into_iter()
+            .map(|(_, interface)| interface)
+            .collect()
+    }
+
     /// The modelled `Instance` for one stored instance.
     pub fn instance_view(&self, instance: &InstanceRecord) -> Instance {
         Instance {
@@ -8171,9 +8312,18 @@ impl ComAmazonawsEc2Amazonec2State {
             image_id: instance.image_id.clone(),
             instance_type: Some(instance.instance_type.clone()),
             key_name: instance.key_name.clone(),
-            subnet_id: instance.subnet_id.clone(),
-            // VPCs are not modelled yet, so `vpcId` stays absent rather than
-            // carrying an invented id.
+            subnet_id: self.instance_subnet_id(instance),
+            // "The ID of the VPC in which the instance is running" (`Instance$VpcId`): the
+            // VPC of the instance's own subnet, read off that subnet rather than copied
+            // onto the instance record, so the instance report and the subnet report cannot
+            // disagree about which VPC the instance is in.
+            vpc_id: self.instance_vpc_id(instance),
+            // "The network interfaces for the instance" (`Instance$NetworkInterfaces`):
+            // every interface the account holds that is attached to THIS instance, primary
+            // first — the launch's own interface at device index 0 and any further one
+            // something attached — projected from the interface store, so an instance
+            // report and `DescribeNetworkInterfaces` cannot disagree about one interface.
+            network_interfaces: Some(self.instance_network_interfaces(&instance.instance_id)),
             state: Some(instance.state.view()),
             // EC2 reports an empty reason while the instance has not been moved
             // by a caller, so the member is always present.
@@ -8283,11 +8433,17 @@ impl ComAmazonawsEc2Amazonec2State {
     /// A name that resolves to an empty list simply matches nothing — which is
     /// different from a name the service does not know, and which the caller
     /// refuses with `InvalidParameterValue`.
+    ///
+    /// `attached` is the instance's own network interfaces, which the caller projects once
+    /// per instance ([`Self::instance_matches`]) because finding them is a scan of the
+    /// interface store; a caller whose filters name none of the
+    /// [`NETWORK_INTERFACE_FILTER_PREFIX`] family passes an empty slice.
     pub fn filter_values(
         &self,
         reservation: &ReservationRecord,
         instance: &InstanceRecord,
         name: &str,
+        attached: &[InstanceNetworkInterface],
     ) -> Option<Vec<String>> {
         if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
             return Some(instance.tags.get(key).cloned().into_iter().collect());
@@ -8364,9 +8520,96 @@ impl ComAmazonawsEc2Amazonec2State {
                     .collect(),
             ),
             "reservation-id" => single(Some(instance.reservation_id.clone())),
-            "subnet-id" => single(instance.subnet_id.clone()),
+            "subnet-id" => single(self.instance_subnet_id(instance)),
+            // "vpc-id - The ID of the VPC that the instance is running in"
+            // (`DescribeInstancesRequest$Filters`), read off the same projection the
+            // instance report carries ([`Self::instance_vpc_id`]), so a filter and a report
+            // cannot disagree about one instance's VPC. An instance in no VPC this store
+            // knows holds no value for it, so a filter naming one selects only instances
+            // that are in one.
+            "vpc-id" => single(self.instance_vpc_id(instance)),
             "tag-key" => Some(instance.tags.keys().cloned().collect()),
-            _ => None,
+            // The `network-interface.*` family: the members of the interfaces attached to
+            // this instance, each read off the SAME projection the instance report carries
+            // ([`Self::instance_network_interfaces`]), so a filter cannot select on
+            // something the report does not show. An instance with no interface holds no
+            // value for any of them.
+            //
+            // `attached` is the projection made ONCE for this instance by the caller
+            // ([`Self::instance_matches`]), not once per filter: finding an instance's
+            // interfaces is a scan of the interface store, so doing it per filter would
+            // multiply two of the store's ceilings by the filter count. The caller charges
+            // that scan to the match budget.
+            _ => {
+                let attachments = || {
+                    attached
+                        .iter()
+                        .filter_map(|interface| interface.attachment.as_ref())
+                };
+                match name {
+                    "network-interface.network-interface-id" => Some(
+                        attached
+                            .iter()
+                            .filter_map(|interface| interface.network_interface_id.clone())
+                            .collect(),
+                    ),
+                    "network-interface.subnet-id" => Some(
+                        attached
+                            .iter()
+                            .filter_map(|interface| interface.subnet_id.clone())
+                            .collect(),
+                    ),
+                    "network-interface.vpc-id" => Some(
+                        attached
+                            .iter()
+                            .filter_map(|interface| interface.vpc_id.clone())
+                            .collect(),
+                    ),
+                    "network-interface.mac-address" => Some(
+                        attached
+                            .iter()
+                            .filter_map(|interface| interface.mac_address.clone())
+                            .collect(),
+                    ),
+                    "network-interface.private-ip-address" => Some(
+                        attached
+                            .iter()
+                            .filter_map(|interface| interface.private_ip_address.clone())
+                            .collect(),
+                    ),
+                    "network-interface.status" => Some(
+                        attached
+                            .iter()
+                            .filter_map(|interface| interface.status.clone())
+                            .collect(),
+                    ),
+                    "network-interface.attachment.attachment-id" => Some(
+                        attachments()
+                            .filter_map(|attachment| attachment.attachment_id.clone())
+                            .collect(),
+                    ),
+                    "network-interface.attachment.device-index" => Some(
+                        attachments()
+                            .filter_map(|attachment| {
+                                attachment.device_index.map(|index| index.to_string())
+                            })
+                            .collect(),
+                    ),
+                    "network-interface.attachment.status" => Some(
+                        attachments()
+                            .filter_map(|attachment| attachment.status.clone())
+                            .collect(),
+                    ),
+                    "network-interface.attachment.delete-on-termination" => Some(
+                        attachments()
+                            .filter_map(|attachment| {
+                                attachment.delete_on_termination.map(|set| set.to_string())
+                            })
+                            .collect(),
+                    ),
+                    _ => None,
+                }
+            }
         }
     }
 
@@ -8389,8 +8632,26 @@ impl ComAmazonawsEc2Amazonec2State {
         if !budget.spend() {
             return false;
         }
+        // The interfaces this instance holds, read ONCE for every filter that needs them
+        // and not at all for a request whose filters do not. The read is the interfaces
+        // THIS instance holds (an index lookup, [`Self::instance_network_interfaces`]),
+        // and each one is charged to the same budget, so the product of stored instances,
+        // stored interfaces and filters stays bounded.
+        let needs_interfaces = filters
+            .iter()
+            .any(|filter| filter.name.starts_with(NETWORK_INTERFACE_FILTER_PREFIX));
+        let attached = if needs_interfaces {
+            let held = self.instance_network_interfaces(&instance.instance_id);
+            if !budget.spend_steps(u64::try_from(held.len()).unwrap_or(u64::MAX)) {
+                return false;
+            }
+            held
+        } else {
+            Vec::new()
+        };
         filters.iter().all(|filter| {
-            let Some(held) = self.filter_values(reservation, instance, &filter.name) else {
+            let Some(held) = self.filter_values(reservation, instance, &filter.name, &attached)
+            else {
                 return false;
             };
             filter.patterns.iter().any(|pattern| {
@@ -9593,6 +9854,37 @@ const HPC_ROOT: &str = "hpc";
 /// One `large` size, in the sixteenths [`instance_size_sixteenths`] counts in.
 const SIZE_UNIT: u32 = 16;
 
+/// One `xlarge` size, in those same sixteenths: the step of the size ladder AWS's
+/// EBS-optimized performance table is read per ([`ebs_optimized_info`]).
+const XLARGE_SIXTEENTHS: u32 = 2 * SIZE_UNIT;
+
+/// The sustained EBS bandwidth, in Mbps, one `xlarge` of size carries — the slope of the
+/// baseline column of AWS's "Amazon EBS-optimized instance types" table below the size at
+/// which a family reaches its ceiling.
+const EBS_BASELINE_MBPS_PER_XLARGE: i64 = 1_150;
+
+/// The sustained EBS IOPS one `xlarge` of size carries: the same column's IOPS slope.
+const EBS_BASELINE_IOPS_PER_XLARGE: i64 = 6_000;
+
+/// The EBS bandwidth ceiling, in Mbps, every size of a family can reach — the full-size row
+/// of that table, which the smaller sizes of the family burst up to.
+const EBS_BURST_FLOOR_MBPS: i64 = 4_750;
+
+/// The EBS IOPS ceiling every size can reach: the same row's IOPS figure.
+const EBS_BURST_FLOOR_IOPS: i64 = 18_750;
+
+/// The EBS bandwidth ceiling, in Mbps, one `xlarge` of size carries ABOVE the full size:
+/// the shallower slope the table's larger rows follow, where a size no longer bursts
+/// because it already has the host's share.
+const EBS_BURST_MBPS_PER_XLARGE: i64 = 850;
+
+/// The EBS IOPS ceiling one `xlarge` of size carries above the full size.
+const EBS_BURST_IOPS_PER_XLARGE: i64 = 3_750;
+
+/// The megabits in a megabyte, which is all that separates `EbsOptimizedInfo`'s Mbps
+/// columns from its MB/s ones.
+const EBS_MEGABITS_PER_MEGABYTE: f64 = 8.0;
+
 /// The vCPUs one `large` unit of size carries: AWS's `large` is a two-vCPU instance and
 /// the ladder doubles from there, so every size of every family follows from this.
 const VCPUS_PER_SIZE_UNIT: u32 = 2;
@@ -9970,13 +10262,14 @@ fn nvme_instance_storage(name: &InstanceTypeName<'_>) -> bool {
 /// The hibernation prerequisites name the supported families — the C, M and R families
 /// from their third generation on and the T families from their second — and bound the
 /// instance's RAM at [`MAX_HIBERNATION_MEMORY_MIB`]. Hibernation saves the instance's
-/// memory to its EBS root volume, which a bare metal instance has no hypervisor to do
-/// and which cannot preserve an instance store, so neither of those can hibernate.
-fn hibernation_supported(
-    name: &InstanceTypeName<'_>,
-    memory_mib: i64,
-    instance_storage: bool,
-) -> bool {
+/// memory to its EBS root volume, which a bare metal instance has no hypervisor to do, so
+/// a bare metal size of a supported family cannot hibernate.
+///
+/// Local instance storage does NOT disqualify a type: the prerequisites list the `d`
+/// variants of those same families beside the plain ones, so hibernation is a fact of the
+/// family, the generation, the size and the RAM alone. What the instance store does lose is
+/// its DATA, which is a property of the hibernated instance rather than of the type.
+fn hibernation_supported(name: &InstanceTypeName<'_>, memory_mib: i64) -> bool {
     let first = if name.burstable() {
         FIRST_HIBERNATION_BURSTABLE_GENERATION
     } else {
@@ -9985,7 +10278,6 @@ fn hibernation_supported(
     matches!(name.root, "c" | "m" | "r" | "t")
         && name.generation.is_some_and(|generation| generation >= first)
         && !name.bare_metal()
-        && !instance_storage
         && memory_mib < MAX_HIBERNATION_MEMORY_MIB
 }
 
@@ -10181,11 +10473,7 @@ pub fn instance_type_record(instance_type: &str) -> Option<InstanceTypeRecord> {
         nitro: name.nitro(),
         architecture,
         instance_storage,
-        hibernation_supported: hibernation_supported(
-            &name,
-            memory_mib,
-            instance_storage.is_some(),
-        ),
+        hibernation_supported: hibernation_supported(&name, memory_mib),
         maximum_network_interfaces,
         ipv4_addresses_per_interface,
     })
@@ -10284,15 +10572,20 @@ fn ebs_optimized_support(name: &InstanceTypeName<'_>) -> &'static str {
         return "default";
     }
     if name.burstable() {
-        return "unsupported";
+        return EBS_OPTIMIZED_UNSUPPORTED;
     }
     match name.generation {
         None => "default",
         Some(generation) if generation >= 4 => "default",
         Some(generation) if generation >= FIRST_EBS_ENCRYPTION_GENERATION => "supported",
-        Some(_) => "unsupported",
+        Some(_) => EBS_OPTIMIZED_UNSUPPORTED,
     }
 }
+
+/// The `EbsOptimizedSupport` of a type with no EBS-optimized mode at all — one value of
+/// that enum, named here because it is also what says the type has no
+/// `EbsInfo$EbsOptimizedInfo` to report.
+const EBS_OPTIMIZED_UNSUPPORTED: &str = "unsupported";
 
 /// Whether Elastic Network Adapter is supported: `required` on the Nitro types, which
 /// have no other network device, `supported` on the current generation types that
@@ -10306,6 +10599,83 @@ fn ena_support(name: &InstanceTypeName<'_>) -> &'static str {
         return "supported";
     }
     "unsupported"
+}
+
+/// Whether an EBS volume attaches to this instance type as an NVMe device
+/// (`EbsInfo$NvmeSupport`, one value of `EbsNvmeSupport`:
+/// `smithy_query(query="shape",shape="EbsNvmeSupport")` gives `unsupported | supported |
+/// required`).
+///
+/// The member reports what the type's DEVICE MODEL can do, which follows from the NVMe
+/// devices it has:
+///
+/// * `required` on a Nitro type, whose only block device model is NVMe, so every volume
+///   attaches as one and nothing can ask for anything else;
+/// * `supported` on a type that is not Nitro but whose local instance store is already
+///   presented as NVMe devices ([`InstanceStorageFacts::nvme`]): the host has the NVMe
+///   model, so a volume MAY attach as an NVMe device beside the Xen block devices — which
+///   is what a client choosing `nvme*` over `xvd*` guest device names reads;
+/// * `unsupported` where the type has no NVMe device at all.
+///
+/// Derived from the same two facts the rest of this module derives — Nitro, and whether the
+/// instance store is NVMe — rather than from a per-type list, so one rule answers every
+/// type of the catalog.
+fn ebs_nvme_support(nitro: bool, nvme_instance_store: bool) -> &'static str {
+    if nitro {
+        return "required";
+    }
+    if nvme_instance_store {
+        return "supported";
+    }
+    "unsupported"
+}
+
+/// The EBS-optimized performance of one size — "the baseline and maximum bandwidth
+/// performance in Mbps, the throughput in MB/s and the input/output operations per second"
+/// (`EbsOptimizedInfo`) — or `None` for a type with no EBS-optimized mode at all.
+///
+/// AWS publishes those six figures per instance type ("Amazon EBS-optimized instance
+/// types"), and the type's NAME does not carry them, so they are derived from its SIZE the
+/// way that table is shaped:
+///
+/// * a figure grows with the size of the instance, which is the instance's share of its
+///   host, counted here per `xlarge` ([`EBS_BASELINE_MBPS_PER_XLARGE`] /
+///   [`EBS_BASELINE_IOPS_PER_XLARGE`]);
+/// * every size can reach at least the full-size row's figure
+///   ([`EBS_BURST_FLOOR_MBPS`] / [`EBS_BURST_FLOOR_IOPS`]), and above that size the
+///   ceiling grows at its own, shallower rate ([`EBS_BURST_MBPS_PER_XLARGE`] /
+///   [`EBS_BURST_IOPS_PER_XLARGE`]);
+/// * the sustained figure never exceeds that ceiling;
+/// * throughput is the same quantity as bandwidth in the other unit — a megabyte is
+///   [`EBS_MEGABITS_PER_MEGABYTE`] megabits — which is exactly how the published table's
+///   Mbps and MB/s columns relate.
+///
+/// `bursts` is what separates the two kinds of type the table holds: a Nitro instance's
+/// dedicated bandwidth is a baseline it bursts above, while a pre-Nitro EBS-optimized
+/// instance has one fixed figure, so for it the maximum IS the baseline.
+fn ebs_optimized_info(sixteenths: u32, bursts: bool) -> EbsOptimizedInfo {
+    let scaled = |per_xlarge: i64| {
+        per_xlarge.saturating_mul(i64::from(sixteenths)) / i64::from(XLARGE_SIXTEENTHS)
+    };
+    let narrow = |value: i64| i32::try_from(value).unwrap_or(i32::MAX);
+    let bandwidth_ceiling = scaled(EBS_BURST_MBPS_PER_XLARGE).max(EBS_BURST_FLOOR_MBPS);
+    let iops_ceiling = scaled(EBS_BURST_IOPS_PER_XLARGE).max(EBS_BURST_FLOOR_IOPS);
+    let bandwidth = scaled(EBS_BASELINE_MBPS_PER_XLARGE).min(bandwidth_ceiling);
+    let iops = scaled(EBS_BASELINE_IOPS_PER_XLARGE).min(iops_ceiling);
+    let (maximum_bandwidth, maximum_iops) = if bursts {
+        (bandwidth_ceiling, iops_ceiling)
+    } else {
+        (bandwidth, iops)
+    };
+    let megabytes = |mbps: i64| mbps as f64 / EBS_MEGABITS_PER_MEGABYTE;
+    EbsOptimizedInfo {
+        baseline_bandwidth_in_mbps: Some(narrow(bandwidth)),
+        baseline_throughput_in_m_bps: Some(megabytes(bandwidth)),
+        baseline_iops: Some(narrow(iops)),
+        maximum_bandwidth_in_mbps: Some(narrow(maximum_bandwidth)),
+        maximum_throughput_in_m_bps: Some(megabytes(maximum_bandwidth)),
+        maximum_iops: Some(narrow(maximum_iops)),
+    }
 }
 
 /// The placement group strategies the instance type supports.
@@ -10414,8 +10784,21 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
             encryption_support: Some(
                 if modern { "supported" } else { "unsupported" }.to_string(),
             ),
-            ebs_optimized_info: None,
-            nvme_support: Some(if nitro { "required" } else { "unsupported" }.to_string()),
+            // "Describes the optimized EBS performance for the instance type"
+            // (`EbsInfo$EbsOptimizedInfo`): reported for every type that HAS an
+            // EBS-optimized mode, and absent for one whose `EbsOptimizedSupport` is
+            // `unsupported`, which has no such performance to describe.
+            ebs_optimized_info: (ebs_optimized_support(&name) != EBS_OPTIMIZED_UNSUPPORTED)
+                .then(|| ebs_optimized_info(sixteenths, nitro)),
+            nvme_support: Some(
+                ebs_nvme_support(
+                    nitro,
+                    record
+                        .instance_storage
+                        .is_some_and(|storage| storage.nvme),
+                )
+                .to_string(),
+            ),
             maximum_ebs_attachments: Some(if nitro {
                 NITRO_ATTACHMENT_LIMIT
             } else {
@@ -16804,6 +17187,82 @@ fn published_amazon_image(name: &str, architecture: &str, creation_date: &str) -
     }
 }
 
+/// How long before the catalog is seeded Amazon Linux 2's standard support ended — the
+/// instant every Amazon Linux 2 build of the catalog carries as its `DeprecationTime`.
+///
+/// CHOSEN, and relative rather than a calendar date, so the catalog always holds an image
+/// that IS deprecated: a client auditing deprecation reads the contrast between an image
+/// `DescribeImages` leaves out and one `IncludeDeprecated` brings back, and a fixed date
+/// either has not been reached yet or recedes without bound as this emulator's clock
+/// advances. It is before every build below, so no build is published after the support it
+/// was published under had ended.
+const AL2_SUPPORT_ENDED_DAYS_AGO: u64 = 120;
+
+/// How long before the catalog is seeded the older of its two Amazon Linux 2 builds was
+/// published — the age of a build still in wide use when its family's support ended, so a
+/// deprecation audit has a build of a realistic age to read.
+const AL2_OLDER_BUILD_DAYS_AGO: u64 = 450;
+
+/// The same for the newer of the two, published later in that family's life.
+const AL2_NEWER_BUILD_DAYS_AGO: u64 = 390;
+
+/// The seconds in a day, for the catalog's relative build dates.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// The instant `days_ago` days before now, truncated to the start of that UTC day.
+///
+/// TRUNCATED so the catalog is stable: every reader of [`published_image_specs`] within one
+/// day of this process's life gets the same timestamp to the second, and the build date a
+/// published name carries is exactly the date the image reports.
+fn rolling_catalog_date(days_ago: u64) -> SystemTime {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(days_ago.saturating_mul(SECONDS_PER_DAY));
+    UNIX_EPOCH + Duration::from_secs(seconds - seconds % SECONDS_PER_DAY)
+}
+
+/// `at` as the `YYYYMMDD` build date an Amazon Linux published name carries, read off the
+/// same rendering the image reports as its `CreationDate` so the two cannot disagree.
+fn published_build_date(at: SystemTime) -> String {
+    iso8601_utc(at)
+        .chars()
+        .take(ISO8601_DATE_WIDTH)
+        .filter(char::is_ascii_digit)
+        .collect()
+}
+
+/// The characters of the date part of an ISO 8601 UTC rendering (`YYYY-MM-DD`).
+const ISO8601_DATE_WIDTH: usize = 10;
+
+/// One deprecated Amazon Linux 2 build of the published catalog, built `days_ago` days
+/// before the catalog was seeded.
+///
+/// The name is the one Amazon documents for an Amazon Linux 2 image —
+/// `amzn2-ami-hvm-<version>-<architecture>-<root volume>`, whose version carries the build
+/// date — so the name, the `CreationDate` and the description all name the same build. Its
+/// `DeprecationTime` is the family's end of standard support
+/// ([`AL2_SUPPORT_ENDED_DAYS_AGO`]), which has passed, so the image is deprecated and
+/// `DescribeImages` leaves it out unless the request asks for deprecated images.
+fn deprecated_amazon_linux_2_image(days_ago: u64) -> ImageSpec {
+    let created = rolling_catalog_date(days_ago);
+    let version = format!("2.0.{}.0", published_build_date(created));
+    ImageSpec {
+        description: format!("Amazon Linux 2 AMI {version} x86_64 HVM gp2"),
+        boot_mode: Some(BOOT_MODE_LEGACY_BIOS.to_string()),
+        root_volume_type: IMAGE_ROOT_VOLUME_TYPE_GP2.to_string(),
+        deprecation_time: Some(iso8601_utc(rolling_catalog_date(
+            AL2_SUPPORT_ENDED_DAYS_AGO,
+        ))),
+        ..published_amazon_image(
+            &format!("amzn2-ami-hvm-{version}-x86_64-gp2"),
+            "x86_64",
+            &iso8601_utc(created),
+        )
+    }
+}
+
 /// The public AMIs a fresh account can already see.
 ///
 /// Each row is one Amazon-published image, named the way Amazon documents its published
@@ -16926,19 +17385,18 @@ pub fn published_image_specs() -> Vec<ImageSpec> {
                 "2024-11-13T18:21:48.000Z",
             )
         },
-        // Amazon Linux 2 reached the end of its standard support on 2025-06-30 (Amazon
-        // Linux FAQs), which is the `DeprecationTime` the builds from before it carry.
-        ImageSpec {
-            description: "Amazon Linux 2 AMI 2.0.20230119.1 x86_64 HVM gp2".to_string(),
-            boot_mode: Some(BOOT_MODE_LEGACY_BIOS.to_string()),
-            root_volume_type: IMAGE_ROOT_VOLUME_TYPE_GP2.to_string(),
-            deprecation_time: Some("2025-06-30T00:00:00.000Z".to_string()),
-            ..published_amazon_image(
-                "amzn2-ami-hvm-2.0.20230119.1-x86_64-gp2",
-                "x86_64",
-                "2023-01-19T18:33:27.000Z",
-            )
-        },
+        // Amazon Linux 2 reached the end of its standard support, which is the
+        // `DeprecationTime` every build published before it carries — so these builds are
+        // deprecated whenever the catalog is read. Both their build dates and that instant
+        // are relative to the moment the catalog is seeded ([`rolling_catalog_date`]): a
+        // published AMI family is republished on a rolling schedule and AWS's own dates move
+        // with it, so a frozen calendar date would make the catalog's deprecated images
+        // arbitrarily old as this emulator's clock advances, and the age a client audits
+        // deprecation by ("how long ago was this deprecated build published?") would answer
+        // differently every month. Two builds, because the choice a caller resolving a
+        // deprecated AMI by name pattern has to make is between builds.
+        deprecated_amazon_linux_2_image(AL2_OLDER_BUILD_DAYS_AGO),
+        deprecated_amazon_linux_2_image(AL2_NEWER_BUILD_DAYS_AGO),
         ImageSpec {
             description: "Microsoft Windows Server 2022 Full Locale English AMI provided by Amazon"
                 .to_string(),
@@ -18704,6 +19162,21 @@ impl ComAmazonawsEc2Amazonec2State {
                     .max(0),
             );
         }
+        // The index of "which interfaces does this instance hold", written here beside the
+        // record itself so the two cannot drift: an interface something already holds when
+        // it is stored is indexed under the instance that holds it, and one attached to
+        // nothing is indexed nowhere.
+        if let Some(instance_id) = interface
+            .attachment
+            .as_ref()
+            .filter(|attachment| !attachment_is_detached(attachment))
+            .and_then(|attachment| attachment.instance_id.clone())
+        {
+            self.network_interfaces_by_instance
+                .entry(instance_id)
+                .or_default()
+                .insert(network_interface_id.clone());
+        }
         self.network_interfaces
             .insert(network_interface_id.clone(), interface);
         Some(network_interface_id)
@@ -20134,23 +20607,18 @@ impl ComAmazonawsEc2Amazonec2State {
 
     /// Whether `instance` sits in the VPC `vpc_id`: its subnet is one of that VPC's.
     ///
-    /// An instance record names the subnet it was launched into and nothing else about its
-    /// network, so the VPC is resolved through the subnet store. The ONE definition of
-    /// "this instance is in that VPC": [`Self::vpc_dependencies`] asks it to decide what a
-    /// `DeleteVpc` is blocked by, and `GetVpcResourcesBlockingEncryptionEnforcement` asks
-    /// it to decide whose instances a report covers, so the two cannot disagree about which
-    /// VPC holds an instance.
+    /// An instance's network placement is its subnet and nothing else, so the VPC is
+    /// resolved through the subnet store — by [`Self::instance_vpc_id`], the ONE reading of
+    /// it, so this and the instance report cannot disagree. [`Self::vpc_dependencies`] asks
+    /// this to decide what a `DeleteVpc` is blocked by, and
+    /// `GetVpcResourcesBlockingEncryptionEnforcement` asks it to decide whose instances a
+    /// report covers.
     ///
     /// The instance's STATE is not read here: which states still count as occupying the VPC
     /// is the caller's question (a delete is blocked by an instance that is not terminated;
     /// a report covers the same set), so each caller states it where it asks.
     pub fn instance_is_in_vpc(&self, instance: &InstanceRecord, vpc_id: &str) -> bool {
-        instance.subnet_id.as_deref().is_some_and(|subnet_id| {
-            self.subnets
-                .get(subnet_id)
-                .and_then(|subnet| subnet.vpc_id.as_deref())
-                == Some(vpc_id)
-        })
+        self.instance_vpc_id(instance).as_deref() == Some(vpc_id)
     }
 
     /// Remove the subnet `subnet_id` and answer it as it was last reported, or `None` when
@@ -24927,6 +25395,15 @@ pub const ATTACHMENT_STATUS_DETACHED: &str = "detached";
 /// completed sits in.
 pub const ATTACHMENT_STATUS_ATTACHED: &str = "attached";
 
+/// The device index the PRIMARY network interface of an instance is attached at.
+///
+/// "The primary network interface is attached at device index 0"
+/// (`InstanceNetworkInterfaceAttachment$DeviceIndex` / the EC2 User Guide's "Elastic network
+/// interfaces"): it is how a client finds the interface it must modify among an instance's
+/// interfaces, so the launch that creates it and anything that reads it name the one
+/// constant.
+pub const PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX: i32 = 0;
+
 /// `InvalidNetworkInterface.InUse` (HTTP 400): the request asked for something that cannot
 /// be done to a network interface while it is still attached. "The specified interface is
 /// currently in use and cannot be deleted or attached to another instance. Ensure that you
@@ -25003,6 +25480,21 @@ impl ComAmazonawsEc2Amazonec2State {
         network_interface_id: &str,
     ) -> Option<NetworkInterface> {
         let interface = self.network_interfaces.remove(network_interface_id)?;
+        // The reverse of the index write in [`Self::insert_network_interface`]: the entry
+        // goes with the record, so no instance goes on holding an interface the store no
+        // longer has.
+        if let Some(instance_id) = interface
+            .attachment
+            .as_ref()
+            .and_then(|attachment| attachment.instance_id.as_deref())
+        {
+            if let Some(held) = self.network_interfaces_by_instance.get_mut(instance_id) {
+                held.remove(network_interface_id);
+                if held.is_empty() {
+                    self.network_interfaces_by_instance.remove(instance_id);
+                }
+            }
+        }
         self.release_stored_bytes(
             network_interface_payload_bytes(&interface)
                 .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
@@ -25069,6 +25561,92 @@ impl ComAmazonawsEc2Amazonec2State {
             .attachment
             .as_ref()
             .filter(|attachment| !attachment_is_detached(attachment))
+    }
+}
+
+/// One stored network interface as the INSTANCE that holds it reports it
+/// (`Instance$NetworkInterfaces`, whose entries are `InstanceNetworkInterface`).
+///
+/// The same resource in the shape the instance report carries: the shared members are
+/// copied straight across and nothing is derived a second time, so an interface cannot read
+/// one way through `DescribeNetworkInterfaces` and another through `DescribeInstances`. The
+/// members `InstanceNetworkInterface` has and the interface's own shape does not are the
+/// attachment's, read off the attachment this projection was given — the one that holds it.
+fn instance_network_interface_view(
+    interface: &NetworkInterface,
+    attachment: &NetworkInterfaceAttachment,
+) -> InstanceNetworkInterface {
+    InstanceNetworkInterface {
+        association: None,
+        attachment: Some(InstanceNetworkInterfaceAttachment {
+            attach_time: attachment.attach_time,
+            attachment_id: attachment.attachment_id.clone(),
+            delete_on_termination: attachment.delete_on_termination,
+            device_index: attachment.device_index,
+            status: attachment.status.clone(),
+            network_card_index: attachment.network_card_index,
+            // ENA Express is a setting of an attachment something asked for, which
+            // nothing here does.
+            ena_srd_specification: None,
+            ena_queue_count: attachment.ena_queue_count,
+        }),
+        description: interface.description.clone(),
+        groups: interface.groups.clone(),
+        ipv6_addresses: interface.ipv6_addresses.as_ref().map(|addresses| {
+            addresses
+                .iter()
+                .map(|address| InstanceIpv6Address {
+                    ipv6_address: address.ipv6_address.clone(),
+                    is_primary_ipv6: address.is_primary_ipv6,
+                })
+                .collect()
+        }),
+        mac_address: interface.mac_address.clone(),
+        network_interface_id: interface.network_interface_id.clone(),
+        owner_id: interface.owner_id.clone(),
+        private_dns_name: interface.private_dns_name.clone(),
+        private_ip_address: interface.private_ip_address.clone(),
+        private_ip_addresses: interface.private_ip_addresses.as_ref().map(|addresses| {
+            addresses
+                .iter()
+                .map(|address| InstancePrivateIpAddress {
+                    association: None,
+                    primary: address.primary,
+                    private_dns_name: address.private_dns_name.clone(),
+                    private_ip_address: address.private_ip_address.clone(),
+                })
+                .collect()
+        }),
+        source_dest_check: interface.source_dest_check,
+        status: interface.status.clone(),
+        subnet_id: interface.subnet_id.clone(),
+        vpc_id: interface.vpc_id.clone(),
+        interface_type: interface.interface_type.clone(),
+        ipv4_prefixes: interface.ipv4_prefixes.as_ref().map(|prefixes| {
+            prefixes
+                .iter()
+                .map(|prefix| InstanceIpv4Prefix {
+                    ipv4_prefix: prefix.ipv4_prefix.clone(),
+                })
+                .collect()
+        }),
+        ipv6_prefixes: interface.ipv6_prefixes.as_ref().map(|prefixes| {
+            prefixes
+                .iter()
+                .map(|prefix| InstanceIpv6Prefix {
+                    ipv6_prefix: prefix.ipv6_prefix.clone(),
+                })
+                .collect()
+        }),
+        connection_tracking_configuration: interface
+            .connection_tracking_configuration
+            .as_ref()
+            .map(|tracking| ConnectionTrackingSpecificationResponse {
+                tcp_established_timeout: tracking.tcp_established_timeout,
+                udp_stream_timeout: tracking.udp_stream_timeout,
+                udp_timeout: tracking.udp_timeout,
+            }),
+        operator: interface.operator.clone(),
     }
 }
 

@@ -248,7 +248,7 @@ fn catalog_names() -> Vec<String> {
 }
 
 /// The catalog images a request that asks for nothing extra must report: every published
-/// image whose deprecation time has not passed (the one that has needs
+/// image whose deprecation time has not passed (the ones that have need
 /// `IncludeDeprecated`).
 fn undeprecated_catalog_names() -> Vec<String> {
     published_image_specs()
@@ -256,6 +256,28 @@ fn undeprecated_catalog_names() -> Vec<String> {
         .filter(|spec| spec.deprecation_time.is_none())
         .map(|spec| spec.name)
         .collect()
+}
+
+/// The published names of the catalog's DEPRECATED images, in catalog order.
+///
+/// Read from the catalog rather than written out, because those images are dated relative
+/// to the instant the catalog is seeded — so that the deprecated/not-deprecated contrast
+/// always holds — and their published names carry that build date.
+static DEPRECATED_CATALOG_NAMES: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| {
+        published_image_specs()
+            .into_iter()
+            .filter(|spec| spec.deprecation_time.is_some())
+            .map(|spec| spec.name)
+            .collect()
+    });
+
+/// `names` followed by the catalog's deprecated image names, for a table row whose filter
+/// selects those too.
+fn with_deprecated_catalog(names: &[&'static str]) -> Vec<&'static str> {
+    let mut all: Vec<&'static str> = names.to_vec();
+    all.extend(DEPRECATED_CATALOG_NAMES.iter().map(String::as_str));
+    all
 }
 
 /// `names` as the borrowed slice the tables take.
@@ -648,11 +670,10 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
         (
             "block-device-mapping.volume-type",
             vec!["gp2".into()],
-            vec![
+            with_deprecated_catalog(&[
                 "amzn2-ami-kernel-5.10-hvm-2.0.20241113.1-x86_64-gp2",
                 "amzn2-ami-minimal-hvm-2.0.20241113.1-x86_64-ebs",
-                "amzn2-ami-hvm-2.0.20230119.1-x86_64-gp2",
-            ],
+            ]),
         ),
         (
             "boot-mode",
@@ -665,11 +686,10 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
         (
             "boot-mode",
             vec!["legacy-bios".into()],
-            vec![
+            with_deprecated_catalog(&[
                 "amzn2-ami-kernel-5.10-hvm-2.0.20241113.1-x86_64-gp2",
                 "amzn2-ami-minimal-hvm-2.0.20241113.1-x86_64-ebs",
-                "amzn2-ami-hvm-2.0.20230119.1-x86_64-gp2",
-            ],
+            ]),
         ),
         // "You can use a wildcard (*), for example, 2021-09-29T*, which matches an entire
         // day" (the `creation-date` filter).
@@ -957,11 +977,10 @@ async fn several_filters_are_joined_with_an_and() {
                 ("boot-mode", &["legacy-bios"][..]),
                 ("block-device-mapping.volume-type", &["gp2"][..]),
             ],
-            vec![
+            with_deprecated_catalog(&[
                 "amzn2-ami-kernel-5.10-hvm-2.0.20241113.1-x86_64-gp2",
                 "amzn2-ami-minimal-hvm-2.0.20241113.1-x86_64-ebs",
-                "amzn2-ami-hvm-2.0.20230119.1-x86_64-gp2",
-            ],
+            ]),
         ),
         // Each filter matches something, but no image matches both.
         (
@@ -1303,7 +1322,7 @@ async fn deprecated_and_disabled_images_are_reported_only_when_asked_for() {
     let (router, engine) = super::ec2_query::emulator();
     let seeded = seed(&engine);
     let deprecated = seeded.id_for("app-retired-image");
-    let also_deprecated = seeded.id_for("amzn2-ami-hvm-2.0.20230119.1-x86_64-gp2");
+    let also_deprecated = seeded.ids_for(&borrowed(&DEPRECATED_CATALOG_NAMES));
     let disabled = seeded.id_for("app-disabled-image");
     let sunsetting = seeded.id_for("app-sunsetting-image");
 
@@ -1333,9 +1352,11 @@ async fn deprecated_and_disabled_images_are_reported_only_when_asked_for() {
              asked for, got {reported:?}"
         );
         assert_eq!(
-            reported.contains(&also_deprecated),
+            also_deprecated
+                .iter()
+                .all(|image_id| reported.contains(image_id)),
             expect_deprecated,
-            "case {case:?}: the deprecated catalog image {also_deprecated:?} follows the same \
+            "case {case:?}: the deprecated catalog images {also_deprecated:?} follow the same \
              rule, got {reported:?}"
         );
         assert_eq!(

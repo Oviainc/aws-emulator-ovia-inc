@@ -407,7 +407,7 @@ async fn the_reported_facts_follow_the_instance_type_name() {
             true,
         ),
         (
-            "the d capability letter",
+            "the d capability letter, whose local storage does not stop it hibernating",
             "m5d.large",
             2,
             1,
@@ -416,7 +416,7 @@ async fn the_reported_facts_follow_the_instance_type_name() {
             false,
             Some("nitro"),
             false,
-            false,
+            true,
             true,
         ),
         (

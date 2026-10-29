@@ -178,9 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             decode_page_token, filter_name_supported, page_from_cursor, require_known_instance,
-            require_service_state, CompiledFilter, MatchBudget, PageTokenRule, MAX_FILTERS,
-            MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE,
-            MAX_RESOURCE_IDS,
+            require_service_state, CompiledFilter, MatchBudget, PageTokenRule, ReservationView,
+            MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES,
+            MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
         };
 
         let _ = ctx;
@@ -319,10 +319,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // `@paginated` names `Reservations` as the paged items, so a page is a whole
-        // number of reservations and the token carries, opaquely
-        // (`state::encode_page_token`), the id of the one it ENDS at, so a caller cannot
-        // assemble one. A request that names no page size gets the documented maximum
+        // `@paginated` names `Reservations` as the paged items and `MaxResults` as the page
+        // size, and the ITEMS a caller counts are the instances: "the maximum number of
+        // items to return for this request" caps the instances a page reports, so a
+        // reservation whose instances straddle the boundary is reported on both pages, each
+        // page carrying the instances that fall in it. The token carries, opaquely
+        // (`state::encode_page_token`), the id of the INSTANCE the page ends at, so a caller
+        // cannot assemble one. A request that names no page size gets the documented maximum
         // rather than the whole store.
         let page_size = input
             .max_results
@@ -337,25 +340,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?),
         };
-        // Launch order IS `ReservationId` order — an id is 17 hex digits of a counter that
-        // only grows — so the set `reservation_order` built is already in the order the
-        // cursor names a position in. Paging it through the one definition of EC2 paging
-        // ([`state::page_from_cursor`]): the cursor names the reservation the page ends at,
-        // and this operation was recorded answering a token only while a further
-        // reservation follows the page.
+        // Launch order IS id order — an instance id is 17 hex digits of a counter that only
+        // grows, and a reservation's id likewise — so the set assembled above is already in
+        // the order the cursor names a position in, reservation by reservation and instance
+        // by instance within each. Paging it through the one definition of EC2 paging
+        // ([`state::page_from_cursor`]): the cursor names the instance the page ends at, and
+        // this operation was recorded answering a token only while a further instance
+        // follows the page.
+        let selected: Vec<(&str, &str)> = matched
+            .iter()
+            .flat_map(|(reservation_id, instance_ids)| {
+                instance_ids
+                    .iter()
+                    .map(|instance_id| (reservation_id.as_str(), instance_id.as_str()))
+            })
+            .collect();
         let (page, next_token) = page_from_cursor(
-            &matched,
+            &selected,
             start_at.as_deref(),
             Some(page_size),
             PageTokenRule::WhenAnotherItemFollows,
-            |(reservation_id, _)| reservation_id.as_str(),
+            |(_, instance_id)| *instance_id,
         );
-        let reservations = page
-            .iter()
-            .filter_map(|(reservation_id, instance_ids)| {
-                store.reservation_view(reservation_id, instance_ids)
-            })
-            .collect();
+        // The page's instances, regrouped into the reservations they belong to in the order
+        // they were selected in: one `Reservation` per run of consecutive instances of the
+        // same reservation, which is what makes a split reservation appear on both of the
+        // pages its instances fall in.
+        let mut reservations: Vec<ReservationView> = Vec::new();
+        let mut grouped: Vec<(&str, Vec<String>)> = Vec::new();
+        for (reservation_id, instance_id) in page {
+            match grouped.last_mut() {
+                Some((held, instance_ids)) if held == reservation_id => {
+                    instance_ids.push((*instance_id).to_string());
+                }
+                _ => grouped.push((reservation_id, vec![(*instance_id).to_string()])),
+            }
+        }
+        for (reservation_id, instance_ids) in &grouped {
+            if let Some(view) = store.reservation_view(reservation_id, instance_ids) {
+                reservations.push(view);
+            }
+        }
 
         Ok(DescribeInstancesOutput {
             reservations: Some(reservations),

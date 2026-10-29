@@ -521,6 +521,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due_transitions();
 
+        // "The ID of the subnet to launch the instance into" (`RunInstancesRequest$SubnetId`)
+        // — and a subnet belongs to ONE Availability Zone, so a launch that named a subnet
+        // of this account and no zone of its own runs in that subnet's zone rather than in
+        // the Region's first. A launch that named a zone keeps it; the two are checked
+        // against each other by nothing here, because the model's `Placement` is what the
+        // caller asked for.
+        let availability_zone = if input
+            .placement
+            .as_ref()
+            .is_some_and(|placement| placement.availability_zone.is_some())
+        {
+            availability_zone
+        } else {
+            input
+                .subnet_id
+                .as_deref()
+                .and_then(|subnet_id| store.subnets.get(subnet_id))
+                .and_then(|subnet| subnet.availability_zone.clone())
+                .unwrap_or(availability_zone)
+        };
+
         // Idempotency: one ClientToken names the one reservation it minted. Looked up
         // here, answered below the DryRun check, because a replay stores nothing and
         // so passes the ceilings a fresh launch has to clear.
@@ -675,18 +696,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every address is taken BEFORE the reservation is stored, so a launch that
         // cannot be given one leaves no partial reservation behind — and the
         // addresses it did take go straight back to the pool.
+        //
+        // "If you don't specify this address, we choose one from the IPv4 range of your
+        // subnet" (`RunInstancesRequest$PrivateIpAddress`): a launch that is placed in a
+        // subnet this account holds ([`crate::state::ComAmazonawsEc2Amazonec2State::launch_subnet`],
+        // the named one or the zone's default) draws from THAT subnet's block, through the
+        // one choice-and-take every subnet address of this crate comes out of, so the
+        // instance, its primary network interface and its subnet cannot disagree about where
+        // the address came from.
+        let subnet_cidr_block = store
+            .launch_subnet(input.subnet_id.as_deref(), &availability_zone)
+            .and_then(|subnet| subnet.cidr_block.clone());
         let mut addresses: Vec<String> = Vec::new();
         let mut exhausted = false;
         for _ in 0..input.max_count {
             match input.private_ip_address.clone() {
                 Some(address) => addresses.push(address),
-                None => match store.allocate_private_ip() {
-                    Some(address) => addresses.push(address),
-                    None => {
-                        exhausted = true;
-                        break;
+                None => {
+                    let chosen = match subnet_cidr_block.as_deref() {
+                        Some(cidr_block) => store.mint_private_ip_in_cidr(cidr_block),
+                        None => store.allocate_private_ip(),
+                    };
+                    match chosen {
+                        Some(address) => addresses.push(address),
+                        None => {
+                            exhausted = true;
+                            break;
+                        }
                     }
-                },
+                }
             }
         }
         if exhausted {
