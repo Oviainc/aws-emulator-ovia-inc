@@ -135,10 +135,9 @@ async fn policy_store_round_trips_every_member_it_was_created_with() {
             expected_protection,
             "case {case:?}: deletionProtection defaults to DISABLED, got {fetched}"
         );
-        let expected_tags = request
-            .get("tags")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        // A store created with tags reports them; a store with none omits the
+        // member even though the request asked for it.
+        let expected_tags = request.get("tags").cloned().unwrap_or(Value::Null);
         assert_eq!(
             fetched["tags"], expected_tags,
             "case {case:?}: tags were not persisted, got {fetched}"

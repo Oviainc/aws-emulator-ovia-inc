@@ -16,6 +16,8 @@
 //! * `policyStoreId` (PolicyStoreId, len 1..200) **required** — the store id, or
 //!   `policy-store-alias/<name>`.
 //! * `tags` (Boolean, default false) — include the store's tags in the response.
+//!   When asked for on a store that carries none, the output member is omitted
+//!   rather than reported as an empty map.
 //!
 //! ## Output
 //!
@@ -136,9 +138,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
             }),
             cedar_version: Some(store.cedar_version.clone()),
-            // The tags are reported only when the request asked for them.
-            tags: input
-                .tags
+            // The tags are reported only when the request asked for them, AND
+            // only when the store carries any: the model documents that a store
+            // with no tags answers with the member OMITTED, not with an empty
+            // map, so "absent" and "present but empty" stay distinguishable.
+            tags: (input.tags && !store.tags.is_empty())
                 .then(|| store.tags.clone().into_iter().collect()),
         })
     }

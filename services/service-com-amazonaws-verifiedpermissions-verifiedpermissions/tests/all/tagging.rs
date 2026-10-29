@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, error_code, ok, router};
+use crate::harness::{as_map, call, error_code, listed_tags, ok, router};
 
 /// `MAX_TAGS_PER_RESOURCE` in `src/state.rs`, which the model states twice: in
 /// `TagResource`'s documentation ("You can associate as many as 50 tags with a
@@ -55,29 +55,6 @@ async fn store_arn(router: &MultiServiceRouter, tags: Option<Value>) -> String {
         .as_str()
         .expect("arn is required on the CreatePolicyStore response")
         .to_string()
-}
-
-/// The tag set `ListTagsForResource` reports for `arn`, as an ordered map so two
-/// sets compare regardless of wire order.
-async fn listed_tags(router: &MultiServiceRouter, arn: &str) -> BTreeMap<String, String> {
-    let body = ok(
-        router,
-        "ListTagsForResource",
-        &json!({ "resourceArn": arn }),
-    )
-    .await;
-    as_map(&body["tags"])
-}
-
-/// A JSON object as an ordered `String -> String` map.
-fn as_map(value: &Value) -> BTreeMap<String, String> {
-    value
-        .as_object()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(key, value)| (key, value.as_str().unwrap_or_default().to_string()))
-        .collect()
 }
 
 /// A tag map of `count` distinct keys, prefixed with `prefix`.

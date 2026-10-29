@@ -8,6 +8,7 @@
 //! write made by one request is only visible to the next if it really reached
 //! state.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -145,6 +146,33 @@ pub async fn cognito(router: &MultiServiceRouter, operation: &str, body: &Value)
     let parsed: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
     assert_eq!(status, 200, "{operation} failed: {parsed}");
     parsed
+}
+
+/// A JSON object as an ordered `String -> String` map, so two tag sets compare
+/// regardless of wire order. An absent member (`Null`) and `{}` both map to the
+/// empty map, so a suite that cares about the DIFFERENCE between those two
+/// asserts on the raw member instead.
+pub fn as_map(value: &Value) -> BTreeMap<String, String> {
+    value
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, value)| (key, value.as_str().unwrap_or_default().to_string()))
+        .collect()
+}
+
+/// The tag set `ListTagsForResource` reports for `arn`, as an ordered map. The
+/// ONE tag-reading helper this test crate has; every suite reaches a persisted
+/// tag set through it.
+pub async fn listed_tags(router: &MultiServiceRouter, arn: &str) -> BTreeMap<String, String> {
+    let body = ok(
+        router,
+        "ListTagsForResource",
+        &json!({ "resourceArn": arn }),
+    )
+    .await;
+    as_map(&body["tags"])
 }
 
 /// The error code an awsJson1_0 fault carries in `__type`, without its namespace.

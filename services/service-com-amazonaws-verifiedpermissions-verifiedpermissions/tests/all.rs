@@ -23,6 +23,8 @@ mod delete_policy_template;
 mod error_messages;
 #[path = "all/evaluation_errors.rs"]
 mod evaluation_errors;
+#[path = "all/get_policy_store_tag_presence.rs"]
+mod get_policy_store_tag_presence;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/identity_source_configuration_writers.rs"]
