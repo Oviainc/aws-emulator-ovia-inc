@@ -2480,10 +2480,11 @@ pub fn output_request_reference_rejection(
 /// and AddFlowSources, which both store this shape through
 /// [`StoredSource::from_set_request`].
 ///
-/// A source references the flow's VPC interfaces through `VpcInterfaceName` and, for a
-/// source fed by a gateway bridge, through its `GatewayBridgeSource`'s attachment — the
-/// same two references [`StoredFlow::vpc_interface_reference`] resolves when
-/// RemoveFlowVpcInterface asks what still holds an interface. The bridge that same
+/// A source references the flow's VPC interfaces through `VpcInterfaceName`, through each
+/// input configuration's `Interface.Name` and, for a source fed by a gateway bridge,
+/// through its `GatewayBridgeSource`'s attachment — the same references
+/// [`StoredFlow::vpc_interface_reference`] resolves when RemoveFlowVpcInterface asks what
+/// still holds an interface. The bridge that same
 /// `GatewayBridgeSource` names is a resource of the ACCOUNT rather than of the flow, so it
 /// is resolved against the store instead, through
 /// [`ComAmazonawsMediaconnectMediaconnectState::source_bridge_reference_rejection`].
@@ -2669,15 +2670,23 @@ impl StoredFlow {
     /// What the VPC interface named `vpc_interface_name` is referenced by, as the phrase a
     /// refusal names it by, or `None` when nothing of this flow references it.
     ///
-    /// A source references a VPC interface by name through `Source.VpcInterfaceName` ("the
-    /// name of the VPC interface that is used for this source") and, for a source fed by a
-    /// gateway bridge, through `GatewayBridgeSource.VpcInterfaceAttachment` ("the name of
-    /// the VPC interface attachment to use for this bridge source"); an output references
-    /// one through `Output.VpcInterfaceAttachment` ("the name of the VPC interface
-    /// attachment to use for this output"). The lookup is stated once here because every
-    /// operation whose documented precondition is such a reference —
-    /// RemoveFlowVpcInterface ("can be made only on a VPC interface that does not have a
-    /// Source or Output associated with it") — must read the SAME references.
+    /// A stored source or output references a VPC interface of its flow by name through
+    /// EVERY member that carries such a name, which is exactly the set the write paths
+    /// resolve against the flow's VPC interfaces before storing it (see
+    /// [`source_request_reference_rejection`] and [`output_request_reference_rejection`]):
+    /// on a source, `Source.VpcInterfaceName` ("the name of the VPC interface that is used
+    /// for this source"), `GatewayBridgeSource.VpcInterfaceAttachment` ("the name of the
+    /// VPC interface attachment to use for this bridge source") and the `Interface.Name`
+    /// of each `MediaStreamSourceConfigurations[*].InputConfigurations[*]` ("the VPC
+    /// interface that is used for the media stream associated with the source or output");
+    /// on an output, `Output.VpcInterfaceAttachment` ("the name of the VPC interface
+    /// attachment to use for this output") and the `Interface.Name` of each
+    /// `MediaStreamOutputConfigurations[*].DestinationConfigurations[*]`. The lookup is
+    /// stated once here because every operation whose documented precondition is such a
+    /// reference — RemoveFlowVpcInterface ("can be made only on a VPC interface that does
+    /// not have a Source or Output associated with it") — must read the SAME references,
+    /// so a removal can never leave behind a stored source or output naming a VPC
+    /// interface the flow no longer holds.
     pub fn vpc_interface_reference(&self, vpc_interface_name: &str) -> Option<String> {
         let source = self.sources.iter().find(|source| {
             source.vpc_interface_name.as_deref() == Some(vpc_interface_name)
@@ -2687,6 +2696,14 @@ impl StoredFlow {
                     .and_then(|bridge_source| bridge_source.vpc_interface_attachment.as_ref())
                     .and_then(|attachment| attachment.vpc_interface_name.as_deref())
                     == Some(vpc_interface_name)
+                || source
+                    .media_stream_source_configurations
+                    .iter()
+                    .flatten()
+                    .flat_map(|configuration| {
+                        configuration.input_configurations.iter().flatten()
+                    })
+                    .any(|configuration| configuration.interface.name == vpc_interface_name)
         });
         if let Some(source) = source {
             return Some(format!("source {}", source.source_arn));
@@ -2697,6 +2714,14 @@ impl StoredFlow {
                 .as_ref()
                 .and_then(|attachment| attachment.vpc_interface_name.as_deref())
                 == Some(vpc_interface_name)
+                || output
+                    .media_stream_output_configurations
+                    .iter()
+                    .flatten()
+                    .flat_map(|configuration| {
+                        configuration.destination_configurations.iter().flatten()
+                    })
+                    .any(|configuration| configuration.interface.name == vpc_interface_name)
         });
         output.map(|output| format!("output {}", output.output_arn))
     }

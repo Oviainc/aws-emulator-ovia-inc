@@ -10,8 +10,11 @@
 //! it moved, the name is free again, a request naming a flow the store does not hold or a
 //! VPC interface that flow does not hold is refused `NotFoundException` (404), and — the
 //! operation's documented precondition — a VPC interface any of the flow's sources or
-//! outputs references is refused `BadRequestException` (400) until that source or output
-//! is deleted or updated to no longer reference it. Every refusal removes nothing.
+//! outputs references THROUGH ANY MEMBER that names one (a source's own
+//! `VpcInterfaceName`, a `VpcInterfaceAttachment`, or the `Interface.Name` of a media
+//! stream's input or destination configuration) is refused `BadRequestException` (400)
+//! until that source or output is deleted or updated to no longer reference it. Every
+//! refusal removes nothing.
 //!
 //! Every case drives the real request path (routing, restJson1 deserialization,
 //! constraint validation, handler, serialization) through the harness
@@ -457,9 +460,26 @@ struct ReferenceCase {
     free: &'static str,
 }
 
-/// The rows the rule is asserted over. `bridge_arn` is the bridge the gateway-bridge-source
-/// row names: `GatewayBridgeSource$BridgeArn` references a bridge of the account, so the row
-/// names one the account HOLDS.
+/// A third VPC interface every reference-case flow holds, so a row whose reference sits
+/// behind another one in the same list can fill the positions before it with a name the
+/// flow holds and still leave [`ReferenceCase::free`] referenced by nothing.
+const AUX_INTERFACE: &str = "vpc-aux";
+
+/// The media streams every reference-case flow holds, as `AddMediaStreamRequest` takes them
+/// (`smithy_query(query="shape",shape="AddMediaStreamRequest")`): a media stream
+/// association names a media stream of the flow's OWN `MediaStreams`, so a row that carries
+/// one needs the flow to hold it.
+fn media_streams() -> Value {
+    json!([
+        { "mediaStreamId": 1, "mediaStreamName": "ms-1", "mediaStreamType": "video" },
+        { "mediaStreamId": 2, "mediaStreamName": "ms-2", "mediaStreamType": "audio" }
+    ])
+}
+
+/// The rows the rule is asserted over — one per member of a stored source or output that
+/// names a VPC interface of its flow by name. `bridge_arn` is the bridge the
+/// gateway-bridge-source row names: `GatewayBridgeSource$BridgeArn` references a bridge of
+/// the account, so the row names one the account HOLDS.
 fn reference_cases(bridge_arn: &str) -> Vec<ReferenceCase> {
     vec![
         ReferenceCase {
@@ -506,13 +526,136 @@ fn reference_cases(bridge_arn: &str) -> Vec<ReferenceCase> {
             referenced: "vpc-ref",
             free: "vpc-free",
         },
+        ReferenceCase {
+            // `Output$MediaStreamOutputConfigurations[0].DestinationConfigurations[0]
+            // .Interface.Name`.
+            case: "an output that sends a media stream out over the VPC interface",
+            extra: json!({
+                "outputs": [{
+                    "name": "stream-out",
+                    "protocol": "st2110-jpegxs",
+                    "port": 5010,
+                    "mediaStreamOutputConfigurations": [
+                        crate::flow_name_references::output_association(
+                            "ms-1",
+                            "vpc-ref",
+                            "203.0.113.20"
+                        )
+                    ]
+                }]
+            }),
+            referenced: "vpc-ref",
+            free: "vpc-free",
+        },
+        ReferenceCase {
+            // The same member at a NON-ZERO destination-configuration position, with the
+            // position before it naming another interface the flow holds.
+            case: "an output whose second destination configuration sends out over it",
+            extra: json!({
+                "outputs": [{
+                    "name": "stream-out-second-destination",
+                    "protocol": "st2110-jpegxs",
+                    "port": 5012,
+                    "mediaStreamOutputConfigurations": [{
+                        "mediaStreamName": "ms-1",
+                        "encodingName": "jxsv",
+                        "destinationConfigurations": [
+                            {
+                                "destinationIp": "203.0.113.21",
+                                "destinationPort": 6000,
+                                "interface": { "name": AUX_INTERFACE }
+                            },
+                            {
+                                "destinationIp": "203.0.113.22",
+                                "destinationPort": 6002,
+                                "interface": { "name": "vpc-ref" }
+                            }
+                        ]
+                    }]
+                }]
+            }),
+            referenced: "vpc-ref",
+            free: "vpc-free",
+        },
+        ReferenceCase {
+            // The same member under the SECOND media stream association of one output.
+            case: "an output whose second media stream association sends out over it",
+            extra: json!({
+                "outputs": [{
+                    "name": "stream-out-second-association",
+                    "protocol": "st2110-jpegxs",
+                    "port": 5014,
+                    "mediaStreamOutputConfigurations": [
+                        crate::flow_name_references::output_association(
+                            "ms-1",
+                            AUX_INTERFACE,
+                            "203.0.113.23"
+                        ),
+                        crate::flow_name_references::output_association(
+                            "ms-2",
+                            "vpc-ref",
+                            "203.0.113.24"
+                        )
+                    ]
+                }]
+            }),
+            referenced: "vpc-ref",
+            free: "vpc-free",
+        },
+        ReferenceCase {
+            // `Source$MediaStreamSourceConfigurations[0].InputConfigurations[0]
+            // .Interface.Name`.
+            case: "a source that takes a media stream in over the VPC interface",
+            extra: json!({
+                "source": {
+                    "name": "stream-src",
+                    "protocol": "st2110-jpegxs",
+                    "whitelistCidr": "10.1.0.0/16",
+                    "mediaStreamSourceConfigurations": [
+                        crate::flow_name_references::source_association("ms-1", "vpc-ref", 9100)
+                    ]
+                }
+            }),
+            referenced: "vpc-ref",
+            free: "vpc-free",
+        },
+        ReferenceCase {
+            // The same member under the SECOND media stream association of one source,
+            // at a non-zero input-configuration position.
+            case: "a source whose second association takes a media stream in over it",
+            extra: json!({
+                "source": {
+                    "name": "stream-src-second-association",
+                    "protocol": "st2110-jpegxs",
+                    "whitelistCidr": "10.2.0.0/16",
+                    "mediaStreamSourceConfigurations": [
+                        crate::flow_name_references::source_association(
+                            "ms-1",
+                            AUX_INTERFACE,
+                            9102
+                        ),
+                        {
+                            "mediaStreamName": "ms-2",
+                            "encodingName": "jxsv",
+                            "inputConfigurations": [
+                                { "inputPort": 9104, "interface": { "name": AUX_INTERFACE } },
+                                { "inputPort": 9106, "interface": { "name": "vpc-ref" } }
+                            ]
+                        }
+                    ]
+                }
+            }),
+            referenced: "vpc-ref",
+            free: "vpc-free",
+        },
     ]
 }
 
 /// "This request can be made only on a VPC interface that does not have a Source or Output
-/// associated with it": a VPC interface any of the flow's sources or outputs references is
-/// refused `BadRequestException` and stays on the flow, while one of the same flow that
-/// nothing references is removed.
+/// associated with it": a VPC interface any of the flow's sources or outputs references —
+/// through ANY member that names a VPC interface, which is the set the crate's write paths
+/// resolve against the flow's own VPC interfaces — is refused `BadRequestException` and
+/// stays on the flow, while one of the same flow that nothing references is removed.
 #[tokio::test]
 async fn remove_flow_vpc_interface_refuses_a_referenced_interface() {
     let emulator = Emulator::new();
@@ -524,10 +667,13 @@ async fn remove_flow_vpc_interface_refuses_a_referenced_interface() {
     for (index, row) in reference_cases(&bridge_arn).into_iter().enumerate() {
         let ReferenceCase {
             case,
-            extra,
+            mut extra,
             referenced,
             free,
         } = row;
+        // Every row's flow holds the media streams an association can name, so a row that
+        // carries one is accepted on creation for the same reason the recorded request is.
+        extra["mediaStreams"] = media_streams();
         let flow_arn = create_flow_with_vpc_interfaces(
             &emulator,
             case,
@@ -535,6 +681,7 @@ async fn remove_flow_vpc_interface_refuses_a_referenced_interface() {
             json!([
                 vpc_interface_request(referenced, None, &["sg-0123456789abcdef0"]),
                 vpc_interface_request(free, None, &["sg-0123456789abcdef0"]),
+                vpc_interface_request(AUX_INTERFACE, None, &["sg-0123456789abcdef0"]),
             ]),
             extra,
         )
@@ -566,6 +713,126 @@ async fn remove_flow_vpc_interface_refuses_a_referenced_interface() {
         // and not about the flow.
         remove_at(&emulator, case, &flow_arn, 1).await;
     }
+}
+
+/// A stored source or output never names a VPC interface its flow no longer holds: a flow
+/// whose output sends a media stream out over a VPC interface is one the crate's own write
+/// paths accept, so after every removal the flow allows, UpdateFlowOutput can still restate
+/// the configurations DescribeFlow reports.
+#[tokio::test]
+async fn remove_flow_vpc_interface_leaves_every_stored_reference_restatable() {
+    let case = "an output sending a media stream out over one of three VPC interfaces";
+    let emulator = Emulator::new();
+
+    let flow_arn = create_flow_with_vpc_interfaces(
+        &emulator,
+        case,
+        "flow-vpc-restatable",
+        json!([
+            vpc_interface_request("vpc-ref", None, &["sg-0123456789abcdef0"]),
+            vpc_interface_request("vpc-free", None, &["sg-0123456789abcdef0"]),
+        ]),
+        json!({
+            "mediaStreams": media_streams(),
+            "outputs": [{
+                "name": "stream-out",
+                "protocol": "st2110-jpegxs",
+                "port": 5020,
+                "mediaStreamOutputConfigurations": [
+                    crate::flow_name_references::output_association(
+                        "ms-1",
+                        "vpc-ref",
+                        "203.0.113.30"
+                    )
+                ]
+            }]
+        }),
+    )
+    .await;
+
+    // Every VPC interface the flow holds is addressed in turn; the referenced one is
+    // refused, the rest are removed.
+    for name in ["vpc-ref", "vpc-free"] {
+        let (status, _, body) = remove_vpc_interface(&emulator, &flow_arn, name).await;
+        let expected = if name == "vpc-ref" { 400 } else { 200 };
+        assert_eq!(
+            status, expected,
+            "case {case:?}: removing {name:?} expected {expected}, got {status}: {body}"
+        );
+    }
+
+    // What DescribeFlow reports is what the write paths accept: restating the stored
+    // configurations through UpdateFlowOutput is accepted, and reports them back unchanged.
+    let (_, _, described) = emulator.describe_flow(&flow_arn).await;
+    let output = described["flow"]["outputs"][0].clone();
+    let output_arn = output["outputArn"].as_str().unwrap_or_default().to_string();
+    let restated = json!({
+        "mediaStreamOutputConfigurations": [{
+            "mediaStreamName": output["mediaStreamOutputConfigurations"][0]["mediaStreamName"]
+                .clone(),
+            "encodingName": output["mediaStreamOutputConfigurations"][0]["encodingName"].clone(),
+            "destinationConfigurations": [{
+                "destinationIp":
+                    output["mediaStreamOutputConfigurations"][0]["destinationConfigurations"][0]
+                        ["destinationIp"]
+                        .clone(),
+                "destinationPort":
+                    output["mediaStreamOutputConfigurations"][0]["destinationConfigurations"][0]
+                        ["destinationPort"]
+                        .clone(),
+                "interface":
+                    output["mediaStreamOutputConfigurations"][0]["destinationConfigurations"][0]
+                        ["interface"]
+                        .clone()
+            }]
+        }]
+    });
+    let (status, code, body) =
+        crate::update_flow_output::update_flow_output(&emulator, &flow_arn, &output_arn, restated)
+            .await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (202, None),
+        "case {case:?}: restating the stored configurations must be accepted, got {status} \
+         {code:?}: {body}"
+    );
+    let restated_configurations =
+        without_outbound_ip(&body["output"]["mediaStreamOutputConfigurations"]);
+    let stored_configurations = without_outbound_ip(&output["mediaStreamOutputConfigurations"]);
+    assert_eq!(
+        restated_configurations, stored_configurations,
+        "case {case:?}: the restated configurations are the stored ones, got {body}"
+    );
+}
+
+/// `configurations` with the one member no request can carry dropped from each destination
+/// configuration — `DestinationConfiguration$OutboundIp`, "the IP address that the receiver
+/// requires in order to establish a connection with the flow", which the SERVICE assigns
+/// for the call that materialised the association — so two stored records can be compared
+/// on exactly what a request states.
+fn without_outbound_ip(configurations: &Value) -> Value {
+    configurations
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    let mut entry = entry.clone();
+                    if let Some(destinations) = entry
+                        .get_mut("destinationConfigurations")
+                        .and_then(Value::as_array_mut)
+                    {
+                        for destination in destinations {
+                            if let Some(object) = destination.as_object_mut() {
+                                object.remove("outboundIp");
+                            }
+                        }
+                    }
+                    entry
+                })
+                .collect()
+        })
+        .unwrap_or(Value::Null)
 }
 
 /// "If the VPC interface is referenced by a Source or Output, you must first delete or
@@ -621,6 +888,72 @@ async fn remove_flow_vpc_interface_succeeds_once_the_reference_is_lifted() {
         (status, code.as_deref()),
         (202, None),
         "case {case:?}: RemoveFlowOutput expected 202, got {status} {code:?}: {body}"
+    );
+
+    remove_at(&emulator, case, &flow_arn, 0).await;
+}
+
+/// The other half of that sentence, for the reference a destination configuration carries:
+/// once the output is UPDATED to no longer send the media stream out over the VPC
+/// interface, the same request that was refused removes it.
+#[tokio::test]
+async fn remove_flow_vpc_interface_succeeds_once_an_output_stops_sending_over_it() {
+    let case = "lift a destination configuration's interface by updating the output";
+    let emulator = Emulator::new();
+
+    let flow_arn = create_flow_with_vpc_interfaces(
+        &emulator,
+        case,
+        "flow-vpc-lift-destination",
+        json!([vpc_interface_request(
+            "vpc-sending",
+            None,
+            &["sg-0123456789abcdef0"]
+        )]),
+        json!({
+            "mediaStreams": media_streams(),
+            "outputs": [{
+                "name": "sending-out",
+                "protocol": "st2110-jpegxs",
+                "port": 5030,
+                "mediaStreamOutputConfigurations": [
+                    crate::flow_name_references::output_association(
+                        "ms-1",
+                        "vpc-sending",
+                        "203.0.113.31"
+                    )
+                ]
+            }]
+        }),
+    )
+    .await;
+
+    let (status, code, body) = remove_vpc_interface(&emulator, &flow_arn, "vpc-sending").await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (400, Some("BadRequestException")),
+        "case {case:?}: while the output sends over it the remove is refused, got {status} \
+         {code:?}: {body}"
+    );
+
+    let (_, _, described) = emulator.describe_flow(&flow_arn).await;
+    let output_arn = described["flow"]["outputs"][0]["outputArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    // "Update the Source or Output to no longer reference the VPC interface": an empty
+    // `MediaStreamOutputConfigurations` associates the output with no media stream.
+    let (status, code, body) = crate::update_flow_output::update_flow_output(
+        &emulator,
+        &flow_arn,
+        &output_arn,
+        json!({ "mediaStreamOutputConfigurations": [] }),
+    )
+    .await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (202, None),
+        "case {case:?}: UpdateFlowOutput expected 202, got {status} {code:?}: {body}"
     );
 
     remove_at(&emulator, case, &flow_arn, 0).await;

@@ -75,7 +75,10 @@ fn held_vpc_interfaces() -> Value {
 
 /// One `MediaStreamOutputConfigurations` entry: the media stream `media_stream` leaving on
 /// the VPC interface `vpc_interface` towards `destination_ip`.
-fn output_association(media_stream: &str, vpc_interface: &str, destination_ip: &str) -> Value {
+///
+/// `pub(crate)` because `tests/all/remove_flow_vpc_interface.rs` builds the same
+/// association to assert what a destination configuration's `Interface.Name` references.
+pub(crate) fn output_association(media_stream: &str, vpc_interface: &str, destination_ip: &str) -> Value {
     json!({
         "mediaStreamName": media_stream,
         "encodingName": "jxsv",
@@ -89,7 +92,10 @@ fn output_association(media_stream: &str, vpc_interface: &str, destination_ip: &
 
 /// One `MediaStreamSourceConfigurations` entry: the media stream `media_stream` arriving on
 /// the VPC interface `vpc_interface` at `input_port`.
-fn source_association(media_stream: &str, vpc_interface: &str, input_port: i32) -> Value {
+///
+/// `pub(crate)` because `tests/all/remove_flow_vpc_interface.rs` builds the same
+/// association to assert what an input configuration's `Interface.Name` references.
+pub(crate) fn source_association(media_stream: &str, vpc_interface: &str, input_port: i32) -> Value {
     json!({
         "mediaStreamName": media_stream,
         "encodingName": "jxsv",
