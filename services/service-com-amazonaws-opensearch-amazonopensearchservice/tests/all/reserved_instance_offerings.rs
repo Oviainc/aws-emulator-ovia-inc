@@ -39,8 +39,8 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::{
 };
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
     is_guid, PAYMENT_OPTION_ALL_UPFRONT, PAYMENT_OPTION_NO_UPFRONT, PAYMENT_OPTION_PARTIAL_UPFRONT,
-    RECURRING_CHARGE_HOURLY, RESERVED_INSTANCE_CURRENCY_CODE, RESERVED_INSTANCE_TERMS,
-    TERM_ONE_YEAR, TERM_THREE_YEARS,
+    RECURRING_CHARGE_HOURLY, RESERVED_INSTANCE_CURRENCY_CODE, RESERVED_INSTANCE_OFFERING_PAGE,
+    RESERVED_INSTANCE_TERMS, TERM_ONE_YEAR, TERM_THREE_YEARS,
 };
 
 use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX};
@@ -110,16 +110,32 @@ fn hourly_cost(offering: &Value, case: &str) -> f64 {
         + number_member(offering, "UsagePrice", case)
 }
 
-/// The whole catalog, read in one call.
+/// The whole catalog, walked through the continuation tokens the answers hand out.
+///
+/// The catalog holds more offerings than one page carries, so a request that names no
+/// `MaxResults` is still answered with a bounded page and a token: a reader that stops
+/// at the first answer sees only part of the catalog.
 async fn whole_catalog(emulator: &Emulator, case: &str) -> Vec<Value> {
-    let answer = describe(emulator, "").await;
-    assert!(
-        answer.body["NextToken"].is_null(),
-        "case {case}: an unpaged read reports the whole catalog, so it carries no \
-         NextToken, got {:?}",
-        answer.body["NextToken"]
-    );
-    offerings(&answer, case)
+    let mut collected: Vec<Value> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let query = match token.as_deref() {
+            None => String::new(),
+            Some(token) => format!("nextToken={token}"),
+        };
+        let answer = describe(emulator, &query).await;
+        collected.extend(offerings(&answer, case));
+        assert!(
+            collected.len() <= expected_catalog_size(),
+            "case {case}: the walk reported more offerings than the catalog publishes, got {}",
+            collected.len()
+        );
+        match answer.body["NextToken"].as_str() {
+            // The last answer of a walk reports no token: there is nothing left.
+            None => return collected,
+            Some(next) => token = Some(next.to_owned()),
+        }
+    }
 }
 
 /// The offering in `catalog` with this instance type, term and payment option.
@@ -570,20 +586,28 @@ async fn pages_partition_the_catalog() {
         );
     }
 
-    // `MaxResults` is `@default(0)`, so a request that sends none reports the whole
-    // catalog in one page.
+    // `MaxResults` is `@default(0)`, so a request that names no page size — or names
+    // zero, which is that default — has asked for no particular one: the service answers
+    // with its own default page and a token, not with the whole catalog.
     for unbounded in ["", "maxResults=0"] {
         let case = format!("unbounded {unbounded:?}");
         let answer = describe(&emulator, unbounded).await;
         let page = offerings(&answer, &case);
         assert_eq!(
-            page, catalog,
-            "case {case}: expected the whole catalog in one page, got {} offerings",
+            page,
+            catalog[..RESERVED_INSTANCE_OFFERING_PAGE].to_vec(),
+            "case {case}: expected the service's own default page, got {} offerings",
             page.len()
         );
-        assert!(
-            answer.body["NextToken"].is_null(),
-            "case {case}: expected no NextToken, got {:?}",
+        let resume_at = string_member(
+            &catalog[RESERVED_INSTANCE_OFFERING_PAGE],
+            "ReservedInstanceOfferingId",
+            &case,
+        );
+        assert_eq!(
+            answer.body["NextToken"].as_str(),
+            Some(resume_at.as_str()),
+            "case {case}: offerings remain, so the answer names where to resume, got {:?}",
             answer.body["NextToken"]
         );
     }

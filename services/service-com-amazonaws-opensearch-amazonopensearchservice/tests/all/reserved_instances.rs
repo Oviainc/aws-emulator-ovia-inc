@@ -134,21 +134,26 @@ fn recurring_charge(value: &Value, case: &str) -> Option<f64> {
 
 /// Every published offering, keyed by instance type, term in seconds and payment
 /// option — the three attributes that make an offering.
+///
+/// The catalog holds more offerings than one page carries, so this walks the
+/// continuation tokens the answers hand out: a reader that stops at the first answer
+/// sees only part of the catalog.
 async fn fetch_catalog(emulator: &Emulator) -> BTreeMap<(String, i64, String), Value> {
-    let answer = offerings(emulator, "").await;
-    assert_eq!(
-        answer.status, 200,
-        "the whole catalog: expected HTTP 200, got {} {:?}",
-        answer.status, answer.body
-    );
-    assert!(
-        answer.body["NextToken"].is_null(),
-        "the whole catalog: an uncapped page carries no NextToken, got {:?}",
-        answer.body["NextToken"]
-    );
-    array(&answer, "ReservedInstanceOfferings", "the whole catalog")
-        .into_iter()
-        .map(|offering| {
+    let mut catalog: BTreeMap<(String, i64, String), Value> = BTreeMap::new();
+    let mut token: Option<String> = None;
+    loop {
+        let query = match token.as_deref() {
+            None => String::new(),
+            Some(token) => format!("?nextToken={token}"),
+        };
+        let answer = offerings(emulator, &query).await;
+        assert_eq!(
+            answer.status, 200,
+            "the whole catalog: expected HTTP 200, got {} {:?}",
+            answer.status, answer.body
+        );
+        let next = answer.body["NextToken"].as_str().map(str::to_owned);
+        for offering in array(&answer, "ReservedInstanceOfferings", "the whole catalog") {
             let key = (
                 text(&offering, "InstanceType", "the whole catalog"),
                 offering["Duration"]
@@ -156,9 +161,14 @@ async fn fetch_catalog(emulator: &Emulator) -> BTreeMap<(String, i64, String), V
                     .expect("every offering publishes a Duration"),
                 text(&offering, "PaymentOption", "the whole catalog"),
             );
-            (key, offering)
-        })
-        .collect()
+            catalog.insert(key, offering);
+        }
+        match next {
+            // The last answer of a walk reports no token: there is nothing left.
+            None => return catalog,
+            Some(next) => token = Some(next),
+        }
+    }
 }
 
 /// The offering with these attributes, from the published catalog.

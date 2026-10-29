@@ -18,14 +18,12 @@
 //!   including the status the clock has left the endpoint in;
 //! * a domain name this account holds no domain under selects no endpoint, so the
 //!   listing is EMPTY rather than refused;
-//! * paging walks a domain's whole set exactly once, every page but the last full, and a
-//!   token that names no endpoint of that domain is refused exactly as the account-wide
-//!   listing refuses one.
+//! * one answer reports a domain's whole set exactly once and carries no `NextToken`
+//!   member at all, and a token that names no endpoint of that domain is refused
+//!   exactly as the account-wide listing refuses one.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    VPC_ENDPOINT_PAGE, VPC_ENDPOINT_STATUS_ACTIVE,
-};
+use service_com_amazonaws_opensearch_amazonopensearchservice::state::VPC_ENDPOINT_STATUS_ACTIVE;
 
 use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
 use super::vpc_endpoints::{create_endpoint, member, minted, vpc_domain};
@@ -227,9 +225,10 @@ async fn a_name_that_names_no_domain_reports_an_empty_listing() {
             answer.body
         );
         assert_eq!(
-            answer.body["NextToken"],
-            json!(""),
-            "case {case:?}: an empty listing ends at once, got {:?}",
+            answer.body.get("NextToken"),
+            None,
+            "case {case:?}: an empty listing is a complete result set, so it carries no \
+             NextToken, got {:?}",
             answer.body
         );
     }
@@ -250,67 +249,50 @@ async fn a_name_that_names_no_domain_reports_an_empty_listing() {
 }
 
 #[tokio::test]
-async fn paging_walks_one_domain_s_set_exactly_once() {
+async fn one_answer_reports_one_domain_s_set_exactly_once() {
     let emulator = Emulator::new();
     let domain = "vpce-domain-paged";
     let arn = vpc_domain(&emulator, domain).await;
     let other = vpc_domain(&emulator, "vpce-domain-beside").await;
 
-    // One endpoint more than a page holds, so the set spans more than one page, plus a
-    // second domain's endpoint that no page of this listing may carry.
-    let total = VPC_ENDPOINT_PAGE + 2;
+    // Far more endpoints than the ten summaries this listing used to cap an answer at,
+    // so a capped answer could not pass; plus a second domain's endpoint that the
+    // listing may not carry.
+    let total = 12;
     let mut minted = Vec::new();
     for index in 0..total {
         minted.push(endpoint_on(&emulator, &arn, &format!("subnet-0ccc{index:013}")).await);
     }
     let beside = endpoint_on(&emulator, &other, "subnet-0ddd0000000000001").await;
 
-    let mut walked: Vec<String> = Vec::new();
-    let mut token: Option<String> = None;
-    let mut pages = 0;
-    loop {
-        let answer = list_for_domain(&emulator, domain, token.as_deref()).await;
-        assert_eq!(
-            answer.status, 200,
-            "case page {pages}: expected 200, got {} with {:?}",
-            answer.status, answer.body
-        );
-        let ids = summary_ids(&answer.body, "paging one domain's set");
-        let next = answer.body["NextToken"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
-        if !next.is_empty() {
-            assert_eq!(
-                ids.len(),
-                VPC_ENDPOINT_PAGE,
-                "case page {pages}: every page but the last is full, got {ids:?}"
-            );
-        }
-        walked.extend(ids);
-        pages += 1;
-        assert!(
-            pages <= total,
-            "case paging one domain's set: the walk terminates, got {pages} pages for {total} \
-             endpoints"
-        );
-        if next.is_empty() {
-            break;
-        }
-        token = Some(next);
-    }
+    let answer = list_for_domain(&emulator, domain, None).await;
+    assert_eq!(
+        answer.status, 200,
+        "case one domain's set: expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    // A complete result set is reported with NO `NextToken` member at all — not the
+    // empty string, which a client testing for the member's presence rather than its
+    // truthiness paginates on forever.
+    assert_eq!(
+        answer.body.get("NextToken"),
+        None,
+        "case one domain's set: the whole set is reported, so the answer carries no NextToken, \
+         got {:?}",
+        answer.body
+    );
+    let listed = summary_ids(&answer.body, "one domain's set");
 
     let mut expected = minted.clone();
     expected.sort();
-    let mut seen = walked.clone();
-    seen.sort();
     assert_eq!(
-        seen, expected,
-        "case paging one domain's set: the walk reports every endpoint of the domain exactly once"
+        listed, expected,
+        "case one domain's set: one answer reports every endpoint of the domain exactly once, in \
+         the order the listing reports them"
     );
     assert!(
-        !walked.contains(&beside),
-        "case paging one domain's set: no page carries another domain's endpoint, got {walked:?}"
+        !listed.contains(&beside),
+        "case one domain's set: the answer carries no other domain's endpoint, got {listed:?}"
     );
 
     // A token that names no endpoint OF THIS DOMAIN names no place in its listing — a

@@ -7,7 +7,10 @@
 //! the same records `AuthorizeVpcEndpointAccess` grants.
 //!
 //! A pure read: the set is reported exactly as it is stored, so the next caller sees
-//! what this one saw.
+//! what this one saw. The domain's set is bounded by
+//! [`crate::state::VPC_ENDPOINT_ACCESS_QUOTA`], so one answer reports it whole and this
+//! listing hands out no continuation token: its response carries no `NextToken` member,
+//! which is how a complete result set is reported.
 //!
 //! ## Shape of an operation
 //!
@@ -82,7 +85,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{invalid_next_token, VPC_ENDPOINT_ACCESS_PAGE};
+use crate::state::invalid_next_token;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -182,46 +185,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request reports the same order twice, which is what lets a token name a place
         // in the set.
         //
-        // A token names the principal the next page starts at, so paging resumes from a
+        // A token names the principal the answer starts at, so a listing resumes from a
         // place in the set rather than from an offset a grant or a revoke would have
         // shifted. A token naming no principal of the set — one this service never
         // handed out, or one whose authorization has since been released — names no such
         // place, which is a malformed request rather than an empty page. The EMPTY token
-        // is the one this operation itself hands out at the end of a listing, so it
-        // starts from the first page exactly as naming no token does.
-        let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
-            None => 0,
-            Some(token) => domain
-                .vpc_endpoint_access
-                .keys()
-                .position(|principal| principal == token)
-                .ok_or_else(|| {
-                    ListVpcEndpointAccessErrorModeled::ValidationException(invalid_next_token())
-                })?,
-        };
-        // ONE page, so the answer is bounded by the page size however large the stored
-        // set is.
-        let page: Vec<AuthorizedPrincipal> = domain
+        // means the start of the set, exactly as naming no token does.
+        let start = crate::state::vpc_endpoint_access_start(
+            domain.vpc_endpoint_access.keys(),
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(|| {
+            ListVpcEndpointAccessErrorModeled::ValidationException(invalid_next_token())
+        })?;
+        // The whole set from there on: it is bounded by
+        // `crate::state::VPC_ENDPOINT_ACCESS_QUOTA`, so one answer reports everything
+        // this caller has not been shown and there is no continuation token to report —
+        // the response carries no `NextToken` member at all, which is how a complete
+        // result set is reported.
+        let listed: Vec<AuthorizedPrincipal> = domain
             .vpc_endpoint_access
             .values()
             .skip(start)
-            .take(VPC_ENDPOINT_ACCESS_PAGE)
             .cloned()
             .collect();
 
         Ok(ListVpcEndpointAccessOutput {
-            authorized_principal_list: page,
-            // "When nextToken is returned, there are more results available": the token
-            // is the principal the next page starts at, and there is none once this page
-            // ended the set. The member is REQUIRED by the model, so the end of the
-            // listing is the empty token rather than no member — which is also what a
-            // paginating client stops on.
-            next_token: domain
-                .vpc_endpoint_access
-                .keys()
-                .nth(start.saturating_add(VPC_ENDPOINT_ACCESS_PAGE))
-                .cloned()
-                .unwrap_or_default(),
+            authorized_principal_list: listed,
         })
     }
 }

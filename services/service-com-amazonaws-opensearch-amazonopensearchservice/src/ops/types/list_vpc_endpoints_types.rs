@@ -17,10 +17,19 @@ pub struct ListVpcEndpointsInput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.opensearch#ListVpcEndpointsResponse")]
+// `ListVpcEndpointsResponse$NextToken` is modelled `@required`, but the recorded AWS
+// answer for a complete result set carries no such member at all — not the empty string
+// the required member would have put on the wire, which a client testing for the
+// member's presence paginates on forever. This listing reports the account's whole
+// endpoint set in one answer (`crate::state::vpc_endpoint_listing`), so it has no
+// continuation token to report and the member is declared unsupported: that keeps it out
+// of the shape's schema, and so out of the body the framework writes.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.opensearch#ListVpcEndpointsResponse",
+    unsupported = ["NextToken"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListVpcEndpointsOutput {
     pub vpc_endpoint_summary_list: Vec<VpcEndpointSummary>,
-    pub next_token: String,
 }
 

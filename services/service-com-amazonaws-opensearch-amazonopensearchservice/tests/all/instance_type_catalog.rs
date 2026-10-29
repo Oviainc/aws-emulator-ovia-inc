@@ -20,10 +20,12 @@
 //! * the `instanceType` filter reports exactly the entry it names, over a table of
 //!   types drawn from the listing, answers an empty listing for a published type the
 //!   version does not offer, and refuses a value that names no published instance type;
-//! * paging is a partition: over a table of page sizes the pages concatenate back to
-//!   the full listing in order, every page is within its size, only the last page
-//!   carries no token, a page size outside the modelled bound is refused at either end,
-//!   and a token the operation never issued is refused;
+//! * the version's catalog is reported COMPLETE in a single answer, with no `NextToken`
+//!   member at all, over a table of page sizes: `MaxResults` does not bound what is
+//!   reported and no token is ever handed out, while a `MaxResults` outside the modelled
+//!   range is still refused at either end; a token names a place in the listing, so an
+//!   answer resumed from one is the listing's suffix and a token naming no entry of the
+//!   listing is refused;
 //! * `retrieveAZs` is what puts Availability Zones in the answer, and the zones are
 //!   those of the Region the listing is for — the signing Region, or the Region of the
 //!   domain the request names;
@@ -107,14 +109,16 @@ fn details(answer: &Answer, case: &str) -> Vec<Value> {
         .clone()
 }
 
-/// The whole listing of one version, read in one call.
+/// The whole listing of one version: this operation reports the version's catalog
+/// complete in a single answer, so the answer carries no continuation token.
 async fn whole_listing(emulator: &Emulator, engine_version: &str, query: &str) -> Vec<Value> {
     let answer = list(emulator, engine_version, query).await;
-    assert!(
-        answer.body["NextToken"].is_null(),
-        "case {engine_version}: an unpaged read reports the whole listing, so it carries \
-         no NextToken, got {:?}",
-        answer.body["NextToken"]
+    assert_eq!(
+        answer.body.get("NextToken"),
+        None,
+        "case {engine_version} ({query:?}): the whole listing is reported, so the answer \
+         carries no NextToken, got {:?}",
+        answer.body
     );
     details(&answer, engine_version)
 }
@@ -648,8 +652,8 @@ async fn instance_type_filter_reports_exactly_that_type() {
         );
     }
 
-    // A token is scoped to the listing it was issued under, so one naming an entry the
-    // filtered listing does not hold is refused rather than served with the filter
+    // A token names a place in the listing it was issued under, so one naming an entry
+    // the FILTERED listing does not hold is refused rather than served with the filter
     // dropped.
     let first = instance_types(&listing)[0].clone();
     let second = instance_types(&listing)[1].clone();
@@ -674,77 +678,76 @@ async fn instance_type_filter_reports_exactly_that_type() {
 }
 
 #[tokio::test]
-async fn pages_partition_the_listing() {
+async fn the_whole_listing_is_reported_whatever_the_pagination_members_ask() {
     let emulator = Emulator::new();
 
-    // One row per page size: the smallest, two that do not divide the listing, and the
-    // largest the modelled range allows — each walked on a version of either engine, so
-    // the partition holds over listings of two different lengths.
+    // One row per way a request can ask for a bounded answer: the smallest page size,
+    // sizes that do not divide the listing, the largest the modelled range allows, and
+    // the modelled default of zero. Each is asked on a version of either engine, so the
+    // rule holds over listings of two different lengths.
+    //
+    // The recorded answers of this operation report the version's catalog complete and
+    // no `NextToken` for such a request: the catalog is published complete in a single
+    // answer, so `MaxResults` does not bound what is reported and no token is ever handed
+    // out.
     for version in ["Elasticsearch_6.7", "OpenSearch_2.19"] {
         let listing = whole_listing(&emulator, version, "").await;
-        for page_size in [1_i32, 2, 7, 100] {
-            let case = format!("{version} page size {page_size}");
-            let mut walked: Vec<Value> = Vec::new();
-            let mut token: Option<String> = None;
-            let mut pages = 0_usize;
-            loop {
-                let query = match &token {
-                    None => format!("maxResults={page_size}"),
-                    Some(token) => format!("maxResults={page_size}&nextToken={token}"),
-                };
-                let answer = list(&emulator, version, &query).await;
-                let page = details(&answer, &case);
-                assert!(
-                    page.len() <= usize::try_from(page_size).unwrap_or_default(),
-                    "case {case}: a page holds at most MaxResults entries, got {}",
-                    page.len()
-                );
-                assert!(
-                    !page.is_empty(),
-                    "case {case}: a page the service issued a token for reports entries, \
-                     got none"
-                );
-                walked.extend(page);
-                pages += 1;
-                token = answer.body["NextToken"].as_str().map(str::to_owned);
-                if token.is_none() {
-                    break;
-                }
-                assert!(
-                    walked.len() <= listing.len(),
-                    "case {case}: paging kept issuing tokens past the end of the listing"
-                );
-            }
+        for query in [
+            "maxResults=1",
+            "maxResults=2",
+            "maxResults=7",
+            "maxResults=100",
+            "maxResults=0",
+        ] {
+            let case = format!("{version} query {query:?}");
+            let reported = whole_listing(&emulator, version, query).await;
             assert_eq!(
-                walked, listing,
-                "case {case}: expected the pages to concatenate back to the whole listing \
-                 in order, got {} entries over {pages} pages",
-                walked.len()
-            );
-            let expected_pages = listing
-                .len()
-                .div_ceil(usize::try_from(page_size).unwrap_or(1));
-            assert_eq!(
-                pages, expected_pages,
-                "case {case}: expected {expected_pages} pages, got {pages}"
+                reported, listing,
+                "case {case}: expected the whole listing in one answer, got {} entries",
+                reported.len()
             );
         }
 
-        // `MaxResults` is `@default(0)`, so a request that sends none reports the whole
-        // listing in one page.
-        for unbounded in ["", "maxResults=0"] {
-            let case = format!("{version} unbounded {unbounded:?}");
-            let page = details(&list(&emulator, version, unbounded).await, &case);
+        // A token names a place in the listing, and the answer from there runs to its
+        // end: it reports the listing's suffix and still carries no token of its own.
+        let types = instance_types(&listing);
+        for at in [1_usize, types.len() / 2, types.len() - 1] {
+            let query = format!("nextToken={}", types[at]);
+            let case = format!("{version} resumed at {at}");
+            let reported = whole_listing(&emulator, version, &query).await;
             assert_eq!(
-                page, listing,
-                "case {case}: expected the whole listing in one page, got {} entries",
-                page.len()
+                reported,
+                listing[at..].to_vec(),
+                "case {case}: expected the listing's suffix, got {} entries",
+                reported.len()
+            );
+        }
+
+        // A token this operation never handed out names no place in the listing, which is
+        // a malformed request rather than an empty answer.
+        for invented in [
+            "nextToken=not-a-token",
+            "nextToken=m5.large.search.page2",
+            "maxResults=5&nextToken=00000000-0000-0000-0000-000000000000",
+        ] {
+            let answer = list(&emulator, version, invented).await;
+            assert_eq!(
+                answer.status, 400,
+                "case {version} {invented}: expected HTTP 400, got {} {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                error_code(&answer),
+                "ValidationException",
+                "case {version} {invented}: expected the modelled validation refusal, got {:?}",
+                answer.body
             );
         }
     }
 
-    // A page size outside the modelled bound is refused at either end; the bound itself
-    // is not.
+    // A page size outside the modelled bound is still refused at either end — the bound
+    // is the model's `@range(max: 100)` on `MaxResults`, and a negative count is no page
+    // size at all; the bound itself is not refused.
     let at_bound = list(&emulator, "OpenSearch_2.11", "maxResults=100").await;
     assert_eq!(
         at_bound.status, 200,
@@ -762,26 +765,6 @@ async fn pages_partition_the_listing() {
             error_code(&answer),
             "ValidationException",
             "case {out_of_bound}: expected the modelled validation refusal, got {:?}",
-            answer.body
-        );
-    }
-
-    // A token the operation never issued is a malformed request, not an empty page.
-    for invented in [
-        "nextToken=not-a-token",
-        "nextToken=m5.large.search.page2",
-        "maxResults=5&nextToken=00000000-0000-0000-0000-000000000000",
-    ] {
-        let answer = list(&emulator, "OpenSearch_2.11", invented).await;
-        assert_eq!(
-            answer.status, 400,
-            "case {invented}: expected HTTP 400, got {} {:?}",
-            answer.status, answer.body
-        );
-        assert_eq!(
-            error_code(&answer),
-            "ValidationException",
-            "case {invented}: expected the modelled validation refusal, got {:?}",
             answer.body
         );
     }

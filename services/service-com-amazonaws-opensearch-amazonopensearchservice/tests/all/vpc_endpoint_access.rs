@@ -24,9 +24,9 @@
 //! * the set belongs to the domain the request names: a grant on one domain is
 //!   invisible on another, a name the registry does not resolve is refused by both
 //!   operations, and deleting a domain releases its authorizations with it;
-//! * paging walks the whole set exactly once in the order the listing reports it, with
-//!   every page but the last full, and a token that names no principal of the set is
-//!   refused;
+//! * one answer reports the whole set exactly once in the order the listing reports it
+//!   and carries no `NextToken` member at all, while a token that names no principal of
+//!   the set is refused;
 //! * the set is bounded per domain: grants are accepted up to the quota and the one
 //!   past it is refused with the modelled `LimitExceededException`, while a re-grant of
 //!   a principal already in the set is still accepted at the bound because it does not
@@ -37,8 +37,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::{
     A_W_S_SERVICE_PRINCIPAL_VALUES, PRINCIPAL_TYPE_VALUES,
 };
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    PRINCIPAL_TYPE_AWS_ACCOUNT, PRINCIPAL_TYPE_AWS_SERVICE, VPC_ENDPOINT_ACCESS_PAGE,
-    VPC_ENDPOINT_ACCESS_QUOTA,
+    PRINCIPAL_TYPE_AWS_ACCOUNT, PRINCIPAL_TYPE_AWS_SERVICE, VPC_ENDPOINT_ACCESS_QUOTA,
 };
 
 use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX};
@@ -91,55 +90,29 @@ pub(crate) fn principal_list(answer: &Answer, case: &str) -> Vec<Value> {
         .clone()
 }
 
-/// The `NextToken` of a listing answer. The member is required by the model, so an
-/// answer that carries no string at all is itself a failure; the end of the listing is
-/// the EMPTY token.
-fn next_token(answer: &Answer, case: &str) -> String {
-    answer.body["NextToken"]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case}: expected a string NextToken, got {:?}", answer.body))
-        .to_owned()
+/// Whether a listing answer carries no `NextToken` member at all, which is how this
+/// listing reports a complete result set — not the empty string, which a client testing
+/// for the member's presence rather than its truthiness paginates on forever.
+fn carries_no_token(answer: &Answer, case: &str) {
+    assert_eq!(
+        answer.body.get("NextToken"),
+        None,
+        "case {case}: the whole set is reported, so the answer carries no NextToken, got {:?}",
+        answer.body
+    );
 }
 
-/// Every authorized principal of a domain, walked page by page through the tokens the
-/// listing hands out — so a set larger than one page is still read in full.
+/// Every authorized principal of a domain. One answer reports the domain's whole set —
+/// it is bounded by [`VPC_ENDPOINT_ACCESS_QUOTA`] — so there is no page to walk.
 async fn all_principals(emulator: &Emulator, domain: &str, case: &str) -> Vec<Value> {
-    let mut collected: Vec<Value> = Vec::new();
-    let mut token: Option<String> = None;
-    // Bounded by the pages the quota can fill, so a listing that never ends fails the
-    // test instead of looping forever.
-    let max_pages = VPC_ENDPOINT_ACCESS_QUOTA / VPC_ENDPOINT_ACCESS_PAGE + 2;
-    for page in 0..=max_pages {
-        assert!(
-            page < max_pages,
-            "case {case}: the listing handed out more than {max_pages} pages"
-        );
-        let answer = list(emulator, domain, token.as_deref()).await;
-        assert_eq!(
-            answer.status, 200,
-            "case {case}: expected 200 from page {page}, got {} with {:?}",
-            answer.status, answer.body
-        );
-        let mut entries = principal_list(&answer, case);
-        let carried = next_token(&answer, case);
-        let last = carried.is_empty();
-        // Every page but the last is FULL: a short page before the end would mean the
-        // token skipped records.
-        if !last {
-            assert_eq!(
-                entries.len(),
-                VPC_ENDPOINT_ACCESS_PAGE,
-                "case {case}: page {page} is short of the page size yet carries the token \
-                 {carried:?}, got {entries:?}"
-            );
-        }
-        collected.append(&mut entries);
-        if last {
-            break;
-        }
-        token = Some(carried);
-    }
-    collected
+    let answer = list(emulator, domain, None).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    carries_no_token(&answer, case);
+    principal_list(&answer, case)
 }
 
 /// The `Principal` of one reported `AuthorizedPrincipal`.
@@ -322,14 +295,8 @@ async fn a_grant_persists_the_principal_it_names_and_the_listing_reports_that_re
              got {:?} then {:?}",
             granted.body["AuthorizedPrincipal"], entries[0]
         );
-        // One page holds the whole set, so the listing ends here: the required token is
-        // the empty one.
-        assert_eq!(
-            next_token(&listed, &case),
-            "",
-            "case {case}: expected no further page, got {:?}",
-            listed.body
-        );
+        // The whole set is reported, so the answer carries no `NextToken` member.
+        carries_no_token(&listed, &case);
 
         // The listing reported the set and changed nothing: a second one answers
         // exactly the same.
@@ -534,12 +501,13 @@ async fn the_authorization_set_belongs_to_the_domain_the_request_names() {
 }
 
 #[tokio::test]
-async fn paging_walks_the_whole_set_exactly_once_and_an_unresolvable_token_is_refused() {
+async fn one_answer_reports_the_whole_set_exactly_once_and_an_unresolvable_token_is_refused() {
     let emulator = Emulator::new();
     created_domain(&emulator, "search-paged").await;
 
-    // More principals than one page holds, so the set spans pages.
-    let count = VPC_ENDPOINT_ACCESS_PAGE + 3;
+    // Far more principals than the ten this listing used to cap an answer at, so a
+    // capped answer could not pass.
+    let count = 13;
     let mut granted: Vec<String> = Vec::new();
     for index in 0..count {
         let account = format!("{:012}", index + 1);
@@ -554,54 +522,53 @@ async fn paging_walks_the_whole_set_exactly_once_and_an_unresolvable_token_is_re
     }
     granted.sort();
 
-    let walked = all_principals(&emulator, "search-paged", "paging").await;
-    let reported: Vec<String> = walked
+    let listed = all_principals(&emulator, "search-paged", "one answer").await;
+    let reported: Vec<String> = listed
         .iter()
-        .map(|entry| principal_of(entry, "paging"))
+        .map(|entry| principal_of(entry, "one answer"))
         .collect();
     assert_eq!(
-        walked.len(),
+        listed.len(),
         count,
-        "case paging: expected {count} principals across the pages, got {reported:?}"
+        "case one answer: expected all {count} principals in one answer, got {reported:?}"
     );
     assert_eq!(
         reported, granted,
-        "case paging: paging must walk the whole set exactly once, expected {granted:?}, \
+        "case one answer: the answer reports the whole set exactly once, expected {granted:?}, \
          got {reported:?}"
     );
 
-    // The token of the first page names where the second starts, so resuming from it
-    // skips exactly the first page and nothing else.
-    let first = list(&emulator, "search-paged", None).await;
-    let token = next_token(&first, "paging/first");
+    // A token naming a principal the set holds is the place the answer starts at, so
+    // resuming from it reports exactly the rest of the set.
+    let resumed = list(&emulator, "search-paged", Some(&granted[4])).await;
     assert_eq!(
-        token, granted[VPC_ENDPOINT_ACCESS_PAGE],
-        "case paging/first: the token must name the principal the next page starts at, \
-         got {:?}",
-        first.body
+        resumed.status, 200,
+        "case ListVpcEndpointAccess(resumed): expected 200, got {} with {:?}",
+        resumed.status, resumed.body
     );
-    let second = list(&emulator, "search-paged", Some(&token)).await;
-    let tail = principal_list(&second, "paging/second");
+    carries_no_token(&resumed, "resumed");
+    let tail: Vec<String> = principal_list(&resumed, "resumed")
+        .iter()
+        .map(|entry| principal_of(entry, "resumed"))
+        .collect();
     assert_eq!(
-        tail.len(),
-        count - VPC_ENDPOINT_ACCESS_PAGE,
-        "case paging/second: expected the rest of the set, got {tail:?}"
+        tail,
+        granted[4..].to_vec(),
+        "case ListVpcEndpointAccess(resumed): expected the rest of the set, got {tail:?}"
     );
 
-    // The token the LAST page hands out is the empty one, and echoing it back is not a
-    // refusal: it starts the listing from the beginning, exactly as naming no token
-    // does.
+    // The EMPTY token is the start of the set, exactly as naming no token is.
     let echoed = list(&emulator, "search-paged", Some("")).await;
     assert_eq!(
         echoed.status, 200,
-        "case ListVpcEndpointAccess(nextToken=): expected 200 for the terminal token, \
+        "case ListVpcEndpointAccess(nextToken=): expected 200 for the empty token, \
          got {} with {:?}",
         echoed.status, echoed.body
     );
     assert_eq!(
         principal_list(&echoed, "paging/echoed"),
-        principal_list(&first, "paging/first"),
-        "case ListVpcEndpointAccess(nextToken=): expected the first page back, got {:?}",
+        listed,
+        "case ListVpcEndpointAccess(nextToken=): expected the whole set back, got {:?}",
         echoed.body
     );
 

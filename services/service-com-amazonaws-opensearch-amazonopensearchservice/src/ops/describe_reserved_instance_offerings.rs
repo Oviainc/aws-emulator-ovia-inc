@@ -246,13 +246,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "An optional parameter that specifies the maximum number of results to
-        // return." `MaxResults` is `@default(0)`, so a request that sends no page size
-        // reaches here as zero: nothing bounds the page but the catalog itself, which
-        // is finite. Every other value reaching here is in `1..=MAX_PAGE_SIZE`.
+        // return. You can use nextToken to get the next page of results." `MaxResults`
+        // is `@default(0)`, so a request that names no page size asks for no PARTICULAR
+        // one — not for the whole catalog: the service still bounds the page by its own
+        // default ([`crate::state::RESERVED_INSTANCE_OFFERING_PAGE`]), which is why the
+        // recorded first answer of this catalog carries a continuation token rather than
+        // every offering the Region publishes. Every other value reaching here is in
+        // `1..=MAX_PAGE_SIZE`.
         let page_size = usize::try_from(input.max_results)
             .ok()
             .filter(|size| *size > 0)
-            .unwrap_or(selected.len());
+            .unwrap_or(crate::state::RESERVED_INSTANCE_OFFERING_PAGE);
         let end = start.saturating_add(page_size).min(selected.len());
         let page: Vec<ReservedInstanceOffering> = selected[start..end]
             .iter()

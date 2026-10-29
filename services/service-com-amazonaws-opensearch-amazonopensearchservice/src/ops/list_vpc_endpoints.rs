@@ -2,10 +2,14 @@
 
 //! @op ListVpcEndpoints
 //!
-//! Pages through the service-managed VPC endpoints this account holds, reporting each
-//! stored [`crate::state::VpcEndpointRecord`] through the same `VpcEndpointSummary`
+//! Reports the service-managed VPC endpoints this account holds, each stored
+//! [`crate::state::VpcEndpointRecord`] through the same `VpcEndpointSummary`
 //! projection `DeleteVpcEndpoint` answers with — so a listing and the record a
-//! create minted cannot disagree, and an endpoint that was released is in no page.
+//! create minted cannot disagree, and an endpoint that was released is in no answer.
+//!
+//! The account's set is bounded by [`crate::state::VPC_ENDPOINT_QUOTA`], so one answer
+//! reports it whole and this listing hands out no continuation token: its response
+//! carries no `NextToken` member, which is how a complete result set is reported.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +173,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in the set.
         let ordered: Vec<&crate::state::VpcEndpointRecord> = store.vpc_endpoints.values().collect();
 
-        // The ONE paging decision both endpoint listings go through: a token naming no
+        // The ONE listing decision both endpoint readers go through: a token naming no
         // endpoint of the set — one this service never handed out, or one whose endpoint
         // has since been released — names no such place, which is a malformed request
-        // rather than an empty page.
-        let (page, next_token) =
-            crate::state::vpc_endpoint_page(&ordered, input.next_token.as_deref()).ok_or_else(
-                || ListVpcEndpointsErrorModeled::ValidationException(invalid_next_token()),
-            )?;
+        // rather than an empty page. The answer runs to the end of the set, so it
+        // reports no continuation token: the response carries no `NextToken` member at
+        // all, which is how a complete result set is reported.
+        let page = crate::state::vpc_endpoint_listing(&ordered, input.next_token.as_deref())
+            .ok_or_else(|| {
+                ListVpcEndpointsErrorModeled::ValidationException(invalid_next_token())
+            })?;
 
         Ok(ListVpcEndpointsOutput {
             vpc_endpoint_summary_list: page,
-            next_token,
         })
     }
 }

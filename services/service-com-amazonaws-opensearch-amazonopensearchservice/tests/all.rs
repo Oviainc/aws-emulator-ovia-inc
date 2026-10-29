@@ -125,6 +125,8 @@ mod package_scope;
 mod package_version_history;
 #[path = "all/package_versions.rs"]
 mod package_versions;
+#[path = "all/pagination_contract.rs"]
+mod pagination_contract;
 #[path = "all/reserved_instance_offerings.rs"]
 mod reserved_instance_offerings;
 #[path = "all/reserved_instances.rs"]

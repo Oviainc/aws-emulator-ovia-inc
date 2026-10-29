@@ -912,14 +912,27 @@ pub fn requested_principal(
     }
 }
 
-/// How many authorized principals ONE page of `ListVpcEndpointAccess` carries.
+/// Where an authorization listing resumes from, or `None` where `next_token` names
+/// no place in `ordered`.
 ///
-/// That operation takes a `NextToken` and its response declares one as REQUIRED, so
-/// the listing is paged; the model gives it no page-size member, so the page size is
-/// the service's to pick and this is the emulator's choice of it. It is smaller than
-/// [`VPC_ENDPOINT_ACCESS_QUOTA`], so a domain's set can span more than one page and a
-/// caller that ignores the token cannot mistake a first page for the whole set.
-pub const VPC_ENDPOINT_ACCESS_PAGE: usize = 10;
+/// `ListVpcEndpointAccess` reports a domain's WHOLE authorization set in one answer —
+/// the set is bounded by [`VPC_ENDPOINT_ACCESS_QUOTA`], so no answer leaves anything
+/// unreported — and therefore hands out no continuation token of its own. This is the
+/// one place that decides what a token sent to it means: the EMPTY token is the start
+/// of the set, as naming none is, and a token naming a principal the set holds is the
+/// place the answer starts at. Anything else names no place, which the caller words as
+/// the modelled refusal.
+pub fn vpc_endpoint_access_start<'a, I>(ordered: I, next_token: Option<&str>) -> Option<usize>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    match next_token.filter(|token| !token.is_empty()) {
+        None => Some(0),
+        Some(token) => ordered
+            .into_iter()
+            .position(|principal| principal == token),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Service-managed VPC endpoints
@@ -976,55 +989,42 @@ pub const VPC_ENDPOINT_ERROR_ENDPOINT_NOT_FOUND: &str = "ENDPOINT_NOT_FOUND";
 /// neither Service Quotas nor an account's adjustments — and it is what stops a
 /// caller looping from growing the state without end: every record it counts is
 /// released by deleting the endpoint. Because the stored set IS what
-/// `ListVpcEndpoints` pages through, it also bounds that listing.
+/// `ListVpcEndpoints` reports, it also bounds that listing.
 pub const VPC_ENDPOINT_QUOTA: usize = 50;
 
-/// How many endpoint summaries ONE page of `ListVpcEndpoints` carries.
+/// An endpoint listing's answer: the summaries it carries, or `None` where
+/// `next_token` names no place in `ordered`.
 ///
-/// That operation takes a `NextToken` and its response declares one as REQUIRED, so
-/// the listing is paged; the model gives it no page-size member, so the page size is
-/// the service's to pick and this is the emulator's choice of it — smaller than
-/// [`VPC_ENDPOINT_QUOTA`], so the set can span more than one page and a caller that
-/// ignores the token cannot mistake a first page for the whole set.
-pub const VPC_ENDPOINT_PAGE: usize = 10;
-
-/// ONE page of an endpoint listing: the summaries it carries and the token the next
-/// page resumes from, or `None` where `next_token` names no place in `ordered`.
+/// BOTH operations that list endpoints go through this — the account's whole set and
+/// one domain's — so they cannot drift on what an answer holds or on what a token
+/// sent to them means. `ordered` is the set in the order the caller reports it, which
+/// is the store's own key order, and is what makes a token a PLACE in the set rather
+/// than an offset a create or a release would have shifted.
 ///
-/// BOTH operations that page endpoints go through this — the account's whole set and
-/// one domain's — so they cannot drift on what a page holds, where a token resumes
-/// from, or how a listing ends. `ordered` is the set in the order the caller reports
-/// it, which is the store's own key order, and is what makes a token a PLACE in the
-/// set rather than an offset a create or a release would have shifted.
-///
-/// `None` is left for the caller to word, which is the modelled `ValidationException`
-/// both listings refuse an unresolvable token with ([`invalid_next_token`]). The EMPTY token is the one a listing itself
-/// hands out at the end of a set, so it starts from the first page exactly as naming
-/// no token does. The token answered is likewise EMPTY at the end of the set, because
-/// both responses declare the member REQUIRED — which is also what a paginating client
-/// stops on.
-pub fn vpc_endpoint_page(
+/// The answer runs to the END of the set: the stored set is bounded by
+/// [`VPC_ENDPOINT_QUOTA`], so one answer always reports everything the caller has not
+/// been shown, and neither listing has a continuation token to hand out. The EMPTY
+/// token therefore means the start of the set, exactly as naming no token does, and
+/// `None` — a token naming no endpoint of the set — is left for the caller to word,
+/// which is the modelled `ValidationException` both listings refuse it with
+/// ([`invalid_next_token`]).
+pub fn vpc_endpoint_listing(
     ordered: &[&VpcEndpointRecord],
     next_token: Option<&str>,
-) -> Option<(Vec<VpcEndpointSummary>, String)> {
+) -> Option<Vec<VpcEndpointSummary>> {
     let start = match next_token.filter(|token| !token.is_empty()) {
         None => 0,
         Some(token) => ordered
             .iter()
             .position(|endpoint| endpoint.vpc_endpoint_id == token)?,
     };
-    // ONE page, so the answer is bounded by the page size however large the set is.
-    let page = ordered
-        .iter()
-        .skip(start)
-        .take(VPC_ENDPOINT_PAGE)
-        .map(|endpoint| endpoint.to_summary())
-        .collect();
-    let resume = ordered
-        .get(start.saturating_add(VPC_ENDPOINT_PAGE))
-        .map(|endpoint| endpoint.vpc_endpoint_id.clone())
-        .unwrap_or_default();
-    Some((page, resume))
+    Some(
+        ordered
+            .iter()
+            .skip(start)
+            .map(|endpoint| endpoint.to_summary())
+            .collect(),
+    )
 }
 
 /// One service-managed VPC endpoint of this account, as this emulator persists it.
@@ -5621,6 +5621,20 @@ pub const TERM_THREE_YEARS: i32 = 3 * TERM_ONE_YEAR;
 /// reserves an instance for one year or for three.
 pub const RESERVED_INSTANCE_TERMS: [i32; 2] = [TERM_ONE_YEAR, TERM_THREE_YEARS];
 
+/// How many offerings ONE page of `DescribeReservedInstanceOfferings` carries when the
+/// request names no `MaxResults`.
+///
+/// `MaxResults` is `@default(0)`: a request that names no page size has asked for no
+/// PARTICULAR one, and the service answers with its own default page rather than with
+/// the whole catalog — which is why the recorded first answer of this catalog carries a
+/// continuation token. The model publishes no default, so this is the emulator's choice
+/// of it, and it is the largest page a caller can ask for (`MaxResults` is
+/// `@range(max: 100)`): a service does not answer an unbounded request with more than it
+/// will answer a bounded one with. The catalog spans every instance type times every
+/// term times every payment option, so it is far larger than this and the listing really
+/// does hand out tokens.
+pub const RESERVED_INSTANCE_OFFERING_PAGE: usize = 100;
+
 /// `ReservedInstanceOffering$CurrencyCode`: every price in the catalog is quoted in
 /// US dollars, the currency AWS publishes its price list in.
 pub const RESERVED_INSTANCE_CURRENCY_CODE: &str = "USD";
@@ -9468,9 +9482,14 @@ pub fn connection_alias_exists(alias: &str, local_domain: &str) -> ResourceAlrea
 /// operation that LISTS `InvalidPaginationTokenException` refuses an unresolvable
 /// token with that error, and one that does not falls back to its
 /// `ValidationException`.
-pub fn invalid_pagination_token(token: &str) -> InvalidPaginationTokenException {
+///
+/// The text is FIXED and carries no variable part — in particular it does not quote
+/// the token back, which is the caller's own input and tells it nothing it did not
+/// send — so every operation that refuses a token with this error words the refusal
+/// identically.
+pub fn invalid_pagination_token() -> InvalidPaginationTokenException {
     InvalidPaginationTokenException {
-        message: Some(format!("Invalid pagination token: {token}")),
+        message: Some("Pagination token provided is invalid".to_string()),
     }
 }
 

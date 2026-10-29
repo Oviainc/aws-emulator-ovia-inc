@@ -3,14 +3,14 @@
 //! @op ListVpcEndpointsForDomain
 //!
 //! Reports the service-managed VPC endpoints of ONE domain: the same stored
-//! [`crate::state::VpcEndpointRecord`]s `ListVpcEndpoints` pages through, narrowed to the
+//! [`crate::state::VpcEndpointRecord`]s `ListVpcEndpoints` reports, narrowed to the
 //! ones whose `DomainArn` is the ARN of the domain the request names, and reported
 //! through the same `VpcEndpointSummary` projection — so this listing and the
 //! account-wide one cannot describe the same endpoint differently.
 //!
-//! Both listings page that one set through the store's own
-//! [`crate::state::vpc_endpoint_page`], so they cannot drift on what a page holds, where
-//! a token resumes from, or how a listing ends.
+//! Both listings read that one set through the store's own
+//! [`crate::state::vpc_endpoint_listing`], so they cannot drift on what an answer holds,
+//! on what a token sent to them means, or on how a listing ends.
 //!
 //! The set is selected by the ARN the named domain has, which is what an endpoint record
 //! carries. A name this account holds no domain under selects no endpoint, so the listing
@@ -203,23 +203,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|endpoint| endpoint.domain_arn == domain_arn)
             .collect();
 
-        // The ONE paging decision both endpoint listings go through, so the two cannot
-        // drift on what a page holds or where a token resumes from. A token naming no
-        // endpoint OF THIS DOMAIN names no place in its listing, which is a malformed
-        // request rather than an empty page — the same refusal, in the same words, the
-        // account-wide listing states for the same condition.
-        let (page, next_token) =
-            crate::state::vpc_endpoint_page(&of_domain, input.next_token.as_deref()).ok_or_else(
-                || {
-                    ListVpcEndpointsForDomainErrorModeled::ValidationException(
-                        invalid_next_token(),
-                    )
-                },
-            )?;
+        // The ONE listing decision both endpoint readers go through, so the two cannot
+        // drift on what an answer holds or on what a token sent to them means. A token
+        // naming no endpoint OF THIS DOMAIN names no place in its listing, which is a
+        // malformed request rather than an empty page — the same refusal, in the same
+        // words, the account-wide listing states for the same condition. The answer runs
+        // to the end of the set, so it reports no continuation token: the response
+        // carries no `NextToken` member at all, which is how a complete result set is
+        // reported.
+        let page = crate::state::vpc_endpoint_listing(&of_domain, input.next_token.as_deref())
+            .ok_or_else(|| {
+                ListVpcEndpointsForDomainErrorModeled::ValidationException(invalid_next_token())
+            })?;
 
         Ok(ListVpcEndpointsForDomainOutput {
             vpc_endpoint_summary_list: page,
-            next_token,
         })
     }
 }

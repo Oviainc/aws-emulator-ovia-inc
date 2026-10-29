@@ -37,13 +37,13 @@
 //!   create already served is still answered from the record it made, and releasing an
 //!   endpoint frees exactly one slot, so the bound counts what is STORED and not how
 //!   many creates were ever made;
-//! * paging walks the whole set exactly once in the order the listing reports it, with
-//!   every page but the last full.
+//! * one answer reports the whole set exactly once, in the order the listing reports
+//!   it, and carries no `NextToken` member at all.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::VPC_ENDPOINT_STATUS_VALUES;
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    ENDPOINT_DOES_NOT_EXIST, ENDPOINT_INACCESSIBLE, VPC_ENDPOINT_PAGE, VPC_ENDPOINT_QUOTA,
+    ENDPOINT_DOES_NOT_EXIST, ENDPOINT_INACCESSIBLE, VPC_ENDPOINT_QUOTA,
     VPC_ENDPOINT_STATUS_ACTIVE, VPC_ENDPOINT_STATUS_CREATING, VPC_ENDPOINT_STATUS_DELETING,
 };
 
@@ -768,58 +768,65 @@ async fn the_same_client_token_mints_one_endpoint() {
 }
 
 #[tokio::test]
-async fn paging_walks_the_whole_set_exactly_once() {
+async fn the_listing_reports_the_whole_set_exactly_once_and_ends_it_with_no_token() {
     let emulator = Emulator::new();
     let arn = vpc_domain(&emulator, "endpoint-paging").await;
 
-    // Two full pages and a partial one, so the walk below crosses a page boundary more
-    // than once and the last page is not full.
-    let total = VPC_ENDPOINT_PAGE * 2 + 3;
-    let mut minted_ids = Vec::with_capacity(total);
-    for index in 0..total {
-        let answer = create_endpoint(
-            &emulator,
-            json!({
-                "DomainArn": arn,
-                "VpcOptions": { "SubnetIds": [format!("subnet-0666000000000{index:03}")] },
-            }),
-        )
-        .await;
-        minted_ids.push(member(
-            &minted(&answer, "an endpoint to page over"),
-            "VpcEndpointId",
-            "an endpoint to page over",
-        ));
-    }
-
-    // The walk itself is the shared one every paged read of this listing goes through,
-    // so what this test adds to it is the page-fullness rule and the order.
-    let pages = walked_pages(&emulator, "ListVpcEndpoints").await;
-    let mut walked: Vec<String> = Vec::new();
-    for (page, summaries) in pages.iter().enumerate() {
-        if page + 1 < pages.len() {
-            assert_eq!(
-                summaries.len(),
-                VPC_ENDPOINT_PAGE,
-                "case ListVpcEndpoints(page {page}): every page but the last is full, got \
-                 {summaries:?}"
-            );
+    // Rows differ in how large the set being reported is — the rule generalises over
+    // the size of the set, and the largest row is far past the ten summaries this
+    // listing used to cap an answer at, so a capped answer could not pass it.
+    let sizes = [1_usize, 10, 23];
+    let mut minted_ids: Vec<String> = Vec::new();
+    for total in sizes {
+        while minted_ids.len() < total {
+            let index = minted_ids.len();
+            let answer = create_endpoint(
+                &emulator,
+                json!({
+                    "DomainArn": arn,
+                    "VpcOptions": { "SubnetIds": [format!("subnet-0666000000000{index:03}")] },
+                }),
+            )
+            .await;
+            minted_ids.push(member(
+                &minted(&answer, "an endpoint to list"),
+                "VpcEndpointId",
+                "an endpoint to list",
+            ));
         }
-        for summary in summaries {
-            walked.push(member(summary, "VpcEndpointId", "ListVpcEndpoints"));
-        }
-    }
 
-    let mut expected = minted_ids.clone();
-    expected.sort();
-    assert_eq!(
-        walked, expected,
-        "case ListVpcEndpoints: paging walks every endpoint exactly once, in the order the \
-         listing reports them"
-    );
+        let answer = list_endpoints(&emulator, None).await;
+        assert_eq!(
+            answer.status, 200,
+            "case ListVpcEndpoints({total} endpoints): expected 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+        // A complete result set is reported with NO `NextToken` member at all — not the
+        // empty string, which a client testing for the member's presence rather than
+        // its truthiness paginates on forever.
+        assert_eq!(
+            answer.body.get("NextToken"),
+            None,
+            "case ListVpcEndpoints({total} endpoints): the whole set is reported, so the \
+             answer carries no NextToken, got {:?}",
+            answer.body
+        );
+        let listed: Vec<String> = summaries(&answer, "ListVpcEndpoints")
+            .iter()
+            .map(|summary| member(summary, "VpcEndpointId", "ListVpcEndpoints"))
+            .collect();
+        let mut expected = minted_ids.clone();
+        expected.sort();
+        assert_eq!(
+            listed, expected,
+            "case ListVpcEndpoints({total} endpoints): one answer reports every endpoint \
+             exactly once, in the order the listing reports them"
+        );
+    }
 
     // A token that names no endpoint of the set is a malformed request rather than an
-    // empty page.
+    // empty page: this listing hands none out, so a token sent to it is never one it
+    // issued.
     let refused = list_endpoints(&emulator, Some("aos-00000000000000")).await;
     assert_eq!(
         (refused.status, error_code(&refused).as_str()),
@@ -831,59 +838,37 @@ async fn paging_walks_the_whole_set_exactly_once() {
     );
 }
 
-/// `ListVpcEndpoints` walked to its end, one entry per page in the order the listing
-/// handed the pages out: the ONE walk of the account's whole set this suite has, resumed
-/// through the token each page carries and bounded by the pages the account's own bound
-/// can fill. Each page is asserted to be served and to carry the `NextToken` the model
-/// declares required; what a page HOLDS is for the caller to assert.
-async fn walked_pages(emulator: &Emulator, case: &str) -> Vec<Vec<Value>> {
-    let mut pages: Vec<Vec<Value>> = Vec::new();
-    let mut token: Option<String> = None;
-    loop {
-        assert!(
-            pages.len() <= VPC_ENDPOINT_QUOTA / VPC_ENDPOINT_PAGE,
-            "case {case}: the listing handed out more pages than the bounded set can fill, got \
-             {pages:?}"
-        );
-        let page = pages.len();
-        let answer = list_endpoints(emulator, token.as_deref()).await;
-        assert_eq!(
-            answer.status, 200,
-            "case {case}(page {page}): expected 200 from ListVpcEndpoints, got {} with {:?}",
-            answer.status, answer.body
-        );
-        pages.push(
-            answer.body["VpcEndpointSummaryList"]
-                .as_array()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "case {case}(page {page}): expected a VpcEndpointSummaryList, got {:?}",
-                        answer.body
-                    )
-                })
-                .clone(),
-        );
-        let next = answer.body["NextToken"].as_str().unwrap_or_else(|| {
+/// The `VpcEndpointSummaryList` of a listing answer, with the case named on failure.
+fn summaries(answer: &Answer, case: &str) -> Vec<Value> {
+    answer.body["VpcEndpointSummaryList"]
+        .as_array()
+        .unwrap_or_else(|| {
             panic!(
-                "case {case}(page {page}): the model declares NextToken required, got {:?}",
+                "case {case}: expected a VpcEndpointSummaryList, got {:?}",
                 answer.body
             )
-        });
-        if next.is_empty() {
-            return pages;
-        }
-        token = Some(next.to_owned());
-    }
+        })
+        .clone()
 }
 
 /// Every endpoint id this account holds, in the order the listing reports them: the
-/// STORED set a create is counted against, read through [`walked_pages`] because at the
-/// bound the set spans more pages than one listing answers with.
+/// STORED set a create is counted against. One answer reports the whole set — it is
+/// bounded by [`VPC_ENDPOINT_QUOTA`] — so there is no page to walk.
 async fn held_ids(emulator: &Emulator, case: &str) -> Vec<String> {
-    walked_pages(emulator, case)
-        .await
+    let answer = list_endpoints(emulator, None).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: expected 200 from ListVpcEndpoints, got {} with {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.body.get("NextToken"),
+        None,
+        "case {case}: the whole set is reported, so the answer carries no NextToken, got {:?}",
+        answer.body
+    );
+    summaries(&answer, case)
         .iter()
-        .flatten()
         .map(|summary| member(summary, "VpcEndpointId", case))
         .collect()
 }

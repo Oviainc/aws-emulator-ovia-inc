@@ -95,7 +95,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The largest page this operation answers with: `MaxResults` is `@range(max: 100)`.
+/// The largest value `MaxResults` takes: it is `@range(max: 100)`.
 const MAX_PAGE_SIZE: i32 = 100;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -180,12 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // page size sent) stays the unbounded case below.
         if input.max_results < 0 || input.max_results > MAX_PAGE_SIZE {
             return Err(ListInstanceTypeDetailsErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "MaxResults must be between 0 and {MAX_PAGE_SIZE}: {}",
-                        input.max_results
-                    )),
-                },
+                crate::state::max_results_out_of_range(input.max_results, MAX_PAGE_SIZE),
             )
             .into());
         }
@@ -251,12 +246,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // The token names the first instance type of the page to answer with, so a
-        // caller resumes exactly where the previous page stopped. It is only ever a
-        // value this operation handed out, so one that names no entry of the listing
-        // the request selected — this version and this filter — is a malformed request
-        // rather than an empty page.
-        let start = match input.next_token.as_deref() {
+        // A token names the entry of the selected listing the answer starts at, so an
+        // answer resumes from a PLACE in the listing rather than from an offset. It is
+        // only ever a value this operation handed out, so one that names no entry of the
+        // listing the request selected — this version and this filter — is a malformed
+        // request rather than an empty answer.
+        let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
             None => 0,
             Some(token) => selected
                 .iter()
@@ -268,17 +263,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })?,
         };
 
-        // "An optional parameter that specifies the maximum number of results to
-        // return." `MaxResults` is `@default(0)`, so a request that sends no page size
-        // reaches here as zero: nothing bounds the page but the catalog itself, which
-        // is finite. Every other value reaching here is in `1..=MAX_PAGE_SIZE`.
-        let page_size = usize::try_from(input.max_results)
-            .ok()
-            .filter(|size| *size > 0)
-            .unwrap_or(selected.len());
-        let end = start.saturating_add(page_size).min(selected.len());
-        let page: Vec<InstanceTypeDetails> = selected[start..end]
+        // The rest of the catalog the request selected — this version, and the instance
+        // type a filter named. The recorded answers of this operation report that catalog
+        // complete and carry NO `NextToken`, including for a request that named a
+        // `MaxResults` smaller than it: the catalog is published complete in a single
+        // answer, so `MaxResults` does not bound what is reported, the answer runs to the
+        // end of the listing, and there is never a token to hand out — which is what
+        // tells a paginating client it has the whole set.
+        let listed: Vec<InstanceTypeDetails> = selected
             .iter()
+            .skip(start)
             .map(|instance_type| {
                 crate::state::instance_type_details(
                     version,
@@ -288,16 +282,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // "When nextToken is returned, there are more results available" — so the
-        // member is present only while the listing holds an instance type this page
-        // did not report, and the last page carries none.
-        let next_token = selected
-            .get(end)
-            .map(|instance_type| (*instance_type).to_string());
-
         Ok(ListInstanceTypeDetailsOutput {
-            instance_type_details: Some(page),
-            next_token,
+            instance_type_details: Some(listed),
+            next_token: None,
         })
     }
 }

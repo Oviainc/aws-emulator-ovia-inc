@@ -209,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .position(|connection| connection.connection_id == token)
                 .ok_or_else(|| {
                     DescribeOutboundConnectionsErrorModeled::InvalidPaginationTokenException(
-                        invalid_pagination_token(token),
+                        invalid_pagination_token(),
                     )
                 })?,
         };

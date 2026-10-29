@@ -82,7 +82,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The largest page this operation answers with: `MaxResults` is `@range(max: 100)`.
+/// The largest value `MaxResults` takes: it is `@range(max: 100)`.
 const MAX_PAGE_SIZE: i32 = 100;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -164,60 +164,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request; the boundary validator refuses it before this handler runs, and the
         // check is repeated here so the rule holds however the request reached us. A
         // NEGATIVE page size is malformed for the same reason — it is not a page size
-        // at all — so it is refused rather than reinterpreted, while `@default(0)` (no
-        // page size sent) stays the unbounded case below.
+        // at all — so it is refused rather than reinterpreted.
         if input.max_results < 0 || input.max_results > MAX_PAGE_SIZE {
             return Err(ListVersionsErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "MaxResults must be between 0 and {MAX_PAGE_SIZE}: {}",
-                        input.max_results
-                    )),
-                },
+                crate::state::max_results_out_of_range(input.max_results, MAX_PAGE_SIZE),
             )
             .into());
         }
 
-        let versions = crate::state::SUPPORTED_ENGINE_VERSIONS;
-
-        // The token names the first version of the page to answer with, so a caller
-        // resumes exactly where the previous page stopped. It is only ever a value this
-        // operation handed out, so one that names no published version is a malformed
-        // request rather than an empty page.
-        let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
-            None => 0,
-            Some(token) => versions
-                .iter()
-                .position(|version| *version == token)
-                .ok_or_else(|| {
-                    ListVersionsErrorModeled::ValidationException(
-                        crate::state::invalid_next_token(),
-                    )
-                })?,
-        };
-
-        // "An optional parameter that specifies the maximum number of results to
-        // return." `MaxResults` is `@default(0)`, so a request that sends no page size
-        // reaches here as zero: nothing bounds the page but the catalog itself, which is
-        // finite. Every other value reaching here is in `1..=MAX_PAGE_SIZE`.
-        let page_size = usize::try_from(input.max_results)
-            .ok()
-            .filter(|size| *size > 0)
-            .unwrap_or(versions.len());
-        let end = start.saturating_add(page_size).min(versions.len());
-        let page: Vec<String> = versions[start..end]
+        // The whole catalog, in the one order it is written in. The recorded answers of
+        // this operation report every supported version and NO `NextToken`, including
+        // for a request that named a `MaxResults` smaller than the catalog and for one
+        // that carried a `NextToken`: this catalog is published complete in a single
+        // answer, so neither member bounds what is reported nor resumes it, and there is
+        // never a token to hand out — which is what tells a paginating client it has the
+        // whole set.
+        let versions: Vec<String> = crate::state::SUPPORTED_ENGINE_VERSIONS
             .iter()
             .map(|version| (*version).to_string())
             .collect();
 
-        // "When nextToken is returned, there are more results available" — so the
-        // member is present only while the catalog holds a version this page did not
-        // report, and the last page carries none.
-        let next_token = versions.get(end).map(|version| (*version).to_string());
-
         Ok(ListVersionsOutput {
-            versions: Some(page),
-            next_token,
+            versions: Some(versions),
+            next_token: None,
         })
     }
 }

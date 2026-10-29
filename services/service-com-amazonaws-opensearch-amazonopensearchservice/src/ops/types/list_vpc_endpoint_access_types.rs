@@ -18,10 +18,20 @@ pub struct ListVpcEndpointAccessInput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.opensearch#ListVpcEndpointAccessResponse")]
+// `ListVpcEndpointAccessResponse$NextToken` is modelled `@required`, but a required
+// member is on the wire on every answer, so the end of a listing could only be the
+// empty string — which a client testing for the member's presence rather than its
+// truthiness paginates on forever, and which the recorded answers of this service's
+// sibling endpoint listings show AWS does not send. This listing reports the domain's
+// whole authorization set in one answer, so it has no continuation token to report and
+// the member is declared unsupported: that keeps it out of the shape's schema, and so
+// out of the body the framework writes.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.opensearch#ListVpcEndpointAccessResponse",
+    unsupported = ["NextToken"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListVpcEndpointAccessOutput {
     pub authorized_principal_list: Vec<AuthorizedPrincipal>,
-    pub next_token: String,
 }
 
