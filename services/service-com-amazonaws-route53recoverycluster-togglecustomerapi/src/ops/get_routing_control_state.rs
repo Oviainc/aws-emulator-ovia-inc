@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRoutingControlState
-//! IMPLEMENTED: a pure READ of the routing control registry in `crate::state`. It
-//! reports the control's CURRENT stored state and never writes; an ARN the registry
-//! does not hold is a `ResourceNotFoundException` (404), never a state the caller
-//! never set. This is the ONLY file to touch for this operation.
+//! IMPLEMENTED: a pure READ of the routing controls this cluster endpoint serves —
+//! the control plane's registry joined with this service's switches, through
+//! `crate::state`. It reports the control's CURRENT state and never writes; an ARN no
+//! control-plane routing control was minted for is a `ResourceNotFoundException`
+//! (404), never a state the caller never set. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ctx` carries request metadata only; this operation needs none of it.
         let _ = ctx;
 
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        let stores = crate::state::stores(&*self.engine).ok_or_else(|| {
             GetRoutingControlStateError::from(
                 GetRoutingControlStateErrorModeled::InternalServerException(
                     InternalServerException {
@@ -177,28 +179,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // One short read under the single state guard: `RoutingControlArn` is matched
+        // One short read under the state guards: `RoutingControlArn` is matched
         // exactly against the registry's keys and nothing is written, so two
         // identical calls answer identically.
-        let guard = state.lock();
-        let Some(control) = guard.routing_control(&input.routing_control_arn) else {
+        let plane = stores.lock();
+        let Some(control) = plane.routing_control(&input.routing_control_arn) else {
             return Err(GetRoutingControlStateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Routing control {} was not found",
-                        input.routing_control_arn
+                    message: crate::state::routing_control_not_found_message(
+                        &input.routing_control_arn,
                     ),
                     resource_id: input.routing_control_arn.clone(),
-                    resource_type: "RoutingControl".to_string(),
+                    resource_type: crate::state::ROUTING_CONTROL_RESOURCE_TYPE.to_string(),
                 },
             )
             .into());
         };
 
         Ok(GetRoutingControlStateOutput {
-            routing_control_arn: control.routing_control_arn.clone(),
+            routing_control_arn: control.routing_control_arn,
             routing_control_state: control.state.as_wire().to_string(),
-            routing_control_name: Some(control.routing_control_name.clone()),
+            routing_control_name: Some(control.routing_control_name),
         })
     }
 }

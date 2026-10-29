@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRoutingControlStates
-//! IMPLEMENTED: applies every entry of the batch to the stored routing controls
-//! ATOMICALLY — every entry is validated first, then all are committed under ONE
-//! state guard, so a refused batch leaves no partial mutation. This is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies every entry of the batch to the routing controls this cluster
+//! endpoint serves ATOMICALLY — every entry is validated first, then all are committed
+//! under ONE pair of state guards, so a refused batch leaves no partial mutation. This
+//! is the ONLY file to touch for this operation.
 //!
 //! More than [`crate::state::MAX_UPDATE_ROUTING_CONTROL_STATE_ENTRIES`] entries is a
 //! `ServiceLimitExceededException` (402); a duplicate ARN in one batch, entries spanning
 //! more than one cluster, or a state outside the modelled `On`/`Off` value set is a
-//! `ValidationException` (400); an ARN the registry does not hold is a
-//! `ResourceNotFoundException` (404). `SafetyRulesToOverride` is accepted and IGNORED in
+//! `ValidationException` (400); an ARN no control-plane routing control was minted for is
+//! a `ResourceNotFoundException` (404). `SafetyRulesToOverride` is accepted and IGNORED in
 //! this first slice: safety-rule assertion and gating is left to its own gap issue.
 //!
 //! ## Shape of an operation
@@ -206,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        let stores = crate::state::stores(&*self.engine).ok_or_else(|| {
             UpdateRoutingControlStatesError::from(
                 UpdateRoutingControlStatesErrorModeled::InternalServerException(
                     InternalServerException {
@@ -217,10 +217,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // ONE guard for the whole batch: validate every entry, then commit. Nothing
-        // is written until the last entry has been accepted, and no other request
-        // can observe the registry in between.
-        let mut guard = state.lock();
+        // ONE pair of guards for the whole batch: validate every entry, then commit.
+        // Nothing is written until the last entry has been accepted, and no other
+        // request can observe the registry in between.
+        let mut plane = stores.lock();
 
         let mut resolved: Vec<(String, crate::state::RoutingControlState)> =
             Vec::with_capacity(entries.len());
@@ -254,16 +254,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
 
-            let Some(cluster) = guard.cluster_of(&entry.routing_control_arn) else {
+            let Some(cluster) = plane.cluster_of(&entry.routing_control_arn) else {
                 return Err(
                     UpdateRoutingControlStatesErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: format!(
-                                "Routing control {} was not found",
-                                entry.routing_control_arn
+                            message: crate::state::routing_control_not_found_message(
+                                &entry.routing_control_arn,
                             ),
                             resource_id: entry.routing_control_arn.clone(),
-                            resource_type: "RoutingControl".to_string(),
+                            resource_type: crate::state::ROUTING_CONTROL_RESOURCE_TYPE
+                                .to_string(),
                         },
                     )
                     .into(),
@@ -289,12 +289,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resolved.push((entry.routing_control_arn.clone(), new_state));
         }
 
-        // Commit: every ARN above resolved through this same guard, so each lookup
-        // succeeds.
+        // Commit: every ARN above resolved through these same guards, so each write
+        // lands.
         for (arn, new_state) in resolved {
-            if let Some(control) = guard.routing_controls.get_mut(&arn) {
-                let previous_state = control.state;
-                control.state = new_state;
+            if let Some(previous_state) = plane.set_state(&arn, new_state) {
                 // Audit record per committed entry: the caller's presented
                 // access-key id (never a secret), the resource, and the transition.
                 tracing::info!(

@@ -13866,6 +13866,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-route53recoverycontrolconfig-route53recoverycontrolconfig",
  "sha2 0.10.9",
  "tokio",
  "tracing",

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRoutingControlState
-//! IMPLEMENTED: moves the named routing control's stored state to `On` or `Off` in
+//! IMPLEMENTED: moves the named routing control's state to `On` or `Off` in
 //! `crate::state`, so a later read reports it. This is
 //! the ONLY file to touch for this operation.
 //!
-//! An ARN the registry does not hold is a `ResourceNotFoundException` (404), and a
-//! state outside the modelled `On`/`Off` value set is a `ValidationException` (400).
+//! An ARN no control-plane routing control was minted for is a
+//! `ResourceNotFoundException` (404), and a state outside the modelled `On`/`Off` value
+//! set is a `ValidationException` (400).
 //!
 //! `SafetyRulesToOverride` is accepted and IGNORED in this first slice: safety-rule
 //! assertion and gating is left to its own gap issue.
@@ -205,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        let stores = crate::state::stores(&*self.engine).ok_or_else(|| {
             UpdateRoutingControlStateError::from(
                 UpdateRoutingControlStateErrorModeled::InternalServerException(
                     InternalServerException {
@@ -216,26 +217,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // Resolve and mutate under ONE guard, so the control cannot vanish between
-        // the lookup and the write.
-        let mut guard = state.lock();
-        let Some(control) = guard.routing_controls.get_mut(&input.routing_control_arn) else {
+        // Resolve and move the switch under ONE pair of guards, so the control cannot
+        // vanish between the lookup and the write.
+        let mut plane = stores.lock();
+        let Some(previous_state) = plane.set_state(&input.routing_control_arn, new_state) else {
             return Err(
                 UpdateRoutingControlStateErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "Routing control {} was not found",
-                            input.routing_control_arn
+                        message: crate::state::routing_control_not_found_message(
+                            &input.routing_control_arn,
                         ),
                         resource_id: input.routing_control_arn.clone(),
-                        resource_type: "RoutingControl".to_string(),
+                        resource_type: crate::state::ROUTING_CONTROL_RESOURCE_TYPE.to_string(),
                     },
                 )
                 .into(),
             );
         };
-        let previous_state = control.state;
-        control.state = new_state;
 
         // Audit record for a state-changing call: the caller's presented access-key
         // id (never a secret), the resource, and the transition.

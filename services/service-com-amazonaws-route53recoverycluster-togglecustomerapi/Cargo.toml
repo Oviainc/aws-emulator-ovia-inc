@@ -24,6 +24,10 @@ tracing = { workspace = true }
 # Opaque `NextToken` cursors for ListRoutingControls are hex-encoded with this
 # crate (already a workspace dependency) rather than a hand-written codec.
 hex = { workspace = true }
+# The recovery-control CONFIG (control-plane) service, which creates every cluster,
+# control panel and routing control this data plane reads and toggles: its store is the
+# registry `src/state.rs` reads through the shared engine.
+service-com-amazonaws-route53recoverycontrolconfig-route53recoverycontrolconfig = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

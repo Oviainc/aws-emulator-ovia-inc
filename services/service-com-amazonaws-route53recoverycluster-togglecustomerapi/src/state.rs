@@ -4,57 +4,48 @@
 //!
 //! # What this service holds
 //!
-//! `ToggleCustomerAPI` is Route 53 ARC's **cluster (data-plane)** API: it reads
-//! and toggles routing controls, and models no operation that can create or
-//! delete one. Routing controls, control panels and clusters are created by the
-//! separate recovery-control-**config** CONTROL plane. So this state is a
-//! registry the data plane reads and mutates in place:
+//! `ToggleCustomerAPI` is Route 53 ARC's **cluster (data-plane)** API: it reads and
+//! toggles routing controls, and models no operation that can create or delete one.
+//! Clusters, control panels and routing controls are created by the separate
+//! recovery-control **config** (CONTROL plane) API, so WHICH of them exist — and their
+//! names, their hosting control panel and cluster, and their owner — is that service's
+//! store to answer, never a table of this one's. This module reaches it: [`stores`]
+//! resolves both halves out of the ONE shared engine and [`DataPlane`] joins them, so a
+//! resource a client creates through the control plane is addressable here immediately
+//! and one it deletes there stops being addressable here.
 //!
-//! - [`ComAmazonawsRoute53recoveryclusterTogglecustomerapiState::routing_controls`]
-//!   — every routing control, keyed by its ARN. A `BTreeMap` so the key order is
-//!   total and stable, which is what makes `ListRoutingControls`' paging walk the
-//!   full set without repeats or omissions even while states are being toggled.
-//! - [`ComAmazonawsRoute53recoveryclusterTogglecustomerapiState::control_panels`]
-//!   — every control panel, keyed by ARN, carrying the cluster it is hosted on and
-//!   the routing controls it hosts. It backs `ListRoutingControls`' `ControlPanelArn`
-//!   filter and `UpdateRoutingControlStates`' "every entry in one cluster" rule.
+//! What this service OWNS is the switch itself
+//! ([`ComAmazonawsRoute53recoveryclusterTogglecustomerapiState::routing_control_states`]):
+//! a routing control's `On`/`Off` state is cluster (data-plane) state in Route 53 ARC —
+//! the control plane neither sets it nor reports it, and only
+//! `UpdateRoutingControlState` / `UpdateRoutingControlStates` move it. A routing control
+//! the registry holds and that map does not is
+//! [`INITIAL_ROUTING_CONTROL_STATE`], the state a newly created routing control has, so
+//! `GetRoutingControlState` and `ListRoutingControls` stay pure reads: nothing is written
+//! merely because a control was read.
 //!
-//! # Seeding rule
+//! No pagination-token table lives here either: `ListRoutingControls` encodes its cursor
+//! (the filter it was issued for, plus the routing control the next page starts at) into
+//! the opaque `NextToken` itself, so issuing a page costs no state write.
 //!
-//! Nothing in this API can create a routing control, so an empty registry would
-//! make the whole service unexercisable. The fleet below is therefore
-//! materialised by [`Default`], i.e. by `engine.state::<_>()` on the FIRST touch
-//! of this service's store, from the fixed table [`SEED_FLEET`]:
+//! # Which resources are addressable
 //!
-//! - seeding is request-independent and happens exactly once per engine, so no
-//!   operation ever writes state merely because it was read: `GetRoutingControlState`
-//!   and `ListRoutingControls` are pure reads of this registry, and only the two
-//!   update operations mutate it;
-//! - every seeded control starts `Off`, the state a newly created routing control
-//!   has in Route 53 ARC, and a state change only ever comes from
-//!   `UpdateRoutingControlState` / `UpdateRoutingControlStates`;
-//! - the ARNs are built through [`::engine::emulator_arn`] with the canonical
-//!   emulator account, in the real `controlpanel/<id>/routingcontrol/<id>` shape of
-//!   a recovery-control ARN.
-//!
-//! When the recovery-control-config emulator grows a registry of its own, this
-//! module's [`Default`] is the single place that should read it (through a crate
-//! shared by both services) instead of the fixed table; no handler needs to change.
-//!
-//! No pagination-token table lives here: `ListRoutingControls` encodes its cursor
-//! (the filter it was issued for, plus the offset) into the opaque `NextToken`
-//! itself, so issuing a page costs no state write and a read stays a read.
+//! Every routing control and control panel the registry holds, whatever deployment
+//! status the control plane reports for it: that status describes the propagation of the
+//! resource DEFINITION, which the control plane's own describes report, while the switch
+//! this service serves exists from the moment the resource does. So a caller that
+//! creates a routing control and toggles it straight away is served, and one whose
+//! resource the control plane has deleted is not.
 
 use std::collections::BTreeMap;
+use std::sync::MutexGuard;
 
-/// The AWS service that owns a routing control's ARN namespace: routing controls,
-/// control panels and clusters are all recovery-**control** (control-plane)
-/// resources, which this data-plane service only reads and toggles.
-const CONTROL_PLANE_SERVICE: &str = "route53-recovery-control";
+/// The recovery-control **config** crate: the control plane that creates every resource
+/// this data plane serves. Its store is the registry read here, through the shared
+/// engine, so the two services cannot disagree about which routing controls exist.
+use service_com_amazonaws_route53recoverycontrolconfig_route53recoverycontrolconfig as recovery_control_config;
 
-/// Recovery-control ARNs carry no region (they are cluster-global), so the region
-/// segment of every ARN built here is empty.
-const ARN_REGION: &str = "";
+use recovery_control_config::state::{RoutingControlRecord, Store as Registry};
 
 /// The most routing control states one `UpdateRoutingControlStates` call may carry.
 ///
@@ -64,73 +55,6 @@ const ARN_REGION: &str = "";
 /// documentation is "The request can't update that many routing control states at
 /// the same time. Try again with fewer routing control states."
 pub const MAX_UPDATE_ROUTING_CONTROL_STATE_ENTRIES: usize = 10;
-
-/// One control panel of the seed fleet: the cluster hosting it, its id/name, and
-/// the routing controls it hosts.
-#[derive(Debug, Clone, Copy)]
-pub struct SeedControlPanel {
-    /// Id of the cluster this control panel is hosted on.
-    pub cluster_id: &'static str,
-    /// Id and name of the control panel (Route 53 ARC panel names are ASCII).
-    pub control_panel_id: &'static str,
-    /// Ids/names of the routing controls hosted in this control panel.
-    pub routing_control_ids: &'static [&'static str],
-}
-
-/// The fleet [`Default`] materialises — see this module's "Seeding rule".
-///
-/// Deliberately spans two clusters, with one cluster hosting two control panels,
-/// so the whole modelled surface is reachable: the `ControlPanelArn` filter, a
-/// batch update across two panels of ONE cluster (allowed), and a batch update
-/// spanning two clusters (refused).
-pub const SEED_FLEET: &[SeedControlPanel] = &[
-    SeedControlPanel {
-        cluster_id: "EmulatorCluster1",
-        control_panel_id: "EmulatorControlPanelA",
-        routing_control_ids: &[
-            "EmulatorRoutingControl1",
-            "EmulatorRoutingControl2",
-            "EmulatorRoutingControl3",
-        ],
-    },
-    SeedControlPanel {
-        cluster_id: "EmulatorCluster1",
-        control_panel_id: "EmulatorControlPanelB",
-        routing_control_ids: &["EmulatorRoutingControl4"],
-    },
-    SeedControlPanel {
-        cluster_id: "EmulatorCluster2",
-        control_panel_id: "EmulatorControlPanelC",
-        routing_control_ids: &["EmulatorRoutingControl5"],
-    },
-];
-
-/// The ARN of a recovery-control cluster.
-pub fn cluster_arn(cluster_id: &str) -> String {
-    ::engine::emulator_arn(
-        CONTROL_PLANE_SERVICE,
-        ARN_REGION,
-        &format!("cluster/{cluster_id}"),
-    )
-}
-
-/// The ARN of a control panel.
-pub fn control_panel_arn(control_panel_id: &str) -> String {
-    ::engine::emulator_arn(
-        CONTROL_PLANE_SERVICE,
-        ARN_REGION,
-        &format!("controlpanel/{control_panel_id}"),
-    )
-}
-
-/// The ARN of a routing control hosted in `control_panel_id`.
-pub fn routing_control_arn(control_panel_id: &str, routing_control_id: &str) -> String {
-    ::engine::emulator_arn(
-        CONTROL_PLANE_SERVICE,
-        ARN_REGION,
-        &format!("controlpanel/{control_panel_id}/routingcontrol/{routing_control_id}"),
-    )
-}
 
 /// A routing control's state: the on/off switch itself.
 ///
@@ -165,119 +89,204 @@ impl RoutingControlState {
     }
 }
 
-/// A routing control, as this service stores it. The members mirror the modelled
-/// `RoutingControl` shape, with `state` as the typed on/off switch.
+/// The state a routing control reports until an update moves it: a newly created
+/// routing control is `Off` in Route 53 ARC, so an absent switch is `Off` rather than a
+/// value a read would have to write in.
+pub const INITIAL_ROUTING_CONTROL_STATE: RoutingControlState = RoutingControlState::Off;
+
+/// A routing control as this data plane reports it: what the control plane's registry
+/// holds about it, joined with the switch this service owns.
 #[derive(Debug, Clone)]
 pub struct RoutingControl {
-    /// ARN of this routing control; the key it is stored under.
+    /// ARN of this routing control, as the control plane minted it.
     pub routing_control_arn: String,
     /// Name of this routing control.
     pub routing_control_name: String,
     /// ARN of the control panel hosting it.
     pub control_panel_arn: String,
-    /// Name of the control panel hosting it.
-    pub control_panel_name: String,
+    /// Name of the control panel hosting it, when the registry still holds that panel.
+    pub control_panel_name: Option<String>,
+    /// ARN of the cluster the hosting control panel is on. Backs the "every entry of a
+    /// batch update is in one cluster" rule, which is a cluster-endpoint property of
+    /// this API.
+    pub cluster_arn: String,
     /// Current on/off state.
     pub state: RoutingControlState,
     /// Account id of the routing control's owner.
     pub owner: String,
 }
 
-/// A control panel: a cluster-hosted group of routing controls.
-#[derive(Debug, Clone)]
-pub struct ControlPanel {
-    /// ARN of this control panel; the key it is stored under.
-    pub arn: String,
-    /// Name of this control panel.
-    pub name: String,
-    /// ARN of the cluster hosting it. Backs the "every entry of a batch update is
-    /// in one cluster" rule, which is a cluster-endpoint property of the API.
-    pub cluster_arn: String,
-    /// ARNs of the routing controls hosted in this control panel.
-    pub routing_control_arns: Vec<String>,
-}
-
-/// Per-service state for com-amazonaws-route53recoverycluster-togglecustomerapi. A handler reaches it through [`service_state`].
-#[derive(Debug)]
+/// Per-service state for com-amazonaws-route53recoverycluster-togglecustomerapi. A handler reaches it through [`stores`].
+#[derive(Debug, Default)]
 pub struct ComAmazonawsRoute53recoveryclusterTogglecustomerapiState {
-    /// Every routing control, keyed by ARN (total, stable order for paging).
-    pub routing_controls: BTreeMap<String, RoutingControl>,
-    /// Every control panel, keyed by ARN.
-    pub control_panels: BTreeMap<String, ControlPanel>,
+    /// The switch of every routing control an update has moved, keyed by the routing
+    /// control's ARN. A control missing from this map is
+    /// [`INITIAL_ROUTING_CONTROL_STATE`]; a switch whose routing control the control
+    /// plane no longer holds is dropped by the next write
+    /// ([`DataPlane::set_state`]), so the map is bounded by the registry and a deleted
+    /// routing control leaves no state behind.
+    pub routing_control_states: BTreeMap<String, RoutingControlState>,
 }
 
-impl Default for ComAmazonawsRoute53recoveryclusterTogglecustomerapiState {
-    /// Materialise the seed fleet — see this module's "Seeding rule". Runs once
-    /// per engine, on the first touch of this service's store.
-    fn default() -> Self {
-        let owner = ::engine::emulator_account_id().to_string();
-        let mut routing_controls = BTreeMap::new();
-        let mut control_panels = BTreeMap::new();
+/// The two stores a handler of this service works over: the control plane's registry of
+/// what exists, and this service's own switches.
+///
+/// Held as the engine's clone-cheap handles, so a handler takes both locks in ONE place
+/// ([`Stores::lock`]) and in one order.
+pub struct Stores {
+    registry: ::engine::ServiceState<Registry>,
+    switches: ::engine::ServiceState<ComAmazonawsRoute53recoveryclusterTogglecustomerapiState>,
+}
 
-        for panel in SEED_FLEET {
-            let panel_arn = control_panel_arn(panel.control_panel_id);
-            let mut hosted = Vec::with_capacity(panel.routing_control_ids.len());
-            for control_id in panel.routing_control_ids {
-                let arn = routing_control_arn(panel.control_panel_id, control_id);
-                hosted.push(arn.clone());
-                routing_controls.insert(
-                    arn.clone(),
-                    RoutingControl {
-                        routing_control_arn: arn,
-                        routing_control_name: (*control_id).to_string(),
-                        control_panel_arn: panel_arn.clone(),
-                        control_panel_name: panel.control_panel_id.to_string(),
-                        // A routing control starts Off; only an update moves it.
-                        state: RoutingControlState::Off,
-                        owner: owner.clone(),
-                    },
-                );
-            }
-            control_panels.insert(
-                panel_arn.clone(),
-                ControlPanel {
-                    arn: panel_arn,
-                    name: panel.control_panel_id.to_string(),
-                    cluster_arn: cluster_arn(panel.cluster_id),
-                    routing_control_arns: hosted,
-                },
-            );
-        }
-
-        Self {
-            routing_controls,
-            control_panels,
-        }
+impl Stores {
+    /// Lock both stores and hand back the joined view.
+    ///
+    /// Always the registry first and the switches second: one order for every handler,
+    /// so two requests cannot take the pair in opposite orders. The control plane never
+    /// reaches for this service's store, so the pair has no cycle.
+    pub fn lock(&self) -> DataPlane<'_> {
+        let registry = self.registry.lock();
+        let switches = self.switches.lock();
+        DataPlane { registry, switches }
     }
 }
 
-impl ComAmazonawsRoute53recoveryclusterTogglecustomerapiState {
-    /// The routing control stored under `arn`, if any.
-    pub fn routing_control(&self, arn: &str) -> Option<&RoutingControl> {
-        self.routing_controls.get(arn)
+/// The routing controls a cluster endpoint serves: the control plane's registry joined
+/// with this service's switches, under one lock on each.
+///
+/// Every lookup resolves against the registry, so an ARN no control-plane resource was
+/// minted for is unknown here however many times it has been asked for, and a resource
+/// the control plane deleted is unknown again.
+pub struct DataPlane<'a> {
+    registry: MutexGuard<'a, Registry>,
+    switches: MutexGuard<'a, ComAmazonawsRoute53recoveryclusterTogglecustomerapiState>,
+}
+
+impl DataPlane<'_> {
+    /// The routing control stored under `arn`, if the control plane holds one.
+    pub fn routing_control(&self, arn: &str) -> Option<RoutingControl> {
+        self.registry
+            .routing_controls
+            .get(arn)
+            .map(|record| self.project(record))
     }
 
-    /// The cluster hosting the control panel that hosts `arn`, if that routing
-    /// control is known.
+    /// Whether the control plane holds a control panel under `arn`.
+    pub fn holds_control_panel(&self, arn: &str) -> bool {
+        self.registry.control_panels.contains_key(arn)
+    }
+
+    /// The cluster hosting the control panel that hosts `arn`, if that routing control
+    /// is known.
     pub fn cluster_of(&self, routing_control_arn: &str) -> Option<&str> {
-        let control = self.routing_controls.get(routing_control_arn)?;
-        let panel = self.control_panels.get(&control.control_panel_arn)?;
-        Some(panel.cluster_arn.as_str())
+        self.registry
+            .routing_controls
+            .get(routing_control_arn)
+            .map(|record| record.cluster_arn.as_str())
     }
 
-    /// The routing controls to report, in ARN order: every one in the registry, or
-    /// just those hosted in `control_panel_arn` when a filter is given.
-    pub fn routing_controls_in(&self, control_panel_arn: Option<&str>) -> Vec<&RoutingControl> {
-        self.routing_controls
+    /// The routing controls to report, in ARN order: every one the control plane holds,
+    /// or just those hosted in `control_panel_arn` when a filter is given.
+    ///
+    /// The order is total and stable, which is what lets `ListRoutingControls`' pages
+    /// walk the set without repeats or omissions.
+    pub fn routing_controls_in(&self, control_panel_arn: Option<&str>) -> Vec<RoutingControl> {
+        self.registry
+            .routing_controls
             .values()
-            .filter(|control| {
-                control_panel_arn.is_none_or(|panel| control.control_panel_arn == panel)
+            .filter(|record| {
+                control_panel_arn.is_none_or(|panel| record.control_panel_arn == panel)
             })
+            .map(|record| self.project(record))
             .collect()
     }
+
+    /// Move the switch of `routing_control_arn` to `state`, answering the state it was
+    /// in before — or `None` when the control plane holds no such routing control, which
+    /// is what the caller answers with `ResourceNotFoundException`.
+    pub fn set_state(
+        &mut self,
+        routing_control_arn: &str,
+        state: RoutingControlState,
+    ) -> Option<RoutingControlState> {
+        if !self.registry.routing_controls.contains_key(routing_control_arn) {
+            return None;
+        }
+        let previous = self
+            .switches
+            .routing_control_states
+            .insert(routing_control_arn.to_string(), state)
+            .unwrap_or(INITIAL_ROUTING_CONTROL_STATE);
+
+        // The registry decides which switches may exist, so every one it does not back
+        // is dropped here: a routing control the control plane has deleted leaves no
+        // state behind, and the map stays bounded by the registry rather than by how
+        // many resources a caller has created and deleted over time.
+        let registry = &self.registry;
+        self.switches
+            .routing_control_states
+            .retain(|arn, _| registry.routing_controls.contains_key(arn));
+
+        Some(previous)
+    }
+
+    /// One registry record as the routing control this data plane reports.
+    fn project(&self, record: &RoutingControlRecord) -> RoutingControl {
+        RoutingControl {
+            routing_control_arn: record.arn.clone(),
+            routing_control_name: record.name.clone(),
+            control_panel_arn: record.control_panel_arn.clone(),
+            control_panel_name: self
+                .registry
+                .control_panels
+                .get(&record.control_panel_arn)
+                .map(|panel| panel.name.clone()),
+            cluster_arn: record.cluster_arn.clone(),
+            state: self
+                .switches
+                .routing_control_states
+                .get(&record.arn)
+                .copied()
+                .unwrap_or(INITIAL_ROUTING_CONTROL_STATE),
+            owner: record.owner.clone(),
+        }
+    }
 }
 
-/// This service's store in the shared engine: call it with a handler's `&*self.engine`.
+/// The `ResourceNotFoundException$ResourceType` a routing control lookup reports.
+///
+/// The modelled member is documented "Hypothetical resource type that was not found",
+/// so it names the KIND of resource the request addressed; both operations that take a
+/// `RoutingControlArn` report it from here.
+pub const ROUTING_CONTROL_RESOURCE_TYPE: &str = "RoutingControl";
+
+/// The `ResourceNotFoundException$ResourceType` a control panel lookup reports.
+pub const CONTROL_PANEL_RESOURCE_TYPE: &str = "ControlPanel";
+
+/// The `ResourceNotFoundException$Message` for a `RoutingControlArn` that names no
+/// routing control.
+///
+/// Route 53 ARC's cluster API words this refusal `Routing Control '<arn>' not found`:
+/// the kind of resource that was looked up, then the ARN the request sent, quoted. Both
+/// operations that take a `RoutingControlArn` state it from here, so they cannot word
+/// the same refusal differently.
+pub fn routing_control_not_found_message(routing_control_arn: &str) -> String {
+    format!("Routing Control '{routing_control_arn}' not found")
+}
+
+/// The `ResourceNotFoundException$Message` for a `ControlPanelArn` filter that names no
+/// control panel.
+///
+/// Route 53 ARC words the control-panel refusal the other way round —
+/// `Control panel not found: '<arn>'`, the quoted ARN AFTER the diagnosis — so it is
+/// stated here rather than folded into
+/// [`routing_control_not_found_message`].
+pub fn control_panel_not_found_message(control_panel_arn: &str) -> String {
+    format!("Control panel not found: '{control_panel_arn}'")
+}
+
+/// This service's own store (the switches) in the shared engine: call it with a
+/// handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
 pub fn service_state<Eng: Send + Sync + 'static>(
@@ -286,4 +295,22 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsRoute53recoveryclusterTogglecustomerapiState>)
+}
+
+/// The control plane's registry in the SAME shared engine — resolved by the owning
+/// crate's own accessor, so there is one copy of every cluster, control panel and
+/// routing control rather than two that can drift, and one reading of where that store
+/// lives.
+pub fn registry<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<Registry>> {
+    recovery_control_config::state::service_state(engine)
+}
+
+/// Both stores at once: what every handler of this service starts from.
+pub fn stores<Eng: Send + Sync + 'static>(engine: &Eng) -> Option<Stores> {
+    Some(Stores {
+        registry: registry(engine)?,
+        switches: service_state(engine)?,
+    })
 }

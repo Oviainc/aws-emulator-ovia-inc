@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRoutingControls
-//! IMPLEMENTED: a pure READ that enumerates the routing controls held in
-//! `crate::state`, in ARN order, filtered by `ControlPanelArn` when one is given. This is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: a pure READ that enumerates the routing controls this cluster endpoint
+//! serves — the control plane's registry joined with this service's switches, through
+//! `crate::state` — in ARN order, filtered by `ControlPanelArn` when one is given. This
+//! is the ONLY file to touch for this operation.
 //!
 //! Paging honours `MaxResults` and `NextToken`: the token is an opaque, versioned
-//! encoding of the filter it was issued for plus the offset reached, so issuing a page
-//! writes no state and the pages walk the whole set without repeats or omissions. A
-//! `ControlPanelArn` no control panel holds is a `ResourceNotFoundException` (404); a
-//! token this service did not issue is a `ValidationException` (400).
+//! encoding of the filter it was issued for plus the routing control the next page
+//! starts at, so issuing a page writes no state and the pages walk the whole set
+//! without repeats or omissions. A `ControlPanelArn` no control panel was minted for is
+//! a `ResourceNotFoundException` (404); a token this service did not issue is a
+//! `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -111,36 +113,41 @@ const CURSOR_VERSION: &str = "v1";
 /// Encode the cursor for the next page as an opaque `PageToken`.
 ///
 /// The cursor is the pair (the `ControlPanelArn` filter the page was issued for,
-/// the offset reached), hex-encoded so a caller cannot read structure into it and
-/// treats it as the opaque token the model describes. Encoding it means paging
-/// keeps no server-side token table: a LIST call writes nothing at all.
-/// The listing order is the registry's ARN order, and this data plane models no
-/// operation that adds or removes a routing control, so an offset stays pointing
-/// at the same element between pages.
-fn encode_cursor(control_panel_arn: Option<&str>, offset: usize) -> String {
+/// the ARN of the routing control the next page starts at), hex-encoded so a caller
+/// treats it as the opaque token the model describes rather than parsing it. The
+/// encoding carries no integrity protection and is not meant to: what a token may do is
+/// decided when it is read back, where [`decode_cursor`] re-checks the version tag and
+/// re-binds the token to the filter THIS request carries. Encoding it means paging keeps
+/// no server-side token table: a LIST call writes nothing at all.
+///
+/// The cursor names the next ITEM rather than an offset into the listing, because the
+/// set it walks is the control plane's registry: a routing control created or deleted
+/// between two pages would shift every offset after it, but it cannot shift the ARN this
+/// page is to resume at.
+fn encode_cursor(control_panel_arn: Option<&str>, resume_at: &str) -> String {
     hex::encode(format!(
-        "{CURSOR_VERSION}|{}|{offset}",
+        "{CURSOR_VERSION}|{}|{resume_at}",
         control_panel_arn.unwrap_or_default()
     ))
 }
 
-/// The offset `token` points at, or `None` when it is not a token this operation
-/// issued for this same `ControlPanelArn` filter.
+/// The routing control ARN `token` resumes at, or `None` when it is not a token this
+/// operation issued for this same `ControlPanelArn` filter.
 ///
 /// An `Arn` cannot contain `|` (its pattern is `^[A-Za-z0-9:./_-]*$`), so the
 /// three encoded fields split unambiguously.
-fn decode_cursor(token: &str, control_panel_arn: Option<&str>) -> Option<usize> {
+fn decode_cursor(token: &str, control_panel_arn: Option<&str>) -> Option<String> {
     let raw = hex::decode(token).ok()?;
     let decoded = String::from_utf8(raw).ok()?;
     let mut fields = decoded.split('|');
-    let (version, panel, offset) = (fields.next()?, fields.next()?, fields.next()?);
+    let (version, panel, resume_at) = (fields.next()?, fields.next()?, fields.next()?);
     if version != CURSOR_VERSION || fields.next().is_some() {
         return None;
     }
     if panel != control_panel_arn.unwrap_or_default() {
         return None;
     }
-    offset.parse().ok()
+    Some(resume_at.to_string())
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -219,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ctx` carries request metadata only; this operation needs none of it.
         let _ = ctx;
 
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        let stores = crate::state::stores(&*self.engine).ok_or_else(|| {
             ListRoutingControlsError::from(
                 ListRoutingControlsErrorModeled::InternalServerException(
                     InternalServerException {
@@ -230,29 +237,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // One read under the single state guard; nothing here writes.
-        let guard = state.lock();
+        // One read under the state guards; nothing here writes.
+        let plane = stores.lock();
 
         let filter = input.control_panel_arn.as_deref();
         if let Some(control_panel_arn) = filter {
-            if !guard.control_panels.contains_key(control_panel_arn) {
+            if !plane.holds_control_panel(control_panel_arn) {
                 return Err(ListRoutingControlsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("Control panel {control_panel_arn} was not found"),
+                        message: crate::state::control_panel_not_found_message(control_panel_arn),
                         resource_id: control_panel_arn.to_string(),
-                        resource_type: "ControlPanel".to_string(),
+                        resource_type: crate::state::CONTROL_PANEL_RESOURCE_TYPE.to_string(),
                     },
                 )
                 .into());
             }
         }
 
-        let controls = guard.routing_controls_in(filter);
+        let controls = plane.routing_controls_in(filter);
 
         let offset = match input.next_token.as_deref() {
             None => 0,
-            Some(token) => decode_cursor(token, filter).filter(|o| *o <= controls.len()).ok_or_else(
-                || {
+            Some(token) => decode_cursor(token, filter)
+                .and_then(|resume_at| {
+                    controls
+                        .iter()
+                        .position(|control| control.routing_control_arn == resume_at)
+                })
+                .ok_or_else(|| {
                     ListRoutingControlsError::from(
                         ListRoutingControlsErrorModeled::ValidationException(ValidationException {
                             message: "NextToken is not a token this call issued for the \
@@ -267,8 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             }]),
                         }),
                     )
-                },
-            )?,
+                })?,
         };
 
         // `MaxResults` is modelled with `@range(min: 1)`, so a value below it is a
@@ -298,7 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .take(page_size)
             .map(|control| RoutingControl {
                 control_panel_arn: Some(control.control_panel_arn.clone()),
-                control_panel_name: Some(control.control_panel_name.clone()),
+                control_panel_name: control.control_panel_name.clone(),
                 routing_control_arn: Some(control.routing_control_arn.clone()),
                 routing_control_name: Some(control.routing_control_name.clone()),
                 routing_control_state: Some(control.state.as_wire().to_string()),
@@ -306,9 +317,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // A `NextToken` only when controls remain after this page.
+        // A `NextToken` only when controls remain after this page, naming the one the
+        // next page starts at.
         let reached = offset + routing_controls.len();
-        let next_token = (reached < controls.len()).then(|| encode_cursor(filter, reached));
+        let next_token = controls
+            .get(reached)
+            .map(|resume_at| encode_cursor(filter, &resume_at.routing_control_arn));
 
         Ok(ListRoutingControlsOutput {
             routing_controls,
