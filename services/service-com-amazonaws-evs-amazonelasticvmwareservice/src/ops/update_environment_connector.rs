@@ -22,12 +22,14 @@
 //! before the connector is active again. A request that asks for the value the
 //! connector already carries changes nothing — the operation is `@idempotent`
 //! (`smithy_query(query="operation",operation="UpdateEnvironmentConnector")`), so
-//! repeating it neither restarts the connector nor moves its `modifiedAt`. A secret is
-//! compared and stored as the ARN its identifier RESOLVES to
+//! repeating it neither restarts the connector nor moves its `modifiedAt`. What the
+//! request NAMES decides that, not how it spelled it: a secret is compared and stored as
+//! the ARN its identifier RESOLVES to
 //! ([`crate::state::secret_resources::resolve_secret_arn`]), because `secretIdentifier`
 //! is "The new ARN or name of" the secret while `Connector$secretArn` is "The Amazon
-//! Resource Name (ARN) of" it: naming the stored secret in its other form is therefore
-//! no change at all.
+//! Resource Name (ARN) of" it, and an appliance FQDN is matched as the domain name it is
+//! ([`crate::state::same_appliance_fqdn`]) — so naming the stored secret or the stored
+//! appliance in its other form is no change at all.
 //!
 //! ## Shape of an operation
 //!
@@ -285,11 +287,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The reconfiguration itself. A value the connector already carries is NOT a
         // change: the record keeps its state and its modifiedAt, so repeating the call
-        // neither restarts the connector nor moves a stamp.
+        // neither restarts the connector nor moves a stamp. "Already carries" is decided
+        // by what the value NAMES, not by how the request spelled it — an appliance FQDN
+        // is a domain name and a secret identifier an ARN or a name of one secret — so a
+        // request naming the stored appliance or the stored secret in its other form
+        // reconfigures nothing and the stored record is left exactly as it was.
         let changed = match requested {
             Requested::ApplianceFqdn(appliance_fqdn) => {
-                let changed = connector.appliance_fqdn != appliance_fqdn;
-                connector.appliance_fqdn = appliance_fqdn.to_string();
+                let changed = !crate::state::same_appliance_fqdn(
+                    &connector.appliance_fqdn,
+                    appliance_fqdn,
+                );
+                if changed {
+                    connector.appliance_fqdn = appliance_fqdn.to_string();
+                }
                 changed
             }
             Requested::SecretArn(secret_arn) => {

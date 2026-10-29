@@ -17,6 +17,8 @@ mod account_settings;
 mod authorization;
 #[path = "all/check_impairment_onset.rs"]
 mod check_impairment_onset;
+#[path = "all/connector_appliance_fqdn_case.rs"]
+mod connector_appliance_fqdn_case;
 #[path = "all/connector_create_while_deleting.rs"]
 mod connector_create_while_deleting;
 #[path = "all/connector_deletion.rs"]

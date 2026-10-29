@@ -720,6 +720,22 @@ impl PendingConnectorState {
     }
 }
 
+/// Whether two `applianceFqdn` values name the SAME VCF appliance.
+///
+/// An `applianceFqdn` is "a fully qualified domain name" (`CreateEnvironmentConnector`
+/// doc) and a domain name is case-insensitive, so two spellings that differ only in
+/// case are one appliance. The ONE comparison every site that matches an appliance FQDN
+/// in this crate makes — the idempotent repeat of `CreateEnvironmentConnector`, the
+/// no-op update of `UpdateEnvironmentConnector`, and the vCenter an entitlement is
+/// associated with ([`StoredEnvironment::entitlements_sharing_vcenter`]) — so none of
+/// them can disagree about which requests name the appliance a connector already
+/// targets. ASCII is the whole alphabet the modelled `ApplianceFqdn` pattern admits
+/// (`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.…)*$`,
+/// `smithy_query(query="shape",shape="ApplianceFqdn")`).
+pub fn same_appliance_fqdn(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
 /// One connector of an environment, as `CreateEnvironmentConnector` stored it: the
 /// record of a connection to one VCF appliance type.
 #[derive(Debug, Clone)]
@@ -1838,8 +1854,9 @@ impl StoredEnvironment {
     /// The vCenter is the APPLIANCE the connector targets, not the connector record, so
     /// every connector of this environment reaching the same `applianceFqdn` counts —
     /// an entitlement created through a connector that was replaced by a new one for
-    /// the same appliance is associated with that same vCenter. The comparison is
-    /// case-insensitive because a DNS name is.
+    /// the same appliance is associated with that same vCenter. Which appliance an
+    /// `applianceFqdn` names is [`same_appliance_fqdn`], case-insensitive because a DNS
+    /// name is.
     ///
     /// Zero for an id this environment holds no connector for: there is no vCenter to
     /// compare against, and the caller is told about the connector instead.
@@ -1850,11 +1867,7 @@ impl StoredEnvironment {
         let same_vcenter: BTreeSet<&str> = self
             .connectors
             .values()
-            .filter(|other| {
-                other
-                    .appliance_fqdn
-                    .eq_ignore_ascii_case(&connector.appliance_fqdn)
-            })
+            .filter(|other| same_appliance_fqdn(&other.appliance_fqdn, &connector.appliance_fqdn))
             .map(|other| other.connector_id.as_str())
             .collect();
         self.live_entitlements()

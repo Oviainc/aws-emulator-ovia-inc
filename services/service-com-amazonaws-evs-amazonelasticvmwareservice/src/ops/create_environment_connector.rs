@@ -20,7 +20,11 @@
 //! stored record when the request asks for the same appliance and secret, and is
 //! refused with the modelled `ValidationException` when it asks for different ones —
 //! the second connector of a type cannot be created, and silently reconfiguring the
-//! first is `UpdateEnvironmentConnector`'s work, not a create's.
+//! first is `UpdateEnvironmentConnector`'s work, not a create's. "The same appliance and
+//! secret" is what the request NAMES, not how it spelled it: the appliance is matched as
+//! the domain name an `applianceFqdn` is ([`crate::state::same_appliance_fqdn`]) and the
+//! secret as the ARN its `secretIdentifier` resolves to
+//! ([`crate::state::secret_resources::resolve_secret_arn`]).
 //!
 //! The record a repeat reports is the one the caller is handed as the created
 //! connector, so it is reported only while it is still a connector a later call
@@ -278,8 +282,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // on its way to `DELETED` and resolves to nothing, so reporting it would
             // report a connector that never comes to exist. It still occupies its type,
             // which is what makes such a request the conflict below.
+            // The stored record is the one this request asks for when it names the same
+            // appliance and the same secret — what each value NAMES, not how the request
+            // spelled it: an appliance FQDN is a domain name
+            // ([`crate::state::same_appliance_fqdn`]) and the secret is compared as the
+            // ARN its identifier resolved to.
             if existing.is_live()
-                && existing.appliance_fqdn == input.appliance_fqdn
+                && crate::state::same_appliance_fqdn(
+                    &existing.appliance_fqdn,
+                    &input.appliance_fqdn,
+                )
                 && existing.secret_arn == secret_arn
             {
                 return Ok(CreateEnvironmentConnectorOutput {
