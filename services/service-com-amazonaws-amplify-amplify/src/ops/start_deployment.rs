@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -84,9 +75,29 @@
 //!   quotas were exceeded.
 //! * `NotFoundException` (HTTP 404) — An entity was not found during an operation.
 //! * `UnauthorizedException` (HTTP 401) — An operation failed due to a lack of access.
+//!
+//! ---
+//!
+//! # How a deployment is served here
+//!
+//! A manual deployment deploys content Amplify does not hold: either the uploads of a
+//! deployment `CreateDeployment` reserved, or a source the request names by URL. So this
+//! operation READS that content before it answers, and the job it starts reports what the
+//! read found:
+//!
+//! * an Amazon S3 source is read in AMPLIFY'S OWN name, so the bucket's own policy has to
+//!   grant the Amplify service principal that read — a bucket whose policy grants it
+//!   nothing is refused with the modelled `UnauthorizedException`, before any job exists;
+//! * a source the read could not resolve — a prefix the policy lets nobody list, an
+//!   archive object that is not there, a source outside this emulator — starts a job that
+//!   the clock settles to `FAILED`, carrying the reason on its one execution step;
+//! * a source whose files WERE read starts a job that settles to `SUCCEED`, and the job
+//!   record carries the asset paths it published.
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::collections::BTreeSet;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -160,18 +171,817 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDeployment"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartDeploymentErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the Amplify emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let started = crate::state::now();
+
+        // What this call deploys, resolved from the store BEFORE anything is read: the
+        // app the deployment is for, the branch it deploys to, and the source itself.
+        // The store is unlocked again before the source is read, because reading it
+        // calls another service of this emulator.
+        let (app_arn, branch_arn, source) = {
+            let mut store = state.lock();
+            let app = store
+                .apps
+                .get_mut(&input.app_id)
+                .ok_or_else(|| absent(crate::state::APP_ENTITY, &input.app_id))?;
+            let app_arn = app.app.app_arn.clone();
+            let branch = app
+                .branches
+                .get_mut(&input.branch_name)
+                .ok_or_else(|| absent(crate::state::BRANCH_ENTITY, &input.branch_name))?;
+            let branch_arn = branch.branch.branch_arn.clone();
+            // The reservations the clock has already let expire are dropped first:
+            // "the maximum duration between the CreateDeployment call and the
+            // StartDeployment call cannot exceed 8 hours", and that window closes
+            // whether or not anybody called — so a `jobId` whose reservation is past it
+            // names nothing to start.
+            branch.expire_deployments();
+            let source = source_of(&input, branch)?;
+            (app_arn, branch_arn, source)
+        };
+
+        // The source, read now: an unauthorized source is refused here, and a source
+        // that could not be read decides how the job this call starts ends.
+        let deployment = read_source(ctx, &region, &app_arn, &source).await?;
+
+        // What the job reports about where its files came from: the URL the request
+        // named, and the kind of source it named it as — which for a request that named
+        // no kind is the modelled default. A deployment of a reservation's uploads has
+        // neither.
+        let (source_url, source_url_type) = match &source {
+            Source::Reserved(_) => (None, None),
+            _ => (
+                input.source_url.clone(),
+                Some(
+                    input
+                        .source_url_type
+                        .clone()
+                        .unwrap_or_else(|| SOURCE_URL_TYPE_ZIP.to_string()),
+                ),
+            ),
+        };
+
+        let mut store = state.lock();
+        let app = store
+            .apps
+            .get_mut(&input.app_id)
+            .ok_or_else(|| absent(crate::state::APP_ENTITY, &input.app_id))?;
+        let branch = app
+            .branches
+            .get_mut(&input.branch_name)
+            .ok_or_else(|| absent(crate::state::BRANCH_ENTITY, &input.branch_name))?;
+
+        // A deployment that starts is one more job of this branch's BOUNDED history, so
+        // the room for it is made (the oldest finished job retired) first. A branch at
+        // its cap with every job still running has nothing to retire: the start is
+        // refused with the modelled quota error instead of growing the map.
+        if !branch.make_room_for_a_job() {
+            return Err(StartDeploymentErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::job_limit_message(&input.branch_name)),
+                },
+            )
+            .into());
+        }
+
+        let job_id = match &source {
+            // The reservation's id was taken out of the branch's sequence when it was
+            // reserved, so the job runs under THAT id; and the reservation is spent by
+            // the call that starts it, so it cannot be started twice.
+            Source::Reserved(pending) => {
+                branch.deployments.remove(&pending.job_id);
+                branch.started_a_job();
+                pending.job_id.clone()
+            }
+            _ => branch.mint_job_id(),
+        };
+
+        let summary = JobSummary {
+            job_arn: format!("{branch_arn}/jobs/{job_id}"),
+            // A manual deployment deploys content, not a commit of a repository: each
+            // member is @required on `JobSummary` with a length minimum of 0, so the
+            // job carries the empty value rather than none — and `commitTime` has no
+            // empty value, so it records the instant the deployment was started.
+            commit_id: String::new(),
+            commit_message: String::new(),
+            commit_time: started,
+            start_time: started,
+            // Nothing has been deployed yet: the job is PENDING, it has no end, and the
+            // clock settles it (see `crate::state::BranchJob::settle`).
+            status: crate::state::JOB_STATUS_PENDING.to_string(),
+            end_time: None,
+            // "If the value is MANUAL, the job is for a manually deployed app"
+            // (`smithy_query(query="shape",shape="JobSummary",member="jobType")`), which
+            // is the only kind of app this operation deploys.
+            job_type: MANUAL_JOB_TYPE.to_string(),
+            // The source the files came from, as the request named it — echoed rather
+            // than rewritten, so a prefix the caller wrote without its separator is
+            // reported the way it was sent. A deployment started from a reservation
+            // names no URL: its content was uploaded to the destinations that
+            // reservation handed out.
+            source_url,
+            source_url_type,
+            job_id,
+        };
+
+        branch.jobs.insert(
+            summary.job_id.clone(),
+            crate::state::BranchJob::settling(
+                Job {
+                    summary: summary.clone(),
+                    steps: Vec::new(),
+                },
+                deployment.conclusion,
+                deployment.assets,
+            ),
+        );
+
+        // The branch's own view of its jobs: the deployment just started is the active
+        // one, and `totalNumberOfJobs` counts the jobs this branch has STARTED.
+        branch.branch.active_job_id = summary.job_id.clone();
+        branch.branch.total_number_of_jobs = branch.jobs_started().to_string();
+
+        Ok(StartDeploymentOutput {
+            job_summary: summary,
+        })
     }
 }
+
+/// The refusal an app id or a branch name that names nothing takes.
+///
+/// A deployment is started ON a branch of an app
+/// (`POST /apps/{appId}/branches/{branchName}/deployments/start`), so neither an unknown
+/// app nor a branch that app does not carry is created on the way, and the modelled 404
+/// ("An entity was not found during an operation") names the entity that is absent and
+/// the identifier the request used for it — the wording every other 404 in this crate
+/// is built with ([`crate::state::not_found_message`]).
+fn absent(entity: &str, identifier: &str) -> StartDeploymentErrorModeled {
+    StartDeploymentErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::not_found_message(entity, identifier)),
+    })
+}
+
+/// Where one `StartDeployment` call takes the files it deploys from.
+#[derive(Debug, Clone)]
+enum Source {
+    /// A deployment `CreateDeployment` reserved on this branch: its content was
+    /// uploaded to the destinations that call handed out.
+    Reserved(crate::state::PendingDeployment),
+    /// The objects of an Amazon S3 bucket under a prefix — `sourceUrlType`
+    /// `BUCKET_PREFIX`.
+    Prefix { bucket: String, prefix: String },
+    /// One `.zip` object of an Amazon S3 bucket — `sourceUrlType` `ZIP`.
+    Archive { bucket: String, key: String },
+    /// A `.zip` behind an HTTP GET URL, which lives outside this emulator.
+    Download { url: String },
+}
+
+impl Source {
+    /// How a job's step names this source in the reason it carries.
+    fn label(&self) -> String {
+        match self {
+            Self::Reserved(_) => RESERVED_SOURCE_LABEL.to_string(),
+            Self::Prefix { bucket, prefix } => format!("{S3_SCHEME}{bucket}/{prefix}"),
+            Self::Archive { bucket, key } => format!("{S3_SCHEME}{bucket}/{key}"),
+            Self::Download { url } => url.clone(),
+        }
+    }
+}
+
+/// Which source the request names, or the refusal it takes for naming none.
+///
+/// A deployment is started EITHER from a reservation — `jobId` is "the job ID for this
+/// deployment that is generated by the CreateDeployment request" — or from a source URL,
+/// which is "used when calling StartDeployment without CreateDeployment". A request that
+/// names a `jobId` therefore starts that reservation, and one that names only a
+/// `sourceUrl` starts a deployment of what the URL points at. A request that names
+/// neither names nothing to deploy, and is refused with the modelled 400 ("A request
+/// contains unexpected data") rather than starting a job with no content.
+fn source_of(
+    input: &StartDeploymentInput,
+    branch: &crate::state::AmplifyBranch,
+) -> Result<Source, StartDeploymentErrorModeled> {
+    // `jobId` and `sourceUrl` are both modelled with a `pattern`, which the empty string
+    // satisfies neither of, so the boundary validator refuses an empty value before this
+    // operation runs. The filters below are what makes that explicit here: an empty
+    // value would name nothing, exactly like an omitted member.
+    let job_id = input
+        .job_id
+        .as_deref()
+        .filter(|job_id| !job_id.is_empty());
+    let source_url = input
+        .source_url
+        .as_deref()
+        .filter(|source_url| !source_url.is_empty());
+
+    if let Some(job_id) = job_id {
+        return branch
+            .deployments
+            .get(job_id)
+            .cloned()
+            .map(Source::Reserved)
+            .ok_or_else(|| absent(crate::state::JOB_ENTITY, job_id));
+    }
+
+    let Some(source_url) = source_url else {
+        return Err(StartDeploymentErrorModeled::BadRequestException(
+            BadRequestException {
+                message: Some(NO_SOURCE_MESSAGE.to_string()),
+            },
+        ));
+    };
+
+    // "If no value is specified, the default is ZIP"
+    // (`smithy_query(query="shape",shape="SourceUrlType")`).
+    let url_type = input
+        .source_url_type
+        .clone()
+        .unwrap_or_else(|| SOURCE_URL_TYPE_ZIP.to_string());
+
+    // An `s3://` URL names a bucket of this same emulator's object storage; every other
+    // scheme the modelled `pattern ^(s3|https|http)://` admits names something outside
+    // it, which is a download rather than a bucket read.
+    let Some((bucket, path)) = s3_location(source_url) else {
+        return Ok(Source::Download {
+            url: source_url.to_string(),
+        });
+    };
+
+    if url_type == SOURCE_URL_TYPE_BUCKET_PREFIX {
+        // A prefix addresses the FOLDER the deployment's files sit in, so an asset's
+        // path is its key under that folder: a prefix the request wrote without the
+        // separator addresses the same folder as one that wrote it.
+        let prefix = if path.is_empty() || path.ends_with('/') {
+            path
+        } else {
+            format!("{path}/")
+        };
+        return Ok(Source::Prefix { bucket, prefix });
+    }
+    Ok(Source::Archive { bucket, key: path })
+}
+
+/// The bucket and the key-or-prefix an `s3://bucket/key` source URL names, or `None`
+/// when the URL is not an Amazon S3 location at all.
+///
+/// A URL that names no bucket (`s3:///key`) names no location either, so it is answered
+/// the same way: nothing here guesses a bucket.
+fn s3_location(source_url: &str) -> Option<(String, String)> {
+    let rest = source_url.strip_prefix(S3_SCHEME)?;
+    let (bucket, path) = rest.split_once('/').unwrap_or((rest, ""));
+    (!bucket.is_empty()).then(|| (bucket.to_string(), path.to_string()))
+}
+
+/// What reading a source produced: the asset paths the deployment publishes, and the
+/// conclusion the clock settles its job to.
+struct Deployment {
+    assets: BTreeSet<String>,
+    conclusion: crate::state::JobConclusion,
+}
+
+impl Deployment {
+    /// A deployment whose files were read: it publishes them when there is a site to
+    /// serve, and fails when there is not.
+    ///
+    /// A hosted branch answers a request for its root with [`ROOT_DOCUMENT`], so a
+    /// deployment whose files carry none at their root has nothing to serve there; and
+    /// a source holding no file at all deploys nothing. Either way the job ends FAILED
+    /// with the reason on its step, rather than reporting a deployment that cannot be
+    /// visited as having succeeded.
+    fn published(label: &str, assets: BTreeSet<String>) -> Self {
+        if assets.is_empty() {
+            return Self::failed(format!("The deployment source {label} holds no file to deploy."));
+        }
+        if !assets.contains(ROOT_DOCUMENT) {
+            return Self::failed(format!(
+                "The deployment source {label} carries no {ROOT_DOCUMENT} at its root, so \
+                 the branch has no document to serve."
+            ));
+        }
+        Self {
+            assets,
+            conclusion: crate::state::JobConclusion::deployed(),
+        }
+    }
+
+    /// A deployment that published nothing, for the reason given.
+    fn failed(reason: impl Into<String>) -> Self {
+        Self {
+            assets: BTreeSet::new(),
+            conclusion: crate::state::JobConclusion::not_deployed(reason),
+        }
+    }
+}
+
+/// Read `source`, refusing the deployment when the source's own policy grants Amplify
+/// no read of it.
+///
+/// The REFUSAL and the job's outcome are different answers to different questions. A
+/// source Amplify may not read at all is refused before any job exists: the deployment
+/// never started. A source Amplify MAY read but could not — a prefix nothing may list,
+/// an object that is not there, a URL outside this emulator — starts the deployment,
+/// which then ends FAILED, because whether the content is actually usable is not known
+/// until it has been read.
+async fn read_source(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    app_arn: &str,
+    source: &Source,
+) -> Result<Deployment, StartDeploymentErrorModeled> {
+    let label = source.label();
+    match source {
+        // Nothing in this emulator opens a connection outside it, so a source behind an
+        // HTTP GET URL cannot be downloaded. The deployment is accepted — the URL is a
+        // modelled source and Amplify has no bucket policy to judge it by — and its job
+        // reports that the content never arrived.
+        Source::Download { .. } => Ok(Deployment::failed(format!(
+            "The deployment source {label} is outside this emulator, which opens no \
+             outbound connection, so the archive was never downloaded."
+        ))),
+        Source::Reserved(pending) => Ok(reserved_deployment(ctx, region, pending, &label).await),
+        Source::Prefix { bucket, prefix } => {
+            let policy = bucket_policy(ctx, region, bucket).await;
+            // Amplify reads the objects of the source in its OWN name, so the read has
+            // to be granted to the Amplify service principal by the policy of the
+            // bucket holding them.
+            if !grants(&policy, GET_OBJECT_ACTION, &object_arn(bucket, prefix), app_arn) {
+                return Err(unauthorized());
+            }
+            // Enumerating the files under a prefix is a second permission on a second
+            // resource — the bucket itself — and a policy that grants the read of the
+            // objects without it leaves Amplify unable to find out WHICH objects to
+            // read. That is a deployment that was authorized and could not be carried
+            // out, so it starts and its job ends FAILED.
+            if !grants(&policy, LIST_BUCKET_ACTION, &bucket_arn(bucket), app_arn) {
+                return Ok(Deployment::failed(format!(
+                    "The bucket policy of {bucket} grants Amplify no {LIST_BUCKET_ACTION}, \
+                     so the files of the deployment source {label} could not be listed."
+                )));
+            }
+            Ok(prefix_deployment(ctx, region, bucket, prefix, &label).await)
+        }
+        Source::Archive { bucket, key } => {
+            let policy = bucket_policy(ctx, region, bucket).await;
+            if !grants(&policy, GET_OBJECT_ACTION, &object_arn(bucket, key), app_arn) {
+                return Err(unauthorized());
+            }
+            Ok(archive_deployment(ctx, region, bucket, key, &label).await)
+        }
+    }
+}
+
+/// The modelled refusal of a source whose bucket policy grants Amplify no read of it:
+/// HTTP 401 `UnauthorizedException` ("An operation failed due to a lack of access"),
+/// carrying [`BUCKET_POLICY_WITHOUT_AMPLIFY_ACCESS`].
+fn unauthorized() -> StartDeploymentErrorModeled {
+    StartDeploymentErrorModeled::UnauthorizedException(UnauthorizedException {
+        message: Some(BUCKET_POLICY_WITHOUT_AMPLIFY_ACCESS.to_string()),
+    })
+}
+
+/// Every asset of the Amazon S3 source `bucket`/`prefix`, as a deployment.
+///
+/// The asset's path is its KEY UNDER THE PREFIX, so the files of `s3://b/src/` are
+/// deployed at the same paths as the files of `s3://b/` would be — which is what makes
+/// the prefix the root of the deployed site. A key that ends in the separator is the
+/// folder placeholder a console creates, not a file, and is deployed as nothing.
+async fn prefix_deployment(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+    prefix: &str,
+    label: &str,
+) -> Deployment {
+    let client = s3_client(ctx, region);
+    let mut assets = BTreeSet::new();
+    let mut examined = 0usize;
+    let mut continuation: Option<String> = None;
+    loop {
+        let mut listing = client.list_objects_v2().bucket(bucket).prefix(prefix);
+        if let Some(token) = continuation {
+            listing = listing.continuation_token(token);
+        }
+        let page = match listing.send().await {
+            Ok(page) => page,
+            Err(failure) => {
+                ::tracing::warn!(
+                    bucket,
+                    prefix,
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+                    "the deployment source's prefix could not be listed"
+                );
+                return Deployment::failed(format!(
+                    "The files of the deployment source {label} could not be listed in \
+                     Amazon S3."
+                ));
+            }
+        };
+        for object in page.contents() {
+            // Every key the listing reports counts against the bound, not only the ones
+            // that become assets: the walk is what has to be finite, whatever the bucket
+            // holds.
+            examined = examined.saturating_add(1);
+            if examined > MAX_DEPLOYMENT_ASSETS {
+                return Deployment::failed(format!(
+                    "The deployment source {label} holds more than the \
+                     {MAX_DEPLOYMENT_ASSETS} files this emulator deploys."
+                ));
+            }
+            let Some(path) = object.key().and_then(|key| key.strip_prefix(prefix)) else {
+                continue;
+            };
+            // A key that ends in the separator is the folder placeholder a console
+            // creates, not a file.
+            if path.is_empty() || path.ends_with('/') {
+                continue;
+            }
+            assets.insert(path.to_string());
+        }
+        continuation = page.next_continuation_token().map(str::to_string);
+        if continuation.is_none() {
+            break;
+        }
+    }
+    Deployment::published(label, assets)
+}
+
+/// The `.zip` object `bucket`/`key`, as a deployment of the files it carries.
+async fn archive_deployment(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+    key: &str,
+    label: &str,
+) -> Deployment {
+    let client = s3_client(ctx, region);
+    let answer = match client.get_object().bucket(bucket).key(key).send().await {
+        Ok(answer) => answer,
+        Err(failure) => {
+            ::tracing::warn!(
+                bucket,
+                key,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+                "the deployment source's archive could not be read"
+            );
+            return Deployment::failed(format!(
+                "The deployment source {label} could not be read from Amazon S3."
+            ));
+        }
+    };
+    // The archive is caller content and is read into this process whole, so its SIZE is
+    // bounded as it ARRIVES rather than only where the answer declares one: an archive
+    // past the bound is refused before the byte that would pass it is kept.
+    let too_large = || {
+        format!(
+            "The deployment source {label} is larger than the {MAX_ARCHIVE_BYTES} bytes \
+             this emulator reads from one archive."
+        )
+    };
+    if answer
+        .content_length()
+        .is_some_and(|length| length > i64::try_from(MAX_ARCHIVE_BYTES).unwrap_or(i64::MAX))
+    {
+        return Deployment::failed(too_large());
+    }
+    let mut body = answer.body;
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        match body.try_next().await {
+            Ok(Some(chunk)) => {
+                if bytes.len().saturating_add(chunk.len()) > MAX_ARCHIVE_BYTES {
+                    return Deployment::failed(too_large());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(failure) => {
+                return Deployment::failed(format!(
+                    "The deployment source {label} could not be read from Amazon S3: \
+                     {failure}."
+                ));
+            }
+        }
+    }
+    match archive_assets(&bytes) {
+        Ok(assets) => Deployment::published(label, assets),
+        Err(why) => Deployment::failed(format!(
+            "The deployment source {label} is not an archive this emulator can deploy: \
+             {why}."
+        )),
+    }
+}
+
+/// The deployment a reservation's uploads make up.
+///
+/// A reservation handed its caller one destination per file it named, or one for the
+/// zipped deployment, so what it deploys is what is actually AT those destinations now:
+/// a reservation whose uploads never happened deploys nothing, and its job says so.
+///
+/// How many files the reservation named is the CALLER'S choice, so the walk over them is
+/// bounded exactly as the walk over a prefix's objects is: at most
+/// [`MAX_DEPLOYMENT_ASSETS`] destinations are looked up, and a reservation naming more
+/// than a deployment may hold deploys nothing rather than fanning one call out into
+/// unboundedly many.
+async fn reserved_deployment(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    pending: &crate::state::PendingDeployment,
+    label: &str,
+) -> Deployment {
+    if !pending.files.is_empty() {
+        if pending.files.len() > MAX_DEPLOYMENT_ASSETS {
+            return Deployment::failed(format!(
+                "The deployment source {label} names {} files, more than the \
+                 {MAX_DEPLOYMENT_ASSETS} files this emulator deploys.",
+                pending.files.len()
+            ));
+        }
+        let client = s3_client(ctx, region);
+        let mut assets = BTreeSet::new();
+        for (file_name, file) in &pending.files {
+            let Some((bucket, key)) = upload_destination(&file.upload_url) else {
+                continue;
+            };
+            if client
+                .head_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .is_ok()
+            {
+                assets.insert(file_name.clone());
+            }
+        }
+        return Deployment::published(label, assets);
+    }
+    let Some((bucket, key)) = upload_destination(&pending.zip_upload_url) else {
+        return Deployment::failed(format!(
+            "The deployment source {label} has no upload to deploy."
+        ));
+    };
+    archive_deployment(ctx, region, &bucket, &key, label).await
+}
+
+/// The bucket and key one upload destination of a reserved deployment addresses.
+///
+/// `CreateDeployment` mints every destination as a virtual-hosted Amazon S3 URL
+/// (`https://<bucket>.s3.<region>.amazonaws.com/<key>`), so the content a caller
+/// uploaded to it is the object `<key>` of `<bucket>`. A destination in any other form
+/// addresses no object of this emulator's object storage, and is answered as none.
+fn upload_destination(upload_url: &str) -> Option<(String, String)> {
+    let rest = upload_url.strip_prefix("https://")?;
+    let (host, key) = rest.split_once('/')?;
+    let bucket = host.split_once(".s3.")?.0;
+    (!bucket.is_empty() && !key.is_empty()).then(|| (bucket.to_string(), key.to_string()))
+}
+
+/// Every file entry of a zip archive, by the path it deploys at.
+///
+/// Reading the archive format is the `zip` crate's job, not this emulator's; what this
+/// function owns is the BOUND, because the archive is caller content: no more entry
+/// names than a deployment may hold are collected, and no entry's CONTENT is read at
+/// all, so a compressed stream cannot expand into this process. A directory entry names
+/// no file, and an entry whose path would leave the deployment's root is refused rather
+/// than deployed somewhere the archive did not name.
+fn archive_assets(bytes: &[u8]) -> Result<BTreeSet<String>, String> {
+    let mut archive =
+        ::zip::ZipArchive::new(::std::io::Cursor::new(bytes)).map_err(|err| err.to_string())?;
+    if archive.len() > MAX_DEPLOYMENT_ASSETS {
+        return Err(format!(
+            "it carries {} entries, past the {MAX_DEPLOYMENT_ASSETS} files this emulator \
+             deploys",
+            archive.len()
+        ));
+    }
+    let mut assets = BTreeSet::new();
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|err| err.to_string())?;
+        // zip reports an entry's name as a `Result`, because a name that is not valid
+        // UTF-8 cannot be a deployed path at all: such an entry is refused rather than
+        // deployed under a lossily decoded name.
+        let name = entry
+            .name()
+            .map_err(|err| format!("an entry's name could not be read: {err}"))?
+            .to_string();
+        if name.ends_with('/') {
+            continue;
+        }
+        if name.starts_with('/') || name.split('/').any(|segment| segment == "..") {
+            return Err(format!("the entry {name} names a path outside the deployment"));
+        }
+        assets.insert(name);
+    }
+    Ok(assets)
+}
+
+/// What the source bucket's own policy is, as S3 answered.
+enum BucketPolicy {
+    /// The document S3 answered with.
+    Document(String),
+    /// S3 answered that there is no policy to read on that bucket — including because
+    /// there is no such bucket: either way the bucket grants Amplify nothing.
+    Absent,
+    /// S3 could not be ASKED — an emulator assembled without object storage, or a
+    /// transport failure. Nothing is then known about the bucket's policy, so no
+    /// refusal can be grounded in it.
+    Unreadable,
+}
+
+/// Whether the source bucket's policy grants the Amplify service principal `action` on
+/// `resource`.
+///
+/// A bucket whose policy could not be READ is not reported as refusing anything: a
+/// refusal has to be grounded in what S3 answered rather than assumed. That grants
+/// nothing by itself — the read that follows is what publishes files, and a read that
+/// does not happen publishes none, so a deployment whose source was never read ends
+/// FAILED rather than succeeding on an unanswered question.
+fn grants(policy: &BucketPolicy, action: &str, resource: &str, app_arn: &str) -> bool {
+    match policy {
+        BucketPolicy::Document(document) => {
+            let principals = [AMPLIFY_SERVICE_PRINCIPAL.to_string()];
+            // A bucket policy may scope its grant to the account and the resource the
+            // cross-service read is for, so the request carries both: the account this
+            // emulator serves, and the app whose deployment is reading.
+            let context = [
+                (
+                    SOURCE_ACCOUNT_KEY.to_string(),
+                    ::emulator_server::emulator_account_id().to_string(),
+                ),
+                (SOURCE_ARN_KEY.to_string(), app_arn.to_string()),
+            ];
+            let request =
+                ::service_common::iam_authorization::Request::new(action, resource, &principals)
+                    .with_context(&context)
+                    .with_published_keys(DEPLOYMENT_CONDITION_KEYS);
+            ::service_common::iam_authorization::resource_decision(document, &request)
+                == ::service_common::iam_authorization::Decision::Allowed
+        }
+        BucketPolicy::Absent => false,
+        BucketPolicy::Unreadable => true,
+    }
+}
+
+/// The policy of the source bucket, read from this emulator's own object storage.
+///
+/// S3 is reached the way the framework documents a handler reaching another emulated
+/// service ([`smithy_server_runtime::OperationContext::callback`]), so this crate names
+/// no other service crate and the policy is the one S3 itself holds.
+async fn bucket_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+) -> BucketPolicy {
+    let answer = s3_client(ctx, region)
+        .get_bucket_policy()
+        .bucket(bucket)
+        .send()
+        .await;
+    let failure = match answer {
+        Ok(answer) => {
+            return answer
+                .policy
+                .map_or(BucketPolicy::Absent, BucketPolicy::Document)
+        }
+        Err(failure) => failure,
+    };
+    // S3 answering a client error IS an answer about the bucket: there is no policy on
+    // it (`NoSuchBucketPolicy`), or no such bucket. Anything else — no response at all,
+    // or a server fault — means the question did not get through.
+    let status = failure
+        .raw_response()
+        .map(|response| response.status().as_u16());
+    if status.is_some_and(|status| (400..500).contains(&status)) {
+        return BucketPolicy::Absent;
+    }
+    ::tracing::warn!(
+        bucket,
+        status = ?status,
+        error = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+        "the deployment source bucket's policy could not be read"
+    );
+    BucketPolicy::Unreadable
+}
+
+/// The Amazon S3 client this operation reads a deployment source through: the AWS SDK
+/// driven over the emulator's own in-process transport, signing in the emulator's own
+/// name.
+///
+/// Nothing here opens a socket or leaves the host: `ctx.callback()` is the framework's
+/// in-process channel into this same emulator's services.
+fn s3_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The emulator serves one endpoint for every service, so the bucket travels in
+        // the path rather than in a per-bucket host the router could not resolve.
+        .force_path_style(true)
+        // The transport is in-process: there is nothing to retry, time out or watch for
+        // a stalled stream, and each of those would need a sleep implementation this
+        // client is not given. The same goes for caching the identity: the credentials
+        // are handed over directly.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// The ARN of an Amazon S3 bucket: a bucket is global to the partition, so the ARN
+/// carries neither a region nor an account.
+fn bucket_arn(bucket: &str) -> String {
+    format!("arn:aws:s3:::{bucket}")
+}
+
+/// The ARN of one object, or of the path a prefix addresses, inside `bucket`.
+fn object_arn(bucket: &str, key: &str) -> String {
+    format!("arn:aws:s3:::{bucket}/{key}")
+}
+
+/// What Amplify refuses a deployment with when the source bucket's policy does not grant
+/// it the read of the source.
+///
+/// The ONE sentence that goes with this operation's modelled 401, as recorded behaviour
+/// words it: entirely fixed text, naming neither the bucket nor the action, because what
+/// the caller is told is that the bucket's policy does not let Amplify in — a bucket
+/// with no policy at all and one whose policy grants Amplify nothing are the same answer.
+pub const BUCKET_POLICY_WITHOUT_AMPLIFY_ACCESS: &str =
+    "The bucket policy is either missing or has insufficient permissions for this operation";
+
+/// Why a request that names neither a reservation nor a source URL is refused.
+pub const NO_SOURCE_MESSAGE: &str =
+    "A deployment requires either the jobId of a CreateDeployment request or a sourceUrl.";
+
+/// The AWS service principal a source bucket's policy grants deployment access to.
+///
+/// Amplify reads a manual deployment's source in its own name rather than in the
+/// caller's, so the grant a bucket policy has to carry names the SERVICE.
+const AMPLIFY_SERVICE_PRINCIPAL: &str = "amplify.amazonaws.com";
+
+/// The Amazon S3 action that reads one object of a deployment's source.
+const GET_OBJECT_ACTION: &str = "s3:GetObject";
+
+/// The Amazon S3 action that enumerates a bucket's objects, which is how the files
+/// under a `BUCKET_PREFIX` source are found.
+const LIST_BUCKET_ACTION: &str = "s3:ListBucket";
+
+/// The condition key naming the account a cross-service read is made on behalf of.
+const SOURCE_ACCOUNT_KEY: &str = "aws:SourceAccount";
+
+/// The condition key naming the resource a cross-service read is made on behalf of:
+/// the Amplify app whose deployment is reading.
+const SOURCE_ARN_KEY: &str = "aws:SourceArn";
+
+/// The condition keys this read carries a value for, so a clause over one of them is
+/// decided rather than left undecided.
+const DEPLOYMENT_CONDITION_KEYS: &[&str] = &[SOURCE_ACCOUNT_KEY, SOURCE_ARN_KEY];
+
+/// `SourceUrlType`'s two modelled values
+/// (`smithy_query(query="shape",shape="SourceUrlType")`): the source is a `.zip` file,
+/// or an Amazon S3 bucket and prefix.
+const SOURCE_URL_TYPE_ZIP: &str = "ZIP";
+const SOURCE_URL_TYPE_BUCKET_PREFIX: &str = "BUCKET_PREFIX";
+
+/// The scheme of a source URL that names an Amazon S3 location.
+const S3_SCHEME: &str = "s3://";
+
+/// The `jobType` of a job this operation starts: "If the value is MANUAL, the job is for
+/// a manually deployed app" (`smithy_query(query="shape",shape="JobType")`).
+const MANUAL_JOB_TYPE: &str = "MANUAL";
+
+/// The document a hosted Amplify branch serves at the root of its site, and so the one
+/// file a deployment has to carry at its own root to be servable.
+pub const ROOT_DOCUMENT: &str = "index.html";
+
+/// How a job's step names a source that is a reservation's uploads rather than a URL.
+const RESERVED_SOURCE_LABEL: &str = "uploaded for this deployment";
+
+/// How many files one deployment publishes at most.
+///
+/// CHOSEN, not a published quota: the asset paths a deployment publishes are held in
+/// this service's state, so a deployment cannot be allowed to grow it without limit. It
+/// is the number of objects one Amazon S3 listing returns, so a source whose files fit
+/// in one page of its bucket is deployable, and the walk over a source's objects stops
+/// there however many the bucket holds.
+pub const MAX_DEPLOYMENT_ASSETS: usize = 1000;
+
+/// How large an archive this operation reads from a deployment source.
+///
+/// CHOSEN, not a published quota: the archive is caller content and is read into this
+/// process whole, so a bound on it is what keeps one deployment from taking the host's
+/// memory. 64 MiB is generous for the built output of a web app, which is what a manual
+/// deployment carries.
+pub const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;

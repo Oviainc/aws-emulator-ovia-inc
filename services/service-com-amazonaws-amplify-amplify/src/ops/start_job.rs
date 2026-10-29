@@ -229,11 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !branch.make_room_for_a_job() {
                 return Err(StartJobErrorModeled::LimitExceededException(
                     LimitExceededException {
-                        message: Some(format!(
-                            "Number of running jobs exceeds the limit of {} for branch {}",
-                            crate::state::MAX_JOBS_PER_BRANCH,
-                            input.branch_name
-                        )),
+                        message: Some(crate::state::job_limit_message(&input.branch_name)),
                     },
                 )
                 .into());

@@ -80,6 +80,32 @@ impl Emulator {
         Self { router }
     }
 
+    /// The same emulator with the S3 service mounted BESIDE Amplify on the one shared
+    /// engine — what the assembled router does — handing back that engine too.
+    ///
+    /// For the suite that drives both front doors
+    /// (`tests/all/s3_sourced_deployments.rs`): `StartDeployment` reads its source by
+    /// calling S3 in process, so S3 has to be there for its answer to be S3's.
+    pub(crate) fn with_object_storage() -> (Self, Arc<engine::InMemoryEngine>) {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
+        (Self { router }, engine)
+    }
+
+    /// Dispatch a request the caller built itself, for a front door that is not
+    /// Amplify's — the object storage an S3-sourced deployment is seeded through.
+    pub(crate) async fn dispatch(
+        &self,
+        request: http::Request<bytes::Bytes>,
+    ) -> http::Response<bytes::Bytes> {
+        self.router.dispatch(request).await
+    }
+
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
         let payload = body.map_or_else(Vec::new, |value| {
             serde_json::to_vec(value).expect("a request body serializes")

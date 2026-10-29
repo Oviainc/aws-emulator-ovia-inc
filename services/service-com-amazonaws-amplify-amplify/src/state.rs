@@ -18,7 +18,7 @@
 //! it shares its branch's lifetime and its `jobId` cannot collide with another
 //! branch's.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{App, BackendEnvironment, Branch, DomainAssociation, Job, Step, Webhook};
 
@@ -139,8 +139,19 @@ impl AmplifyBranch {
     /// also what `Branch$activeJobId` and `Branch$totalNumberOfJobs` report about.
     pub fn mint_job_id(&mut self) -> String {
         let job_id = self.reserve_job_id();
-        self.started_jobs = self.started_jobs.wrapping_add(1);
+        self.started_a_job();
         job_id
+    }
+
+    /// Count one more job as STARTED on this branch without taking an id out of its
+    /// sequence.
+    ///
+    /// What starting a deployment whose id was already reserved does: the id came out of
+    /// the sequence when `CreateDeployment` reserved it ([`Self::reserve_job_id`]), and
+    /// the job under it exists only once a start call creates it — which is the moment
+    /// the branch has started one more job.
+    pub fn started_a_job(&mut self) {
+        self.started_jobs = self.started_jobs.wrapping_add(1);
     }
 
     /// Take the next `jobId` of this branch's id sequence without starting a job on it.
@@ -230,6 +241,17 @@ impl AmplifyBranch {
 /// [`AmplifyBranch::make_room_for_a_job`].
 pub const MAX_JOBS_PER_BRANCH: usize = 50;
 
+/// The `message` an Amplify `LimitExceededException` carries when a branch cannot take
+/// one more job: it is at [`MAX_JOBS_PER_BRANCH`] and every job it holds is still
+/// running, so there is nothing to retire (see [`AmplifyBranch::make_room_for_a_job`]).
+///
+/// Built FROM THE REQUEST and from the limit, and formatted HERE rather than in each
+/// handler, so `StartJob` and `StartDeployment` — the two calls that start a job on a
+/// branch — cannot drift on the sentence they refuse with.
+pub fn job_limit_message(branch_name: &str) -> String {
+    format!("Number of running jobs exceeds the limit of {MAX_JOBS_PER_BRANCH} for branch {branch_name}")
+}
+
 /// One deployment reserved on a branch and not started yet: the `jobId` it reserved,
 /// where its content is uploaded, and the window it has to be started in.
 ///
@@ -286,12 +308,13 @@ pub const DEPLOYMENT_WINDOW_MILLIS: i64 = 8 * 60 * 60 * 1_000;
 /// of that branch's equally bounded history.
 pub const MAX_PENDING_DEPLOYMENTS_PER_BRANCH: usize = MAX_JOBS_PER_BRANCH;
 
-/// One job as this service persists it: the modelled [`Job`] record, plus the instant
-/// at which the clock owes that job its next status change.
+/// One job as this service persists it: the modelled [`Job`] record, the instant at
+/// which the clock owes that job its next status change, and what that change is.
 ///
-/// Starting a job is ASYNCHRONOUS — `StartJob` answers with a non-terminal status and
-/// the job settles later — so the record carries when that settling is due instead of
-/// blocking the call that started it. [`BranchJob::settle`] materialises it.
+/// Starting a job is ASYNCHRONOUS — the call that starts it answers with a non-terminal
+/// status and the job settles later — so the record carries when that settling is due,
+/// and what it settles to, instead of blocking the call that started it.
+/// [`BranchJob::settle`] materialises it.
 #[derive(Debug, Clone)]
 pub struct BranchJob {
     /// The job record, exactly as every reader returns it.
@@ -299,16 +322,46 @@ pub struct BranchJob {
     /// Epoch milliseconds at which this job's non-terminal status is due to settle,
     /// or `None` once it has settled and the status is terminal.
     pub settles_at: Option<i64>,
+    /// The terminal status, step and reason the clock settles this job to, DECIDED when
+    /// the job was started rather than when it is read: what the job's work found is
+    /// what it found at the instant it ran, so two reads of one settled job cannot
+    /// disagree about how it ended.
+    pub conclusion: JobConclusion,
+    /// The asset paths this job's deployment published, relative to the root of the
+    /// hosted branch — empty for a job that deployed nothing (every job that failed,
+    /// and every job that is not a deployment at all).
+    ///
+    /// Held on the JOB rather than on the branch because it is what THIS job deployed:
+    /// a later deployment of the same branch publishes its own set, and a reader of an
+    /// older job still sees the one that job published.
+    pub deployed_assets: BTreeSet<String>,
 }
 
 impl BranchJob {
     /// A job that has just been started: [`JOB_STATUS_PENDING`] now, settled by the
-    /// clock [`JOB_SETTLE_MILLIS`] from now.
-    pub fn started(job: Job) -> Self {
+    /// clock [`JOB_SETTLE_MILLIS`] from now to `conclusion`, having published `assets`.
+    pub fn settling(
+        job: Job,
+        conclusion: JobConclusion,
+        deployed_assets: BTreeSet<String>,
+    ) -> Self {
         Self {
             job,
             settles_at: Some(now_millis().saturating_add(JOB_SETTLE_MILLIS)),
+            conclusion,
+            deployed_assets,
         }
+    }
+
+    /// A job `StartJob` has just started: a build of the branch's repository, which
+    /// this emulator has no environment to run (see
+    /// [`JobConclusion::build_without_an_environment`]), so it publishes no assets.
+    pub fn started(job: Job) -> Self {
+        Self::settling(
+            job,
+            JobConclusion::build_without_an_environment(),
+            BTreeSet::new(),
+        )
     }
 
     /// Materialise the status change the clock has ALREADY made due, and nothing else.
@@ -316,13 +369,11 @@ impl BranchJob {
     /// The change is owed at `settles_at` whether or not anybody calls, so a reporting
     /// operation applies it before answering rather than reporting a `PENDING` job that
     /// the clock settled seconds ago. Before that instant this is a no-op, so a caller
-    /// that reads straight after `StartJob` still observes the non-terminal status.
+    /// that reads straight after the start call still observes the non-terminal status.
     ///
-    /// The status it settles to is [`JOB_STATUS_FAILED`]: a job builds a branch from
-    /// its repository, this emulator has no build environment to run that in, and a
-    /// build nothing ran cannot be reported as having succeeded. The reason is carried
-    /// on the one modelled member that can hold it — `Step$statusReason` — because
-    /// `JobSummary` models no reason of its own.
+    /// What it settles TO is the job's own [`JobConclusion`], recorded when the job was
+    /// started: the reason is carried on the one modelled member that can hold it —
+    /// `Step$statusReason` — because `JobSummary` models no reason of its own.
     pub fn settle(&mut self) {
         let Some(due) = self.settles_at else {
             return;
@@ -332,14 +383,14 @@ impl BranchJob {
         }
         self.settles_at = None;
         let ended = ::aws_smithy_types::DateTime::from_millis(due);
-        self.job.summary.status = JOB_STATUS_FAILED.to_string();
+        self.job.summary.status = self.conclusion.status.clone();
         self.job.summary.end_time = Some(ended);
         self.job.steps = vec![Step {
-            step_name: BUILD_STEP_NAME.to_string(),
+            step_name: self.conclusion.step_name.clone(),
             start_time: self.job.summary.start_time,
-            status: JOB_STATUS_FAILED.to_string(),
+            status: self.conclusion.status.clone(),
             end_time: ended,
-            status_reason: Some(NO_BUILD_ENVIRONMENT_REASON.to_string()),
+            status_reason: self.conclusion.status_reason.clone(),
             // Every URL below addresses an artifact a build produced, and no build
             // ran; `screenshots` and `context` likewise only exist for a step that
             // executed.
@@ -350,6 +401,56 @@ impl BranchJob {
             screenshots: None,
             context: None,
         }];
+    }
+}
+
+/// How one job ends: the terminal `JobStatus` it reaches, the execution step that
+/// carries that status, and the reason for it when there is one to give.
+///
+/// `JobStatus` is modelled `CREATED | PENDING | PROVISIONING | RUNNING | FAILED |
+/// SUCCEED | CANCELLING | CANCELLED` (`smithy_query(query="shape",shape="JobStatus")`),
+/// of which `FAILED` and `SUCCEED` are the two a job of this emulator settles to.
+#[derive(Debug, Clone)]
+pub struct JobConclusion {
+    /// The terminal `JobStatus` the job settles to.
+    pub status: String,
+    /// The `Step$stepName` of the one execution step the settled job carries.
+    pub step_name: String,
+    /// `Step$statusReason`, the reason for that status — `None` where there is nothing
+    /// to explain, which is what a step that did what it was asked carries.
+    pub status_reason: Option<String>,
+}
+
+impl JobConclusion {
+    /// A build of a branch's repository, which this emulator has no environment to run:
+    /// a build nothing executed cannot be reported as having succeeded, so the job ends
+    /// [`JOB_STATUS_FAILED`] in its `BUILD` step. See [`NO_BUILD_ENVIRONMENT_REASON`].
+    pub fn build_without_an_environment() -> Self {
+        Self {
+            status: JOB_STATUS_FAILED.to_string(),
+            step_name: BUILD_STEP_NAME.to_string(),
+            status_reason: Some(NO_BUILD_ENVIRONMENT_REASON.to_string()),
+        }
+    }
+
+    /// A deployment whose assets were read and published: the job ends
+    /// [`JOB_STATUS_SUCCEED`] in its `DEPLOY` step, with nothing to explain.
+    pub fn deployed() -> Self {
+        Self {
+            status: JOB_STATUS_SUCCEED.to_string(),
+            step_name: DEPLOY_STEP_NAME.to_string(),
+            status_reason: None,
+        }
+    }
+
+    /// A deployment whose assets could NOT be read and published: the job ends
+    /// [`JOB_STATUS_FAILED`] in its `DEPLOY` step, carrying `reason`.
+    pub fn not_deployed(reason: impl Into<String>) -> Self {
+        Self {
+            status: JOB_STATUS_FAILED.to_string(),
+            step_name: DEPLOY_STEP_NAME.to_string(),
+            status_reason: Some(reason.into()),
+        }
     }
 }
 
@@ -368,14 +469,24 @@ pub const JOB_SETTLE_MILLIS: i64 = 500;
 /// what `PENDING` says.
 pub const JOB_STATUS_PENDING: &str = "PENDING";
 
-/// The terminal status a job settles to; see [`BranchJob::settle`].
+/// The terminal status a job settles to when its work could not be done; see
+/// [`JobConclusion`].
 pub const JOB_STATUS_FAILED: &str = "FAILED";
+
+/// The terminal status a job settles to when its work WAS done — the status Amplify
+/// spells `SUCCEED` (`smithy_query(query="shape",shape="JobStatus")`), not `SUCCEEDED`.
+pub const JOB_STATUS_SUCCEED: &str = "SUCCEED";
 
 /// The name of the execution step a settled job carries its failure reason on.
 ///
 /// `Step$stepName` is modelled as free text (`smithy_query(query="shape",shape="Step")`)
 /// and the phase a job fails in here is the build, which Amplify names `BUILD`.
 pub const BUILD_STEP_NAME: &str = "BUILD";
+
+/// The name of the execution step a MANUAL deployment's job carries: a manual
+/// deployment runs no build — its content is already built — so the one step of its job
+/// is the deploy of that content, which Amplify names `DEPLOY`.
+pub const DEPLOY_STEP_NAME: &str = "DEPLOY";
 
 /// Why a job this emulator started ends in [`JOB_STATUS_FAILED`].
 pub const NO_BUILD_ENVIRONMENT_REASON: &str =
