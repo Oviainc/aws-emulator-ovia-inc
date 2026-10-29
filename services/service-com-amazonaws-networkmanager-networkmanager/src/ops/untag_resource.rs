@@ -157,15 +157,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A string that is not an ARN of this service names no resource at all, which is
         // a bad request rather than a missing one.
         let parts = crate::state::parse_resource_arn(&input.resource_arn).ok_or_else(|| {
-            UntagResourceErrorModeled::ValidationException(ValidationException {
-                message: "ResourceArn is not a networkmanager resource ARN".to_string(),
-                reason: Some("FieldValidationFailed".to_string()),
-                fields: Some(vec![ValidationExceptionField {
-                    name: "ResourceArn".to_string(),
-                    message: "must read arn:<partition>:networkmanager::<account>:<type>/<id>"
-                        .to_string(),
-                }]),
-            })
+            UntagResourceErrorModeled::ValidationException(crate::state::malformed_resource_arn(
+                crate::state::FIELD_RESOURCE_ARN,
+            ))
         })?;
 
         let mut store = state.lock();

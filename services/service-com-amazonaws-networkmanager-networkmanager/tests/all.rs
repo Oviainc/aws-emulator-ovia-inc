@@ -141,6 +141,8 @@ mod link_lifecycle;
 mod list_attachments;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/malformed_resource_arn_refusal.rs"]
+mod malformed_resource_arn_refusal;
 #[path = "all/network_resource_counts.rs"]
 mod network_resource_counts;
 #[path = "all/network_resource_metadata.rs"]
