@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/create_encryption_configuration_forms.rs"]
 mod create_encryption_configuration_forms;
+#[path = "all/cross_account_configuration_names_an_account.rs"]
+mod cross_account_configuration_names_an_account;
 #[path = "all/error_message_rules.rs"]
 mod error_message_rules;
 #[path = "all/group_reader_and_id_shape.rs"]

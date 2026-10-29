@@ -1218,14 +1218,28 @@ pub fn stored_encryption_configuration(
 /// entry names an account other than this one.
 ///
 /// A cross-account configuration exists to let the investigating account reach
-/// ANOTHER account's resources, so a `sourceRoleArn` whose account id is the
-/// investigation account's own is refused: it could never do anything. The modelled
-/// constraints on the member (`@length 20..2048`, `^arn:.*$`) cannot express that, so
-/// the boundary walk admits it and this is where the rule lives — and every operation
-/// that stores the list applies it, each rendering the refusal as its own modelled
-/// `ValidationException`.
+/// ANOTHER account's resources, so an entry has to NAME that other account, and an
+/// entry that does not is refused: it could never do anything. Both halves of that are
+/// enforced here, because both are things the model admits —
 ///
-/// Worded through [`constraint_clause`] inside [`validation_envelope`] — the builders a
+/// * `sourceRoleArn` is not `@required` on the structure
+///   (`smithy_query(query="shape",shape="CrossAccountConfiguration")`), so an entry
+///   carrying no source role at all is a request the boundary walk passes through; it
+///   names no account, and is refused through [`absent_member_clause`] with the
+///   framework's own absent-member requirement, exactly as the walk would refuse a
+///   member the model did mark required;
+/// * the member's modelled constraints (`@length 20..2048`, `^arn:.*$`) admit text that
+///   is not a complete ARN, so a value whose account id field cannot be read
+///   ([`arn_account_id`]) names no account either and is refused alongside a value whose
+///   account id IS the investigation account's own.
+///
+/// So the list is accepted only when every entry names a readable account that is not
+/// this one, and nothing the rule says cannot exist is ever stored — every operation
+/// that stores the list applies this rule, each rendering the refusal as its own
+/// modelled `ValidationException`.
+///
+/// Worded through [`constraint_clause`] — or [`absent_member_clause`], for an entry that
+/// carried no value at that path at all — inside [`validation_envelope`], the builders a
 /// boundary refusal is worded through: the member path and the requirement, with the
 /// offending ARN withheld. The path keeps the refused ENTRY's position
 /// ([`list_element_member_path`]), which is a fact about the request's shape rather than
@@ -1243,22 +1257,25 @@ pub fn cross_account_configurations_rejection(
     let clauses: Vec<String> = configurations?
         .iter()
         .enumerate()
-        .filter(|(_, configuration)| {
-            configuration
-                .source_role_arn
-                .as_deref()
-                .and_then(arn_account_id)
-                == Some(own_account)
-        })
-        .map(|(index, _)| {
-            constraint_clause(
-                &list_element_member_path(
-                    CROSS_ACCOUNT_CONFIGURATIONS_MEMBER,
-                    index,
-                    SOURCE_ROLE_ARN_MEMBER,
-                ),
-                &requirement,
-            )
+        .filter_map(|(index, configuration)| {
+            let member_path = list_element_member_path(
+                CROSS_ACCOUNT_CONFIGURATIONS_MEMBER,
+                index,
+                SOURCE_ROLE_ARN_MEMBER,
+            );
+            match configuration.source_role_arn.as_deref() {
+                // Nothing at that path to judge: the entry names no account because it
+                // carries no source role.
+                None => Some(absent_member_clause(
+                    &member_path,
+                    &requirement_text(ViolationKind::MissingRequiredMember),
+                )),
+                // A source role names another account only when an account id can be
+                // read from it at all, and that id is not this account's.
+                Some(arn) => arn_account_id(arn)
+                    .is_none_or(|account| account == own_account)
+                    .then(|| constraint_clause(&member_path, &requirement)),
+            }
         })
         .collect();
     (!clauses.is_empty()).then(|| validation_envelope(&clauses))
@@ -1327,9 +1344,16 @@ pub fn policy_document_rejection(policy: &str) -> Option<String> {
 ///
 /// An ARN is `arn:partition:service:region:account:resource`, and the resource
 /// portion may itself hold `:`, so only the first five fields are split off.
+///
+/// The account is the FIFTH field of a complete ARN, so all six have to be present for
+/// one to be read: a string with fewer fields carries no account id — its last field is
+/// a resource, a region or a service name — and answers `None` rather than having
+/// whatever sits in the fourth position read as an account. An ARN whose account field
+/// is empty, as a resource owned by no account spells it, carries none either.
 pub fn arn_account_id(arn: &str) -> Option<&str> {
     let mut fields = arn.strip_prefix("arn:")?.splitn(5, ':');
-    let (_partition, _service, _region, account) = (
+    let (_partition, _service, _region, account, _resource) = (
+        fields.next()?,
         fields.next()?,
         fields.next()?,
         fields.next()?,
