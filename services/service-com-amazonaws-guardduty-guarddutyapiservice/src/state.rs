@@ -605,6 +605,63 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
             .is_some()
     }
 
+    /// Deliver into the inbox `region`'s endpoint serves the invitation an account
+    /// that sends one through that endpoint has just sent, reporting whether this
+    /// call delivered one.
+    ///
+    /// The MEMBER side of sending an invitation: "the invited accounts can either
+    /// accept or decline the invitation from their GuardDuty accounts"
+    /// (`smithy_query(query="doc",shape="InviteMembers")`), so an invitation that
+    /// was sent is pending for the account it was delivered to until that account
+    /// answers it — which is what [`Detector::accept_invitation`],
+    /// [`Self::take_received_invitations_in`] and the inbox reads resolve. The
+    /// administrator side of the same send is the member records the caller moves.
+    ///
+    /// One inbox per Region, resolved the way [`Self::received_invitations_in`]
+    /// resolves it: the operations that answer an invitation name no detector, so
+    /// the inbox a request addresses is the one the Region it was signed for
+    /// serves, and an invitation delivered through one Region's endpoint is not in
+    /// another's inbox.
+    ///
+    /// ONE invitation is pending per inviting account at a time — an acceptance
+    /// identifies the invitation by that account and the id alone
+    /// (`smithy_query(operation="AcceptInvitation")`) — so an account whose
+    /// invitation is still pending KEEPS it: re-sending re-sends that same
+    /// invitation rather than issuing a second one, exactly as the member record a
+    /// re-send leaves where it was, and no id is minted for it. An account whose
+    /// invitation has been accepted, declined or deleted has none pending, so a
+    /// later send delivers a fresh one.
+    pub fn deliver_invitation_in(
+        &mut self,
+        region: &str,
+        administrator_account_id: &str,
+        now: i64,
+    ) -> bool {
+        // The whole condition the delivery writes under is answered BEFORE anything
+        // is minted — the Region's inbox is resolved, and
+        // [`Detector::inbox_has_room_for`] answers both of the write's guards — so a
+        // call that writes nothing consumes no id: the ids this state hands out are a
+        // sequence, and one burned on a path that writes nothing would shift every
+        // later id.
+        let Some(detector) = self
+            .detectors
+            .values()
+            .find(|detector| detector.region == region)
+        else {
+            return false;
+        };
+        if !detector.inbox_has_room_for(administrator_account_id) {
+            return false;
+        }
+        let detector_id = detector.id.clone();
+        let invitation_id = self.mint_id();
+        self.detectors
+            .get_mut(&detector_id)
+            .is_some_and(|detector| {
+                detector.deliver_invitation(administrator_account_id, &invitation_id, now)
+            })
+    }
+
     /// Take out of the inbox `region`'s endpoint serves the invitation each account
     /// in `account_ids` sent, reporting the accounts the inbox held none from as the
     /// `UnprocessedAccounts` the caller answers with.
@@ -2355,20 +2412,22 @@ pub struct Detector {
     /// id of the administrator that sent each one.
     ///
     /// The inbox side of the member relationship: `InviteMembers` is called by an
-    /// administrator and delivers an invitation to the account it names, so an
-    /// entry here is an invitation some OTHER account addressed to this one —
-    /// which is what `AcceptInvitation` / `AcceptAdministratorInvitation` resolve
+    /// administrator and sends an invitation the invited account then answers, so
+    /// an entry here is an invitation that was SENT and is still pending — which
+    /// is what `AcceptInvitation` / `AcceptAdministratorInvitation` resolve
     /// `(MasterId, InvitationId)` against, and what `ListInvitations` reports.
     ///
-    /// This emulator serves a single account ([`administrator_account_id`]) and
-    /// models no way for another account to call `InviteMembers` against it, so no
-    /// operation writes this map and it is EMPTY for every request the emulator
-    /// answers — which is why `AcceptInvitation` refuses every well-formed pair
-    /// and `ListInvitations` reports an empty inbox. `InviteMembers` does not
-    /// write it either: it is called BY the administrator this emulator serves and
-    /// delivers its invitation to the account it names, which is another account
-    /// and so has no detector here; what it writes is the administrator side of
-    /// the relationship ([`MemberRecord`]).
+    /// WRITTEN by `InviteMembers`, which is the one operation that SENDS an
+    /// invitation: sending one is a write to both sides of the relationship — the
+    /// administrator's own view of the account it invited ([`MemberRecord`]) and
+    /// the pending invitation the invited account answers — so the send delivers
+    /// it here through
+    /// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::deliver_invitation_in`].
+    /// Every account this emulator presents carries the one canonical account id
+    /// ([`administrator_account_id`]), the sending administrator included, so the
+    /// inbox an invitation is delivered to is the one the Region's endpoint
+    /// serves and the key it lands under is that account id.
+    ///
     /// This is state rather than a constant because both the refusal and the
     /// report are a lookup: an invitation this store holds is accepted by one and
     /// reported by the other, read through [`Self::received_invitations_in`] and
@@ -2378,8 +2437,8 @@ pub struct Detector {
     /// [`Self::take_received_invitations_in`], so an invitation this store holds
     /// leaves the inbox accepted, declined or deleted and never twice.
     ///
-    /// BOUNDED by [`MAX_INVITATIONS_PER_DETECTOR`], so a future writer cannot
-    /// grow it without limit: the key is an account id, which is request-chosen.
+    /// BOUNDED by [`MAX_INVITATIONS_PER_DETECTOR`], so the delivery cannot grow
+    /// it without limit: the key is an account id, which is request-chosen.
     pub received_invitations: BTreeMap<String, ReceivedInvitationRecord>,
     /// The administrator this detector's account is monitored by — what
     /// `GetMasterAccount` / `GetAdministratorAccount` report — or `None` while the
@@ -2812,6 +2871,61 @@ impl Detector {
             .iter()
             .find(|id| !self.findings.contains_key(id.as_str()))
             .map(String::as_str)
+    }
+
+    /// Put a pending invitation from `administrator_account_id` in this detector's
+    /// inbox, reporting whether this call delivered one.
+    ///
+    /// The inverse of [`Self::accept_invitation`]: the record it writes is exactly
+    /// the one an acceptance resolves, an inbox read reports and a decline or a
+    /// delete takes out. A delivered invitation is [`RELATIONSHIP_INVITED`] — it
+    /// is pending — and carries `now` as the instant it was SENT, which is the
+    /// `InvitedAt` every read of it reports and the one the accepted relationship
+    /// keeps.
+    ///
+    /// Writes NOTHING, and reports `false`, for an account that already has an
+    /// invitation pending here (that invitation stays as it is, so the inviter
+    /// cannot overwrite the id the invited account was handed) and for an inbox
+    /// already holding [`MAX_INVITATIONS_PER_DETECTOR`] invitations from other
+    /// accounts, which is the ceiling that keeps a request-keyed store bounded.
+    ///
+    /// The detector itself does not move: an invitation is a record of its own,
+    /// not a change to the detector's configuration, so `UpdatedAt` is left where
+    /// it was until an acceptance establishes the relationship.
+    pub fn deliver_invitation(
+        &mut self,
+        administrator_account_id: &str,
+        invitation_id: &str,
+        now: i64,
+    ) -> bool {
+        if !self.inbox_has_room_for(administrator_account_id) {
+            return false;
+        }
+        self.received_invitations.insert(
+            administrator_account_id.to_string(),
+            ReceivedInvitationRecord {
+                administrator_account_id: administrator_account_id.to_string(),
+                invitation_id: invitation_id.to_string(),
+                relationship_status: RELATIONSHIP_INVITED.to_string(),
+                invited_at_millis: now,
+            },
+        );
+        true
+    }
+
+    /// Can this detector's inbox take an invitation from `administrator_account_id`?
+    ///
+    /// The condition [`Self::deliver_invitation`] writes under, read over an
+    /// IMMUTABLE borrow so a delivery can answer it BEFORE it mints an id: an
+    /// account that already has an invitation pending here keeps that invitation,
+    /// and an inbox at [`MAX_INVITATIONS_PER_DETECTOR`] takes no further account.
+    /// One definition, so the check and the write cannot disagree on what the
+    /// inbox will accept.
+    pub fn inbox_has_room_for(&self, administrator_account_id: &str) -> bool {
+        !self
+            .received_invitations
+            .contains_key(administrator_account_id)
+            && self.received_invitations.len() < MAX_INVITATIONS_PER_DETECTOR
     }
 
     /// Is an invitation pending for this detector's account under exactly the pair

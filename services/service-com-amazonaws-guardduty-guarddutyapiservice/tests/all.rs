@@ -89,6 +89,8 @@ mod invitation_count;
 mod invitation_decline;
 #[path = "all/invitation_delete.rs"]
 mod invitation_delete;
+#[path = "all/invitation_delivery.rs"]
+mod invitation_delivery;
 #[path = "all/invitation_listing.rs"]
 mod invitation_listing;
 #[path = "all/ip_set_lifecycle.rs"]

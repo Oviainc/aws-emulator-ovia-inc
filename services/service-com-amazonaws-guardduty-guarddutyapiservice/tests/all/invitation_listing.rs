@@ -34,10 +34,10 @@
 //!    modelled `BadRequestException` — never a hollow page.
 //!
 //! The invitations are seeded through this service's own state module (the
-//! `negative_class_rejections` suite owns that helper), because the operation that
-//! delivers one — `InviteMembers`, called by ANOTHER account — is a scaffold with an
-//! issue of its own: this emulator serves a single account, so no request it can
-//! answer puts an invitation in its own inbox.
+//! `negative_class_rejections` suite owns that helper), so a row can hold an
+//! invitation from any account id in the space rather than only from the one account
+//! id this emulator presents, which is the account `InviteMembers` delivers an
+//! invitation from; the delivery itself is the `invitation_delivery` suite's subject.
 
 use std::sync::Arc;
 

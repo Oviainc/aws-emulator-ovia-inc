@@ -13,12 +13,23 @@
 //! `CreateMembers` (the documentation below states it): the condition this operation
 //! checks is the member RECORD, not the association.
 //!
-//! The invited account's own INBOX is not written: an invitation is delivered to the
-//! account it names, which is a different account from the one this emulator serves,
-//! so there is no detector here to deliver it to (see
-//! `crate::state::Detector::received_invitations`). What this operation persists is
-//! the ADMINISTRATOR side of the relationship, which `GetMembers` and `ListMembers`
-//! report.
+//! Sending an invitation writes BOTH sides of the relationship. Beside the member
+//! records above — the administrator's own view, which `GetMembers` and `ListMembers`
+//! report — the invitation is delivered to the pending-invitation inbox the Region's
+//! endpoint serves (`crate::state::Detector::received_invitations`), because "the
+//! invited accounts can either accept or decline the invitation from their GuardDuty
+//! accounts": that inbox is what `ListInvitations` reports, `GetInvitationsCount`
+//! sizes, `AcceptInvitation` / `AcceptAdministratorInvitation` resolve and
+//! `DeclineInvitations` / `DeleteInvitations` take an invitation out of. One
+//! invitation is pending per inviting account, so a re-send re-sends that same
+//! invitation.
+//!
+//! An invitation's `AccountId` is the account that SENT it, and every account this
+//! emulator presents carries the one canonical account id
+//! (`crate::state::administrator_account_id`) — the sending administrator included —
+//! so the inbox an invitation is delivered to here is the one that account answers
+//! from. The two roles AWS keeps in separate accounts are therefore the same account
+//! id in this emulator, which is why one Region's inbox holds at most the one key.
 //!
 //! ## Shape of an operation
 //!
@@ -220,6 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut unprocessed = Vec::new();
+        let mut sent = false;
         let mut seen = ::std::collections::BTreeSet::new();
         for account_id in &input.account_ids {
             // `AccountIds` names a SET of accounts: a repeated id is invited once, so
@@ -233,6 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // be invited again, so an invitation re-associates one rather than
                 // needing a second `CreateMembers`.
                 Some(member) => {
+                    sent = true;
                     // One invitation is pending per administrator/member pair, so
                     // inviting an account whose invitation is still pending re-sends
                     // that same invitation rather than issuing a second one: nothing
@@ -254,6 +267,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     result: crate::state::not_a_member_message(&administrator),
                 }),
             }
+        }
+
+        // An invitation that was sent is pending for the account it was delivered to
+        // until that account answers it, so the send writes the MEMBER side of the
+        // relationship too: it delivers the invitation to the inbox the Region's
+        // endpoint serves, which is what the inbox reads report and what an
+        // acceptance, a decline and a delete each act on. A call that invited nobody
+        // sent nothing, so it delivers nothing.
+        //
+        // Nothing is reported from the delivery, because every outcome it can have is
+        // already the outcome this call owes its caller: it answers `false` for an
+        // inviting account whose invitation is still pending, which is the re-send
+        // that must change nothing at all, and the inbox ceiling it also guards is not
+        // reachable through a request — the inbox is keyed by the SENDING account and
+        // every account this emulator presents carries the one canonical account id,
+        // so a Region's inbox holds at most that single key.
+        if sent {
+            state.deliver_invitation_in(&region, &administrator, now);
         }
 
         // `Message` and `DisableEmailNotification` govern the EMAIL the invitation is

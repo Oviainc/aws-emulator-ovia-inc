@@ -237,11 +237,11 @@ async fn accept_invitation_without_a_pending_invitation_is_refused_and_establish
 /// The refusal above is a LOOKUP: an invitation the store does hold is accepted, and
 /// the relationship it establishes is what both administrator reads then report.
 ///
-/// The invitations are seeded through this service's own state module, because the
-/// operations that deliver one (`InviteMembers` from ANOTHER account) are scaffolds
-/// with issues of their own — this emulator serves a single account, so no request it
-/// can answer puts an invitation in its inbox. The rows differ along the operation
-/// NAME, the inviting account id and the invitation id's shape.
+/// The invitations are seeded through this service's own state module, so the rows can
+/// span inviting account ids and invitation-id shapes the one account id this emulator
+/// presents does not reach; `InviteMembers` delivering one over the wire is the
+/// `invitation_delivery` suite's subject. The rows differ along the operation NAME, the
+/// inviting account id and the invitation id's shape.
 #[tokio::test]
 async fn accept_invitation_accepts_a_pending_invitation_and_the_read_reports_it() {
     let cases = [
@@ -395,8 +395,9 @@ async fn administrator_account(
 /// `region` is the Region the detector's create was signed for, because a detector is
 /// a REGIONAL resource and the store resolves it under that Region. Shared with the
 /// `administrator_disassociation` suite, which needs the same seam for the same
-/// reason: no request this single-account emulator can answer delivers an invitation
-/// to its own inbox.
+/// reason: an invitation from an account id other than the one this emulator presents
+/// reaches the inbox only through the store (`InviteMembers` delivers one from that
+/// account id, which the `invitation_delivery` suite drives over the wire).
 pub(crate) fn seed_invitation(
     engine: &engine::InMemoryEngine,
     region: &str,
