@@ -197,6 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // entity this operation resolves is the workflow the ARN names. One that the
         // store does not hold is a lookup miss, not an empty tag map — and a workflow
         // of ANOTHER region is not one this endpoint holds.
+        //
+        // This operation addresses the resource as an untyped taggable one, by the ARN
+        // that is the only identifier it was handed, so the `ResourceId` of its refusal
+        // is that ARN — where an operation addressing a workflow resource reports the
+        // workflow's own id segment (`crate::state::workflow_resource_id`).
         let workflow = store
             .workflow_in(&region, &input.resource_arn)
             .ok_or_else(|| {

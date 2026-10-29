@@ -246,7 +246,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::lookup_miss(StartWorkflowRunErrorModeled::ResourceNotFoundException(
                 crate::state::unresolved(
                     crate::state::UnresolvedEntity::version_for(requested),
-                    requested.unwrap_or(&input.workflow_arn),
+                    // The version named, else the workflow whose latest version this run
+                    // would have executed — by its own identifier, the ARN's resource-id
+                    // segment, not the ARN the request addressed it with.
+                    requested
+                        .unwrap_or_else(|| crate::state::workflow_resource_id(&input.workflow_arn)),
                 ),
             ))
         };
@@ -264,7 +268,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name and the resource type its refusal reports, so the token is remembered
         // per operation and per region: a token presented at one regional endpoint says
         // nothing about what another endpoint started.
-        let tokens = crate::state::TokenLedger::of(Self::NAME, "workflow-run", &region);
+        let tokens = crate::state::TokenLedger::of(
+            Self::NAME,
+            crate::state::WORKFLOW_RUN_RESOURCE_TYPE,
+            &region,
+        );
         let replayed = tokens
             .replay(
                 &store.idempotency,
@@ -334,7 +342,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::MAX_RUNS_PER_WORKFLOW
                     ),
                     resource_id: input.workflow_arn.clone(),
-                    resource_type: "workflow-run".to_string(),
+                    resource_type: crate::state::WORKFLOW_RUN_RESOURCE_TYPE.to_string(),
                     service_code: crate::state::ARN_NAMESPACE.to_string(),
                     quota_code: "RunsPerWorkflow".to_string(),
                 },
@@ -439,7 +447,7 @@ fn tearing_down(workflow_arn: &str) -> StartWorkflowRunError {
             crate::state::WORKFLOW_STATUS_DELETING
         ),
         resource_id: workflow_arn.to_string(),
-        resource_type: "workflow".to_string(),
+        resource_type: crate::state::WORKFLOW_RESOURCE_TYPE.to_string(),
     })
     .into()
 }

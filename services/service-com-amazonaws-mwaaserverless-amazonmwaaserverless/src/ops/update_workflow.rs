@@ -244,7 +244,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A reference that resolves to nothing is a lookup miss, and the entity THIS
         // operation resolves is the workflow itself. A workflow of ANOTHER region is
-        // not one this endpoint holds, so its ARN resolves to nothing here either.
+        // not one this endpoint holds, so its ARN resolves to nothing here either. The
+        // refusal names the workflow by its OWN identifier, the ARN's resource-id
+        // segment, not by the ARN the request addressed it with.
         let (arn, version_count, encryption_configuration) = {
             let workflow = store
                 .workflow_in(&region, &input.workflow_arn)
@@ -253,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         UpdateWorkflowErrorModeled::ResourceNotFoundException(
                             crate::state::unresolved(
                                 crate::state::UnresolvedEntity::Workflow,
-                                &input.workflow_arn,
+                                crate::state::workflow_resource_id(&input.workflow_arn),
                             ),
                         ),
                     )
@@ -289,7 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::MAX_VERSIONS_PER_WORKFLOW
                     ),
                     resource_id: arn.clone(),
-                    resource_type: "workflow-version".to_string(),
+                    resource_type: crate::state::WORKFLOW_VERSION_RESOURCE_TYPE.to_string(),
                     service_code: crate::state::ARN_NAMESPACE.to_string(),
                     quota_code: "VersionsPerWorkflow".to_string(),
                 },
@@ -369,7 +371,7 @@ fn tearing_down(workflow_arn: &str) -> UpdateWorkflowError {
             crate::state::WORKFLOW_STATUS_DELETING
         ),
         resource_id: workflow_arn.to_string(),
-        resource_type: "workflow".to_string(),
+        resource_type: crate::state::WORKFLOW_RESOURCE_TYPE.to_string(),
     })
     .into()
 }

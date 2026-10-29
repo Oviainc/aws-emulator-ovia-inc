@@ -214,14 +214,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A reference that resolves to nothing is a lookup miss, and the entity THIS
         // operation resolves is the workflow itself. A workflow of ANOTHER region is
-        // not one this endpoint holds, so its ARN resolves to nothing here either.
+        // not one this endpoint holds, so its ARN resolves to nothing here either. The
+        // refusal names the workflow by its OWN identifier, the ARN's resource-id
+        // segment, not by the ARN the request addressed it with.
         let workflow = store
             .workflow_in(&region, &input.workflow_arn)
             .ok_or_else(|| {
                 crate::state::lookup_miss(DeleteWorkflowErrorModeled::ResourceNotFoundException(
                     crate::state::unresolved(
                         crate::state::UnresolvedEntity::Workflow,
-                        &input.workflow_arn,
+                        crate::state::workflow_resource_id(&input.workflow_arn),
                     ),
                 ))
             })?;
@@ -238,7 +240,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     DeleteWorkflowErrorModeled::ResourceNotFoundException(
                         crate::state::unresolved(
                             crate::state::UnresolvedEntity::version_for(requested),
-                            requested.unwrap_or(&input.workflow_arn),
+                            // The version named, else the workflow whose versions were
+                            // asked for — by its own identifier, as above.
+                            requested.unwrap_or_else(|| {
+                                crate::state::workflow_resource_id(&input.workflow_arn)
+                            }),
                         ),
                     ),
                 )

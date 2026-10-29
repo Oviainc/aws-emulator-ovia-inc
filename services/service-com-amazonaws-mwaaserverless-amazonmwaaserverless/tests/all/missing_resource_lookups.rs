@@ -49,11 +49,13 @@ const NAMED_VERSION_MISSING: &str = "Unable to find the requested version";
 /// fixture (GetWorkflowRun).
 const RUN_MISSING: &str = "Workflow run not found";
 
-/// The `ResourceType` each entity reports. `ResourceId` and `ResourceType` are
-/// **required** members of `ResourceNotFoundException`
+/// The `ResourceType` each entity reports: the AWS resource name of its class, as the
+/// recorded service answers it (fixture
+/// `mwaa-serverless-resource-not-found-errors`: `Workflow`). `ResourceId` and
+/// `ResourceType` are **required** members of `ResourceNotFoundException`
 /// (`smithy_query(query="shape", shape="ResourceNotFoundException")`), so a refusal
 /// must carry both.
-const RESOURCE_TYPES: &[&str] = &["workflow", "workflow-version", "workflow-run"];
+const RESOURCE_TYPES: &[&str] = &["Workflow", "WorkflowVersion", "WorkflowRun"];
 
 /// One row of the table: a call whose reference resolves to nothing.
 struct Case {

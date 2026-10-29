@@ -1582,6 +1582,49 @@ impl WorkflowConfigurationView<'_> {
     }
 }
 
+/// The `ResourceType` an error document of this service reports for a workflow.
+///
+/// A type token names the resource CLASS by its AWS resource name — the capitalised
+/// entity name, exactly as the recorded service answers it (fixture
+/// `mwaa-serverless-resource-not-found-errors`: `UpdateWorkflow`,
+/// `ListTagsForResource`, `TagResource` and `UntagResource` each report `Workflow`
+/// for a workflow nothing holds) — and never a lowercased or hyphenated spelling of
+/// it, so a client matching on the class sees the token AWS publishes. The model's own
+/// name for the class is the same word: its resource shape is `WorkflowResource`,
+/// identified by `WorkflowArn`
+/// (`smithy_query(query="shape", shape="WorkflowResource")`).
+pub const WORKFLOW_RESOURCE_TYPE: &str = "Workflow";
+
+/// The `ResourceType` for one version of a workflow, the class named as the model
+/// names it (`WorkflowVersion` / `WorkflowVersionSummary`,
+/// `smithy_query(query="shape", shape="WorkflowVersion,WorkflowVersionSummary")`).
+pub const WORKFLOW_VERSION_RESOURCE_TYPE: &str = "WorkflowVersion";
+
+/// The `ResourceType` for one run of a workflow, the class named as the model names it
+/// (`WorkflowRunSummary`, `smithy_query(query="shape", shape="WorkflowRunSummary")`).
+pub const WORKFLOW_RUN_RESOURCE_TYPE: &str = "WorkflowRun";
+
+/// The `ResourceType` for one task instance of a run, the class named as the model
+/// names it (`TaskInstanceSummary`,
+/// `smithy_query(query="shape", shape="TaskInstanceSummary")`).
+pub const TASK_INSTANCE_RESOURCE_TYPE: &str = "TaskInstance";
+
+/// The workflow's OWN identifier, taken out of a `WorkflowArn`: the resource-id
+/// segment the modelled pattern places after `workflow/`
+/// (`[a-zA-Z0-9][a-zA-Z0-9.\-_]{0,254}-[a-zA-Z0-9]{10}`,
+/// `smithy_query(query="shape", shape="WorkflowArn")`).
+///
+/// A refusal reports the identifier OF the resource, not the reference a request
+/// addressed it by, so an operation that takes a `WorkflowArn` reports this segment
+/// rather than the whole ARN — a client comparing it against the id it tracks
+/// matches, and one re-composing an ARN from it does not nest a second ARN inside.
+/// A value carrying no `/` has no segment to take and is reported as it stands.
+pub fn workflow_resource_id(workflow_arn: &str) -> &str {
+    workflow_arn
+        .rsplit_once('/')
+        .map_or(workflow_arn, |(_, resource_id)| resource_id)
+}
+
 /// Mint a `WorkflowArn`: `arn:aws:airflow-serverless:<region>:<account>:workflow/<name>-<10 alnum>`,
 /// the shape the modelled `WorkflowArn` pattern requires. The 10-character suffix
 /// is the service-generated unique part the docs describe ("The service generates
@@ -1879,13 +1922,16 @@ impl UnresolvedEntity {
         }
     }
 
-    /// The `ResourceType` the refusal reports for this entity.
+    /// The `ResourceType` the refusal reports for this entity: the AWS resource name
+    /// of its class ([`WORKFLOW_RESOURCE_TYPE`] and the tokens beside it).
     pub fn resource_type(self) -> &'static str {
         match self {
-            Self::Workflow => "workflow",
-            Self::LatestWorkflowVersion | Self::NamedWorkflowVersion => "workflow-version",
-            Self::WorkflowRun => "workflow-run",
-            Self::TaskInstance => "task-instance",
+            Self::Workflow => WORKFLOW_RESOURCE_TYPE,
+            Self::LatestWorkflowVersion | Self::NamedWorkflowVersion => {
+                WORKFLOW_VERSION_RESOURCE_TYPE
+            }
+            Self::WorkflowRun => WORKFLOW_RUN_RESOURCE_TYPE,
+            Self::TaskInstance => TASK_INSTANCE_RESOURCE_TYPE,
         }
     }
 }
@@ -1895,6 +1941,12 @@ impl UnresolvedEntity {
 ///
 /// Every handler in this service funnels its lookup misses through here (wrapped by
 /// [`lookup_miss`]), so one status and one vocabulary cover them all.
+///
+/// `resource_id` is the IDENTIFIER of the entity that did not resolve — the workflow's
+/// id segment ([`workflow_resource_id`]), a version id, a run id, a task-instance id —
+/// so what the refusal reports is the resource, not the reference a request addressed
+/// it by. The tag operations, which address an untyped taggable resource and are handed
+/// nothing but its ARN, report that ARN.
 pub fn unresolved(entity: UnresolvedEntity, resource_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: entity.message().to_string(),

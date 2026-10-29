@@ -33,6 +33,8 @@ mod idempotency_token_ledger;
 mod list_page_size;
 #[path = "all/missing_resource_lookups.rs"]
 mod missing_resource_lookups;
+#[path = "all/not_found_resource_identity.rs"]
+mod not_found_resource_identity;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
 #[path = "all/resource_tag_listing.rs"]

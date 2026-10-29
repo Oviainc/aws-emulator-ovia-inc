@@ -297,7 +297,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports — so the token is remembered per operation and per region, because a
         // token presented at one regional endpoint says nothing about what another
         // endpoint created. All this handler keeps is how it answers from the record.
-        let tokens = crate::state::TokenLedger::of(Self::NAME, "workflow", &region);
+        let tokens = crate::state::TokenLedger::of(
+            Self::NAME,
+            crate::state::WORKFLOW_RESOURCE_TYPE,
+            &region,
+        );
         let replayed = tokens
             .replay(
                 &store.idempotency,
@@ -336,7 +340,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreateWorkflowErrorModeled::ConflictException(ConflictException {
                     message,
                     resource_id: existing,
-                    resource_type: "workflow".to_string(),
+                    resource_type: crate::state::WORKFLOW_RESOURCE_TYPE.to_string(),
                 })
                 .into(),
             );
@@ -352,7 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::MAX_WORKFLOWS
                     ),
                     resource_id: input.name.clone(),
-                    resource_type: "workflow".to_string(),
+                    resource_type: crate::state::WORKFLOW_RESOURCE_TYPE.to_string(),
                     service_code: crate::state::ARN_NAMESPACE.to_string(),
                     quota_code: "WorkflowsPerAccount".to_string(),
                 },

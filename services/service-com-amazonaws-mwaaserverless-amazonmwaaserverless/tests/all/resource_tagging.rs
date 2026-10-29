@@ -463,8 +463,8 @@ async fn an_arn_this_endpoint_holds_no_resource_for_is_a_lookup_miss() {
         );
         assert_eq!(
             answered["ResourceType"].as_str(),
-            Some("workflow"),
-            "case {arn:?}: expected ResourceType \"workflow\", got {:?}",
+            Some("Workflow"),
+            "case {arn:?}: expected ResourceType \"Workflow\", got {:?}",
             answered["ResourceType"]
         );
     }

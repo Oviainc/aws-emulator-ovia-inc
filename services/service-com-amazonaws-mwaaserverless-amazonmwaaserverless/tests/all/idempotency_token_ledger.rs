@@ -35,13 +35,13 @@ fn rows() -> Vec<Row> {
         Row {
             case: "CreateWorkflow mints a workflow",
             operation: "CreateWorkflow",
-            resource_type: "workflow",
+            resource_type: "Workflow",
             identity_member: "WorkflowArn",
         },
         Row {
             case: "StartWorkflowRun starts a run",
             operation: "StartWorkflowRun",
-            resource_type: "workflow-run",
+            resource_type: "WorkflowRun",
             identity_member: "RunId",
         },
     ]
