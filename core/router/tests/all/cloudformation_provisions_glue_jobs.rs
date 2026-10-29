@@ -34,6 +34,11 @@
 //!
 //! The awsQuery form encoder and the XML readers are the test crate's own
 //! ([`crate::query_wire`]), not another copy.
+//!
+//! The router this suite mounts and the two wire helpers over it are `pub(crate)` for the
+//! same reason: the suite beside this one that deploys ONE stack name into two Regions
+//! ([`crate::cloudformation_glue_job_redeploy_across_regions`]) drives exactly these two
+//! wires, so it calls these rather than carrying a second copy.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -50,11 +55,11 @@ use crate::query_wire::{element, form_encode, opt_element, outputs_of, physical_
 /// so the stack reports the deployment it completed. Neither an IAM role nor a Glue job
 /// definition has a transient status of its own: each create answers with a resource that
 /// is usable at once.
-const PAST_STACK_SPAN: Duration = Duration::from_millis(1_200);
+pub(crate) const PAST_STACK_SPAN: Duration = Duration::from_millis(1_200);
 
 /// The account id every ARN this emulator mints carries, which the `Fn::Sub` row's job name
 /// is derived from.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The longest job name AWS Glue accepts (`NameString`, `@length(min: 1, max: 255)` in that
 /// service's own model), which a GENERATED name is held to.
@@ -78,7 +83,7 @@ const STACK_TAG: (&str, &str) = ("Stack", "glue-job-suite");
 /// as `core/router/src/lib.rs` mounts them. Request authentication is off, as in every other
 /// suite here; the in-process callback CloudFormation makes signs its request either way
 /// (the credential scope is what routes it).
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -109,7 +114,7 @@ fn authorization(service: &str, region: &str) -> String {
 }
 
 /// Call one CloudFormation operation over its awsQuery wire, signed for `region`.
-async fn cloudformation(
+pub(crate) async fn cloudformation(
     router: &MultiServiceRouter,
     region: &str,
     action: &str,
@@ -136,7 +141,7 @@ async fn cloudformation(
 }
 
 /// Call one AWS Glue operation over its awsJson1_1 wire, through `region`'s endpoint.
-async fn glue(
+pub(crate) async fn glue(
     router: &MultiServiceRouter,
     region: &str,
     operation: &str,
@@ -161,7 +166,7 @@ async fn glue(
 
 /// The error code an awsJson answer carries, without the namespace a `__type` may qualify
 /// it with.
-fn error_code(payload: &Value) -> String {
+pub(crate) fn error_code(payload: &Value) -> String {
     payload
         .get("__type")
         .and_then(Value::as_str)
@@ -189,12 +194,16 @@ fn foreign_region(region: &str) -> &'static str {
 /// job runs as.
 ///
 /// Written with no `&`, `=`, `+` or `%` so it travels in an awsQuery form body as written.
-const TRUST_POLICY: &str = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
+pub(crate) const TRUST_POLICY: &str = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
      \"Principal\":{\"Service\":\"glue.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}";
 
 /// The names AWS Glue reports for the job definitions `region`'s endpoint holds, sorted so
 /// the comparison is about membership.
-async fn listed_names(router: &MultiServiceRouter, case: &str, region: &str) -> Vec<String> {
+pub(crate) async fn listed_names(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+) -> Vec<String> {
     let (status, body) = glue(router, region, "ListJobs", &json!({})).await;
     assert_eq!(
         status, 200,
