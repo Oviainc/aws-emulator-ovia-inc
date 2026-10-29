@@ -24,6 +24,10 @@
 //! is `None`, and the service that asked words its own refusal — or takes its own default
 //! — from that. A duration of ZERO length IS a span and is returned as one; whether a
 //! zero-length span is usable is the asking service's rule, not this reading's.
+//!
+//! A service that has to decide whether a caller's value is a duration AT ALL — rather
+//! than how long it is — asks [`is_iso8601_duration`], which reads the same grammar
+//! through the same parser and admits the calendar designators and the signed form.
 
 use std::time::Duration;
 
@@ -45,6 +49,30 @@ pub fn iso8601_span(value: &str) -> Option<Duration> {
     // `try_from_secs_f64` is the non-panicking construction: a span a `Duration` cannot
     // hold is read as no span, exactly like a value that is no duration at all.
     Duration::try_from_secs_f64(seconds).ok()
+}
+
+/// Whether `value` IS an ISO 8601 duration — the FORM of the text, not the span it names.
+///
+/// Several AWS APIs take a duration as a plain string member and have to decide whether a
+/// caller's value is a duration at all before they store it, including the SIGNED form an
+/// API that takes an offset from the present documents (`-P3M` for three months ago). So
+/// that reading is stated here too, over the same maintained parser [`iso8601_span`] reads
+/// a span with, rather than as a second hand-written grammar: a leading `+` or `-` is the
+/// sign of the offset and what follows it is the duration.
+///
+/// Unlike [`iso8601_span`] this answers for the CALENDAR designators as well (`P1Y`,
+/// `-P3M`): a year or a month IS a duration, whatever number of days it works out to in a
+/// given calendar — only the fixed SPAN of one is undecidable, and that is the other
+/// reading's question.
+///
+/// TOTAL over every string a caller can send, and it cannot panic.
+#[must_use]
+pub fn is_iso8601_duration(value: &str) -> bool {
+    let unsigned = value
+        .strip_prefix('-')
+        .or_else(|| value.strip_prefix('+'))
+        .unwrap_or(value);
+    ::iso8601_duration::Duration::parse(unsigned).is_ok()
 }
 
 #[cfg(test)]
@@ -92,6 +120,55 @@ mod tests {
             assert_eq!(
                 actual, None,
                 "case {value:?}: expected no span, got {actual:?}"
+            );
+        }
+    }
+
+    /// The FORM reading is wider than the span reading, and the rows say where: the
+    /// calendar designators and either sign are durations, and so is a duration whose span
+    /// no `Duration` could hold, while prose, a bare designator and a value carrying text
+    /// beside the duration are not.
+    #[test]
+    fn the_form_reading_admits_every_duration_and_nothing_else() {
+        let durations = [
+            "P3M",
+            "-P3M",
+            "+P3M",
+            "P1Y",
+            "-P12M",
+            "P0D",
+            "P0M",
+            "PT5M",
+            "P1DT1H1M1S",
+            "PT0.5S",
+            "P1Y2M3DT4H5M6S",
+            "P1e30D",
+        ];
+        for value in durations {
+            assert!(
+                is_iso8601_duration(value),
+                "case {value:?}: expected an ISO 8601 duration, got false"
+            );
+        }
+
+        let not_durations = [
+            "",
+            "-",
+            "P",
+            "PT",
+            "-P",
+            "last quarter",
+            "3 months",
+            "3M",
+            "p3m",
+            "2025-07-01",
+            "P3M and a half",
+            "--P3M",
+        ];
+        for value in not_durations {
+            assert!(
+                !is_iso8601_duration(value),
+                "case {value:?}: expected no ISO 8601 duration, got true"
             );
         }
     }

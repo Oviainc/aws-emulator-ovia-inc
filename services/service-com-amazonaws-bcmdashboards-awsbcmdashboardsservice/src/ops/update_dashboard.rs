@@ -196,6 +196,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The rules a WIDGET's own configuration has to satisfy, applied here for the same
+        // reason and at the same point as on the create path: a submitted time range has
+        // to be a time period and the ids in one widget list have to be distinct
+        // (`crate::state::widget_list_refusal`). A request breaking one changes nothing —
+        // not even the members it got right, and not the widget-id counter.
+        if let Some(message) =
+            crate::state::widget_list_refusal(input.widgets.as_deref().unwrap_or_default())
+        {
+            crate::state::record_state_change(ctx, Self::NAME, &arn, "ValidationException");
+            return Err(UpdateDashboardErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
         let not_found = || {
             // The request-derived template the recorded service words THIS operation's
             // refusal with (each operation has its own); the ARN is the request's.

@@ -232,6 +232,10 @@ const MANAGED_CATALOG_UPDATED_AT: u64 = 1_787_079_600;
 /// bounds are offsets from the instant the widget is rendered rather than fixed dates.
 const DATE_TIME_TYPE_RELATIVE: &str = "RELATIVE";
 
+/// The `DateTimeType` (`DATE_TIME_TYPE_VALUES`) a time range uses when its bounds are
+/// fixed dates rather than offsets.
+const DATE_TIME_TYPE_ABSOLUTE: &str = "ABSOLUTE";
+
 /// The `Granularity` (`GRANULARITY_VALUES`) every widget in the AWS-managed catalog
 /// aggregates at: a month, which is the period a bill covers.
 const GRANULARITY_MONTHLY: &str = "MONTHLY";
@@ -1021,12 +1025,25 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     /// id minted for every one that arrived without one. `width`, `height` and
     /// `horizontalOffset` already carry the model's declared defaults (4, 7, 0),
     /// which the framework fills in before a handler runs.
+    ///
+    /// A minted id is one no widget of this list already carries: `Widget$id` is the unique
+    /// identifier of a widget, which a client may supply itself, so a supplied id that the
+    /// counter would have reached next is skipped rather than minted a second time — the
+    /// same invariant [`widget_list_refusal`] holds the supplied ids to.
     pub fn adopt_widgets(&mut self, widgets: Vec<Widget>) -> Vec<Widget> {
+        let mut taken: BTreeSet<String> = widgets
+            .iter()
+            .filter_map(|widget| widget.id.clone())
+            .collect();
         widgets
             .into_iter()
             .map(|mut widget| {
                 if widget.id.as_deref().is_none_or(str::is_empty) {
-                    widget.id = Some(self.mint_widget_id());
+                    let mut minted = self.mint_widget_id();
+                    while !taken.insert(minted.clone()) {
+                        minted = self.mint_widget_id();
+                    }
+                    widget.id = Some(minted);
                 }
                 widget
             })
@@ -1627,6 +1644,219 @@ pub fn report_text_members<'a>(
         ));
     }
     members
+}
+
+/// The instant the text of an `ABSOLUTE` [`DateTimeValue`] names, in seconds since the
+/// epoch, or `None` when the text names no point in time at all.
+///
+/// The calendar is the runtime's own (`aws_smithy_types::DateTime`, the reader this service
+/// already renders and reads its timestamps with) plus
+/// [`service_common::rfc3339::split_utc_offset`] for the numeric zone that reader does not
+/// take, so no date arithmetic and no leap-year rule is written here:
+///
+/// * a DATE alone names that date's first instant — the form the model's own example of an
+///   absolute value takes ("2025-07-01");
+/// * a value carrying a time of day names the instant it spells, in any of the zone forms
+///   RFC 3339 admits, and with no zone it is read as UTC.
+///
+/// TOTAL over every string a caller can send: a value outside those forms — prose, a
+/// calendar date that does not exist, a month without a day, epoch seconds — names no
+/// instant, and the caller refuses it.
+fn absolute_instant(value: &str) -> Option<i64> {
+    let utc_instant = |civil: &str| -> Option<i64> {
+        Some(
+            ::aws_smithy_types::DateTime::from_str(
+                civil,
+                ::aws_smithy_types::date_time::Format::DateTime,
+            )
+            .ok()?
+            .secs(),
+        )
+    };
+    if !value.contains(['T', 't']) {
+        // A date with no time part: the first instant of that date.
+        return utc_instant(&format!("{value}T00:00:00Z"));
+    }
+    match ::service_common::rfc3339::split_utc_offset(value) {
+        Some((civil, offset)) => Some(utc_instant(&format!("{civil}Z"))? - offset),
+        // No zone at all, so the civil time is the UTC one.
+        None => utc_instant(&format!("{value}Z")),
+    }
+}
+
+/// Whether `point` carries a `value` in the form its `type` names, which is what makes it
+/// a point in time rather than text.
+///
+/// `DateTimeValue` is documented as "a point in time that can be specified as either an
+/// absolute date (for example, \"2025-07-01\") or a relative time period using ISO 8601
+/// duration format (for example, \"-P3M\" for three months ago)"
+/// (`smithy_query(query="shape",shape="DateTimeValue")`), and its `type` says which of the
+/// two a given value is. `value` targets an unconstrained string, so the form is read here:
+/// an `ABSOLUTE` value has to name an instant ([`absolute_instant`]) and a `RELATIVE` one
+/// has to be an ISO 8601 duration, read by the maintained parser every service of this
+/// workspace reads one with (`service_common::iso8601_span::is_iso8601_duration`).
+///
+/// A `type` outside the enum is the BOUNDARY's refusal to word (`DateTimeType` is an
+/// enumerated shape), and no form belongs to it, so this answers `true` for one and lets
+/// that refusal stand.
+fn names_a_point_in_time(point: &DateTimeValue) -> bool {
+    match point.r#type.as_str() {
+        DATE_TIME_TYPE_ABSOLUTE => absolute_instant(&point.value).is_some(),
+        DATE_TIME_TYPE_RELATIVE => {
+            ::service_common::iso8601_span::is_iso8601_duration(&point.value)
+        }
+        _ => true,
+    }
+}
+
+/// How this service refuses the [`DateTimeValue`] at the member path `path` whose `value`
+/// is not in the form its `type` names.
+///
+/// Worded from the request, like every other refusal this service builds: the member that
+/// broke the rule, the value it carried and the form that `type` requires, named with the
+/// model's own example of it.
+fn malformed_date_time_value_message(path: &str, point: &DateTimeValue) -> String {
+    let requirement = if point.r#type == DATE_TIME_TYPE_ABSOLUTE {
+        "the value of an ABSOLUTE date/time value must be an absolute date, for example \
+         '2025-07-01'"
+    } else {
+        "the value of a RELATIVE date/time value must be a relative time period in the ISO \
+         8601 duration format, for example '-P3M' for three months ago"
+    };
+    format!(
+        "{path}.value: '{}' is not a valid {} date/time value; {requirement}",
+        point.value, point.r#type
+    )
+}
+
+/// How this service refuses the [`DateTimeRange`] at the member path `path`, or `None`
+/// when that range defines a time period.
+///
+/// `DateTimeRange` is documented as "a time period with explicit start and end times for
+/// data queries", with both bounds `@required`
+/// (`smithy_query(query="shape",shape="DateTimeRange")`), so two rules are applied here
+/// before a range is stored, in the order the request spells its members:
+///
+/// * each bound has to name a point in time in the form its `type` declares
+///   ([`names_a_point_in_time`]);
+/// * the period has to run forwards — the end may not come BEFORE the start. Only two
+///   bounds that both name a FIXED point (both `ABSOLUTE`) are ordered here: a `RELATIVE`
+///   bound names an offset resolved when the data is queried rather than a point this
+///   service holds, so nothing at write time can say which of two of them comes first.
+///   Equal bounds are a period of no length, which is a period and is accepted.
+///
+/// One helper for every write that submits a range, so a widget's `timeRange` and a
+/// scheduled report's `widgetDateRangeOverride` cannot drift apart on either rule.
+pub fn date_time_range_refusal(path: &str, range: &DateTimeRange) -> Option<String> {
+    for (member, point) in [
+        ("startTime", &range.start_time),
+        ("endTime", &range.end_time),
+    ] {
+        if !names_a_point_in_time(point) {
+            return Some(malformed_date_time_value_message(
+                &format!("{path}.{member}"),
+                point,
+            ));
+        }
+    }
+    let both_absolute = range.start_time.r#type == DATE_TIME_TYPE_ABSOLUTE
+        && range.end_time.r#type == DATE_TIME_TYPE_ABSOLUTE;
+    if both_absolute {
+        let start = absolute_instant(&range.start_time.value)?;
+        let end = absolute_instant(&range.end_time.value)?;
+        if end < start {
+            return Some(format!(
+                "{path}: endTime '{}' is earlier than startTime '{}'; a date/time range \
+                 defines a time period with explicit start and end times",
+                range.end_time.value, range.start_time.value
+            ));
+        }
+    }
+    None
+}
+
+/// The time range of one widget query, as `(the union member that carries the query, the
+/// range)`.
+///
+/// Every member of the `QueryParameters` union carries a `@required` `timeRange`
+/// (`smithy_query(query="shape",shape="QueryParameters")`), so the rules a range has to
+/// satisfy reach all five of them rather than only the cost-and-usage query.
+fn query_time_range(parameters: &QueryParameters) -> (&'static str, &DateTimeRange) {
+    match parameters {
+        QueryParameters::costAndUsage(query) => ("costAndUsage", &query.time_range),
+        QueryParameters::savingsPlansCoverage(query) => {
+            ("savingsPlansCoverage", &query.time_range)
+        }
+        QueryParameters::savingsPlansUtilization(query) => {
+            ("savingsPlansUtilization", &query.time_range)
+        }
+        QueryParameters::reservationCoverage(query) => {
+            ("reservationCoverage", &query.time_range)
+        }
+        QueryParameters::reservationUtilization(query) => {
+            ("reservationUtilization", &query.time_range)
+        }
+    }
+}
+
+/// How this service refuses the `widgets` a dashboard write submits, or `None` when every
+/// widget in the list is one this service can store.
+///
+/// Two rules, applied before anything is written — no ARN minted, no widget id consumed —
+/// so a stored dashboard never holds a widget configuration a reader would have to make
+/// sense of:
+///
+/// * the time range of every query of every config is a time period
+///   ([`date_time_range_refusal`]);
+/// * the ids in ONE list are DISTINCT. `Widget$id` is documented as "the unique identifier
+///   for the widget" (`smithy_query(query="shape",shape="Widget")`), and a client may
+///   supply it, so two widgets of one dashboard carrying one id would make every id-keyed
+///   resolution of a widget ambiguous — a scheduled report's `widgetIds`, and the
+///   `WIDGET_ID_NOT_FOUND` an execution derives from it.
+///
+/// One helper for both dashboard writes, so `CreateDashboard` and `UpdateDashboard` apply
+/// the same rules at the same member paths. A widget and a config name their 1-based
+/// position the way the framework spells a list element's path.
+pub fn widget_list_refusal(widgets: &[Widget]) -> Option<String> {
+    let position = ::aws_smithy_schema_server::constraints::path::element;
+    let widget_path = |index: usize| {
+        ::aws_smithy_schema_server::constraints::path::join(&[
+            "widgets".to_string(),
+            position(index + 1),
+        ])
+    };
+    for (index, widget) in widgets.iter().enumerate() {
+        for (config_index, config) in widget.configs.iter().enumerate() {
+            let (query_member, range) = query_time_range(&config.query_parameters);
+            let path = ::aws_smithy_schema_server::constraints::path::join(&[
+                widget_path(index),
+                "configs".to_string(),
+                position(config_index + 1),
+                "queryParameters".to_string(),
+                query_member.to_string(),
+                "timeRange".to_string(),
+            ]);
+            if let Some(message) = date_time_range_refusal(&path, range) {
+                return Some(message);
+            }
+        }
+    }
+
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (index, widget) in widgets.iter().enumerate() {
+        let Some(id) = widget.id.as_deref().filter(|id| !id.is_empty()) else {
+            // No id of its own: `adopt_widgets` mints one, and a minted id is fresh.
+            continue;
+        };
+        if !seen.insert(id) {
+            return Some(format!(
+                "{}.id: '{id}' is already the id of another widget in this dashboard; the \
+                 identifier of a widget must be unique within the dashboard",
+                widget_path(index)
+            ));
+        }
+    }
+    None
 }
 
 /// Encode the ARN a listing page resumes at as an opaque `nextToken`.

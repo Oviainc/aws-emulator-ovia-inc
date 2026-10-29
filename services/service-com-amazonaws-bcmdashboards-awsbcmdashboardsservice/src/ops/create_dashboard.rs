@@ -200,6 +200,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The rules a WIDGET's own configuration has to satisfy, which the boundary
+        // validator cannot state either: a time range whose bounds are points in time of
+        // the form their `type` names and that runs forwards, and widget ids that are
+        // distinct within the list (`crate::state::widget_list_refusal`). A request
+        // breaking one is refused with this operation's modelled `ValidationException`
+        // (400) and creates NOTHING: no ARN is minted and no widget id consumed.
+        if let Some(message) = crate::state::widget_list_refusal(&input.widgets) {
+            crate::state::record_state_change(ctx, Self::NAME, "-", "ValidationException");
+            return Err(CreateDashboardErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
         // Tag-on-create takes caller-supplied tag keys, so the reserved `aws:` namespace
         // is refused here exactly as `TagResource` refuses it: a request naming such a key
         // creates NO dashboard at all — no ARN is minted and no widget id consumed — rather

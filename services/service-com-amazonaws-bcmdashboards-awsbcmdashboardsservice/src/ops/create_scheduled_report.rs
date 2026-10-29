@@ -236,6 +236,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A `widgetDateRangeOverride` is a submitted `DateTimeRange`, so it satisfies the
+        // same two rules a widget's own time range does — bounds in the form their `type`
+        // names, and a period that runs forwards (`crate::state::date_time_range_refusal`).
+        // A request breaking one creates NO report: no ARN is minted and its `clientToken`
+        // stays free.
+        if let Some(message) = requested.widget_date_range_override.as_ref().and_then(|range| {
+            crate::state::date_time_range_refusal("scheduledReport.widgetDateRangeOverride", range)
+        }) {
+            crate::state::record_state_change(ctx, Self::NAME, "-", "ValidationException");
+            return Err(CreateScheduledReportErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
         // The `@idempotencyToken` is what it is modelled as: "A unique, case-sensitive
         // identifier that you provide to ensure the idempotency of the request". A call
         // presenting a token an earlier create already recorded is that same request

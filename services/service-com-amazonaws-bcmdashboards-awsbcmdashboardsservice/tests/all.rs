@@ -75,3 +75,5 @@ mod update_dashboard_partial_update;
 mod update_scheduled_report;
 #[path = "all/validation_pattern_rendering.rs"]
 mod validation_pattern_rendering;
+#[path = "all/widget_time_range_validation.rs"]
+mod widget_time_range_validation;

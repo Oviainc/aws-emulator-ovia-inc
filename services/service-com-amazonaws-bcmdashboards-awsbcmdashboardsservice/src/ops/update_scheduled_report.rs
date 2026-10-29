@@ -235,6 +235,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A `widgetDateRangeOverride` is a submitted `DateTimeRange`, so it satisfies the
+        // same two rules a widget's own time range does — bounds in the form their `type`
+        // names, and a period that runs forwards (`crate::state::date_time_range_refusal`)
+        // — and, like a malformed name, it is refused whether or not the ARN it names
+        // resolves, leaving every stored record as it was.
+        if let Some(message) = input.widget_date_range_override.as_ref().and_then(|range| {
+            crate::state::date_time_range_refusal("widgetDateRangeOverride", range)
+        }) {
+            crate::state::record_state_change(ctx, Self::NAME, &arn, "ValidationException");
+            return Err(UpdateScheduledReportErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
         // Resolve the resource this call addresses FIRST: an ARN no report is stored
         // under is refused before any other member is looked at, and nothing is written
         // on that path.
