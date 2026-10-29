@@ -223,8 +223,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.time_out_due_executions(&input.thing_name, now);
 
         // Pending is "IN_PROGRESS or QUEUED", as this operation documents; an
-        // already-started execution is resumed before a queued one is started.
-        let Some(index) = state.next_pending_index(&input.thing_name) else {
+        // already-started execution is resumed before a queued one is started. This
+        // request models no `executionNumber`, so it names no particular execution
+        // and every pending one is a candidate.
+        let Some(index) = state.next_pending_index(&input.thing_name, None) else {
             // No pending execution for this thing: nothing was started, so there
             // is no execution to report — reported as a null `execution`, which is
             // this service's wire form for a member it has no value for.

@@ -186,7 +186,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.time_out_due_executions(&input.thing_name, now);
 
         // ONE lookup, so a job the store does not hold has exactly one answer:
-        // 404. `$next` resolves to the thing's next pending execution.
+        // 404. `$next` resolves to the thing's next pending execution, and
+        // `executionNumber` — "a number that identifies a particular job execution
+        // on a particular device" — selects whichever label named the job: with one,
+        // only the executions carrying that number can be resolved, so this read
+        // never reports an execution the request did not name, and a number the
+        // thing holds no (pending, for `$next`) execution for is the same 404.
         let Some(record) =
             state.resolve_record(&input.thing_name, &input.job_id, input.execution_number)
         else {

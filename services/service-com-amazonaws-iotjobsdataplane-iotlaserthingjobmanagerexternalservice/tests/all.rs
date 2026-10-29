@@ -19,6 +19,8 @@ mod command_execution_concurrency;
 mod command_execution_validation;
 #[path = "all/describe_job_execution_against_the_clock.rs"]
 mod describe_job_execution_against_the_clock;
+#[path = "all/describe_next_honours_the_execution_number.rs"]
+mod describe_next_honours_the_execution_number;
 #[path = "all/job_execution_lifecycle.rs"]
 mod job_execution_lifecycle;
 #[path = "all/job_execution_state_machine.rs"]

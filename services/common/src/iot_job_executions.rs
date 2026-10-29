@@ -587,11 +587,25 @@ impl JobExecutionStore {
     /// Index of the thing's next pending execution: an already-started
     /// (`IN_PROGRESS`) execution before any `QUEUED` one, oldest-queued first within
     /// each group, enqueue order breaking a tie.
-    pub fn next_pending_index(&self, thing_name: &str) -> Option<usize> {
+    ///
+    /// `execution_number` is the SELECTOR the request sent, exactly as it is on
+    /// [`Self::execution_index`]: with one, only the pending executions carrying that
+    /// `executionNumber` are candidates, so a caller naming "a particular job
+    /// execution on a particular device" is never handed a different one, and a
+    /// number the thing holds no pending execution for resolves to nothing. Without
+    /// one every pending execution is a candidate. It is a PARAMETER rather than a
+    /// filter the caller applies afterwards so the next pending execution is chosen
+    /// from what the request asked for and not from what it did not.
+    pub fn next_pending_index(
+        &self,
+        thing_name: &str,
+        execution_number: Option<i64>,
+    ) -> Option<usize> {
         self.executions_for(thing_name)
             .iter()
             .enumerate()
             .filter(|(_, record)| record.is_pending())
+            .filter(|(_, record)| execution_number.is_none_or(|n| record.execution_number == n))
             .min_by_key(|(position, record)| {
                 let group = u8::from(record.status != STATUS_IN_PROGRESS);
                 (group, record.queued_at, *position)
@@ -620,6 +634,12 @@ impl JobExecutionStore {
 
     /// Index of the execution a `jobId` label resolves to, resolving `$next` to the
     /// thing's next pending execution.
+    ///
+    /// `execution_number` selects on BOTH labels — it names one execution of the
+    /// thing, and which label the request used to reach it does not change which
+    /// execution that is — so the two branches differ only in the candidates they
+    /// order (the named job's executions, or the thing's pending ones) and in the
+    /// default they take when the request named no number.
     pub fn resolve_index(
         &self,
         thing_name: &str,
@@ -627,7 +647,7 @@ impl JobExecutionStore {
         execution_number: Option<i64>,
     ) -> Option<usize> {
         if job_id == NEXT_JOB_ID {
-            self.next_pending_index(thing_name)
+            self.next_pending_index(thing_name, execution_number)
         } else {
             self.execution_index(thing_name, job_id, execution_number)
         }
