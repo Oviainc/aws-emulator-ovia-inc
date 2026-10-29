@@ -91,6 +91,8 @@ mod topic_apis_serverless_gate;
 mod topic_lifecycle;
 #[path = "all/topic_replication.rs"]
 mod topic_replication;
+#[path = "all/vpc_connection_contention.rs"]
+mod vpc_connection_contention;
 #[path = "all/vpc_connection_lifecycle.rs"]
 mod vpc_connection_lifecycle;
 #[path = "all/vpc_connection_listing.rs"]

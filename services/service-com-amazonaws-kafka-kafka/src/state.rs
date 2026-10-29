@@ -1103,8 +1103,9 @@ impl ServerlessConfig {
 /// Stored, never slept on — [`Cluster::settle`] materialises it.
 #[derive(Debug, Clone)]
 pub struct PendingUpdate {
-    /// `ClusterInfo$ActiveOperationArn` while the operation runs, and the
-    /// `ClusterOperationArn` the update call answered with.
+    /// The active operation's ARN while the operation runs — reported as
+    /// `ClusterInfo$ActiveOperationArn` and as `Cluster$ActiveOperationArn` —
+    /// and the `ClusterOperationArn` the update call answered with.
     pub operation_arn: String,
     /// When the operation is due to finish.
     pub due: SystemTime,
@@ -5090,16 +5091,27 @@ impl Cluster {
         )
     }
 
+    /// The ARN of the cluster operation in flight on this cluster, while one is:
+    /// the ARN the update call that started it answered with, and `None` once the
+    /// clock has made that update due.
+    ///
+    /// The in-flight operation is part of the STORED cluster record, so every
+    /// reader of a cluster reports it off this one accessor: the `ClusterInfo`
+    /// view (`DescribeCluster`, `ListClusters`) and the `Cluster` view
+    /// (`DescribeClusterV2`, `ListClustersV2`) cannot disagree about which
+    /// operation a cluster has in flight, and a client that tracks an update
+    /// through either reader sees the same ARN.
+    pub fn active_operation_arn(&self) -> Option<String> {
+        self.pending_update
+            .as_ref()
+            .map(|update| update.operation_arn.clone())
+    }
+
     /// The cluster as `ClusterInfo`, the shape both `DescribeCluster` and
     /// `ListClusters` report.
     pub fn to_cluster_info(&self) -> ClusterInfo {
         ClusterInfo {
-            // The operation in flight on the cluster, while one is: this is the
-            // ARN the update call that started it answered with.
-            active_operation_arn: self
-                .pending_update
-                .as_ref()
-                .map(|update| update.operation_arn.clone()),
+            active_operation_arn: self.active_operation_arn(),
             broker_node_group_info: Some(self.broker_node_group_info.clone()),
             rebalancing: self.rebalancing.clone(),
             client_authentication: self.client_authentication.clone(),
@@ -5132,7 +5144,7 @@ impl Cluster {
     /// built from, so the V1 and V2 views of one cluster cannot disagree.
     pub fn to_cluster_v2(&self) -> crate::ops::types::Cluster {
         crate::ops::types::Cluster {
-            active_operation_arn: None,
+            active_operation_arn: self.active_operation_arn(),
             cluster_type: Some(self.cluster_type.clone()),
             cluster_arn: Some(self.arn.clone()),
             cluster_name: Some(self.name.clone()),
