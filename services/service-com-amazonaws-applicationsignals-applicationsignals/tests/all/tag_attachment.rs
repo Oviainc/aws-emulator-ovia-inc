@@ -42,7 +42,10 @@ const SLO_RESOURCE_TYPE: &str = "Slo";
 
 /// `POST /tag-resource` with the given `ResourceArn` and `Tags`
 /// (`smithy_query(query="operation",operation="TagResource")`: `POST /tag-resource`).
-async fn tag_resource(
+///
+/// `pub(crate)` so the other suites in this test target attach tags through the one helper
+/// rather than re-deriving the request.
+pub(crate) async fn tag_resource(
     router: &MultiServiceRouter,
     resource_arn: &str,
     tags: &[(String, String)],

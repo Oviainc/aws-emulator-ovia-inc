@@ -314,9 +314,10 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     ///
     /// An instrumentation configuration is tagged too (`CreateInstrumentationConfiguration`
     /// takes a `TagList`), and its ARN carries the service and environment names, which may
-    /// themselves contain `/` — so it is resolved by comparing against the ARN each stored
-    /// record was minted with rather than by taking the identity apart again. The scan is
-    /// bounded by [`MAX_INSTRUMENTATION_CONFIGURATIONS`].
+    /// themselves contain `/` and `:` — so it is resolved by comparing against the ARN each
+    /// stored record was minted with ([`names_stored_resource`], which compares the identity
+    /// an ARN spells rather than taking it apart again) instead of re-deriving the identity.
+    /// The scan is bounded by [`MAX_INSTRUMENTATION_CONFIGURATIONS`].
     pub fn tagged_resource_arn(&self, resource_arn: &str) -> Option<&str> {
         if let Some(arn) = tagged_slo_name_in_arn(resource_arn)
             .and_then(|name| self.slos.get(name))
@@ -327,7 +328,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         self.instrumentation_configurations
             .values()
             .flat_map(|set| set.configurations.values())
-            .find(|configuration| configuration.arn == resource_arn)
+            .find(|configuration| names_stored_resource(resource_arn, &configuration.arn))
             .map(|configuration| configuration.arn.as_str())
     }
 
@@ -608,22 +609,54 @@ pub fn slo_name_in_arn(arn: &str) -> Option<&str> {
 /// Stricter than [`slo_name_in_arn`], because `ResourceArn` is a bare `AmazonResourceName`:
 /// the model puts no pattern on it, so nothing before the handler rejects an ARN of another
 /// service or another account, and an ARN that merely CARRIES an SLO-shaped resource field
-/// (`arn:aws:s3:::slo/x`) names no resource here. The VENDOR field must be this service's
-/// namespace (`SIGNING_NAME`, which the modelled `ServiceLevelObjectiveArn` pattern spells)
-/// — which is what `service_common::arn::parse_of` narrows a parse to — and the account
-/// field must be the account this store holds ([`names_other_account`]). A
-/// `ServiceLevelObjectiveId` needs neither check: its modelled pattern already fixes the
-/// namespace before a handler runs.
+/// (`arn:aws:s3:::slo/x`) names no resource here. That narrowing — the VENDOR field is this
+/// service's namespace and the ACCOUNT field the one this store holds — is
+/// [`tagged_resource_field`]'s, the one every caller-supplied `ResourceArn` of this service
+/// passes through. A `ServiceLevelObjectiveId` needs neither check: its modelled pattern
+/// already fixes the namespace before a handler runs.
 ///
-/// The REGION field is not compared, for the reason the store's own doc gives: this process
-/// holds one account's and one Region's records, and the region in a minted ARN is a
+/// The REGION field is not compared, for the reason [`tagged_resource_field`] gives: this
+/// process holds one account's and one Region's records, and the region in a minted ARN is a
 /// rendering of the writer's SigV4 scope rather than part of an SLO's identity.
 pub fn tagged_slo_name_in_arn(resource_arn: &str) -> Option<&str> {
-    let arn = ::service_common::arn::parse_of(resource_arn, SIGNING_NAME)?;
-    if names_other_account(Some(arn.account)) {
-        return None;
-    }
+    // The narrowing to this service's namespace and this account, which every ARN this
+    // service resolves is held to; the name itself then comes out of the RESOURCE field.
+    tagged_resource_field(resource_arn)?;
     slo_name_in_arn(resource_arn)
+}
+
+/// The RESOURCE field of `resource_arn` when that ARN addresses a resource of THIS service
+/// and account, and `None` for any other value — the one narrowing every caller-supplied
+/// `ResourceArn` of this service passes through, whichever KIND of resource it names.
+///
+/// The VENDOR field must be this service's namespace (`SIGNING_NAME`) and the ACCOUNT field
+/// the account this store holds ([`names_other_account`]), because a bare
+/// `AmazonResourceName` carries no modelled pattern: nothing before a handler rejects an ARN
+/// of another service or another account.
+///
+/// The REGION and PARTITION fields are NOT part of what an ARN identifies here: this process
+/// holds one account's and one Region's records, so those fields render the writer's SigV4
+/// credential scope rather than the resource's identity, and both the modelled
+/// `InstrumentationConfigurationArn` pattern (`^arn:[^:]+:application-signals:[^:]+:…`) and
+/// the `ServiceLevelObjectiveArn` one leave the Region unconstrained. What is left is the
+/// resource field, which is the whole identity an ARN of this service spells.
+pub fn tagged_resource_field(resource_arn: &str) -> Option<&str> {
+    let arn = ::service_common::arn::parse_of(resource_arn, SIGNING_NAME)?;
+    (!names_other_account(Some(arn.account))).then_some(arn.resource)
+}
+
+/// Whether the caller-supplied `resource_arn` names the resource a stored record was minted
+/// under `stored_arn` for.
+///
+/// The comparison is on the RESOURCE field each ARN carries ([`tagged_resource_field`]): the
+/// field is compared WHOLE, so a service or environment name that itself contains `/` or `:`
+/// (which the modelled `InstrumentationConfigurationArn` doc calls out) needs no taking the
+/// identity apart again, while the region and partition a caller spelled do not narrow the
+/// match — the same rule [`tagged_slo_name_in_arn`] applies to the service's other kind, so
+/// one ARN resolves one stored resource whatever credential scope minted the spelling.
+pub fn names_stored_resource(resource_arn: &str, stored_arn: &str) -> bool {
+    tagged_resource_field(resource_arn)
+        .is_some_and(|resource| ::service_common::arn::resource(stored_arn) == Some(resource))
 }
 
 /// The ARN of the SLO called `name` in `region`, in the shape the modelled
@@ -4897,8 +4930,9 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// that "determines which backing store to query": an ARN naming a configuration of the
     /// OTHER type names nothing in the store the request addressed. The ARN is matched
     /// against the one each stored record was minted with, rather than by taking the identity
-    /// apart again, because a service or environment name may itself contain `/` (the same
-    /// reason [`Self::tagged_resource_arn`] compares whole ARNs). The scan is bounded by
+    /// apart again, because a service or environment name may itself contain `/` or `:` — the
+    /// comparison [`names_stored_resource`] makes, so this delete resolves an ARN exactly as
+    /// [`Self::tagged_resource_arn`] does. The scan is bounded by
     /// [`MAX_INSTRUMENTATION_CONFIGURATIONS`].
     pub fn locate_instrumentation_configuration(
         &self,
@@ -4913,7 +4947,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
                     .iter()
                     .map(move |(key, configuration)| (scope, key, configuration))
             })
-            .find(|(_, _, configuration)| configuration.arn == arn)
+            .find(|(_, _, configuration)| names_stored_resource(arn, &configuration.arn))
             .map(|(scope, key, _)| (scope.clone(), key.clone()))
     }
 }

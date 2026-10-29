@@ -109,6 +109,8 @@ mod state_roundtrip;
 mod stated_instant_rendering;
 #[path = "all/tag_attachment.rs"]
 mod tag_attachment;
+#[path = "all/tagged_arn_identity.rs"]
+mod tagged_arn_identity;
 #[path = "all/time_ranged_reads.rs"]
 mod time_ranged_reads;
 #[path = "all/unissued_next_token.rs"]
