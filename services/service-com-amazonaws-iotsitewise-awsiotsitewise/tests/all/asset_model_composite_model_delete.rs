@@ -705,6 +705,290 @@ async fn a_surviving_formula_that_reads_a_doomed_property_refuses_the_delete() {
     }
 }
 
+/// The `assetModelCompositeModelProperties`/`assetModelProperties` definitions
+/// honour a caller-supplied `id`, so the rows below can name the property the
+/// component model lends before anything mints an id for it.
+const LENT_PROPERTY_ID: &str = "11111111-2222-4333-8444-555555555555";
+
+/// A `metric` property definition averaging whatever `variable` reads, under
+/// `name` — the smallest formula-carrying property the dependency rule looks at
+/// (`smithy_query(query="shape", shape="Metric")`: an expression, its variables
+/// and a window).
+fn metric_property(name: &str, variable: Value) -> Value {
+    json!({
+        "name": name,
+        "dataType": "DOUBLE",
+        "type": {"metric": {
+            "expression": "avg(lent)",
+            "variables": [{"name": "lent", "value": variable}],
+            "window": {"tumbling": {"interval": "1h"}},
+        }},
+    })
+}
+
+/// `POST /asset-models` with the whole request body, for the rows that vary the
+/// model's type and its own properties.
+async fn create_model_from(router: &MultiServiceRouter, case: &str, body: Value) -> String {
+    let (status, created) = call(router, "POST", "/asset-models", Some(body)).await;
+    assert_eq!(
+        status, 202,
+        "case {case:?}: CreateAssetModel got {status} {created}"
+    );
+    created["assetModelId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: CreateAssetModel minted no id: {created}"))
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_formula_reading_a_property_a_component_model_lends_refuses_the_delete() {
+    /// Where the surviving formula sits, and how it names the property the
+    /// deleted composite model contributed.
+    #[derive(Debug, Clone, Copy)]
+    enum Row {
+        /// A `metric` on a SIBLING composite model naming the property by
+        /// `propertyId`.
+        SiblingMetricById,
+        /// A `transform` on a sibling whose `propertyPath` names the property
+        /// itself, rather than the composite model that contributes it.
+        SiblingTransformByPath,
+        /// A `metric` the asset model carries DIRECTLY, outside any composite
+        /// model.
+        ModelMetricById,
+        /// The formula is the COMPONENT model's own, over its own property: the
+        /// component model goes on exposing it, so nothing dangles.
+        ComponentModelOwnMetric,
+        /// A second composite model of the same asset model reuses the same
+        /// component model, so the asset model still exposes the property.
+        SecondCompositeLendsItToo,
+    }
+
+    // Every row: the surviving formula, the status the delete must answer, and
+    // — for a refusal — the name of the property it must name.
+    for (case, row, expected_status, referrer) in [
+        (
+            "a sibling composite model's metric naming the lent property by id",
+            Row::SiblingMetricById,
+            400,
+            "Average",
+        ),
+        (
+            "a sibling composite model's transform naming it through a property path",
+            Row::SiblingTransformByPath,
+            400,
+            "Doubled",
+        ),
+        (
+            "the asset model's own metric naming it by id",
+            Row::ModelMetricById,
+            400,
+            "ModelAverage",
+        ),
+        (
+            "the component model's own metric over its own property",
+            Row::ComponentModelOwnMetric,
+            202,
+            "",
+        ),
+        (
+            "a second composite model that lends the same property",
+            Row::SecondCompositeLendsItToo,
+            202,
+            "",
+        ),
+    ] {
+        let router = router();
+
+        // The COMPONENT_MODEL whose properties a component-model-based
+        // composite model reuses. One row gives it a formula of its own.
+        let mut component_properties = vec![json!({
+            "id": LENT_PROPERTY_ID,
+            "name": "Setpoint",
+            "dataType": "DOUBLE",
+            "type": {"measurement": {}},
+        })];
+        if matches!(row, Row::ComponentModelOwnMetric) {
+            component_properties.push(metric_property(
+                "PumpAverage",
+                json!({"propertyId": LENT_PROPERTY_ID}),
+            ));
+        }
+        let component_id = create_model_from(
+            &router,
+            case,
+            json!({
+                "assetModelName": "Pump",
+                "assetModelType": "COMPONENT_MODEL",
+                "assetModelProperties": component_properties,
+            }),
+        )
+        .await;
+
+        let model_properties = match row {
+            Row::ModelMetricById => vec![metric_property(
+                "ModelAverage",
+                json!({"propertyId": LENT_PROPERTY_ID}),
+            )],
+            _ => Vec::new(),
+        };
+        let model_id = create_model_from(
+            &router,
+            case,
+            json!({
+                "assetModelName": "Boiler",
+                "assetModelProperties": model_properties,
+            }),
+        )
+        .await;
+
+        // The composite model under test: component-model-based, so it stores
+        // no properties of its own and contributes the component model's.
+        let (status, created) = create_composite(
+            &router,
+            &model_id,
+            json!({
+                "assetModelCompositeModelName": "ThePump",
+                "assetModelCompositeModelType": "CUSTOM",
+                "composedAssetModelId": &component_id,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: create the component-model-based composite got {status} {created}"
+        );
+        let source_id = created["assetModelCompositeModelId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: create minted no id: {created}"))
+            .to_string();
+
+        // The premise every row rests on: the composite model REPORTS the
+        // property it contributes, under the component model's property id.
+        let (status, described) = describe_composite(&router, &model_id, &source_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: describe the source got {status} {described}"
+        );
+        let contributed: Vec<&str> = described["assetModelCompositeModelProperties"]
+            .as_array()
+            .map(|list| list.iter().filter_map(|entry| entry["id"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            contributed.contains(&LENT_PROPERTY_ID),
+            "case {case:?}: the composite model must contribute {LENT_PROPERTY_ID}, got {described}"
+        );
+
+        // The surviving formula, where the row puts it.
+        let sibling = match row {
+            Row::SiblingMetricById | Row::SecondCompositeLendsItToo => Some(metric_property(
+                "Average",
+                json!({"propertyId": LENT_PROPERTY_ID}),
+            )),
+            Row::SiblingTransformByPath => Some(json!({
+                "name": "Doubled",
+                "dataType": "DOUBLE",
+                "type": {"transform": {
+                    "expression": "lent * 2",
+                    "variables": [{"name": "lent", "value": {"propertyPath": [
+                        {"id": LENT_PROPERTY_ID, "name": "Setpoint"},
+                    ]}}],
+                }},
+            })),
+            Row::ModelMetricById | Row::ComponentModelOwnMetric => None,
+        };
+        if let Some(property) = sibling {
+            let (status, created) = create_composite(
+                &router,
+                &model_id,
+                json!({
+                    "assetModelCompositeModelName": "Derived",
+                    "assetModelCompositeModelType": "CUSTOM",
+                    "assetModelCompositeModelProperties": [property],
+                }),
+            )
+            .await;
+            assert_eq!(
+                status, 202,
+                "case {case:?}: create the referrer got {status} {created}"
+            );
+        }
+        // The row that keeps the property exposed by another route.
+        let mut second_source = None;
+        if matches!(row, Row::SecondCompositeLendsItToo) {
+            let (status, created) = create_composite(
+                &router,
+                &model_id,
+                json!({
+                    "assetModelCompositeModelName": "TheOtherPump",
+                    "assetModelCompositeModelType": "CUSTOM",
+                    "composedAssetModelId": &component_id,
+                }),
+            )
+            .await;
+            assert_eq!(
+                status, 202,
+                "case {case:?}: create the second reuse got {status} {created}"
+            );
+            second_source = created["assetModelCompositeModelId"]
+                .as_str()
+                .map(str::to_string);
+        }
+
+        let (status, answered) = delete_composite(&router, &model_id, &source_id, &[]).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected {expected_status}, got {status} {answered}"
+        );
+        if expected_status == 400 {
+            assert_eq!(
+                error_code(&answered),
+                "InvalidRequestException",
+                "case {case:?}: expected InvalidRequestException, got {answered}"
+            );
+            assert_eq!(
+                answered["message"].as_str(),
+                Some(
+                    format!(
+                        "Composite model {source_id} is referenced by the formula expression of \
+                         property {referrer} of asset model {model_id} when delete was called"
+                    )
+                    .as_str()
+                ),
+                "case {case:?}: the refusal must name the referring property, got {answered}"
+            );
+            let (status, still_there) = describe_composite(&router, &model_id, &source_id).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the refused delete must leave it readable, got \
+                 {status} {still_there}"
+            );
+        } else {
+            let (status, gone) = describe_composite(&router, &model_id, &source_id).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: it must be gone after the accepted delete, got {status} {gone}"
+            );
+            // Whatever lent the property still lends it.
+            if let Some(second) = second_source.as_deref() {
+                let (status, other) = describe_composite(&router, &model_id, second).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the second reuse must survive, got {status} {other}"
+                );
+                let still: Vec<&str> = other["assetModelCompositeModelProperties"]
+                    .as_array()
+                    .map(|list| list.iter().filter_map(|entry| entry["id"].as_str()).collect())
+                    .unwrap_or_default();
+                assert!(
+                    still.contains(&LENT_PROPERTY_ID),
+                    "case {case:?}: the surviving reuse must still contribute \
+                     {LENT_PROPERTY_ID}, got {other}"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn externalid_labels_delete_the_same_composite_model_as_the_raw_ids() {
     let router = router();

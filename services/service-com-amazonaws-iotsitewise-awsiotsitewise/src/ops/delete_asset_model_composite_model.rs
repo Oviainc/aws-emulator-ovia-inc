@@ -397,71 +397,120 @@ fn formula_dependent(
     asset_model_id: &str,
     doomed: &HashSet<String>,
 ) -> Option<(String, String)> {
-    // The properties the doomed composite models define: the ones that go away,
-    // and so the ones no surviving expression may still read. A composite model
-    // may define none (it may have no properties of its own at all), which is
-    // not a reason to skip the scan: a `propertyPath` segment can name the
-    // composite model itself.
-    let doomed_properties: HashSet<&str> = store
-        .asset_models
-        .get(asset_model_id)
-        .into_iter()
-        .flat_map(|model| model.composite_models.iter())
-        .filter(|composite| {
-            composite
-                .id
-                .as_deref()
-                .is_some_and(|id| doomed.contains(id))
-        })
-        .flat_map(|composite| composite.properties.iter().flatten())
-        .filter_map(|property| property.id.as_deref())
+    let written = store.asset_models.get(asset_model_id)?;
+    // This call removes composite models from ONE asset model, so every other
+    // stored model goes on exposing exactly the properties it exposes now.
+    let nothing_removed: HashSet<String> = HashSet::new();
+
+    // What the written model still exposes once the doomed composite models are
+    // gone: a property still exposed is not going away, however it is reached.
+    let still_exposed_by_written = exposed_property_ids(store, written, doomed);
+    // The properties that go away, and so the ones no surviving expression may
+    // still read: the ones the doomed composite models CONTRIBUTE, less any the
+    // written model keeps exposing by another route. A composite model may
+    // contribute none, which is not a reason to skip the scan: a `propertyPath`
+    // segment can name the composite model itself.
+    let doomed_properties: HashSet<String> = written
+        .composite_models
+        .iter()
+        .filter_map(|composite| composite.id.as_deref())
+        .filter(|id| doomed.contains(*id))
+        .flat_map(|id| store.composite_model_properties(written, id))
+        .filter_map(|property| property.id)
+        .filter(|id| !still_exposed_by_written.contains(id))
         .collect();
 
     store.asset_models.values().find_map(|model| {
         // Only the written model holds the doomed composite models, so only its
-        // own properties can sit inside one.
-        let owning = model.id == asset_model_id;
-        let direct = model.properties.iter().map(|property| (None, property));
-        let nested = model.composite_models.iter().flat_map(|composite| {
-            composite
-                .properties
-                .iter()
-                .flatten()
-                .map(move |property| (composite.id.as_deref(), property))
-        });
-        direct
-            .chain(nested)
-            // A property of a composite model that is itself going away takes
-            // its own dependencies with it.
-            .filter(|(owner, _)| {
-                !owning || owner.is_none_or(|owner| !doomed.contains(owner))
-            })
-            .find(|(_, property)| depends_on(property, &doomed_properties, doomed))
-            .map(|(_, property)| (model.id.clone(), property.name.clone()))
+        // own properties can sit inside one — and a property of a composite
+        // model that is itself going away takes its own dependencies with it.
+        let removed = if model.id == asset_model_id {
+            doomed
+        } else {
+            &nothing_removed
+        };
+        // The properties this model goes on exposing: a formula of its own that
+        // names one of them still reads something that exists, even when
+        // another model stops exposing that same definition — the component
+        // model a composite model reuses keeps the properties it lends.
+        let exposed = exposed_property_ids(store, model, removed);
+        exposed_properties(store, model, removed)
+            .into_iter()
+            .find(|property| depends_on(property, &doomed_properties, doomed, &exposed))
+            .map(|property| (model.id.clone(), property.name))
     })
+}
+
+/// Every property asset model `model` exposes once the composite models in
+/// `removed` are gone: its OWN definitions, plus the ones each remaining
+/// composite model CONTRIBUTES.
+///
+/// What a composite model contributes is its own definitions, or — for a
+/// component-model-based one, which stores none of its own — the properties of
+/// the `COMPONENT_MODEL` it reuses, so this asks
+/// [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::composite_model_properties`],
+/// the crate's one definition of "the properties of a composite model", rather
+/// than the raw stored field. That is what makes the dependency rule here see
+/// the same properties `DescribeAssetModelCompositeModel` reports.
+fn exposed_properties(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    model: &crate::state::AssetModelRecord,
+    removed: &HashSet<String>,
+) -> Vec<AssetModelProperty> {
+    model
+        .properties
+        .iter()
+        .cloned()
+        .chain(
+            model
+                .composite_models
+                .iter()
+                .filter_map(|composite| composite.id.as_deref())
+                .filter(|id| !removed.contains(*id))
+                .flat_map(|id| store.composite_model_properties(model, id)),
+        )
+        .collect()
+}
+
+/// The ids of [`exposed_properties`], for the membership questions the
+/// dependency rule asks.
+fn exposed_property_ids(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    model: &crate::state::AssetModelRecord,
+    removed: &HashSet<String>,
+) -> HashSet<String> {
+    exposed_properties(store, model, removed)
+        .into_iter()
+        .filter_map(|property| property.id)
+        .collect()
 }
 
 /// Whether `property`'s formula reads something that is going away: a variable
 /// naming one of `doomed_properties` directly, or a `propertyPath` segment
 /// naming one of them or one of the `doomed` composite models.
+///
+/// `exposed` is what the asset model this property belongs to goes on exposing,
+/// so a formula reading a definition its own model still has is left alone.
 fn depends_on(
     property: &AssetModelProperty,
-    doomed_properties: &HashSet<&str>,
+    doomed_properties: &HashSet<String>,
     doomed: &HashSet<String>,
+    exposed: &HashSet<String>,
 ) -> bool {
+    let dangling = |id: &str| doomed_properties.contains(id) && !exposed.contains(id);
     crate::state::formula_variables(property).any(|variable| {
         variable
             .value
             .property_id
             .as_deref()
-            .is_some_and(|id| doomed_properties.contains(id))
+            .is_some_and(&dangling)
             || variable
                 .value
                 .property_path
                 .iter()
                 .flatten()
                 .filter_map(|segment| segment.id.as_deref())
-                .any(|id| doomed_properties.contains(id) || doomed.contains(id))
+                .any(|id| dangling(id) || doomed.contains(id))
     })
 }
 
