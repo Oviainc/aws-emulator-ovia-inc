@@ -221,6 +221,21 @@ impl Emulator {
         record.last_modified_time_millis = at;
     }
 
+    /// How many SUPERSEDED generations of `group` the store holds: the slots this group
+    /// has spent of the bounded version history a period-scoped read of a closed period
+    /// is answered from. Counted from the store because no read reports the size of that
+    /// history.
+    pub(crate) fn superseded_generations(&self, group: &str) -> usize {
+        let state = self.engine.state::<BillingConductorState>();
+        let state = state.lock();
+        state
+            .billing_groups
+            .get(group)
+            .expect("superseded_generations: the group was created above")
+            .superseded_versions
+            .len()
+    }
+
     /// The `BillingGroups` `ListBillingGroups` reports for `body`, in response order.
     async fn listed(&self, case: &str, body: &Value) -> Vec<Value> {
         let (status, answer) = self.post(LIST_PATH, body).await;

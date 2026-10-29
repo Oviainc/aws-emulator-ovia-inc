@@ -361,10 +361,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modified", so it moves only when this call actually modified the group: a
         // request that names no member, or names the values the group already holds,
         // leaves it where it was.
+        //
+        // "The values the group already holds" are the ones a READ of it reports, so
+        // every term below compares the reported value rather than the internal form it
+        // is kept in: `Status` is compared through the derived
+        // `BillingGroupRecord::status`, under which the status a group reports before any
+        // caller has set one and that same status named explicitly are ONE value — so
+        // restating it modifies nothing a read can tell apart. `Name`,
+        // `Description`, the pricing plan and `AutoAssociate` are reported exactly as
+        // they are held, an absent `Description` or `AutoAssociate` as an absent member
+        // rather than as an empty string or `false`, so for those the held value IS the
+        // reported one and the comparison is the stored member itself.
         let changed = updated.name != stored.name
             || updated.description != stored.description
             || updated.pricing_plan_arn != stored.pricing_plan_arn
-            || updated.requested_status != stored.requested_status
+            || updated.status() != stored.status()
             || updated.auto_associate != stored.auto_associate;
         if changed {
             updated.last_modified_time_millis = crate::state::now_millis();

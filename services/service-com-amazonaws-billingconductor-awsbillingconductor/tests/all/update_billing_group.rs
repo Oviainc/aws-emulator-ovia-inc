@@ -1116,41 +1116,129 @@ async fn the_responsibility_transfer_arn_of_an_existing_group_cannot_be_modified
     );
 }
 
+/// One row of the `LastModifiedTime` table: the `Status` values earlier served calls
+/// already put the group through, the members the call under test names beside `Arn`, and
+/// whether that call modified the group at all.
+struct ClockCase {
+    label: &'static str,
+    /// The `Status` each prior `UpdateBillingGroup` asked for, in order — the status
+    /// history the group carries BEFORE the call under test, which is what decides
+    /// whether that call is restating what the group already reports.
+    prior_statuses: &'static [&'static str],
+    patch: PatchBuilder,
+    /// Does the call under test move `LastModifiedTime`?
+    moves: bool,
+}
+
 #[tokio::test]
 async fn last_modified_time_moves_only_when_the_group_changed() {
     // Rows differ along whether the request asks for anything the group does not
-    // already hold: no member at all, the values it holds, and each kind of real change.
-    let cases: [(&str, PatchBuilder, bool); 7] = [
-        ("no member named", |_| json!({}), false),
-        (
-            "the Name it already holds",
-            |_| json!({ "Name": "ClockGroup" }),
-            false,
-        ),
-        (
-            "the Description it already holds",
-            |_| json!({ "Description": "the group as created" }),
-            false,
-        ),
-        (
-            "the plan it already computes with",
-            |plan| json!({ "ComputationPreference": { "PricingPlanArn": plan } }),
-            false,
-        ),
-        (
-            "a new Description",
-            |_| json!({ "Description": "moved on" }),
-            true,
-        ),
-        ("a new Name", |_| json!({ "Name": "ClockRenamed" }), true),
-        ("a new Status", |_| json!({ "Status": "PENDING" }), true),
+    // already REPORT: no member at all, the values a read of it reports (each member
+    // class — a name, free text, an ARN, an enum value, a boolean), and each kind of real
+    // change. The `Status` rows also differ along the history behind the group's reported
+    // status — never set, set to the status it already reported, and set away and back —
+    // because the status a read reports is one value however the group came to it.
+    let cases: [ClockCase; 12] = [
+        ClockCase {
+            label: "no member named",
+            prior_statuses: &[],
+            patch: |_| json!({}),
+            moves: false,
+        },
+        ClockCase {
+            label: "the Name it already holds",
+            prior_statuses: &[],
+            patch: |_| json!({ "Name": "ClockGroup" }),
+            moves: false,
+        },
+        ClockCase {
+            label: "the Description it already holds",
+            prior_statuses: &[],
+            patch: |_| json!({ "Description": "the group as created" }),
+            moves: false,
+        },
+        ClockCase {
+            label: "the plan it already computes with",
+            prior_statuses: &[],
+            patch: |plan| json!({ "ComputationPreference": { "PricingPlanArn": plan } }),
+            moves: false,
+        },
+        ClockCase {
+            label: "the AutoAssociate it already holds",
+            prior_statuses: &[],
+            patch: |_| json!({ "AccountGrouping": { "AutoAssociate": false } }),
+            moves: false,
+        },
+        ClockCase {
+            // The status a group with a billing owner reports before any caller has set
+            // one: naming it names what every read already answers with.
+            label: "the Status it already reports, never having been set",
+            prior_statuses: &[],
+            patch: |_| json!({ "Status": "ACTIVE" }),
+            moves: false,
+        },
+        ClockCase {
+            label: "the Status it already reports, set once before",
+            prior_statuses: &["ACTIVE"],
+            patch: |_| json!({ "Status": "ACTIVE" }),
+            moves: false,
+        },
+        ClockCase {
+            label: "the Status it already reports, having been away and back",
+            prior_statuses: &["PENDING", "ACTIVE"],
+            patch: |_| json!({ "Status": "ACTIVE" }),
+            moves: false,
+        },
+        ClockCase {
+            label: "a new Description",
+            prior_statuses: &[],
+            patch: |_| json!({ "Description": "moved on" }),
+            moves: true,
+        },
+        ClockCase {
+            label: "a new Name",
+            prior_statuses: &[],
+            patch: |_| json!({ "Name": "ClockRenamed" }),
+            moves: true,
+        },
+        ClockCase {
+            label: "a new Status",
+            prior_statuses: &[],
+            patch: |_| json!({ "Status": "PENDING" }),
+            moves: true,
+        },
+        ClockCase {
+            label: "the Status it reported before it was moved off",
+            prior_statuses: &["PENDING"],
+            patch: |_| json!({ "Status": "ACTIVE" }),
+            moves: true,
+        },
     ];
 
-    for (index, (case, patch, moves)) in cases.into_iter().enumerate() {
+    for (
+        index,
+        ClockCase {
+            label: case,
+            prior_statuses,
+            patch,
+            moves,
+        },
+    ) in cases.into_iter().enumerate()
+    {
         let em = Emulator::new();
         let plan = em.create_plan(&format!("ClockPlan{index:03}")).await;
         let arn = em.create_group(&base_group("ClockGroup", &plan)).await;
+        // The status history this row starts from, laid down through the real wire.
+        for prior in prior_statuses {
+            let (status, response) = em.update_group(&arn, &json!({ "Status": prior })).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: setup UpdateBillingGroup Status {prior:?} expected 200, got \
+                 {status} with {response}"
+            );
+        }
         let created = em.listed(&arn).await;
+        let status_before = created["Status"].as_str().unwrap_or_default().to_string();
         let creation_time = created["CreationTime"].as_i64().unwrap_or_default();
         let modified_before = created["LastModifiedTime"].as_i64().unwrap_or_default();
         // The clock this emulator reads has millisecond resolution, so a change is
@@ -1183,6 +1271,26 @@ async fn last_modified_time_moves_only_when_the_group_changed() {
                 reported, modified_before,
                 "case {case:?}: a call that modified nothing must leave LastModifiedTime where it \
                  was ({modified_before}), got {reported}"
+            );
+            // And nothing a read reports differs across it either — the premise of the
+            // row: the `Status` the group reported before the call is the one it reports
+            // after, with the same `StatusReason` derived from it.
+            assert_eq!(
+                listed["Status"].as_str(),
+                Some(status_before.as_str()),
+                "case {case:?}: expected the reported Status to stay {status_before:?}, got \
+                 {listed}"
+            );
+            assert_eq!(
+                response["Status"].as_str(),
+                Some(status_before.as_str()),
+                "case {case:?}: expected the answer to report Status {status_before:?}, got \
+                 {response}"
+            );
+            assert_eq!(
+                listed["StatusReason"], response["StatusReason"],
+                "case {case:?}: the response and state must agree on StatusReason, got {listed} \
+                 and {response}"
             );
         }
         assert_eq!(

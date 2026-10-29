@@ -139,6 +139,8 @@ mod tagging_surface;
 mod untag_created_tags;
 #[path = "all/update_billing_group.rs"]
 mod update_billing_group;
+#[path = "all/update_billing_group_no_op_generations.rs"]
+mod update_billing_group_no_op_generations;
 #[path = "all/update_custom_line_item.rs"]
 mod update_custom_line_item;
 #[path = "all/update_custom_line_item_billing_period_window.rs"]
