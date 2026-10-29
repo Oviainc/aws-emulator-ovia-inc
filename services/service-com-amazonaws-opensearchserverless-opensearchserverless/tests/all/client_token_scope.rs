@@ -223,7 +223,7 @@ async fn stored_markers(
 ///
 /// The `UPDATING -> ACTIVE` move is owed by the clock, so this waits for the wall clock
 /// rather than for a call.
-async fn await_collection_active(
+pub(crate) async fn await_collection_active(
     router: &smithy_server_runtime::MultiServiceRouter,
     case: &str,
     id: &str,

@@ -67,6 +67,8 @@ mod security_policy_listing;
 mod state_roundtrip;
 #[path = "all/tag_key_uniqueness.rs"]
 mod tag_key_uniqueness;
+#[path = "all/update_collection_token_scope.rs"]
+mod update_collection_token_scope;
 #[path = "all/vpc_endpoint.rs"]
 mod vpc_endpoint;
 #[path = "all/vpc_endpoint_batch_read.rs"]
