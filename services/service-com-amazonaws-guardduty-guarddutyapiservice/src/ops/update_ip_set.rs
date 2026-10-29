@@ -164,6 +164,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // `ExpectedBucketOwner` is the same fact the create's member carries — "the
+        // Amazon Web Services account ID that owns the Amazon S3 bucket specified in
+        // the location parameter"
+        // (`smithy_query(query="doc",shape="UpdateIPSetRequest",member="ExpectedBucketOwner")`)
+        // — so the update is held to the account-id form the create is, and a value
+        // that cannot be one is refused before anything is written
+        // ([`crate::state::expected_bucket_owner_rejection`]).
+        if let Some(message) =
+            crate::state::expected_bucket_owner_rejection(input.expected_bucket_owner.as_deref())
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(message));
+        }
+
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
 

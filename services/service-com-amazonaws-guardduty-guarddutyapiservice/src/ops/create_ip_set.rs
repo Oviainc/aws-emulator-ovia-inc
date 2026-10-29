@@ -173,6 +173,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // `ExpectedBucketOwner` is "the Amazon Web Services account ID that owns the
+        // Amazon S3 bucket specified in the location parameter"
+        // (`smithy_query(query="doc",shape="CreateIPSetRequest",member="ExpectedBucketOwner")`),
+        // so a value that cannot be an account id at all is refused here, for the
+        // same reason and at the same point as the name above: the member targets
+        // `AccountId`, whose modelled constraint is a length only
+        // ([`crate::state::expected_bucket_owner_rejection`]).
+        if let Some(message) =
+            crate::state::expected_bucket_owner_rejection(input.expected_bucket_owner.as_deref())
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(message));
+        }
+
         // The per-resource tag ceiling holds however the tags arrive, so a create
         // carrying more of them than a resource may hold is refused here rather
         // than storing a resource past the limit

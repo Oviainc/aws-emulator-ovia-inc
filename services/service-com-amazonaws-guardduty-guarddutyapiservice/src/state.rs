@@ -1484,6 +1484,14 @@ pub const DESTINATION_TYPE_MEMBER: &str = "destinationType";
 /// [`DESTINATION_ARN_MEMBER`].
 pub const EXPECTED_BUCKET_OWNER_MEMBER: &str = "destinationProperties.expectedBucketOwner";
 
+/// The wire name of the TOP-LEVEL `ExpectedBucketOwner` member the IPSet, threat
+/// list and entity set creates and updates carry
+/// (`smithy_query(operation="CreateIPSet")` renders it `expectedBucketOwner`), as
+/// distinct from the one nested in `DestinationProperties`
+/// ([`EXPECTED_BUCKET_OWNER_MEMBER`]): the same fact, named at a different place in
+/// the request.
+pub const LIST_EXPECTED_BUCKET_OWNER_MEMBER: &str = "expectedBucketOwner";
+
 /// The wire name of the `ThreatIntelSetId` member, as the request carries it in the
 /// URI (`smithy_query(operation="GetThreatIntelSet")` renders it
 /// `threatIntelSetId`).
@@ -1648,6 +1656,28 @@ where
         .into_iter()
         .any(|account_id| !is_account_id(account_id.as_ref()))
         .then(|| invalid_parameter_message(ACCOUNT_ID_MEMBER))
+}
+
+/// Classify the top-level `ExpectedBucketOwner` a request carried: `Some(message)`
+/// when the value supplied cannot be an account id at all, `None` when the request
+/// omitted the member or supplied a well-formed id.
+///
+/// The member is "the Amazon Web Services account ID that owns the Amazon S3 bucket
+/// specified in the location parameter"
+/// (`smithy_query(query="doc",shape="CreateIPSetRequest",member="ExpectedBucketOwner")`),
+/// so its value space is an account id's ([`is_account_id`]) and nothing wider.
+/// Where the member targets `AccountId` the model constrains the LENGTH only, so a
+/// 12-character value that is not an account id reaches the handler and the handler
+/// is the enforcement point; where it targets a shape the model gives a
+/// digits-only pattern the boundary refuses the same values first. One reader for
+/// every operation that carries the member, so the form cannot drift between them,
+/// and one message — [`invalid_parameter_message`] for
+/// [`LIST_EXPECTED_BUCKET_OWNER_MEMBER`] — because the member at fault is the same
+/// one whichever operation carried it.
+pub fn expected_bucket_owner_rejection(owner: Option<&str>) -> Option<String> {
+    owner
+        .is_some_and(|owner| !is_account_id(owner))
+        .then(|| invalid_parameter_message(LIST_EXPECTED_BUCKET_OWNER_MEMBER))
 }
 
 /// The DISTINCT entries of an id list a request carried, in the order the request
@@ -6016,10 +6046,12 @@ pub fn validate_destination_property_forms(
     if let Some(owner) = properties.expected_bucket_owner.as_deref() {
         // "The 12-digit Amazon Web Services account ID of the account that owns the
         // Amazon S3 bucket"
-        // (`smithy_query(query="doc",shape="DestinationProperties",member="ExpectedBucketOwner")`).
-        // The model's own `len 12..12` refuses another length at the boundary; the
-        // length is checked here too so this helper states the whole rule.
-        if owner.len() != ACCOUNT_ID_LEN || !owner.bytes().all(|b| b.is_ascii_digit()) {
+        // (`smithy_query(query="doc",shape="DestinationProperties",member="ExpectedBucketOwner")`),
+        // which is the account-id form [`is_account_id`] reads — the one reader
+        // every account-id-valued member on this service is held to. The model's
+        // own `len 12..12` refuses another length at the boundary; the length is
+        // part of that reader too, so this helper states the whole rule.
+        if !is_account_id(owner) {
             return Err(invalid_parameter_message(EXPECTED_BUCKET_OWNER_MEMBER));
         }
     }
