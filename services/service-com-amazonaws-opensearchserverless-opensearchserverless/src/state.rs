@@ -2972,6 +2972,34 @@ fn document_from_json_at(
     })
 }
 
+/// The JSON value a request's `policy` text is: the FIRST half of the rule every
+/// policy-writing operation follows, in the ONE place it lives, so no two of them can
+/// drift apart over the wording of the refusal.
+///
+/// `Err` carries the message the caller wraps in its own modelled `ValidationException`:
+/// this module owns the text, each operation owns the error enum the text travels in.
+pub fn parse_policy_text(text: &str) -> Result<serde_json::Value, String> {
+    serde_json::from_str(text).map_err(|error| format!("policy must be a JSON document: {error}"))
+}
+
+/// The stored document a parsed policy value converts to: the SECOND half of that rule,
+/// again in one place, so the bound the refusal names is read from
+/// [`MAX_DOCUMENT_DEPTH`] once.
+///
+/// Split from [`parse_policy_text`] because an operation whose policy content has its own
+/// syntax (a `retention` lifecycle policy) checks that content against the parsed value,
+/// at the point in its own order of checks where it checks it.
+pub fn policy_document(parsed: &serde_json::Value) -> Result<::aws_smithy_types::Document, String> {
+    document_from_json(parsed)
+        .ok_or_else(|| format!("policy must not nest deeper than {MAX_DOCUMENT_DEPTH} levels"))
+}
+
+/// Both halves of the rule for an operation that needs only the document: parse the
+/// `policy` text, then convert it.
+pub fn policy_document_from_text(text: &str) -> Result<::aws_smithy_types::Document, String> {
+    policy_document(&parse_policy_text(text)?)
+}
+
 // ---------------------------------------------------------------------------
 // The audit record a call emits
 // ---------------------------------------------------------------------------

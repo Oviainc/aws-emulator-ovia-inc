@@ -202,29 +202,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // named document has to parse as JSON for there to be a policy at all. It is
         // stored PARSED, which is what makes a read answer "the JSON policy document
         // without any whitespaces" rather than the caller's own formatting. A request that
-        // names no `policy` replaces none.
+        // names no `policy` replaces none. Parse, bound and refusal wording live in
+        // `crate::state::policy_document_from_text`.
         let policy = match input.policy.as_deref() {
-            Some(text) => {
-                let parsed: serde_json::Value = match serde_json::from_str(text) {
-                    Ok(parsed) => parsed,
-                    Err(error) => {
-                        crate::state::audit(
-                            Self::NAME,
-                            ctx,
-                            AuditOutcome::ValidationRefused,
-                            Some(&resource),
-                        );
-                        return Err(UpdateAccessPolicyErrorModeled::ValidationException(
-                            ValidationException {
-                                message: Some(format!("policy must be a JSON document: {error}")),
-                            },
-                        )
-                        .into());
-                    }
-                };
-                // A document nested past the emulator's own conversion bound is refused
-                // rather than converted; see `crate::state::MAX_DOCUMENT_DEPTH`.
-                let Some(document) = crate::state::document_from_json(&parsed) else {
+            Some(text) => match crate::state::policy_document_from_text(text) {
+                Ok(document) => Some(document),
+                Err(message) => {
                     crate::state::audit(
                         Self::NAME,
                         ctx,
@@ -233,16 +216,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     );
                     return Err(UpdateAccessPolicyErrorModeled::ValidationException(
                         ValidationException {
-                            message: Some(format!(
-                                "policy must not nest deeper than {} levels",
-                                crate::state::MAX_DOCUMENT_DEPTH
-                            )),
+                            message: Some(message),
                         },
                     )
                     .into());
-                };
-                Some(document)
-            }
+                }
+            },
             None => None,
         };
 

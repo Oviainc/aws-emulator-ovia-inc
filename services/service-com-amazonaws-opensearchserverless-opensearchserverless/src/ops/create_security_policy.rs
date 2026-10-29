@@ -185,25 +185,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `policy` arrives as text and `SecurityPolicyDetail$policy` is a document, so the
         // text has to parse as JSON for there to be a policy at all. It is stored PARSED,
         // which is also what makes a read answer "the JSON policy document without any
-        // whitespaces" rather than the caller's own formatting.
-        let parsed: serde_json::Value = serde_json::from_str(&input.policy).map_err(|error| {
+        // whitespaces" rather than the caller's own formatting. Parse, bound and refusal
+        // wording all live in `crate::state::policy_document_from_text`; this handler only
+        // names the error the message travels in.
+        let policy = crate::state::policy_document_from_text(&input.policy).map_err(|message| {
             CreateSecurityPolicyErrorModeled::ValidationException(ValidationException {
-                message: Some(format!("policy must be a JSON document: {error}")),
+                message: Some(message),
             })
         })?;
-        // A document nested past the emulator's own conversion bound is refused rather
-        // than converted; see `crate::state::MAX_DOCUMENT_DEPTH`.
-        let Some(policy) = crate::state::document_from_json(&parsed) else {
-            return Err(CreateSecurityPolicyErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "policy must not nest deeper than {} levels",
-                        crate::state::MAX_DOCUMENT_DEPTH
-                    )),
-                },
-            )
-            .into());
-        };
 
         let key = (input.r#type.clone(), input.name.clone());
         let mut store = state.lock();

@@ -43,6 +43,8 @@ mod policies_stats;
 mod policy_and_group_writes;
 #[path = "all/policy_document_shape.rs"]
 mod policy_document_shape;
+#[path = "all/policy_text_parse.rs"]
+mod policy_text_parse;
 #[path = "all/reported_pattern.rs"]
 mod reported_pattern;
 #[path = "all/security_config_update.rs"]

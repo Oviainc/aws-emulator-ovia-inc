@@ -199,10 +199,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `policy` arrives as text and `AccessPolicyDetail$policy` is a document, so the
         // text has to parse as JSON for there to be a policy at all. It is stored PARSED,
         // which is also what makes a read answer "the JSON policy document without any
-        // whitespaces" rather than the caller's own formatting.
-        let parsed: serde_json::Value = match serde_json::from_str(&input.policy) {
-            Ok(parsed) => parsed,
-            Err(error) => {
+        // whitespaces" rather than the caller's own formatting. Parse, bound and refusal
+        // wording live in `crate::state::policy_document_from_text`.
+        let policy = match crate::state::policy_document_from_text(&input.policy) {
+            Ok(policy) => policy,
+            Err(message) => {
                 crate::state::audit(
                     Self::NAME,
                     ctx,
@@ -211,30 +212,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
                 return Err(CreateAccessPolicyErrorModeled::ValidationException(
                     ValidationException {
-                        message: Some(format!("policy must be a JSON document: {error}")),
+                        message: Some(message),
                     },
                 )
                 .into());
             }
-        };
-        // A document nested past the emulator's own conversion bound is refused rather
-        // than converted; see `crate::state::MAX_DOCUMENT_DEPTH`.
-        let Some(policy) = crate::state::document_from_json(&parsed) else {
-            crate::state::audit(
-                Self::NAME,
-                ctx,
-                AuditOutcome::ValidationRefused,
-                Some(&resource),
-            );
-            return Err(CreateAccessPolicyErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "policy must not nest deeper than {} levels",
-                        crate::state::MAX_DOCUMENT_DEPTH
-                    )),
-                },
-            )
-            .into());
         };
 
         let mut store = state.lock();

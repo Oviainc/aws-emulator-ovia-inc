@@ -208,12 +208,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // named document has to parse as JSON for there to be a policy at all. It is stored
         // PARSED, which is what makes a read answer "the JSON policy document without any
         // whitespaces" rather than the caller's own formatting. A request that names no
-        // `policy` replaces none.
+        // `policy` replaces none. The parsed value is kept because this operation also
+        // checks the document's CONTENT below; parse, bound and refusal wording live in
+        // `crate::state`.
         let policy = match input.policy.as_deref() {
             Some(text) => {
-                let parsed: serde_json::Value = match serde_json::from_str(text) {
+                let parsed: serde_json::Value = match crate::state::parse_policy_text(text) {
                     Ok(parsed) => parsed,
-                    Err(error) => {
+                    Err(message) => {
                         crate::state::audit(
                             Self::NAME,
                             ctx,
@@ -222,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         );
                         return Err(UpdateLifecyclePolicyErrorModeled::ValidationException(
                             ValidationException {
-                                message: Some(format!("policy must be a JSON document: {error}")),
+                                message: Some(message),
                             },
                         )
                         .into());
@@ -248,23 +250,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
                 // A document nested past the emulator's own conversion bound is refused
-                // rather than converted; see `crate::state::MAX_DOCUMENT_DEPTH`.
-                let Some(document) = crate::state::document_from_json(&parsed) else {
-                    crate::state::audit(
-                        Self::NAME,
-                        ctx,
-                        AuditOutcome::ValidationRefused,
-                        Some(&resource),
-                    );
-                    return Err(UpdateLifecyclePolicyErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(format!(
-                                "policy must not nest deeper than {} levels",
-                                crate::state::MAX_DOCUMENT_DEPTH
-                            )),
-                        },
-                    )
-                    .into());
+                // rather than converted; the bound and its wording live in
+                // `crate::state::policy_document`.
+                let document = match crate::state::policy_document(&parsed) {
+                    Ok(document) => document,
+                    Err(message) => {
+                        crate::state::audit(
+                            Self::NAME,
+                            ctx,
+                            AuditOutcome::ValidationRefused,
+                            Some(&resource),
+                        );
+                        return Err(UpdateLifecyclePolicyErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(message),
+                            },
+                        )
+                        .into());
+                    }
                 };
                 Some(document)
             }
