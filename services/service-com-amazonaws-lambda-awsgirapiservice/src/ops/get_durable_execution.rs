@@ -277,11 +277,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .flatten()
                 .filter(|payload| !payload.is_empty()),
             // "The JSON result returned by the durable execution if it completed
-            // successfully" and the error of one that did not: no in-process runtime here
-            // ran the function's deployment package, so there is neither a result nor an
-            // error to report, and none is invented.
+            // successfully": no in-process runtime here ran the function's deployment
+            // package, so there is no result to report and none is invented.
             result: None,
-            error: None,
+            // The error is the one the execution ENDED with — the reason a
+            // `StopDurableExecution` gave for stopping it — and nothing else: no run
+            // here produced a failure payload. It is execution data, so a compact read
+            // withholds it with the rest.
+            error: include_execution_data
+                .then(|| execution.error.clone())
+                .flatten(),
             start_timestamp: ::aws_smithy_types::DateTime::from(execution.started),
             status: execution.status.clone(),
             end_timestamp: execution.ended.map(::aws_smithy_types::DateTime::from),

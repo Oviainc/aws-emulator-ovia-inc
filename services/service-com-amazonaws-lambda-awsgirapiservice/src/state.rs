@@ -53,7 +53,10 @@
 //! filtered and paged exactly as its own members ask — and never an execution nothing
 //! started. An execution has a lifetime of its own: it starts `RUNNING`, and the move to
 //! `TIMED_OUT` is owed by the CLOCK once the `ExecutionTimeout` of the function's
-//! `DurableConfig` falls due (see [`DurableExecutionRecord::materialize`]).
+//! `DurableConfig` falls due (see [`DurableExecutionRecord::materialize`]). The move to
+//! `STOPPED` is the one a CALLER makes: `StopDurableExecution` ends the execution it
+//! addresses at the instant of the call and keeps the reason the call gave (see
+//! [`DurableExecutionRecord::stop`]).
 //!
 //! The runtime-management slice hangs off the same record, one entry per version:
 //! `PutRuntimeManagementConfig` "sets the runtime management configuration for a
@@ -170,8 +173,9 @@ use crate::ops::types::{
     CodeSigningPolicies, Cors, CreateAliasOutput, CreateEventSourceMappingOutput,
     CreateFunctionOutput, DeadLetterConfig, DestinationConfig, DocumentDBEventSourceConfig,
     DurableConfig, Environment, EnvironmentResponse, EphemeralStorage, Event, EventInput,
-    EventSourceMappingLoggingConfig, EventSourceMappingMetricsConfig, Execution,
-    ExecutionStartedDetails, ExecutionTimedOutDetails, FileSystemConfig,
+    EventSourceMappingLoggingConfig, EventSourceMappingMetricsConfig, ErrorObject, Execution,
+    ExecutionStartedDetails, ExecutionStoppedDetails, ExecutionTimedOutDetails, EventError,
+    FileSystemConfig,
     FilterCriteria, FunctionCodeLocation, FunctionScalingConfig, GetFunctionScalingConfigOutput,
     GetLayerVersionOutput, GetProvisionedConcurrencyConfigOutput,
     ImageConfig, ImageConfigResponse, InstanceRequirements, Layer, LayerVersionContentOutput,
@@ -1827,6 +1831,10 @@ pub const EVENT_TYPE_EXECUTION_STARTED: &str = "ExecutionStarted";
 /// `ExecutionTimeout` closes with; see [`EVENT_TYPE_EXECUTION_STARTED`].
 pub const EVENT_TYPE_EXECUTION_TIMED_OUT: &str = "ExecutionTimedOut";
 
+/// The model's `EventType` for the event an execution a caller STOPPED closes with; see
+/// [`EVENT_TYPE_EXECUTION_STARTED`] and [`DurableExecutionRecord::stop`].
+pub const EVENT_TYPE_EXECUTION_STOPPED: &str = "ExecutionStopped";
+
 /// One durable execution of a function.
 ///
 /// Held per function on [`FunctionRecord::durable_executions`] and keyed by its name,
@@ -1870,6 +1878,14 @@ pub struct DurableExecutionRecord {
     /// When the execution ended, once it reached a terminal status; the model's
     /// `EndTimestamp`, which is absent while it is still running.
     pub ended: Option<SystemTime>,
+    /// Why the execution ended, once it ended for a reason a caller gave: the model's
+    /// `GetDurableExecution$Error`, "An object that contains error information".
+    ///
+    /// It is only ever the error object the call that ENDED the execution carried
+    /// (`StopDurableExecution$Error`, "Optional error details explaining why the
+    /// execution is being stopped"), so no read ever reports an error the execution did
+    /// not end with.
+    pub error: Option<ErrorObject>,
     /// The customer managed key the function's `DurableConfig` named for the execution's
     /// payload data, when it named one.
     pub kms_key_arn: Option<String>,
@@ -1882,14 +1898,16 @@ pub struct DurableExecutionRecord {
     /// during the execution."
     ///
     /// The log is APPEND-ONLY and it is the only record of what happened: an event is
-    /// appended by the call that made it happen (the start, below) or by the clock
+    /// appended by the call that made it happen (the start, and the stop), or by the clock
     /// transition that fell due ([`DurableExecutionRecord::materialize`]), so nothing
     /// reading the history ever invents an event. `EventId` is "the unique identifier for
     /// this event. Event IDs increment sequentially", which is the position in this
     /// vector, counted from 1 ([`DurableExecutionRecord::next_event`]).
     ///
-    /// It is bounded by what can append to it: one event for the start and one for the
-    /// terminal transition the clock owes.
+    /// It is bounded by what can append to it: one event for the start, and one for the
+    /// TERMINAL transition — the timeout the clock owes, or the stop a caller makes —
+    /// which can happen only once, because neither moves an execution that has already
+    /// ended.
     pub history: Vec<Event>,
 }
 
@@ -1918,6 +1936,42 @@ impl DurableExecutionRecord {
             event.execution_timed_out_details = Some(ExecutionTimedOutDetails { error: None });
             self.history.push(event);
         }
+    }
+
+    /// Stop this execution at `now`, for the reason `error` gives, and report the instant
+    /// it stopped.
+    ///
+    /// "Stops a running durable execution. The execution transitions to STOPPED status and
+    /// cannot be resumed. Any in-progress operations are terminated" — so a RUNNING
+    /// execution becomes [`EXECUTION_STATUS_STOPPED`], ends at `now`, keeps the error the
+    /// caller gave as the reason it ended, and owes no timeout any more.
+    ///
+    /// An execution already in a terminal status is NOT moved and nothing is appended: it
+    /// cannot be resumed, so it cannot be stopped a second time, and the model declares no
+    /// state error for the attempt. The instant reported is then the one the execution
+    /// really ended at, so a repeat of the same stop answers the same `StopTimestamp` as
+    /// the stop that performed it.
+    pub fn stop(&mut self, error: Option<ErrorObject>, now: SystemTime) -> SystemTime {
+        if self.status != EXECUTION_STATUS_RUNNING {
+            return self.ended.unwrap_or(now);
+        }
+        self.status = EXECUTION_STATUS_STOPPED.to_string();
+        self.ended = Some(now);
+        self.timeout_due = None;
+        self.error = error.clone();
+        // The history records what happened, and `ExecutionStoppedDetails$Error` is
+        // REQUIRED: the event carries the error object the stop named, and carries none
+        // inside that envelope for a stop that named no reason. The whole object the call
+        // sent is kept, so nothing about it is truncated.
+        let mut event = self.next_event(EVENT_TYPE_EXECUTION_STOPPED, now);
+        event.execution_stopped_details = Some(ExecutionStoppedDetails {
+            error: EventError {
+                payload: error,
+                truncated: Some(false),
+            },
+        });
+        self.history.push(event);
+        now
     }
 
     /// The next history event of this execution: `event_type` at the instant `at` it
@@ -2448,6 +2502,7 @@ impl FunctionRecord {
             started: now,
             input_payload: payload.to_vec(),
             ended: None,
+            error: None,
             kms_key_arn: durable_config
                 .as_ref()
                 .and_then(|config| config.kms_key_arn.clone()),

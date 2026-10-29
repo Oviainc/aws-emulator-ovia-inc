@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopDurableExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopDurableExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopDurableExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves the `DurableExecutionArn` an `Invoke` of a durable function answered against
+//! the execution that start registered in [`crate::state`], and performs what the model
+//! documents: "Stops a running durable execution. The execution transitions to STOPPED
+//! status and cannot be resumed. Any in-progress operations are terminated." So the
+//! execution ends at the instant of the call, keeps the `Error` the call gave as the
+//! reason it ended ("Optional error details explaining why the execution is being
+//! stopped"), records the stop in its own history, and the call answers that instant as
+//! the required `StopTimestamp`.
+//!
+//! An ARN naming an execution this emulator does not hold is the modelled
+//! `ResourceNotFoundException` (404). An execution already in a terminal status is not
+//! moved again — it "cannot be resumed", the model declares no state error for the
+//! attempt, and the call answers the instant that execution really ended at, so a repeat
+//! of a stop answers the same `StopTimestamp` as the stop that performed it.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +168,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopDurableExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopDurableExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopDurableExecution"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StopDurableExecutionErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The execution is addressed by the ARN its start answered, which carries the
+        // function, the version and the execution's name and id; resolving it is also what
+        // brings the record up to whatever the clock already made due, so an execution
+        // whose `ExecutionTimeout` fell due before this call is already terminal when the
+        // stop reaches it.
+        let (record, name) = crate::state::resolve_durable_execution(
+            &mut store,
+            &input.durable_execution_arn,
+            &region,
+            now,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                StopDurableExecutionErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                StopDurableExecutionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+        })?;
+        let Some(execution) = record.durable_executions.get_mut(&name) else {
+            return Err(StopDurableExecutionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    r#type: None,
+                    message: Some(crate::state::durable_execution_not_found_message(
+                        &input.durable_execution_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "The timestamp when the execution was stopped": the instant the execution
+        // ended, which is this call's for the execution it stopped and the earlier one
+        // for an execution that had already ended.
+        let stopped = execution.stop(input.error, now);
+        Ok(StopDurableExecutionOutput {
+            stop_timestamp: ::aws_smithy_types::DateTime::from(stopped),
+        })
     }
 }
