@@ -717,3 +717,96 @@ async fn dry_run_reports_the_permitted_outcome_without_writing() {
         stored_tables(&engine)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Which refusal a request that fails in several ways at once gets
+// ---------------------------------------------------------------------------
+
+/// A request can fail in more than one way at once, and EC2 answers exactly one of them: the
+/// request's own FORM is read before any permission is checked, and permission before
+/// anything the request names is RESOLVED against the account's resources. Each row below
+/// carries the same three defects — a `LocalGatewayId` that cannot resolve, a
+/// `TagSpecification` naming another resource type, and `DryRun` — and drops one defect at a
+/// time, so the code that comes back is the first refusal in that order rather than whichever
+/// check happens to run last.
+#[tokio::test]
+async fn a_request_that_fails_several_ways_gets_the_first_refusal_in_order() {
+    let unknown = format!("{}-0123456789abcdef0", ec2::state::LOCAL_GATEWAY_ID_PREFIX);
+    let malformed = format!("{}-zzzzzzzz", ec2::state::LOCAL_GATEWAY_ID_PREFIX);
+
+    // (case, LocalGatewayId, a TagSpecification naming another resource type, DryRun,
+    //  expected status, expected code)
+    let cases: [(&str, &str, bool, bool, u16, &str); 5] = [
+        (
+            "no id, a foreign tag type and a dry run",
+            "",
+            true,
+            true,
+            400,
+            MISSING_PARAMETER,
+        ),
+        (
+            "a malformed id, a foreign tag type and a dry run",
+            malformed.as_str(),
+            true,
+            true,
+            400,
+            INVALID_LOCAL_GATEWAY_ID_MALFORMED,
+        ),
+        (
+            "an unresolvable id, a foreign tag type and a dry run",
+            unknown.as_str(),
+            true,
+            true,
+            400,
+            INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "an unresolvable id and a dry run",
+            unknown.as_str(),
+            false,
+            true,
+            DRY_RUN_STATUS,
+            ec2::state::DRY_RUN_OPERATION,
+        ),
+        (
+            "an unresolvable id alone",
+            unknown.as_str(),
+            false,
+            false,
+            400,
+            INVALID_LOCAL_GATEWAY_ID_NOT_FOUND,
+        ),
+    ];
+
+    for (case, local_gateway_id, foreign_tag_type, dry_run, expected_status, expected_code) in cases
+    {
+        let (router, engine) = super::ec2_query::emulator();
+        seed_gateways(&engine);
+
+        let mut params = vec![param("LocalGatewayId", local_gateway_id)];
+        if foreign_tag_type {
+            params.extend(tag_specification("local-gateway", &[("Name", "rack")]));
+        }
+        if dry_run {
+            params.push(param("DryRun", "true"));
+        }
+
+        let (status, body) = create(&router, &params).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            expected_code,
+            "case {case:?}: expected {expected_code:?}, got {body}"
+        );
+        assert_eq!(
+            stored_tables(&engine),
+            0,
+            "case {case:?}: a refused create must write nothing, got {} route tables",
+            stored_tables(&engine)
+        );
+    }
+}
