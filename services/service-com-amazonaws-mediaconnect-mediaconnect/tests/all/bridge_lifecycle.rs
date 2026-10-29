@@ -109,6 +109,43 @@ pub(crate) async fn cloud_flow(emulator: &Emulator, name: &str) -> String {
     .await
 }
 
+/// Create one ground-to-cloud (ingress) bridge over the wire and answer its ARN.
+///
+/// This is the bridge a cloud flow's source is fed BY: `GatewayBridgeSource$BridgeArn` is
+/// "the ARN of the bridge feeding this flow", and content that reaches a cloud flow from a
+/// bridge "originates at your premises" (`AddIngressGatewayBridgeRequest`), which is the
+/// direction an ingress bridge carries. CreateBridge is `bridge_lifecycle`'s subject; here
+/// it is only the fixture a flow-source suite needs a REAL bridge ARN from, so `pub(crate)`
+/// and one encoding of it for the whole test crate.
+pub(crate) async fn bridge_feeding_a_flow(emulator: &Emulator, name: &str) -> String {
+    let gateway_arn = gateway_with_networks(emulator, &format!("gw-{name}"), &["net-1"]).await;
+    let (status, code, created) = create_bridge(
+        emulator,
+        json!({
+            "name": name,
+            "placementArn": gateway_arn,
+            "ingressGatewayBridge": { "maxBitrate": 20_000_000, "maxOutputs": 2 },
+            "sources": [{ "networkSource": {
+                "multicastIp": "224.0.1.1",
+                "name": "net-a",
+                "networkName": "net-1",
+                "port": 5000,
+                "protocol": "rtp",
+            }}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (201, None),
+        "fixture bridge {name:?}: create expected 201, got {status} {code:?}: {created}"
+    );
+    created["bridge"]["bridgeArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("fixture bridge {name:?}: the create answers an ARN: {created}"))
+        .to_string()
+}
+
 /// Every ARN CreateBridge mints must be one this service could have minted: the model
 /// puts no pattern on `BridgeArn` (it carries an `@arnReference` to
 /// `AWS::MediaConnect::Bridge`), so the form is the crate's own and is asserted through

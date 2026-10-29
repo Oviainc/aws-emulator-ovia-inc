@@ -457,7 +457,10 @@ struct ReferenceCase {
     free: &'static str,
 }
 
-fn reference_cases() -> Vec<ReferenceCase> {
+/// The rows the rule is asserted over. `bridge_arn` is the bridge the gateway-bridge-source
+/// row names: `GatewayBridgeSource$BridgeArn` references a bridge of the account, so the row
+/// names one the account HOLDS.
+fn reference_cases(bridge_arn: &str) -> Vec<ReferenceCase> {
     vec![
         ReferenceCase {
             // `Source$VpcInterfaceName`.
@@ -495,7 +498,7 @@ fn reference_cases() -> Vec<ReferenceCase> {
                 "source": {
                     "name": "bridge-src",
                     "gatewayBridgeSource": {
-                        "bridgeArn": "arn:aws:mediaconnect:us-east-1:111122223333:bridge:1-0000cafe:br-1",
+                        "bridgeArn": bridge_arn,
                         "vpcInterfaceAttachment": { "vpcInterfaceName": "vpc-ref" }
                     }
                 }
@@ -513,8 +516,12 @@ fn reference_cases() -> Vec<ReferenceCase> {
 #[tokio::test]
 async fn remove_flow_vpc_interface_refuses_a_referenced_interface() {
     let emulator = Emulator::new();
+    // A source fed by a gateway bridge names a bridge of the account, so the row that
+    // carries one names a bridge this account holds.
+    let bridge_arn =
+        crate::bridge_lifecycle::bridge_feeding_a_flow(&emulator, "br-vpc-reference").await;
 
-    for (index, row) in reference_cases().into_iter().enumerate() {
+    for (index, row) in reference_cases(&bridge_arn).into_iter().enumerate() {
         let ReferenceCase {
             case,
             extra,

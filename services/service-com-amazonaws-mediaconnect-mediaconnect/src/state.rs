@@ -1275,6 +1275,69 @@ pub fn assigned_source_max_bitrate(protocol: &str, requested: Option<i32>) -> Op
     })
 }
 
+/// The `Protocol` enum values that are Zixi protocols: the `zixi-push` and `zixi-pull`
+/// values of `Protocol` (`smithy_query(query="shape",shape="Protocol")`).
+pub const ZIXI_PROTOCOLS: [&str; 2] = ["zixi-push", "zixi-pull"];
+
+/// The one port a source on one of [`ZIXI_PROTOCOLS`] listens on: "the port that the flow
+/// listens on for incoming content. If the protocol of the source is Zixi, the port must
+/// be set to 2088"
+/// (`smithy_query(query="doc",shape="UpdateFlowSourceRequest",member="IngestPort")`).
+pub const ZIXI_INGEST_PORT: i32 = 2088;
+
+/// Whether `protocol` is one of [`ZIXI_PROTOCOLS`].
+pub fn is_zixi_protocol(protocol: &str) -> bool {
+    ZIXI_PROTOCOLS.contains(&protocol)
+}
+
+/// The `Source$IngestPort` a source on `protocol` listens on, given the `port` it would
+/// otherwise carry — `None` for a source that listens on no ingest endpoint of its own,
+/// which keeps none.
+///
+/// A source on a Zixi protocol listens on [`ZIXI_INGEST_PORT`] and on no other port, so
+/// that is the port the service hands one whichever call put it on that protocol. Every
+/// operation that materialises or updates a source resolves the port HERE, exactly as it
+/// resolves the smoothing bitrate through [`assigned_source_max_bitrate`], so a source
+/// whose protocol moves onto Zixi reports the port it would have been created with. A port
+/// the request itself named is admitted before this (see [`zixi_ingest_port_rejection`]),
+/// so this never silently replaces a value a client chose and was answered 2xx for.
+pub fn assigned_source_ingest_port(protocol: Option<&str>, port: Option<i32>) -> Option<i32> {
+    match port {
+        Some(_) if protocol.is_some_and(is_zixi_protocol) => Some(ZIXI_INGEST_PORT),
+        port => port,
+    }
+}
+
+/// Why `ingest_port` cannot be the port a source on `protocol` listens on, or `None` when
+/// it can — including when the request named no port at all, because the service then
+/// assigns the source its port ([`assigned_source_ingest_port`]). `member` is the request
+/// member that named it.
+///
+/// A Zixi source listens on one port and the model states which: "if the protocol of the
+/// source is Zixi, the port must be set to 2088". So a request that names any other port
+/// for a source that would be on a Zixi protocol describes a source this service does not
+/// listen for, and is refused with `BadRequestException` — the error the model describes as
+/// the one for "a semantic error" in the request. Every operation that stores a source's
+/// ingest port (CreateFlow's `Source` / `Sources`, AddFlowSources, UpdateFlowSource)
+/// refuses through this one function, so one request value cannot be admitted by one of
+/// them and refused by another.
+pub fn zixi_ingest_port_rejection(
+    member: &str,
+    protocol: Option<&str>,
+    ingest_port: Option<i32>,
+) -> Option<String> {
+    let port = ingest_port?;
+    let protocol = protocol.filter(|protocol| is_zixi_protocol(protocol))?;
+    if port == ZIXI_INGEST_PORT {
+        return None;
+    }
+    Some(format!(
+        "{member} {port} cannot be the port a source on the {protocol:?} protocol listens \
+         on: if the protocol of the source is Zixi, the port must be set to \
+         {ZIXI_INGEST_PORT}."
+    ))
+}
+
 /// The recovery window (in milliseconds) a flow's source failover config reports when
 /// the request that set it named none.
 ///
@@ -1583,11 +1646,18 @@ impl StoredSource {
             name,
             description: request.description.clone(),
             ingest_ip: (!entitled).then(|| assigned_ingest_ip(suffix)),
-            ingest_port: (!entitled).then(|| {
-                request
-                    .ingest_port
-                    .unwrap_or_else(|| assigned_ingest_port(suffix))
-            }),
+            // The port the source listens on: the one the request named, or the one the
+            // service assigns a request that named none — resolved against the protocol
+            // through the one place this crate resolves a source's port, so a Zixi source
+            // listens on the port the model fixes for it.
+            ingest_port: assigned_source_ingest_port(
+                request.protocol.as_deref(),
+                (!entitled).then(|| {
+                    request
+                        .ingest_port
+                        .unwrap_or_else(|| assigned_ingest_port(suffix))
+                }),
+            ),
             whitelist_cidr: request.whitelist_cidr.clone(),
             entitlement_arn: request.entitlement_arn.clone(),
             vpc_interface_name: request.vpc_interface_name.clone(),
@@ -2381,7 +2451,10 @@ pub fn output_request_reference_rejection(
 /// A source references the flow's VPC interfaces through `VpcInterfaceName` and, for a
 /// source fed by a gateway bridge, through its `GatewayBridgeSource`'s attachment — the
 /// same two references [`StoredFlow::vpc_interface_reference`] resolves when
-/// RemoveFlowVpcInterface asks what still holds an interface.
+/// RemoveFlowVpcInterface asks what still holds an interface. The bridge that same
+/// `GatewayBridgeSource` names is a resource of the ACCOUNT rather than of the flow, so it
+/// is resolved against the store instead, through
+/// [`ComAmazonawsMediaconnectMediaconnectState::source_bridge_reference_rejection`].
 pub fn source_request_reference_rejection(
     prefix: &str,
     request: &SetSourceRequest,
@@ -5789,6 +5862,57 @@ impl ComAmazonawsMediaconnectMediaconnectState {
     /// [`Self::holds_flow_source`] and [`Self::holds_flow_output`].
     pub fn holds_flow(&self, arn: &str) -> bool {
         self.flows.contains_key(arn)
+    }
+
+    /// Why `arn` names no bridge this account holds, or `None` when the store holds one for
+    /// it. `member` is the request member that named it, for the refusal detail.
+    ///
+    /// The bridge-level counterpart of [`Self::unknown_flow_rejection`]: a `BridgeArn` names
+    /// a resource THIS service mints ([`is_mintable_bridge_arn`]) and holds in
+    /// [`Self::bridges`], so a request that points at one is resolved against the store
+    /// rather than taken on trust.
+    pub fn unknown_bridge_rejection(&self, member: &str, arn: &str) -> Option<String> {
+        if self.holds_bridge(arn) {
+            return None;
+        }
+        Some(format!(
+            "{member} {arn:?} does not name a bridge this account holds."
+        ))
+    }
+
+    /// Whether the store holds the bridge `arn` — the bridge-level counterpart of
+    /// [`Self::holds_flow`]. A bridge leaves the store when DeleteBridge takes it out, so a
+    /// reference to a deleted bridge resolves nothing.
+    pub fn holds_bridge(&self, arn: &str) -> bool {
+        self.bridges.contains_key(arn)
+    }
+
+    /// Why the gateway bridge source a request would store on a FLOW SOURCE cannot be
+    /// stored, or `None` when the reference it carries resolves — including when the request
+    /// carries no bridge source, or a bridge source that names no bridge, because neither
+    /// references anything. `prefix` is the request member that nests the source
+    /// (`Sources[0]`, say; see [`qualified_member`]).
+    ///
+    /// `GatewayBridgeSource$BridgeArn` is "the ARN of the bridge feeding this flow", so it
+    /// is a reference to a bridge of the ACCOUNT, not to a sub-resource of the flow — the
+    /// account-level half of the references a source carries, whose flow-local half
+    /// [`source_request_reference_rejection`] resolves. Every operation that writes one
+    /// (CreateFlow's `Source` / `Sources`, AddFlowSources, UpdateFlowSource) resolves it
+    /// HERE, so a stored source never names a bridge the account has not got — the same
+    /// reading every other cross-resource ARN this store holds is resolved by
+    /// ([`Self::unknown_flow_rejection`] for a bridge flow source's `FlowArn`,
+    /// [`Self::unknown_router_network_interface_rejection`] for a router configuration's
+    /// interface).
+    pub fn source_bridge_reference_rejection(
+        &self,
+        prefix: &str,
+        bridge_arn: Option<&str>,
+    ) -> Option<String> {
+        let arn = bridge_arn?;
+        self.unknown_bridge_rejection(
+            &qualified_member(prefix, "GatewayBridgeSource.BridgeArn"),
+            arn,
+        )
     }
 
     /// Why `network_name` names no network the gateway `placement_arn` declares, or `None`

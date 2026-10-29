@@ -407,6 +407,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 return Err(bad_request(rejection));
             }
+            // A Zixi source listens on one port and the model states which ("if the
+            // protocol of the source is Zixi, the port must be set to 2088"), so a source
+            // this request would store on a Zixi protocol with any other port stores no
+            // flow at all — the rule read from the one place this crate reads it, so the
+            // create and the update paths admit the same ports.
+            if let Some(rejection) = crate::state::zixi_ingest_port_rejection(
+                &format!("Sources[{index}].IngestPort"),
+                source.protocol.as_deref(),
+                source.ingest_port,
+            ) {
+                return Err(bad_request(rejection));
+            }
         }
         for (index, output) in input.outputs.iter().flatten().enumerate() {
             if let Some(rejection) = crate::state::output_request_reference_rejection(
@@ -450,6 +462,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        // A source fed by a gateway bridge names a BRIDGE of this account by ARN, which is
+        // a resource this service mints and holds rather than a sub-resource of the flow
+        // being created — so that reference is resolved against the STORE, under the same
+        // lock this create writes under and through the one place this crate resolves it
+        // (`crate::state`). Nothing is stored for a request that names a bridge the account
+        // has not got.
+        for (index, source) in requested_sources.iter().enumerate() {
+            if let Some(rejection) = store.source_bridge_reference_rejection(
+                &format!("Sources[{index}]"),
+                source
+                    .gateway_bridge_source
+                    .as_ref()
+                    .map(|bridge_source| bridge_source.bridge_arn.as_str()),
+            ) {
+                return Err(bad_request(rejection));
+            }
+        }
 
         // A flow's identity is the ARN this operation mints, and that ARN carries a
         // per-flow generated id as well as the name (`flow:1-<id>:<name>`), so two flows

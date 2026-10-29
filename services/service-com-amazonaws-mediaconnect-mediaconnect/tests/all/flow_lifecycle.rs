@@ -333,6 +333,8 @@ fn create_cases() -> Vec<CreateCase> {
 /// its own ARN, and the response is that record — the same bytes DescribeFlow reports.
 #[tokio::test]
 async fn create_flow_persists_the_flow_it_returns() {
+    use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
+
     let emulator = Emulator::new();
 
     for CreateCase {
@@ -421,16 +423,29 @@ async fn create_flow_persists_the_flow_it_returns() {
             );
             // An explicit `IngestPort` is kept verbatim; a source that asked for none is
             // assigned one from the service's pool (`crate::state::assigned_ingest_port`:
-            // 5000 up to the top of the 16-bit port space).
+            // 5000 up to the top of the 16-bit port space) — except on a Zixi protocol,
+            // whose port the model fixes ("if the protocol of the source is Zixi, the port
+            // must be set to 2088", `UpdateFlowSourceRequest$IngestPort`), asserted over
+            // the whole `Protocol` catalog in `crate::flow_source_bridge_and_ingest_port`.
             if !entitled {
                 let port = source["ingestPort"].as_i64().unwrap_or_default();
-                match requested_sources[index]["ingestPort"].as_i64() {
-                    Some(requested) => assert_eq!(
+                let requested = requested_sources[index]["ingestPort"].as_i64();
+                let zixi = requested_sources[index]["protocol"]
+                    .as_str()
+                    .is_some_and(mc::is_zixi_protocol);
+                match (requested, zixi) {
+                    (_, true) => assert_eq!(
+                        port,
+                        i64::from(mc::ZIXI_INGEST_PORT),
+                        "case {case:?}: source {index} is a Zixi source, so it listens on \
+                         the port the model fixes, got {port}"
+                    ),
+                    (Some(requested), false) => assert_eq!(
                         port, requested,
                         "case {case:?}: source {index} keeps the requested IngestPort, got \
                          {port}"
                     ),
-                    None => assert!(
+                    (None, false) => assert!(
                         (5_000..=65_535).contains(&port),
                         "case {case:?}: source {index} is assigned a port from the pool, got \
                          {port}"

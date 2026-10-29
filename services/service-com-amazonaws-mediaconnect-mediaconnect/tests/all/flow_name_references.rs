@@ -50,9 +50,10 @@ const UNKNOWN_NAMES: [&str; 4] = ["does-not-exist", "", "VID", "vpc-a-2"];
 const SECURITY_GROUP_IDS: [&str; 1] = ["sg-0123456789abcdef0"];
 
 /// A bridge ARN, well formed against the modelled `SetGatewayBridgeSourceRequest$BridgeArn`
-/// pattern (`^arn:.+:mediaconnect.+:bridge:.+$`), for the row whose source is fed by a
-/// bridge: the member under test there is the VPC interface the bridge source attaches.
-const BRIDGE_ARN: &str = "arn:aws:mediaconnect:us-east-1:111122223333:bridge:1-0000beef:bridge-1";
+/// pattern (`^arn:.+:mediaconnect.+:bridge:.+$`), that names NO bridge this account holds —
+/// what [`crate::bridge_lifecycle::bridge_feeding_a_flow`] mints is the resolvable one.
+const UNKNOWN_BRIDGE_ARN: &str =
+    "arn:aws:mediaconnect:us-east-1:111122223333:bridge:1-0000beef:bridge-1";
 
 /// The flow's `MediaStreams`, as [`HELD_MEDIA_STREAMS`] names them.
 fn held_media_streams() -> Value {
@@ -256,8 +257,11 @@ struct SourceCase {
     source: Value,
 }
 
-/// The source rows, driven exactly as [`output_cases`] is.
-fn source_cases(media_stream: &str, vpc_interface: &str) -> Vec<SourceCase> {
+/// The source rows, driven exactly as [`output_cases`] is. `bridge_arn` is the bridge the
+/// gateway-bridge-source row names: that member references a bridge of the ACCOUNT rather
+/// than a name within the flow, so every row names one the account holds and the name under
+/// test stays the only unresolved reference.
+fn source_cases(media_stream: &str, vpc_interface: &str, bridge_arn: &str) -> Vec<SourceCase> {
     let held_stream = HELD_MEDIA_STREAMS[1].0;
     let held_interface = HELD_VPC_INTERFACES[1];
     vec![
@@ -314,7 +318,7 @@ fn source_cases(media_stream: &str, vpc_interface: &str) -> Vec<SourceCase> {
             source: json!({
                 "name": "s-bridge",
                 "gatewayBridgeSource": {
-                    "bridgeArn": BRIDGE_ARN,
+                    "bridgeArn": bridge_arn,
                     "vpcInterfaceAttachment": { "vpcInterfaceName": vpc_interface }
                 }
             }),
@@ -388,13 +392,17 @@ async fn add_flow_outputs_resolves_every_output_reference_against_the_flow() {
 async fn add_flow_sources_resolves_every_source_reference_against_the_flow() {
     let emulator = Emulator::new();
     let flow_arn = fixture_flow(&emulator, "flow-add-source-references").await;
+    // The gateway-bridge-source row names a bridge of the account, so the account holds
+    // one: the name under test is the VPC interface that row attaches.
+    let bridge_arn =
+        crate::bridge_lifecycle::bridge_feeding_a_flow(&emulator, "br-add-source-refs").await;
 
     for unknown in UNKNOWN_NAMES {
         for SourceCase {
             case,
             member,
             source,
-        } in source_cases(unknown, unknown)
+        } in source_cases(unknown, unknown, &bridge_arn)
         {
             let case = format!("{case} as {unknown:?}, added");
             let before = described_sources(&emulator, &case, &flow_arn).await;
@@ -419,7 +427,7 @@ async fn add_flow_sources_resolves_every_source_reference_against_the_flow() {
     // The same rows, resolved. A flow holds at most two sources with failover ACTIVE, so
     // each row gets its own fixture flow and the add brings it to two.
     for (index, SourceCase { case, member, source }) in
-        source_cases(HELD_MEDIA_STREAMS[0].0, HELD_VPC_INTERFACES[0])
+        source_cases(HELD_MEDIA_STREAMS[0].0, HELD_VPC_INTERFACES[0], &bridge_arn)
             .into_iter()
             .enumerate()
     {
@@ -623,7 +631,11 @@ async fn an_update_resolves_every_reference_it_moves_against_the_flow() {
                 "GatewayBridgeSource.VpcInterfaceAttachment.VpcInterfaceName",
                 json!({
                     "gatewayBridgeSource": {
-                        "bridgeArn": BRIDGE_ARN,
+                        // The bridge this names resolves nowhere either, and the refusal
+                        // still names the VPC interface: the flow-local reference is
+                        // resolved first, so each row leaves exactly one member unresolved
+                        // in the answer under test.
+                        "bridgeArn": UNKNOWN_BRIDGE_ARN,
                         "vpcInterfaceAttachment": { "vpcInterfaceName": unknown }
                     }
                 }),

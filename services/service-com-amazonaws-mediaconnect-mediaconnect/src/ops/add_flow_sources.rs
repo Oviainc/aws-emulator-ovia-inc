@@ -275,6 +275,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 return Err(bad_request(rejection));
             }
+            // The bridge a gateway bridge source names is a resource of the ACCOUNT, so it
+            // is resolved against the STORE rather than against the flow, through the one
+            // place this crate resolves that reference.
+            if let Some(rejection) = store.source_bridge_reference_rejection(
+                &format!("Sources[{index}]"),
+                source
+                    .gateway_bridge_source
+                    .as_ref()
+                    .map(|bridge_source| bridge_source.bridge_arn.as_str()),
+            ) {
+                return Err(bad_request(rejection));
+            }
+            // A Zixi source listens on one port and the model states which, so a source
+            // this request would append on a Zixi protocol with any other port appends
+            // nothing — the same rule, read from the same place, that CreateFlow stores a
+            // source under.
+            if let Some(rejection) = crate::state::zixi_ingest_port_rejection(
+                &format!("Sources[{index}].IngestPort"),
+                source.protocol.as_deref(),
+                source.ingest_port,
+            ) {
+                return Err(bad_request(rejection));
+            }
         }
 
         // `Source.Name` is required while `SetSourceRequest.Name` is optional, so a

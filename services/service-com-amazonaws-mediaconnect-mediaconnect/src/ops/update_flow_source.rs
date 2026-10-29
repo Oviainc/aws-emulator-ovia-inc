@@ -26,6 +26,13 @@
 //! becomes the state a source reports, so a source whose requests never mentioned router
 //! integration still reports the disabled state.
 //!
+//! A setting the request MOVES is admitted before anything is written, so a refused update
+//! leaves the source exactly as it was: every reference it carries has to resolve — the
+//! flow's own media streams and VPC interfaces by name, and the bridge a
+//! `GatewayBridgeSource` names against the bridges the ACCOUNT holds — and `IngestPort` has
+//! to be the one port a source on a Zixi protocol listens on. Both rules live in
+//! [`crate::state`], where CreateFlow and AddFlowSources read them too.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -467,6 +474,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(bad_request(rejection));
         }
+        // The bridge that same member names is a resource of the ACCOUNT — "the ARN of the
+        // bridge feeding this flow" — so it is resolved against the STORE, through the one
+        // place this crate resolves that reference (`crate::state`), before the merged
+        // record is written. Only the ARN THIS request carries is resolved: a request that
+        // does not move the reference is never refused for the bridge the source already
+        // names.
+        if let Some(rejection) = store.source_bridge_reference_rejection(
+            "",
+            input
+                .gateway_bridge_source
+                .as_ref()
+                .and_then(|bridge_source| bridge_source.bridge_arn.as_deref()),
+        ) {
+            return Err(bad_request(rejection));
+        }
+
+        // A Zixi source listens on one port, and the model states which: "if the protocol
+        // of the source is Zixi, the port must be set to 2088"
+        // (`UpdateFlowSourceRequest$IngestPort`). The protocol the SOURCE would be on once
+        // this request is applied is what the rule reads — the protocol the request names,
+        // or the one the source already carries when it names none — so a request that
+        // names another port for a Zixi source is refused and writes nothing, through the
+        // one place this crate reads that rule (`crate::state`).
+        let merged_protocol = input
+            .protocol
+            .clone()
+            .or_else(|| updated.transport.as_ref().map(|t| t.protocol.clone()));
+        if let Some(rejection) = crate::state::zixi_ingest_port_rejection(
+            "IngestPort",
+            merged_protocol.as_deref(),
+            input.ingest_port,
+        ) {
+            return Err(bad_request(rejection));
+        }
 
         // What each setting becomes once this request is applied: the request's value
         // where it carries one, the stored value where it does not.
@@ -535,6 +576,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             updated.transport = Some(transport);
         }
+        // The port the source listens on, resolved against the protocol it now carries
+        // through the one place this crate resolves a source's port: a source whose protocol
+        // this request moved onto Zixi listens on the port the model fixes for it, exactly
+        // as it would have been created, and a source that listens on no ingest endpoint of
+        // its own keeps none.
+        updated.ingest_port = crate::state::assigned_source_ingest_port(
+            updated
+                .transport
+                .as_ref()
+                .map(|transport| transport.protocol.as_str()),
+            updated.ingest_port,
+        );
         // "The media stream that is associated with the source, and the parameters for
         // that association": the member carries the WHOLE association list, so the list in
         // the request becomes the source's, materialised the one way this crate

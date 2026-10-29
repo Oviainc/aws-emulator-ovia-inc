@@ -62,7 +62,10 @@ struct UpdateCase {
 /// existed before, and a request that carries none at all. They are applied in order to
 /// the SAME source, so each row also proves the settings the earlier rows wrote survive an
 /// update that does not mention them.
-fn update_cases() -> Vec<UpdateCase> {
+///
+/// `bridge_arn` is the bridge the gateway-bridge-source rows name: `GatewayBridgeSource`'s
+/// ARN references a bridge of the account, so the row names one the account HOLDS.
+fn update_cases(bridge_arn: &str) -> Vec<UpdateCase> {
     vec![
         UpdateCase {
             case: "a description on its own",
@@ -271,15 +274,8 @@ fn update_cases() -> Vec<UpdateCase> {
             // `GatewayBridgeSource$BridgeArn` is required on the stored shape, so this row
             // names it; the next changes only its sibling.
             case: "a gateway bridge source",
-            body: json!({
-                "gatewayBridgeSource": {
-                    "bridgeArn": "arn:aws:mediaconnect:us-east-1:111122223333:bridge:1-0000cafe:br-1"
-                }
-            }),
-            expect: vec![(
-                "gatewayBridgeSource.bridgeArn",
-                json!("arn:aws:mediaconnect:us-east-1:111122223333:bridge:1-0000cafe:br-1"),
-            )],
+            body: json!({ "gatewayBridgeSource": { "bridgeArn": bridge_arn } }),
+            expect: vec![("gatewayBridgeSource.bridgeArn", json!(bridge_arn))],
         },
         UpdateCase {
             case: "the VPC attachment of the gateway bridge source, keeping the bridge",
@@ -291,10 +287,7 @@ fn update_cases() -> Vec<UpdateCase> {
                     "gatewayBridgeSource.vpcInterfaceAttachment.vpcInterfaceName",
                     json!("vpc-7"),
                 ),
-                (
-                    "gatewayBridgeSource.bridgeArn",
-                    json!("arn:aws:mediaconnect:us-east-1:111122223333:bridge:1-0000cafe:br-1"),
-                ),
+                ("gatewayBridgeSource.bridgeArn", json!(bridge_arn)),
             ],
         },
         UpdateCase {
@@ -337,8 +330,11 @@ async fn update_flow_source_applies_only_the_settings_the_request_carries() {
     let held = described_sources(&emulator, "updates", &flow_arn).await;
     let source_arn = held[0]["sourceArn"].as_str().unwrap_or_default().to_string();
     let untouched_sibling = held[1].clone();
+    // A gateway bridge source names a bridge of the account, so the rows that move one
+    // name a bridge this account holds.
+    let bridge_arn = crate::bridge_lifecycle::bridge_feeding_a_flow(&emulator, "br-updates").await;
 
-    for UpdateCase { case, body, expect } in update_cases() {
+    for UpdateCase { case, body, expect } in update_cases(&bridge_arn) {
         let before = described_sources(&emulator, case, &flow_arn).await[0].clone();
         let (status, code, response) =
             update_flow_source(&emulator, &flow_arn, &source_arn, body).await;
