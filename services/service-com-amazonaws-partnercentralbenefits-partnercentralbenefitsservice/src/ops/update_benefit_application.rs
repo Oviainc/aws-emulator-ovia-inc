@@ -29,6 +29,12 @@
 //! `ValidationException` (HTTP 400) and nothing is persisted — see
 //! [`crate::state::benefit_schema_refusal`].
 //!
+//! A caller string this update PERSISTS that the model constrains not at all — the `Phone`
+//! of a supplied contact, the `BusinessUseCase` of a supplied attachment — carries this
+//! service's own bound on such a value, so one past it is refused with the modelled
+//! `ValidationException` (HTTP 400) and nothing is persisted, exactly as the create and the
+//! amendment refuse it: see [`crate::state::unconstrained_members_refusal`].
+//!
 //! Idempotency: `ClientToken` identifies the REQUEST, so a retry carrying the token of an
 //! update that already applied changes nothing a second time and answers with the
 //! `Id`/`Arn`/`Revision` that update reported, while an update carrying that token with
@@ -230,10 +236,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `BenefitApplicationDetails` is an unconstrained `Document`, so the bounds on a
         // document this update would store are this service's own, refused exactly as the
-        // create refuses them — see [`crate::state::details_refusal`].
+        // create refuses them — see [`crate::state::details_refusal`]. The `Phone` of a
+        // supplied contact and the `BusinessUseCase` of a supplied attachment are
+        // unconstrained strings this update also persists, so they carry this service's
+        // own bound on the same rule, wherever the member is written — see
+        // [`crate::state::unconstrained_members_refusal`].
         if let Some(refusal) = crate::state::details_refusal(
             crate::state::DETAILS_MEMBER,
             input.benefit_application_details.as_ref(),
+        ) {
+            return Err(UpdateBenefitApplicationErrorModeled::ValidationException(refusal).into());
+        }
+        if let Some(refusal) = crate::state::unconstrained_members_refusal(
+            input.partner_contacts.as_deref(),
+            input.file_details.as_deref(),
         ) {
             return Err(UpdateBenefitApplicationErrorModeled::ValidationException(refusal).into());
         }

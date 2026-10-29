@@ -187,7 +187,7 @@ const MEMBER_EMAIL: &str = "Email";
 const MEMBER_FIRST_NAME: &str = "FirstName";
 const MEMBER_LAST_NAME: &str = "LastName";
 const MEMBER_BUSINESS_TITLE: &str = "BusinessTitle";
-const MEMBER_PHONE: &str = "Phone";
+const MEMBER_PHONE: &str = crate::state::CONTACT_PHONE_MEMBER;
 const CONTACT_MEMBERS: &[&str] = &[
     MEMBER_EMAIL,
     MEMBER_FIRST_NAME,
@@ -202,7 +202,7 @@ const CONTACT_MEMBERS: &[&str] = &[
 /// the service's own — `FileName` and `FileType` follow the URI, `CreatedBy` and
 /// `CreatedAt` record who attached the file and when (see [`crate::state::file_detail`]).
 const MEMBER_FILE_URI: &str = "FileURI";
-const MEMBER_BUSINESS_USE_CASE: &str = "BusinessUseCase";
+const MEMBER_BUSINESS_USE_CASE: &str = crate::state::FILE_BUSINESS_USE_CASE_MEMBER;
 const FILE_MEMBERS: &[&str] = &[MEMBER_FILE_URI, MEMBER_BUSINESS_USE_CASE];
 
 /// The member of a `Contact` the model constrains not at all: `Phone` targets
@@ -210,7 +210,8 @@ const FILE_MEMBERS: &[&str] = &[MEMBER_FILE_URI, MEMBER_BUSINESS_USE_CASE];
 /// (`smithy_query(query="shape",shape="Contact")`). A value written to it therefore
 /// carries this service's own bound on a persisted caller value, exactly as a leaf of the
 /// details document does ([`crate::state::MAX_DETAILS_VALUE_LEN`]), so no amendment can
-/// grow one record without limit.
+/// grow one record without limit — the SAME bound the create and the update apply to the
+/// member ([`crate::state::unconstrained_members_refusal`]).
 const CONTACT_UNCONSTRAINED_MEMBERS: &[&str] = &[MEMBER_PHONE];
 
 /// The member of a `FileInput` the model constrains not at all, for the same reason:
@@ -243,13 +244,15 @@ impl AmendmentRefusal {
     }
 }
 
+/// The input member one amendment arrives on, as the wire spells it.
+const AMENDMENTS_MEMBER: &str = "Amendments";
+
 /// The path of one member of `Amendments[position]`, spelled the way this service's
-/// validation messages spell a member path: members in lowerCamel, a list element as
-/// its 1-BASED position followed by the collection step `member` (see
-/// `smithy_schema_server::constraints::path`, which spells the paths the centralized
-/// walk reports) — e.g. `amendments.1.member.fieldPath`.
+/// validation messages spell a member path — through the one construction that spells a
+/// nested member of a list element ([`crate::state::element_member_path`]), e.g.
+/// `amendments.1.member.fieldPath`.
 fn member_path(position: usize, member: &str) -> String {
-    format!("amendments.{}.member.{member}", position + 1)
+    crate::state::element_member_path(AMENDMENTS_MEMBER, position, member)
 }
 
 /// The segments of one `FieldPath`: a field name, optionally written in JSON-path form
@@ -396,7 +399,7 @@ fn unconstrained_member_clause(
     if !unconstrained.contains(&member) {
         return None;
     }
-    crate::state::length_clause(value, 0, crate::state::MAX_DETAILS_VALUE_LEN)
+    crate::state::unconstrained_member_clause(value)
 }
 
 /// Write `value` at `path` inside `document`, creating the objects the path needs.
@@ -708,12 +711,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // applies them runs under the lock with a cited bound.
         if input.amendments.is_empty() {
             return Err(refused(
-                "amendments",
+                AMENDMENTS_MEMBER,
                 "Member must name at least one field to amend",
             ));
         }
         if let Some(clause) = amendments_length_clause(input.amendments.len()) {
-            return Err(refused("amendments", &clause));
+            return Err(refused(AMENDMENTS_MEMBER, &clause));
         }
 
         // The two caller-chosen strings this operation PERSISTS, checked at the door of

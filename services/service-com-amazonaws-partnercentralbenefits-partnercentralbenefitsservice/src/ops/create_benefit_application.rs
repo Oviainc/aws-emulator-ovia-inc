@@ -24,6 +24,12 @@
 //! [`crate::state::benefit_schema_refusal`], which the update and the amendment apply to
 //! the document they would store too.
 //!
+//! A caller string this create PERSISTS that the model constrains not at all — the `Phone`
+//! of a supplied contact, the `BusinessUseCase` of a supplied attachment — carries this
+//! service's own bound on such a value, so one past it is refused with the modelled
+//! `ValidationException` (HTTP 400) and nothing is created, exactly as the update and the
+//! amendment refuse it: see [`crate::state::unconstrained_members_refusal`].
+//!
 //! The create's own `Tags` are caller-supplied tag keys, so they go through the same
 //! reserved-namespace rule the tagging operations apply: a key in the AWS-reserved `aws:`
 //! namespace is refused with the modelled `ValidationException` (HTTP 400) and no
@@ -230,14 +236,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Every string pattern and length on this input, and the length of every list it
-        // carries, is a modelled constraint the centralized walk has already enforced.
-        // `BenefitApplicationDetails` is an unconstrained `Document`, so its bounds live
-        // here — refused in the same envelope the walk's own refusals carry, see
-        // [`crate::state::details_refusal`].
+        // Every string pattern and length the model states on this input, and the length
+        // of every list it carries, is a modelled constraint the centralized walk has
+        // already enforced. What the model constrains NOT AT ALL this handler bounds
+        // itself, because the value is persisted: `BenefitApplicationDetails` is an
+        // unconstrained `Document` (see [`crate::state::details_refusal`]), and the
+        // `Phone` of a supplied contact and the `BusinessUseCase` of a supplied attachment
+        // are unconstrained strings (see
+        // [`crate::state::unconstrained_members_refusal`]) — each refused in the same
+        // envelope the walk's own refusals carry, and each the same rule the amendment
+        // that writes those members applies.
         if let Some(refusal) = crate::state::details_refusal(
             crate::state::DETAILS_MEMBER,
             input.benefit_application_details.as_ref(),
+        ) {
+            return Err(
+                CreateBenefitApplicationErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+        if let Some(refusal) = crate::state::unconstrained_members_refusal(
+            input.partner_contacts.as_deref(),
+            input.file_details.as_deref(),
         ) {
             return Err(
                 CreateBenefitApplicationErrorModeled::ValidationException(refusal).into(),

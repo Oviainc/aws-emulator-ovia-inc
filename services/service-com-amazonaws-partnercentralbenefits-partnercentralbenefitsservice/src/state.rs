@@ -1516,8 +1516,10 @@ pub const ALLOCATION_RESOURCE: &str = "benefit-allocation";
 /// [`MAX_APPLICATIONS_PER_CATALOG`], the catalog set is fixed by [`SEEDED_CATALOGS`],
 /// `arns` and `client_tokens` carry at most one entry per stored application, one
 /// application records at most [`MAX_APPLIED_WRITE_HISTORY`] applied writes, and a catalog holds
-/// at most [`MAX_ALLOCATIONS_PER_CATALOG`] allocations — so no caller can grow this store
-/// without limit.
+/// at most [`MAX_ALLOCATIONS_PER_CATALOG`] allocations, and every caller string a record
+/// holds carries a length — the model's own where it states one, and this service's where
+/// it states none ([`unconstrained_members_refusal`], [`details_requirement`]) — so no
+/// caller can grow this store without limit.
 #[derive(Debug)]
 pub struct ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     /// Every catalog, keyed by the `Catalog` input string.
@@ -2565,6 +2567,96 @@ pub fn benefit_not_offered_refusal(
         member,
         &requirement,
         VALIDATION_REASON_BUSINESS,
+    ))
+}
+
+/// The input member a benefit application's partner contacts arrive on, as the wire
+/// spells it (`smithy_query(query="operation",operation="CreateBenefitApplication")`).
+pub const PARTNER_CONTACTS_MEMBER: &str = "PartnerContacts";
+
+/// The input member a benefit application's attachments arrive on, likewise.
+pub const FILE_DETAILS_MEMBER: &str = "FileDetails";
+
+/// The member of a `Contact` the model constrains not at all: `Phone` targets
+/// `ContactPhone`, a bare string with no `@length`, while every other member of the shape
+/// carries one (`smithy_query(query="shape",shape="Contact")`).
+pub const CONTACT_PHONE_MEMBER: &str = "Phone";
+
+/// The member of a supplied `FileInput` — and of the `FileDetail` it is stored in — the
+/// model constrains not at all, for the same reason: `BusinessUseCase` targets a bare
+/// `String` (`smithy_query(query="shape",shape="FileInput")`).
+pub const FILE_BUSINESS_USE_CASE_MEMBER: &str = "BusinessUseCase";
+
+/// The requirement a caller string this service PERSISTS fails when the model puts no
+/// bound on it at all, or `None` when the value is one this service stores.
+///
+/// Such a value carries this service's own bound on a persisted caller string
+/// ([`MAX_DETAILS_VALUE_LEN`], the longest string member the model lets a caller store on
+/// a benefit application), applied through [`length_clause`] so it is counted and worded
+/// exactly like a modelled length. The one function every path that writes such a member
+/// goes through, so a value one path stores cannot be one another path refuses.
+pub fn unconstrained_member_clause(value: &str) -> Option<String> {
+    length_clause(value, 0, MAX_DETAILS_VALUE_LEN)
+}
+
+/// The path a refusal names for `member` of the element at `index` of the list member
+/// `list`, spelled the way the centralized walk spells one: the list member, the element's
+/// 1-based position and the collection step, then the member — through the framework's own
+/// path helpers, so a handler's rule names a nested member exactly as the walk does.
+pub fn element_member_path(list: &str, index: usize, member: &str) -> String {
+    let element = ::aws_smithy_schema_server::constraints::path::element(index + 1);
+    let leaf = ::aws_smithy_schema_server::constraints::path::member(member);
+    format!("{list}.{element}.{leaf}")
+}
+
+/// The refusal a request supplying a `PartnerContacts` or `FileDetails` list is answered
+/// with when one of the caller strings it would persist is past this service's own bound,
+/// or `None` when every supplied value can be stored.
+///
+/// The members checked are the ones the model constrains not at all
+/// ([`CONTACT_PHONE_MEMBER`], [`FILE_BUSINESS_USE_CASE_MEMBER`]); every other string of
+/// either shape carries a modelled `@length` or `@pattern` the centralized walk has
+/// already enforced. The refusal is built by the one construction every member refusal of
+/// this crate goes through ([`member_validation_exception`]), naming the element and the
+/// member a caller must fix ([`element_member_path`]) and echoing nothing of the value.
+///
+/// Applied by every operation that supplies these lists — the create and the update to the
+/// lists they were handed, `AmendBenefitApplication` to the single value an amendment
+/// writes — so one rule refuses one value in one form wherever it holds, and no read can
+/// report a value no other write path would accept.
+pub fn unconstrained_members_refusal(
+    contacts: Option<&[Contact]>,
+    files: Option<&[FileInput]>,
+) -> Option<crate::ops::types::ValidationException> {
+    let refused_contact = contacts
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .find_map(|(index, contact)| {
+            let clause = unconstrained_member_clause(contact.phone.as_deref()?)?;
+            Some((
+                element_member_path(PARTNER_CONTACTS_MEMBER, index, CONTACT_PHONE_MEMBER),
+                clause,
+            ))
+        });
+    let refused_file = || {
+        files
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .find_map(|(index, file)| {
+                let clause = unconstrained_member_clause(file.business_use_case.as_deref()?)?;
+                Some((
+                    element_member_path(FILE_DETAILS_MEMBER, index, FILE_BUSINESS_USE_CASE_MEMBER),
+                    clause,
+                ))
+            })
+    };
+    let (member, requirement) = refused_contact.or_else(refused_file)?;
+    Some(member_validation_exception(
+        &member,
+        &requirement,
+        VALIDATION_REASON_FIELD,
     ))
 }
 

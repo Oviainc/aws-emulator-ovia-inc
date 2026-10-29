@@ -93,6 +93,8 @@ mod state_roundtrip;
 mod status_transition_revision;
 #[path = "all/tag_cap.rs"]
 mod tag_cap;
+#[path = "all/unconstrained_member_bounds.rs"]
+mod unconstrained_member_bounds;
 #[path = "all/unknown_catalog_lookup.rs"]
 mod unknown_catalog_lookup;
 #[path = "all/validation_error_body.rs"]
