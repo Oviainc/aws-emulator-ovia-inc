@@ -682,6 +682,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         store.flows.insert(flow_arn.clone(), stored);
 
+        // A source that names a bridge is a cloud flow "receiving a stream from a bridge",
+        // and that stream is an output OF THAT BRIDGE: the bridge each of this flow's
+        // gateway-bridge sources names owes a flow output for it, materialised through the
+        // one place this crate decides which flow outputs a bridge holds (`crate::state`),
+        // so a bridge reports the same outputs whichever call wrote the flow source that
+        // asked for them.
+        store.sync_bridge_flow_outputs();
+
         // The response is the STORED record, read back out of the store, not the request.
         let flow = store
             .flows

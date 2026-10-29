@@ -203,3 +203,5 @@ mod bridge_output_network_name_paths_agree;
 mod flow_deletion_bridge_source_integrity;
 #[path = "all/flow_source_bridge_and_ingest_port.rs"]
 mod flow_source_bridge_and_ingest_port;
+#[path = "all/bridge_flow_outputs.rs"]
+mod bridge_flow_outputs;

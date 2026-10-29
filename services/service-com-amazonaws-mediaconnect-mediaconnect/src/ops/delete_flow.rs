@@ -225,8 +225,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The flow goes, and its sources and outputs go with it, so every record of this
         // store that NAMED one of them stops naming it: the references go with the resources
         // they pointed at, through the one repair every operation that takes a flow, a flow
-        // output or a flow source out of the store performs.
+        // output or a flow source out of the store performs. A bridge one of this flow's
+        // sources was fed by held a flow output for that source — the service's own record of
+        // a flow taking the bridge as its source — so those outputs go with the flow too,
+        // through the one place this crate decides which flow outputs a bridge holds.
         store.clear_unresolvable_flow_references(now);
+        store.sync_bridge_flow_outputs();
 
         Ok(DeleteFlowOutput {
             flow_arn: Some(flow_arn),

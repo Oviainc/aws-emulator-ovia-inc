@@ -131,9 +131,9 @@ fn bad_request(detail: impl Into<String>) -> UpdateBridgeOutputError {
 ///
 /// A bridge's flow output is one the service materialises for it, never one a request
 /// configures ([`crate::state::materialise_bridge_output`] projects a `NetworkOutput`
-/// only), so no bridge this emulator stores holds an output this refuses yet. It guards
-/// the merge rather than assuming the kind, so the day a flow output can be stored the
-/// request that cannot apply to it is refused instead of silently rewriting its kind.
+/// only): it is the record of a cloud flow that took the bridge as its source
+/// ([`crate::state::ComAmazonawsMediaconnectMediaconnectState::sync_bridge_flow_outputs`]),
+/// and it has no network settings a request could update.
 fn refused_by_output(detail: impl Into<String>) -> UpdateBridgeOutputError {
     UpdateBridgeOutputErrorModeled::BadRequestException(BadRequestException {
         message: crate::state::bad_request_message(&detail.into()),

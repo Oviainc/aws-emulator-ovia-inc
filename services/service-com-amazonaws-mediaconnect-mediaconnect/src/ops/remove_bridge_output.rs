@@ -6,6 +6,12 @@
 //! read back out of [`crate::state`]: the output DescribeBridge reported before this call
 //! is gone from the bridge afterwards.
 //!
+//! An output a request can remove is one a request CONFIGURED: a network output. A bridge's
+//! other kind of output, a `BridgeFlowOutput`, is the service's own record of a cloud flow
+//! that takes the bridge as its source — no request shape in this model carries one — so a
+//! request to remove one is refused with `BadRequestException` (HTTP 400) and the caller
+//! clears that flow source instead.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -78,6 +84,18 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Refuse a WELL-FORMED request the addressed OUTPUT itself does not admit, with
+/// `BadRequestException` (HTTP 400) under this service's bad-request envelope
+/// ([`crate::state::bad_request_message`]): the request is not malformed, the output is just
+/// not one a request can remove. The same split UpdateBridgeOutput makes for a wrapper the
+/// addressed output has no counterpart for.
+fn refused_by_output(detail: impl Into<String>) -> RemoveBridgeOutputError {
+    RemoveBridgeOutputErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::bad_request_message(&detail.into()),
+    })
+    .into()
+}
 
 /// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
 /// in the request does not exist in the system" — the bridge or the output `identifier`
@@ -181,6 +199,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The bridge state change the clock already owes is materialised before the bridge
         // is read, exactly as AddBridgeOutputs and the reporting operations do it.
         store.settle_due_transitions(::std::time::SystemTime::now());
+
+        // A bridge's FLOW output is the service's own record of a cloud flow that takes the
+        // bridge as its source, which no request shape configures, so no request can remove
+        // one either: the refusal and its wording are read from the one place this crate
+        // decides which flow outputs a bridge holds (`crate::state`), and the bridge is left
+        // exactly as it was. An output a request DID configure, a network output, is removed
+        // below.
+        if let Some(detail) =
+            store.bridge_flow_output_removal_rejection(&input.bridge_arn, &input.output_name)
+        {
+            return Err(refused_by_output(detail));
+        }
 
         // This operation removes an output from "a bridge", addressed by the bridge's own
         // ARN.

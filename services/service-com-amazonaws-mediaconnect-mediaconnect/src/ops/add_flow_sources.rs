@@ -4,6 +4,13 @@
 //! Adds sources to the flow a request names, each materialised into a record the flow
 //! keeps and reported back out of the stored flow.
 //!
+//! A source that names a bridge (`SetGatewayBridgeSourceRequest`) is a cloud flow
+//! "receiving a stream from a bridge", and that stream is an output OF THAT BRIDGE — the
+//! `BridgeFlowOutput` the service materialises for it, which no request configures. So this
+//! operation completes its write through
+//! [`crate::state::ComAmazonawsMediaconnectMediaconnectState::sync_bridge_flow_outputs`],
+//! exactly as CreateFlow and UpdateFlowSource do.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -335,12 +342,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The details of the newly added sources" — read back out of the STORED flow,
         // not from the request, and only the sources this call appended.
+        let flow_arn = flow.flow_arn.clone();
         let sources: Vec<Source> = flow.sources[first_added..]
             .iter()
             .map(StoredSource::to_source)
             .collect();
+
+        // A source that names a bridge is a stream that bridge delivers into the cloud, so
+        // the bridge this call pointed a source at owes a flow output for it: the write is
+        // completed through the one place this crate decides which flow outputs a bridge
+        // holds (`crate::state`), so a bridge reports the same outputs whichever call wrote
+        // the flow source that asked for them.
+        store.sync_bridge_flow_outputs();
+
         Ok(AddFlowSourcesOutput {
-            flow_arn: Some(flow.flow_arn.clone()),
+            flow_arn: Some(flow_arn),
             sources: Some(sources),
         })
     }

@@ -623,9 +623,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // will report. The source's name and ARN are its identity and no input member
         // names either, so an update never moves them; the flow's status is left to the
         // clock, exactly as UpdateFlow leaves it.
+        let flow_arn = flow.flow_arn.clone();
+        let source = flow.sources[position].to_source();
+
+        // This update can move which bridge the source is fed by, and a cloud flow
+        // "receiving a stream from a bridge" is an output OF THAT BRIDGE: the bridge the
+        // source now names owes a flow output for it and the one it no longer names holds
+        // none, both through the one place this crate decides which flow outputs a bridge
+        // holds (`crate::state`).
+        store.sync_bridge_flow_outputs();
+
         Ok(UpdateFlowSourceOutput {
-            flow_arn: Some(flow.flow_arn.clone()),
-            source: Some(flow.sources[position].to_source()),
+            flow_arn: Some(flow_arn),
+            source: Some(source),
         })
     }
 }
