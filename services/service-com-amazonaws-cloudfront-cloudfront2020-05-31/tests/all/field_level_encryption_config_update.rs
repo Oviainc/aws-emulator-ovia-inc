@@ -64,8 +64,7 @@ use crate::public_key_lifecycle::is_wire_timestamp;
 
 /// The sentence CloudFront sends for a mapping naming no stored profile, spelled out here
 /// rather than taken from the crate, so a reworded refusal fails this suite.
-const NO_SUCH_PROFILE_MESSAGE: &str =
-    "The specified profile for field-level encryption doesn't exist.";
+const NO_SUCH_PROFILE_MESSAGE: &str = "The specified field level encryption profile does not exist.";
 
 // ---------------------------------------------------------------------------
 // Calling the update

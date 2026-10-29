@@ -47,9 +47,10 @@ use crate::field_level_encryption_profile_lifecycle::{
 
 /// The sentences CloudFront sends for these refusals, spelled out here rather than taken from
 /// the crate, so a reworded refusal fails this suite.
-const NO_SUCH_PROFILE_MESSAGE: &str =
-    "The specified profile for field-level encryption doesn't exist.";
-const PROFILE_IN_USE_MESSAGE: &str = "The specified profile for field-level encryption is in use.";
+const NO_SUCH_PROFILE_MESSAGE: &str = "The specified field level encryption profile does not exist.";
+const PROFILE_IN_USE_MESSAGE: &str =
+    "The field level encryption profile is currently associated with a field level encryption \
+     config. Please disassociate the profile before deleting.";
 
 /// How one row below spells a version token in the `If-Match` header: bare, as CloudFront's own
 /// `ETag` header reports it, or quoted or weak, as HTTP spells an entity tag.

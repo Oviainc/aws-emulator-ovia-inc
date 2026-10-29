@@ -125,6 +125,8 @@ mod field_level_encryption_profile_delete;
 mod field_level_encryption_profile_lifecycle;
 #[path = "all/field_level_encryption_profile_list.rs"]
 mod field_level_encryption_profile_list;
+#[path = "all/field_level_encryption_profile_refusal_message.rs"]
+mod field_level_encryption_profile_refusal_message;
 #[path = "all/field_level_encryption_profile_update.rs"]
 mod field_level_encryption_profile_update;
 #[path = "all/function_delete.rs"]

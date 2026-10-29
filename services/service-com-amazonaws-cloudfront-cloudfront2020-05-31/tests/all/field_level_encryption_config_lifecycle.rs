@@ -66,8 +66,7 @@ const URL_ENCODED: &str = "URLEncoded";
 /// The sentences CloudFront sends on the wire for these refusals, spelled out here rather
 /// than taken from the crate, so a reworded refusal fails this suite.
 const NO_SUCH_CONFIG_MESSAGE: &str = "The specified field level encryption config does not exist.";
-const NO_SUCH_PROFILE_MESSAGE: &str =
-    "The specified profile for field-level encryption doesn't exist.";
+const NO_SUCH_PROFILE_MESSAGE: &str = "The specified field level encryption profile does not exist.";
 const QUERY_ARG_PROFILE_EMPTY: &str =
     "No profile specified for the field-level encryption query argument.";
 

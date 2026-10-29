@@ -10261,9 +10261,9 @@ pub const MAX_FIELD_LEVEL_ENCRYPTION_PROFILE_COMMENT: usize = MAX_ORIGIN_ACCESS_
 /// The modelled `NoSuchFieldLevelEncryptionProfile` (HTTP 404) for a profile id the store
 /// does not hold.
 ///
-/// The sentence is the one the model states on the shape itself — "The specified profile for
-/// field-level encryption doesn't exist." — a property of the store rather than of the
-/// request, so nothing from the request belongs in the text.
+/// The sentence states a property of the store rather than of the request — the id names no
+/// profile — so nothing from the request belongs in the text and every path that raises this
+/// code reads the same.
 pub fn no_such_field_level_encryption_profile() -> crate::ops::types::NoSuchFieldLevelEncryptionProfile
 {
     crate::ops::types::NoSuchFieldLevelEncryptionProfile {
@@ -10271,9 +10271,15 @@ pub fn no_such_field_level_encryption_profile() -> crate::ops::types::NoSuchFiel
     }
 }
 
-/// `NoSuchFieldLevelEncryptionProfile`'s message, as the model documents the shape.
+/// `NoSuchFieldLevelEncryptionProfile`'s message, as CloudFront sends it on the wire —
+/// observed in a recorded CloudFront response to this refusal, which is the source this
+/// wording comes from. The service words it "field level encryption profile does not exist",
+/// as [`NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE`] words the same condition for the
+/// other field-level encryption resource, rather than in the model's documentation prose
+/// ("The specified profile for field-level encryption doesn't exist."), and the wire wording
+/// is what a client reads. Do not "correct" this constant to the documentation sentence.
 pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE: &str =
-    "The specified profile for field-level encryption doesn't exist.";
+    "The specified field level encryption profile does not exist.";
 
 /// The modelled `FieldLevelEncryptionProfileInUse` (HTTP 409) for a delete of a profile a
 /// stored field-level encryption configuration still names.
@@ -10289,9 +10295,17 @@ pub fn field_level_encryption_profile_in_use(
     }
 }
 
-/// `FieldLevelEncryptionProfileInUse`'s message, as the model documents the shape.
+/// `FieldLevelEncryptionProfileInUse`'s message, as CloudFront sends it on the wire —
+/// observed in a recorded CloudFront response to this refusal, which is the source this
+/// wording comes from: the profile is associated with a field-level encryption
+/// configuration and the caller is told to disassociate it before deleting, worded as
+/// [`FIELD_LEVEL_ENCRYPTION_CONFIG_IN_USE_MESSAGE`] and [`CACHE_POLICY_IN_USE_MESSAGE`] word
+/// the same condition for the resources they gate, rather than in the model's documentation
+/// prose ("The specified profile for field-level encryption is in use."). Do not "correct"
+/// this constant to the documentation sentence.
 pub const FIELD_LEVEL_ENCRYPTION_PROFILE_IN_USE_MESSAGE: &str =
-    "The specified profile for field-level encryption is in use.";
+    "The field level encryption profile is currently associated with a field level encryption \
+     config. Please disassociate the profile before deleting.";
 
 /// The sentence `FieldLevelEncryptionProfileAlreadyExists` carries — "The specified profile
 /// for field-level encryption already exists." — up to the profile the caller reference is
