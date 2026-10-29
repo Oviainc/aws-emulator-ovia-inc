@@ -522,18 +522,20 @@ fn property_records(
     properties
         .into_iter()
         .map(|(property_name, property)| {
-            (
-                property_name,
-                crate::state::PropertyRecord {
-                    definition: property.definition,
-                    value: property.value,
-                    // A create carries no time-series value: those arrive
-                    // through the time-series data plane
-                    // (`BatchPutPropertyValues`), which writes them into the
-                    // property record this one stores.
-                    time_series: ::std::collections::BTreeMap::new(),
-                },
-            )
+            let mut record = crate::state::PropertyRecord {
+                definition: property.definition,
+                // A create carries no time-series value: those arrive through
+                // the time-series data plane (`BatchPutPropertyValues`), which
+                // writes them into the property record this one stores.
+                ..crate::state::PropertyRecord::default()
+            };
+            if let Some(value) = property.value {
+                // Through the writer, so the control plane is recorded as the
+                // plane that wrote this property's value and every read reports
+                // what the create set.
+                record.set_value(value);
+            }
+            (property_name, record)
         })
         .collect()
 }

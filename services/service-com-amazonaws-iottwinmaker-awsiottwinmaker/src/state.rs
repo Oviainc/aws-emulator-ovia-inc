@@ -3176,16 +3176,17 @@ pub fn property_definition_response(
 /// the property, else the DEFAULT its definition declares, and nothing at all
 /// when neither exists.
 ///
-/// A property is written to through either plane, so both are consulted here:
+/// A property is written to through either plane, so the plane that wrote LAST
+/// is the one the value comes from ([`PropertyRecord::latest_written_value`]):
 /// the time-series data plane writes values FOR an instant
 /// ([`PropertyRecord::time_series`], keyed by that instant, so its LAST entry
 /// is the value written for the latest instant), and the control plane writes
-/// one current value ([`PropertyRecord::value`]). The series is preferred where
-/// it holds anything, because a property the data plane has written to carries
-/// its values there and nowhere else; `defaultValue` is "an object that
-/// contains the default value" of the property, so a property nothing has
-/// written to still reads as the value its definition gave it, and either write
-/// replaces it.
+/// one current value ([`PropertyRecord::value`]) or takes it away again
+/// ([`PropertyRecord::reset_value`]). Every write is therefore observable here,
+/// whichever plane made it; `defaultValue` is "an object that contains the
+/// default value" of the property, so a property nothing has written to — and
+/// one whose value a reset took away — reads as the value its definition gave
+/// it, and either plane's write replaces it.
 ///
 /// Shared by every reader of a property's current value, so one property reads
 /// the same way wherever it is reported; `definition` is the one
@@ -3850,6 +3851,27 @@ pub fn component_at_path<'a>(
     }
 }
 
+/// Which plane wrote to a property's value LAST, which is the plane whose value
+/// a read of the property reports ([`PropertyRecord::latest_written_value`]).
+///
+/// A property's value is writable through both planes — the control plane sets
+/// or resets the one current value a property carries (`CreateEntity`,
+/// `UpdateEntity`), the time-series data plane writes values for an instant
+/// (`BatchPutPropertyValues`) — so which of the two a read reports is decided
+/// by which wrote most recently, and a property no write has reached yet
+/// carries no writer at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueWriter {
+    /// The control plane wrote the property's value last, so its one current
+    /// value ([`PropertyRecord::value`]) is what the property reads as — and
+    /// nothing at all where that write RESET the value away.
+    ControlPlane,
+    /// The time-series data plane wrote last, so the value of the latest
+    /// instant in the series ([`PropertyRecord::time_series`]) is what the
+    /// property reads as.
+    DataPlane,
+}
+
 /// One property of a component: the definition and value the request gave it.
 ///
 /// Whether the property is the component's external id is NOT answerable from
@@ -3860,6 +3882,12 @@ pub fn component_at_path<'a>(
 #[derive(Debug, Clone, Default)]
 pub struct PropertyRecord {
     pub definition: Option<crate::ops::types::PropertyDefinitionRequest>,
+    /// The one current value the CONTROL plane set on this property, `None`
+    /// where it has set none or where its last write RESET the value away.
+    ///
+    /// Written only through [`Self::set_value`] and [`Self::reset_value`], so
+    /// the plane that wrote the property's value last
+    /// ([`Self::value_writer`]) is recorded with every write to it.
     pub value: Option<crate::ops::types::DataValue>,
     /// The values written to this property through the time-series data plane
     /// (`BatchPutPropertyValues`), keyed by the instant each was written FOR in
@@ -3872,9 +3900,37 @@ pub struct PropertyRecord {
     /// definition that is not `isTimeSeries`
     /// ([`property_is_time_series`]) — the data plane writes to no other.
     pub time_series: BTreeMap<i128, TimeSeriesValue>,
+    /// Which plane wrote to this property's value last ([`ValueWriter`]), and
+    /// `None` for a property no write has reached: it is what decides which of
+    /// the two the property reads as, so a write through either plane is the
+    /// value every later read reports.
+    pub value_writer: Option<ValueWriter>,
 }
 
 impl PropertyRecord {
+    /// Set the one current value the control plane holds for this property.
+    ///
+    /// The control plane becomes the property's latest writer, so this value is
+    /// what every read of it reports until the next write through either plane.
+    pub fn set_value(&mut self, value: crate::ops::types::DataValue) {
+        self.value = Some(value);
+        self.value_writer = Some(ValueWriter::ControlPlane);
+    }
+
+    /// Take this property's value away, leaving its definition — a `RESET_VALUE`
+    /// property update.
+    ///
+    /// A reset is a write of NO value: it makes the control plane the
+    /// property's latest writer with nothing in hand, so the property reads as
+    /// a property nothing has written to (its definition's default, else
+    /// nothing at all) whatever either plane wrote before it. The series itself
+    /// is left whole, because it is the history of the values written FOR their
+    /// instants and a reset did not unwrite them.
+    pub fn reset_value(&mut self) {
+        self.value = None;
+        self.value_writer = Some(ValueWriter::ControlPlane);
+    }
+
     /// Record one time-series value for this property, at the instant `at`.
     ///
     /// A value written for an instant the series already holds REPLACES it: the
@@ -3884,26 +3940,35 @@ impl PropertyRecord {
     /// ([`MAX_TIME_SERIES_VALUES_PER_PROPERTY`]) the OLDEST values are
     /// dropped, so a caller that keeps writing grows the store no further and
     /// keeps the most recent window.
+    ///
+    /// The data plane becomes the property's latest writer, so a read reports
+    /// the series' latest value again even where the control plane had set or
+    /// reset one before.
     pub fn record_time_series_value(&mut self, at: i128, value: TimeSeriesValue) {
         self.time_series.insert(at, value);
         while self.time_series.len() > MAX_TIME_SERIES_VALUES_PER_PROPERTY {
             self.time_series.pop_first();
         }
+        self.value_writer = Some(ValueWriter::DataPlane);
     }
 
     /// The most recent value WRITTEN to this property, through either plane —
-    /// `None` for a property nothing has written a value to.
+    /// `None` for a property nothing has written a value to, and for one whose
+    /// latest write RESET its value away.
     ///
-    /// The series is keyed by the instant each value was written FOR
-    /// ([`Self::time_series`]), so its last entry is the value of its latest
-    /// instant and that is this property's current value wherever the data
-    /// plane has written one; a property the data plane never wrote to reads as
-    /// the single value the control plane set on it ([`Self::value`]).
+    /// The plane that wrote last is the one the value comes from
+    /// ([`Self::value_writer`]): the control plane holds the one current value
+    /// it set ([`Self::value`]), and the data plane's series is keyed by the
+    /// instant each value was written FOR ([`Self::time_series`]), so its last
+    /// entry is the value of its latest instant.
     pub fn latest_written_value(&self) -> Option<crate::ops::types::DataValue> {
-        if let Some((_, latest)) = self.time_series.last_key_value() {
-            return Some(latest.value.clone());
+        match self.value_writer? {
+            ValueWriter::ControlPlane => self.value.clone(),
+            ValueWriter::DataPlane => self
+                .time_series
+                .last_key_value()
+                .map(|(_, latest)| latest.value.clone()),
         }
-        self.value.clone()
     }
 }
 

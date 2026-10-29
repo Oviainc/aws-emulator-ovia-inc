@@ -30,7 +30,13 @@
 //! write the definition and the value the entry carries whether or not the
 //! property was there, since both describe the property the entry defines and a
 //! property is wholly described by the entry rather than brought into being by
-//! it. A `propertyGroupUpdates` entry's `PropertyGroupUpdateType` is `CREATE`,
+//! it. Either kind of value update is the property's LATEST write, so what a
+//! read reports for it moves with this call even where the time-series data
+//! plane had written values to the property before
+//! ([`crate::state::latest_property_value`]): the value the entry carries is
+//! what every read reports, and a reset leaves the property reading as one
+//! nothing has written to. A `propertyGroupUpdates` entry's
+//! `PropertyGroupUpdateType` is `CREATE`,
 //! `UPDATE` or `DELETE`, read the way a component's is.
 //! `parentEntityUpdate` re-parents the entity (`UPDATE`, with the
 //! `parentEntityId` it requires) or detaches it to the root sentinel
@@ -616,8 +622,12 @@ fn apply_property_updates(
                     ));
                 };
                 // The definition stays: a reset takes the property's VALUE
-                // away, not the declaration that gives it meaning.
-                property.value = None;
+                // away, not the declaration that gives it meaning. It is the
+                // property's latest write, so no earlier write through either
+                // plane is reported any more and the property reads as one
+                // nothing has written to
+                // ([`crate::state::PropertyRecord::reset_value`]).
+                property.reset_value();
             }
             // `CREATE` and `UPDATE` both describe the property the entry
             // defines, so both write the definition and the value it carries;
@@ -640,7 +650,11 @@ fn apply_property_updates(
                     property.definition = Some(definition);
                 }
                 if let Some(value) = update.value {
-                    property.value = Some(value);
+                    // The property's latest write, so this is the value every
+                    // read reports from here on — whatever either plane wrote
+                    // before it
+                    // ([`crate::state::PropertyRecord::set_value`]).
+                    property.set_value(value);
                 }
             }
             Some(other) => {

@@ -119,6 +119,9 @@ mod property_listing;
 #[path = "all/property_value_read.rs"]
 mod property_value_read;
 
+#[path = "all/property_value_write_order.rs"]
+mod property_value_write_order;
+
 #[path = "all/refusal_constructions.rs"]
 mod refusal_constructions;
 
