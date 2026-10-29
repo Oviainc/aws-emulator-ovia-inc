@@ -372,10 +372,12 @@ pub fn mutually_exclusive_members(member: &str, other_member: &str) -> ServiceEr
     )
 }
 
-/// The query parameter `ListHarvestJobs` binds `IncludeChannelId` to, and that member's
-/// modelled name — the two halves of the refusal above
+/// The query parameter `ListHarvestJobs` binds `IncludeChannelId` to
 /// (`smithy_query(query="operation",operation="ListHarvestJobs")`:
 /// `IncludeChannelId` is `@httpQuery("includeChannelId")`).
+pub const INCLUDE_CHANNEL_ID_QUERY: &str = "includeChannelId";
+
+/// That member's modelled name — the other half of the refusal above.
 pub const INCLUDE_CHANNEL_ID_MEMBER: &str = "IncludeChannelId";
 
 /// The query parameter `ListHarvestJobs` binds `IncludeStatus` to
@@ -2767,7 +2769,8 @@ pub fn harvest_job_arn(region: &str, id: &str) -> String {
 }
 
 /// A stable, opaque 32-hex-character label derived from `parts`, used for the
-/// account/resource labels in an ingest or playback hostname and path. Derived from
+/// account/resource labels in an ingest or playback hostname and path, and for the tag
+/// that ties a page token to the enumeration that issued it ([`PageScope`]). Derived from
 /// content (never from the clock or a random source) so the same resource always renders
 /// the same URL on every later read.
 pub fn stable_label(parts: &[&str]) -> String {
@@ -3031,22 +3034,106 @@ pub fn rederive_cmaf_package(record: &mut OriginEndpointRecord) {
     record.cmaf_package = package;
 }
 
-/// Encode a paging token: the key the NEXT page starts at.
+/// How many characters the tag half of a page token is: the width [`stable_label`]
+/// renders.
+const PAGE_TOKEN_TAG_CHARS: usize = 32;
+
+/// The longest `nextToken` this service could ever have issued: the longest key a record
+/// is stored under, hex-encoded at two characters a byte, plus the tag.
 ///
-/// Opaque to the caller (hex of the key's bytes), and resolved against the `BTreeMap`
-/// ordering, so a token taken from one call resumes exactly where that call stopped even
-/// if records were added or removed in between.
-pub fn encode_page_token(next_key: &str) -> String {
-    hex::encode(next_key.as_bytes())
+/// A longer string is refused before anything is decoded from it, so a caller cannot turn
+/// an unbounded `nextToken` into work this service does.
+const MAX_PAGE_TOKEN_CHARS: usize = MAX_STRING_CHARS * 2 + PAGE_TOKEN_TAG_CHARS;
+
+/// Which enumeration a `nextToken` belongs to: the listing operation that would mint it,
+/// the Region the request is served in, and the filters that decide which records the
+/// listing walks at all.
+///
+/// A page cursor is not a free-standing position in the store but a position in ONE
+/// enumeration — one collection's records, of one Region, selected by one set of filters,
+/// in key order. All three decide WHICH records are walked, so all three are part of the
+/// enumeration's identity: a cursor into a filtered walk points at the next MATCHING
+/// record, which is not where the same key sits in any other walk. Carrying that identity
+/// in the token is what lets [`Self::resume_key`] tell a cursor this listing minted from
+/// any other string a caller could send, and what keeps a cursor of one enumeration from
+/// slicing another.
+#[derive(Debug, Clone)]
+pub struct PageScope {
+    /// The enumeration's identity, as the token's tag is derived from it. Rendered once
+    /// at construction, with every part length-prefixed, so no two different
+    /// operation/Region/filter sets can render the same identity whatever characters a
+    /// caller puts in a filter value.
+    identity: String,
 }
 
-/// Decode a paging token back to the key its page starts at.
-///
-/// `None` for a token this service did not issue, which the caller is told about rather
-/// than silently served page one for.
-pub fn decode_page_token(token: &str) -> Option<String> {
-    let bytes = hex::decode(token).ok()?;
-    String::from_utf8(bytes).ok()
+impl PageScope {
+    /// The enumeration `operation` serves in `region`, selecting records with `filters`:
+    /// each filter's wire name, and the value this request gave it (`None` when the
+    /// request left it out, which selects a different set of records from any value).
+    pub fn new(operation: &str, region: &str, filters: &[(&str, Option<&str>)]) -> Self {
+        let mut identity = String::new();
+        let mut push = |part: &str| {
+            identity.push_str(&format!("{}:{part}", part.len()));
+        };
+        push(operation);
+        push(region);
+        for (name, value) in filters {
+            push(name);
+            match value {
+                Some(value) => push(&format!("={value}")),
+                None => push("*"),
+            }
+        }
+        Self { identity }
+    }
+
+    /// The tag that ties a token to THIS enumeration and the key it resumes at.
+    ///
+    /// Derived from the enumeration and the key alone (never from the clock or a random
+    /// source), so the same cursor always renders the same token and a token this service
+    /// issued still verifies on a later call.
+    fn tag(&self, key: &str) -> String {
+        stable_label(&["nextToken", &self.identity, key])
+    }
+
+    /// Mint the token for the page starting at `next_key`: the key, plus the tag that
+    /// shows this enumeration issued it.
+    ///
+    /// Opaque to the caller, and resolved against the `BTreeMap` ordering, so a token
+    /// taken from one call resumes exactly where that call stopped even if records were
+    /// added or removed in between.
+    pub fn issue(&self, next_key: &str) -> String {
+        format!(
+            "{}{}",
+            hex::encode(next_key.as_bytes()),
+            self.tag(next_key)
+        )
+    }
+
+    /// The key a caller-supplied `nextToken` resumes this enumeration at, or
+    /// [`invalid_page_token`] for a token this enumeration did not issue — which is told
+    /// to the caller rather than silently served as an arbitrary slice of the collection.
+    ///
+    /// `Ok(None)` is a request carrying no token at all: page one.
+    pub fn resume_key(&self, next_token: Option<&str>) -> Result<Option<String>, ServiceError> {
+        next_token
+            .map(|token| self.decode(token).ok_or_else(invalid_page_token))
+            .transpose()
+    }
+
+    /// The key `token` names, when `token` is one this enumeration minted.
+    fn decode(&self, token: &str) -> Option<String> {
+        if token.len() > MAX_PAGE_TOKEN_CHARS
+            || token.len() < PAGE_TOKEN_TAG_CHARS
+            || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        // Every character is ASCII, so the split is on a character boundary.
+        let (key_hex, tag) = token.split_at(token.len() - PAGE_TOKEN_TAG_CHARS);
+        let key = String::from_utf8(hex::decode(key_hex).ok()?).ok()?;
+        (self.tag(&key) == tag).then_some(key)
+    }
 }
 
 /// How many items one `List*` call serves, for the `MaxResults` it was given.
@@ -3065,10 +3152,14 @@ pub fn page_size(max_results: Option<i32>) -> usize {
     }
 }
 
-/// One page of `BTreeMap` keys: up to `page_size` keys at or after `start`, plus the key
-/// the next page would start at when (and only when) more remain.
+/// One page of `BTreeMap` keys: up to `page_size` keys at or after `start`, plus the
+/// token the next page would be resumed with when (and only when) more remain.
+///
+/// The token is minted by `scope`, the enumeration these keys come from, so the only
+/// cursor a later call can resume at is one this listing itself handed out.
 pub fn paginate<'a, I>(
     keys: I,
+    scope: &PageScope,
     start: Option<&str>,
     page_size: usize,
 ) -> (Vec<&'a str>, Option<String>)
@@ -3079,6 +3170,6 @@ where
         .into_iter()
         .filter(|key| start.is_none_or(|from| *key >= from));
     let page: Vec<&'a str> = remaining.by_ref().take(page_size).collect();
-    let next_token = remaining.next().map(encode_page_token);
+    let next_token = remaining.next().map(|key| scope.issue(key));
     (page, next_token)
 }

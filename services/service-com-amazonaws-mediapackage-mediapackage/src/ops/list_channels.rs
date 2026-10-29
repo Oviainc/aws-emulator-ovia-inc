@@ -154,15 +154,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
 
-        // An opaque token this service did not issue is refused rather than silently
-        // served as page one, which would make a paging client loop over page one.
-        let start = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => Some(
-                crate::state::decode_page_token(token)
-                    .ok_or_else(crate::state::invalid_page_token)?,
-            ),
-        };
+        // A `nextToken` is resolved against the enumeration that would have minted it —
+        // this operation, in this Region, which this listing takes no filter to narrow —
+        // so a token this listing did not issue is refused rather than used as a lower
+        // bound, which would serve an arbitrary slice of the collection as if it were a
+        // page.
+        let scope = crate::state::PageScope::new(Self::NAME, &region, &[]);
+        let start = scope.resume_key(input.next_token.as_deref())?;
         let page_size = crate::state::page_size(input.max_results);
 
         // One Region's channels are a contiguous id-ordered range of the store, so this
@@ -170,6 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // here at all.
         let (keys, next_token) = crate::state::paginate(
             state.channels_in(&region).map(|record| record.id.as_str()),
+            &scope,
             start.as_deref(),
             page_size,
         );
