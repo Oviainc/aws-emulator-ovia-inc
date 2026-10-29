@@ -44,6 +44,14 @@
 //! `Value at '<member path>' failed to satisfy constraint: …` — where a scalar states the
 //! value it submitted. There is no scalar rendering of a list or a map, so none is
 //! invented.
+//!
+//! The same half is dropped for a member whose value the refusal WITHHOLDS: a member
+//! modelled `@sensitive` is one the service never discloses, so its clause names the
+//! member and the requirement and states no value — neither the submitted bytes nor the
+//! `null` the framework writes for an absent one. WHICH members those are is a property of
+//! each service's model, so the caller decides it and passes the decision to
+//! [`aws_validation_refusal_withholding`]; the clause, the envelope and every other
+//! requirement stay this module's and the framework's.
 
 use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 use smithy_server_runtime::{Refusal, Refused};
@@ -112,8 +120,24 @@ fn collection_length_clause(violation: &Violation) -> Option<String> {
     COLLECTION_SIZE_SUFFIXES
         .iter()
         .find_map(|suffix| collection_size(stored, suffix))?;
-    let valued = violation.message();
-    let requirement_half = valued.strip_prefix(&format!("Value '{stored}' "))?;
+    valueless_clause(violation)
+}
+
+/// The clause `violation` states with its VALUE half dropped — `Value at '<member path>'
+/// failed to satisfy constraint: <requirement>` — whichever half the framework wrote: the
+/// submitted value a present member echoes, or the `null` an ABSENT member is stated with.
+///
+/// Built by removing that half from the framework's own clause rather than by spelling a
+/// clause here, so the requirement, the member path and the punctuation around them stay
+/// single-homed in the framework and cannot drift. `None` when the framework's clause does
+/// not start with the value half this would remove.
+fn valueless_clause(violation: &Violation) -> Option<String> {
+    let value_half = match violation.value.as_deref() {
+        Some(stored) => format!("Value '{stored}' "),
+        // How the framework writes a member that was not there at all.
+        None => "Value null ".to_string(),
+    };
+    let requirement_half = violation.message().strip_prefix(&value_half)?.to_string();
     Some(format!("Value {requirement_half}"))
 }
 
@@ -289,6 +313,21 @@ pub fn aws_validation_refusal(refusal: &Refusal) -> Option<Refused> {
     aws_validation_refusal_with(refusal, unanchored)
 }
 
+/// [`aws_validation_refusal`], with the members whose value the refusal WITHHOLDS chosen by
+/// the caller: `withholds_value` is asked about a violation's member path, and a clause it
+/// answers `true` for states no value at all.
+///
+/// A service passes the members its own model marks `@sensitive`, which the runtime schemas
+/// do not carry. Everything else — which refusals are restated, the code, the envelope, the
+/// member paths, the `@pattern` rendering and every other requirement — is the same body
+/// [`aws_validation_refusal`] runs, so the two cannot drift.
+pub fn aws_validation_refusal_withholding(
+    refusal: &Refusal,
+    withholds_value: impl Fn(&str) -> bool,
+) -> Option<Refused> {
+    stated_refusal(refusal, unanchored, withholds_value)
+}
+
 /// [`aws_validation_refusal`], with the `@pattern` rendering CHOSEN by the caller.
 ///
 /// Everything a service does not choose — which refusals are restated, which violations are
@@ -301,6 +340,21 @@ pub fn aws_validation_refusal(refusal: &Refusal) -> Option<Refused> {
 pub fn aws_validation_refusal_with(
     refusal: &Refusal,
     quote_pattern: impl Fn(&str) -> String,
+) -> Option<Refused> {
+    // Nothing is withheld unless a service says so: the model trait that decides it is not
+    // in the runtime schemas, so a caller that does not pass the decision gets the
+    // framework's value half on every clause, exactly as before.
+    stated_refusal(refusal, quote_pattern, |_| false)
+}
+
+/// The ONE body behind every entry point above: the framework's envelope over the
+/// framework's clauses, with the two renderings this module owns applied — the `@pattern`
+/// quoting the caller chose, and the value half dropped from a clause that states none (a
+/// collection's `@length`, or a member the caller withholds the value of).
+fn stated_refusal(
+    refusal: &Refusal,
+    quote_pattern: impl Fn(&str) -> String,
+    withholds_value: impl Fn(&str) -> bool,
 ) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
@@ -321,7 +375,12 @@ pub fn aws_validation_refusal_with(
     // carrying no value reads `Value null at …`, which is how an ABSENT member is stated).
     let mut message = envelope(&restated)?;
     for violation in &restated {
-        if let Some(valueless) = collection_length_clause(violation) {
+        let stated = if withholds_value(&violation.path) {
+            valueless_clause(violation)
+        } else {
+            collection_length_clause(violation)
+        };
+        if let Some(valueless) = stated {
             message = message.replace(&violation.message(), &valueless);
         }
     }
@@ -334,8 +393,9 @@ pub fn aws_validation_refusal_with(
 #[cfg(test)]
 mod tests {
     use super::{
-        aws_validation_refusal, aws_validation_refusal_with, enum_value_not_found,
-        pattern_mismatch, property_count_refusal, string_too_long, string_too_short,
+        aws_validation_refusal, aws_validation_refusal_with, aws_validation_refusal_withholding,
+        enum_value_not_found, pattern_mismatch, property_count_refusal, string_too_long,
+        string_too_short,
     };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema_server::{Violation, ViolationKind};
@@ -541,6 +601,84 @@ mod tests {
                 stated.message
             );
         }
+    }
+
+    /// RULE: a member the caller WITHHOLDS the value of is stated with no value half at
+    /// all, whichever half the framework wrote and whatever the constraint was — and the
+    /// members it does not withhold keep theirs, in the same envelope.
+    #[test]
+    fn a_withheld_members_clause_states_no_value() {
+        // (case, the violation, the clause the refusal must state for the withheld member)
+        let rows: [(&str, Violation, &str); 4] = [
+            (
+                "a withheld member that was absent",
+                Violation {
+                    path: "secret".to_owned(),
+                    kind: ViolationKind::MissingRequiredMember,
+                    value: None,
+                },
+                "Value at 'secret' failed to satisfy constraint: Member must not be null",
+            ),
+            (
+                "a withheld member shorter than its minimum",
+                violation("secret", ViolationKind::MinLength(4), "ab"),
+                "Value at 'secret' failed to satisfy constraint: Member must have length \
+                 greater than or equal to 4",
+            ),
+            (
+                "a withheld member longer than its maximum",
+                violation("secret", ViolationKind::MaxLength(8), "abcdefghij"),
+                "Value at 'secret' failed to satisfy constraint: Member must have length less \
+                 than or equal to 8",
+            ),
+            (
+                "a withheld member outside its pattern",
+                violation(
+                    "secret",
+                    ViolationKind::Pattern("^[a-z]+$".to_owned()),
+                    "A B",
+                ),
+                "Value at 'secret' failed to satisfy constraint: Member must satisfy regular \
+                 expression pattern: [a-z]+",
+            ),
+        ];
+
+        for (case, offending, clause) in rows {
+            let refusal = Refusal::Invalid(vec![offending]);
+            let stated = aws_validation_refusal_withholding(&refusal, |path| path == "secret")
+                .expect("a constraint refusal is stated");
+            let expected = format!("1 validation error detected: {clause}");
+            assert_eq!(
+                stated.message, expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                stated.message
+            );
+            // The same refusal, with nothing withheld, keeps the framework's value half:
+            // the suppression is the caller's decision and nothing else about the clause.
+            let kept = aws_validation_refusal(&refusal).expect("a constraint refusal is stated");
+            assert_ne!(
+                kept.message, expected,
+                "case {case:?}: withholding nothing must keep the value half, got {:?}",
+                kept.message
+            );
+        }
+
+        // One envelope over both kinds of member: only the withheld one loses its value.
+        let refusal = Refusal::Invalid(vec![
+            violation("secret", ViolationKind::MinLength(4), "ab"),
+            violation("name", ViolationKind::MinLength(2), "a"),
+        ]);
+        let stated = aws_validation_refusal_withholding(&refusal, |path| path == "secret")
+            .expect("a constraint refusal is stated");
+        let expected = "2 validation errors detected: Value at 'secret' failed to satisfy \
+                        constraint: Member must have length greater than or equal to 4; Value \
+                        'a' at 'name' failed to satisfy constraint: Member must have length \
+                        greater than or equal to 2";
+        assert_eq!(
+            stated.message, expected,
+            "expected {expected:?}, got {:?}",
+            stated.message
+        );
     }
 
     #[test]

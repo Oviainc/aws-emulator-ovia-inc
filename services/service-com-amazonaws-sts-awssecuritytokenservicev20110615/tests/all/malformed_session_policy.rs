@@ -44,9 +44,11 @@ fn policy_operations() -> Vec<(&'static str, Vec<(&'static str, String)>)> {
     ]
 }
 
-/// An XML text node, decoded: the awsQuery envelope escapes the five XML entities
-/// and emits tab/LF/CR as numeric references, so a message carrying a quote or a
-/// newline arrives encoded.
+/// An XML text node, decoded: a message carrying a control character arrives as the
+/// numeric reference the envelope writes for it, and one carrying `&` or `<` arrives
+/// escaped as XML requires of a text node. A quote character is not markup there and
+/// arrives as itself (`refusal_message_bytes.rs` owns that rule), so resolving it here is
+/// a no-op kept for a message this decoder is handed from anywhere else.
 pub(crate) fn decode_xml_text(text: &str) -> String {
     text.replace("&quot;", "\"")
         .replace("&apos;", "'")

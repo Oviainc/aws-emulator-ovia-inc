@@ -26,6 +26,9 @@ mod packed_policy_budget;
 #[path = "all/query_parameter_signing.rs"]
 mod query_parameter_signing;
 
+#[path = "all/refusal_message_bytes.rs"]
+mod refusal_message_bytes;
+
 #[path = "all/session_policy_limits.rs"]
 mod session_policy_limits;
 

@@ -42,8 +42,11 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+pub mod message_text;
+pub mod sensitive_members;
+
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -355,13 +358,19 @@ fn stated_refusal<O: smithy_server_runtime::Operation>(
 /// [`StatedPerOperation`] for a request a wrapped operation refuses, and
 /// [`Service::override_refusal`] for one the centralized walk refuses — so a caller cannot
 /// be told the same broken constraint two ways.
+///
+/// A clause about a member this service does not disclose the value of states no value at
+/// all; which members those are is read from this service's model by
+/// [`sensitive_members`], and the clause, the envelope and every requirement stay the
+/// shared renderer's and the framework's.
 fn stated_violations(violations: &[aws_smithy_schema_server::Violation]) -> Option<Refused> {
     if violations.is_empty() {
         return None;
     }
-    ::service_common::validation_message::aws_validation_refusal(&Refusal::Invalid(
-        violations.to_vec(),
-    ))
+    ::service_common::validation_message::aws_validation_refusal_withholding(
+        &Refusal::Invalid(violations.to_vec()),
+        sensitive_members::withholds_value,
+    )
     .map(|stated| Refused {
         code: crate::scaffolded::VALIDATION_ERROR_CODE.to_string(),
         message: stated.message,
@@ -389,11 +398,18 @@ where
                 None => stated_refusal::<O>(svc.definition().protocol(), req),
             };
             if let Some((violations, stated)) = refused {
-                return svc
-                    .definition()
-                    .refusal_response(ProtocolError::Invalid(violations), Some(stated));
+                // Stated through the same seam as everything else, so this path does not
+                // depend on which definition the service hands back; the restatement is
+                // idempotent, so passing an already-stated document through costs nothing.
+                return message_text::with_literal_message_text(
+                    svc.definition()
+                        .refusal_response(ProtocolError::Invalid(violations), Some(stated)),
+                );
             }
-            self.operation.run(svc, req, ctx).await
+            // Every failure an operation answers — a modelled error, and a refusal the
+            // centralized walk raised while it was being served — states its message with
+            // the escaping XML asks of a text node; see [`message_text`].
+            message_text::with_literal_message_text(self.operation.run(svc, req, ctx).await)
         })
     }
 
@@ -410,7 +426,10 @@ where
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, wrapped so the three failures the router renders OUTSIDE the
+    /// dispatch path state their message as a text node too (see [`message_text`]).
+    /// Identity, the protocol and the routing table are the generated entry's untouched.
+    entry: message_text::StatedMessageDefinition<Eng>,
     /// The SAME shared engine the generated entry threaded into every operation, kept
     /// here too because the refusal wording below has to ask whether the account holds
     /// the credential a refused request presented, and the records that answer that are
@@ -450,7 +469,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             get_web_identity_token::GetWebIdentityToken,
         );
         Self {
-            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            entry: message_text::StatedMessageDefinition::new(Arc::clone(&engine)),
             engine,
             protocol: QuerySignedCalls::new(),
             stated,
@@ -573,18 +592,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             Refusal::Unauthenticated => Some(self.unauthenticated_refusal()),
             // A refusal of the request's VALUES is stated the way AWS states one: the
             // framework's own envelope and member paths, with the code STS answers a
-            // constraint violation with, and a `@pattern` quoted back WITHOUT the
-            // anchors a whole-value pattern is written with — the tree's one rendering
-            // of that rule. The CHECK still uses the model's pattern as written; only
-            // the quoting changes.
-            Refusal::Invalid(_) => {
-                ::service_common::validation_message::aws_validation_refusal(refusal).map(
-                    |stated| Refused {
-                        code: crate::scaffolded::VALIDATION_ERROR_CODE.to_string(),
-                        message: stated.message,
-                    },
-                )
-            }
+            // constraint violation with, a `@pattern` quoted back WITHOUT the anchors a
+            // whole-value pattern is written with — the tree's one rendering of that rule
+            // — and no value at all for a member this service does not disclose. The CHECK
+            // still uses the model's pattern as written; only the quoting changes.
+            Refusal::Invalid(violations) => stated_violations(violations),
             _ => None,
         }
     }

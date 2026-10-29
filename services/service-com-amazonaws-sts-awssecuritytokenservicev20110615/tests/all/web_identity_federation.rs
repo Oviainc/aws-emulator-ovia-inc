@@ -330,10 +330,11 @@ async fn an_unsigned_assume_role_with_web_identity_is_classified_by_its_token() 
             "case {case:?}: expected <Code>{expected_code}</Code>, got {body}"
         );
         let message = member(case, &body, "Message");
-        // The element's text as the client reads it: XML escapes the apostrophe AWS's
-        // own sentence carries, and an awsQuery client unescapes it before it ever
-        // reaches application code.
-        let message = message.replace("&apos;", "'").replace("&amp;", "&");
+        // The element's text as the client reads it: XML requires `&` escaped inside a
+        // text node, so a sentence carrying one arrives encoded and an awsQuery client
+        // decodes it before it ever reaches application code. An apostrophe is not markup
+        // there and arrives as itself; `refusal_message_bytes.rs` owns that rule.
+        let message = message.replace("&amp;", "&");
         if expected_code == "ExpiredTokenException" {
             assert!(
                 message.starts_with("Token expired: current date/time ")
