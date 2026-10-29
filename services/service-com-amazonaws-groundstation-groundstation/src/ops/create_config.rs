@@ -211,50 +211,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default(),
         };
 
-        // An `uplinkEchoConfig` echoes a specific ANTENNA UPLINK config, named by ARN:
-        // like every ARN-valued reference it must resolve to a config that exists, and
-        // the config it names must be of the type the member is for — the member's own
-        // name and the `antenna-uplink` segment of a `ConfigArn` are what say so. The two
-        // ways that fails are different answers: nothing there is a missing resource,
-        // while a config of another type is a bad parameter. Checked before the store
-        // bound below, so what the caller hears is what is wrong with the request.
-        if let ConfigTypeData::uplinkEchoConfig(echo) = &stored.config_data {
-            // The one capability type an `uplinkEchoConfig`'s reference may name — the
-            // member's own name and the `antenna-uplink` segment of a `ConfigArn` are
-            // what say so.
-            const ECHOED_TYPE: &str = "antenna-uplink";
-
-            match guard.typed_reference_fault(&echo.antenna_uplink_config_arn, ECHOED_TYPE) {
-                None => {}
-                Some(crate::state::TypedReferenceFault::Absent) => {
-                    return Err(CreateConfigErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            // This service's `CreateConfig` text names the capability the
-                            // reference required, spelled as the model spells that
-                            // capability's shape, and the ARN the request gave — not the
-                            // wire enum token, which is an on-the-wire spelling rather
-                            // than a user-facing one.
-                            message: Some(crate::state::typed_reference_absent_message(
-                                ECHOED_TYPE,
-                                &echo.antenna_uplink_config_arn,
-                            )),
-                        },
-                    )
-                    .into());
-                }
-                Some(crate::state::TypedReferenceFault::WrongType) => {
-                    return Err(CreateConfigErrorModeled::InvalidParameterException(
-                        InvalidParameterException {
-                            message: Some(crate::state::typed_reference_wrong_type_message(
-                                ECHOED_TYPE,
-                            )),
-                            parameter_name: Some(
-                                "configData.uplinkEchoConfig.antennaUplinkConfigArn".to_string(),
-                            ),
-                        },
-                    )
-                    .into());
-                }
+        // An `uplinkEchoConfig` echoes a specific ANTENNA UPLINK config, named by ARN, and
+        // the reference rule that holds of it — which capability it may name, and which of
+        // its two faults is a missing resource and which a bad parameter — is the rule
+        // every write of a config is held to, so it is answered by `crate::state` and only
+        // lifted into this operation's error enum here. Checked before the store bound
+        // below, so what the caller hears is what is wrong with the request.
+        match guard.uplink_echo_reference_fault(&stored.config_data) {
+            None => {}
+            Some(crate::state::UplinkEchoReferenceFault::Absent(error)) => {
+                return Err(CreateConfigErrorModeled::ResourceNotFoundException(error).into());
+            }
+            Some(crate::state::UplinkEchoReferenceFault::WrongType(error)) => {
+                return Err(CreateConfigErrorModeled::InvalidParameterException(error).into());
             }
         }
 

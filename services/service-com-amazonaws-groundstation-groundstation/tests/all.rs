@@ -117,3 +117,5 @@ mod state_roundtrip;
 mod tag_removal;
 #[path = "all/tag_rules.rs"]
 mod tag_rules;
+#[path = "all/uplink_echo_reference_rule.rs"]
+mod uplink_echo_reference_rule;

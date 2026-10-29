@@ -226,42 +226,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
 
-        // An `uplinkEchoConfig` echoes a specific ANTENNA UPLINK config, named by ARN:
-        // the update is held to the same reference rule, and answers the same two texts,
-        // as the create, so an echo config cannot be pointed at a config that does not
-        // exist (a missing resource) or at one of another type (a bad parameter).
-        if let ConfigTypeData::uplinkEchoConfig(echo) = &input.config_data {
-            // The one capability type an `uplinkEchoConfig`'s reference may name — the
-            // member's own name and the `antenna-uplink` segment of a `ConfigArn` are
-            // what say so.
-            const ECHOED_TYPE: &str = "antenna-uplink";
-
-            match guard.typed_reference_fault(&echo.antenna_uplink_config_arn, ECHOED_TYPE) {
-                None => {}
-                Some(crate::state::TypedReferenceFault::Absent) => {
-                    return Err(UpdateConfigErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(crate::state::typed_reference_absent_message(
-                                ECHOED_TYPE,
-                                &echo.antenna_uplink_config_arn,
-                            )),
-                        },
-                    )
-                    .into());
-                }
-                Some(crate::state::TypedReferenceFault::WrongType) => {
-                    return Err(UpdateConfigErrorModeled::InvalidParameterException(
-                        InvalidParameterException {
-                            message: Some(crate::state::typed_reference_wrong_type_message(
-                                ECHOED_TYPE,
-                            )),
-                            parameter_name: Some(
-                                "configData.uplinkEchoConfig.antennaUplinkConfigArn".to_string(),
-                            ),
-                        },
-                    )
-                    .into());
-                }
+        // An `uplinkEchoConfig` echoes a specific ANTENNA UPLINK config, named by ARN: the
+        // update is held to the same reference rule, and answers the same two texts, as the
+        // create, so the rule is answered once by `crate::state` and only lifted into this
+        // operation's error enum here — an echo config cannot be pointed at a config that
+        // does not exist (a missing resource) or at one of another type (a bad parameter).
+        match guard.uplink_echo_reference_fault(&input.config_data) {
+            None => {}
+            Some(crate::state::UplinkEchoReferenceFault::Absent(error)) => {
+                return Err(UpdateConfigErrorModeled::ResourceNotFoundException(error).into());
+            }
+            Some(crate::state::UplinkEchoReferenceFault::WrongType(error)) => {
+                return Err(UpdateConfigErrorModeled::InvalidParameterException(error).into());
             }
         }
 

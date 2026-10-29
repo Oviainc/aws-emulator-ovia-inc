@@ -2363,6 +2363,38 @@ pub fn typed_reference_wrong_type_message(required_type: &str) -> String {
     wrong_config_type_message(&[required_type])
 }
 
+/// The one config capability type an `uplinkEchoConfig`'s `antennaUplinkConfigArn` may
+/// name — the member's own name and the `antenna-uplink` segment of a `ConfigArn` are what
+/// say so (`smithy_query(query="shape", shape="UplinkEchoConfig,ConfigCapabilityType")`).
+pub const UPLINK_ECHO_REFERENCED_TYPE: &str = "antenna-uplink";
+
+/// The member a refusal of an `uplinkEchoConfig`'s reference names, shared by the create
+/// and the update so both answer one parameter name (as [`DATAFLOW_EDGES_PARAMETER`] is one
+/// name for a mission profile's graph).
+pub const UPLINK_ECHO_REFERENCE_PARAMETER: &str =
+    "configData.uplinkEchoConfig.antennaUplinkConfigArn";
+
+/// Why the config an `uplinkEchoConfig` echoes cannot be referenced, as the modelled
+/// refusal to answer with.
+///
+/// The two faults are different conditions and this service answers them differently, the
+/// same way it answers them for a program track's ephemeris reference
+/// ([`ProgramTrackFault`]) — see
+/// [`ComAmazonawsGroundstationGroundstationState::uplink_echo_reference_fault`], which is
+/// where the whole rule lives, so the create and the update of a config cannot drift apart
+/// on it.
+#[derive(Debug, Clone)]
+pub enum UplinkEchoReferenceFault {
+    /// The `antennaUplinkConfigArn` names no config this account holds: there is nothing to
+    /// echo, so the resource is MISSING (`ResourceNotFoundException`, HTTP 434).
+    Absent(ResourceNotFoundException),
+    /// It names a config that EXISTS, of another capability type than
+    /// [`UPLINK_ECHO_REFERENCED_TYPE`]: a BAD PARAMETER (`InvalidParameterException`,
+    /// HTTP 431), since the reference resolved and no amount of waiting changes the type of
+    /// the config it points at.
+    WrongType(InvalidParameterException),
+}
+
 /// `types` as the sentence fragment a refusal names them in, each quoted as the
 /// `ConfigCapabilityType` token it is: `"antenna-uplink"`, or `"dataflow-endpoint" or
 /// "s3-recording"`, or `"a", "b" or "c"`.
@@ -4318,6 +4350,55 @@ impl ComAmazonawsGroundstationGroundstationState {
                 Some(TypedReferenceFault::WrongType)
             }
             Some(_) => None,
+        }
+    }
+
+    /// Why the config an `uplinkEchoConfig` in `config_data` echoes cannot be referenced,
+    /// as the modelled refusal to answer with; `None` when the reference names a config of
+    /// [`UPLINK_ECHO_REFERENCED_TYPE`] this account holds, and when the `configData`
+    /// carries no `uplinkEchoConfig` at all.
+    ///
+    /// An `uplinkEchoConfig` echoes a specific antenna uplink config, named by ARN: like
+    /// every ARN-valued reference it must resolve to a config that exists, and the config it
+    /// names must be of the type the member is for. The two ways that fails are different
+    /// answers ([`UplinkEchoReferenceFault`]): nothing there is a missing resource, while a
+    /// config of another type is a bad parameter.
+    ///
+    /// Written here rather than in a handler because every write of a config holds an
+    /// `uplinkEchoConfig` it stores to the same reference rule — the whole rule, which
+    /// capability the reference admits and which fault answers which error included — so a
+    /// create and an update of one echo config cannot answer differently. Each caller lifts
+    /// the fault into its own error enum, the way both writers of a contact version lift
+    /// [`Self::program_track_fault`].
+    pub fn uplink_echo_reference_fault(
+        &self,
+        config_data: &ConfigTypeData,
+    ) -> Option<UplinkEchoReferenceFault> {
+        let ConfigTypeData::uplinkEchoConfig(echo) = config_data else {
+            return None;
+        };
+        let arn = &echo.antenna_uplink_config_arn;
+        match self.typed_reference_fault(arn, UPLINK_ECHO_REFERENCED_TYPE)? {
+            TypedReferenceFault::Absent => Some(UplinkEchoReferenceFault::Absent(
+                ResourceNotFoundException {
+                    // The not-found text names the capability the reference required,
+                    // spelled as the model spells that capability's shape, and the ARN the
+                    // request gave — not the wire enum token, which is an on-the-wire
+                    // spelling rather than a user-facing one.
+                    message: Some(typed_reference_absent_message(
+                        UPLINK_ECHO_REFERENCED_TYPE,
+                        arn,
+                    )),
+                },
+            )),
+            TypedReferenceFault::WrongType => Some(UplinkEchoReferenceFault::WrongType(
+                InvalidParameterException {
+                    message: Some(typed_reference_wrong_type_message(
+                        UPLINK_ECHO_REFERENCED_TYPE,
+                    )),
+                    parameter_name: Some(UPLINK_ECHO_REFERENCE_PARAMETER.to_string()),
+                },
+            )),
         }
     }
 
