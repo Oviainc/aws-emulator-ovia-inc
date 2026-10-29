@@ -61,6 +61,8 @@ mod not_found_and_conflict_bodies;
 mod platform_domain_authority;
 #[path = "all/put_rum_events_unresolvable_id.rs"]
 mod put_rum_events_unresolvable_id;
+#[path = "all/query_bound_required_members.rs"]
+mod query_bound_required_members;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/resource_tagging.rs"]

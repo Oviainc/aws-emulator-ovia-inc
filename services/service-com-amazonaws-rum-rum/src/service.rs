@@ -24,13 +24,13 @@
 //!   correctly. EDITED HERE, for two reasons that compose: every request this service
 //!   serves goes through [`AnnouncedMediaType`], which runs the operation unchanged and
 //!   announces this service's media type on the response (see "The media type this
-//!   service announces" below), and a `DELETE /tags/{ResourceArn}` that binds no
-//!   `tagKeys` value — the empty key list `UntagResource` models — is served by
-//!   `UntagResource`, which the framework's required-query-binding rule leaves unmatched
-//!   (see [`UNTAG_RESOURCE_ROUTE`]), as is a `DELETE /rummetrics/{AppMonitorName}/metrics`
-//!   that binds no `metricDefinitionIds` value (see
-//!   [`BATCH_DELETE_METRIC_DEFINITIONS_ROUTE`]). Which operation serves a request is still
-//!   the model's routing table's answer in every other case.
+//!   service announces" below), and a request that binds no value for a `@required`
+//!   `@httpQuery` member — which the framework's required-query-binding rule leaves
+//!   matching NO route, so the router would answer it "unknown operation" rather than
+//!   letting the operation state its own refusal — is served by the operation the model
+//!   binds to its method and path (see [`QUERY_UNMATCHED_ROUTES`], which lists every
+//!   route of this service that binds such a member). Which operation serves a request is
+//!   still the model's routing table's answer in every other case.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -157,91 +157,99 @@ fn is_resource_arn_syntax_violation(violations: &[Violation]) -> bool {
     })
 }
 
-/// The one route of this service whose operation the generated routing table cannot name
-/// when a `@required` `@httpQuery` member is absent, as
-/// `(method, collection segment, operation)`.
+/// EVERY route of this service that binds a `@required` `@httpQuery` member, as
+/// `(method, pattern, operation)` — the pattern being the one the model's `@http` trait
+/// gives that operation.
 ///
-/// `UntagResource` is `DELETE /tags/{ResourceArn}` with `TagKeys` `@required` and bound to
-/// the `tagKeys` query parameter (`smithy_query(query="operation",
-/// operation="UntagResource")`). The framework's REST router rejects a candidate route
-/// whose `@required` query bindings are not on the request — the rule that lets an
-/// S3-class model tell several operations apart on ONE method + URI template by the SHAPE
-/// of the request. This service overloads no route: `GET`, `POST` and `DELETE` on
-/// `/tags/{ResourceArn}` name one operation each, so for `DELETE` the rule only misfires.
-/// A call that binds no `tagKeys` value — which is how a query-bound list spells the empty
-/// list `TagKeyList`'s `@length(min: 0)` admits — then matches NO route and is answered
-/// "unknown operation" (HTTP 501 `NotImplemented`, a status and code the operation does
-/// not model) instead of being served.
+/// The framework's REST router rejects a candidate route whose `@required` query bindings
+/// are not on the request — the rule that lets an S3-class model tell several operations
+/// apart on ONE method + URI template by the SHAPE of the request. This service overloads
+/// no route: every method + URI template it publishes names exactly one operation, so for
+/// a request that binds no value for such a member the rule only misfires: the request
+/// matches NO route and is answered "unknown operation" (HTTP 501 `NotImplemented`, a
+/// status and code no operation here models) instead of reaching the operation the model
+/// binds to its method and path, whose own answer for an absent `@required` member is the
+/// service's common `ValidationException` (HTTP 400).
 ///
-/// It is one of the two such routes in this service: every operation other than it and
-/// [`BATCH_DELETE_METRIC_DEFINITIONS_ROUTE`] either binds no `@required` member to the
-/// query string at all, or binds only members a request always carries a value for, so no
-/// other method+path pair can fail to resolve this way.
-const UNTAG_RESOURCE_ROUTE: (&str, &str, &str) = ("DELETE", "tags", "UntagResource");
+/// So the routes below are resolved by method and path alone, which takes nothing away
+/// from the model's own routing table — it is consulted first, and only a request it
+/// cannot name is matched here. The table is EVERY route of this service with such a
+/// member, so no sibling route answers the same client mistake differently from another:
+///
+/// * `UntagResource` — `TagKeys` (`tagKeys`), whose `TagKeyList` admits the empty list
+///   (`@length(min: 0)`), which a query-bound list spells as no values at all;
+/// * `BatchDeleteRumMetricDefinitions` — `MetricDefinitionIds` (`metricDefinitionIds`),
+///   a list with no `@length`, so the empty list again, and `Destination` (`destination`);
+/// * `BatchGetRumMetricDefinitions` — `Destination`;
+/// * `DeleteRumMetricsDestination` — `Destination`.
+///
+/// Source: `smithy_query(query="operation", operation="UntagResource,
+/// BatchDeleteRumMetricDefinitions,BatchGetRumMetricDefinitions,DeleteRumMetricsDestination")`
+/// against this service's model, which is also where each pattern is read from. Every
+/// other operation of this service either binds no `@required` member to the query string
+/// at all, or (`ListRumMetricsDestinations`, the metric-definition create and update)
+/// binds its required members to the path or the body, so its route always resolves.
+const QUERY_UNMATCHED_ROUTES: &[(&str, &str, &str)] = &[
+    ("DELETE", "/tags/{ResourceArn}", "UntagResource"),
+    (
+        "DELETE",
+        "/rummetrics/{AppMonitorName}/metrics",
+        "BatchDeleteRumMetricDefinitions",
+    ),
+    (
+        "GET",
+        "/rummetrics/{AppMonitorName}/metrics",
+        "BatchGetRumMetricDefinitions",
+    ),
+    (
+        "DELETE",
+        "/rummetrics/{AppMonitorName}/metricsdestination",
+        "DeleteRumMetricsDestination",
+    ),
+];
 
-/// The other route of this service the same rule leaves unmatched, as
-/// `(method, collection segment, sub-resource segment, operation)`.
+/// Whether `path` is a request path the modelled `@http.uri` `pattern` matches: the same
+/// segments in the same order, a literal segment matching itself and a `{Label}` segment
+/// matching ONE non-empty segment — an SDK percent-encodes a non-greedy label, so the
+/// label itself carries no `/`, and none of [`QUERY_UNMATCHED_ROUTES`]'s patterns binds a
+/// greedy one.
 ///
-/// `BatchDeleteRumMetricDefinitions` is `DELETE /rummetrics/{AppMonitorName}/metrics` with
-/// `MetricDefinitionIds` `@required` and bound to the `metricDefinitionIds` query parameter
-/// (`smithy_query(query="operation", operation="BatchDeleteRumMetricDefinitions")`). A call
-/// that binds no `metricDefinitionIds` value — which is how a query-bound list spells the
-/// empty list, the value a list with no `@length` admits — matches no route for exactly the
-/// reason above, and is answered "unknown operation" instead of being served. This method
-/// and path name that one operation (the same template is `POST` for the batch create and
-/// `GET` for the batch read), so resolving it here takes nothing away from the model's own
-/// routing table.
-const BATCH_DELETE_METRIC_DEFINITIONS_ROUTE: (&str, &str, &str, &str) = (
-    "DELETE",
-    "rummetrics",
-    "metrics",
-    "BatchDeleteRumMetricDefinitions",
-);
+/// Segments are read the way the framework's own matcher reads them (leading and trailing
+/// `/` ignored, nothing else skipped), or this and the generated table would disagree
+/// about which requests the table already resolves.
+fn path_matches_pattern(pattern: &str, path: &str) -> bool {
+    let mut expected_segments = pattern.trim_matches('/').split('/');
+    let mut segments = path.trim_matches('/').split('/');
+    loop {
+        match (expected_segments.next(), segments.next()) {
+            (None, None) => return true,
+            (Some(expected), Some(segment)) => {
+                let matched = if expected.starts_with('{') && expected.ends_with('}') {
+                    !segment.is_empty()
+                } else {
+                    expected == segment
+                };
+                if !matched {
+                    return false;
+                }
+            }
+            // One path is longer than the other, so they are different routes.
+            _ => return false,
+        }
+    }
+}
 
-/// Whether `req` is a request to [`UNTAG_RESOURCE_ROUTE`]: the method, and a path whose
-/// segments are `tags` followed by ONE non-empty segment — the single `{ResourceArn}`
-/// label the modelled URI pattern ends in, which an SDK percent-encodes, so the label
-/// itself carries no `/`. Segments are read the way the framework's own matcher reads
-/// them (leading and trailing `/` ignored), or the two would disagree about which
-/// requests the generated table already resolves.
+/// The operation the model binds to `req`'s method and path among
+/// [`QUERY_UNMATCHED_ROUTES`], or `None` when `req` addresses none of them.
 ///
 /// The URI this seam is handed is the whole one the SDK sent, so its path comes from the
-/// shared reader (`service_common::uri_path`) and its segments from the shared
-/// `nth_path_segment`, rather than from a private copy of either.
-fn is_untag_resource_route(req: &aws_smithy_runtime_api::http::Request) -> bool {
-    let (method, collection, _) = UNTAG_RESOURCE_ROUTE;
-    if req.method() != method {
-        return false;
-    }
+/// shared reader (`service_common::uri_path`) rather than from a private copy of it.
+fn query_unmatched_operation(req: &aws_smithy_runtime_api::http::Request) -> Option<&'static str> {
     let path = service_common::uri_path(req.uri());
-    let path = path.trim_end_matches('/');
-    service_common::nth_path_segment(path, 0) == Some(collection)
-        && service_common::nth_path_segment(path, 1).is_some_and(|label| !label.is_empty())
-        && service_common::nth_path_segment(path, 2).is_none()
-}
-
-/// Whether `req` is a request to [`BATCH_DELETE_METRIC_DEFINITIONS_ROUTE`]: the method, and
-/// a path whose segments are `rummetrics`, ONE non-empty `{AppMonitorName}` label and
-/// `metrics`, and nothing after it. Segments are read through the same shared reader
-/// [`is_untag_resource_route`] uses, so the two cannot disagree with the framework's own
-/// matcher about which requests the generated table already resolves.
-fn is_batch_delete_metric_definitions_route(req: &aws_smithy_runtime_api::http::Request) -> bool {
-    let (method, collection, sub_resource, _) = BATCH_DELETE_METRIC_DEFINITIONS_ROUTE;
-    if req.method() != method {
-        return false;
-    }
-    let path = service_common::uri_path(req.uri());
-    let path = path.trim_end_matches('/');
-    service_common::nth_path_segment(path, 0) == Some(collection)
-        && service_common::nth_path_segment(path, 1).is_some_and(|label| !label.is_empty())
-        && service_common::nth_path_segment(path, 2) == Some(sub_resource)
-        && service_common::nth_path_segment(path, 3).is_none()
-}
-
-/// Whether `req` is a request to one of the two routes the protocol's routing key cannot
-/// name.
-fn is_query_unmatched_route(req: &aws_smithy_runtime_api::http::Request) -> bool {
-    is_untag_resource_route(req) || is_batch_delete_metric_definitions_route(req)
+    QUERY_UNMATCHED_ROUTES
+        .iter()
+        .find(|(method, pattern, _)| req.method() == *method && path_matches_pattern(pattern, path))
+        .map(|(_, _, operation)| *operation)
 }
 
 /// The `com-amazonaws-rum-rum` emulated service: the generated [`ServiceDefinition`] plus
@@ -275,12 +283,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 ///
 /// It decides nothing else. The operation that serves the request is the one the model's
 /// routing table names, reached through its own `run`, so that operation stays the single
-/// owner of the request — its telemetry included. The exceptions are the two routes the
-/// protocol's routing key cannot name ([`UNTAG_RESOURCE_ROUTE`] and
-/// [`BATCH_DELETE_METRIC_DEFINITIONS_ROUTE`]), which the gate serves from the operations it
-/// holds, and a request the framework's own constraint walk refuses, which the gate states
-/// in front of the operation because that is the only place the request's own values are
-/// still in hand ([`AnnouncedMediaType::stated_refusal`]).
+/// owner of the request — its telemetry included. The exceptions are the routes the
+/// protocol's routing key cannot name ([`QUERY_UNMATCHED_ROUTES`]), which the gate serves
+/// from the operations it holds, and a request the framework's own constraint walk refuses,
+/// which the gate states in front of the operation because that is the only place the
+/// request's own values are still in hand ([`AnnouncedMediaType::stated_refusal`]).
 struct AnnouncedMediaType<Eng> {
     /// `UntagResource`, built from the SAME shared engine the generated entry threads
     /// into every operation, so this gate and the rest of the service read one store.
@@ -288,11 +295,19 @@ struct AnnouncedMediaType<Eng> {
     /// without a request in hand, and the schemes this gate reports for the route the
     /// routing key cannot name must be that operation's MODELLED ones.
     untag_resource: crate::ops::untag_resource::UntagResource<Eng>,
-    /// `BatchDeleteRumMetricDefinitions`, held from that same shared engine for the other
-    /// route the routing key cannot name
-    /// ([`BATCH_DELETE_METRIC_DEFINITIONS_ROUTE`]).
+    /// `BatchDeleteRumMetricDefinitions`, held from that same shared engine for another
+    /// route the routing key cannot name ([`QUERY_UNMATCHED_ROUTES`]).
     batch_delete_rum_metric_definitions:
         crate::ops::batch_delete_rum_metric_definitions::BatchDeleteRumMetricDefinitions<Eng>,
+    /// `BatchGetRumMetricDefinitions`, held for the same reason: `GET
+    /// /rummetrics/{AppMonitorName}/metrics` binds `Destination` to the query string.
+    batch_get_rum_metric_definitions:
+        crate::ops::batch_get_rum_metric_definitions::BatchGetRumMetricDefinitions<Eng>,
+    /// `DeleteRumMetricsDestination`, held for the same reason: `DELETE
+    /// /rummetrics/{AppMonitorName}/metricsdestination` binds `Destination` to the query
+    /// string.
+    delete_rum_metrics_destination:
+        crate::ops::delete_rum_metrics_destination::DeleteRumMetricsDestination<Eng>,
 }
 
 /// Read one `crate::ops::<module>::<Operation>`'s refusal per line, choosing the arm by the
@@ -322,9 +337,54 @@ impl<Eng: Send + Sync + 'static> AnnouncedMediaType<Eng> {
             untag_resource: crate::ops::untag_resource::UntagResource::new(Arc::clone(&engine)),
             batch_delete_rum_metric_definitions:
                 crate::ops::batch_delete_rum_metric_definitions::BatchDeleteRumMetricDefinitions::new(
-                    engine,
+                    Arc::clone(&engine),
                 ),
+            batch_get_rum_metric_definitions:
+                crate::ops::batch_get_rum_metric_definitions::BatchGetRumMetricDefinitions::new(
+                    Arc::clone(&engine),
+                ),
+            delete_rum_metrics_destination:
+                crate::ops::delete_rum_metrics_destination::DeleteRumMetricsDestination::new(engine),
         }
+    }
+
+    /// The operation this gate serves a [`QUERY_UNMATCHED_ROUTES`] request from, or `None`
+    /// when `req` addresses none of those routes.
+    ///
+    /// WHICH operation serves which route is the model's answer twice over: the route table
+    /// carries the operation the model binds to that method and path, and the operation it
+    /// names is matched against each held operation's OWN modelled name
+    /// ([`Operation::NAME`]), so this gate cannot serve a request from an operation the
+    /// model does not bind to its route.
+    fn unmatched_route_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
+        let operation = query_unmatched_operation(req)?;
+        let held: [(&'static str, &dyn ErasedOperation); 4] = [
+            (
+                <crate::ops::untag_resource::UntagResource<Eng> as Operation>::NAME,
+                &self.untag_resource,
+            ),
+            (
+                <crate::ops::batch_delete_rum_metric_definitions::BatchDeleteRumMetricDefinitions<
+                    Eng,
+                > as Operation>::NAME,
+                &self.batch_delete_rum_metric_definitions,
+            ),
+            (
+                <crate::ops::batch_get_rum_metric_definitions::BatchGetRumMetricDefinitions<
+                    Eng,
+                > as Operation>::NAME,
+                &self.batch_get_rum_metric_definitions,
+            ),
+            (
+                <crate::ops::delete_rum_metrics_destination::DeleteRumMetricsDestination<
+                    Eng,
+                > as Operation>::NAME,
+                &self.delete_rum_metrics_destination,
+            ),
+        ];
+        held.into_iter()
+            .find(|(name, _)| *name == operation)
+            .map(|(_, operation)| operation)
     }
 
     /// How this service states every modelled constraint `req` breaks, with the two facts
@@ -346,9 +406,10 @@ impl<Eng: Send + Sync + 'static> AnnouncedMediaType<Eng> {
     ///
     /// WHICH operation's input schema the violations are read against is the model's
     /// answer: the routing key the protocol resolves, the same key the generated routing
-    /// table is keyed by. A key this service does not serve — and the two routes that key
-    /// cannot name, which bind no body at all — is left to the centralized walk, which
-    /// refuses it and comes back through [`Service::override_refusal`].
+    /// table is keyed by. A key this service does not serve — and the routes that key
+    /// cannot name ([`QUERY_UNMATCHED_ROUTES`]), which bind no body at all — is left to
+    /// the operation's own sequence, whose refusal comes back through
+    /// [`Service::override_refusal`].
     fn stated_refusal(
         &self,
         svc: &dyn Service,
@@ -463,19 +524,12 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AnnouncedMediaType<Eng> {
             // success, a handler's modelled error and a boundary refusal all pass back
             // out through here. Reached through the routing table rather than through
             // `override_operation`, which would route straight back to this gate.
-            let response = match modeled_operation(svc, req) {
-                Some(op) => op.run(svc, req, ctx).await,
+            let response = match modeled_operation(svc, req).or_else(|| {
                 // The routes the protocol's routing key cannot name, each served by the
-                // operation the model binds to it (see [`UNTAG_RESOURCE_ROUTE`] and
-                // [`BATCH_DELETE_METRIC_DEFINITIONS_ROUTE`]).
-                None if is_untag_resource_route(req) => {
-                    self.untag_resource.run(svc, req, ctx).await
-                }
-                None if is_batch_delete_metric_definitions_route(req) => {
-                    self.batch_delete_rum_metric_definitions
-                        .run(svc, req, ctx)
-                        .await
-                }
+                // operation the model binds to it (see [`QUERY_UNMATCHED_ROUTES`]).
+                self.unmatched_route_operation(req)
+            }) {
+                Some(op) => op.run(svc, req, ctx).await,
                 // Unreachable: this gate is served only for a request that is one of the
                 // cases above.
                 None => svc.definition().routing_error_response(req),
@@ -485,13 +539,13 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AnnouncedMediaType<Eng> {
     }
 
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
-        // Consulted only when the modelled routing key names NO operation — the two
-        // routes above — because the router prefers the modelled operation's schemes for
+        // Consulted only when the modelled routing key names NO operation — the routes
+        // above — because the router prefers the modelled operation's schemes for
         // every request whose key it can resolve. So the schemes reported here are an
         // operation's own modelled ones, read off it rather than written out: a gate
-        // must not be able to weaken what the model requires. Neither of those two
-        // operations overrides the service's authentication, so the schemes are the same
-        // for both and either one reports them.
+        // must not be able to weaken what the model requires. None of those operations
+        // overrides the service's authentication, so the schemes are the same for all of
+        // them and any one of them reports them.
         self.untag_resource.auth_schemes()
     }
 }
@@ -560,21 +614,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     /// Serve every request this service answers through [`AnnouncedMediaType`], the gate
     /// that announces this service's media type on the response (see the module docs),
-    /// including the one request whose operation the protocol's routing key cannot name:
-    /// a `DELETE /tags/{ResourceArn}` whose `@required` `tagKeys` query parameter is
-    /// ABSENT — the empty key list `TagKeyList`'s `@length(min: 0)` admits.
+    /// including a request whose operation the protocol's routing key cannot name: one
+    /// that binds no value for a `@required` `@httpQuery` member of the operation the
+    /// model binds to its method and path (see [`QUERY_UNMATCHED_ROUTES`]).
     ///
     /// WHICH operation serves a request is still decided by the model: the gate resolves
-    /// it from the generated routing table, exactly as the router would have, and the one
-    /// route the table cannot name is matched by method and path alone (see
-    /// [`UNTAG_RESOURCE_ROUTE`] for why the framework's required-binding rule leaves it
-    /// unmatched, and `crate::ops::untag_resource`'s own input reader for how the absent
-    /// member is then read as the empty list). A request that names no modelled operation
-    /// and is not that route is left to the framework, which refuses it in front of this
-    /// service in its own protocol-correct envelope.
+    /// it from the generated routing table, exactly as the router would have, and a route
+    /// the table cannot name is matched by method and path alone (see
+    /// [`QUERY_UNMATCHED_ROUTES`] for why the framework's required-binding rule leaves
+    /// those unmatched, and for the member each one binds). The operation then answers its
+    /// OWN refusal for the absent member — the service's `ValidationException`, HTTP 400 —
+    /// or, where the member is a list whose empty value the wire spells as no values at
+    /// all, serves the call (`crate::ops::untag_resource` and
+    /// `crate::ops::batch_delete_rum_metric_definitions` read the absent list that way).
+    /// A request that names no modelled operation and is none of those routes is left to
+    /// the framework, which refuses it in front of this service in its own
+    /// protocol-correct envelope.
     fn override_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
         let gate = &self.announced_media_type as &dyn ErasedOperation;
-        if modeled_operation(self, req).is_some() || is_query_unmatched_route(req) {
+        if modeled_operation(self, req).is_some() || query_unmatched_operation(req).is_some() {
             return Some(gate);
         }
         None
