@@ -107,6 +107,8 @@ mod time_windows;
 mod unknown_ids;
 #[path = "all/unsettled_store_listings.rs"]
 mod unsettled_store_listings;
+#[path = "all/unsettled_store_single_agreement_reads.rs"]
+mod unsettled_store_single_agreement_reads;
 #[path = "all/validation_envelope.rs"]
 mod validation_envelope;
 #[path = "all/validation_messages.rs"]

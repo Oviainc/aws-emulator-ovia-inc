@@ -167,7 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // association belongs to is RESOLVED from the charge: a charge belongs
         // to the agreement whose quote minted it, and charge ids are minted from
         // the store's single counter, so a `chargeId` names at most one charge
-        // of at most one agreement.
+        // of at most one agreement. The resolution is over every agreement the
+        // store holds, so every end-date transition the clock has already made
+        // due is materialised first (`crate::state::settle_agreements`, what
+        // the scanning reports of this crate call): the charges of a renewal an
+        // end date created are charges of the store from that date on.
+        store.settle_agreements(now);
         let owners = store.charge_owners();
         // The revision each of those charges is at, as the charge report states
         // it, which is what an element's `chargeRevision` precondition is

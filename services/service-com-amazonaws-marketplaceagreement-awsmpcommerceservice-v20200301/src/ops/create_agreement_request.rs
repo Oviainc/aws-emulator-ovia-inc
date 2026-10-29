@@ -282,8 +282,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An amendment or replacement "acts upon" an agreement that must exist:
         // the quantities it already holds are what the new quote is measured
-        // against.
+        // against. The source is settled before it is resolved, for the reason
+        // every single-agreement guard of this crate settles: an agreement
+        // whose own stored end date has passed reached it at that instant
+        // whether or not anybody called, and the renewal that date created is
+        // an agreement from then on.
         if let Some(source) = input.source_agreement_identifier.as_deref() {
+            store.settle_before_lookup(source, now);
             if !store.agreements.contains_key(source) {
                 // The lookup found nothing: the modelled not-found body, at the
                 // status this service answers it with

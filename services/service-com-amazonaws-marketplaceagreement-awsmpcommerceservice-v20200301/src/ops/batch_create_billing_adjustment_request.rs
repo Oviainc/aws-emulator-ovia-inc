@@ -268,7 +268,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // An adjustment is made to an invoice OF an agreement, so the
             // agreement has to exist: it is also where a summary's
-            // `agreementType` and `catalog` come from.
+            // `agreementType` and `catalog` come from. The agreement an entry
+            // names is settled before its id is resolved: an agreement whose
+            // own stored end date has passed reached it at that instant
+            // whether or not anybody called, and the renewal that date created
+            // is an agreement from then on
+            // (`crate::state::settle_before_lookup`).
+            store.settle_before_lookup(&entry.agreement_id, now);
             let Some((agreement_type, catalog)) = store
                 .agreements
                 .get(&entry.agreement_id)

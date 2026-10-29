@@ -4855,10 +4855,11 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     /// loop is additionally capped by [`RENEWALS_PER_CALL`] for a renewal term
     /// that publishes no limit at all.
     ///
-    /// What an operation answering about a single agreement calls: the record it
-    /// is about is the only one its answer depends on, so it and the chain it
-    /// starts are the only ones to bring up to date. An id that names nothing is
-    /// left to the operation's own refusal.
+    /// What settles the chain of an agreement this store HOLDS: the record an
+    /// answer is about is the only one that answer depends on, so it and the
+    /// chain it starts are the only ones to bring up to date. An operation
+    /// RESOLVING an id calls [`Self::settle_before_lookup`], which adds what an
+    /// id this store holds nothing under needs.
     pub fn settle_agreement(&mut self, agreement_id: &str, now: SystemTime) {
         let mut id = agreement_id.to_string();
         for _ in 0..=RENEWALS_PER_CALL {
@@ -4880,7 +4881,7 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     /// end date is searched by, the summary status reported beside it, and the
     /// renewal agreement its end date created are then the ones the clock
     /// already owed. An operation answering about a single agreement calls
-    /// [`Self::settle_agreement`] instead.
+    /// [`Self::settle_before_lookup`] instead.
     ///
     /// The ids are taken before the walk, because a renewal inserts a new
     /// agreement: each chain is settled to its end by the walk of its first
@@ -4889,6 +4890,30 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
         let ids: Vec<String> = self.agreements.keys().cloned().collect();
         for id in ids {
             self.settle_agreement(&id, now);
+        }
+    }
+
+    /// Materialise what the clock has already made due BEFORE the id
+    /// `agreement_id` is resolved: the chain that id starts
+    /// ([`Self::settle_agreement`]) and, only when this store holds no
+    /// agreement under it, every chain this store holds
+    /// ([`Self::settle_agreements`]).
+    ///
+    /// What an operation answering about a SINGLE agreement calls. The second
+    /// half is what a renewal makes necessary: the agreement a `RENEW` end date
+    /// creates is owed at that date whether or not anybody calls, and until the
+    /// chain that owes it is walked this store holds nothing under its id — so
+    /// an id that resolves to nothing is not yet an id that NAMES nothing, and
+    /// answering the not-found refusal for it would make the answer depend on
+    /// whether some other call had walked that chain first. Once every chain is
+    /// settled the id either names the agreement the clock created or names
+    /// nothing at all, and the operation's own refusal is what the latter
+    /// earns. The store-wide walk runs only on that miss, so resolving an
+    /// agreement this store already holds stays the settling of its own chain.
+    pub fn settle_before_lookup(&mut self, agreement_id: &str, now: SystemTime) {
+        self.settle_agreement(agreement_id, now);
+        if !self.agreements.contains_key(agreement_id) {
+            self.settle_agreements(now);
         }
     }
 

@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The agreement guard below acts on the status the clock has already
         // left the agreement in: one past its own stored end date ended at
         // that instant, so no new request is taken under it.
-        store.settle_agreement(&input.agreement_id, now);
+        store.settle_before_lookup(&input.agreement_id, now);
 
         // `@idempotencyToken`: the same token names the same payment request, so
         // a retried send reports the first one rather than charging the buyer

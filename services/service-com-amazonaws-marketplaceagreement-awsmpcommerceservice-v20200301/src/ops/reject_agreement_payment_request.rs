@@ -203,6 +203,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // The parent this call resolves against is settled BEFORE its id is
+        // resolved: an agreement whose own stored end date has passed reached
+        // it at that instant whether or not anybody called, and the renewal
+        // that date created is an agreement from then on — so the parent the
+        // clock already owes resolves here whether or not another call looked
+        // at the store first (`crate::state::settle_before_lookup`).
+        store.settle_before_lookup(&input.agreement_id, now);
 
         // A payment request is a child of the agreement it was sent under, and
         // this call names both. Resolution goes PARENT-FIRST, so

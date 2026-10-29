@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ended at that instant — expired, or renewed into the agreement
             // that continues its chain — so it keeps the status the clock gave
             // it rather than being moved to `REPLACED` afterwards.
-            store.settle_agreement(id, now);
+            store.settle_before_lookup(id, now);
             let Some(stored) = store.agreements.get(id) else {
                 // The agreement this request acts upon is gone: the same
                 // not-found refusal, naming the agreement that was looked for.

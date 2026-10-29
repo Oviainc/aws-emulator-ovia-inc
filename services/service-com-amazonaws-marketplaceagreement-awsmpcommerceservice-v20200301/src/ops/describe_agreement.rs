@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // only carries "for every active agreement". Nothing else here writes:
         // every other member is read from the record `AcceptAgreementRequest`
         // stored.
-        store.settle_agreement(&input.agreement_id, now);
+        store.settle_before_lookup(&input.agreement_id, now);
         let Some(agreement) = store.agreements.get(&input.agreement_id) else {
             // The lookup found nothing: the modelled not-found body, at the
             // status this service answers it with (`state::NOT_FOUND_STATUS`).

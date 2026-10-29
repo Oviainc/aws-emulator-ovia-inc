@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // agreement in: one past its own stored end date ended at that instant
         // — expired, or renewed into the agreement that continues its chain —
         // so there is nothing left for an acceptor to cancel.
-        store.settle_agreement(&input.agreement_id, now);
+        store.settle_before_lookup(&input.agreement_id, now);
         let Some(agreement) = store.agreements.get_mut(&input.agreement_id) else {
             // The lookup found nothing: the modelled not-found body, at the
             // status this service answers it with (`state::NOT_FOUND_STATUS`).

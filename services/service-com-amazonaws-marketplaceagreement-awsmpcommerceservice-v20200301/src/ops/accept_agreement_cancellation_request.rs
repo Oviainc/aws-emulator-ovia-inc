@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The agreement is cancelled below, and only an active agreement is:
         // one past its own stored end date ended at that instant, so it keeps
         // the status the clock gave it rather than being cancelled afterwards.
-        store.settle_agreement(&input.agreement_id, now);
+        store.settle_before_lookup(&input.agreement_id, now);
 
         // A cancellation request is a child of the agreement it was sent over,
         // and this call names both. Resolution goes PARENT-FIRST, so

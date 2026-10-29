@@ -193,13 +193,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
 
         // "The unique identifier of the agreement": the invoices reported are
         // the invoices OF that agreement, so an id naming none is a reference to
         // a resource that does not exist — the modelled not-found this operation
         // declares, at the status this service answers every lookup that found
-        // nothing with.
+        // nothing with. The agreement is settled before its id is resolved: an
+        // agreement whose own stored end date has passed reached it at that
+        // instant whether or not anybody called, and the renewal that date
+        // created is an agreement from then on
+        // (`crate::state::settle_before_lookup`).
         //
         // The agreement is resolved BEFORE the page token below, as the sibling
         // per-agreement reads of this crate do: the listing a token resumes is a
@@ -209,6 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `nextToken` — the member that is not at fault, and in the error shape
         // this service reserves for a refused value rather than the one it
         // answers a lookup that found nothing with.
+        store.settle_before_lookup(&input.agreement_id, now);
         if !store.agreements.contains_key(&input.agreement_id) {
             return Err(crate::state::not_found(
                 ListAgreementInvoiceLineItemsErrorModeled::ResourceNotFoundException(

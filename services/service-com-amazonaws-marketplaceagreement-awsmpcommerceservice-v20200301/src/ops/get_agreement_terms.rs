@@ -161,8 +161,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A pure report: it reads the stored accepted terms and writes nothing.
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A report, of the accepted terms as the clock has already left them:
+        // the agreement this call names is settled BEFORE its id is resolved,
+        // because an agreement whose own stored end date has passed reached it
+        // at that instant whether or not anybody called, and what that date
+        // owed includes the renewal agreement created "from the accepted terms
+        // of this agreement" together with the terms it re-states. So the terms
+        // of an agreement the clock already owes are reported whether or not
+        // some other call looked at the store first
+        // (`crate::state::settle_before_lookup`). Nothing else here writes: the
+        // terms themselves are read from the record `AcceptAgreementRequest`
+        // stored.
+        store.settle_before_lookup(&input.agreement_id, now);
         let Some(agreement) = store.agreements.get(&input.agreement_id) else {
             // The lookup found nothing: the modelled not-found body, at the
             // status this service answers it with (`state::NOT_FOUND_STATUS`).
