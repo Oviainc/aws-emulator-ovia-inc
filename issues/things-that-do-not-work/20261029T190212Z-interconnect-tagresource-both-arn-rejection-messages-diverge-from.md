@@ -1,0 +1,72 @@
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: interconnect.tag-resource-cross-account-arn-rejected interconnect.tag-resource-nonexistent-connection-rejected
+Issue-Shape-Id: com.amazonaws.interconnect#Interconnect
+Issue-Key: interconnect.tag-resource-cross-account-arn-rejected|run#8|AssertionError|assert tag_message == (
+Issue-Key: interconnect.tag-resource-nonexistent-connection-rejected|run#9|AssertionError|assert tag_message == "Unable to process request: Resource does not exist or is deleted", (
+Issue-Commit: f5ba8024c64455531a4bd3d9779b46ec0fe104e4
+
+# Interconnect TagResource: both ARN rejection messages diverge from AWS's wording — cross-account ARN and nonexistent-connection ARN
+
+> _Note: this issue was identified against the code base at commit `f5ba8024c64455531a4bd3d9779b46ec0fe104e4`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+TagResource, ListTagsForResource
+
+## Description
+TagResource is now implemented (it no longer answers the scaffold 501) and it now classifies both negative ARN classes with the right modeled error codes — InterconnectValidationException for an out-of-scope ARN and InterconnectClientException for an in-scope ARN naming no connection — so the code assertions of both behavioral checks pass. What still diverges is the MESSAGE each refusal carries: the emulator writes its own sentences instead of the ones AWS words for these two classes. TWO net-new root causes, numbered Cause 1 of 2 .. Cause 2 of 2; BOTH must be closed before this issue is submitted, and both check ids in trace_ids must be re-replayed.
+
+Related but NOT covering: the open issue 20261022T145736Z-interconnect-error-semantics-three-operations-still-501-environment.md. Its Cause 3 covers TagResource only as a 501 scaffold stub and only requires the two distinct error CODES (which the emulator now produces); it says nothing about the message either refusal must carry. Its Cause 5 is the GetConnection/DeleteConnection identifier not-found wording, which is a different message from the one Cause 2 below requires (see Cause 2: the ARN-addressed tag path is value-free). Neither check is marked OWNED by it in the replay report, because the replay keys it carries for them are the code assertions that now pass.
+
+=== Cause 1 of 2: the cross-account/out-of-scope ARN refusal uses the service's generic "Unable to process request" envelope instead of AWS's account-mismatch sentence, and echoes the whole ARN ===
+AWS: Smithy (services/service-com-amazonaws-interconnect-interconnect/smithy-model/com-amazonaws-interconnect-interconnect.json): TagResource input arn (required, AmazonResourceName, @length 59..150, @pattern ^arn:aws[a-z-]*:interconnect:[^:]+:[0-9]{12}:connection/(mcc|lmcc)-[a-z0-9]{8}$) and tags (required, TagMap); input references ConnectionResource by arn; modeled errors include InterconnectValidationException (@httpError 400). ListTagsForResource takes the same arn member and models the same error set. Recorded behavior for the message itself: an ARN whose account id is not the caller's is refused with code InterconnectValidationException (HTTP 400) and the message
+  "ARN account ID (<arn-account-id>) does not match caller account ID (<caller-account-id>) for <InputShapeName>"
+Its FIXED text is "ARN account ID (", ") does not match caller account ID (" and ") for "; its VARIABLE parts are the 12-digit account id taken from the request's arn member, the caller's own account id (as STS GetCallerIdentity reports it) and the name of the request shape the ARN arrived in — "TagResourceRequest" for TagResource and "ListTagsForResourceRequest" for ListTagsForResource. Note what the AWS form does NOT contain: the service-wide "Unable to process request: " envelope, and the ARN text itself.
+Emulator: answers the right code/status with
+  "Unable to process request: <arn> is in account <arn-account-id>, and this request is for account <caller-account-id>"
+(observed: "Unable to process request: arn:aws:interconnect:us-west-2:111111111111:connection/mcc-abcd1234 is in account 111111111111, and this request is for account 000000000000" — the account ids and the ARN there are per-run values filling the template, not requirements). It is built by the shared scope checker, which prefixes the generic refusal envelope, splices the full ARN text, and names the differing FIELD generically ("partition"/"region"/"account") rather than naming the request shape.
+Why: a caller that distinguishes "you addressed another account's resource" from the other 400s of this service by matching the account-mismatch sentence (and operators/tests that diff an emulated run against a recorded one) see a different string for a correctly classified failure; the per-request-shape suffix AWS uses is also the only part of the message that says WHICH input member/shape carried the offending ARN, so it cannot be recovered from the emulator's text. Because the helper is shared by every ARN-addressed input of the crate, the same wrong wording is served for ListTagsForResource and any other ARN scope violation.
+Fix: the shared ARN-scope refusal message builder in the service's state — services/service-com-amazonaws-interconnect-interconnect/src/state.rs arn_scope_violation() (see Traces for lines), and its two callers in src/ops/tag_resource.rs and the ListTagsForResource handler, which must pass the name of the request shape the ARN arrived in so the message can name it.
+Traces: interconnect.tag-resource-cross-account-arn-rejected (assertion at check line 22, on the TagResource message). The check's second half — the same refusal and wording for ListTagsForResource — was never reached because the TagResource assertion fails first, so it is UNVERIFIED; fix and re-check both operations. Source: src/state.rs lines 1181-1193 (arn_scope_violation, REFUSAL_ENVELOPE + "<arn> is in <field> <carried>, and this request is for <field> <addressed>"); src/ops/tag_resource.rs lines 176-182 (the call site).
+
+=== Cause 2 of 2: an in-scope ARN naming no connection reuses the identifier-echoing not-found sentence, where AWS answers a fixed, value-free one ===
+AWS: Smithy: TagResource models InterconnectClientException (@httpError 400) alongside ResourceNotFoundException (404); arn is the required ARN member above. Recorded behavior: a well-formed, same-account, same-Region ARN whose Connection does not exist is refused with code InterconnectClientException (HTTP 400 — the emulator gets this right) and the message
+  "Unable to process request: Resource does not exist or is deleted"
+That message is ENTIRELY fixed text: it has no variable parts at all — it names neither the ARN, nor the connection id, nor the resource type. (Per the same recording the companion read ListTagsForResource on that ARN does NOT validate connection existence: it answers HTTP 200 with an empty tag map.)
+Emulator: answers
+  "Unable to process request: Unable to retrieve connection <arn>, as it does not exist"
+(observed with the ARN of the request spliced in). The handler reuses connection_not_retrievable_message(), the sentence this crate words for a connection READ addressed BY ITS ConnectionId (GetConnection/DeleteConnection), so the tag path both echoes the caller's ARN and states a sentence AWS reserves for a different operation class.
+Why: the two not-found wordings are not interchangeable on AWS — an identifier-addressed read names the connection it could not retrieve, while the ARN-addressed tag write answers the generic "Resource does not exist or is deleted". A client (or test, or log-matching runbook) that keys on the tag-path text never matches, and the emulator additionally puts the caller-supplied ARN into a message AWS keeps value-free.
+Fix: the TagResource handler's not-found refusal — give the ARN-addressed tag path its own fixed message rather than calling the identifier-based read helper; the fixed text belongs beside the other refusal wordings in src/state.rs so the sibling tag writers share it.
+Traces: interconnect.tag-resource-nonexistent-connection-rejected (assertion at check line 26). The check's follow-up — ListTagsForResource on the same ARN must answer 200 with tags == {} , proving no tag was applied — was never reached and is UNVERIFIED; re-check it with the fix. Source: src/ops/tag_resource.rs lines 210-217 (the InterconnectClientException built from crate::state::connection_not_retrievable_message(&input.arn)); src/state.rs lines 1057-1061 (connection_not_retrievable_message, documented as the wording for GetConnection/DeleteConnection).
+
+## Evidence
+Behavioral suite (simparity-behavioral-aws-v1), interconnect 10/15 passed (5 mismatched, 0 errored, 0 skipped, 0 unloadable; emulator up, bootstrap_signal false). Three of the five failures are marked OWNED by 20261022T145736Z-interconnect-error-semantics-three-operations-still-501-environment.md and are skipped. The two remaining failures are the causes above:
+
+Cause 1 — interconnect.tag-resource-cross-account-arn-rejected (check line 22, assert on tag_message; the preceding `assert tag_code == "InterconnectValidationException"` PASSED):
+  expected: "ARN account ID (111111111111) does not match caller account ID (000000000000) for TagResourceRequest"
+  got:      "Unable to process request: arn:aws:interconnect:us-west-2:111111111111:connection/mcc-abcd1234 is in account 111111111111, and this request is for account 000000000000"
+  (111111111111 = the foreign account the check builds into the ARN, 000000000000 = the caller account STS GetCallerIdentity returned in this run; both are values filling the template.)
+  The check's positive control ic.list_connections() succeeded, and the ListTagsForResource half of the check was not reached.
+
+Cause 2 — interconnect.tag-resource-nonexistent-connection-rejected (check line 26, assert on tag_message; the preceding `assert tag_code == "InterconnectClientException"` PASSED, and the positive control ic.list_connections() succeeded):
+  expected: "Unable to process request: Resource does not exist or is deleted"
+  got:      "Unable to process request: Unable to retrieve connection arn:aws:interconnect:us-west-2:000000000000:connection/mcc-deadbeef, as it does not exist"
+  (the ARN is the one the check constructs from its own account id and the id mcc-deadbeef — an example, not part of the requirement.) The trailing ListTagsForResource effect-absent read was not reached.
+
+Model evidence (smithy_query, model_path services/service-com-amazonaws-interconnect-interconnect/smithy-model/com-amazonaws-interconnect-interconnect.json): TagResource input {arn: AmazonResourceName required, @length 59..150, @pattern ^arn:aws[a-z-]*:interconnect:[^:]+:[0-9]{12}:connection/(mcc|lmcc)-[a-z0-9]{8}$; tags: TagMap required}, output empty, errors AccessDeniedException(403), InterconnectClientException(400), InterconnectServerException(500), InterconnectValidationException(400), ResourceNotFoundException(404), ServiceQuotaExceededException(402), ThrottlingException(429), input references com.amazonaws.interconnect#ConnectionResource via arn. ListTagsForResource: same arn member and error set, @readonly, output {tags: TagMap}.
+
+Source corroboration in the checkout:
+- services/service-com-amazonaws-interconnect-interconnect/src/ops/tag_resource.rs lines 176-182: `arn_scope_violation(&parsed, &region)` -> InterconnectValidationException { message } (Cause 1 call site); lines 210-217: missing connection -> InterconnectClientException { message: crate::state::connection_not_retrievable_message(&input.arn) } (Cause 2).
+- services/service-com-amazonaws-interconnect-interconnect/src/state.rs lines 1181-1193: arn_scope_violation renders "{REFUSAL_ENVELOPE}{arn} is in {field} {carried}, and this request is for {field} {addressed}" with field in {partition, region, account}.
+- services/service-com-amazonaws-interconnect-interconnect/src/state.rs lines 1057-1061: connection_not_retrievable_message, documented as "how a connection READ (GetConnection, DeleteConnection) words an identifier that names no stored connection" — reused by the ARN-addressed tag path.
+
+## Steps to Reproduce
+Boot the emulator from this checkout and point a botocore/AWS SDK interconnect client (plus an sts client) at it.
+
+1. Cause 1: own = sts.get_caller_identity()['Account']; foreign = '111111111111' if own != '111111111111' else '222222222222'; arn = f"arn:aws:interconnect:{region}:{foreign}:connection/mcc-abcd1234". Call ic.tag_resource(arn=arn, tags={'k': 'v'}) -> code must be InterconnectValidationException (it already is) and the message must be exactly "ARN account ID ({foreign}) does not match caller account ID ({own}) for TagResourceRequest" — no "Unable to process request: " prefix, no ARN echoed, and the request-shape name as the suffix. Observe "Unable to process request: <arn> is in account {foreign}, and this request is for account {own}". Then call ic.list_tags_for_resource(arn=arn) -> same code with "... for ListTagsForResourceRequest" (currently unverified; the check aborts before it). Re-replay interconnect.tag-resource-cross-account-arn-rejected.
+2. Cause 2: arn = f"arn:aws:interconnect:{region}:{own}:connection/mcc-deadbeef" (same account and Region, no such connection). Call ic.tag_resource(arn=arn, tags={'k': 'v'}) -> code must be InterconnectClientException (it already is) and the message must be exactly "Unable to process request: Resource does not exist or is deleted" — fixed text, with no ARN, id or resource type spliced in. Observe "Unable to process request: Unable to retrieve connection <arn>, as it does not exist". Then ic.list_tags_for_resource(arn=arn) must answer HTTP 200 with tags == {} (it must not validate connection existence, and no tag may have been applied) — currently unverified. Re-replay interconnect.tag-resource-nonexistent-connection-rejected.
+3. Regression guard: ic.get_connection(identifier='mcc-00000000') and ic.delete_connection(identifier='lmcc-00000000') must keep their own identifier-naming not-found wording ("Unable to process request: Unable to retrieve connection <identifier>, as it does not exist") — Cause 2 must not be fixed by changing that shared helper's text for the identifier-addressed reads.
+
+Both causes must be closed, then re-replay both check ids in trace_ids.
