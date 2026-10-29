@@ -19,6 +19,8 @@ mod access_policy_listing;
 mod account_settings;
 #[path = "all/client_error_status.rs"]
 mod client_error_status;
+#[path = "all/client_token_scope.rs"]
+mod client_token_scope;
 #[path = "all/collection_group_capacity.rs"]
 mod collection_group_capacity;
 #[path = "all/collection_group_delete.rs"]

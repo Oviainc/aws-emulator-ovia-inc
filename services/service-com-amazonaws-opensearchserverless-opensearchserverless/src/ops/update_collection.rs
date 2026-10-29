@@ -194,10 +194,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A replayed `clientToken` is a retry of the call that already applied this
         // update, so it answers the record that call left rather than applying it twice.
+        // The replay is scoped to the id THIS request addresses: a token spent again on
+        // another collection is a request for that other collection, served on its own
+        // terms rather than answered with the record the token first named.
         if let Some(token) = input.client_token.as_deref() {
-            if let Some(record) = store.replayed_collection(Self::NAME, token) {
+            let replayed = store
+                .replayed_collection(Self::NAME, token)
+                .filter(|record| record.id == input.id)
+                .map(crate::state::CollectionRecord::update_detail);
+            if let Some(detail) = replayed {
                 return Ok(UpdateCollectionOutput {
-                    update_collection_detail: Some(record.update_detail()),
+                    update_collection_detail: Some(detail),
                 });
             }
         }
