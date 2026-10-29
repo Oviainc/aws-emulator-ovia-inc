@@ -37,7 +37,8 @@ use service_com_amazonaws_outposts_outpostsolafservice::state::{
 };
 
 use crate::capacity_task_lifecycle::{
-    an_order, capacity_route, install, pool, settle_capacity_task, task_route, INSTALLED,
+    an_order, capacity_route, install, install_capacity, pool, settle_capacity_task, task_route,
+    INSTALLED,
 };
 use crate::site_and_outpost_lifecycle::{
     query_value, refusal, text, Outposts, Refusal, ABSENT_OUTPOST_ID, HOME_REGION,
@@ -672,6 +673,9 @@ async fn each_region_lists_only_its_own_capacity_tasks() {
 async fn the_list_reports_the_status_each_task_holds_now() {
     let outposts = Outposts::new();
     let (outpost_id, _) = outposts.site_and_outpost("task-listing-clock").await;
+    // Hardware that can hold the configuration the task below asks for, so the task
+    // this row follows across the span is one that COMPLETES.
+    install_capacity(&outposts, &outpost_id, &INSTALLED[..1], "task-listing-clock");
     let answered = outposts
         .ok(
             "POST",

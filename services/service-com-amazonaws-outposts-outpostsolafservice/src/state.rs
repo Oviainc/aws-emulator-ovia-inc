@@ -606,6 +606,19 @@ pub const CAPACITY_TASK_COMPLETED: &str = "COMPLETED";
 /// The terminal `CapacityTaskStatus` of a task that could not be completed.
 pub const CAPACITY_TASK_FAILED: &str = "FAILED";
 
+/// The `CapacityTaskStatus` of a task that cannot run on the capacity free to it
+/// now — the model's "the capacity task requires capacity to run. You must stop the
+/// recommended EC2 running instances to free up capacity for the task to run".
+///
+/// It is NOT terminal: Amazon Web Services Outposts is still waiting on the task, so
+/// it is still ACTIVE on its Outpost. What it waits for is the instances
+/// `ListBlockingInstancesForCapacityTask` recommends stopping being stopped, which an
+/// instance's owner does through Amazon EC2 and no call of THIS API does — so the
+/// clock owes such a task nothing: it holds this status until the instances are gone
+/// or `CancelCapacityTask` ends it, and the emulator invents neither the evacuation
+/// nor an outcome for one that never happened.
+pub const CAPACITY_TASK_WAITING_FOR_EVACUATION: &str = "WAITING_FOR_EVACUATION";
+
 /// The `CapacityTaskStatus` a cancelled capacity task holds while the service
 /// cleans up after it — the model's "the capacity task has been cancelled and is in
 /// the process of cleaning up resources".
@@ -630,22 +643,23 @@ pub const CAPACITY_TASK_TERMINAL: &[&str] = &[
     CAPACITY_TASK_CANCELLED,
 ];
 
-// The `CapacityTaskStatus` values a task this emulator STARTS never reaches, and
-// why, stated once so no handler invents one:
+// Which `CapacityTaskStatus` a task this emulator starts reaches, and off what,
+// stated once so no handler invents one:
 //
-// * `WAITING_FOR_EVACUATION` and the `CapacityTaskFailure` type
-//   `BLOCKING_INSTANCES_NOT_EVACUATED` describe a task held up by running EC2
-//   instances. Nothing in this slice stops an instance, so a task it starts runs on
-//   the clock and never waits for one to be evacuated. Which instances would have to
-//   stop is reported by `ListBlockingInstancesForCapacityTask`, off
-//   [`OutpostRecord::instances`].
-// * `FAILED` needs a failure something produced; nothing fails a task it has
-//   started, so `Failed` stays absent rather than carrying an invented reason. The
-//   one verdict this service does reach is the DRY RUN's, which is not a task at all
-//   ([`ComAmazonawsOutpostsOutpostsolafserviceState::capacity_verdict`]).
+// * `COMPLETED`, `FAILED` and `WAITING_FOR_EVACUATION` are the three outcomes of
+//   weighing the configuration the task asks for against the capacity available to
+//   the hardware it configures
+//   ([`ComAmazonawsOutpostsOutpostsolafserviceState::capacity_task_course`]), which
+//   is the same weighing the DRY RUN of that request reports
+//   ([`ComAmazonawsOutpostsOutpostsolafserviceState::capacity_verdict`]), so the two
+//   never contradict each other. A `FAILED` task carries the `CapacityTaskFailure`
+//   that weighing produced and never an invented one.
+// * `REQUESTED` is what a just-started task holds, and `IN_PROGRESS` what a task
+//   whose configuration fits holds while it runs
+//   ([`capacity_task_progression`]).
 // * `CANCELLATION_IN_PROGRESS` and `CANCELLED` are reached only by CANCELLING a
-//   task ([`CapacityTaskRecord::cancel`]), never by the progression a start owes
-//   the clock ([`capacity_task_progression`]).
+//   task ([`CapacityTaskRecord::cancel`]), never by the course a start owes the
+//   clock.
 
 /// The `CapacityTaskFailureType` of a capacity configuration the hardware it is
 /// asked of cannot be configured with, from the modelled value set
@@ -660,8 +674,37 @@ pub const CAPACITY_TASK_TERMINAL: &[&str] = &[
 pub const CAPACITY_TASK_FAILURE_UNSUPPORTED_CONFIGURATION: &str =
     "UNSUPPORTED_CAPACITY_CONFIGURATION";
 
-/// How long after the call that started it each step of a capacity task's
-/// `REQUESTED` -> `IN_PROGRESS` -> `COMPLETED` progression falls due.
+/// The `CapacityTaskFailureType` of a task that could only have run on capacity held
+/// by running instances it was not allowed to leave running, from the same modelled
+/// value set [`crate::ops::types::CAPACITY_TASK_FAILURE_TYPE_VALUES`].
+///
+/// It is the failure type the modelled `FAIL_TASK` action carries: the hardware CAN
+/// hold the configuration — so it is not the unsupported-configuration failure above
+/// — but only once the instances
+/// `ListBlockingInstancesForCapacityTask` recommends stopping have been stopped, and
+/// `FAIL_TASK` is the caller saying the task fails instead of waiting for them.
+pub const CAPACITY_TASK_FAILURE_BLOCKING_INSTANCES_NOT_EVACUATED: &str =
+    "BLOCKING_INSTANCES_NOT_EVACUATED";
+
+/// The `TaskActionOnBlockingInstances` that fails a capacity task instances are
+/// blocking — the model's "`FAIL_TASK` - The capacity task fails" — from the modelled
+/// value set [`crate::ops::types::TASK_ACTION_ON_BLOCKING_INSTANCES_VALUES`].
+pub const TASK_ACTION_FAIL_TASK: &str = "FAIL_TASK";
+
+/// The other `TaskActionOnBlockingInstances` the model declares: "`WAIT_FOR_EVACUATION`
+/// - Checks every 10 minutes over 48 hours to determine if instances have stopped and
+/// capacity is available to complete the task", so a task asked for it waits on those
+/// instances ([`CAPACITY_TASK_WAITING_FOR_EVACUATION`]) instead of failing.
+///
+/// It is also what a request that named NO action asks for: the member is optional and
+/// only `FAIL_TASK` asks for a failure, so a caller that named neither has not asked
+/// for one.
+pub const TASK_ACTION_WAIT_FOR_EVACUATION: &str = "WAIT_FOR_EVACUATION";
+
+/// How long after the call that started it each step of a capacity task's course
+/// falls due — the `REQUESTED` -> `IN_PROGRESS` -> `COMPLETED` progression of a
+/// configuration that fits, and every other course a start can be weighed into
+/// ([`ComAmazonawsOutpostsOutpostsolafserviceState::capacity_task_course`]).
 ///
 /// AWS publishes no duration for running a capacity task, so — exactly as
 /// [`OUTPOST_PROVISIONING`] — this span is the emulator's own: short enough that a
@@ -682,6 +725,15 @@ pub struct CapacityTaskTransition {
     pub at: std::time::SystemTime,
     /// The `CapacityTaskStatus` the task holds from that instant on.
     pub status: String,
+    /// The `CapacityTaskFailure` the task carries from that instant on, for a
+    /// transition INTO [`CAPACITY_TASK_FAILED`], and `None` for every other.
+    ///
+    /// The failure travels with the step that fails the task rather than being
+    /// written on the record when the task is created, so a task still awaiting its
+    /// next step reports no reason for a failure that has not happened
+    /// ([`ComAmazonawsOutpostsOutpostsolafserviceState::settle_capacity_tasks`]
+    /// applies it with the status).
+    pub failed: Option<CapacityTaskFailure>,
 }
 
 /// A persisted capacity task: every member `StartCapacityTask` / `GetCapacityTask`
@@ -763,14 +815,52 @@ impl CapacityTaskRecord {
     }
 }
 
-/// The transitions a capacity task started at `now` owes the clock: one
-/// [`CAPACITY_TASK_STEP`] to `IN_PROGRESS`, and another to `COMPLETED`.
+/// The transitions a capacity task whose configuration the hardware can hold owes
+/// the clock from `now`: one [`CAPACITY_TASK_STEP`] to `IN_PROGRESS`, and another to
+/// `COMPLETED`.
+///
+/// One of the courses
+/// [`ComAmazonawsOutpostsOutpostsolafserviceState::capacity_task_course`] chooses
+/// between — the one a configuration that fits takes.
 ///
 /// Both instants are fixed when the task starts, so the status a read reports is
 /// the one the task holds at the instant it is asked for — the same answer whether
 /// or not anybody polled in between.
 pub fn capacity_task_progression(now: std::time::SystemTime) -> VecDeque<CapacityTaskTransition> {
-    capacity_task_steps(now, &[CAPACITY_TASK_IN_PROGRESS, CAPACITY_TASK_COMPLETED])
+    capacity_task_steps(
+        now,
+        &[CAPACITY_TASK_IN_PROGRESS, CAPACITY_TASK_COMPLETED],
+        None,
+    )
+}
+
+/// The transitions a capacity task that `failure` fails owes the clock from `now`:
+/// one [`CAPACITY_TASK_STEP`] to `FAILED`, carrying that failure.
+///
+/// A failure is weighed before anything is configured, so such a task never reports
+/// [`CAPACITY_TASK_IN_PROGRESS`] — the model's "the capacity task is running" — on
+/// its way there. The step is still owed the clock rather than applied at once,
+/// exactly as the fitting course's first step is: a caller reading straight after
+/// the start observes the `REQUESTED` status the start reported.
+pub fn capacity_task_failure(
+    now: std::time::SystemTime,
+    failure: CapacityTaskFailure,
+) -> VecDeque<CapacityTaskTransition> {
+    capacity_task_steps(now, &[CAPACITY_TASK_FAILED], Some(failure))
+}
+
+/// The transitions a capacity task that can run only on capacity its blocking
+/// instances hold owes the clock from `now`: one [`CAPACITY_TASK_STEP`] to
+/// [`CAPACITY_TASK_WAITING_FOR_EVACUATION`], and nothing after it.
+///
+/// Nothing after it because what such a task waits for is not the clock: it is the
+/// recommended instances being stopped, which their owner does through Amazon EC2 and
+/// no call of this API does. So the task holds that status until they are gone or
+/// `CancelCapacityTask` ends it, and no outcome is invented for work nothing did.
+pub fn capacity_task_evacuation_wait(
+    now: std::time::SystemTime,
+) -> VecDeque<CapacityTaskTransition> {
+    capacity_task_steps(now, &[CAPACITY_TASK_WAITING_FOR_EVACUATION], None)
 }
 
 /// The transitions a capacity task cancelled at `now` owes the clock: one
@@ -782,21 +872,24 @@ pub fn capacity_task_progression(now: std::time::SystemTime) -> VecDeque<Capacit
 /// [`CAPACITY_TASK_CANCELLED`] when that step falls due, so a caller reading straight
 /// after the cancellation still observes the transient status.
 pub fn capacity_task_cancellation(now: std::time::SystemTime) -> VecDeque<CapacityTaskTransition> {
-    capacity_task_steps(now, &[CAPACITY_TASK_CANCELLED])
+    capacity_task_steps(now, &[CAPACITY_TASK_CANCELLED], None)
 }
 
 /// The transitions through `statuses`, each one [`CAPACITY_TASK_STEP`] after the
-/// last, counted from `now`.
+/// last, counted from `now`, with `failed` carried by the LAST of them — the step
+/// that fails the task, for a course that ends in one.
 ///
-/// Both courses a task can take are built here, so neither can disagree with the
-/// other about when a step falls due or about the two clocks a transition carries:
-/// the monotonic instant nothing ever sleeps for, and the wall clock the change is
-/// dated at.
+/// Every course a task can take is built here, so none can disagree with another
+/// about when a step falls due or about what a transition carries: the monotonic
+/// instant nothing ever sleeps for, the wall clock the change is dated at, and the
+/// failure the status it moves to reports.
 fn capacity_task_steps(
     now: std::time::SystemTime,
     statuses: &[&str],
+    failed: Option<CapacityTaskFailure>,
 ) -> VecDeque<CapacityTaskTransition> {
     let started = std::time::Instant::now();
+    let last = statuses.len().saturating_sub(1);
     statuses
         .iter()
         .enumerate()
@@ -806,6 +899,7 @@ fn capacity_task_steps(
                 due: started + elapsed,
                 at: now + elapsed,
                 status: (*status).to_string(),
+                failed: (step == last).then(|| failed.clone()).flatten(),
             }
         })
         .collect()
@@ -887,6 +981,94 @@ impl CapacityVerdict {
             status: CAPACITY_TASK_COMPLETED,
             failed: None,
         }
+    }
+}
+
+/// The capacity configuration one request asks of one piece of hardware: everything
+/// weighing it reads off the REQUEST.
+///
+/// Stated once as a value because two readers weigh the same thing — the verdict a DRY
+/// RUN reports ([`ComAmazonawsOutpostsOutpostsolafserviceState::capacity_verdict`]) and
+/// the course a real task takes
+/// ([`ComAmazonawsOutpostsOutpostsolafserviceState::capacity_task_course`]) — so
+/// neither can be given a narrower request than the other.
+#[derive(Debug, Clone, Copy)]
+pub struct CapacityConfiguration<'a> {
+    /// The region the request is addressed to, where the Outpost is resolved.
+    pub region: &'a str,
+    /// The bare `OutpostId` of the Outpost whose hardware is to be configured.
+    pub outpost_id: &'a str,
+    /// The `AssetId` the request names, which scopes the configuration to that one
+    /// piece of the Outpost's hardware, or `None` for a request that names none.
+    pub asset_id: Option<&'a str>,
+    /// `RequestedInstancePools`: the configuration asked for.
+    pub pools: &'a [InstanceTypeCapacity],
+    /// `InstancesToExclude`: the running instances the task must not stop, so capacity
+    /// they hold is capacity it cannot free.
+    pub instances_to_exclude: Option<&'a InstancesToExclude>,
+}
+
+/// What weighing a requested capacity configuration against the hardware in its
+/// scope measured, in the vCPUs every instance-capacity figure of this service is
+/// published in: the one weighing both the DRY RUN's verdict
+/// ([`ComAmazonawsOutpostsOutpostsolafserviceState::capacity_verdict`]) and the
+/// course a real task takes
+/// ([`ComAmazonawsOutpostsOutpostsolafserviceState::capacity_task_course`]) are read
+/// off, so a dry run and the identical real request can never disagree about the
+/// configuration.
+///
+/// Produced by
+/// [`ComAmazonawsOutpostsOutpostsolafserviceState::weigh_capacity`], which states the
+/// rule.
+#[derive(Debug, Clone)]
+struct CapacityWeighing {
+    /// Why the hardware in scope cannot hold the configuration AT ALL, whatever is
+    /// free on it — a pool of an instance type it does not run — and `None` when
+    /// there is no such pool.
+    unsupported: Option<String>,
+    /// What the configuration asks for.
+    requested: i64,
+    /// What the hardware has free with every instance recorded on it still running:
+    /// its vCPU ceiling less the capacity all of them hold.
+    free: i64,
+    /// What it would have free once the instances this task MAY stop
+    /// ([`instance_can_be_stopped`]) were stopped: its ceiling less only the capacity
+    /// held by instances the task could not stop. Never below [`Self::free`].
+    free_after_evacuation: i64,
+}
+
+impl CapacityWeighing {
+    /// Whether the configuration is one the hardware in scope can be configured
+    /// with: the DRY RUN's question, "whether the instance type and instance size
+    /// changes is above or below available instance capacity", where what is
+    /// available is what the task could have once the instances it may stop are
+    /// stopped.
+    fn verdict(&self) -> CapacityVerdict {
+        if let Some(reason) = &self.unsupported {
+            return CapacityVerdict::unsupported(reason.clone());
+        }
+        if self.requested > self.free_after_evacuation {
+            return CapacityVerdict::unsupported(capacity_above_available(
+                self.requested,
+                self.free_after_evacuation,
+            ));
+        }
+        CapacityVerdict::fits()
+    }
+
+    /// Whether the configuration fits only once the instances the task would need
+    /// stopped have stopped: the hardware can hold it
+    /// ([`Self::verdict`]), but not beside everything running on it now.
+    ///
+    /// Those instances are exactly the ones
+    /// `ListBlockingInstancesForCapacityTask` recommends stopping, so a task is held
+    /// up only by instances that list names, and never by an Outpost's other
+    /// tenants' ones — capacity THEY hold is capacity the configuration was already
+    /// weighed without.
+    fn needs_evacuation(&self) -> bool {
+        self.unsupported.is_none()
+            && self.requested <= self.free_after_evacuation
+            && self.requested > self.free
     }
 }
 
@@ -3254,41 +3436,104 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         provisioned
     }
 
-    /// The verdict on the capacity configuration `pools` asks of the Outpost
-    /// `outpost_id` names in `region`, scoped to the asset `asset_id` names when the
-    /// request named one: whether what it asks for is at or above the instance
-    /// capacity available to it.
+    /// The verdict on the capacity `configuration` a request asks of one Outpost's
+    /// hardware: whether what it asks for is at or above the instance capacity
+    /// available to it.
     ///
     /// "You can request a dry run to determine if the instance type and instance size
     /// changes is above or below available instance capacity", as the modelled
-    /// `DryRun` documents it, so the verdict compares two figures this store already
-    /// holds, both in the vCPUs every instance-capacity figure of this service is
-    /// published in ([`Self::published_vcpus`]):
+    /// `DryRun` documents it, so this is [`Self::weigh_capacity`] read as that one
+    /// question ([`CapacityWeighing::verdict`]) — the SAME weighing the course a real
+    /// task takes is read off ([`Self::capacity_task_course`]), so a dry run and the
+    /// identical real request never contradict each other about the configuration.
+    ///
+    /// A READ: it computes the verdict and writes nothing, which is what lets a dry
+    /// run — the one call that asks for it — leave the store exactly as it found it.
+    pub fn capacity_verdict(&self, configuration: &CapacityConfiguration<'_>) -> CapacityVerdict {
+        self.weigh_capacity(configuration).verdict()
+    }
+
+    /// The course a capacity task started NOW on the capacity `configuration` a
+    /// request asks owes the clock: what the task does, weighed when it is accepted.
+    ///
+    /// Every outcome follows from the one weighing of the request against what is
+    /// persisted ([`Self::weigh_capacity`]) and from `task_action_on_blocking_instances`:
+    ///
+    /// * a configuration the hardware in scope cannot be configured with is the
+    ///   modelled unsupported-configuration failure — the same answer the DRY RUN of
+    ///   that request reports ([`Self::capacity_verdict`]), because it is the same
+    ///   weighing;
+    /// * a configuration it can hold, but not beside the instances the task would
+    ///   have to stop, is what the caller's action decides: `FAIL_TASK` is "the
+    ///   capacity task fails", so the task fails naming the capacity still held, while
+    ///   `WAIT_FOR_EVACUATION` (and a request that named no action, which asked for no
+    ///   failure) waits on them ([`CAPACITY_TASK_WAITING_FOR_EVACUATION`]);
+    /// * a configuration that fits beside everything already running runs to
+    ///   `COMPLETED` ([`capacity_task_progression`]).
+    ///
+    /// A READ: it writes nothing. The course it returns is what the caller stores on
+    /// the task it is creating, so the weighing happens once, at the instant the task
+    /// is accepted, and every later report of that task reads the same course.
+    pub fn capacity_task_course(
+        &self,
+        configuration: &CapacityConfiguration<'_>,
+        task_action_on_blocking_instances: Option<&str>,
+        now: std::time::SystemTime,
+    ) -> VecDeque<CapacityTaskTransition> {
+        let weighing = self.weigh_capacity(configuration);
+        if let Some(failure) = weighing.verdict().failed {
+            return capacity_task_failure(now, failure);
+        }
+        if weighing.needs_evacuation() {
+            if task_action_on_blocking_instances == Some(TASK_ACTION_FAIL_TASK) {
+                return capacity_task_failure(
+                    now,
+                    CapacityTaskFailure {
+                        reason: blocking_instances_not_evacuated(
+                            weighing.requested,
+                            weighing.free,
+                        ),
+                        r#type: Some(
+                            CAPACITY_TASK_FAILURE_BLOCKING_INSTANCES_NOT_EVACUATED.to_string(),
+                        ),
+                    },
+                );
+            }
+            return capacity_task_evacuation_wait(now);
+        }
+        capacity_task_progression(now)
+    }
+
+    /// Weigh the capacity `configuration` a request asks of one Outpost's hardware
+    /// against what is persisted for that hardware.
+    ///
+    /// Three figures, all in the vCPUs every instance-capacity figure of this service
+    /// is published in ([`Self::published_vcpus`]):
     ///
     /// * what the configuration ASKS FOR: each pool's `Count` ("the number of
     ///   instances for the specified instance type") times the default vCPUs the
     ///   catalog publishes for its instance type.
-    /// * what is AVAILABLE on the hardware in scope — the one asset the request
-    ///   names, or every compute asset of the Outpost when it names none, because a
-    ///   capacity task configures the hardware it names. That is the vCPU ceiling of
-    ///   that hardware (`ComputeAttributes$MaxVcpus`) less the vCPUs held by the
-    ///   instances running on it that the task could not stop: an instance the
-    ///   request excludes must not be stopped and one belonging to another account is
-    ///   not this caller's to stop ([`instance_can_be_stopped`]), so neither one's
-    ///   capacity can be freed, while the instances it may stop hold capacity it can
-    ///   have.
+    /// * what the hardware in scope has FREE — the one asset the request names, or
+    ///   every compute asset of the Outpost when it names none, because a capacity
+    ///   task configures the hardware it names. That is the vCPU ceiling of that
+    ///   hardware (`ComputeAttributes$MaxVcpus`) less the vCPUs held by every instance
+    ///   recorded as running on it.
+    /// * what it would have free once the instances this task MAY stop were stopped:
+    ///   the same ceiling less only the capacity held by instances it could not stop —
+    ///   an instance the request excludes must not be stopped and one belonging to
+    ///   another account is not this caller's to stop
+    ///   ([`instance_can_be_stopped`]) — which is the capacity a configuration is
+    ///   weighed as being "above or below".
     ///
-    /// A configuration at or below what is available is one the hardware can take
-    /// ([`CapacityVerdict::fits`]). One ABOVE it, and one naming an instance type
-    /// none of the hardware in scope runs ([`compute_runs`]) or this service
-    /// publishes no vCPU figure for, is the modelled unsupported-configuration
-    /// failure. Hardware that recorded nothing about its capacity carries none and
-    /// hardware that is not there carries none either, so an Outpost holding no
-    /// compute asset can take no pool: a request is weighed against what is
-    /// persisted, never against a figure the emulator invents.
+    /// A pool naming an instance type none of the hardware in scope runs
+    /// ([`compute_runs`]), or one this service publishes no vCPU figure for, is a
+    /// configuration that hardware cannot hold whatever is free on it. Hardware that
+    /// recorded nothing about its capacity carries none and hardware that is not there
+    /// carries none either, so an Outpost holding no compute asset can take no pool: a
+    /// request is weighed against what is persisted, never against a figure the
+    /// emulator invents.
     ///
-    /// A READ: it computes the verdict and writes nothing, which is what lets a dry
-    /// run — the one call that asks for it — leave the store exactly as it found it.
+    /// A READ: it computes the figures and writes nothing.
     ///
     /// What it COSTS is proportional to the request it was given and nothing else: the
     /// published catalog is read into one lookup and the hardware in scope into one
@@ -3296,14 +3541,14 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// instance type is decided once per DISTINCT type the catalog publishes — so a
     /// pool costs a lookup and an addition however many pools arrive, and no figure
     /// here multiplies the length of the request by anything that grows.
-    pub fn capacity_verdict(
-        &self,
-        region: &str,
-        outpost_id: &str,
-        asset_id: Option<&str>,
-        pools: &[InstanceTypeCapacity],
-        instances_to_exclude: Option<&InstancesToExclude>,
-    ) -> CapacityVerdict {
+    fn weigh_capacity(&self, configuration: &CapacityConfiguration<'_>) -> CapacityWeighing {
+        let &CapacityConfiguration {
+            region,
+            outpost_id,
+            asset_id,
+            pools,
+            instances_to_exclude,
+        } = configuration;
         let record = self.outpost(region, outpost_id);
         // Which hardware the configuration is asked of: the asset the request named,
         // or all of the Outpost's when it named none. Read once, because every pool
@@ -3341,10 +3586,12 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         // invents one — and one of a type that hardware does not run is not a
         // configuration it can hold, whatever capacity happens to be free on it.
         let mut requested: i64 = 0;
+        let mut unsupported: Option<String> = None;
         for pool in pools {
             let instance_type = pool.instance_type.as_str();
             let Some(&vcpus) = published.get(instance_type) else {
-                return CapacityVerdict::unsupported(instance_type_not_run(instance_type));
+                unsupported = Some(instance_type_not_run(instance_type));
+                break;
             };
             let runs_it = *runs.entry(instance_type).or_insert_with(|| {
                 hardware.iter().any(|compute| {
@@ -3352,7 +3599,8 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
                 })
             });
             if !runs_it {
-                return CapacityVerdict::unsupported(instance_type_not_run(instance_type));
+                unsupported = Some(instance_type_not_run(instance_type));
+                break;
             }
             // `InstanceTypeCount` is modelled `range(0..9999)`, so a count the
             // boundary accepted is never negative. Saturating, so no length of
@@ -3368,23 +3616,35 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             .filter_map(|compute| compute.max_vcpus)
             .map(i64::from)
             .sum();
-        // What of it is in use and could not be freed for this configuration. What
-        // the request excludes is read into [`ExcludedInstances`] once, so an
-        // instance costs a lookup in it rather than a walk of it.
+        // What of it the instances running on it hold, split by whether this task
+        // could free it. What the request excludes is read into [`ExcludedInstances`]
+        // once, so an instance costs a lookup in it rather than a walk of it.
         let exclude = ExcludedInstances::of(instances_to_exclude);
-        let held: i64 = record
+        let mut held: i64 = 0;
+        let mut held_unstoppable: i64 = 0;
+        for instance in record
             .iter()
             .flat_map(|record| record.instances.iter())
             .filter(|instance| in_scope(instance.asset_id.as_deref()))
-            .filter(|instance| !instance_can_be_stopped(instance, &exclude))
-            .filter_map(|instance| published.get(instance.instance_type.as_deref()?))
-            .map(|vcpus| i64::from(*vcpus))
-            .sum();
-        let available = (ceiling - held).max(0);
-        if requested > available {
-            return CapacityVerdict::unsupported(capacity_above_available(requested, available));
+        {
+            let Some(&vcpus) = instance
+                .instance_type
+                .as_deref()
+                .and_then(|instance_type| published.get(instance_type))
+            else {
+                continue;
+            };
+            held = held.saturating_add(i64::from(vcpus));
+            if !instance_can_be_stopped(instance, &exclude) {
+                held_unstoppable = held_unstoppable.saturating_add(i64::from(vcpus));
+            }
         }
-        CapacityVerdict::fits()
+        CapacityWeighing {
+            unsupported,
+            requested,
+            free: (ceiling - held).max(0),
+            free_after_evacuation: (ceiling - held_unstoppable).max(0),
+        }
     }
 
     /// How many renewal contracts this store holds, across every Outpost of every
@@ -3811,6 +4071,10 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// that polls late sees the same terminal status, with the same
     /// `LastModifiedDate` and `CompletionDate`, as one that polled all along — and a
     /// task that has settled in a terminal status is left alone.
+    ///
+    /// A step that fails the task carries the `CapacityTaskFailure` the course was
+    /// weighed with ([`Self::capacity_task_course`]), so `Failed` appears exactly when
+    /// the status it explains does and never before it.
     pub fn settle_capacity_tasks(&mut self) {
         let now = std::time::Instant::now();
         for record in self.capacity_tasks.values_mut() {
@@ -3823,6 +4087,7 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
                     record.completed_at = Some(next.at);
                 }
                 record.status = next.status;
+                record.failed = next.failed;
             }
         }
     }
@@ -5384,6 +5649,23 @@ fn clip(value: &str, max: usize) -> String {
 pub fn capacity_above_available(requested: i64, available: i64) -> String {
     format!(
         "the requested capacity of {requested} vCPUs is above the {available} vCPUs available"
+    )
+}
+
+/// How this service states that a capacity task the hardware COULD be configured for
+/// was failed because the instances holding the capacity it needs were left running,
+/// both figures in vCPUs.
+///
+/// What the modelled `FAIL_TASK` action leaves behind, worded by the same rule
+/// [`instance_type_not_run`] is: the caller branches on the modelled
+/// [`CAPACITY_TASK_FAILURE_BLOCKING_INSTANCES_NOT_EVACUATED`] type, while the reason
+/// names how much capacity is still held by instances that would have had to stop —
+/// which is what tells a caller how much of `ListBlockingInstancesForCapacityTask` it
+/// has to act on before asking again.
+pub fn blocking_instances_not_evacuated(requested: i64, free: i64) -> String {
+    format!(
+        "the requested capacity of {requested} vCPUs needs {} vCPUs freed by instances left running",
+        (requested - free).max(0)
     )
 }
 

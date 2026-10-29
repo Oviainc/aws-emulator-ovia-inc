@@ -31,6 +31,8 @@ mod capacity_task_lifecycle;
 mod capacity_task_listing;
 #[path = "all/capacity_task_order_region.rs"]
 mod capacity_task_order_region;
+#[path = "all/capacity_task_outcome.rs"]
+mod capacity_task_outcome;
 #[path = "all/catalog_items.rs"]
 mod catalog_items;
 #[path = "all/configured_instance_types.rs"]

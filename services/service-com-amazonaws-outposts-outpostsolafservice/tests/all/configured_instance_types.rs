@@ -22,7 +22,9 @@
 //! 3. Every reported entry carries the `VCPUs` the published instance-type catalog
 //!    reports for its type, so this report cannot disagree with what
 //!    `ListOrderableInstanceTypes` says about an instance type; a type that catalog
-//!    does not publish is reported without a count rather than with an invented one.
+//!    publishes no vCPU figure for is one no capacity task can configure at all — a
+//!    configuration naming it cannot be weighed against the hardware, so the task
+//!    fails and configures nothing ([`crate::capacity_task_outcome`]).
 //! 4. The configuration moves on the CLOCK alone: a capacity task still being worked
 //!    through has configured nothing, and reading the report never moves it.
 //! 5. The report is cut into pages of at most `MaxResults` with a `NextToken` that
@@ -45,7 +47,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_outposts_outpostsolafservice::ops::types::{AssetInfo, ComputeAttributes};
 
-use crate::capacity_task_lifecycle::{an_order, pool, settle_capacity_task, start_ok};
+use crate::capacity_task_lifecycle::{an_order, pool, settle_capacity_task, start_ok, HOST_VCPUS};
 use crate::outpost_assets::record;
 use crate::site_and_outpost_lifecycle::{
     deliver_orders, install_hardware, query_value, refusal, segment, text, Outposts, Refusal,
@@ -53,8 +55,8 @@ use crate::site_and_outpost_lifecycle::{
 };
 
 /// An instance type the modelled `InstanceTypeName` pattern (`^[a-z0-9\-]+\.[a-z0-9\-]+$`)
-/// accepts but that this service's published catalog carries no entry for — so a
-/// capacity task may configure it and the report must answer it without a vCPU count.
+/// accepts but that this service's published catalog carries no entry for — so no
+/// capacity task can configure it: there is no size to weigh a pool of it by.
 const UNPUBLISHED_INSTANCE_TYPE: &str = "zz9.xlarge";
 
 /// A `CatalogItemId` of the modelled `SkuCode` form (`^OR-[A-Z0-9]{7}$`) that this
@@ -142,12 +144,15 @@ async fn an_outpost(
 }
 
 /// One recorded compute asset, so a capacity task can be scoped to a piece of this
-/// Outpost's hardware.
+/// Outpost's hardware and weighed against its capacity.
 ///
 /// An asset is a PHYSICAL unit Amazon Web Services installs, so no call in this API
 /// creates one: the rows below record their own through the same store seam
 /// [`crate::outpost_assets`] records hardware through, and that module owns the
-/// projection every member of one is asserted against.
+/// projection every member of one is asserted against. The vCPU ceiling is
+/// [`HOST_VCPUS`], the figure the hardware this service installs really carries, so
+/// what a row's task asks for has to fit on the hosts the row records — a
+/// configuration above them fails instead of configuring anything.
 fn compute_asset(asset_id: &str) -> AssetInfo {
     AssetInfo {
         asset_id: Some(asset_id.to_string()),
@@ -158,7 +163,7 @@ fn compute_asset(asset_id: &str) -> AssetInfo {
             state: Some("ACTIVE".to_string()),
             instance_families: None,
             instance_type_capacities: None,
-            max_vcpus: None,
+            max_vcpus: Some(HOST_VCPUS),
         }),
         asset_location: None,
     }
@@ -205,7 +210,8 @@ struct Configuring {
     /// task per Outpost, as [`crate::capacity_task_lifecycle`] states.
     tasks: Vec<Value>,
     /// The `AssetId`s recorded as this Outpost's hardware, so a task scoped to one of
-    /// them resolves. Values the modelled `AssetIdInput` (`^\d{10}$`) accepts.
+    /// them resolves AND the configuration its tasks ask for has hardware to be
+    /// weighed against. Values the modelled `AssetIdInput` (`^\d{10}$`) accepts.
     hardware: &'static [&'static str],
     /// Whether the first task names an order placed against this Outpost.
     with_order: bool,
@@ -217,11 +223,14 @@ struct Configuring {
 /// the configuration they left on it, each entry carrying the catalog's own `VCPUs`.
 ///
 /// The rows differ along everything the rule generalises over: how many pools a task
-/// configures (none, one, several), a `Count` at both published bounds of the modelled
-/// `range(0..9999)`, a type the published catalog does not carry, how many tasks have
-/// run (one, two in sequence), the hardware a task names (the Outpost itself, one of
-/// its assets, both), the same type configured on two scopes at once, and whether the
-/// task names an order.
+/// configures (none, one, several), a `Count` at the published minimum of the modelled
+/// `range(0..9999)` and inside it, a type the published catalog does not carry, how
+/// many tasks have run (one, two in sequence), the hardware a task names (the Outpost
+/// itself, one of its assets, both), how much hardware the Outpost holds (none, one
+/// host, two), the same type configured on two scopes at once, and whether the task
+/// names an order. Each row asks for a configuration the hardware it records can hold,
+/// because only a COMPLETED task configures anything; that a task above that capacity
+/// fails instead is [`crate::capacity_task_outcome`]'s.
 #[tokio::test]
 async fn a_completed_capacity_task_is_what_the_outpost_is_configured_with() {
     let outposts = Outposts::new();
@@ -229,7 +238,7 @@ async fn a_completed_capacity_task_is_what_the_outpost_is_configured_with() {
     assert_eq!(
         published_vcpus(&catalog, UNPUBLISHED_INSTANCE_TYPE),
         None,
-        "the row that configures {UNPUBLISHED_INSTANCE_TYPE:?} needs a type the published \
+        "the row that asks for {UNPUBLISHED_INSTANCE_TYPE:?} needs a type the published \
          catalog does not carry"
     );
 
@@ -237,20 +246,24 @@ async fn a_completed_capacity_task_is_what_the_outpost_is_configured_with() {
         Configuring {
             case: "one pool of one type",
             tasks: vec![json!({ "InstancePools": [pool("m5.4xlarge", 2)] })],
-            hardware: &[],
+            hardware: &["1000000001"],
             with_order: false,
             expected: &["m5.4xlarge"],
         },
         Configuring {
-            case: "several pools, counts at both published bounds",
+            // The published MAXIMUM `Count` is asked of a start in
+            // [`crate::capacity_task_lifecycle`], where what a started task persists is
+            // stated: no hardware holds 9999 of an instance type, so a task asking for
+            // it fails and configures nothing.
+            case: "several pools, one at the published minimum Count",
             tasks: vec![json!({
                 "InstancePools": [
                     pool("c5.xlarge", 1),
-                    pool("m5.24xlarge", 9999),
+                    pool("m5.24xlarge", 1),
                     pool("m5.large", 0),
                 ],
             })],
-            hardware: &[],
+            hardware: &["1000000001", "1000000002"],
             with_order: false,
             // The pool at the minimum count configures no instance of its type, so it
             // names no configured instance type.
@@ -259,11 +272,13 @@ async fn a_completed_capacity_task_is_what_the_outpost_is_configured_with() {
         Configuring {
             case: "every pool at the minimum count",
             tasks: vec![json!({ "InstancePools": [pool("m5.large", 0)] })],
-            hardware: &[],
+            hardware: &["1000000001"],
             with_order: false,
             expected: &[],
         },
         Configuring {
+            // No pool asks for any capacity, so there is nothing to weigh and nothing
+            // the Outpost's hardware — none at all, here — has to hold.
             case: "no pools at all",
             tasks: vec![json!({ "InstancePools": [] })],
             hardware: &[],
@@ -271,11 +286,14 @@ async fn a_completed_capacity_task_is_what_the_outpost_is_configured_with() {
             expected: &[],
         },
         Configuring {
-            case: "a type the published catalog does not carry",
+            // Rule 3: the catalog publishes no vCPU figure for this type, so the
+            // configuration cannot be weighed against the hardware at all — the task
+            // fails and leaves the Outpost configured with nothing.
+            case: "a type the published catalog does not carry configures nothing",
             tasks: vec![json!({ "InstancePools": [pool(UNPUBLISHED_INSTANCE_TYPE, 1)] })],
-            hardware: &[],
+            hardware: &["1000000001"],
             with_order: false,
-            expected: &[UNPUBLISHED_INSTANCE_TYPE],
+            expected: &[],
         },
         Configuring {
             case: "a later task on the Outpost supersedes the earlier one",
@@ -283,7 +301,7 @@ async fn a_completed_capacity_task_is_what_the_outpost_is_configured_with() {
                 json!({ "InstancePools": [pool("m5.large", 1)] }),
                 json!({ "InstancePools": [pool("c5.9xlarge", 3)] }),
             ],
-            hardware: &[],
+            hardware: &["1000000001", "1000000002"],
             with_order: false,
             expected: &["c5.9xlarge"],
         },
@@ -311,7 +329,7 @@ async fn a_completed_capacity_task_is_what_the_outpost_is_configured_with() {
         Configuring {
             case: "a task that names the order its hardware was bought on",
             tasks: vec![json!({ "InstancePools": [pool("m5.8xlarge", 1)] })],
-            hardware: &[],
+            hardware: &["1000000001"],
             with_order: true,
             expected: &["m5.8xlarge"],
         },
@@ -373,6 +391,14 @@ async fn a_capacity_task_still_running_has_configured_nothing() {
     let outposts = Outposts::new();
     let catalog = catalog(&outposts).await;
     let (outpost_id, _) = an_outpost(&outposts, "running", None).await;
+    // Hardware the task's configuration is weighed against, so the task this row
+    // follows is one that completes.
+    record(
+        &outposts,
+        &outpost_id,
+        &[compute_asset("1000000001")],
+        "running",
+    );
     let started = start_ok(
         &outposts,
         &outpost_id,
@@ -638,6 +664,14 @@ async fn the_report_pages_and_refuses_a_token_it_did_not_issue() {
     let outposts = Outposts::new();
     let catalog = catalog(&outposts).await;
     let (outpost_id, _) = an_outpost(&outposts, "paging", None).await;
+    // See [`a_capacity_task_still_running_has_configured_nothing`]: the pools below
+    // are weighed against this hardware.
+    record(
+        &outposts,
+        &outpost_id,
+        &[compute_asset("1000000001")],
+        "paging",
+    );
     let pools = ["m5.large", "m5.4xlarge", "c5.xlarge", "r5.2xlarge"];
     start_ok(
         &outposts,

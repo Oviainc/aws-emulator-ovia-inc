@@ -14,7 +14,10 @@
 //!    what was persisted; `GetCapacityTask` answers that same record, member for
 //!    member, whether the Outpost was named by bare id or by full ARN.
 //! 2. A task starts in the non-terminal `REQUESTED` status and advances through the
-//!    modelled statuses on the clock alone, ending `COMPLETED` with a
+//!    modelled statuses on the clock alone, ending `COMPLETED` — for a configuration
+//!    the hardware it runs on can hold, which is what every row here asks for; WHICH
+//!    outcome the configuration asked for leads to is
+//!    [`crate::capacity_task_outcome`]'s — with a
 //!    `CompletionDate` that equals its `LastModifiedDate` and never moving again. A
 //!    read reports the status the task holds at the instant it is asked for, and
 //!    never moves the task itself.
@@ -47,7 +50,7 @@ use service_com_amazonaws_outposts_outpostsolafservice::state::{
     CAPACITY_TASK_REQUESTED, CAPACITY_TASK_STEP, MAX_RESOURCES,
 };
 
-use crate::outpost_assets::{asset, record};
+use crate::outpost_assets::{asset, compute, record};
 use crate::site_and_outpost_lifecycle::{
     segment, text, Outposts, Reply, ABSENT_OUTPOST_ID, OUTPOST_ARN_PREFIX,
 };
@@ -111,6 +114,50 @@ pub(crate) fn install(outposts: &Outposts, outpost_id: &str, asset_ids: &[&str],
     let assets: Vec<AssetInfo> = asset_ids
         .iter()
         .map(|asset_id| asset(asset_id, "rack-1", Some("COMPUTE"), None, None))
+        .collect();
+    record(outposts, outpost_id, &assets, case);
+}
+
+/// The `ComputeAttributes$MaxVcpus` recorded on each compute host
+/// [`install_capacity`] installs — the figure the hardware this service really
+/// installs carries, which is the largest vCPU count its catalog publishes for the
+/// form factor (`crate::site_and_outpost_lifecycle::install_hardware` installs that
+/// hardware through the order path).
+pub(crate) const HOST_VCPUS: i32 = 96;
+
+/// Record `asset_ids` as compute hardware WITH the capacity a configuration is
+/// weighed against: each host carries a vCPU ceiling of [`HOST_VCPUS`] and no
+/// recorded instance family, so what such an Outpost can be configured with is
+/// decided by that ceiling alone.
+///
+/// The hardware [`install`] records carries no `ComputeAttributes` at all, which is
+/// hardware this service holds no capacity figure for and so can hold no
+/// configuration; a row whose capacity task has to RUN needs hardware that can hold
+/// what it asks for, which is what this records.
+pub(crate) fn install_capacity(
+    outposts: &Outposts,
+    outpost_id: &str,
+    asset_ids: &[&str],
+    case: &str,
+) {
+    let assets: Vec<AssetInfo> = asset_ids
+        .iter()
+        .enumerate()
+        .map(|(index, asset_id)| {
+            asset(
+                asset_id,
+                "rack-1",
+                Some("COMPUTE"),
+                Some(compute(
+                    Some(&format!("h-{:017x}", index + 1)),
+                    Some("ACTIVE"),
+                    None,
+                    None,
+                    Some(HOST_VCPUS),
+                )),
+                None,
+            )
+        })
         .collect();
     record(outposts, outpost_id, &assets, case);
 }
@@ -487,6 +534,10 @@ async fn both_outpost_identifier_forms_read_the_same_capacity_task() {
 async fn a_capacity_task_runs_to_completion_on_the_clock_alone() {
     let outposts = Outposts::new();
     let outpost_id = outpost(&outposts, "progression").await;
+    // Hardware that can hold what the task below asks for: a configuration is weighed
+    // against the capacity of the hardware it configures, so a task that is to
+    // COMPLETE runs on an Outpost whose hardware can take its pools.
+    install_capacity(&outposts, &outpost_id, &INSTALLED[..1], "progression");
     let started = start_ok(
         &outposts,
         &outpost_id,

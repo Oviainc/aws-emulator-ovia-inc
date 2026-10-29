@@ -10,8 +10,16 @@
 //! resolves to nothing is refused with the modelled `NotFoundException` rather than
 //! stored on the task. The task
 //! starts in the non-terminal
-//! `REQUESTED` status and runs to `COMPLETED` on the clock
-//! ([`crate::state::capacity_task_progression`]), and a second task is refused with the
+//! `REQUESTED` status and takes the course the configuration it asks for is weighed
+//! into ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::capacity_task_course`]),
+//! on the clock: a configuration the hardware in scope can hold beside what is
+//! already running on it completes, one that hardware cannot hold fails with the
+//! modelled `UNSUPPORTED_CAPACITY_CONFIGURATION`, and one that could only run on
+//! capacity the instances `ListBlockingInstancesForCapacityTask` recommends stopping
+//! still hold is what the caller's `TaskActionOnBlockingInstances` decides — it fails
+//! with the modelled `BLOCKING_INSTANCES_NOT_EVACUATED` for `FAIL_TASK` ("the
+//! capacity task fails"), and otherwise waits on those instances. A second task is
+//! refused with the
 //! modelled `ConflictException` while one is still active on the same Outpost or order,
 //! or when the store has reached the emulator's entry ceiling
 //! ([`crate::state::MAX_RESOURCES`]): a completed task is never released, so the store
@@ -24,7 +32,9 @@
 //! to the hardware they would configure, which
 //! [`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::capacity_verdict`]
 //! weighs off what is persisted: the vCPU ceiling of that hardware and the instances
-//! running on it that the task could not stop. It reports no `CapacityTaskId`,
+//! running on it that the task could not stop. That is the same weighing a real start
+//! above is judged by, so the dry run of a request and the request answer the same
+//! thing about the configuration. It reports no `CapacityTaskId`,
 //! because no task was created for one to name, and a terminal `CapacityTaskStatus`,
 //! because the verdict leaves nothing for the clock to advance.
 //!
@@ -324,14 +334,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // per Outpost and per order, the store's entry ceiling) are not applied to a
         // call that creates none, and nothing a dry run touches changes what a later
         // caller sees.
+        // The capacity configuration this request asks of the Outpost's hardware: what
+        // both the dry run's verdict and a real task's course are weighed off, so
+        // neither is given a narrower request than the other.
+        let configuration = crate::state::CapacityConfiguration {
+            region: &region,
+            outpost_id: &outpost_id,
+            asset_id: asset_id.as_deref(),
+            pools: &input.instance_pools,
+            instances_to_exclude: input.instances_to_exclude.as_ref(),
+        };
         if input.dry_run {
-            let verdict = store.capacity_verdict(
-                &region,
-                &outpost_id,
-                asset_id.as_deref(),
-                &input.instance_pools,
-                input.instances_to_exclude.as_ref(),
-            );
+            let verdict = store.capacity_verdict(&configuration);
             // The dry run was requested and answered at this one instant, and it
             // leaves nothing to do: the verdict is a terminal status, so the clock
             // owes it no transition.
@@ -424,6 +438,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let (capacity_task_id, sequence) = store.mint_id("cap");
         let now = std::time::SystemTime::now();
+        // What this task will DO, weighed at the instant it is accepted: the
+        // configuration it asks for against the capacity available to the hardware it
+        // configures, and the caller's action for instances blocking it
+        // ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::capacity_task_course`]).
+        // It is the SAME weighing the dry run of this request reports, so the two
+        // never contradict each other: a configuration the hardware cannot hold fails
+        // here exactly as the dry run said it would.
+        let course = store.capacity_task_course(
+            &configuration,
+            input.task_action_on_blocking_instances.as_deref(),
+            now,
+        );
         let task = crate::state::CapacityTaskRecord {
             sequence,
             capacity_task_id: capacity_task_id.clone(),
@@ -442,15 +468,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.task_action_on_blocking_instances,
             ),
             // A just-started task is awaiting its next step, so it reports the
-            // non-terminal status until the progression the clock owes falls due;
-            // every read materialises it through `settle_capacity_tasks`.
+            // non-terminal status until the first step of the course above falls
+            // due; every read materialises what the clock owes through
+            // `settle_capacity_tasks`.
             status: crate::state::CAPACITY_TASK_REQUESTED.to_string(),
-            // Nothing in this slice fails a task. See `CAPACITY_TASK_FAILED`.
+            // Nothing has failed yet: the failure a course ending in
+            // `CAPACITY_TASK_FAILED` carries arrives with that step, so a task still
+            // awaiting one reports no reason for a failure that has not happened.
             failed: None,
             created_at: now,
             last_modified_at: now,
             completed_at: None,
-            pending: crate::state::capacity_task_progression(now),
+            pending: course,
         };
         store.capacity_tasks.insert(capacity_task_id, task.clone());
 

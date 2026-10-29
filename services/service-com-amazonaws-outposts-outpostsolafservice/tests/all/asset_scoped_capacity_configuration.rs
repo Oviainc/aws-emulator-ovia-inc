@@ -56,6 +56,11 @@ enum Configured {
 
 /// One capacity task of a row: the hardware it names and the pools it configures
 /// there, each as `(instance type, Count)`.
+///
+/// The pools of an ASSET-scoped task are weighed against that one asset's own
+/// capacity, and an Outpost-wide one's against all of its compute hardware, so a row
+/// asks for a configuration the hardware it names can hold — a task above it would
+/// FAIL instead of configuring anything ([`crate::capacity_task_outcome`]).
 struct Task {
     scope: Scope,
     pools: &'static [(Configured, i64)],
@@ -294,6 +299,35 @@ fn expectation(row: &Row, ordered: &[String], spare: &[String]) -> Vec<String> {
     want
 }
 
+/// The published instance types one FORM FACTOR's hardware runs that NO published
+/// configuration carries capacity of — so a task configuring one of them configures
+/// something the ordered hardware did not arrive carrying, on hardware that runs it.
+///
+/// Which types a piece of hardware runs is what its `ComputeAttributes` record, and
+/// this service installs on an Outpost the families and vCPU ceiling its catalog
+/// publishes as orderable on that form factor — so a type offered on another form
+/// factor is one this hardware does not run, and a task asking for it would FAIL
+/// rather than configure anything ([`crate::capacity_task_outcome`]). The form factor
+/// each type is offered on is the catalog's own `FormFactorConfigs`, read over the
+/// wire like every other expectation here.
+fn spares(catalog: &[Value], ordered_anywhere: &[String], form_factor: &str) -> Vec<String> {
+    catalog
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("FormFactorConfigs")
+                .and_then(Value::as_array)
+                .is_some_and(|configs| {
+                    configs
+                        .iter()
+                        .any(|config| text(config, "FormFactor") == form_factor)
+                })
+        })
+        .map(|entry| text(entry, "InstanceType"))
+        .filter(|instance_type| !ordered_anywhere.contains(instance_type))
+        .collect()
+}
+
 /// The rule: a completed capacity task reconfigures the hardware it named and nothing
 /// else, so the configuration of every other piece of the Outpost's compute hardware
 /// goes on standing.
@@ -309,23 +343,25 @@ async fn a_capacity_task_configures_only_the_hardware_it_named() {
     );
     // Instance types NO published configuration carries capacity of, so a task that
     // configures one of them configures something the ordered hardware did not arrive
-    // carrying: every published type less every published configuration's largest
-    // size per family.
+    // carrying — taken per form factor, because a row's task may only ask for types the
+    // hardware it runs on runs.
     let ordered_anywhere: Vec<String> = racks
         .iter()
         .chain(servers.iter())
         .flat_map(max_sizes)
         .collect();
-    let spare: Vec<String> = catalog
-        .iter()
-        .map(|entry| text(entry, "InstanceType"))
-        .filter(|instance_type| !ordered_anywhere.contains(instance_type))
-        .collect();
+    let rack_spare = spares(&catalog, &ordered_anywhere, "RACK");
+    let server_spare = spares(&catalog, &ordered_anywhere, "SERVER");
     assert!(
-        spare.len() >= 2,
-        "the rows need two published types no published configuration carries capacity of, \
-         got {spare:?}"
+        rack_spare.len() >= 2 && !server_spare.is_empty(),
+        "the rows need two published rack types and one server type that no published \
+         configuration carries capacity of, got {rack_spare:?} and {server_spare:?}"
     );
+    // The spare types of the form factor one row's Outpost holds.
+    let spare_of = |hardware_type: &str| match hardware_type {
+        "SERVER" => server_spare.clone(),
+        _ => rack_spare.clone(),
+    };
 
     let rows: &[Row] = &[
         Row {
@@ -347,7 +383,7 @@ async fn a_capacity_task_configures_only_the_hardware_it_named() {
                 },
                 Task {
                     scope: Scope::Asset(3),
-                    pools: &[(Configured::Spare(1), 2)],
+                    pools: &[(Configured::Spare(1), 1)],
                 },
             ],
             keeps_ordered: true,
@@ -463,7 +499,7 @@ async fn a_capacity_task_configures_only_the_hardware_it_named() {
                 start_ok(
                     &outposts,
                     outpost_id,
-                    &request(task, assets, ordered, &spare),
+                    &request(task, assets, ordered, &spare_of(row.hardware_type)),
                 )
                 .await;
             }
@@ -473,7 +509,7 @@ async fn a_capacity_task_configures_only_the_hardware_it_named() {
 
     for (row, (outpost_id, ordered)) in rows.iter().zip(&placed) {
         let case = row.case;
-        let want = expectation(row, ordered, &spare);
+        let want = expectation(row, ordered, &spare_of(row.hardware_type));
         let answer = configured(&outposts, outpost_id).await;
         assert_eq!(
             reported(&answer),

@@ -420,7 +420,7 @@ const NARROW_HOST: &str = "1000000004";
 /// One compute host of a profile: a `COMPUTE` asset carrying the Dedicated Host it
 /// hosts instances on, the instance families it runs and its vCPU ceiling — the two
 /// `ComputeAttributes` members a capacity verdict reads.
-fn host(
+pub(crate) fn host(
     asset_id: &str,
     host_id: &str,
     elevation: f32,
@@ -488,7 +488,7 @@ fn narrow_hardware() -> Vec<AssetInfo> {
 /// `DetailedInstanceTypeItem$VCPUs` is the figure every capacity figure of this
 /// service is counted in) — so what a row expects follows the published catalog
 /// rather than a copy of it.
-async fn published_vcpus(outposts: &Outposts) -> BTreeMap<String, i64> {
+pub(crate) async fn published_vcpus(outposts: &Outposts) -> BTreeMap<String, i64> {
     let catalog = outposts.ok("GET", "/instanceTypes", None).await;
     let entries = catalog
         .get("InstanceTypes")
