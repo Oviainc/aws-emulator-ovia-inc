@@ -229,49 +229,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        // A trajectory belongs to the job its key names, so the `JobArn` is resolved
-        // against the jobs the SageMaker control plane minted before this call touches a
-        // stored trajectory: the crate's one job resolution, shared with the sampling
-        // path, so the two cannot disagree about whether an ARN denotes a job.
-        if let Some(message) = crate::state::unresolved_job_trajectory_message(
+        // The `(JobArn, TrajectoryId)` pair is resolved through the ONE resolution both
+        // rollout-lifecycle operations serve a call by, so this operation cannot disagree
+        // with `UpdateReward` about which pairs are refused, in which order, or with which
+        // sentence; what is this operation's own is the error it reports that sentence
+        // through, and what it does to the trajectory it is handed.
+        crate::state::serve_rollout_trajectory(
             &*self.engine,
+            &state,
             &input.job_arn,
             &input.trajectory_id,
-        ) {
-            return Err(not_found(message));
-        }
-
-        let now = ::std::time::SystemTime::now();
-        let mut guard = state.lock();
-        let Some(trajectory) = guard.trajectory_mut(&input.job_arn, &input.trajectory_id) else {
-            return Err(not_found(crate::state::trajectory_not_found_message(
-                &input.trajectory_id,
-            )));
-        };
-
-        match trajectory.completion_status {
-            // Not sealed yet: seal it, recording the terminal status and the
-            // `ClientToken` the sealing call carried.
-            None => {
-                trajectory.status = crate::state::TrajectoryStatus::Complete;
-                trajectory.completion_status = Some(requested);
-                trajectory.complete_rollout_token = input.client_token.clone();
-                trajectory.updated_at = now;
-                Ok(CompleteRolloutOutput {})
-            }
-            // `@idempotent`: asking again for the status it is already sealed with
-            // changes nothing and succeeds.
-            Some(sealed) if sealed == requested => Ok(CompleteRolloutOutput {}),
-            // Anything that would CHANGE the sealed terminal status conflicts with
-            // the trajectory's current state.
-            Some(sealed) => Err(conflict(format!(
-                "Trajectory {} is already completed with Status {}; it cannot be completed with \
-                 Status {}.",
-                input.trajectory_id,
-                sealed.as_str(),
-                requested.as_str()
-            ))),
-        }
+            |trajectory, now| match trajectory.completion_status {
+                // Not sealed yet: seal it, recording the terminal status and the
+                // `ClientToken` the sealing call carried.
+                None => {
+                    trajectory.status = crate::state::TrajectoryStatus::Complete;
+                    trajectory.completion_status = Some(requested);
+                    trajectory.complete_rollout_token = input.client_token.clone();
+                    trajectory.updated_at = now;
+                    Ok(CompleteRolloutOutput {})
+                }
+                // `@idempotent`: asking again for the status it is already sealed with
+                // changes nothing and succeeds.
+                Some(sealed) if sealed == requested => Ok(CompleteRolloutOutput {}),
+                // Anything that would CHANGE the sealed terminal status conflicts with
+                // the trajectory's current state.
+                Some(sealed) => Err(conflict(format!(
+                    "Trajectory {} is already completed with Status {}; it cannot be completed \
+                     with Status {}.",
+                    input.trajectory_id,
+                    sealed.as_str(),
+                    requested.as_str()
+                ))),
+            },
+        )
+        .map_err(not_found)?
     }
 }
 

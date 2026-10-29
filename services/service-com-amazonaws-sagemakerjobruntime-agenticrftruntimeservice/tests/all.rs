@@ -31,6 +31,9 @@ mod rejected_value_echo;
 #[path = "all/rollout_operations_resolve_the_job.rs"]
 mod rollout_operations_resolve_the_job;
 
+#[path = "all/rollout_resolution_is_one_path.rs"]
+mod rollout_resolution_is_one_path;
+
 #[path = "all/sampling_path_is_shared.rs"]
 mod sampling_path_is_shared;
 

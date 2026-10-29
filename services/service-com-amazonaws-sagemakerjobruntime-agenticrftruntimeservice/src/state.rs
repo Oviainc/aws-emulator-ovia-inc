@@ -28,7 +28,10 @@
 //! sampling call because the turn can be routed to no model session, and
 //! `CompleteRollout` and `UpdateReward` because a trajectory lives inside the job its
 //! key names, so the pair names no trajectory of it either
-//! ([`unresolved_job_trajectory_message`]). Beside that, a sampling call is refused
+//! ([`unresolved_job_trajectory_message`], which the rollout pair reaches through the
+//! one resolution both of them serve a call by, [`serve_rollout_trajectory`], as the
+//! sampling pair reaches its own through [`serve_sampling_turn`]). Beside that, a
+//! sampling call is refused
 //! on state this service owns: a trajectory `CompleteRollout` has sealed, and the
 //! emulator bounds below.
 
@@ -551,8 +554,9 @@ pub fn job_not_found_message(job_arn: &str) -> String {
 /// holds under the pair — the pair is reported absent with the same sentence an id that
 /// was never sampled gets ([`trajectory_not_found_message`]).
 ///
-/// `CompleteRollout` and `UpdateReward` both take their job resolution from here, so
-/// neither can disagree with the sampling path about whether an ARN denotes a job.
+/// The job half of the rollout pair's resolution, which both of them reach through
+/// [`serve_rollout_trajectory`], so neither can disagree with the sampling path about
+/// whether an ARN denotes a job.
 #[must_use]
 pub fn unresolved_job_trajectory_message<Eng: Send + Sync + 'static>(
     engine: &Eng,
@@ -564,6 +568,50 @@ pub fn unresolved_job_trajectory_message<Eng: Send + Sync + 'static>(
     } else {
         Some(trajectory_not_found_message(trajectory_id))
     }
+}
+
+// ---------------------------------------------------------------------------
+// The rollout-lifecycle call, once
+// ---------------------------------------------------------------------------
+
+/// Resolve the `(JobArn, TrajectoryId)` pair one rollout-lifecycle call carries and hand
+/// the stored trajectory to `apply`, or answer the sentence the call is refused with.
+///
+/// `CompleteRollout` and `UpdateReward` reach the SAME state through this, so neither can
+/// drift from the other on which calls are refused, in which order, or with which
+/// sentence: the `JobArn` is resolved against the jobs the SageMaker control plane minted
+/// ([`unresolved_job_trajectory_message`]) BEFORE the store is locked, because a trajectory
+/// lives inside the job its key names, and only then is the pair looked up in this
+/// service's own map, a miss being reported with the sentence an id that was never sampled
+/// gets ([`trajectory_not_found_message`]). What is left to each of them is what genuinely
+/// differs: the modelled error constructor the sentence is reported through, the request
+/// checks that operation owns, and what it does to the trajectory once it has it.
+///
+/// `apply` is handed the stored trajectory for writing and the instant the call is served
+/// at, so both operations stamp one clock reading taken before the lock, and answers
+/// whatever that operation owes its caller — including its own refusal, which is why the
+/// answer is nested: the outer `Err` is the shared resolution's sentence, the inner value
+/// is the operation's own.
+pub fn serve_rollout_trajectory<Eng, T, F>(
+    engine: &Eng,
+    state: &::engine::ServiceState<ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState>,
+    job_arn: &str,
+    trajectory_id: &str,
+    apply: F,
+) -> Result<T, String>
+where
+    Eng: Send + Sync + 'static,
+    F: FnOnce(&mut Trajectory, SystemTime) -> T,
+{
+    if let Some(message) = unresolved_job_trajectory_message(engine, job_arn, trajectory_id) {
+        return Err(message);
+    }
+    let now = SystemTime::now();
+    let mut guard = state.lock();
+    let Some(trajectory) = guard.trajectory_mut(job_arn, trajectory_id) else {
+        return Err(trajectory_not_found_message(trajectory_id));
+    };
+    Ok(apply(trajectory, now))
 }
 
 // ---------------------------------------------------------------------------

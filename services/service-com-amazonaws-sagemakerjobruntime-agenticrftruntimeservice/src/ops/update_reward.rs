@@ -222,81 +222,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(validation(EMPTY_REWARDS_MESSAGE.to_string()));
         }
 
-        // A trajectory belongs to the job its key names, so the `JobArn` is resolved
-        // against the jobs the SageMaker control plane minted before this call touches a
-        // stored trajectory: the crate's one job resolution, shared with the sampling
-        // path, so the two cannot disagree about whether an ARN denotes a job.
-        if let Some(message) = crate::state::unresolved_job_trajectory_message(
+        // The `(JobArn, TrajectoryId)` pair is resolved through the ONE resolution both
+        // rollout-lifecycle operations serve a call by, so this operation cannot disagree
+        // with `CompleteRollout` about which pairs are refused, in which order, or with
+        // which sentence; what is this operation's own is the error it reports that
+        // sentence through, and what it does to the trajectory it is handed.
+        crate::state::serve_rollout_trajectory(
             &*self.engine,
+            &state,
             &input.job_arn,
             &input.trajectory_id,
-        ) {
-            return Err(not_found(message));
-        }
+            |trajectory, now| {
+                // "Call this operation after CompleteRollout": a trajectory that has not
+                // been sealed is not eligible for reward submission yet.
+                let Some(completion_status) = trajectory.completion_status else {
+                    return Err(conflict(format!(
+                        "Trajectory {} is in {} status; call CompleteRollout before UpdateReward.",
+                        input.trajectory_id,
+                        trajectory.status.as_str()
+                    )));
+                };
+                // Only the `ready` terminal status is "sealed and eligible for reward
+                // submission"; `failed` is "a terminal state, no further processing".
+                if !completion_status.accepts_reward() {
+                    return Err(conflict(format!(
+                        "Trajectory {} was completed with Status {}, which is terminal and \
+                         accepts no rewards.",
+                        input.trajectory_id,
+                        completion_status.as_str()
+                    )));
+                }
 
-        let now = ::std::time::SystemTime::now();
-        let mut guard = state.lock();
-        let Some(trajectory) = guard.trajectory_mut(&input.job_arn, &input.trajectory_id) else {
-            return Err(not_found(crate::state::trajectory_not_found_message(
-                &input.trajectory_id,
-            )));
-        };
+                // "Provide one reward value per turn in the trajectory": the submission
+                // carries one score per captured turn or it cannot be attributed to the
+                // turns at all. The trajectory is sealed by this point, so the turn count
+                // it is checked against is final.
+                if input.rewards.len() != trajectory.turns.len() {
+                    return Err(validation(reward_count_message(
+                        &input.trajectory_id,
+                        trajectory.turns.len(),
+                        input.rewards.len(),
+                    )));
+                }
 
-        // "Call this operation after CompleteRollout": a trajectory that has not
-        // been sealed is not eligible for reward submission yet.
-        let Some(completion_status) = trajectory.completion_status else {
-            return Err(conflict(format!(
-                "Trajectory {} is in {} status; call CompleteRollout before UpdateReward.",
-                input.trajectory_id,
-                trajectory.status.as_str()
-            )));
-        };
-        // Only the `ready` terminal status is "sealed and eligible for reward
-        // submission"; `failed` is "a terminal state, no further processing".
-        if !completion_status.accepts_reward() {
-            return Err(conflict(format!(
-                "Trajectory {} was completed with Status {}, which is terminal and accepts no \
-                 rewards.",
-                input.trajectory_id,
-                completion_status.as_str()
-            )));
-        }
-
-        // "Provide one reward value per turn in the trajectory": the submission
-        // carries one score per captured turn or it cannot be attributed to the
-        // turns at all. The trajectory is sealed by this point, so the turn count
-        // it is checked against is final.
-        if input.rewards.len() != trajectory.turns.len() {
-            return Err(validation(reward_count_message(
-                &input.trajectory_id,
-                trajectory.turns.len(),
-                input.rewards.len(),
-            )));
-        }
-
-        match &trajectory.rewards {
-            // Not rewarded yet: record the scores and transition the trajectory to
-            // reward-received status.
-            None => {
-                trajectory.rewards = Some(input.rewards.clone());
-                trajectory.status = crate::state::TrajectoryStatus::RewardReceived;
-                trajectory.update_reward_token = input.client_token.clone();
-                trajectory.updated_at = now;
-                Ok(UpdateRewardOutput {})
-            }
-            // `@idempotent`: resubmitting the SAME scores changes nothing and
-            // succeeds again.
-            Some(recorded) if same_rewards(recorded, &input.rewards) => Ok(UpdateRewardOutput {}),
-            // Anything that would CHANGE the recorded scores conflicts with the
-            // trajectory's current state.
-            Some(recorded) => Err(conflict(format!(
-                "Trajectory {} is already in {} status with {} reward value(s); they cannot be \
-                 replaced with {} value(s).",
-                input.trajectory_id,
-                trajectory.status.as_str(),
-                recorded.len(),
-                input.rewards.len()
-            ))),
-        }
+                match &trajectory.rewards {
+                    // Not rewarded yet: record the scores and transition the trajectory to
+                    // reward-received status.
+                    None => {
+                        trajectory.rewards = Some(input.rewards.clone());
+                        trajectory.status = crate::state::TrajectoryStatus::RewardReceived;
+                        trajectory.update_reward_token = input.client_token.clone();
+                        trajectory.updated_at = now;
+                        Ok(UpdateRewardOutput {})
+                    }
+                    // `@idempotent`: resubmitting the SAME scores changes nothing and
+                    // succeeds again.
+                    Some(recorded) if same_rewards(recorded, &input.rewards) => {
+                        Ok(UpdateRewardOutput {})
+                    }
+                    // Anything that would CHANGE the recorded scores conflicts with the
+                    // trajectory's current state.
+                    Some(recorded) => Err(conflict(format!(
+                        "Trajectory {} is already in {} status with {} reward value(s); they \
+                         cannot be replaced with {} value(s).",
+                        input.trajectory_id,
+                        trajectory.status.as_str(),
+                        recorded.len(),
+                        input.rewards.len()
+                    ))),
+                }
+            },
+        )
+        .map_err(not_found)?
     }
 }
