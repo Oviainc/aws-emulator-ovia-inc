@@ -237,6 +237,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::TokenVerdict::Serve => {}
         }
 
+        // A `workspaceName` the request names is resolved FIRST, as every
+        // workspace-scoped entry point in this crate resolves the resource its
+        // request names before the one nested in it: a request that is wrong in both
+        // ways reports the resource that is absent.
+        if let Some(workspace) = input.workspace_name.as_deref() {
+            if !store.workspaces.contains_key(workspace) {
+                return Err(not_found(crate::state::RESOURCE_WORKSPACE, workspace));
+            }
+        }
+
         let dataset = store
             .datasets
             .get_mut(&input.dataset_id)
@@ -250,7 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .is_none()
                     || input.workspace_name == dataset.workspace_name
             })
-            .ok_or_else(|| not_found(&input.dataset_id))?;
+            .ok_or_else(|| not_found(crate::state::RESOURCE_DATASET, &input.dataset_id))?;
 
         // The caller-owned members are REPLACED by what this request carries, so an
         // omitted optional member clears the stored one: the request describes the
@@ -300,11 +310,14 @@ fn token_spent(dataset_id: &str, resource_arn: String) -> UpdateDatasetError {
     ))
 }
 
-/// HTTP 404 `ResourceNotFoundException` naming the id that resolved to nothing.
-fn not_found(dataset_id: &str) -> UpdateDatasetError {
+/// HTTP 404 `ResourceNotFoundException` naming the resource KIND that is absent and
+/// the identifier the request supplied for it — the workspace the request names when
+/// this service holds no such workspace, otherwise the dataset id that resolved to
+/// nothing.
+fn not_found(resource: &str, requested: &str) -> UpdateDatasetError {
     UpdateDatasetError::Modeled(UpdateDatasetErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: crate::state::not_found_message(crate::state::RESOURCE_DATASET, dataset_id),
+            message: crate::state::not_found_message(resource, requested),
         },
     ))
 }

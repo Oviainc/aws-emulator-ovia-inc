@@ -37,7 +37,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_iotsitewise_awsiotsitewise::state::{
     empty_span_message, not_found_message, service_state, DataSegmentRecord, ACTIVATION_DELAY,
-    MAX_DATA_SEGMENTS_PER_DATASET, RESOURCE_DATA_SEGMENT, RESOURCE_DATASET,
+    MAX_DATA_SEGMENTS_PER_DATASET, RESOURCE_DATA_SEGMENT, RESOURCE_DATASET, RESOURCE_WORKSPACE,
 };
 
 use crate::asset_lifecycle::{call, error_code, router_with_engine};
@@ -808,18 +808,26 @@ async fn a_disassociation_leaves_the_source_dataset_and_lets_the_span_be_associa
 async fn a_request_the_dataset_does_not_answer_is_refused_and_removes_nothing() {
     let (router, fixture) = fixture().await;
     let external = create_dataset(&router, "Kiln external", Some("EXTERNAL"), None).await;
+    // The row scoping the curated dataset to ANOTHER workspace is about the
+    // dataset's scoping, so that other workspace is opened: a name this service
+    // does not hold is its own row below, and reports the workspace.
+    crate::support::ensure_workspace(&router, OTHER_WORKSPACE).await;
 
     // (case, the datasetId the request addresses, the workspaceName it carries,
-    // the status and error code expected) — an id that names nothing, the stored id
-    // scoped to a workspace that does not hold it, a dataset of no workspace, and
-    // the dataset type whose segments are its own data rather than a selection.
-    let rows: Vec<(&str, String, &str, u16, &str)> = vec![
+    // the status and error code expected, the absence a 404 states) — an id that
+    // names nothing, the stored id scoped to a workspace that does not hold it, a
+    // dataset of no workspace, the dataset type whose segments are its own data
+    // rather than a selection, and a workspace this service does not hold at all,
+    // which is reported as the workspace being absent because the request's
+    // workspace is resolved before the dataset scoped to it.
+    let rows: Vec<(&str, String, &str, u16, &str, String)> = vec![
         (
             "an id that names no dataset",
             ABSENT_DATASET.to_string(),
             WORKSPACE,
             404,
             "ResourceNotFoundException",
+            not_found_message(RESOURCE_DATASET, ABSENT_DATASET),
         ),
         (
             "the dataset scoped to another workspace",
@@ -827,6 +835,7 @@ async fn a_request_the_dataset_does_not_answer_is_refused_and_removes_nothing() 
             OTHER_WORKSPACE,
             404,
             "ResourceNotFoundException",
+            not_found_message(RESOURCE_DATASET, &fixture.target),
         ),
         (
             "a dataset that belongs to no workspace",
@@ -834,6 +843,7 @@ async fn a_request_the_dataset_does_not_answer_is_refused_and_removes_nothing() 
             WORKSPACE,
             404,
             "ResourceNotFoundException",
+            not_found_message(RESOURCE_DATASET, &external),
         ),
         (
             "a session dataset",
@@ -841,10 +851,19 @@ async fn a_request_the_dataset_does_not_answer_is_refused_and_removes_nothing() 
             WORKSPACE,
             400,
             "InvalidRequestException",
+            String::new(),
+        ),
+        (
+            "a workspace this service does not hold",
+            fixture.target.clone(),
+            "dryer-ghost",
+            404,
+            "ResourceNotFoundException",
+            not_found_message(RESOURCE_WORKSPACE, "dryer-ghost"),
         ),
     ];
 
-    for (case, target, workspace, expected_status, expected_code) in rows {
+    for (case, target, workspace, expected_status, expected_code, expected_message) in rows {
         let wire = vec![wire_entry(&fixture, &FIRST_EARLY)];
         let (status, body) = disassociate(&router, &target, workspace, wire).await;
         assert_eq!(
@@ -859,10 +878,9 @@ async fn a_request_the_dataset_does_not_answer_is_refused_and_removes_nothing() 
         if expected_status == 404 {
             let message = body["message"].as_str().unwrap_or("");
             assert_eq!(
-                message,
-                not_found_message(RESOURCE_DATASET, &target),
-                "case {case:?}: an absent dataset must carry the service's not-found wording, \
-                 got {body}"
+                message, expected_message,
+                "case {case:?}: an absence must carry the service's not-found wording for the \
+                 resource that is absent, got {body}"
             );
         }
 

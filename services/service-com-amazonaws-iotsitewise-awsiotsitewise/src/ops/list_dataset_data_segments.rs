@@ -168,6 +168,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // segments a later deletion addresses are exactly the ones reported here.
         let store = state.lock();
 
+        // The workspace the REQUEST names is resolved FIRST — it rides the query
+        // string here rather than the path — as every workspace-scoped entry point
+        // in this crate resolves the workspace before the resource scoped to it: a
+        // request that is wrong in both ways reports the resource that is absent.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            ));
+        }
+
         // The dataset this request addresses, scoped the way every other
         // dataset-addressed operation of this service scopes it: `workspaceName`
         // names "the workspace that contains the dataset", so a dataset held by
@@ -187,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_ref()
                     .is_none_or(|version| *version == dataset.version_label())
             })
-            .ok_or_else(|| not_found(&input.dataset_id))?;
+            .ok_or_else(|| not_found(crate::state::RESOURCE_DATASET, &input.dataset_id))?;
         let dataset_id = dataset.id.clone();
 
         // Every segment the dataset holds, each one summarised from the record plus
@@ -300,11 +311,13 @@ fn invalid_token() -> ListDatasetDataSegmentsError {
     .into()
 }
 
-/// HTTP 404 `ResourceNotFoundException` naming the dataset id that resolved to
-/// nothing in the workspace, and at the version, the request named.
-fn not_found(dataset_id: &str) -> ListDatasetDataSegmentsError {
+/// HTTP 404 `ResourceNotFoundException` naming the resource KIND that is absent and
+/// the identifier the request supplied for it — the workspace the request names
+/// when this service holds no such workspace, otherwise the dataset id that
+/// resolved to nothing in the workspace, and at the version, the request named.
+fn not_found(resource: &str, requested: &str) -> ListDatasetDataSegmentsError {
     ListDatasetDataSegmentsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: crate::state::not_found_message(crate::state::RESOURCE_DATASET, dataset_id),
+        message: crate::state::not_found_message(resource, requested),
     })
     .into()
 }

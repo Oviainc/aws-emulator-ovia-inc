@@ -185,6 +185,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let store = state.lock();
+
+        // A `workspaceName` the request names is resolved FIRST, as every
+        // workspace-scoped entry point in this crate resolves the resource its
+        // request names before the one nested in it: a request that is wrong in both
+        // ways reports the resource that is absent. The workspace registry is the one
+        // place that says which workspaces exist, and a create that puts a dataset in
+        // a workspace resolves it there too, so no dataset can be stored under a
+        // workspace the registry does not hold.
+        if let Some(workspace) = input.workspace_name.as_deref() {
+            if !store.workspaces.contains_key(workspace) {
+                return Err(not_found(crate::state::RESOURCE_WORKSPACE, workspace));
+            }
+        }
+
         let dataset = store
             .datasets
             .get(&input.dataset_id)
@@ -203,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_ref()
                     .is_none_or(|version| *version == dataset.version_label())
             })
-            .ok_or_else(|| not_found(&input.dataset_id))?;
+            .ok_or_else(|| not_found(crate::state::RESOURCE_DATASET, &input.dataset_id))?;
 
         Ok(DescribeDatasetOutput {
             dataset_id: dataset.id.clone(),
@@ -233,11 +247,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// HTTP 404 `ResourceNotFoundException` naming the id that resolved to nothing.
-fn not_found(dataset_id: &str) -> DescribeDatasetError {
+/// HTTP 404 `ResourceNotFoundException` naming the resource KIND that is absent and
+/// the identifier the request supplied for it — the workspace the request names when
+/// this service holds no such workspace, otherwise the dataset id that resolved to
+/// nothing.
+fn not_found(resource: &str, requested: &str) -> DescribeDatasetError {
     DescribeDatasetError::Modeled(DescribeDatasetErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: crate::state::not_found_message(crate::state::RESOURCE_DATASET, dataset_id),
+            message: crate::state::not_found_message(resource, requested),
         },
     ))
 }

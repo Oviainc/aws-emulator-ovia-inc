@@ -191,6 +191,13 @@ mod pipeline_executions;
 #[path = "all/refusal_message_rule.rs"]
 mod refusal_message_rule;
 
+// `workspace_scoped_absence` is declared HERE, beside the refusal-rule suite it
+// belongs with, for the reason the notes above give: the sorted list and the END
+// of this file are both where every concurrent iotsitewise change puts a
+// declaration of its own. Fold it into the list once the churn settles.
+#[path = "all/workspace_scoped_absence.rs"]
+mod workspace_scoped_absence;
+
 // Same reasoning: this suite's alphabetical place is inside the sorted list, the
 // stretch every concurrent iotsitewise change lands a declaration of its own in,
 // so it is declared up here with the other suites kept out of that stretch. Fold

@@ -262,6 +262,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::TokenVerdict::Serve => {}
         }
 
+        // The workspace the request names is resolved FIRST — it rides the body
+        // here rather than the path — as every workspace-scoped entry point in this
+        // crate resolves the workspace before the resource scoped to it: a request
+        // that is wrong in both ways reports the resource that is absent.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            ));
+        }
+
         // `workspaceName` names "the name of the workspace that contains the
         // dataset", so it SCOPES the lookup: a dataset held by another workspace, or
         // by none at all, is not the dataset this request addresses — the same
@@ -270,7 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .datasets
             .get(&input.dataset_id)
             .filter(|dataset| dataset.workspace_name.as_deref() == Some(&input.workspace_name))
-            .ok_or_else(|| not_found(&input.dataset_id))?;
+            .ok_or_else(|| not_found(crate::state::RESOURCE_DATASET, &input.dataset_id))?;
         let dataset_type = dataset.dataset_type.clone();
         // The version the dataset reports if this call accepts no entry at all.
         let unchanged_version = dataset.version_label();
@@ -446,16 +457,15 @@ fn token_spent(
     )
 }
 
-/// HTTP 404 `ResourceNotFoundException` naming the dataset id that resolved to
+/// HTTP 404 `ResourceNotFoundException` naming the resource KIND that is absent and
+/// the identifier the request supplied for it — the workspace the request names when
+/// this service holds no such workspace, otherwise the dataset id that resolved to
 /// nothing in the workspace the request named.
-fn not_found(dataset_id: &str) -> BatchDisassociateDataSegmentsFromDatasetError {
+fn not_found(resource: &str, requested: &str) -> BatchDisassociateDataSegmentsFromDatasetError {
     BatchDisassociateDataSegmentsFromDatasetError::Modeled(
         BatchDisassociateDataSegmentsFromDatasetErrorModeled::ResourceNotFoundException(
             ResourceNotFoundException {
-                message: crate::state::not_found_message(
-                    crate::state::RESOURCE_DATASET,
-                    dataset_id,
-                ),
+                message: crate::state::not_found_message(resource, requested),
             },
         ),
     )

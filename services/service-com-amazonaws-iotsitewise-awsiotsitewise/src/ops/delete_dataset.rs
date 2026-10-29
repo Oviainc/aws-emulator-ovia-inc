@@ -206,6 +206,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::TokenVerdict::Serve => {}
         }
 
+        // A `workspaceName` the request names is resolved FIRST, as every
+        // workspace-scoped entry point in this crate resolves the resource its
+        // request names before the one nested in it: a request that is wrong in both
+        // ways reports the resource that is absent.
+        if let Some(workspace) = input.workspace_name.as_deref() {
+            if !store.workspaces.contains_key(workspace) {
+                return Err(not_found(crate::state::RESOURCE_WORKSPACE, workspace));
+            }
+        }
+
         // `workspaceName` names "the name of the workspace that contains the dataset",
         // so a request that names one SCOPES the lookup: a dataset held by another
         // workspace, or by none at all, is not the dataset this request addresses —
@@ -214,7 +224,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.datasets.get(&input.dataset_id).is_some_and(|dataset| {
             input.workspace_name.is_none() || input.workspace_name == dataset.workspace_name
         }) {
-            return Err(not_found(&input.dataset_id));
+            return Err(not_found(
+                crate::state::RESOURCE_DATASET,
+                &input.dataset_id,
+            ));
         }
 
         // "You can't delete a session dataset while a curated dataset references its
@@ -293,11 +306,14 @@ fn token_spent(dataset_id: &str, resource_arn: String) -> DeleteDatasetError {
     ))
 }
 
-/// HTTP 404 `ResourceNotFoundException` naming the id that resolved to nothing.
-fn not_found(dataset_id: &str) -> DeleteDatasetError {
+/// HTTP 404 `ResourceNotFoundException` naming the resource KIND that is absent and
+/// the identifier the request supplied for it — the workspace the request names when
+/// this service holds no such workspace, otherwise the dataset id that resolved to
+/// nothing.
+fn not_found(resource: &str, requested: &str) -> DeleteDatasetError {
     DeleteDatasetError::Modeled(DeleteDatasetErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: crate::state::not_found_message(crate::state::RESOURCE_DATASET, dataset_id),
+            message: crate::state::not_found_message(resource, requested),
         },
     ))
 }

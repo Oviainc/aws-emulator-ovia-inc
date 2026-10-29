@@ -36,6 +36,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_iotsitewise_awsiotsitewise::ops::types::TimeInNanos;
 use service_com_amazonaws_iotsitewise_awsiotsitewise::state::{
     not_found_message, service_state, DataSegmentRecord, ACTIVATION_DELAY, RESOURCE_DATASET,
+    RESOURCE_WORKSPACE,
 };
 
 use crate::asset_lifecycle::{
@@ -676,52 +677,70 @@ async fn max_results_and_next_token_page_one_stable_enumeration() {
 async fn a_dataset_the_request_does_not_resolve_is_refused_rather_than_empty() {
     let (router, _engine, fixture) = seeded().await;
     let outside = create_dataset(&router, "Press outside", "EXTERNAL", None).await;
+    // The row scoping the stored dataset to ANOTHER workspace is about the
+    // dataset's scoping, so that other workspace is opened: a name this service
+    // does not hold is its own row below, and reports the workspace.
+    crate::support::ensure_workspace(&router, OTHER_WORKSPACE).await;
 
     // (case, the datasetId the request names, the workspaceName it carries, the
-    // extra query) — an id that names nothing, the stored id scoped to a workspace
-    // that does not hold it, a dataset held by no workspace at all, and a
-    // `datasetVersion` other than the one this store holds. Each is resolved
-    // BEFORE the page is cut, so paging query is no excuse to answer success.
-    let rows: Vec<(&str, String, &str, Vec<String>)> = vec![
+    // extra query, the absence the refusal states) — an id that names nothing, the
+    // stored id scoped to a workspace that does not hold it, a dataset held by no
+    // workspace at all, a `datasetVersion` other than the one this store holds,
+    // and a workspace this service does not hold at all. Each is resolved BEFORE
+    // the page is cut, so paging query is no excuse to answer success.
+    let rows: Vec<(&str, String, &str, Vec<String>, String)> = vec![
         (
             "an id no dataset carries",
             ABSENT_TIME_SERIES.to_string(),
             WORKSPACE,
             Vec::new(),
+            not_found_message(RESOURCE_DATASET, ABSENT_TIME_SERIES),
         ),
         (
             "an id no dataset carries, with a page size",
             ABSENT_TIME_SERIES.to_string(),
             WORKSPACE,
             vec!["maxResults=1".to_string()],
+            not_found_message(RESOURCE_DATASET, ABSENT_TIME_SERIES),
         ),
         (
             "the stored dataset under another workspace",
             fixture.dataset_id.clone(),
             OTHER_WORKSPACE,
             Vec::new(),
+            not_found_message(RESOURCE_DATASET, &fixture.dataset_id),
         ),
         (
             "a dataset held by no workspace",
             outside.clone(),
             WORKSPACE,
             Vec::new(),
+            not_found_message(RESOURCE_DATASET, &outside),
         ),
         (
             "a datasetVersion the store does not hold",
             fixture.dataset_id.clone(),
             WORKSPACE,
             vec!["datasetVersion=2".to_string()],
+            not_found_message(RESOURCE_DATASET, &fixture.dataset_id),
         ),
         (
             "the version a dataset reaches only after a write",
             fixture.dataset_id.clone(),
             WORKSPACE,
             vec!["datasetVersion=7".to_string()],
+            not_found_message(RESOURCE_DATASET, &fixture.dataset_id),
+        ),
+        (
+            "a workspace this service does not hold",
+            fixture.dataset_id.clone(),
+            "segment-ghost",
+            Vec::new(),
+            not_found_message(RESOURCE_WORKSPACE, "segment-ghost"),
         ),
     ];
 
-    for (case, dataset_id, workspace, extra) in rows {
+    for (case, dataset_id, workspace, extra, expected) in rows {
         let (status, body) = list_raw(&router, &dataset_id, workspace, &extra).await;
         assert_eq!(
             status, 404,
@@ -734,9 +753,8 @@ async fn a_dataset_the_request_does_not_resolve_is_refused_rather_than_empty() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(not_found_message(RESOURCE_DATASET, &dataset_id).as_str()),
-            "case {case:?}: the refusal must name the dataset that resolved to nothing, \
-             got {body}"
+            Some(expected.as_str()),
+            "case {case:?}: the refusal must name the resource that is absent, got {body}"
         );
     }
 

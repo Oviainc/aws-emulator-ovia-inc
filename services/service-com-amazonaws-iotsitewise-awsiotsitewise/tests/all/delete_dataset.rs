@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_iotsitewise_awsiotsitewise::state::{
-    not_found_message, service_state, DataSegmentRecord, RESOURCE_DATASET,
+    not_found_message, service_state, DataSegmentRecord, RESOURCE_DATASET, RESOURCE_WORKSPACE,
 };
 
 use crate::asset_lifecycle::{call, error_code, router_with_engine};
@@ -187,6 +187,18 @@ fn assert_accepted(case: &str, status: u16, body: &Value) {
 
 /// Assert that `body` is the modelled absence of `dataset_id`, for `case`.
 fn assert_absent(case: &str, status: u16, body: &Value, dataset_id: &str) {
+    assert_absent_resource(
+        case,
+        status,
+        body,
+        &not_found_message(RESOURCE_DATASET, dataset_id),
+    );
+}
+
+/// Assert that `body` is the modelled absence stated by `expected`, for `case` —
+/// the dataset the request named, or the workspace it scoped itself to when this
+/// service holds no such workspace.
+fn assert_absent_resource(case: &str, status: u16, body: &Value, expected: &str) {
     assert_eq!(
         status, 404,
         "case {case:?}: expected 404, got {status} {body}"
@@ -198,8 +210,8 @@ fn assert_absent(case: &str, status: u16, body: &Value, dataset_id: &str) {
     );
     assert_eq!(
         body["message"].as_str(),
-        Some(not_found_message(RESOURCE_DATASET, dataset_id).as_str()),
-        "case {case:?}: the refusal must name the dataset that resolved to nothing, got {body}"
+        Some(expected),
+        "case {case:?}: the refusal must name the resource that is absent, got {body}"
     );
 }
 
@@ -563,30 +575,46 @@ async fn an_id_the_request_does_not_resolve_is_refused_and_removes_nothing() {
     neighbour[at] = '0';
     let neighbour: String = neighbour.into_iter().collect();
 
-    // (case, the id the request names, the workspace it scopes itself to)
-    let rows: Vec<(&str, String, Option<&str>)> = vec![
-        ("an id that names no dataset", ABSENT_DATASET.to_string(), None),
-        ("an id one nibble from a stored one", neighbour, None),
+    // (case, the id the request names, the workspace it scopes itself to, the
+    // absence the refusal states) — a request scoping itself to a workspace this
+    // service does not hold reports THAT workspace, because a delete resolves the
+    // workspace its request names before the dataset it scopes to it.
+    let rows: Vec<(&str, String, Option<&str>, String)> = vec![
+        (
+            "an id that names no dataset",
+            ABSENT_DATASET.to_string(),
+            None,
+            not_found_message(RESOURCE_DATASET, ABSENT_DATASET),
+        ),
+        (
+            "an id one nibble from a stored one",
+            neighbour.clone(),
+            None,
+            not_found_message(RESOURCE_DATASET, &neighbour),
+        ),
         (
             "a stored id scoped to another workspace",
             dataset.clone(),
             Some(OTHER_WORKSPACE),
+            not_found_message(RESOURCE_DATASET, &dataset),
         ),
         (
             "a stored id scoped to a workspace nobody opened",
             dataset.clone(),
             Some("kiln-ghost"),
+            not_found_message(RESOURCE_WORKSPACE, "kiln-ghost"),
         ),
         (
             "a dataset of no workspace scoped to one",
             external.clone(),
             Some(WORKSPACE),
+            not_found_message(RESOURCE_DATASET, &external),
         ),
     ];
 
-    for (case, target, workspace) in rows {
+    for (case, target, workspace, expected) in rows {
         let (status, body) = delete_dataset(&router, &target, workspace, None).await;
-        assert_absent(case, status, &body, &target);
+        assert_absent_resource(case, status, &body, &expected);
 
         // The refused delete removed nothing: every dataset, every segment and every
         // sample is where it was.
