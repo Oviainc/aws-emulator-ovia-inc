@@ -238,7 +238,8 @@ pub(crate) struct Refusing {
 /// [`SubmittedEcho::Unrendered`], an ABSENT member is [`SubmittedEcho::Absent`], and
 /// everything this walk can render — including a LIST as `[<element>, …]` and a STRUCTURE
 /// as `<ShapeName>(<member>=<value>, …)`, the form the AWS SDKs print a modelled structure
-/// in — is [`SubmittedEcho::Rendered`]. Which of them a clause quotes, and how long a
+/// in, or over every member the shape declares where the caller states that form
+/// ([`refusing_violations_with_declared_echoes_over`]) — is [`SubmittedEcho::Rendered`]. Which of them a clause quotes, and how long a
 /// value it is willing to quote, stays with the service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmittedEcho {
@@ -303,6 +304,44 @@ pub fn refusing_violations_with_echoes_over<O: Operation>(
         .collect()
 }
 
+/// As [`refusing_violations_with_echoes_over`], with a STRUCTURE rendered over EVERY member
+/// its shape declares — one the request left unset as `null` — and with a structure reached
+/// as a struct MEMBER rendered too, under the shape name its own members carry.
+///
+/// The two forms a value of structure type is printed in differ in exactly that: the
+/// server-side validation layer in front of a service prints a modelled structure with its
+/// unset members named (`Thing(name=n, size=null)`), while the client SDKs print only the
+/// members that are set (`Thing(name=n)`) — so which one a clause quotes is a fact about
+/// the service whose refusal is being reproduced, and is chosen here rather than guessed.
+/// Everything else is [`refusing_violations_with_echoes_over`]'s: the same collecting walk,
+/// the same violations, the same per-value and per-message echo bounds.
+///
+/// ONE LEVEL DEEP, and this is a limit of the frozen schema crate rather than a choice: a
+/// structure reached as a struct MEMBER is written against the MEMBER's schema, which
+/// carries the member's own name and nothing of its target shape — no shape name (recovered
+/// here from the members the structure wrote, [`declaring_shape`]) and no member list. Such
+/// a structure therefore renders over the members that were SET, which is the same text
+/// whenever every member its shape declares was sent (the single-member destination shapes
+/// are that case) and states one member too few when it was not. Rendering it over its
+/// declared members needs the target shape's members on the member schema, which only
+/// `aws-smithy-schema` can carry; the fail-safe directions are taken meanwhile — a
+/// structure the walk cannot name at all renders as nothing, and a composite with an
+/// unrenderable child renders as nothing, so a clause states the framework's own summary
+/// rather than a value missing a part of itself.
+#[must_use]
+pub fn refusing_violations_with_declared_echoes_over<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+    max_positions: usize,
+) -> Vec<(Violation, SubmittedEcho)> {
+    let refusing = violations_in::<O>(protocol, req, Echoes::DeclaredRenderingsOver(max_positions));
+    refusing
+        .violations
+        .into_iter()
+        .zip(refusing.echoes)
+        .collect()
+}
+
 /// Whether a collected violation's value echo is restored to the bytes the caller sent.
 ///
 /// A service whose refusal QUOTES the value needs it restored; one whose refusal reports
@@ -326,6 +365,25 @@ pub(crate) enum Echoes {
     /// As [`Self::Renderings`], over as many member positions as the SERVICE states
     /// ([`with_submitted_echoes_over`]) instead of [`MAX_RECORDED_LEAVES`].
     RenderingsOver(usize),
+    /// As [`Self::RenderingsOver`], with a structure rendered over every member its shape
+    /// declares ([`refusing_violations_with_declared_echoes_over`]).
+    DeclaredRenderingsOver(usize),
+}
+
+/// Which members a STRUCTURE is rendered over inside a clause.
+///
+/// Both forms are printed by AWS, by different layers (see
+/// [`refusing_violations_with_declared_echoes_over`]), so the caller states the one its
+/// recordings show rather than this walk picking one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum StructureForm {
+    /// The members the request SET, in the order the value wrote them, and only for a
+    /// structure whose own shape schema is at hand to name it.
+    #[default]
+    MembersSet,
+    /// Every member the shape DECLARES, in declaration order, with one the request left
+    /// unset rendered as `null`.
+    EveryMemberDeclared,
 }
 
 /// The ONE collecting walk this crate performs: every violation that refuses `req` before
@@ -387,6 +445,22 @@ pub(crate) fn violations_in<O: Operation>(
                         &input,
                         O::INPUT_SCHEMA,
                         max_positions,
+                    )
+                    .into_iter()
+                    .unzip();
+                    Refusing {
+                        violations,
+                        lists: HashMap::new(),
+                        echoes,
+                    }
+                }
+                Echoes::DeclaredRenderingsOver(max_positions) => {
+                    let (violations, echoes) = echoed_over(
+                        violations,
+                        &input,
+                        O::INPUT_SCHEMA,
+                        max_positions,
+                        StructureForm::EveryMemberDeclared,
                     )
                     .into_iter()
                     .unzip();
@@ -591,6 +665,26 @@ pub fn with_submitted_echoes_over(
     schema: &Schema,
     max_positions: usize,
 ) -> Vec<(Violation, SubmittedEcho)> {
+    echoed_over(
+        violations,
+        input,
+        schema,
+        max_positions,
+        StructureForm::MembersSet,
+    )
+}
+
+/// [`with_submitted_echoes_over`], with the STRUCTURE form the caller states.
+///
+/// The one body both echo modes run: the walk, the path spelling and the echo bounds are
+/// the same, so the two forms cannot drift into two walks.
+fn echoed_over(
+    violations: Vec<Violation>,
+    input: &dyn SerializableStruct,
+    schema: &Schema,
+    max_positions: usize,
+    structures: StructureForm,
+) -> Vec<(Violation, SubmittedEcho)> {
     // A refusal that states no value at all (an absent `@required` member is the common
     // case) is not worth a walk over the whole input.
     if violations.iter().all(|violation| violation.value.is_none()) {
@@ -599,7 +693,7 @@ pub fn with_submitted_echoes_over(
             .map(|violation| (violation, SubmittedEcho::Absent))
             .collect();
     }
-    let renderings = submitted_renderings_over(input, schema, max_positions);
+    let renderings = renderings_in(input, schema, max_positions, structures);
     // ONE pass over the renderings builds the lookup, so the cost is O(positions) rather
     // than O(violations x positions).
     let mut by_path: HashMap<&str, Option<&str>> = HashMap::new();
@@ -1000,7 +1094,8 @@ fn collected_leaves(
 /// with any unrenderable child renders as `None` rather than as one missing a part of the
 /// value, and so does a map (no rule for how AWS states one in a clause is known here)
 /// and a structure reached as a struct MEMBER, whose schema names the member rather than
-/// the shape.
+/// the shape. The other structure form — every member the shape declares, an unset one as
+/// `null` — is [`refusing_violations_with_declared_echoes_over`]'s.
 ///
 /// Bounded by [`MAX_RECORDED_RENDERINGS`], [`MAX_RECORDED_RENDERED_BYTES`],
 /// [`MAX_RENDERED_CHILDREN`] and [`MAX_RESTORED_ECHO`], so neither the memory nor the
@@ -1028,11 +1123,23 @@ pub fn submitted_renderings_over(
     schema: &Schema,
     max_positions: usize,
 ) -> Vec<(String, Option<String>)> {
+    renderings_in(input, schema, max_positions, StructureForm::MembersSet)
+}
+
+/// [`submitted_renderings_over`], with the STRUCTURE form the caller states: the one walk
+/// both forms run.
+fn renderings_in(
+    input: &dyn SerializableStruct,
+    schema: &Schema,
+    max_positions: usize,
+    structures: StructureForm,
+) -> Vec<(String, Option<String>)> {
     // The ONLY walk that composes renderings: a caller that reads one named leaf
     // ([`submitted_leaves`], [`submitted_lists`]) pays nothing for them.
     let mut walk = SubmittedValues {
         renders: true,
         max_positions: Some(max_positions),
+        structures,
         ..SubmittedValues::default()
     };
     let _ = walk.write_struct(schema, input);
@@ -1040,12 +1147,33 @@ pub fn submitted_renderings_over(
 }
 
 /// One child of an open composite: the member name it reported under (absent for a
-/// collection element) and how its value renders.
+/// collection element), the shape that DECLARES that member, and how its value renders.
 #[derive(Debug)]
 struct RenderedChild {
     name: Option<String>,
+    /// The name of the shape this child is a member of, for a child written against a
+    /// MEMBER schema; `None` for a collection element. It is how a structure reached as a
+    /// struct member learns its own shape's name: that member schema names the member,
+    /// while the members the structure itself wrote name the structure (see
+    /// [`declaring_shape`]).
+    declared_by: Option<String>,
     rendering: Option<String>,
 }
+
+/// The name of the shape that DECLARES `schema`, when `schema` is a member schema.
+///
+/// A member's shape id is `<namespace>#<Shape>$<member>`, so the shape it belongs to is
+/// the part between the two separators. `None` for anything that is not a member schema.
+fn declaring_shape(schema: &Schema) -> Option<String> {
+    schema.member_name()?;
+    let id = schema.shape_id().to_string();
+    let (_, qualified) = id.split_once('#')?;
+    let (shape, _) = qualified.split_once('$')?;
+    Some(shape.to_string())
+}
+
+/// How a member the request left UNSET is stated inside a rendered structure.
+const UNSET_MEMBER: &str = "null";
 
 /// The children of one composite being walked, and whether more arrived than
 /// [`MAX_RENDERED_CHILDREN`] allows, one of them was larger than a composite may hold,
@@ -1137,6 +1265,55 @@ fn rendered_structure(name: &str, children: &[RenderedChild]) -> Option<String> 
     Some(format!("{name}({})", members.join(", ")))
 }
 
+/// `children` as a structure renders over the members `declared` names: the shape's name
+/// over EVERY member its shape declares, in declaration order, each `<member>=<value>`,
+/// with one the request left unset stated as [`UNSET_MEMBER`] — the form the validation
+/// layer in front of an AWS service prints a modelled structure in
+/// ([`refusing_violations_with_declared_echoes_over`]).
+///
+/// `None` on the same terms as [`rendered_structure`]: a member that WAS written and has
+/// no text rendering suppresses the whole structure, so one carrying a blob or a map
+/// states no value at all rather than one missing a part of itself, and so does a
+/// rendering longer than [`MAX_RESTORED_ECHO`], measured before it is built.
+fn rendered_declared_structure(
+    name: &str,
+    declared: &[String],
+    children: &[RenderedChild],
+) -> Option<String> {
+    let mut length = name.len() + 2;
+    let mut members: Vec<String> = Vec::with_capacity(declared.len());
+    for member in declared {
+        let rendering = match children
+            .iter()
+            .find(|child| child.name.as_deref() == Some(member.as_str()))
+        {
+            Some(child) => child.rendering.as_deref()?,
+            None => UNSET_MEMBER,
+        };
+        if !members.is_empty() {
+            length += 2; // ", "
+        }
+        length += member.len() + 1 + rendering.len();
+        if length > MAX_RESTORED_ECHO {
+            return None;
+        }
+        members.push(format!("{member}={rendering}"));
+    }
+    Some(format!("{name}({})", members.join(", ")))
+}
+
+/// The members `schema` DECLARES, in declaration order, spelled as a clause spells a
+/// member — empty for a schema that declares none, and for a member schema, which carries
+/// the member's own name rather than its target shape's members.
+fn declared_members(schema: &Schema) -> Vec<String> {
+    schema
+        .members()
+        .iter()
+        .filter_map(|member| member.member_name())
+        .map(path::member)
+        .collect()
+}
+
 /// A frame of the collection stack, mirroring the one the validating walk keeps so a
 /// leaf's path is spelled identically.
 ///
@@ -1182,6 +1359,9 @@ struct SubmittedValues {
     /// Whether this walk composes renderings at all. Off by default, so a caller that
     /// only reads leaves pays neither the frames nor the owned text for them.
     renders: bool,
+    /// Which members a STRUCTURE renders over, as the caller stated it
+    /// ([`StructureForm`]).
+    structures: StructureForm,
     /// The member positions this walk may visit and record, or `None` for
     /// [`MAX_RECORDED_LEAVES`], the count this module states. A caller whose model
     /// declares a collection larger than that count states its own ceiling
@@ -1345,6 +1525,12 @@ impl SubmittedValues {
         if let Some(open) = self.open.last_mut() {
             open.take(RenderedChild {
                 name: Self::segment_for(schema),
+                // Read only by the form that needs it, so the other form pays no
+                // allocation for a shape name nothing will state.
+                declared_by: match self.structures {
+                    StructureForm::EveryMemberDeclared => declaring_shape(schema),
+                    StructureForm::MembersSet => None,
+                },
                 rendering,
             });
         }
@@ -1452,21 +1638,43 @@ impl SubmittedValues {
         }
         let rendering = match frame {
             Some(Frame::List { .. }) => rendered_sequence(&composite.children),
-            // A structure renders under its SHAPE's name, which only the shape's own
-            // schema carries: a list element is written against the element struct's own
-            // schema (`&Inner::SCHEMA`, from the generated `serialize_members`), while a
-            // struct reached as a MEMBER carries the member schema, whose name is the
-            // member's. Rendering that one would state `<member>(…)`, a form AWS never
-            // emits, so such a structure renders as nothing and the service states no
-            // value for it.
-            Some(Frame::Struct) if schema.member_name().is_none() => {
-                rendered_structure(schema.shape_id().shape_name(), &composite.children)
-            }
+            Some(Frame::Struct) => self.rendered_struct(schema, &composite.children),
             // A map: no rule for how AWS states one inside a clause is known here, so a
             // clause on a map member states no value rather than a form AWS never emits.
             _ => None,
         };
         rendering.filter(|rendered| rendered.len() <= MAX_RESTORED_ECHO)
+    }
+
+    /// One closed STRUCT frame, rendered in the form the caller stated
+    /// ([`StructureForm`]).
+    ///
+    /// A structure renders under its SHAPE's name, which only the shape's own schema
+    /// carries: a list element is written against the element struct's own schema
+    /// (`&Inner::SCHEMA`, from the generated `serialize_members`), while a struct reached
+    /// as a MEMBER carries the member schema, whose name is the member's. Rendering that
+    /// one would state `<member>(…)`, a form AWS never emits — so under
+    /// [`StructureForm::MembersSet`] such a structure renders as nothing, and under
+    /// [`StructureForm::EveryMemberDeclared`] it is named by the shape its own members
+    /// declare ([`declaring_shape`]), which is the one fact about it the member schema
+    /// does not carry. The members that shape DECLARES are not reachable that way, so a
+    /// structure reached as a member renders over the members it wrote even in that form.
+    fn rendered_struct(&self, schema: &Schema, children: &[RenderedChild]) -> Option<String> {
+        match (self.structures, schema.member_name()) {
+            (StructureForm::MembersSet, None) => {
+                rendered_structure(schema.shape_id().shape_name(), children)
+            }
+            (StructureForm::MembersSet, Some(_)) => None,
+            (StructureForm::EveryMemberDeclared, None) => rendered_declared_structure(
+                schema.shape_id().shape_name(),
+                &declared_members(schema),
+                children,
+            ),
+            (StructureForm::EveryMemberDeclared, Some(_)) => {
+                let name = children.iter().find_map(|child| child.declared_by.as_deref())?;
+                rendered_structure(name, children)
+            }
+        }
     }
 }
 
@@ -1612,11 +1820,11 @@ impl ShapeSerializer for SubmittedValues {
 #[cfg(test)]
 mod tests {
     use super::{
-        echo_of, is_elision_of, list_of_element, quoted_echo, rendered_sequence,
-        rendered_structure, unanchored, unanchored_grouping_alternation, Composite, RenderedChild,
-        Submitted, SubmittedEcho, SubmittedValues, MAX_RECORDED_BYTES, MAX_RECORDED_LEAVES,
-        MAX_RECORDED_RENDERED_BYTES, MAX_RECORDED_RENDERINGS, MAX_RENDERED_CHILDREN,
-        MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
+        echo_of, is_elision_of, list_of_element, quoted_echo, rendered_declared_structure,
+        rendered_sequence, rendered_structure, unanchored, unanchored_grouping_alternation,
+        Composite, RenderedChild, Submitted, SubmittedEcho, SubmittedValues, MAX_RECORDED_BYTES,
+        MAX_RECORDED_LEAVES, MAX_RECORDED_RENDERED_BYTES, MAX_RECORDED_RENDERINGS,
+        MAX_RENDERED_CHILDREN, MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
     };
     use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
     use std::collections::HashMap;
@@ -2036,6 +2244,7 @@ mod tests {
     fn a_composite_renders_from_the_children_it_was_given() {
         let child = |name: Option<&str>, rendering: Option<&str>| RenderedChild {
             name: name.map(str::to_string),
+            declared_by: name.map(|_| "Thing".to_string()),
             rendering: rendering.map(str::to_string),
         };
         let sequences: [(&str, Vec<RenderedChild>, Option<&str>); 4] = [
@@ -2098,6 +2307,81 @@ mod tests {
         }
     }
 
+    /// RULE: in the DECLARED form a structure renders over every member its shape
+    /// declares, in declaration order, with one the request left unset stated as `null`;
+    /// a member that WAS written and has no text rendering still suppresses the whole
+    /// structure.
+    #[test]
+    fn a_declared_structure_names_every_member_its_shape_declares() {
+        let child = |name: &str, rendering: Option<&str>| RenderedChild {
+            name: Some(name.to_string()),
+            declared_by: Some("Thing".to_string()),
+            rendering: rendering.map(str::to_string),
+        };
+        let declared = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|name| (*name).to_string()).collect()
+        };
+
+        // (case, the members the shape declares, the children the request wrote, the
+        // rendering). The rows differ along which declared members were set, how many
+        // were not, and where the unset ones sit in the declaration order.
+        struct Row {
+            case: &'static str,
+            declared: Vec<String>,
+            children: Vec<RenderedChild>,
+            expected: Option<&'static str>,
+        }
+
+        let rows = [
+            Row {
+                case: "a shape declaring nothing",
+                declared: declared(&[]),
+                children: vec![],
+                expected: Some("Thing()"),
+            },
+            Row {
+                case: "every declared member set",
+                declared: declared(&["name", "size"]),
+                children: vec![child("name", Some("n")), child("size", Some("2"))],
+                expected: Some("Thing(name=n, size=2)"),
+            },
+            Row {
+                case: "a trailing member left unset",
+                declared: declared(&["name", "size"]),
+                children: vec![child("name", Some("n"))],
+                expected: Some("Thing(name=n, size=null)"),
+            },
+            Row {
+                case: "a leading member left unset",
+                declared: declared(&["name", "size"]),
+                children: vec![child("size", Some("2"))],
+                expected: Some("Thing(name=null, size=2)"),
+            },
+            Row {
+                case: "every declared member left unset",
+                declared: declared(&["name", "size", "body"]),
+                children: vec![],
+                expected: Some("Thing(name=null, size=null, body=null)"),
+            },
+            Row {
+                case: "a member written with no text rendering",
+                declared: declared(&["name", "body"]),
+                children: vec![child("name", Some("n")), child("body", None)],
+                expected: None,
+            },
+        ];
+        for row in rows {
+            let actual = rendered_declared_structure("Thing", &row.declared, &row.children);
+            assert_eq!(
+                actual.as_deref(),
+                row.expected,
+                "case {:?}: expected {:?}, got {actual:?}",
+                row.case,
+                row.expected
+            );
+        }
+    }
+
     /// RULE: what a composite may hold is bounded by BYTES as well as by child count, and
     /// a rendering past [`MAX_RESTORED_ECHO`] is refused before it is built — so neither
     /// the text this walk retains nor the text it allocates is sized by the request.
@@ -2105,6 +2389,7 @@ mod tests {
     fn a_composite_is_bounded_by_the_bytes_its_children_hold() {
         let child = |rendering: &str| RenderedChild {
             name: Some("name".to_string()),
+            declared_by: Some("Thing".to_string()),
             rendering: Some(rendering.to_string()),
         };
 
@@ -2150,6 +2435,15 @@ mod tests {
         assert_eq!(
             structure, None,
             "case an oversized structure: expected no rendering, got {structure:?}"
+        );
+        let declared = rendered_declared_structure(
+            "Thing",
+            &["name".to_string()],
+            &[child(&"a".repeat(MAX_RESTORED_ECHO))],
+        );
+        assert_eq!(
+            declared, None,
+            "case an oversized declared structure: expected no rendering, got {declared:?}"
         );
     }
 

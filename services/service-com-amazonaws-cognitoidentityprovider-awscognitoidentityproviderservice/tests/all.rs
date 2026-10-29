@@ -43,6 +43,8 @@ mod admin_user_pool_lifecycle;
 mod auth_flow_not_enabled;
 #[path = "all/clock_dependent_state.rs"]
 mod clock_dependent_state;
+#[path = "all/constraint_refusal_values.rs"]
+mod constraint_refusal_values;
 #[path = "all/delete_group.rs"]
 mod delete_group;
 #[path = "all/delete_identity_provider.rs"]
