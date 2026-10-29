@@ -880,6 +880,40 @@ pub const CROSS_ACCOUNT_MESSAGE: &str = "Invalid permission to access another ac
      this is an organization account, request the management account to enable service \
      access.";
 
+/// What the recommendation-preference API answers when the ARN a request names is not one it
+/// can resolve a resource from — "Only EC2 instance and Auto Scaling group ARNs are currently
+/// supported" (`GetEffectiveRecommendationPreferences$resourceArn`, `Scope$value`).
+///
+/// The service's own constant refusal for the condition: it states that the ARN is not valid
+/// and what to do about it, and names neither the member it arrived on nor the rejected value,
+/// so caller-supplied input is never reflected back in the error body. ONE spelling for the
+/// preference surface, so its reader and its writers cannot word the same refusal differently.
+pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid Amazon Resource Name (ARN) specified. \
+     Please check the resource name and try again.";
+
+/// What `PutRecommendationPreferences` answers a preference for an Auto Scaling group asked
+/// for at the organization or account level: "You cannot create recommendation preferences for
+/// Auto Scaling groups at the organization and account levels. You can create recommendation
+/// preferences for Auto Scaling groups only at the resource level by specifying a scope name
+/// of ResourceArn and a scope value of the Auto Scaling group Amazon Resource Name (ARN)"
+/// (`PutRecommendationPreferences$scope`).
+///
+/// The service's own constant refusal for the condition — it names the scope names that cannot
+/// be used and the remediation, and takes nothing from the request.
+pub const AUTO_SCALING_GROUP_SCOPE_MESSAGE: &str = "You cannot create a recommendation \
+     preference for an Auto Scaling Group with the \"Organization\" or \"AccountId\" scope \
+     name. Specify \"ResourceArn\" as the scope name, the Auto Scaling group ARN ID as the \
+     scope value, and try again.";
+
+/// What `UpdateEnrollmentStatus` answers a `status` a client cannot set: "The Pending and
+/// Failed options cannot be used to update the enrollment status of an account"
+/// (`UpdateEnrollmentStatus$status`).
+///
+/// The service's own constant refusal for the condition — it names the two statuses a client
+/// may supply, and neither the member nor the rejected value.
+pub const INVALID_ENROLLMENT_STATUS_MESSAGE: &str = "Invalid status, should be 'Active' or \
+     'Inactive'.";
+
 /// What this service answers a caller that asks for `includeMemberAccounts` — the
 /// organization-wide switch — while it manages no organization.
 ///
@@ -1023,11 +1057,10 @@ pub fn scope_rejection(scope: Option<&Scope>) -> Option<String> {
              not {value}."
         )),
         (Some(SCOPE_RESOURCE_ARN), Some(value)) if parse_resource_arn(value).is_none() => {
-            Some(format!(
-                "The value supplied for parameter scope is not valid: the value of a \
-                 {SCOPE_RESOURCE_ARN} scope must be the Amazon Resource Name (ARN) of an EC2 \
-                 instance or an Auto Scaling group, not {value}."
-            ))
+            // The same ARN the preference reader resolves a resource from, so the same
+            // refusal it answers an ARN it cannot resolve with
+            // ([`INVALID_RESOURCE_ARN_MESSAGE`]).
+            Some(INVALID_RESOURCE_ARN_MESSAGE.to_string())
         }
         (Some(_), Some(_)) => None,
     }

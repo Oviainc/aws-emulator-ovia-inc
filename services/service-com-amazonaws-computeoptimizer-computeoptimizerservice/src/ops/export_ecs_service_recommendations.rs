@@ -226,7 +226,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 fields_to_export: input.fields_to_export.as_deref(),
                 exportable_fields: EXPORTABLE_E_C_S_SERVICE_FIELD_VALUES,
                 file_format: input.file_format,
-                one_job_in_progress: ONE_JOB_IN_PROGRESS,
                 // This surface's model declares no `recommendationPreferences`, so there is
                 // no preference for the export to be generated under.
                 recommendation_preferences: None,
@@ -246,13 +245,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// the export is of the recommendations `GetECSServiceRecommendations` reports, whose
 /// analysed resources are Amazon ECS services.
 const EXPORTED_RESOURCE_TYPE: &str = crate::state::RESOURCE_TYPE_ECS_SERVICE;
-
-/// The one-job-in-progress limit this operation documents: "You can only have one Amazon ECS
-/// service export job in progress per Amazon Web Services Region." The shared admission rule
-/// refuses a second in-progress export of this resource type with it, naming the job that
-/// still holds it.
-const ONE_JOB_IN_PROGRESS: &str = "You can only have one Amazon ECS service export job in \
-                                   progress per Amazon Web Services Region.";
 
 /// Lift a refusal of the shared export rule into this operation's modelled error channel:
 /// a 400 `InvalidParameterValueException` ("The value supplied for the input parameter is out

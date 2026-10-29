@@ -239,6 +239,14 @@ pub const MISSING_DESTINATION_MESSAGE: &str =
     "The Amazon S3 destination provided does not exist. Confirm your S3 destination and try \
      again.";
 
+/// What every export operation answers a request made while one of its own resource type is
+/// still in flight: the service's own constant sentence for the condition. It states the limit
+/// and nothing else — neither the resource type, nor the Region, nor the job that still holds
+/// the slot — so the refusal is the same text for every export surface and every run, and ONE
+/// spelling serves the whole crate.
+pub const EXPORT_JOB_LIMIT_MESSAGE: &str = "Export job limit exceeded. You can only have one \
+     active job per resource type at a time.";
+
 /// The columns of an export file: the fields the request asked for, in the order it asked for
 /// them, or — for a request that names none — every field the resource type's
 /// `Exportable*Field` enum declares.
@@ -317,9 +325,6 @@ pub struct ExportRequest<'a, F: ExportFilter> {
     /// The `fileFormat` the request asked for, or `None` for the one format the model
     /// declares ([`FILE_FORMAT_CSV`]).
     pub file_format: Option<String>,
-    /// The one-job-in-progress sentence this operation documents, which the refusal of a
-    /// second in-progress export of this resource type opens with.
-    pub one_job_in_progress: &'a str,
     /// The `recommendationPreferences` the request carries, for the export surfaces whose
     /// model declares that member, and `None` for the surfaces that declare none. It
     /// "describes the recommendation preferences to return in the response of a
@@ -388,7 +393,9 @@ pub struct CreatedExport {
 /// whose endpoint created it, and so does the one-job-in-progress limit each export operation
 /// documents: "You can have only one ... export job in progress per Amazon Web Services
 /// Region", which a job that has reached its terminal status no longer holds, and which a job
-/// of another resource type never holds against this one.
+/// of another resource type never holds against this one. That refusal carries the service's
+/// one constant sentence for the condition ([`EXPORT_JOB_LIMIT_MESSAGE`]), whatever the
+/// resource type and whichever job holds the slot.
 pub fn create_export_job<Eng: Send + Sync + 'static, F: ExportFilter>(
     engine: &Arc<Eng>,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -485,15 +492,14 @@ pub fn create_export_job<Eng: Send + Sync + 'static, F: ExportFilter>(
 
     guard.export_jobs.prune_expired(now);
 
-    if let Some(running) = guard
+    if guard
         .export_jobs
         .in_progress_in(&region, request.resource_type, now)
+        .is_some()
     {
-        let running = running.job_id.clone();
-        let documented = request.one_job_in_progress;
-        return Err(ExportRefusal::LimitExceeded(format!(
-            "{documented} Export job {running} is still in progress."
-        )));
+        return Err(ExportRefusal::LimitExceeded(
+            EXPORT_JOB_LIMIT_MESSAGE.to_string(),
+        ));
     }
     if !guard.export_jobs.can_hold() {
         return Err(ExportRefusal::LimitExceeded(format!(

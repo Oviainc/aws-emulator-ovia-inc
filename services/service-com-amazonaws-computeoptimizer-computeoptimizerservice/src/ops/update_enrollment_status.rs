@@ -188,21 +188,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // documentation: "The Pending and Failed options cannot be used to update the
         // enrollment status of an account. They are returned in the response of a request
         // to update the enrollment status of an account." Refused before anything is
-        // written, so a refused call leaves the stored record exactly as it was.
+        // written, so a refused call leaves the stored record exactly as it was, and with
+        // the service's own sentence for the condition
+        // ([`crate::state::INVALID_ENROLLMENT_STATUS_MESSAGE`]), which names neither this
+        // member nor the value that arrived on it.
         if input.status != crate::state::STATUS_ACTIVE
             && input.status != crate::state::STATUS_INACTIVE
         {
             return Err(
                 UpdateEnrollmentStatusErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
-                        message: Some(format!(
-                            "The value supplied for parameter status is not valid: {} cannot be \
-                             used to update the enrollment status of an account. Valid values are \
-                             {} and {}.",
-                            input.status,
-                            crate::state::STATUS_ACTIVE,
-                            crate::state::STATUS_INACTIVE,
-                        )),
+                        message: Some(
+                            crate::state::INVALID_ENROLLMENT_STATUS_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

@@ -218,17 +218,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // supported." The ARN also names the resource type whose preferences apply and
         // the account that owns the resource. Refused before the store is
         // read, so InvalidParameterValueException takes precedence over the opt-in gate,
-        // as it does in the other preference operations.
+        // as it does in the other preference operations. The refusal carries the service's
+        // own ARN-validation sentence ([`crate::state::INVALID_RESOURCE_ARN_MESSAGE`]),
+        // which names neither this member nor the value that arrived on it.
         let Some(resource) = crate::state::parse_resource_arn(&input.resource_arn) else {
             return Err(
                 GetEffectiveRecommendationPreferencesErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
-                        message: Some(format!(
-                            "The value supplied for parameter resourceArn is not valid: {} is not \
-                             the Amazon Resource Name (ARN) of an EC2 instance or an Auto Scaling \
-                             group.",
-                            input.resource_arn,
-                        )),
+                        message: Some(crate::state::INVALID_RESOURCE_ARN_MESSAGE.to_string()),
                     },
                 )
                 .into(),

@@ -231,7 +231,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 fields_to_export: input.fields_to_export.as_deref(),
                 exportable_fields: EXPORTABLE_R_D_S_D_B_FIELD_VALUES,
                 file_format: input.file_format,
-                one_job_in_progress: ONE_JOB_IN_PROGRESS,
                 // `recommendationPreferences` "describes the recommendation preferences to
                 // return in the response of a … GetRDSDatabaseRecommendations … request", so
                 // an export of those same recommendations is of the recommendations those
@@ -256,13 +255,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// analysed rows are the DB instance ones. The `ResourceType` domain, not the
 /// `RecommendationSourceType` one a findings row carries.
 const EXPORTED_RESOURCE_TYPE: &str = crate::state::RESOURCE_TYPE_RDS_DB_INSTANCE;
-
-/// The one-job-in-progress limit this operation documents: "You can have only one Amazon
-/// Aurora or RDS export job in progress per Amazon Web Services Region." The shared admission
-/// rule refuses a second in-progress export of this resource type with it, naming the job that
-/// still holds it.
-const ONE_JOB_IN_PROGRESS: &str = "You can have only one Amazon Aurora or RDS export job in \
-                                   progress per Amazon Web Services Region.";
 
 /// Lift a refusal of the shared export rule into this operation's modelled error channel:
 /// a 400 `InvalidParameterValueException` ("The value supplied for the input parameter is out

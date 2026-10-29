@@ -321,15 +321,13 @@ fn request_rejection(input: &PutRecommendationPreferencesInput) -> Option<String
     // the organization and account levels. You can create recommendation preferences for
     // Auto Scaling groups only at the resource level by specifying a scope name of
     // ResourceArn and a scope value of the Auto Scaling group Amazon Resource Name (ARN)."
+    // The refusal carries the service's own sentence for the condition
+    // ([`crate::state::AUTO_SCALING_GROUP_SCOPE_MESSAGE`]), which takes nothing from the
+    // request.
     if input.resource_type == crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP
         && scope_name != Some(crate::state::SCOPE_RESOURCE_ARN)
     {
-        return Some(format!(
-            "The value supplied for parameter scope is not valid: a {} recommendation \
-             preference can only be created at the resource level, with a scope name of {}.",
-            crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP,
-            crate::state::SCOPE_RESOURCE_ARN,
-        ));
+        return Some(crate::state::AUTO_SCALING_GROUP_SCOPE_MESSAGE.to_string());
     }
 
     // Each preference member is settable only for the `ResourceType` values the service

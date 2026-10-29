@@ -19,7 +19,9 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::export::MISSING_DESTINATION_MESSAGE;
+use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::export::{
+    EXPORT_JOB_LIMIT_MESSAGE, MISSING_DESTINATION_MESSAGE,
+};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
     EXPORT_JOB_STEP, RESOURCE_TYPE_AUTO_SCALING_GROUP, RESOURCE_TYPE_EBS_VOLUME,
     RESOURCE_TYPE_EC2_INSTANCE, RESOURCE_TYPE_ECS_SERVICE, RESOURCE_TYPE_IDLE,
@@ -40,84 +42,58 @@ const BUCKET: &str = "shared-recommendation-exports";
 /// export job."
 const MISSING_BUCKET: &str = "no-such-recommendation-export-bucket";
 
-/// One export surface: the operation, the `ResourceType` its job carries and the
-/// one-job-in-progress sentence the model documents for it.
+/// One export surface: the operation and the `ResourceType` its job carries.
 struct Surface {
     /// The operation this row drives.
     operation: &'static str,
     /// The `ResourceType` of the job it records, from the crate's own constants.
     resource_type: &'static str,
-    /// The sentence this operation's documentation states the limit with, which its refusal
-    /// of a second in-progress export opens with.
-    one_job_in_progress: &'static str,
     /// The `keyPrefix` this row's request carries, so the rows also span the forms a
     /// destination prefix takes.
     key_prefix: Option<&'static str>,
 }
 
-/// Every operation that reaches the shared export rule, with the limit sentence each one
-/// documents.
-///
-/// The sentences are the model's own, one per operation
-/// (`smithy_query(query="doc",shape="Export<Resource>Recommendations")`) — note that the
-/// Amazon ECS surface words it "You can only have one" where the others say "You can have
-/// only one".
+/// Every operation that reaches the shared export rule.
 fn surfaces() -> Vec<Surface> {
     vec![
         Surface {
             operation: "ExportAutoScalingGroupRecommendations",
             resource_type: RESOURCE_TYPE_AUTO_SCALING_GROUP,
-            one_job_in_progress: "You can have only one Auto Scaling group export job in \
-                                  progress per Amazon Web Services Region.",
             key_prefix: None,
         },
         Surface {
             operation: "ExportEBSVolumeRecommendations",
             resource_type: RESOURCE_TYPE_EBS_VOLUME,
-            one_job_in_progress: "You can have only one Amazon EBS volume export job in \
-                                  progress per Amazon Web Services Region.",
             key_prefix: Some("volumes"),
         },
         Surface {
             operation: "ExportEC2InstanceRecommendations",
             resource_type: RESOURCE_TYPE_EC2_INSTANCE,
-            one_job_in_progress: "You can have only one Amazon EC2 instance export job in \
-                                  progress per Amazon Web Services Region.",
             key_prefix: Some("/instances/"),
         },
         Surface {
             operation: "ExportECSServiceRecommendations",
             resource_type: RESOURCE_TYPE_ECS_SERVICE,
-            one_job_in_progress: "You can only have one Amazon ECS service export job in \
-                                  progress per Amazon Web Services Region.",
             key_prefix: Some("fargate/services"),
         },
         Surface {
             operation: "ExportIdleRecommendations",
             resource_type: RESOURCE_TYPE_IDLE,
-            one_job_in_progress: "You can have only one idle resource export job in progress \
-                                  per Amazon Web Services Region.",
             key_prefix: Some(""),
         },
         Surface {
             operation: "ExportLambdaFunctionRecommendations",
             resource_type: RESOURCE_TYPE_LAMBDA_FUNCTION,
-            one_job_in_progress: "You can have only one Lambda function export job in \
-                                  progress per Amazon Web Services Region.",
             key_prefix: Some("a/b/c"),
         },
         Surface {
             operation: "ExportLicenseRecommendations",
             resource_type: RESOURCE_TYPE_LICENSE,
-            one_job_in_progress: "You can have only one license export job in progress per \
-                                  Amazon Web Services Region.",
             key_prefix: Some("licences/"),
         },
         Surface {
             operation: "ExportRDSDatabaseRecommendations",
             resource_type: RESOURCE_TYPE_RDS_DB_INSTANCE,
-            one_job_in_progress: "You can have only one Amazon Aurora or RDS export job in \
-                                  progress per Amazon Web Services Region.",
             key_prefix: Some("databases"),
         },
     ]
@@ -327,8 +303,9 @@ async fn every_export_operation_refuses_the_same_malformed_requests() {
 }
 
 /// Every export operation holds the one-job-in-progress limit it documents, counts it per
-/// resource type, and refuses the second call with that operation's own sentence naming the
-/// job still in progress.
+/// resource type, and refuses the second call with the service's one limit sentence
+/// ([`EXPORT_JOB_LIMIT_MESSAGE`]) — the same text on every surface, naming neither the
+/// resource type nor the job that still holds the slot.
 #[tokio::test]
 async fn every_export_operation_holds_the_limit_it_documents() {
     let router = enrolled_emulator().await;
@@ -361,13 +338,7 @@ async fn every_export_operation_holds_the_limit_it_documents() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(
-                format!(
-                    "{} Export job {first} is still in progress.",
-                    surface.one_job_in_progress
-                )
-                .as_str()
-            ),
+            Some(EXPORT_JOB_LIMIT_MESSAGE),
             "case {case:?}: unexpected message, got {body}"
         );
         first_jobs.push(first);

@@ -21,6 +21,8 @@ mod auto_scaling_group_recommendations;
 mod auto_scaling_group_recommendations_export;
 #[path = "all/auto_scaling_group_recommendations_export_file.rs"]
 mod auto_scaling_group_recommendations_export_file;
+#[path = "all/client_refusal_wording.rs"]
+mod client_refusal_wording;
 #[path = "all/cross_account_requests.rs"]
 mod cross_account_requests;
 #[path = "all/cross_account_resource_arns.rs"]

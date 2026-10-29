@@ -227,7 +227,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 fields_to_export: input.fields_to_export.as_deref(),
                 exportable_fields: EXPORTABLE_INSTANCE_FIELD_VALUES,
                 file_format: input.file_format,
-                one_job_in_progress: ONE_JOB_IN_PROGRESS,
                 // "When you specify AWS_ARM64 with an ExportEC2InstanceRecommendations
                 // request, Compute Optimizer exports recommendations that consist of Graviton
                 // instance types only": the preference selects which recommendation options
@@ -250,13 +249,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// the export is of the recommendations `GetEC2InstanceRecommendations` reports, whose
 /// analysed resources are EC2 instances.
 const EXPORTED_RESOURCE_TYPE: &str = crate::state::RESOURCE_TYPE_EC2_INSTANCE;
-
-/// The one-job-in-progress limit this operation documents: "You can have only one Amazon EC2
-/// instance export job in progress per Amazon Web Services Region." The shared admission rule
-/// refuses a second in-progress export of this resource type with it, naming the job that
-/// still holds it.
-const ONE_JOB_IN_PROGRESS: &str = "You can have only one Amazon EC2 instance export job in \
-                                   progress per Amazon Web Services Region.";
 
 /// Lift a refusal of the shared export rule into this operation's modelled error channel:
 /// a 400 `InvalidParameterValueException` ("The value supplied for the input parameter is out
