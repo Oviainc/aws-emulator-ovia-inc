@@ -213,7 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holds, which are ingested data with no create of their own rather than a
         // resource a caller creates one at a time, so they go with the workspace
         // instead of blocking it forever — a `DeleteTimeSeries` scoped to the
-        // workspace is what removes one on its own.
+        // workspace is what removes one on its own. A BULK IMPORT JOB is not counted
+        // either: a caller does start one at a time, but this service models no call
+        // that deletes one, so counting it would block this delete for good; it goes
+        // with the workspace, like every other record of what running the workspace
+        // produced.
         let contents = store.workspace_contents(&input.workspace_name);
         if !contents.is_empty() {
             return Err(DeleteWorkspaceError::Modeled(
@@ -230,8 +234,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The workspace and everything keyed off it go away, so no later read can still
-        // see it: a describe of the workspace, or of a query, a search or a job that
-        // ran in it, resolves to nothing, and its tags stop resolving by ARN.
+        // see it: a describe of the workspace, or of a query, a search, an enrichment,
+        // export or bulk import job that ran in it, resolves to nothing, and its tags
+        // stop resolving by ARN.
         store.forget_workspace(&input.workspace_name);
 
         // The token is spent only now that the delete has succeeded: a refused

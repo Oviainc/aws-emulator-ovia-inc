@@ -262,9 +262,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The dataset and the segments it held go away, so no later read can still see
         // it: a describe of the dataset, a listing of its data segments and a lookup of
         // its tags by ARN all resolve to nothing. The data those segments covered goes
-        // with them only where the dataset OWNED it — see
-        // `ComAmazonawsIotsitewiseAwsiotsitewiseState::forget_dataset`, which states
-        // that split once for every caller.
+        // with them only where the dataset OWNED it, and a bulk import job whose
+        // destination this dataset was goes with it because nothing deletes such a job
+        // on its own — see `ComAmazonawsIotsitewiseAwsiotsitewiseState::forget_dataset`,
+        // which states that once for every caller.
         store.forget_dataset(&input.dataset_id);
 
         // The token is spent only now that the delete has succeeded: a refused

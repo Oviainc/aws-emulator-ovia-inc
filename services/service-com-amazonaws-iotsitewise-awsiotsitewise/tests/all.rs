@@ -378,6 +378,10 @@ mod batch_put_timestamp_and_quality;
 // one.
 #[path = "all/bulk_import_jobs.rs"]
 mod bulk_import_jobs;
+// Declared here, beside the sibling bulk-import suites, for the reason the note
+// above gives.
+#[path = "all/bulk_import_job_destination_delete.rs"]
+mod bulk_import_job_destination_delete;
 // Declared here, beside the sibling bulk-import suite, for the reason the note
 // above gives.
 #[path = "all/list_bulk_import_jobs.rs"]

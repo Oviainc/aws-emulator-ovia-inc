@@ -4060,7 +4060,11 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// job was created for (a job ingesting into a session dataset has one,
     /// a job ingesting into time series outside a workspace has none) lives on
     /// the record. Written by `CreateBulkImportJob` and read by
-    /// `DescribeBulkImportJob`; bounded by [`MAX_BULK_IMPORT_JOBS`].
+    /// `DescribeBulkImportJob`; bounded by [`MAX_BULK_IMPORT_JOBS`]. A job whose
+    /// destination is a session dataset is removed with that destination —
+    /// [`Self::forget_dataset`] and [`Self::forget_workspace`] — because nothing
+    /// deletes a job on its own and a read of one must not report a dataset or a
+    /// workspace this store no longer holds.
     pub bulk_import_jobs: HashMap<String, BulkImportJobRecord>,
     /// The mutating calls this store has already served under a `clientToken`,
     /// by [`idempotency_key`] — the operation and the token — because a token is
@@ -4815,8 +4819,16 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// The dataset's tags go with its record, which owns them. A dataset whose
     /// data another dataset still references is NOT refused here:
     /// [`Self::dataset_data_reference`] is what the caller refuses it with.
+    ///
+    /// A bulk import job that was created to ingest INTO this dataset goes too:
+    /// its destination is the dataset, this service models no call that deletes
+    /// a job on its own, and a job the store kept would report a `datasetId`
+    /// this store no longer holds — the same reason
+    /// [`Self::forget_workspace`] takes the jobs of a workspace with it.
     pub fn forget_dataset(&mut self, dataset_id: &str) -> Option<DatasetRecord> {
         let record = self.datasets.remove(dataset_id)?;
+        self.bulk_import_jobs
+            .retain(|_, job| job.dataset_id.as_deref() != Some(dataset_id));
         let held = self
             .dataset_data_segments
             .remove(dataset_id)
@@ -5583,7 +5595,10 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// this store keys by a workspace but a caller cannot CREATE one at a time
     /// (a search, a query, an enrichment job, a dataset export job, a capture
     /// source) are NOT contents in this sense: they are what running the
-    /// workspace produced, and they go with it in [`Self::forget_workspace`]. A
+    /// workspace produced, and they go with it in [`Self::forget_workspace`] —
+    /// and so is a bulk import job, which a caller does start one at a time but
+    /// can never DELETE, so counting it here would refuse the container's delete
+    /// for good. A
     /// pipeline execution goes with its own PIPELINE
     /// ([`Self::forget_pipeline`]), which is a content and so has to be gone
     /// before the workspace can be deleted at all.
@@ -5620,9 +5635,10 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     }
 
     /// Forget a workspace and everything keyed off it: its tags (on the record),
-    /// the searches, asynchronous queries, enrichment jobs and dataset export
-    /// jobs started in it, the capture sources it holds together with the alias
-    /// index they resolve through, and the logging scope set for it.
+    /// the searches, asynchronous queries, enrichment jobs, dataset export jobs
+    /// and bulk import jobs started in it, the capture sources it holds together
+    /// with the alias index they resolve through, and the logging scope set for
+    /// it.
     ///
     /// Each of those is addressable ONLY inside the workspace, so a workspace
     /// this service no longer holds can leave none of them behind for a later
@@ -5646,6 +5662,14 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .retain(|(workspace, _), _| workspace != workspace_name);
         self.dataset_export_jobs
             .retain(|(workspace, _), _| workspace != workspace_name);
+        // A bulk import job names the workspace its destination session dataset
+        // lives in, and nothing deletes a job on its own, so the jobs of this
+        // workspace go with it however the records were removed: a job the store
+        // kept would answer a read with a `workspaceName` this store no longer
+        // holds. A job ingesting into time series OUTSIDE any workspace names
+        // none and so belongs to no workspace's delete.
+        self.bulk_import_jobs
+            .retain(|_, job| job.workspace_name.as_deref() != Some(workspace_name));
         self.capture_sources.remove(workspace_name);
         self.capture_source_aliases.remove(workspace_name);
         self.logging_options.remove(workspace_name);
