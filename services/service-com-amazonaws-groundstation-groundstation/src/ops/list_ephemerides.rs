@@ -258,12 +258,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             // An empty (or absent) status list selects every status: the member is
             // modelled `len 0..500` and documented as "the list of ephemeris status to
-            // return", so naming none narrows nothing.
+            // return", so naming none narrows nothing — the service's one reading of an
+            // empty list filter (`crate::state::list_filter_admits`).
             .filter(|ephemeris| {
-                input
-                    .status_list
-                    .as_ref()
-                    .is_none_or(|wanted| wanted.is_empty() || wanted.contains(&ephemeris.status))
+                crate::state::list_filter_admits(
+                    input.status_list.as_deref().unwrap_or_default(),
+                    &ephemeris.status,
+                )
             })
             // The window is tested against the EXPIRATION time, as both members
             // document ("returns ephemerides with expiration times within your specified

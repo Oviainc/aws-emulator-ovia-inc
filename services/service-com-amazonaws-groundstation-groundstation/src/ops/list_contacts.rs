@@ -323,7 +323,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_ref()
                     .is_none_or(|after| stored_key(&contact.contact_id) > *after)
             })
-            .filter(|contact| input.status_list.contains(&contact.contact_status))
+            // A `statusList` that names statuses selects them; one that names NONE narrows
+            // nothing, so every contact the store holds over this window is reported
+            // (`crate::state::list_filter_admits`, the one reading of an empty list filter
+            // this service has).
+            .filter(|contact| {
+                crate::state::list_filter_admits(&input.status_list, &contact.contact_status)
+            })
             // A contact is in the window when its own window overlaps it — the one
             // reading of "these two windows collide" this service has
             // (`crate::state::windows_overlap`), shared with the reservation listing and
@@ -394,6 +400,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`available_contact_windows`), which is what makes the first step of the
         // discovery-then-reserve loop answerable. The three members that pairing is made of
         // are present: the request was refused above otherwise.
+        //
+        // Entered only when the status list NAMES `AVAILABLE`, which is the same condition
+        // the three required members are keyed on: a list that names no status narrows the
+        // contacts the account HOLDS and names no pairing, so there is nothing for a search
+        // to be computed from — and, naming no status, it is answered rather than refused.
         if input
             .status_list
             .iter()

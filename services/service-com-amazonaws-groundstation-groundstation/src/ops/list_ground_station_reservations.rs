@@ -232,11 +232,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A request that names no type filters on none: every reservation type is
-        // reported. A value outside the modelled `ReservationType` enum never reaches
-        // here — the model's own rules refuse it before this handler runs.
-        let wanted = |reservation_type: &str| {
-            types.is_empty() || types.iter().any(|named| named == reservation_type)
-        };
+        // reported — the service's one reading of an empty list filter
+        // (`crate::state::list_filter_admits`). A value outside the modelled
+        // `ReservationType` enum never reaches here — the model's own rules refuse it
+        // before this handler runs.
+        let wanted =
+            |reservation_type: &str| crate::state::list_filter_admits(&types, reservation_type);
         let window = (
             input.start_time.as_secs_f64(),
             input.end_time.as_secs_f64(),

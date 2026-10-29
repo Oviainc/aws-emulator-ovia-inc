@@ -1240,6 +1240,23 @@ pub fn page_size(max_results: Option<i32>) -> usize {
     }
 }
 
+/// Whether a listing's list-valued filter member, which NAMED the values `named`, admits
+/// an item carrying `value`.
+///
+/// A filter that names NO values narrows nothing. Every list-valued filter member this
+/// service has is modelled with a minimum length of zero — `ListContacts$statusList` and
+/// `ListEphemerides$statusList` are `len 0..500` and
+/// `ListGroundStationReservations$reservationTypes` is unbounded below
+/// (`smithy_query(query="operation", operation="ListContacts,ListEphemerides,\
+/// ListGroundStationReservations")`) — and each is documented as the values to RETURN, so
+/// an empty list is a request that names nothing to narrow by rather than a request for
+/// nothing; an absent optional one is the same request, written by leaving the member out.
+/// Stated once here so the same request shape means the same thing in every listing of
+/// this service rather than one thing per handler.
+pub fn list_filter_admits(named: &[String], value: &str) -> bool {
+    named.is_empty() || named.iter().any(|wanted| wanted == value)
+}
+
 /// The two members a window-filtered listing is asked for its window in, spelled once so
 /// the refusal below names and quotes the same members every listing binds.
 const SEARCH_WINDOW_START_PARAMETER: &str = "startTime";
