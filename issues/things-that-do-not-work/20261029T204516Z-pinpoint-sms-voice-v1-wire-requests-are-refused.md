@@ -1,0 +1,71 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: pinpoint-sms-voice-get-configuration-set-event-destinations-empty-name-validation
+Issue-Step: task#1
+Issue-Severity: HIGH
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: pinpoint-sms-voice-get-configuration-set-event-destinations-empty-name-validation pinpoint-sms-voice-list-configuration-sets-garbage-next-token-rejected pinpoint-sms-voice-list-configuration-sets-invalid-page-size-rejected
+Issue-Shape-Id: com.amazonaws.pinpointsmsvoice#PinpointSMSVoice
+Issue-Key: pinpoint-sms-voice|GetConfigurationSetEventDestinations|4xx->5xx|$headers.content-type
+Issue-Key: pinpoint-sms-voice|GetConfigurationSetEventDestinations|4xx->5xx|$headers.x-amzn-errortype
+Issue-Key: pinpoint-sms-voice|GetConfigurationSetEventDestinations|4xx->5xx|status
+Issue-Key: pinpoint-sms-voice|ListConfigurationSets|4xx->5xx|$.message
+Issue-Key: pinpoint-sms-voice|ListConfigurationSets|4xx->5xx|$headers.content-type
+Issue-Key: pinpoint-sms-voice|ListConfigurationSets|4xx->5xx|$headers.x-amzn-errortype
+Issue-Key: pinpoint-sms-voice|ListConfigurationSets|4xx->5xx|status
+Issue-Key: pinpoint-sms-voice|ListConfigurationSets|2xx->5xx|$.ConfigurationSets
+Issue-Key: pinpoint-sms-voice|ListConfigurationSets|2xx->5xx|$headers.content-type
+Issue-Key: pinpoint-sms-voice|ListConfigurationSets|2xx->5xx|status
+Issue-Commit: 5ecccbf2d16404d973c3a7fbd682960e34c37056
+
+# Pinpoint SMS Voice V1 wire requests are refused pre-dispatch as AmbiguousService
+
+> _Note: this issue was identified against the code base at commit `5ecccbf2d16404d973c3a7fbd682960e34c37056`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+ListConfigurationSets
+
+## Description
+All 5 replayed wire steps of the pinpoint-sms-voice corpus (3 fixtures, 4 divergence clusters) fail on ONE emulator defect: the request router resolves the target emulated service by SigV4 signing name instead of by the addressed endpoint / protocol route table, so PinpointSMSVoice (restJson1, endpointPrefix 'sms-voice.pinpoint') and PinpointSMSVoiceV2 (awsJson1_0, endpointPrefix 'sms-voice') both claim the signing name 'sms-voice' and NEITHER is dispatched. Every request is answered HTTP 500 with x-amzn-errortype 'AmbiguousService', content-type 'application/x-amz-json-1.1' and body message "2 emulated services all claim requests for '<signingName>': <service>, <service>; the request is rejected rather than served by an arbitrary one" (the duplicated service name is itself the diagnosis: the router is listing the shared signing name, not the distinct endpoint prefixes). There are 4 wire causes to close, one per divergence cluster; all 4 are the same root cause but each is a distinct fixture step that must replay green.
+
+Cause 1 of 4: GetConfigurationSetEventDestinations with an empty ConfigurationSetName (fixture pinpoint-sms-voice-get-configuration-set-event-destinations-empty-name-validation, step task#1). AWS: Smithy GetConfigurationSetEventDestinations is restJson1 GET /v1/sms-voice/configuration-sets/{ConfigurationSetName}/event-destinations, ConfigurationSetName is @required and @httpLabel, so an empty label is a request-shape violation; the modeled client error is BadRequestException (errorKind client, httpError 400, member Message, doc 'The input you provided is invalid.'). Per the recording the response is HTTP 400 with restJson1 framing — content-type 'application/json' and an x-amzn-errortype header naming the modeled error; the message is the missing/invalid-parameter wording whose only variable part is the member name taken from the request ('ConfigurationSetName'). Emulator: HTTP 500, content-type 'application/x-amz-json-1.1', x-amzn-errortype 'AmbiguousService'. Why: the 400 a client must catch to fix and resubmit its input never arrives; instead it gets a retryable 5xx with an error code in neither service's vocabulary, so no except-BadRequestException branch fires and botocore burns its whole retry budget. Fix: the shared service-resolution layer of the request router (pre-dispatch), not this operation's handler.
+
+Cause 2 of 4: ListConfigurationSets with a garbage NextToken (fixture pinpoint-sms-voice-list-configuration-sets-garbage-next-token-rejected, step task#1). AWS: Smithy ListConfigurationSets is restJson1 GET /v1/sms-voice/configuration-sets with NextToken and PageSize as @httpQuery __string; an unparseable continuation token is rejected with the service-common BadRequestException (client, httpError 400). Recorded response: HTTP 400, content-type 'application/json', body $.message "The following parameter is null, empty or invalid: ['nextToken']" — fixed text is "The following parameter is null, empty or invalid: [...]", the only variable part being the offending parameter name(s) taken from the request, here the single entry 'nextToken'. Emulator: HTTP 500, content-type 'application/x-amz-json-1.1', x-amzn-errortype 'AmbiguousService' and $.message "2 emulated services all claim requests for 'sms-voice': sms-voice, sms-voice; the request is rejected rather than served by an arbitrary one". Why: a pagination bug in a caller is reported as a server outage with no parameter name, so the caller retries a permanently invalid token instead of discarding it. Fix: the router's service resolution; the ListConfigurationSets query-parameter validation behind it must then produce the 400 above.
+
+Cause 3 of 4: ListConfigurationSets positive control, the follow-up read that must still succeed after a rejected request (fixture pinpoint-sms-voice-list-configuration-sets-garbage-next-token-rejected, step task#2; same cluster also covers pinpoint-sms-voice-list-configuration-sets-invalid-page-size-rejected#task#2). AWS: Smithy ListConfigurationSets has no required input and http code 200; the success body is ListConfigurationSetsResponse with member ConfigurationSets (a list) plus optional NextToken, serialized restJson1 with content-type 'application/json'. Emulator: HTTP 500, content-type 'application/x-amz-json-1.1', no ConfigurationSets member at all. Why: the service's only unauthenticated-by-resource read is unusable, so a client can neither enumerate configuration sets nor confirm that a rejected call left account state unchanged. Fix: the router's service resolution; then the ListConfigurationSets handler/serializer must emit a 200 restJson1 body carrying ConfigurationSets.
+
+Cause 4 of 4: ListConfigurationSets with a non-numeric PageSize (fixture pinpoint-sms-voice-list-configuration-sets-invalid-page-size-rejected, step task#1). AWS: PageSize is modeled as __string via @httpQuery, so there is no client-side type check and the server validates it; the modeled rejection is BadRequestException (client, httpError 400) with restJson1 framing — content-type 'application/json' and x-amzn-errortype naming the modeled error, message being the invalid-parameter wording whose variable part is the parameter name from the request ('pageSize'). Emulator: HTTP 500, content-type 'application/x-amz-json-1.1', x-amzn-errortype 'AmbiguousService'. Why: same as cause 2 — a client input error is surfaced as a retryable server fault outside the modeled error set. Fix: the router's service resolution, then PageSize validation in the ListConfigurationSets input parsing.
+
+Shared fix: resolve the emulated service from the request's addressed endpoint (Host / awsService.endpointPrefix: 'sms-voice.pinpoint' for V1 vs 'sms-voice' for V2) and, failing that, from the candidates' protocol and route tables (V1 restJson1 on /v1/sms-voice/* paths; V2 awsJson1_0 dispatched by X-Amz-Target on POST /). A shared sigv4Name across two service versions is normal in AWS and must not be treated as a conflict. The 'AmbiguousService' refusal path must never be reachable for two services that differ in endpointPrefix or protocol, and must never be returned as an HTTP 500 with an awsJson1_1 content-type for a restJson1 service. NOTE: open issue 20261029T190906Z-pinpoint-sms-voice-v1-is-entirely-unreachable-the.md describes the same router root cause, but it is a BEHAVIORAL (simparity-behavioral-aws-v1) issue whose Issue-Trace-Ids and Issue-Keys are behavioral check ids only — it carries none of the four wire replay keys above, and the replay reports owned_by=[] for every one of these clusters, so these wire steps are not covered by it. Related router issues for other signing-name-colliding pairs: 20261022T110819Z-migrationhub-config..., 20261022T145747Z-connectcampaigns..., 20261029T174910Z-payment-cryptography-control-plane..., 20261029T185843Z-agent-registry... — none names sms-voice.
+
+Traces: pinpoint-sms-voice-get-configuration-set-event-destinations-empty-name-validation#task#1; pinpoint-sms-voice-list-configuration-sets-garbage-next-token-rejected#task#1; pinpoint-sms-voice-list-configuration-sets-garbage-next-token-rejected#task#2 (also pinpoint-sms-voice-list-configuration-sets-invalid-page-size-rejected#task#2); pinpoint-sms-voice-list-configuration-sets-invalid-page-size-rejected#task#1.
+
+## Evidence
+Wire replay of trace set simparity-wire-aws-v1: 3 fixtures replayed, steps_total 5, steps_passed 0, steps_mismatched 5, score_pct 0.0, emulator_up true. All 4 divergence clusters are service 'pinpoint-sms-voice', verdict 'mismatch', actual_status 500, stub_path empty, owned_by empty.
+
+Cluster 1 — GetConfigurationSetEventDestinations, fixture pinpoint-sms-voice-get-configuration-set-event-destinations-empty-name-validation#task#1:
+  expected: status 400, content-type 'application/json', x-amzn-errortype present and shaped (modeled BadRequestException)
+  actual:   status 500, content-type 'application/x-amz-json-1.1', x-amzn-errortype 'AmbiguousService'
+
+Cluster 2 — ListConfigurationSets, fixture pinpoint-sms-voice-list-configuration-sets-garbage-next-token-rejected#task#1:
+  expected: status 400, content-type 'application/json', $.message "The following parameter is null, empty or invalid: ['nextToken']"
+  actual:   status 500, content-type 'application/x-amz-json-1.1', x-amzn-errortype 'AmbiguousService', $.message "2 emulated services all claim requests for 'sms-voice': sms-voice, sms-voice; the request is rejected rather than served by an arbitrary one"
+
+Cluster 3 — ListConfigurationSets, fixture pinpoint-sms-voice-list-configuration-sets-garbage-next-token-rejected#task#2 (affected_count 2; also pinpoint-sms-voice-list-configuration-sets-invalid-page-size-rejected#task#2):
+  expected: status 200, content-type 'application/json', body member $.ConfigurationSets present
+  actual:   status 500, content-type 'application/x-amz-json-1.1', $.ConfigurationSets missing (None)
+
+Cluster 4 — ListConfigurationSets, fixture pinpoint-sms-voice-list-configuration-sets-invalid-page-size-rejected#task#1:
+  expected: status 400, content-type 'application/json', x-amzn-errortype present and shaped
+  actual:   status 500, content-type 'application/x-amz-json-1.1', x-amzn-errortype 'AmbiguousService'
+
+Model evidence (services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json): service PinpointSMSVoice, sdkId 'Pinpoint SMS Voice', protocol restJson1 (hence content-type application/json), authScheme sigv4. ListConfigurationSets: GET /v1/sms-voice/configuration-sets, code 200, input NextToken/PageSize as httpQuery __string, output ListConfigurationSetsResponse{ConfigurationSets: list, NextToken}, errors BadRequestException(400)/InternalServiceErrorException(500)/TooManyRequestsException(429). GetConfigurationSetEventDestinations: GET /v1/sms-voice/configuration-sets/{ConfigurationSetName}/event-destinations, ConfigurationSetName required+httpLabel, errors BadRequestException(400)/NotFoundException(404)/InternalServiceErrorException(500)/TooManyRequestsException(429). BadRequestException: errorKind client, httpError 400, member Message, doc 'The input you provided is invalid.' 'AmbiguousService' is not an error shape in this model, nor in the PinpointSMSVoiceV2 model. Both crates are in the bootstrapped set (service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice and service-com-amazonaws-pinpointsmsvoicev2-pinpointsmsvoicev2), so both stood up and then collided at routing time.
+
+## Steps to Reproduce
+1. Clone the repo and build/boot the emulator from mainline with both Pinpoint SMS Voice crates present (service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice and service-com-amazonaws-pinpointsmsvoicev2-pinpointsmsvoicev2) — the default build reproduces it.
+2. Replay the simparity-wire-aws-v1 corpus. All 5 steps mismatch (score 0%).
+3. Cause 1: replay fixture pinpoint-sms-voice-get-configuration-set-event-destinations-empty-name-validation step task#1 — GET /v1/sms-voice/configuration-sets//event-destinations signed for 'sms-voice'. Expect HTTP 400, content-type application/json, x-amzn-errortype naming BadRequestException; observe HTTP 500, content-type application/x-amz-json-1.1, x-amzn-errortype AmbiguousService.
+4. Cause 2: replay pinpoint-sms-voice-list-configuration-sets-garbage-next-token-rejected step task#1 — GET /v1/sms-voice/configuration-sets?NextToken=<unparseable token>. Expect HTTP 400 with $.message "The following parameter is null, empty or invalid: ['nextToken']"; observe HTTP 500 / AmbiguousService.
+5. Cause 3: replay the same fixture's step task#2 (and pinpoint-sms-voice-list-configuration-sets-invalid-page-size-rejected step task#2) — a plain GET /v1/sms-voice/configuration-sets. Expect HTTP 200, content-type application/json, body carrying ConfigurationSets; observe HTTP 500 with no ConfigurationSets member.
+6. Cause 4: replay pinpoint-sms-voice-list-configuration-sets-invalid-page-size-rejected step task#1 — GET /v1/sms-voice/configuration-sets?PageSize=<non-numeric>. Expect HTTP 400 / BadRequestException framing; observe HTTP 500 / AmbiguousService.
+7. Confirm the cause: both services declare sigv4Name 'sms-voice' while their endpointPrefixes ('sms-voice.pinpoint' vs 'sms-voice') and protocols (restJson1 vs awsJson1_0) differ. Route on the addressed endpoint and the per-protocol route table instead of the signing name, then re-replay all four steps.
