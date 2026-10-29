@@ -25,6 +25,8 @@ mod agent_registration_tags;
 mod agent_task_response_url;
 #[path = "all/antenna_inventory.rs"]
 mod antenna_inventory;
+#[path = "all/availability_search_references.rs"]
+mod availability_search_references;
 #[path = "all/available_contacts.rs"]
 mod available_contacts;
 #[path = "all/config_defaults_and_references.rs"]

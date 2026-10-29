@@ -398,6 +398,14 @@ async fn the_refusal_names_every_holding_contact_and_the_delete_lands_once_they_
 async fn a_refused_delete_leaves_the_profile_and_the_contact_loop_exactly_as_they_were() {
     let (router, engine) = harness_with_engine();
     stock_ground_stations(&engine, GROUND_STATION);
+    // The availability search below names a satellite of THIS account: a `satelliteArn` is
+    // an argument of the windows such a search computes rather than a filter of them, so an
+    // ARN naming no onboarding resolves to nothing and is refused
+    // (`crate::available_contacts`). What this suite is about is the mission profile, so the
+    // satellite it pairs with is an on-boarded one.
+    let satellite_arn =
+        crate::contact_satellite_reference_integrity::onboard_satellite_arns(&engine, 1)[0]
+            .clone();
     let (profile_id, profile_arn) = profile_with_one_dataflow(&router, "untouched profile").await;
     let start = epoch(2035, 7, 9, 13, 30);
     let contact_id = reserve_pass(&router, &profile_arn, "untouched", start, 10 * 60).await;
@@ -451,11 +459,7 @@ async fn a_refused_delete_leaves_the_profile_and_the_contact_loop_exactly_as_the
             "startTime": start - 3_600,
             "endTime": start + 3_600,
             "groundStation": GROUND_STATION,
-            "satelliteArn": format!(
-                "arn:aws:groundstation:{REGION}:{}:satellite/\
-                 11111111-1111-1111-1111-111111111111",
-                engine::EMULATOR_ACCOUNT_ID
-            ),
+            "satelliteArn": satellite_arn,
             "missionProfileArn": profile_arn,
         })),
     )

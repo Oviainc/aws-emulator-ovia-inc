@@ -84,7 +84,11 @@ pub(crate) fn onboard_satellite_arns(engine: &engine::InMemoryEngine, count: usi
 /// this account IS on-boarded to, which the last two rows re-address under an account and a
 /// region no onboarding carries, so a refusal cannot be passing merely because the id is
 /// unknown.
-fn absent_satellite_arns(onboarded_id: &str) -> Vec<(String, String, String)> {
+///
+/// `pub(crate)`: every operation that RESOLVES a `satelliteArn` is held to the same rule, so
+/// a sibling suite spans the absent ones from this ONE catalogue rather than keeping a copy
+/// of it (`crate::availability_search_references`). Each row is `(case, arn, satelliteId)`.
+pub(crate) fn absent_satellite_arns(onboarded_id: &str) -> Vec<(String, String, String)> {
     let account: String = engine::emulator_account_id().to_string();
     let rows = vec![
         (

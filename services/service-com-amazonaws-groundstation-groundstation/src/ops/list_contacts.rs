@@ -423,9 +423,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(crate::state::MISSION_PROFILE_NOT_FOUND.to_string()),
                     })
                 })?;
-            // A satellite this account is not on-boarded to, and a station nothing was
-            // supplied for, have no pointing data in force and so fly nothing: that is an
-            // empty answer rather than a refusal.
+            // The satellite and the ground station are arguments of that same computation
+            // rather than filters of it — the windows offered are the passes THIS
+            // satellite's pointing data puts above THAT station's horizon — so each of
+            // them is RESOLVED here, exactly as the mission profile above is: a reference
+            // naming nothing this account holds names nothing to compute windows for, and
+            // is answered as the unresolved reference it carries rather than with an empty
+            // page a caller could not tell from "this pairing has no pass in that window".
+            //
+            // Each is refused the way the operation that requires that reference refuses
+            // it, so the discovery step and the reservation step it feeds answer one text:
+            // the satellite as the missing resource both writers of a contact version
+            // refuse it as (`crate::state::satellite_reference_fault`), the ground station
+            // as the bad parameter every operation whose subject is a station named in a
+            // member refuses it as (`crate::state::ground_station_not_found_message`), in
+            // the order `ReserveContact` resolves the two.
+            if let Some(error) = guard.satellite_reference_fault(input.satellite_arn.as_deref()) {
+                return Err(ListContactsErrorModeled::ResourceNotFoundException(error).into());
+            }
+            if let Some(name) = input.ground_station.as_deref() {
+                if !guard.knows_ground_station(name) {
+                    return Err(ListContactsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(crate::state::ground_station_not_found_message(name)),
+                            parameter_name: Some("groundStation".to_string()),
+                        },
+                    )
+                    .into());
+                }
+            }
+            // Both members are present — a request asking for AVAILABLE without them was
+            // refused above — and both now resolve, so what remains is the computation
+            // they are the arguments of.
             if let (Some(ground_station), Some(satellite_arn)) = (
                 input.ground_station.as_deref(),
                 input.satellite_arn.as_deref(),
