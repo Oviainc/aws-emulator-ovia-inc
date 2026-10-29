@@ -260,6 +260,16 @@ impl Case {
         if let Some(mode) = self.mode {
             value["PredictiveScalingMode"] = json!(mode);
         }
+        // Every predictive row pins the buffer time at zero, so a scheduled-action data
+        // point is reported at the instant of the interval it provisions for and the four
+        // answers below line up interval by interval. The shift a stored buffer time — and
+        // the one an absent member is read with — causes is pinned by
+        // [`crate::scheduled_action_buffer_time`]. The member is "only valid when
+        // configuring predictive scaling", so a row with no load metric specification
+        // leaves it out.
+        if self.is_predictive() {
+            value["ScheduledActionBufferTime"] = json!(0);
+        }
         value
     }
 

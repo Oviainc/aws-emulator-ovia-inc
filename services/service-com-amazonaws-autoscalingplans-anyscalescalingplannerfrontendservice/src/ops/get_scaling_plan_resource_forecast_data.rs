@@ -398,6 +398,14 @@ fn validate_forecast_resource(
 /// (`smithy_query(query="doc",shape="CustomizedLoadMetricSpecification")`).
 pub const FORECAST_INTERVAL_SECONDS: i64 = 3_600;
 
+/// The buffer a scheduled scaling action runs ahead of its forecast interval by when the
+/// stored instruction carries no `ScheduledActionBufferTime`.
+///
+/// `ScalingInstruction$ScheduledActionBufferTime` states the value the service uses for an
+/// instruction that leaves the member out: "The value must be less than the forecast
+/// interval duration of 3600 seconds (60 minutes). The default is 300 seconds."
+pub const DEFAULT_SCHEDULED_ACTION_BUFFER_SECONDS: i64 = 300;
+
 /// How far ahead of the current date and time forecast data exists, in days.
 ///
 /// `GetScalingPlanResourceForecastDataRequest$EndTime`: "AWS Auto Scaling only issues
@@ -644,9 +652,10 @@ struct ResourceForecast {
     /// provisions for ("if the forecast says to add capacity at 10:00 AM, and the buffer
     /// time is 5 minutes, then the run time of the corresponding scheduled scaling action
     /// will be 9:55 AM"), so it is what shifts the instants the two scheduled-action
-    /// capacities are reported at. Zero where the instruction carries no buffer time: the
-    /// member is held and reported back exactly as it was stored, so an instruction
-    /// carrying none buffers none.
+    /// capacities are reported at. An instruction that carries no buffer time buffers by
+    /// the value the member documents for that case ([`DEFAULT_SCHEDULED_ACTION_BUFFER_SECONDS`]):
+    /// what the member is stored and echoed as says nothing about which buffer the service
+    /// uses when it is absent, and the model states that value outright.
     scheduled_action_buffer_seconds: i64,
 }
 
@@ -688,7 +697,7 @@ impl ResourceForecast {
                 != Some(MODE_FORECAST_ONLY),
             scheduled_action_buffer_seconds: instruction
                 .scheduled_action_buffer_time
-                .map_or(0, i64::from),
+                .map_or(DEFAULT_SCHEDULED_ACTION_BUFFER_SECONDS, i64::from),
         })
     }
 

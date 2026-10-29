@@ -73,6 +73,11 @@ async fn with_predictive_plan() -> Emulator {
     );
     scaling_instruction["PredefinedLoadMetricSpecification"] =
         json!({ "PredefinedLoadMetricType": "ASGTotalCPUUtilization" });
+    // The buffer time is pinned at zero, so every data point — including the two
+    // scheduled-action ones — is reported at the forecast interval instant whose membership
+    // of the window this suite is about. What a buffer time, stored or absent, shifts those
+    // instants by is pinned by [`crate::scheduled_action_buffer_time`].
+    scaling_instruction["ScheduledActionBufferTime"] = json!(0);
 
     let emulator = Emulator::new();
     emulator

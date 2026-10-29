@@ -23,6 +23,8 @@ mod describe_scaling_plans_selector_bounds;
 mod describe_scaling_plans_version_member;
 #[path = "all/documented_entry_count_wording.rs"]
 mod documented_entry_count_wording;
+#[path = "all/documented_member_defaults.rs"]
+mod documented_member_defaults;
 #[path = "all/error_message_wording.rs"]
 mod error_message_wording;
 #[path = "all/forecast_data.rs"]

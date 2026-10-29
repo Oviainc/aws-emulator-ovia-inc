@@ -114,6 +114,12 @@ impl Row {
         if let Some(buffer) = self.buffer {
             value["PredictiveScalingMaxCapacityBuffer"] = json!(buffer);
         }
+        // Every row pins `ScheduledActionBufferTime` at zero, so a scheduled scaling action
+        // is reported at the instant of the interval it provisions for and the three lists
+        // read below line up interval by interval. What a stored buffer time — and what an
+        // absent member — shifts those instants by is pinned by
+        // [`crate::scheduled_action_buffer_time`].
+        value["ScheduledActionBufferTime"] = json!(0);
         value
     }
 
@@ -261,7 +267,7 @@ async fn emulator_with(instruction: Value) -> Emulator {
 /// The capacity forecast and the two scheduled-action capacities of one stored instruction
 /// over `window`, one triple per forecast interval.
 ///
-/// Every row's instruction carries no `ScheduledActionBufferTime`, so a scheduled scaling
+/// Every row's instruction pins `ScheduledActionBufferTime` at zero, so a scheduled scaling
 /// action is reported at the instant of the interval it provisions for and the three lists
 /// line up interval by interval.
 async fn forecast_triples(emulator: &Emulator, window: (i64, i64)) -> Vec<(i64, f64, f64, f64)> {
@@ -287,7 +293,7 @@ async fn forecast_triples(emulator: &Emulator, window: (i64, i64)) -> Vec<(i64, 
                 (min_at, max_at),
                 (at, at),
                 "the scheduled-action capacities of an interval are reported at its own \
-                 instant when no buffer time is stored"
+                 instant when the stored buffer time is zero"
             );
             (at, capacity, minimum, maximum)
         })

@@ -13,6 +13,11 @@
 //! for, so the buffer moves WHEN a scheduled-action capacity is reported and never WHAT it
 //! is.
 //!
+//! The buffer an instruction that stores no buffer time is read with is the one the member
+//! documents for that case ("The default is 300 seconds"), so an absent member and that
+//! value describe the same instruction and are answered the same way, while
+//! `DescribeScalingPlans` still echoes the member exactly as stored.
+//!
 //! Rows differ along what the rule generalises over: the buffer time, over the whole range
 //! the member accepts and with the member absent, crossed with instructions differing in
 //! capacity band, target value and maximum-capacity behavior.
@@ -24,7 +29,8 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::get_scaling_plan_resource_forecast_data::{
-    FORECAST_INTERVAL_SECONDS, FORECAST_SCALABLE_DIMENSION, FORECAST_SERVICE_NAMESPACE,
+    DEFAULT_SCHEDULED_ACTION_BUFFER_SECONDS, FORECAST_INTERVAL_SECONDS,
+    FORECAST_SCALABLE_DIMENSION, FORECAST_SERVICE_NAMESPACE,
 };
 
 use crate::forecast_datapoints::{assert_close, points};
@@ -118,11 +124,18 @@ fn buffer_times() -> Vec<Option<i64>> {
         Some(0),
         Some(1),
         Some(60),
-        Some(300),
+        Some(DEFAULT_SCHEDULED_ACTION_BUFFER_SECONDS),
         Some(600),
         Some(FORECAST_INTERVAL_SECONDS / 2),
         Some(FORECAST_INTERVAL_SECONDS - 1),
     ]
+}
+
+/// The buffer the service uses for an instruction storing `buffer`: the stored value, or —
+/// where the member is absent — the value the member documents for that case ("The default
+/// is 300 seconds"), which is what an absent member asks the service to buffer by.
+fn effective_buffer(buffer: Option<i64>) -> i64 {
+    buffer.unwrap_or(DEFAULT_SCHEDULED_ACTION_BUFFER_SECONDS)
 }
 
 /// One instruction shape: the capacity rules the scheduled-action capacities follow from,
@@ -260,9 +273,7 @@ async fn the_buffer_time_moves_every_scheduled_action_run_time_ahead_of_its_inte
         for buffer in buffer_times() {
             let case = format!("{} with buffer {buffer:?}", shape.label);
             let emulator = emulator_with(plan, shape.instruction(buffer)).await;
-            // An absent member buffers nothing: the instruction is reported back exactly as
-            // it was stored, so it carries no buffer time to shift anything by.
-            let seconds = buffer.unwrap_or(0);
+            let seconds = effective_buffer(buffer);
 
             // The quantities OF an interval stay on the interval boundaries: the buffer
             // time moves a scheduled scaling action, not the forecast itself.
@@ -341,11 +352,15 @@ async fn two_plans_differing_only_in_buffer_time_report_the_same_capacities_at_o
     let window = window();
     let shape = shapes()[0];
     let buffered = "buffered";
-    let unbuffered = "unbuffered";
+    let defaulted = "defaulted";
     let seconds = 600;
+    // The instruction that leaves the member out is buffered by the value the member
+    // documents for that case, which differs from the one spelled out above — so the two
+    // answers are stamped with different run times for the same intervals.
+    let default_seconds = effective_buffer(None);
 
     let emulator = Emulator::new();
-    for (index, (plan, buffer)) in [(buffered, Some(seconds)), (unbuffered, None)]
+    for (index, (plan, buffer)) in [(buffered, Some(seconds)), (defaulted, None)]
         .into_iter()
         .enumerate()
     {
@@ -366,9 +381,9 @@ async fn two_plans_differing_only_in_buffer_time_report_the_same_capacities_at_o
     // The member round-trips: the plan that was created with it carries it back, and the
     // plan created without it carries nothing.
     let described = emulator
-        .ok("DescribeScalingPlans", json!({ "ScalingPlanNames": [buffered, unbuffered] }))
+        .ok("DescribeScalingPlans", json!({ "ScalingPlanNames": [buffered, defaulted] }))
         .await;
-    for (plan, expected) in [(buffered, Some(seconds)), (unbuffered, None)] {
+    for (plan, expected) in [(buffered, Some(seconds)), (defaulted, None)] {
         let stored = described["ScalingPlans"]
             .as_array()
             .unwrap_or_else(|| panic!("case {plan}: expected a ScalingPlans list, got {described}"))
@@ -385,25 +400,28 @@ async fn two_plans_differing_only_in_buffer_time_report_the_same_capacities_at_o
 
     for data_type in SCHEDULED_ACTION_DATA_TYPES {
         let with_buffer = points(&emulator, buffered, RESOURCE, data_type, window).await;
-        let without = points(&emulator, unbuffered, RESOURCE, data_type, window).await;
+        let with_default = points(&emulator, defaulted, RESOURCE, data_type, window).await;
 
-        // Not one instant in common: every buffered run time sits inside an interval, every
-        // unbuffered one on an interval boundary.
+        // Not one instant in common: the two plans buffer by different amounts, so each
+        // interval's action runs at a different instant on each plan.
         for (at, _) in &with_buffer {
             assert!(
-                !without.iter().any(|(other, _)| other == at),
-                "case {data_type}: a buffered run time {at} must differ from every \
-                 unbuffered one, got {without:?}"
+                !with_default.iter().any(|(other, _)| other == at),
+                "case {data_type}: a run time {at} buffered by {seconds} seconds must \
+                 differ from every run time buffered by {default_seconds}, got \
+                 {with_default:?}"
             );
         }
 
         // And the capacity of each interval is the same on both plans: keyed by the
         // interval each action provisions for, the two answers agree wherever they overlap.
-        let unbuffered_by_interval: std::collections::BTreeMap<i64, f64> =
-            without.iter().copied().collect();
+        let defaulted_by_interval: std::collections::BTreeMap<i64, f64> = with_default
+            .iter()
+            .map(|(at, value)| (at + default_seconds, *value))
+            .collect();
         let mut compared = 0;
         for (at, value) in &with_buffer {
-            if let Some(other) = unbuffered_by_interval.get(&(at + seconds)) {
+            if let Some(other) = defaulted_by_interval.get(&(at + seconds)) {
                 assert_close(*value, *other, &format!("{data_type} for interval {}", at + seconds));
                 compared += 1;
             }
