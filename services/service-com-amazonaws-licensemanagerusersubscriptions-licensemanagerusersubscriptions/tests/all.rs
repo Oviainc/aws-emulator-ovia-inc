@@ -17,6 +17,8 @@ mod arn_addressing_cross_checks_domain;
 mod arn_and_members_address_one_resource;
 #[path = "all/associations_follow_their_registration.rs"]
 mod associations_follow_their_registration;
+#[path = "all/deregistration_spares_what_it_was_not_asked_about.rs"]
+mod deregistration_spares_what_it_was_not_asked_about;
 #[path = "all/filter_operations.rs"]
 mod filter_operations;
 #[path = "all/identity_provider_deregistration.rs"]

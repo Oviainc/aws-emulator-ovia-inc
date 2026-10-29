@@ -246,7 +246,13 @@ async fn subscribe_party(h: &Harness, party: &Party) -> String {
 
 /// The summary `reply`'s list reports for `arn`, or `None` when the list does not report
 /// it at all.
-fn reported(reply: &Reply, items: &str, member: &str, arn: &str, case: &str) -> Option<Value> {
+pub(crate) fn reported(
+    reply: &Reply,
+    items: &str,
+    member: &str,
+    arn: &str,
+    case: &str,
+) -> Option<Value> {
     let answered = reply.ok(case);
     answered[items]
         .as_array()
@@ -258,7 +264,13 @@ fn reported(reply: &Reply, items: &str, member: &str, arn: &str, case: &str) -> 
 
 /// Assert the resource `arn` names is still reported, in a status that is not `forbidden`
 /// (the status the refused call would have moved it to).
-fn assert_untouched(case: &str, who: &str, arn: &str, forbidden: &str, summary: Option<Value>) {
+pub(crate) fn assert_untouched(
+    case: &str,
+    who: &str,
+    arn: &str,
+    forbidden: &str,
+    summary: Option<Value>,
+) {
     let summary = summary.unwrap_or_else(|| {
         panic!("case {case:?}: the {who} resource {arn} must still be reported, got nothing")
     });
