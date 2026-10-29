@@ -55,3 +55,5 @@ mod state_roundtrip;
 mod tag_arn_label_encoding;
 #[path = "all/update_rule_lock_invariant.rs"]
 mod update_rule_lock_invariant;
+#[path = "all/update_rule_refusal_atomicity.rs"]
+mod update_rule_refusal_atomicity;
