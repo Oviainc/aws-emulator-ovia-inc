@@ -77,6 +77,8 @@ mod single_region_replication;
 mod state_roundtrip;
 #[path = "all/static_columns_require_clustering_keys.rs"]
 mod static_columns_require_clustering_keys;
+#[path = "all/tagging_a_deleting_resource.rs"]
+mod tagging_a_deleting_resource;
 #[path = "all/type_lifecycle.rs"]
 mod type_lifecycle;
 #[path = "all/update_keyspace.rs"]

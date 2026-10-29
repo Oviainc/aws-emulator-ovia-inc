@@ -374,6 +374,20 @@ pub fn keyspace_deleting_rejection(keyspace_name: &str) -> String {
     )
 }
 
+/// The same rule one level down: the refusal a request that would change a TABLE whose
+/// deletion is already in progress carries, worded exactly as
+/// [`keyspace_deleting_rejection`] words it for a keyspace, so a caller reads one sentence
+/// whichever resource is on its way out.
+///
+/// The table is named the way every refusal of this service names one, `<keyspace>.<table>`,
+/// and the status the caller is waiting on is in the message.
+pub fn table_deleting_rejection(keyspace_name: &str, table_name: &str) -> String {
+    format!(
+        "Table '{keyspace_name}.{table_name}' is in status {TABLE_STATUS_DELETING} and takes \
+         no further change until its deletion completes."
+    )
+}
+
 /// Whether `status` is one whose own change is still in flight: the resource is neither
 /// settled nor on its way out, so the clock still owes it a transition.
 ///
@@ -1899,6 +1913,63 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
                 table.restored_from.is_some() && table.status == TABLE_STATUS_RESTORING
             })
             .count()
+    }
+
+    /// Why the resource `resource_arn` names to a request signed for `region` takes no
+    /// further change — the refusal a write against it carries — or `None` when no
+    /// deletion stands in that write's way.
+    ///
+    /// A resource whose deletion has been accepted is on its way out and takes no further
+    /// change until that deletion completes ([`keyspace_deleting_rejection`],
+    /// [`table_deleting_rejection`]): the record [`Self::settle`] is about to drop would
+    /// throw the write away wholesale, so reporting it as stored would report a durable
+    /// change that never was. `DELETING` is the only status that blocks a write here — a
+    /// resource whose creation or update is still settling is still a resource that stays.
+    ///
+    /// Deleting a keyspace deletes everything in it ("The `DeleteKeyspace` operation
+    /// deletes a keyspace and all of its tables"), so the keyspace's own deletion answers
+    /// for every ARN below it; a table's own deletion answers for the table and for the CDC
+    /// streams that follow its changes, which cannot outlive it.
+    ///
+    /// An ARN that names no resource of that Region yields `None`: that is the caller's
+    /// `ResourceNotFoundException`, not a conflict, and only a resource that is there can
+    /// be on its way out.
+    pub fn deletion_in_progress_rejection(
+        &self,
+        region: &str,
+        resource_arn: &str,
+    ) -> Option<String> {
+        // Resolved through the reading lookup, so the ARN is held to exactly the resource
+        // it was minted for — an ARN of another partition, Region or account reaches
+        // nothing here and is left to the 404.
+        self.resource_tags(region, resource_arn)?;
+        // Parsed ONCE: the ARN's two halves — the keyspace that owns the resource and, for
+        // an ARN below a keyspace, the table the write reaches through — come out of the
+        // same `ResourceRef`.
+        let (keyspace_name, table_name) = match parse_resource_arn(resource_arn)? {
+            ResourceRef::Keyspace { keyspace_name } => (keyspace_name, None),
+            ResourceRef::Table {
+                keyspace_name,
+                table_name,
+            }
+            | ResourceRef::Stream {
+                keyspace_name,
+                table_name,
+                ..
+            } => (keyspace_name, Some(table_name)),
+        };
+        let keyspace = self.keyspace(region, &keyspace_name)?;
+        // The keyspace's deletion takes everything in it with it, so it answers for every
+        // ARN below it before the addressed resource's own status is looked at.
+        if keyspace.is_deleting() {
+            return Some(keyspace_deleting_rejection(&keyspace_name));
+        }
+        // A keyspace ARN has nothing below it, so the keyspace's own status was the whole
+        // question for it.
+        let table_name = table_name?;
+        let table = keyspace.tables.get(&table_name)?;
+        (table.status == TABLE_STATUS_DELETING)
+            .then(|| table_deleting_rejection(&keyspace_name, &table_name))
     }
 
     /// The same lookup, for a tagging operation that writes.

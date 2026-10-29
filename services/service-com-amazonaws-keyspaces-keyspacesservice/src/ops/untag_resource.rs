@@ -187,6 +187,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // See `tag_resource.rs`: a resource whose deletion is already in progress takes no
+        // further change until that deletion completes, so a removal inside that span is
+        // the modelled conflict rather than a 200 reporting a tag set that is about to be
+        // dropped along with the resource.
+        if let Some(rejection) =
+            store.deletion_in_progress_rejection(&region, &input.resource_arn)
+        {
+            return Err(UntagResourceErrorModeled::ConflictException(ConflictException {
+                message: Some(rejection),
+            })
+            .into());
+        }
+
         let Some(tags) = store.resource_tags_mut(&region, &input.resource_arn) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::arn_not_found(&input.resource_arn),

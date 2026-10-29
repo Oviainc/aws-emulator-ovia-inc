@@ -202,6 +202,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A resource whose deletion is already in progress takes no further change until
+        // that deletion completes — the rule `CreateTable`, `CreateType`, `RestoreTable`
+        // and `DeleteKeyspace` already refuse by, applied to the resource the ARN names
+        // and to the keyspace that owns it. Within the span between the delete being
+        // accepted and `settle` dropping the record, a tag written here would be thrown
+        // away with that record, so a 200 would report a change the caller can never read
+        // back. That is the modelled conflict — "you try to perform an action and the same
+        // or a different action is already in progress" — and nothing is written for it.
+        if let Some(rejection) =
+            store.deletion_in_progress_rejection(&region, &input.resource_arn)
+        {
+            return Err(TagResourceErrorModeled::ConflictException(ConflictException {
+                message: Some(rejection),
+            })
+            .into());
+        }
+
         // Tags attach to the resource the ARN names, so the ARN — not a name — is what is
         // resolved, in the Region the request was signed for: an ARN that names no resource
         // of THAT Region is the 404 the model declares, whatever another Region holds.
