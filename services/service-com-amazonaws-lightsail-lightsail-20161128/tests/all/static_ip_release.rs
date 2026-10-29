@@ -245,7 +245,7 @@ async fn releasing_a_static_ip_gives_up_the_reservation() {
             .to_string();
         if let Some(attachment) = &row.attached {
             create_running_instance(&emulator, attachment).await;
-            let attached = attach_static_ip(&emulator, row.name, attachment.instance_name);
+            let attached = attach_static_ip(&emulator, row.name, attachment.instance_name).await;
             assert_eq!(
                 attached, released_address,
                 "case {case}: the attachment must hold the reserved address, got {attached:?}"
@@ -356,7 +356,7 @@ async fn releasing_an_attached_static_ip_leaves_the_instance_on_an_ordinary_addr
             .to_string();
 
         allocate(&emulator, row.region, row.name).await;
-        let static_address = attach_static_ip(&emulator, row.name, attachment.instance_name);
+        let static_address = attach_static_ip(&emulator, row.name, attachment.instance_name).await;
 
         // What a client sees while the attachment stands: the instance is
         // reachable at the reserved address, and says so.
@@ -451,7 +451,7 @@ async fn a_name_the_account_does_not_hold_releases_nothing() {
     create_running_instance(&emulator, &attachment).await;
     allocate(&emulator, None, KEPT).await;
     allocate(&emulator, None, "attached-static-ip").await;
-    attach_static_ip(&emulator, "attached-static-ip", holder);
+    attach_static_ip(&emulator, "attached-static-ip", holder).await;
 
     let before_kept = static_ip(&emulator, KEPT).await;
     let before_attached = static_ip(&emulator, "attached-static-ip").await;
@@ -517,8 +517,8 @@ async fn releasing_one_static_ip_leaves_every_other_alone() {
     for name in ["doomed-ip", "kept-ip", "spare-ip"] {
         allocate(&emulator, None, name).await;
     }
-    attach_static_ip(&emulator, "doomed-ip", doomed.instance_name);
-    let kept_address = attach_static_ip(&emulator, "kept-ip", kept.instance_name);
+    attach_static_ip(&emulator, "doomed-ip", doomed.instance_name).await;
+    let kept_address = attach_static_ip(&emulator, "kept-ip", kept.instance_name).await;
 
     let before_kept_ip = static_ip(&emulator, "kept-ip").await;
     let before_spare = static_ip(&emulator, "spare-ip").await;

@@ -42,8 +42,8 @@ pub(crate) struct Emulator {
     /// The ONE shared engine the mounted service was constructed from, kept so a
     /// sibling suite can reach the store for a fixture the API itself cannot
     /// produce — a record whose instant is far enough in the past that a
-    /// windowed read leaves it out, or a static IP ATTACHED to an instance while
-    /// `AttachStaticIp` is still a 501 stub (`instance_start_addresses.rs`).
+    /// windowed read leaves it out, or an attachment released without the
+    /// operation that releases it (`instance_start_addresses.rs`).
     engine: Arc<engine::InMemoryEngine>,
 }
 

@@ -645,6 +645,8 @@ pub const OPERATION_TYPE_DETACH_DISK: &str = "DetachDisk";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_DISK: &str = "DeleteDisk";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_ATTACH_STATIC_IP: &str = "AttachStaticIp";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DETACH_STATIC_IP: &str = "DetachStaticIp";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DETACH_INSTANCES_FROM_LOAD_BALANCER: &str =
@@ -13383,6 +13385,39 @@ impl ComAmazonawsLightsailLightsail20161128State {
         let instance_name = self.static_ips.get_mut(name)?.attached_to.take()?;
         self.redraw_public_address_without_static_ip(&instance_name);
         Some(instance_name)
+    }
+
+    /// Attach the static IP `name` to the instance `instance_name`, answering the
+    /// reserved address the instance is reachable at from now on. `None` when the
+    /// account holds no static IP of that name or no such instance — in which
+    /// case nothing was changed.
+    ///
+    /// Both halves of the attachment are this ONE step, exactly as releasing it
+    /// is [`Self::detach_static_ip`]'s: the attachment itself lives on the static
+    /// IP record (the modelled `StaticIp$attachedTo` names the resource "to which
+    /// the static IP is attached"), and the instance it names is reachable at the
+    /// reserved address, because an attached static IP is the only thing that
+    /// pins an instance's public IPv4 address — so `Instance$isStaticIp`, "a
+    /// Boolean value indicating whether this instance has a static IP assigned to
+    /// it", is true for as long as the attachment stands. Nothing is drawn from
+    /// the address allocator here: the address the instance takes on is the one
+    /// the reservation already holds, which is what makes it static.
+    ///
+    /// Attaching the static IP an instance already holds writes exactly what is
+    /// already stored, so the call is idempotent; whether an attachment may be
+    /// made at all — the static IP is free, the instance holds none, the instance
+    /// has public IPv4 addressing — is the calling operation's question, decided
+    /// before this is reached.
+    pub fn attach_static_ip(&mut self, name: &str, instance_name: &str) -> Option<String> {
+        let ip_address = self.static_ips.get(name)?.ip_address.clone();
+        // The instance is written FIRST, so a name this store holds no instance
+        // under leaves the reservation exactly as it was rather than pointing it
+        // at an instance that is not there.
+        let instance = self.instance_mut(instance_name)?;
+        instance.is_static_ip = true;
+        instance.public_ip_address = Some(ip_address.clone());
+        self.static_ips.get_mut(name)?.attached_to = Some(instance_name.to_string());
+        Some(ip_address)
     }
 
     /// Put the instance `instance_name` back on the public addressing it holds

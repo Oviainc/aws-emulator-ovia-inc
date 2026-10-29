@@ -303,6 +303,8 @@ mod snapshot_copy;
 mod state_roundtrip;
 #[path = "all/static_ip_allocation.rs"]
 mod static_ip_allocation;
+#[path = "all/static_ip_attach.rs"]
+mod static_ip_attach;
 #[path = "all/static_ip_detach.rs"]
 mod static_ip_detach;
 #[path = "all/static_ip_listing.rs"]

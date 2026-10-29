@@ -686,9 +686,10 @@ async fn only_the_hours_the_resource_has_existed_for_are_billed() {
 /// only while it is idle, and a resource this store holds no metered dimension for
 /// carries no usage type at all.
 ///
-/// `AttachStaticIp` is still a scaffold and a DNS zone's name cannot satisfy this
-/// operation's `ResourceName` pattern, so these two rows are driven against the
-/// store directly — the same lookup the handler runs.
+/// These rows are driven against the store directly — the same lookup the handler
+/// runs — because each needs a record the wire cannot place: one created at the
+/// instant the priced window opens, and a DNS zone, whose name cannot satisfy this
+/// operation's `ResourceName` pattern.
 #[test]
 fn an_attached_static_ip_is_free_and_an_unpriced_resource_carries_no_usage_type() {
     let created_at_ms = 1_700_000_000_000;

@@ -223,39 +223,36 @@ fn assert_everything_else_unchanged(case: &str, before: &Value, after: &Value) {
     );
 }
 
-/// Attach the static IP `static_ip_name` to the instance `instance_name` in the
-/// store, answering the reserved address.
+/// Attach the static IP `static_ip_name` to the instance `instance_name` through
+/// `AttachStaticIp`, answering the reserved address the instance is reachable at
+/// from then on.
 ///
-/// `AttachStaticIp` is still a 501 stub, so the attachment the rule's exception is
-/// about cannot be made through the API yet. It is made here where the store holds
-/// it — on the STATIC IP record, which names the instance it is attached to —
-/// through the same public state API a handler uses, so the exception is exercised
-/// against the one persisted record rather than a copy. Writing what that
-/// operation will write, so it stays correct once the stub is implemented.
+/// The attachment is made through the same front door a client uses, so the
+/// exception the rule below is about stands on the one persisted record the
+/// operation wrote rather than on a fixture's copy of it.
 ///
 /// `pub(crate)` so a sibling suite in this test target makes the same attachment
-/// rather than carrying a second copy of it (`resource_ip_address_type.rs`, where
-/// the attachment is what refuses an IPv6-only address type).
-pub(crate) fn attach_static_ip(
+/// rather than carrying a second copy of it (`static_ip_detach.rs`,
+/// `static_ip_release.rs` and `resource_ip_address_type.rs`, where the attachment
+/// is what refuses an IPv6-only address type). What the operation itself asserts
+/// about the attachment it makes is pinned in `static_ip_attach.rs`.
+pub(crate) async fn attach_static_ip(
     emulator: &Emulator,
     static_ip_name: &str,
     instance_name: &str,
 ) -> String {
-    lightsail_state::with_state(emulator.engine(), |store| {
-        let static_ip = store
-            .static_ips
-            .get_mut(static_ip_name)
-            .expect("the suite allocated this static IP through AllocateStaticIp");
-        static_ip.attached_to = Some(instance_name.to_string());
-        let address = static_ip.ip_address.clone();
-        let instance = store
-            .instance_mut(instance_name)
-            .expect("the suite created this instance through CreateInstances");
-        instance.is_static_ip = true;
-        instance.public_ip_address = Some(address.clone());
-        address
-    })
-    .expect("the suite's engine is the shared in-memory one")
+    emulator
+        .ok(
+            "AttachStaticIp",
+            json!({"staticIpName": static_ip_name, "instanceName": instance_name}),
+        )
+        .await;
+    emulator
+        .ok("GetStaticIp", json!({"staticIpName": static_ip_name}))
+        .await["staticIp"]["ipAddress"]
+        .as_str()
+        .expect("an attached static IP reports the address it reserves")
+        .to_string()
 }
 
 /// Release the attachment made by [`attach_static_ip`], leaving the address
@@ -482,22 +479,7 @@ async fn an_instance_with_a_static_ip_attached_keeps_its_public_ipv4_address() {
         .ok("AllocateStaticIp", json!({"staticIpName": "reserved"}))
         .await;
 
-    // The attachment is made in the store, because the operation that makes it is
-    // still a stub — but this case does not depend on that staying true: an
-    // emulator that already attaches it through the API answers 200, and the
-    // store-side setup then re-applies exactly what that call made.
-    let (status, body) = emulator
-        .call(
-            "AttachStaticIp",
-            json!({"instanceName": name, "staticIpName": "reserved"}),
-        )
-        .await;
-    assert!(
-        matches!(status, 200 | 501),
-        "case the static IP exception: expected AttachStaticIp either to attach the \
-         address or to answer the scaffold's 501, got {status} {body:?}"
-    );
-    let reserved = attach_static_ip(&emulator, "reserved", name);
+    let reserved = attach_static_ip(&emulator, "reserved", name).await;
 
     // The record the cycles below are measured against: `publicIpAddress` is what
     // the attachment made it, so only what the STARTS do to it is asserted.

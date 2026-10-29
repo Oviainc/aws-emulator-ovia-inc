@@ -36,9 +36,9 @@ use crate::instance_lifecycle::{
     error_code, is_modelled_ipv4, is_modelled_ipv6, is_uuid_shaped, wait_for_state, Emulator,
 };
 use crate::instance_metadata_ipv6_region::IPV6_METADATA_REGION;
-// The store-side static IP attachment `instance_start_addresses.rs` already
-// publishes: `AttachStaticIp` is still a 501 stub, so the attachment the refusal
-// below is about cannot be made through the API yet.
+// The static IP attachment fixture `instance_start_addresses.rs` already
+// publishes, which drives `AttachStaticIp` through the same front door: the
+// attachment the refusal below is about is made by the operation that makes it.
 use crate::instance_start_addresses::attach_static_ip;
 
 /// Every value of the modelled `IpAddressType` enum
@@ -898,7 +898,7 @@ async fn an_instance_with_a_static_ip_attached_cannot_be_moved_to_ipv6_only() {
     emulator
         .ok("AllocateStaticIp", json!({"staticIpName": "reserved"}))
         .await;
-    let reserved = attach_static_ip(&emulator, "reserved", name);
+    let reserved = attach_static_ip(&emulator, "reserved", name).await;
     let before = instance(&emulator, name).await;
 
     let (status, body) = emulator

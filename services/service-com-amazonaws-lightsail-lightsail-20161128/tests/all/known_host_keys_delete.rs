@@ -27,9 +27,8 @@
 //! Lightsail" (`HostKeyAttributes$witnessedAt`) — is still a 501 stub with its own
 //! issue, so the record this operation deletes cannot be made through the API yet:
 //! it is made here on the instance's own record through the same public state API
-//! a handler uses (as `instance_start_addresses.rs` makes a static IP attachment
-//! `AttachStaticIp` cannot make yet), so the delete is exercised against the one
-//! persisted record rather than a copy.
+//! a handler uses, so the delete is exercised against the one persisted record
+//! rather than a copy.
 //!
 //! The HTTP harness is the one `instance_lifecycle.rs` already has.
 

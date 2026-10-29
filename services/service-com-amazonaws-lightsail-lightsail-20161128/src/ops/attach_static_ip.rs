@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachStaticIp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachStaticIp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Attaches one reserved address this account holds to one of its instances: the
+//! instance becomes reachable at that address and keeps it across a stop and a start,
+//! which is the whole reason a static IP exists.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachStaticIp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +159,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachStaticIp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachStaticIpErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachStaticIp"))
+        // Both resources are addressed by the names the request names — the store
+        // holds each under its own name alone — and where each of them is, is what
+        // its own record holds, so nothing here comes from the request metadata
+        // `ctx` carries, exactly as it does not in `DetachStaticIp`.
+        let _ = ctx;
+
+        // `staticIpName` and `instanceName` are modelled `@required` members
+        // carrying the modelled `ResourceName` pattern, so the centralized walk
+        // refused an absent or malformed one before this body ran. What is left is
+        // what the model cannot express: both resources have to be ones this
+        // account holds, neither may already hold another attachment, and the
+        // instance has to have the kind of address a static IP is. Every one of
+        // those is decided BEFORE the first write, so a refused request attaches
+        // nothing.
+        let static_ip_name = input.static_ip_name;
+        let instance_name = input.instance_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // READ what the request addresses first, under one exclusive hold on
+            // the store. The static IP comes first: it is the resource this
+            // operation acts on, and the one the log entry is written against —
+            // located where the reservation was made, for the same reason every
+            // other entry in this crate is, because the log says where the
+            // resource is.
+            let static_ip = store.static_ip(&static_ip_name).ok_or_else(|| {
+                not_found(crate::state::RESOURCE_TYPE_STATIC_IP, &static_ip_name)
+            })?;
+            let location = static_ip.location.clone();
+            let attached_to = static_ip.attached_to.clone();
+
+            let instance = store.instance(&instance_name).ok_or_else(|| {
+                not_found(crate::state::RESOURCE_TYPE_INSTANCE, &instance_name)
+            })?;
+            let instance_ip_address_type = instance.ip_address_type.clone();
+            // The static IP this instance already holds, when it holds one. The
+            // attachment lives on the STATIC IP record, so the one way to find it
+            // is to ask the static IPs — which is why that walk is the store's
+            // own. The static IP under attachment is not an answer to it: one
+            // already attached to this instance is the request's own subject.
+            let instance_holds = store
+                .attached_static_ip(&instance_name)
+                .map(|held| held.name.clone())
+                .filter(|held| held != &static_ip_name);
+
+            // A static IP is attached to at most one instance: the modelled
+            // `StaticIp$attachedTo` names the ONE resource it is attached to, so
+            // an attachment can only be made from a reservation that holds none.
+            // `DetachStaticIp` is what frees it, so a request that would move the
+            // address off the instance serving on it is refused rather than
+            // silently taking it away.
+            if let Some(holder) = attached_to
+                .as_deref()
+                .filter(|holder| *holder != instance_name)
+            {
+                return Err(operation_failure(format!(
+                    "The static IP {static_ip_name} is already attached to the instance \
+                     {holder}. Detach the static IP before attaching it to another \
+                     instance."
+                )));
+            }
+            // And an instance serves on at most one static IP: the modelled
+            // `Instance$publicIpAddress` is ONE public IPv4 address and a static
+            // IP is one reserved such address, so a second reservation has nothing
+            // left to pin.
+            if let Some(held) = instance_holds {
+                return Err(operation_failure(format!(
+                    "The instance {instance_name} already has the static IP {held} attached. \
+                     Detach that static IP before attaching another one to the instance."
+                )));
+            }
+            // A static IP IS a public IPv4 address the account has reserved (the
+            // modelled `StaticIp$ipAddress`), so an instance whose address type
+            // gives it no public IPv4 address has nothing for the reservation to
+            // pin — the same reason `SetIpAddressType` refuses to take that
+            // addressing away from an instance an address is attached to.
+            if !crate::state::ip_address_type_has_ipv4(&instance_ip_address_type) {
+                return Err(operation_failure(format!(
+                    "The instance {instance_name} is {instance_ip_address_type}: a static IP \
+                     is a public IPv4 address, so it can be attached only to an instance \
+                     whose IP address type gives it one."
+                )));
+            }
+            // The attachment itself: the static IP names the instance it is
+            // attached to, and that instance is reachable at the reserved address
+            // and reports that it holds a static one. Both halves are the store's
+            // own one step, the same one a detach releases through, and attaching
+            // the address an instance already holds writes what is already stored.
+            if store
+                .attach_static_ip(&static_ip_name, &instance_name)
+                .is_none()
+            {
+                // Unreachable: both records were read above under this same lock.
+                return Err(not_found(
+                    crate::state::RESOURCE_TYPE_STATIC_IP,
+                    &static_ip_name,
+                ));
+            }
+
+            // The address is serving the instance as this call returns — a
+            // `StaticIp` carries no status member and an `Instance`'s own state is
+            // not what an attachment moves, so there is nothing left for the clock
+            // to settle later — which is why the operation this call logs is
+            // answered terminal, exactly as the detach, the allocation and the
+            // release of a reservation are.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_ATTACH_STATIC_IP,
+                crate::state::RESOURCE_TYPE_STATIC_IP,
+                &static_ip_name,
+                &location,
+                None,
+            );
+            // `operations` is a list because a Lightsail call can act on several
+            // resources at once; this one attaches exactly one static IP, so it
+            // answers exactly one entry, against the static IP that is the
+            // resource this operation acts on.
+            Ok(AttachStaticIpOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// Lightsail's refusal of a well-formed request its resources' state does not
+/// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
+/// this exception when an operation fails to execute" — whose message names the
+/// resource that is in the way and what about it is in the way.
+fn operation_failure(message: String) -> AttachStaticIpError {
+    AttachStaticIpErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The request names a resource this account does not hold, so this attach has
+/// nothing to attach or nothing to attach it to: Lightsail's `DoesNotExist`
+/// rejection — HTTP 400, wire error `NotFoundException`, body `code`
+/// `DoesNotExist` and a message naming the resource type and the requested name.
+fn not_found(resource_type: &str, name: &str) -> AttachStaticIpError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(resource_type, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> AttachStaticIpError {
+    AttachStaticIpErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail static IP store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

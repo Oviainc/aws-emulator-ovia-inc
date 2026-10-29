@@ -367,7 +367,7 @@ async fn detaching_a_static_ip_releases_the_attachment_and_keeps_the_reservation
             .as_str()
             .unwrap_or_default()
             .to_string();
-        let reserved = attach_static_ip(&emulator, row.static_ip_name, row.instance_name);
+        let reserved = attach_static_ip(&emulator, row.static_ip_name, row.instance_name).await;
 
         // What a client sees while the attachment stands.
         let attached_ip = static_ip(&emulator, row.static_ip_name).await;
@@ -471,7 +471,7 @@ async fn detaching_a_static_ip_twice_releases_nothing_the_second_time() {
         let emulator = Emulator::new();
         allocate(&emulator, row.region, row.static_ip_name).await;
         create_instance(&emulator, row).await;
-        attach_static_ip(&emulator, row.static_ip_name, row.instance_name);
+        attach_static_ip(&emulator, row.static_ip_name, row.instance_name).await;
 
         detach(&emulator, case, row.region, row.static_ip_name).await;
         let once_ip = static_ip(&emulator, row.static_ip_name).await;
@@ -557,7 +557,7 @@ async fn a_name_the_account_does_not_hold_detaches_nothing() {
     allocate(&emulator, None, KEPT).await;
     allocate(&emulator, None, row.static_ip_name).await;
     create_instance(&emulator, row).await;
-    attach_static_ip(&emulator, row.static_ip_name, row.instance_name);
+    attach_static_ip(&emulator, row.static_ip_name, row.instance_name).await;
 
     let before_kept = static_ip(&emulator, KEPT).await;
     let before_attached = static_ip(&emulator, row.static_ip_name).await;
@@ -610,7 +610,7 @@ async fn detaching_one_static_ip_leaves_every_other_attachment_alone() {
     for row in [detached, kept] {
         allocate(&emulator, None, row.static_ip_name).await;
         create_instance(&emulator, row).await;
-        attach_static_ip(&emulator, row.static_ip_name, row.instance_name);
+        attach_static_ip(&emulator, row.static_ip_name, row.instance_name).await;
     }
     allocate(&emulator, None, KEPT).await;
 
