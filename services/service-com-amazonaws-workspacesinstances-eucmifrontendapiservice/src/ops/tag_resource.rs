@@ -178,20 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // can report is refused outright rather than growing the record.
         let mut merged = record.tags.clone();
         crate::state::merge_tags(&mut merged, input.tags.iter());
-        if merged.len() > crate::state::MAX_TAGS_PER_INSTANCE {
-            // Names the member and the constraint it violated, and NONE of what the
-            // caller sent: this service does not reflect request values back into an
-            // error body, which is why the refusal renderer in `crate::service`
-            // states a boundary violation the same way.
-            let why = format!(
-                "the request would leave the WorkSpace Instance holding more than the {} tags a resource can hold",
-                crate::state::MAX_TAGS_PER_INSTANCE
-            );
-            return Err(TagResourceErrorModeled::ValidationException(
-                crate::state::field_validation_failed("Tags", why),
-            )
-            .into());
-        }
+        // The crate's one tag-capacity rule, named for the member that carried the
+        // tags here — the same function the create of an instance refuses an
+        // over-large tag set through.
+        crate::state::require_tag_capacity("Tags", &merged)
+            .map_err(TagResourceErrorModeled::ValidationException)?;
         record.tags = merged;
 
         Ok(TagResourceOutput {})

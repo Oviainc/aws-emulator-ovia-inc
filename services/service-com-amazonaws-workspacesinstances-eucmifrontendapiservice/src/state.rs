@@ -2458,6 +2458,35 @@ pub fn reject_reserved_tag_keys<'a>(
     Ok(())
 }
 
+/// Refuse a request that would leave a WorkSpace Instance holding more tags than
+/// [`MAX_TAGS_PER_INSTANCE`].
+///
+/// `tags` is the tag set the request would leave the resource holding — the merge a
+/// create builds from every member that carries caller tags, or the merge a tagging
+/// call builds onto what is already stored — so the rule is read off the RESULT, not
+/// off the length of any one member. `member` is the input member named in the
+/// refusal, exactly as [`field_validation_failed`] names any other bad member.
+///
+/// The ONE place that rule is applied, so a create and a later tagging call cannot
+/// drift apart on the bound, on the comparison or on the wording. Checked before
+/// anything is stored, so nothing is written for a request that is going to be
+/// refused, and the wording states the rule and none of what the caller sent.
+pub fn require_tag_capacity(
+    member: &str,
+    tags: &BTreeMap<String, String>,
+) -> Result<(), ValidationException> {
+    if tags.len() > MAX_TAGS_PER_INSTANCE {
+        return Err(field_validation_failed(
+            member,
+            format!(
+                "the request would leave the WorkSpace Instance holding more than the \
+                 {MAX_TAGS_PER_INSTANCE} tags a resource can hold"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Every tag key the `TagSpecification` list of a create request carries, whichever
 /// resource type each specification names.
 ///

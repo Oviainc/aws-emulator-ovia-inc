@@ -351,20 +351,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // its own `TagList`, so the two members together can name more distinct keys
         // than the modelled `TagList` `ListTagsForResource` reports them in could
         // carry. Such a request is refused rather than storing a tag set this service
-        // could not report, exactly as `TagResource` refuses a merge that would grow
-        // the set past the bound — and refused HERE, before the store is reached, so it
-        // neither retires its token nor mints an id. The refusal names the member and
-        // the constraint, and none of what the caller sent.
-        if tags.len() > crate::state::MAX_TAGS_PER_INSTANCE {
-            let why = format!(
-                "the request would leave the WorkSpace Instance holding more than the {} tags a resource can hold",
-                crate::state::MAX_TAGS_PER_INSTANCE
-            );
-            return Err(CreateWorkspaceInstanceErrorModeled::ValidationException(
-                crate::state::field_validation_failed("TagSpecifications", why),
-            )
-            .into());
-        }
+        // could not report, through the crate's one tag-capacity rule — the same
+        // function `TagResource` refuses a merge through, named for the member that
+        // carried the tags here — and refused HERE, before the store is reached, so it
+        // neither retires its token nor mints an id.
+        crate::state::require_tag_capacity("TagSpecifications", &tags)
+            .map_err(CreateWorkspaceInstanceErrorModeled::ValidationException)?;
 
         // The launch configuration is checked BEFORE the store is reached too, so a
         // launch this service could not carry out is refused whatever the store holds:

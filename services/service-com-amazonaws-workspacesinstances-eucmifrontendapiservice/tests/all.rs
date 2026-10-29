@@ -41,6 +41,8 @@ mod regional_scoping;
 mod reserved_tag_keys;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_capacity_rule_sharing.rs"]
+mod tag_capacity_rule_sharing;
 #[path = "all/tag_list_merge_rule.rs"]
 mod tag_list_merge_rule;
 #[path = "all/tag_removal.rs"]
