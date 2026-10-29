@@ -110,6 +110,24 @@ impl Emulator {
         );
         created
     }
+
+    /// `CreateSubscription` under `domain_id`, asserting it was accepted, and the created
+    /// subscription's id — the companion of [`Emulator::create_domain`], so a suite that
+    /// needs a collection of subscriptions does not grow a copy of this walk.
+    pub(crate) async fn create_subscription(&self, domain_id: &str) -> String {
+        let (status, created) = self
+            .send(
+                "POST",
+                &format!("/domains/{domain_id}/subscriptions"),
+                Some(&json!({})),
+            )
+            .await;
+        assert_eq!(
+            status, 201,
+            "CreateSubscription under {domain_id} got {created:?}"
+        );
+        string_at(&created, "subscriptionId")
+    }
 }
 
 /// Dispatch ONE signed restJson1 request against `router` and return its status and

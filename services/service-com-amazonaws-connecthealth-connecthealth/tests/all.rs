@@ -37,6 +37,8 @@ mod list_domains_filter_cursor_scope;
 mod list_tags_for_resource;
 #[path = "all/pagination_token_issuance.rs"]
 mod pagination_token_issuance;
+#[path = "all/pagination_token_spelling.rs"]
+mod pagination_token_spelling;
 #[path = "all/patient_insights_job_lifecycle.rs"]
 mod patient_insights_job_lifecycle;
 #[path = "all/patient_insights_job_terminal_output.rs"]

@@ -1521,6 +1521,14 @@ pub fn encode_page_token(scope: &str, last_key: &str) -> String {
 /// The key a `nextToken` resumes after in `scope`, or `None` when the token is not one
 /// this service issued FOR THAT collection — a fabricated token, a token whose tag does
 /// not match the key it carries, and a token another listing minted all answer `None`.
+///
+/// Only the ONE spelling [`encode_page_token`] writes for a position names that position:
+/// a token is accepted only when it is byte-identical to the token this service would
+/// mint for the collection and key it decodes to, which is the check that covers the
+/// scope, the tag and the spelling at once. The hex decode is laxer than the hex encode —
+/// it reads `A-F` as well as the `a-f` the minter emits — so without that comparison a
+/// re-cased copy of a cursor, a string no response of this service ever carried, would
+/// resume a listing.
 pub fn decode_page_token(scope: &str, token: &str) -> Option<String> {
     if token.len() > MAX_PAGE_TOKEN_LEN {
         return None;
@@ -1528,10 +1536,8 @@ pub fn decode_page_token(scope: &str, token: &str) -> Option<String> {
     let plaintext = String::from_utf8(hex::decode(token).ok()?).ok()?;
     // A scope carries no `:`, so the first two fields are the tag and the scope and the
     // remainder is the key, whatever the key itself contains.
-    let mut fields = plaintext.splitn(3, ':');
-    let (tag, token_scope, after_key) = (fields.next()?, fields.next()?, fields.next()?);
-    (token_scope == scope && page_token_tag(scope, after_key) == tag)
-        .then(|| after_key.to_string())
+    let after_key = plaintext.splitn(3, ':').nth(2)?;
+    (encode_page_token(scope, after_key) == token).then(|| after_key.to_string())
 }
 
 /// The page-size bound a `@paginated` listing of this service enforces itself, and the

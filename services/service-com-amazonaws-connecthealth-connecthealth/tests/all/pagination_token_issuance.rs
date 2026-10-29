@@ -209,7 +209,7 @@ async fn list_domains_resumes_only_from_a_cursor_it_issued() {
 
     // A subscription of one of those domains, so a row can send a cursor the OTHER
     // listing issued.
-    let subscription_id = create_subscription(&emulator, &last_key).await;
+    let subscription_id = emulator.create_subscription(&last_key).await;
 
     let cases = vec![
         // The token the issue recorded: hex of plausible text, even length, decodes to
@@ -280,7 +280,7 @@ async fn list_subscriptions_resumes_only_from_a_cursor_it_issued() {
     );
     let mut created: BTreeSet<String> = BTreeSet::new();
     for _ in 0..3 {
-        created.insert(create_subscription(&emulator, &domain_id).await);
+        created.insert(emulator.create_subscription(&domain_id).await);
     }
     let first_key = created
         .iter()
@@ -388,21 +388,4 @@ async fn list_subscriptions_resumes_only_from_a_cursor_it_issued() {
         listed, created,
         "a refused token must leave the listing itself unchanged"
     );
-}
-
-/// `CreateSubscription` under `domain_id`, asserting it was accepted, and the created
-/// subscription's id.
-async fn create_subscription(emulator: &Emulator, domain_id: &str) -> String {
-    let (status, subscription) = emulator
-        .send(
-            "POST",
-            &format!("/domains/{domain_id}/subscriptions"),
-            Some(&json!({})),
-        )
-        .await;
-    assert_eq!(
-        status, 201,
-        "CreateSubscription under {domain_id} got {subscription:?}"
-    );
-    string_at(&subscription, "subscriptionId")
 }

@@ -125,22 +125,6 @@ fn range_sentence(value: i64, member_path: &str, requirement: &str) -> String {
     )
 }
 
-/// `CreateSubscription` under `domain_id`, asserting it was accepted.
-async fn create_subscription(emulator: &Emulator, domain_id: &str) -> String {
-    let (status, created) = emulator
-        .send(
-            "POST",
-            &format!("/domains/{domain_id}/subscriptions"),
-            Some(&json!({})),
-        )
-        .await;
-    assert_eq!(
-        status, 201,
-        "CreateSubscription under {domain_id} got {created:?}"
-    );
-    string_at(&created, "subscriptionId")
-}
-
 /// Both listings of this service, each over a collection of exactly [`COLLECTION_SIZE`]
 /// persisted records, plus a request to the same listing whose collection is empty.
 ///
@@ -168,7 +152,7 @@ async fn listings(emulator: &Emulator) -> Vec<Listing> {
         "the suite needs two distinct domains, got {domains:?}"
     );
     for _ in 0..COLLECTION_SIZE {
-        create_subscription(emulator, &parent).await;
+        emulator.create_subscription(&parent).await;
     }
 
     vec![
