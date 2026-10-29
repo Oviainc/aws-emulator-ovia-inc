@@ -63,6 +63,8 @@ mod missing_resource_refusal_is_one_answer;
 mod negative_paths;
 #[path = "all/page_token_provenance.rs"]
 mod page_token_provenance;
+#[path = "all/page_token_query_identity.rs"]
+mod page_token_query_identity;
 #[path = "all/put_bandwidth_rate_limit_schedule.rs"]
 mod put_bandwidth_rate_limit_schedule;
 #[path = "all/put_hypervisor_property_mappings.rs"]

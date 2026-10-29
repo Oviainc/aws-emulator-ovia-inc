@@ -164,11 +164,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // accepted against one view of the records and spent against another.
         let store = state.lock();
 
-        // A `NextToken` resumes after the page boundary it encodes. One this service did
-        // not issue for a virtual-machine listing is refused, never quietly treated as
-        // "start from the top" — which is a question for the store, since a boundary of
-        // the right SHAPE that this service never minted would include the whole listing
-        // and hand back page one.
+        // A `NextToken` resumes after the page boundary it encodes, for the QUERY it was
+        // issued under: this listing is narrowed by its `HypervisorArn` filter, so the
+        // filter the request carries is part of the question the store is asked, and a
+        // token minted for another hypervisor's listing (or for the unfiltered one) is
+        // refused rather than spent against records it was never cut from — which would
+        // drop every machine sorting below that boundary and report this hypervisor as
+        // having none. One this service did not issue at all is refused the same way,
+        // never quietly treated as "start from the top".
         let after = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
@@ -177,13 +180,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         token,
                         crate::state::VIRTUAL_MACHINE_RESOURCE_TYPE,
                         &region,
+                        &[input.hypervisor_arn.as_deref()],
                     )
                     .ok_or_else(|| {
                         ListVirtualMachinesErrorModeled::ValidationException(ValidationException {
                             error_code: None,
                             // Worded by `crate::service`, as in `list_gateways`: the
                             // member's validation path, under the validation-error
-                            // envelope, and the opaque token not echoed back.
+                            // envelope, and the opaque token not echoed back. One
+                            // sentence covers every token this listing did not issue,
+                            // whichever way it fails to be one — a boundary never minted,
+                            // or one minted for a differently filtered listing, which is
+                            // not a token a previous response of THIS listing returned.
                             message: Some(crate::service::handler_constraint_violation(
                                 None,
                                 &crate::service::member_path("NextToken"),

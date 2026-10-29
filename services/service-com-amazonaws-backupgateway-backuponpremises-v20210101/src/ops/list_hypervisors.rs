@@ -166,7 +166,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
             Some(token) => Some(
                 store
-                    .resume_after(token, crate::state::HYPERVISOR_RESOURCE_TYPE, &region)
+                    // No filters, as in `list_gateways`: the model gives this listing
+                    // `MaxResults` and `NextToken` only, so a token it issues is a token
+                    // of the one listing of this region's hypervisors.
+                    .resume_after(token, crate::state::HYPERVISOR_RESOURCE_TYPE, &region, &[])
                     .ok_or_else(|| {
                         ListHypervisorsErrorModeled::ValidationException(ValidationException {
                             error_code: None,

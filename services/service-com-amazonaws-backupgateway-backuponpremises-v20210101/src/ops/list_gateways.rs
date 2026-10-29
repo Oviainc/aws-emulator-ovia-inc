@@ -165,7 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
             Some(token) => Some(
                 store
-                    .resume_after(token, crate::state::GATEWAY_RESOURCE_TYPE, &region)
+                    // No filters: this listing takes none beside its page controls (the
+                    // model gives it `MaxResults` and `NextToken` only), so every token
+                    // it issues is a token of the one listing of this region's gateways.
+                    .resume_after(token, crate::state::GATEWAY_RESOURCE_TYPE, &region, &[])
                     .ok_or_else(|| {
                         ListGatewaysErrorModeled::ValidationException(ValidationException {
                             error_code: None,

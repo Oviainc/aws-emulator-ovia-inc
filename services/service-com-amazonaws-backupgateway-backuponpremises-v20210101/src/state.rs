@@ -80,10 +80,16 @@
 //! Every listing pages through one helper ([`page_of_where`], handing back a [`Page`]),
 //! so a page boundary and the token that encodes it mean the same thing whichever
 //! resource is being listed, filtered ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::page_of_virtual_machines`])
-//! or not. A `NextToken` is RESOLVED against this store rather than parsed
+//! or not. A token identifies the whole QUERY it resumes and not merely where the last
+//! page stopped ([`encode_page_token`]): the boundary, plus the filters the listing
+//! applied beside its page controls, so a page cut from one query is never resumed by
+//! another — whose matching records may lie entirely below that boundary, which would
+//! report an empty page no client could tell from a last one. A `NextToken` is RESOLVED
+//! against this store rather than parsed
 //! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::resume_after`]): only a
-//! boundary this store really minted, for that resource type and in the region the
-//! listing reports, resumes a listing, and every other string is refused — a boundary of
+//! boundary this store really minted, for that resource type, in the region the listing
+//! reports and under the filters the request presenting it carries, resumes a listing,
+//! and every other string is refused — a boundary of
 //! the right shape that nothing was ever stored under would bound the range at a key the
 //! whole listing sorts above, so accepting it would hand a client page one for ever.
 //! Every resource of this service is REGIONAL — its region is a segment of the
@@ -2154,6 +2160,12 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// machines and carries a token only while a matching machine remains past its
     /// boundary, and a filtered listing pages exactly like an unfiltered one. Same boundary
     /// contract as [`Self::page_of_gateways`], whose implementation it shares.
+    ///
+    /// `hypervisor_arn` is the one filter this listing takes beside its page controls, so
+    /// it is also what the token this page carries is minted UNDER
+    /// ([`encode_page_token`]): the boundary of a page of the machines of one hypervisor
+    /// resumes the listing of that hypervisor and no other, because the machines matching
+    /// another filter are not the records this page was cut from.
     pub fn page_of_virtual_machines(
         &self,
         region: &str,
@@ -2162,11 +2174,17 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         limit: usize,
         now: SystemTime,
     ) -> Page<StoredVirtualMachine> {
-        page_of_where(&self.virtual_machines, after, limit, |arn, machine| {
-            arn_is_in_region(arn, region)
-                && machine.discovered_as_of(now)
-                && hypervisor_arn.is_none_or(|filter| machine.hypervisor_arn == filter)
-        })
+        page_of_where(
+            &self.virtual_machines,
+            after,
+            limit,
+            &[hypervisor_arn],
+            |arn, machine| {
+                arn_is_in_region(arn, region)
+                    && machine.discovered_as_of(now)
+                    && hypervisor_arn.is_none_or(|filter| machine.hypervisor_arn == filter)
+            },
+        )
     }
 
     /// The ARN `arn` is stored under and the tags the resource it names carries, or
@@ -2264,7 +2282,8 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     }
 
     /// The page boundary a client-supplied `NextToken` resumes after, for the listing of
-    /// `resource_type` records of `region` — the `after` every `page_of_*` takes.
+    /// `resource_type` records of `region` that applies `filters` — the `after` every
+    /// `page_of_*` takes.
     ///
     /// `Some` only for a token THIS STORE REALLY ISSUED for THIS listing, which is a
     /// question about the store and not about the spelling of the token: the boundary a
@@ -2280,11 +2299,25 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// alone cannot decide this, because an ARN of the right form sorting below every
     /// stored key would include the whole listing and hand back page one.
     ///
+    /// `filters` are the filters the request presenting the token carries, in the order
+    /// the listing applies them — the very filters a page of this listing mints its token
+    /// under ([`encode_page_token`]) — so a token issued for a differently filtered
+    /// listing of the same resource type is `None` too: the records it was cut from are
+    /// not the records being listed, and resuming after its boundary would drop every
+    /// matching record sorting below it and answer with a page no client can tell from a
+    /// final one. A listing that takes no filter at all passes an empty slice.
+    ///
     /// A boundary whose record has since been DELETED still resumes the listing: a minted
     /// ARN stays minted, so the page after it is the records that sort above it, exactly
     /// as [`page_of_where`] documents for a record deleted between two pages.
-    pub fn resume_after(&self, token: &str, resource_type: &str, region: &str) -> Option<String> {
-        let boundary = decode_page_token(token, resource_type)?;
+    pub fn resume_after(
+        &self,
+        token: &str,
+        resource_type: &str,
+        region: &str,
+        filters: &[Option<&str>],
+    ) -> Option<String> {
+        let boundary = decode_page_token(token, resource_type, filters)?;
         (arn_is_in_region(&boundary, region)
             && self.is_minted_resource_arn(&boundary, resource_type))
         .then_some(boundary)
@@ -2444,7 +2477,10 @@ fn page_of_in_region<T: Clone>(
     after: Option<&str>,
     limit: usize,
 ) -> Page<T> {
-    page_of_where(records, after, limit, |arn, _| {
+    // No filters: a listing of a region's records of one kind is the whole listing, so
+    // the only query identity its token needs is the boundary, whose own region segment
+    // is what scopes it to this region.
+    page_of_where(records, after, limit, &[], |arn, _| {
         arn_is_in_region(arn, region)
     })
 }
@@ -2457,10 +2493,17 @@ fn page_of_in_region<T: Clone>(
 /// successor. `page_of_in_region` is this with a predicate that keeps the records of one
 /// region, so a further-filtered listing and a merely regional one cut their pages and
 /// mint their tokens the same way.
+///
+/// `filters` are the REQUEST-supplied filters `keep` applies beside the region — the
+/// values the listing was narrowed by, in the order it applies them — and the token this
+/// page carries is minted under them ([`encode_page_token`]), so the page a token resumes
+/// is a page of the same query. A listing narrowed by nothing but its region passes an
+/// empty slice, the region being carried by the boundary ARN itself.
 fn page_of_where<T: Clone>(
     records: &BTreeMap<String, T>,
     after: Option<&str>,
     limit: usize,
+    filters: &[Option<&str>],
     keep: impl Fn(&str, &T) -> bool,
 ) -> Page<T> {
     let lower = match after {
@@ -2475,7 +2518,7 @@ fn page_of_where<T: Clone>(
     // not carry one, or a paginating client never stops.
     let next_token = remaining
         .next()
-        .and_then(|_| page.last().map(|(key, _)| encode_page_token(key)));
+        .and_then(|_| page.last().map(|(key, _)| encode_page_token(key, filters)));
     Page {
         items: page.into_iter().map(|(_, record)| record.clone()).collect(),
         next_token,
@@ -2606,31 +2649,81 @@ pub fn tag_map(requested: &[Tag]) -> Result<BTreeMap<String, String>, String> {
     merged_tags(&BTreeMap::new(), requested)
 }
 
-/// The opaque pagination token for a page that ended on `arn`.
+/// The opaque pagination token for a page that ended on `arn`, of the listing narrowed by
+/// `filters`.
 ///
-/// The token is the page boundary itself (the last ARN returned), hex-encoded so a
-/// client has nothing to read in it and treats it as opaque, as the modelled `NextToken`
-/// requires. Encoding the boundary rather than storing a cursor server-side is what lets
-/// a token stay resolvable for as long as the client holds it, with no per-caller state.
-pub fn encode_page_token(arn: &str) -> String {
-    hex::encode(arn)
+/// The token identifies the QUERY it resumes and not merely where the last page stopped:
+/// the page boundary (the last ARN returned) together with the filters the listing applied
+/// beside its page controls ([`page_token_payload`]), hex-encoded so a client has nothing
+/// to read in it and treats it as opaque, as the modelled `NextToken` requires. Encoding
+/// that rather than storing a cursor server-side is what lets a token stay resolvable for
+/// as long as the client holds it, with no per-caller state.
+///
+/// The filters belong in the token because a boundary means nothing without the query it
+/// was cut from: the records matching a DIFFERENT filter may all sort below it, so
+/// resuming that other listing after it would hand back no records and no successor — the
+/// shape of a correct final page — and report a resource as empty while the store holds
+/// its records. The page CONTROLS are not part of the identity: `MaxResults` is the
+/// `pageSize` of the modelled `@paginated` trait, so a client may ask for a different page
+/// size on every page and still walk one listing.
+pub fn encode_page_token(arn: &str, filters: &[Option<&str>]) -> String {
+    hex::encode(page_token_payload(arn, filters))
 }
 
-/// The ARN a `NextToken` SPELLS, for a listing of `resource_type`: the hex-decoded
-/// boundary, once it is an ARN of this service naming that resource type.
+/// The byte that separates the fields inside a page token's decoded payload: the ASCII
+/// unit separator, which no field can contain — a boundary is an ARN of the printable form
+/// [`is_resource_arn`] accepts, and every member a listing of this service is narrowed by
+/// is modelled with a `@pattern` of printable characters — so the fields read back exactly
+/// as they were written.
+const PAGE_TOKEN_FIELD_SEPARATOR: char = '\u{1f}';
+
+/// What a page token encodes, before it is hex-encoded: the boundary ARN, then one field
+/// per filter the listing applied, in the order it applies them.
 ///
-/// `None` for not hex, not UTF-8, not an ARN of this service, or an ARN naming another
-/// resource type — a token one listing handed out does not resume another, because the
-/// page boundary it encodes is a key of a different map.
+/// Written once and read back through this very function ([`decode_page_token`] rebuilds
+/// the payload the request presenting a token WOULD have been handed and compares), so no
+/// token can be resumed by a query that would not have minted it. A listing narrowed by
+/// nothing — one that takes no filter, or one whose request named none — encodes the bare
+/// boundary, because that is the same listing of the same records: the whole listing of
+/// that resource type in that region. Where one filter of several is absent its field is
+/// EMPTY, which no present one can spell, every such member being modelled non-empty.
+fn page_token_payload(arn: &str, filters: &[Option<&str>]) -> String {
+    if filters.iter().all(Option::is_none) {
+        return arn.to_string();
+    }
+    let mut payload = arn.to_string();
+    for filter in filters {
+        payload.push(PAGE_TOKEN_FIELD_SEPARATOR);
+        payload.push_str(filter.unwrap_or_default());
+    }
+    payload
+}
+
+/// The ARN a `NextToken` SPELLS, for a listing of `resource_type` narrowed by `filters`:
+/// the hex-decoded boundary, once the payload is the one [`encode_page_token`] mints for
+/// those very filters and the boundary is an ARN of this service naming that resource
+/// type.
+///
+/// `None` for not hex, not UTF-8, not an ARN of this service, an ARN naming another
+/// resource type, or a payload minted for another query — a token one listing handed out
+/// does not resume another, whether the other lists a different resource type, whose page
+/// boundary is a key of a different map, or the same resource type under a different
+/// filter, whose matching records may lie entirely on the far side of that boundary.
 ///
 /// SHAPE ONLY, which is why this is private: whether this store ever ISSUED the token is
 /// a question about the store, which only
 /// [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::resume_after`] can answer —
 /// and that is the one route a listing resolves a token through, so no handler can accept
 /// a boundary this store never minted.
-fn decode_page_token(token: &str, resource_type: &str) -> Option<String> {
+fn decode_page_token(
+    token: &str,
+    resource_type: &str,
+    filters: &[Option<&str>],
+) -> Option<String> {
     let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    is_resource_arn(&decoded, resource_type).then_some(decoded)
+    let boundary = decoded.split(PAGE_TOKEN_FIELD_SEPARATOR).next()?;
+    (decoded == page_token_payload(boundary, filters) && is_resource_arn(boundary, resource_type))
+        .then(|| boundary.to_string())
 }
 
 /// One resource id as this store mints them: `prefix` followed by `sequence` in 16 hex
