@@ -247,18 +247,18 @@ async fn a_baseline_teardown_in_flight_reports_no_drift_assessment() {
 /// One row of the control table: the configuration an enabled control has deployed when
 /// `DisableControl` starts removing it.
 #[derive(Debug, Clone)]
-struct ControlRow {
-    case: String,
-    control_identifier: String,
-    target_identifier: String,
+pub(crate) struct ControlRow {
+    pub(crate) case: String,
+    pub(crate) control_identifier: String,
+    pub(crate) target_identifier: String,
     /// The `parameters` member `EnableControl` is given; `None` omits it.
-    initial: Option<serde_json::Value>,
+    pub(crate) initial: Option<serde_json::Value>,
 }
 
 /// The control table: a control the catalog publishes WITH parameters under each kind of
 /// configuration it can carry, a control that declares none, and a control implemented with
 /// a service control policy, so the rows span both control implementations.
-fn control_rows() -> Vec<ControlRow> {
+pub(crate) fn control_rows() -> Vec<ControlRow> {
     let parameterized = CONTROL_CATALOG
         .iter()
         .find(|control| control.enablable && !control.parameters.is_empty())
@@ -331,7 +331,7 @@ fn control_rows() -> Vec<ControlRow> {
 }
 
 /// POST `/disable-control` for the enablement `arn` names.
-async fn disable_control(router: &MultiServiceRouter, arn: &str) -> Answer {
+pub(crate) async fn disable_control(router: &MultiServiceRouter, arn: &str) -> Answer {
     call(
         router,
         "/disable-control",
@@ -342,7 +342,7 @@ async fn disable_control(router: &MultiServiceRouter, arn: &str) -> Answer {
 
 /// POST `/get-enabled-control` without asserting the answer, for the cases whose subject is
 /// whether the enablement still exists.
-async fn get_enabled_control(router: &MultiServiceRouter, arn: &str) -> Answer {
+pub(crate) async fn get_enabled_control(router: &MultiServiceRouter, arn: &str) -> Answer {
     call(
         router,
         "/get-enabled-control",

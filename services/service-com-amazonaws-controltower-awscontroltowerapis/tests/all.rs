@@ -63,6 +63,8 @@ mod get_enabled_control;
 mod in_flight_configuration_change_drift;
 #[path = "all/in_flight_control_change_reporting.rs"]
 mod in_flight_control_change_reporting;
+#[path = "all/in_flight_control_drift_reporting.rs"]
+mod in_flight_control_drift_reporting;
 #[path = "all/in_flight_teardown_drift.rs"]
 mod in_flight_teardown_drift;
 #[path = "all/inherited_enabled_baselines.rs"]

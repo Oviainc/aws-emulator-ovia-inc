@@ -49,7 +49,7 @@ use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer
 
 /// The three `EnabledControlFilter` members that narrow the listing by one of the drift
 /// dimensions a control reports.
-const DRIFT_FILTER_MEMBERS: &[&str] = &[
+pub(crate) const DRIFT_FILTER_MEMBERS: &[&str] = &[
     "driftStatuses",
     "inheritanceDriftStatuses",
     "resourceDriftStatuses",
@@ -58,7 +58,7 @@ const DRIFT_FILTER_MEMBERS: &[&str] = &[
 /// `ListEnabledControls` over the whole store, narrowed by `filter` (`Value::Null` asks for
 /// no narrowing at all). `maxResults` is inside the modelled range 1..200 and above the
 /// number of controls this suite enables, so every answer is one page.
-async fn listing(router: &MultiServiceRouter, filter: serde_json::Value) -> Answer {
+pub(crate) async fn listing(router: &MultiServiceRouter, filter: serde_json::Value) -> Answer {
     let mut body = serde_json::json!({ "maxResults": 100 });
     if !filter.is_null() {
         body["filter"] = filter;
@@ -74,7 +74,7 @@ async fn listing(router: &MultiServiceRouter, filter: serde_json::Value) -> Answ
 
 /// The `filter` that narrows the listing by `member` to the controls reporting `status` for
 /// the drift dimension it narrows by. One value, the modelled maximum length of the list.
-fn drift_filter(member: &str, status: &str) -> serde_json::Value {
+pub(crate) fn drift_filter(member: &str, status: &str) -> serde_json::Value {
     let mut filter = serde_json::Map::new();
     filter.insert(member.to_string(), serde_json::json!([status]));
     serde_json::Value::Object(filter)
@@ -82,7 +82,7 @@ fn drift_filter(member: &str, status: &str) -> serde_json::Value {
 
 /// The state every reporting call reports about the control `arn` names, asserting the two
 /// agree — they read one stored record, so a difference between them is the defect.
-async fn reported_everywhere(
+pub(crate) async fn reported_everywhere(
     router: &MultiServiceRouter,
     case: &str,
     arn: &str,
@@ -119,7 +119,7 @@ async fn reported_everywhere(
 
 /// The state `status` with all three drift dimensions at `drift`, as
 /// [`reported_everywhere`] hands one back.
-fn state(status: &str, drift: &str) -> (String, (String, String, String)) {
+pub(crate) fn state(status: &str, drift: &str) -> (String, (String, String, String)) {
     (
         status.to_string(),
         (drift.to_string(), drift.to_string(), drift.to_string()),
