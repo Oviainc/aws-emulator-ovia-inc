@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyVerifiedAccessInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyVerifiedAccessInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyVerifiedAccessInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: applies the members the request carries to the stored Verified Access
+//! instance, leaves the ones it does not carry as they were, and answers the instance as the
+//! store now holds it — so a later read of the same instance reports what this call left
+//! behind. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +136,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyVerifiedAccessInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyVerifiedAccessInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyVerifiedAccessInstance"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            idempotent_parameter_mismatch, invalid_verified_access_instance_id_not_found,
+            require_service_state, verified_access_instance_limit_exceeded,
+            verified_access_instance_modification_payload_bytes,
+            verified_access_instance_payload_bytes, VerifiedAccessInstanceModification,
+            MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES,
+        };
+
+        // `ctx` carries request metadata only, and nothing this record holds names a Region:
+        // the modelled `VerifiedAccessInstance` carries no ARN and no zone, so there is
+        // nothing on it to read off the request.
+        let _ = ctx;
+
+        // Bounded the way every other client token this service accepts is, so one
+        // modification cannot retain caller-chosen text the budget was never asked about.
+        if input
+            .client_token
+            .as_deref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // "The custom subdomain" (`ModifyVerifiedAccessInstanceRequest$
+        // CidrEndpointsCustomSubDomain`) is the name the network CIDR endpoints of this
+        // instance are reached under, so a value naming no domain at all is refused rather
+        // than stored as a subdomain of the empty name — the same rule, and the same wording,
+        // the create of an instance reads that member by. A request that carries none leaves
+        // the instance's own subdomain as it was.
+        if input
+            .cidr_endpoints_custom_sub_domain
+            .as_deref()
+            .is_some_and(|sub_domain| sub_domain.trim().is_empty())
+        {
+            return Err(Scaffolded::invalid_parameter_value(
+                "cidrEndpointsCustomSubDomain must name a subdomain",
+            ));
+        }
+
+        // The modification this request asks for: the instance it names and the members it
+        // carries. A member it does not carry is absent here too, so applying this leaves
+        // that member of the instance as it was.
+        let modification = VerifiedAccessInstanceModification {
+            verified_access_instance_id: input.verified_access_instance_id.clone(),
+            description: input.description.clone(),
+            cidr_endpoints_custom_sub_domain: input.cidr_endpoints_custom_sub_domain.clone(),
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // "Modifies the configuration of the specified Amazon Web Services Verified Access
+        // instance": an id that names no instance of the account modifies nothing and is
+        // refused, whatever the id looks like.
+        let Some(current) = store
+            .verified_access_instances
+            .get(&modification.verified_access_instance_id)
+            .cloned()
+        else {
+            return Err(invalid_verified_access_instance_id_not_found(
+                &modification.verified_access_instance_id,
+            ));
+        };
+
+        // Idempotency: "A unique, case-sensitive token that you provide to ensure idempotency
+        // of your modification request"
+        // (`ModifyVerifiedAccessInstanceRequest$ClientToken`) — a repeat of one request
+        // applies nothing further and reports the instance as it stands, while the same token
+        // carrying a DIFFERENT request is the mismatch EC2 refuses rather than a second
+        // modification. Read here, answered below the DryRun check, because a replay writes
+        // nothing and so passes the budget a fresh modification has to clear.
+        let replayed = match input.client_token.as_deref() {
+            None => false,
+            Some(token) => match store.verified_access_instance_modification_for_token(token) {
+                None => false,
+                Some(recorded) if recorded == &modification => true,
+                Some(_) => return Err(idempotent_parameter_mismatch()),
+            },
+        };
+
+        // The budget is asked about the NET change only on the path that writes: this call
+        // stores no further instance, so the instance ceiling cannot bound it, and the
+        // members it sets are caller-chosen text — replacing a short description with a long
+        // one grows the store by the difference, and the token it is recorded under is
+        // retained too.
+        if !replayed {
+            let refund = verified_access_instance_payload_bytes(&current, None);
+            // What this call would leave behind, computed by the store's ONE definition of
+            // what a modification does to an instance, so the figure checked here is exactly
+            // the one the write charges.
+            let charge =
+                verified_access_instance_payload_bytes(&modification.applied_to(&current), None)
+                    .saturating_add(input.client_token.as_deref().map_or(0, |token| {
+                        verified_access_instance_modification_payload_bytes(&modification, token)
+                    }));
+            if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+                return Err(verified_access_instance_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied data, so it cannot store this modification's {charge} \
+                     bytes",
+                    store.stored_bytes()
+                )));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and the instance resolved, and
+        // BEFORE the first write: the flag asks whether the request WOULD have worked, so one
+        // that would have been refused is refused with that reason instead, and one that
+        // would have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // A replay applies nothing — not even a second `LastUpdatedTime` — and reports the
+        // instance as it stands, which is what the first call left behind.
+        let verified_access_instance = if replayed {
+            current
+        } else {
+            // Written through the store's ONE writer of a modification, so what this answers
+            // is the stored record a later describe of the same instance reports.
+            store
+                .modify_verified_access_instance(
+                    &modification,
+                    input.client_token.as_deref(),
+                    ::std::time::SystemTime::now(),
+                )
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "the Verified Access instance '{}' could not be read back after its \
+                         modification",
+                        modification.verified_access_instance_id
+                    ))
+                })?
+        };
+
+        Ok(ModifyVerifiedAccessInstanceOutput {
+            verified_access_instance: Some(verified_access_instance),
+        })
     }
 }

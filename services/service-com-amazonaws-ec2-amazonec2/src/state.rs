@@ -342,6 +342,10 @@
 //! reference. The store starts EMPTY — a fresh account has created no Verified Access
 //! instance — and `CreateVerifiedAccessInstance` is what lands on that writer, so the
 //! instance a caller created is the one every reader of an instance resolves.
+//! [`ComAmazonawsEc2Amazonec2State::modify_verified_access_instance`] is the one way a stored
+//! instance CHANGES: it applies the members a `ModifyVerifiedAccessInstance` request carried,
+//! leaves the ones it did not alone, and stamps the instance's `LastUpdatedTime`, so the
+//! modify and a later describe cannot report one instance differently.
 //!
 //! [`ComAmazonawsEc2Amazonec2State::verified_access_groups`] holds the account's Verified
 //! Access groups as [`VerifiedAccessGroupRecord`]s, keyed by `VerifiedAccessGroupId`, and
@@ -3072,6 +3076,14 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// repeat of the same request answers with that instance instead of creating a second
     /// one.
     pub verified_access_instance_client_tokens: HashMap<String, String>,
+    /// A `ModifyVerifiedAccessInstance` `ClientToken` and the modification it made, so a
+    /// repeat of the same request applies nothing further and the same token carrying a
+    /// different request is refused instead of modifying the instance twice. Separate from
+    /// [`Self::verified_access_instance_client_tokens`] because a token names the request it
+    /// was given with: a modification carrying the token some create was given is a
+    /// modification, not a replay of that create.
+    pub verified_access_instance_modification_client_tokens:
+        HashMap<String, VerifiedAccessInstanceModification>,
     /// Every Verified Access group the account holds, by `VerifiedAccessGroupId`, as
     /// [`VerifiedAccessGroupRecord`]s — see the module docs. Ordered by id, the order a
     /// describe of the groups reports and pages over.
@@ -4020,6 +4032,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // no endpoint on a group.
             verified_access_instances: BTreeMap::new(),
             verified_access_instance_client_tokens: HashMap::new(),
+            verified_access_instance_modification_client_tokens: HashMap::new(),
             verified_access_groups: BTreeMap::new(),
             verified_access_group_client_tokens: HashMap::new(),
             verified_access_endpoints: BTreeMap::new(),
@@ -15400,6 +15413,85 @@ pub fn verified_access_instance_payload_bytes(
         .saturating_add(client_token.map_or(0, str::len))
 }
 
+/// One `ModifyVerifiedAccessInstance` request, as the token it was given with recorded it:
+/// the instance it modified and the members it set.
+///
+/// "A unique, case-sensitive token that you provide to ensure idempotency of your
+/// modification request" (`ModifyVerifiedAccessInstanceRequest$ClientToken`) — so a repeat of
+/// one request applies nothing further, while the SAME token carrying a DIFFERENT request is
+/// the mismatch EC2 refuses ([`idempotent_parameter_mismatch`]) rather than a second
+/// modification. Telling those two apart needs the REQUEST, which is why a recorded
+/// modification carries the members it set and not just the instance it named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedAccessInstanceModification {
+    /// The instance the request named.
+    pub verified_access_instance_id: String,
+    /// "A description for the Verified Access instance"
+    /// (`ModifyVerifiedAccessInstanceRequest$Description`), or `None` when the request
+    /// carried none and so left the stored description as it was.
+    pub description: Option<String>,
+    /// "The custom subdomain"
+    /// (`ModifyVerifiedAccessInstanceRequest$CidrEndpointsCustomSubDomain`), or `None` when
+    /// the request carried none and so left the stored subdomain as it was.
+    pub cidr_endpoints_custom_sub_domain: Option<String>,
+}
+
+impl VerifiedAccessInstanceModification {
+    /// `instance` as this modification leaves it: every member the request carried replaces
+    /// the stored value, and every member it did not carry keeps it.
+    ///
+    /// The ONE definition of what a modification does to an instance, so the pre-check of the
+    /// store's byte budget and
+    /// [`ComAmazonawsEc2Amazonec2State::modify_verified_access_instance`]'s write cannot
+    /// disagree about the record the call leaves behind. `LastUpdatedTime` is NOT set here:
+    /// the instant a modification was applied is the store's to stamp, not a figure a
+    /// pre-check may invent.
+    pub fn applied_to(
+        &self,
+        instance: &crate::ops::types::VerifiedAccessInstance,
+    ) -> crate::ops::types::VerifiedAccessInstance {
+        let mut applied = instance.clone();
+        if let Some(description) = self.description.clone() {
+            applied.description = Some(description);
+        }
+        if let Some(sub_domain) = self.cidr_endpoints_custom_sub_domain.clone() {
+            applied.cidr_endpoints_custom_sub_domain =
+                Some(crate::ops::types::VerifiedAccessInstanceCustomSubDomain {
+                    sub_domain: Some(sub_domain),
+                    // "The name servers"
+                    // (`VerifiedAccessInstanceCustomSubDomain$Nameservers`) are the servers of
+                    // the zone the subdomain is delegated to. This emulator delegates no zone
+                    // and answers no DNS query, so that set is EMPTY — exactly as a create
+                    // leaves it.
+                    nameservers: Some(Vec::new()),
+                });
+        }
+        applied
+    }
+}
+
+/// The caller-chosen bytes one recorded Verified Access instance modification holds for the
+/// process's lifetime: the members the request set and the token the map is keyed by, over a
+/// fixed floor for the entry itself. The instance id is the service's own, so it is bounded
+/// already and not counted here.
+///
+/// The FLOOR is what lets [`MAX_STORED_BYTES`] bound how many modifications can be recorded:
+/// a client token is the caller's and may be a single byte, nothing reclaims a recorded
+/// modification, and an instance may be modified any number of times, so this map has no
+/// record-count ceiling the way a create's store has. Without the floor a stream of
+/// one-character tokens would grow this process's memory while charging almost nothing
+/// against the budget.
+pub fn verified_access_instance_modification_payload_bytes(
+    modification: &VerifiedAccessInstanceModification,
+    client_token: &str,
+) -> usize {
+    let text = |value: &Option<String>| value.as_ref().map_or(0, String::len);
+    ::std::mem::size_of::<VerifiedAccessInstanceModification>()
+        .saturating_add(text(&modification.description))
+        .saturating_add(text(&modification.cidr_endpoints_custom_sub_domain))
+        .saturating_add(client_token.len())
+}
+
 /// The caller-chosen bytes one stored Verified Access endpoint holds for the process's
 /// lifetime: every string the REQUEST chose the length of, the policy document beside the
 /// record, the `EndpointDomainPrefix` the generated endpoint domain carries, and the client
@@ -15592,6 +15684,60 @@ impl ComAmazonawsEc2Amazonec2State {
         self.verified_access_instances
             .insert(instance_id.clone(), instance);
         instance_id
+    }
+
+    /// The modification the `ModifyVerifiedAccessInstance` `ClientToken` `token` named, or
+    /// `None` when no modification has been made under it.
+    pub fn verified_access_instance_modification_for_token(
+        &self,
+        token: &str,
+    ) -> Option<&VerifiedAccessInstanceModification> {
+        self.verified_access_instance_modification_client_tokens
+            .get(token)
+    }
+
+    /// Apply `modification` to the instance it names as of `at`, record it under
+    /// `client_token` when the request carried one, and answer the instance as it NOW
+    /// stands — `None` when this store holds no instance under that id.
+    ///
+    /// The one way a stored instance is modified, so what the modify answers and what a
+    /// later describe of the same instance reports cannot differ: the view it hands back is
+    /// the stored record itself. A member the modification leaves `None` is one the request
+    /// did not carry, so the stored value stays as it was; a member it carries replaces that
+    /// value. The caller-chosen bytes are re-charged across the write — the record this
+    /// replaces is refunded and the record it becomes is charged — so a caller cannot grow
+    /// the store past [`MAX_STORED_BYTES`] by modifying one instance repeatedly; a handler
+    /// asks [`Self::would_exceed_stored_bytes_after_refund`] about that net change first.
+    pub fn modify_verified_access_instance(
+        &mut self,
+        modification: &VerifiedAccessInstanceModification,
+        client_token: Option<&str>,
+        at: SystemTime,
+    ) -> Option<crate::ops::types::VerifiedAccessInstance> {
+        let held = self
+            .verified_access_instances
+            .get(&modification.verified_access_instance_id)?;
+        let refund = verified_access_instance_payload_bytes(held, None);
+        let mut view = modification.applied_to(held);
+        // "The last updated time" (`VerifiedAccessInstance$LastUpdatedTime`): the instant this
+        // modification was applied to the instance.
+        view.last_updated_time = Some(iso8601_utc(at));
+        let charge = verified_access_instance_payload_bytes(&view, None);
+        self.verified_access_instances.insert(
+            modification.verified_access_instance_id.clone(),
+            view.clone(),
+        );
+        self.release_stored_bytes(refund);
+        self.add_stored_bytes(charge);
+        if let Some(token) = client_token {
+            self.add_stored_bytes(verified_access_instance_modification_payload_bytes(
+                modification,
+                token,
+            ));
+            self.verified_access_instance_modification_client_tokens
+                .insert(token.to_string(), modification.clone());
+        }
+        Some(view)
     }
 
     /// Whether another Verified Access group fits inside the store's ceiling

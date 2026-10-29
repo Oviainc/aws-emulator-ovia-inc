@@ -953,3 +953,8 @@ mod transit_gateway_route_tables;
 // page size narrow it, and that the association a writer stored reads back through it.
 #[path = "all/describe_transit_gateway_attachments.rs"]
 mod describe_transit_gateway_attachments;
+// Appended at the END of this file, for the reason the header gives. What
+// `ModifyVerifiedAccessInstance` applies to a stored Verified Access instance, what it leaves
+// as it was, what it refuses, and how one `ClientToken` bounds it to one modification.
+#[path = "all/modify_verified_access_instance.rs"]
+mod modify_verified_access_instance;
