@@ -609,12 +609,14 @@ fn refused_cases() -> Vec<RefusedCase> {
             THREE_VERSION_RESOURCE,
         ),
         not_found(
+            // An extension's ARN carries the extension's NAME, so a refusal that names what
+            // the request identified names that name — the same sentence the name form gets.
             "an ARN no record carries",
             vec![
                 ("Arn", unknown_arn.clone()),
                 ("VersionId", "00000001".to_string()),
             ],
-            &unknown_arn,
+            "No::Such::Resource",
         ),
         not_found(
             "the ARN of a registration another Region's registry holds",
@@ -622,7 +624,7 @@ fn refused_cases() -> Vec<RefusedCase> {
                 ("Arn", other_region_arn.clone()),
                 ("VersionId", "00000001".to_string()),
             ],
-            &other_region_arn,
+            OTHER_REGION_TYPE_NAME,
         ),
         not_found(
             "a VersionId the record holds no version under",

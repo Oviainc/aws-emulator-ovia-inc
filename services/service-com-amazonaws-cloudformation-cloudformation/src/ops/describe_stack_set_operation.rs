@@ -231,9 +231,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let operation = stack_set.operation(&input.operation_id).ok_or_else(|| {
             DescribeStackSetOperationErrorModeled::OperationNotFoundException(
                 OperationNotFoundException {
-                    message: Some(crate::state::stack_set_operation_does_not_exist(
-                        &input.operation_id,
-                    )),
+                    message: Some(
+                        crate::state::stack_set_operation_does_not_exist().to_string(),
+                    ),
                 },
             )
         })?;

@@ -544,7 +544,7 @@ async fn a_stackset_or_an_operation_the_store_does_not_hold_is_refused() {
         );
         assert_eq!(
             xml_text(&body, "Message").as_deref(),
-            Some(format!("StackSet operation {operation_id} not found").as_str()),
+            Some("Operation not found"),
             "case {case:?}: expected the operation-not-found message, got {body}"
         );
     }

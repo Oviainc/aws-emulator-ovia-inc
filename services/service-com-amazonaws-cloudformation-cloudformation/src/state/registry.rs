@@ -230,6 +230,35 @@ pub fn public_type_arn(region: &str, type_kind: &str, type_name: &str) -> String
     )
 }
 
+/// The extension NAME an account-scoped registry ARN carries, as the registry keys a record
+/// by it.
+///
+/// CloudFormation addresses an extension of one account and Region by
+/// `…:<account>:type/<kind>/<Type-Name>` ([`type_arn`] mints exactly that), spelling the
+/// `::` separators of the name as `-` ([`arn_type_name`]), so the second segment after
+/// `type/` is read back here into the spelling the registry keys the record by — a type
+/// name's own segments carry no `-` of their own (the modelled `TypeName` pattern admits only
+/// letters and digits in them), so that reading is unambiguous.
+///
+/// `None` for anything that is not that form: an ARN of another resource kind, and one
+/// carrying further segments — a public extension's ARN names its publisher between the kind
+/// and the name ([`public_type_arn`], read back by [`split_public_type_arn`]) and a version's
+/// ARN carries the version id after the name ([`type_version_arn`]), neither of which this
+/// reads.
+///
+/// What this is for: a refusal that names the extension a request identified names it by this
+/// name, whether the request named the extension by name or by its ARN.
+pub fn arn_extension_name(arn: &str) -> Option<String> {
+    let (_, path) = arn.split_once(":type/")?;
+    let mut segments = path.split('/');
+    let type_kind = segments.next()?;
+    let dashed_name = segments.next()?;
+    if type_kind.is_empty() || dashed_name.is_empty() || segments.next().is_some() {
+        return None;
+    }
+    Some(dashed_name.replace('-', "::"))
+}
+
 /// The kind, the publisher id and the extension name a PUBLIC extension ARN carries.
 ///
 /// CloudFormation addresses a public extension by `…::type/<kind>/<publisher id>/<Type-Name>`

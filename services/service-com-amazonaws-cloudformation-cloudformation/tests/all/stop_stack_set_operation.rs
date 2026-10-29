@@ -426,7 +426,7 @@ async fn a_stop_that_resolves_nothing_names_what_it_could_not_find() {
             operation_id: "operation-never-started".to_string(),
             region: REGION,
             code: "OperationNotFoundException",
-            message: "StackSet operation operation-never-started not found".to_string(),
+            message: "Operation not found".to_string(),
         },
     ];
 

@@ -22,27 +22,31 @@
 //!
 //! 1. WHAT the request identifies: "you must specify Arn, or TypeName and Type", so a
 //!    request carrying both forms, neither, or half of the name form identifies no extension
-//!    and is refused with the registry's modelled `CFNRegistryException` (400). An `Arn` that
-//!    names one VERSION of an extension identifies no publishable extension either: what a
-//!    publication publishes is the extension's default version, never a version the request
-//!    picked. This is read BEFORE the caller is looked at, because it is a property of the
-//!    request alone — an account that is not a publisher yet, naming an extension the
-//!    registry does not hold, is still answered this refusal rather than either of those.
-//! 2. The CALLER: "to publish an extension, you must be registered as a publisher with
+//!    and is refused with the registry's modelled `CFNRegistryException` (400). This is read
+//!    BEFORE anything is resolved, because it is a property of the request alone.
+//! 2. WHICH record the request names, resolved against the registry of THIS account and
+//!    Region — an `Arn` by the extension it addresses, whether or not it pins a version, and
+//!    the name form by kind and name. An identifier that resolves to no record of this
+//!    account and Region is refused with the modelled 400 carrying
+//!    [`NOT_FOUND_IN_YOUR_ACCOUNT`]: existence and ownership are what a publication resolves
+//!    first, so an unregistered extension is never reported as a malformed request. A record
+//!    the registry holds but this account did not REGISTER — a public extension, whether
+//!    provided by Amazon Web Services or published by a third party and activated here — is
+//!    not a private extension to publish, so it too is refused with the modelled 400;
+//!    `Arn` is a `PrivateTypeArn` for that same reason.
+//! 3. The VERSION the `Arn` names, read against the record that resolved: what a publication
+//!    publishes is the extension's default version, never a version the request picked, so an
+//!    `Arn` carrying a version segment is refused with the modelled 400.
+//! 4. The CALLER: "to publish an extension, you must be registered as a publisher with
 //!    CloudFormation" ([`crate::state::publisher`], which `RegisterPublisher` writes), and
 //!    the publisher id that registration carries is the one the published extension belongs
 //!    to. An account holding no such registration is refused with that same modelled 400.
-//! 3. WHICH record the request names: an extension this account and Region's registry does
-//!    not hold is the modelled `TypeNotFoundException` (404). A record it holds but did not
-//!    REGISTER — a public extension, whether provided by Amazon Web Services or published by
-//!    a third party and activated here — is not a private extension to publish, so it is
-//!    refused with the modelled 400; `Arn` is a `PrivateTypeArn` for that same reason.
-//! 4. The VERSION: the record's default version, "used when the extension version isn't
-//!    specified". A record carrying none is the modelled 404, and one whose default version's
-//!    contract tests have not concluded `PASSED` is refused with the modelled 400 — "an
-//!    extension must have a test status of PASSED before it can be published", which
-//!    `TestType` is what reaches.
-//! 5. The VERSION NUMBER: "you cannot specify a version number the first time you publish a
+//! 5. The DEFAULT VERSION and the VERSION NUMBER: the record's default version, "used when
+//!    the extension version isn't specified". A record carrying none is the modelled
+//!    `TypeNotFoundException` (404), and one whose default version's contract tests have not
+//!    concluded `PASSED` is refused with the modelled 400 — "an extension must have a test
+//!    status of PASSED before it can be published", which `TestType` is what reaches. Then
+//!    the version number: "you cannot specify a version number the first time you publish a
 //!    type. CloudFormation automatically sets the first version number to be 1.0.0", so a
 //!    first publication carrying one is refused and one carrying none is assigned that
 //!    number; afterwards "if you don't specify a version number, CloudFormation increments
@@ -211,22 +215,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `IN_PROGRESS`.
         store.settle(now);
 
-        // "To publish an extension, you must be registered as a publisher with
-        // CloudFormation": the publication belongs to the publisher id that registration
-        // carries, so an account holding none has nothing to publish under.
-        let publisher_id = match store.publisher(None) {
-            Some(registered) => registered.publisher_id.clone(),
-            None => return Err(registry_exception(NOT_A_PUBLISHER.to_string())),
-        };
-
-        // The record the request names, in the Region the request was signed for: the
+        // The record the request names, in the Region the request was signed for, resolved
+        // BEFORE any rule about the caller or about which version may be published: the
         // registry is regional, so a record another Region holds is not addressable here.
-        // A name a publication has already written a public record for is held by two
-        // records at once, so the name form resolves the REGISTRATION first and falls back
-        // to whatever else the name holds — which is what the public-extension refusal below
-        // is answered from.
+        // An `Arn` resolves by the EXTENSION it addresses, whatever it carries after it, so
+        // an ARN that pins a version of an extension this account did not register resolves
+        // nothing and is answered the not-registered refusal rather than a rule about its
+        // version segment. A name a publication has already written a public record for is
+        // held by two records at once, so the name form resolves the REGISTRATION first and
+        // falls back to whatever else the name holds — which is what the public-extension
+        // refusal below is answered from.
         let stored = match identifier {
-            Identifier::Arn(extension) => store.extension_by_arn(&region, extension),
+            Identifier::Arn { extension, .. } => store.extension_by_arn(&region, extension),
             Identifier::Name {
                 type_kind,
                 type_name,
@@ -239,10 +239,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The registry also holds the public extensions Amazon Web Services publishes,
             // which are in every account's registry without anybody registering them: one
             // of those EXISTS, so what the call runs into is the public-extension refusal
-            // rather than "doesn't exist".
+            // rather than the not-registered one.
             None => {
                 let published = match identifier {
-                    Identifier::Arn(extension) => {
+                    Identifier::Arn { extension, .. } => {
                         crate::state::registry::aws_published_by_arn(&region, extension)
                     }
                     Identifier::Name {
@@ -250,18 +250,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         type_name,
                     } => crate::state::registry::aws_published(&region, type_kind, type_name),
                 };
-                return Err(match published {
-                    Some(published) => registry_exception(not_a_private_extension(&published.arn)),
-                    None => type_not_found(identifier.named()),
-                });
+                return Err(registry_exception(match published {
+                    Some(published) => not_a_private_extension(&published.arn),
+                    None => NOT_FOUND_IN_YOUR_ACCOUNT.to_string(),
+                }));
             }
         };
         if !extension.is_private() {
             return Err(registry_exception(not_a_private_extension(&extension.arn)));
         }
-        // "Only default version can be published": the version the record's
-        // `DefaultVersionId` names, which is the one "used when the extension version isn't
-        // specified".
+        // The version the `Arn` names, read against the record that DID resolve: what a
+        // publication publishes is the extension's default version, so an ARN that pins one
+        // names nothing publishable.
+        if let Identifier::Arn {
+            version_id: Some(_),
+            ..
+        } = identifier
+        {
+            return Err(registry_exception(
+                ONLY_DEFAULT_VERSION_CAN_BE_PUBLISHED.to_string(),
+            ));
+        }
+        // "To publish an extension, you must be registered as a publisher with
+        // CloudFormation": the publication belongs to the publisher id that registration
+        // carries, so an account holding none has nothing to publish under.
+        let publisher_id = match store.publisher(None) {
+            Some(registered) => registered.publisher_id.clone(),
+            None => return Err(registry_exception(NOT_A_PUBLISHER.to_string())),
+        };
+
+        // The version a publication publishes: the one the record's `DefaultVersionId`
+        // names, which is "used when the extension version isn't specified".
         let version = extension
             .default_version()
             .ok_or_else(|| type_not_found(identifier.named()))?;
@@ -321,6 +340,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 const ONLY_DEFAULT_VERSION_CAN_BE_PUBLISHED: &str =
     "Only default version can be published. Please remove versionId from Arn";
 
+/// The refusal AWS answers a request identifying an extension that is registered in no
+/// account — or in an account and Region other than the one the request is served in: a
+/// publication resolves the extension against THIS account's registry, and what it did not
+/// resolve there is not publishable, whatever else the request carries. Entirely fixed text:
+/// no part of it comes from the request or from the store.
+pub const NOT_FOUND_IN_YOUR_ACCOUNT: &str = "Type not found in your account.";
+
 /// The refusal AWS answers an account that has not registered as a publisher of public
 /// extensions, which is what this operation requires of its caller.
 const NOT_A_PUBLISHER: &str =
@@ -333,9 +359,14 @@ const NOT_A_PUBLISHER: &str =
 /// mix and never neither.
 #[derive(Debug, Clone, Copy)]
 enum Identifier<'a> {
-    /// `Arn`, which addresses the record on its own. It names the EXTENSION: a version ARN
-    /// is refused rather than carried here, since only the default version is published.
-    Arn(&'a str),
+    /// `Arn`, which addresses the record on its own: the extension's own ARN, and the version
+    /// id the request pinned after it where it pinned one. The record is resolved by the
+    /// extension either way, and the version segment is read against the record that
+    /// resolved — only the default version is published.
+    Arn {
+        extension: &'a str,
+        version_id: Option<&'a str>,
+    },
     /// `Type` and `TypeName`, resolved in the Region the request was signed for.
     Name {
         type_kind: &'a str,
@@ -347,7 +378,7 @@ impl Identifier<'_> {
     /// What the request named the extension by, for the not-found message.
     fn named(&self) -> &str {
         match self {
-            Self::Arn(extension) => extension,
+            Self::Arn { extension, .. } => extension,
             Self::Name { type_name, .. } => type_name,
         }
     }
@@ -358,19 +389,23 @@ impl Identifier<'_> {
 ///
 /// Every modelled constraint (each member's length and pattern, and `Type`'s enum) is
 /// already enforced before the handler runs; what is left are the CONDITIONAL rules the
-/// model states in prose — the same ones `DescribeType` and `TestType` read, plus the one
-/// that is this operation's own: a publication is of the default version, so an `Arn` that
-/// pins a version names nothing publishable.
+/// model states in prose — the same ones `DescribeType` and `TestType` read. A version
+/// segment an `Arn` carries is READ here rather than refused here: the `PrivateTypeArn`
+/// pattern (`…:type/.+$`) admits one, so it is a well-formed identifier of a record, and the
+/// rule about which version may be published is applied once that record has resolved.
 fn read_request(input: &PublishTypeInput) -> Result<Identifier<'_>, String> {
     match (
         input.arn.as_deref(),
         input.r#type.as_deref(),
         input.type_name.as_deref(),
     ) {
-        (Some(arn), None, None) => match crate::state::registry::split_version_arn(arn) {
-            (extension, None) => Ok(Identifier::Arn(extension)),
-            (_, Some(_)) => Err(ONLY_DEFAULT_VERSION_CAN_BE_PUBLISHED.to_string()),
-        },
+        (Some(arn), None, None) => {
+            let (extension, version_id) = crate::state::registry::split_version_arn(arn);
+            Ok(Identifier::Arn {
+                extension,
+                version_id,
+            })
+        }
         (None, Some(type_kind), Some(type_name)) => Ok(Identifier::Name {
             type_kind,
             type_name,

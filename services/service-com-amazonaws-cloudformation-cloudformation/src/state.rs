@@ -6032,12 +6032,15 @@ pub fn stack_set_does_not_exist(name_or_id: &str) -> String {
 pub const AUTO_DEPLOYMENT_IS_SERVICE_MANAGED_ONLY: &str =
     "Auto-deployment targets are only available for service-managed stack sets";
 
-/// The message CloudFormation answers when a stack set holds no operation under the
-/// `OperationId` a request named.
+/// The `OperationNotFoundException` message CloudFormation answers when a stack set holds no
+/// operation under the `OperationId` a request named.
 ///
-/// Built from what the request named, the way [`stack_set_does_not_exist`] is.
-pub fn stack_set_operation_does_not_exist(operation_id: &str) -> String {
-    format!("StackSet operation {operation_id} not found")
+/// The text carries NO variable part, the way [`drift_operation_does_not_exist`] carries
+/// none: the refusal names the KIND of record the request did not resolve, and the operation
+/// id and the stack set name are the ones the caller already sent. Worded once, so the
+/// operation-scoped stack set reads and the stop cannot drift about it.
+pub fn stack_set_operation_does_not_exist() -> &'static str {
+    "Operation not found"
 }
 
 /// The message CloudFormation answers when a request for a stack instance's RESOURCE
@@ -6118,10 +6121,15 @@ pub fn resource_does_not_exist(logical_resource_id: &str, stack_name: &str) -> S
 /// in another Region, a publisher that published no such extension, or a version the
 /// record does not carry.
 ///
-/// The sentence CloudFormation answers for `TypeNotFoundException`, with the extension the
-/// request named quoted in it; nothing else of the request appears in it.
+/// The sentence CloudFormation answers for `TypeNotFoundException`, with the EXTENSION the
+/// request identified quoted in it: its type name, which is what an account-scoped registry
+/// ARN carries ([`registry::arn_extension_name`]) as much as the name form does, so the two
+/// ways of identifying one extension are refused identically. Anything else the request
+/// named is quoted as the request spelled it; nothing else of the request appears in it.
 pub fn extension_does_not_exist(identifier: &str) -> String {
-    format!("The type '{identifier}' cannot be found.")
+    let named = registry::arn_extension_name(identifier)
+        .unwrap_or_else(|| identifier.to_string());
+    format!("The type '{named}' cannot be found.")
 }
 
 /// The message answered when a request names a `StackDriftDetectionId` this account has

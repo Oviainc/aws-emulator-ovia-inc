@@ -491,12 +491,14 @@ fn refused_cases() -> Vec<RefusedCase> {
             RESOURCE_ALIAS,
         ),
         not_found(
+            // An extension's ARN carries the extension's NAME, so a refusal that names what
+            // the request identified names that name — the same sentence the name form gets.
             "an ARN no record carries",
             vec![(
                 "Arn",
                 type_arn(REGION, registry_type::RESOURCE, "No::Such::Resource"),
             )],
-            &type_arn(REGION, registry_type::RESOURCE, "No::Such::Resource"),
+            "No::Such::Resource",
         ),
         not_found(
             "the ARN of an activation another Region's registry holds",
@@ -504,9 +506,11 @@ fn refused_cases() -> Vec<RefusedCase> {
                 "Arn",
                 type_arn(OTHER_REGION, registry_type::RESOURCE, OTHER_REGION_ALIAS),
             )],
-            &type_arn(OTHER_REGION, registry_type::RESOURCE, OTHER_REGION_ALIAS),
+            OTHER_REGION_ALIAS,
         ),
         not_found(
+            // A VERSION ARN carries a segment past the extension's name, so it names no
+            // extension of this registry and is quoted as the request spelled it.
             "an ARN naming one VERSION of an activation, which addresses no extension",
             vec![("Arn", type_version_arn(&resource_arn, "00000001"))],
             &type_version_arn(&resource_arn, "00000001"),
@@ -517,7 +521,7 @@ fn refused_cases() -> Vec<RefusedCase> {
                 "Arn",
                 type_arn(REGION, registry_type::RESOURCE, PRIVATE_TYPE_NAME),
             )],
-            &type_arn(REGION, registry_type::RESOURCE, PRIVATE_TYPE_NAME),
+            PRIVATE_TYPE_NAME,
         ),
         refused("a request identifying no extension at all", vec![], NO_IDENTITY),
         refused(

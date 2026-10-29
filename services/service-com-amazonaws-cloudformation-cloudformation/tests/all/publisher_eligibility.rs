@@ -25,11 +25,18 @@
 use service_com_amazonaws_cloudformation_cloudformation::state::publisher::{
     MarketplaceSellerEnrollment, NOT_A_MARKETPLACE_SELLER,
 };
-use service_com_amazonaws_cloudformation_cloudformation::state::registry::registry_type;
+use service_com_amazonaws_cloudformation_cloudformation::state::registry::{
+    registry_type, StoredExtension,
+};
 
 use crate::stack_lifecycle::{
     call, enroll_as_a_marketplace_seller, member, router_with_engine, store, xml_text, ACCOUNT_ID,
+    REGION,
 };
+
+/// A private extension this account's registry DOES hold, for the row whose operation
+/// resolves the extension it was asked about before it reads the caller.
+const REGISTERED: &str = "My::Registered::Resource";
 
 /// The refusal AWS answers an account that has not registered as a publisher, which is what
 /// `TestType` requires of its caller. Entirely fixed text.
@@ -121,7 +128,18 @@ async fn an_account_that_is_not_a_marketplace_seller_cannot_register_as_a_publis
     }
 
     // And because nothing registered, every operation downstream of "is this account a
-    // publisher" goes on answering its own refusal.
+    // publisher" goes on answering its own refusal. `TestType` and `PublishType` both resolve
+    // the extension the request names against this account's registry BEFORE they read the
+    // caller, so their rows name a record the registry does hold — what they are refused for
+    // is the caller.
+    {
+        let state = store(&engine);
+        state.lock().extensions.push(StoredExtension::new(
+            REGION,
+            registry_type::RESOURCE,
+            REGISTERED,
+        ));
+    }
     let (status_code, body) = call(&router, "DescribePublisher", &[]).await;
     assert_registry_refusal(
         "DescribePublisher after a refused registration",
@@ -132,15 +150,17 @@ async fn an_account_that_is_not_a_marketplace_seller_cannot_register_as_a_publis
              describe a specific publisher, please specify the publisherID"
         ),
     );
-    for (case, action, expected) in [
+    for (case, action, type_name, expected) in [
         (
             "TestType after a refused registration",
             "TestType",
+            REGISTERED,
             TEST_TYPE_NOT_A_PUBLISHER,
         ),
         (
             "PublishType after a refused registration",
             "PublishType",
+            REGISTERED,
             PUBLISH_TYPE_NOT_A_PUBLISHER,
         ),
     ] {
@@ -149,7 +169,7 @@ async fn an_account_that_is_not_a_marketplace_seller_cannot_register_as_a_publis
             action,
             &[
                 member("Type", registry_type::RESOURCE),
-                member("TypeName", "My::Never::Registered"),
+                member("TypeName", type_name),
             ],
         )
         .await;
