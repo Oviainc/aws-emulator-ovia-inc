@@ -30,7 +30,13 @@ use service_com_amazonaws_iotsitewise_awsiotsitewise::state::{
 use super::asset_lifecycle::{call, error_code, router, REGION};
 
 /// A `tags` request/response map built from pairs.
-fn tags_json(pairs: &[(String, String)]) -> Value {
+///
+/// This helper and the ones below it (`expected`, `generated_pairs`, `pairs`,
+/// `keys`, `tag_resource`, `stored_tags`) are `pub(crate)` for the reason `list_tags`
+/// and `untag_resource` already are: the sibling `task_create_time_tags` suite
+/// writes and reads a tag set through exactly these steps, so one definition of
+/// each is what keeps the two suites from drifting on the tagging wire form.
+pub(crate) fn tags_json(pairs: &[(String, String)]) -> Value {
     let mut map = Map::new();
     for (key, value) in pairs {
         map.insert(key.clone(), Value::String(value.clone()));
@@ -39,7 +45,7 @@ fn tags_json(pairs: &[(String, String)]) -> Value {
 }
 
 /// The same pairs as a comparable map.
-fn expected(pairs: &[(String, String)]) -> BTreeMap<String, String> {
+pub(crate) fn expected(pairs: &[(String, String)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
@@ -58,14 +64,14 @@ type TaggingCase = (&'static str, &'static str, TagRows);
 type CeilingCase = (&'static str, Vec<TagRows>);
 
 /// `n` distinct pairs, `key000`/`value000` upwards.
-fn generated_pairs(n: usize) -> Vec<(String, String)> {
+pub(crate) fn generated_pairs(n: usize) -> Vec<(String, String)> {
     (0..n)
         .map(|at| (format!("key{at:03}"), format!("value{at:03}")))
         .collect()
 }
 
 /// Owned `(key, value)` pairs from `&str` literals.
-fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
     rows.iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
         .collect()
@@ -147,7 +153,7 @@ async fn create_resource(router: &MultiServiceRouter, kind: &str, name: &str) ->
 }
 
 /// `TagResource` on `arn` with `tags`.
-async fn tag_resource(
+pub(crate) async fn tag_resource(
     router: &MultiServiceRouter,
     arn: &str,
     tags: Value,
@@ -213,7 +219,7 @@ fn keys_of(pairs: &[(String, String)]) -> Vec<String> {
 }
 
 /// Owned keys from `&str` literals.
-fn keys(rows: &[&str]) -> Vec<String> {
+pub(crate) fn keys(rows: &[&str]) -> Vec<String> {
     rows.iter().map(|key| (*key).to_string()).collect()
 }
 
@@ -231,7 +237,7 @@ async fn seed_tags(router: &MultiServiceRouter, arn: &str, rows: &[(String, Stri
 }
 
 /// The tag set `ListTagsForResource` reports for `arn`, asserting a 200.
-async fn stored_tags(
+pub(crate) async fn stored_tags(
     router: &MultiServiceRouter,
     arn: &str,
     case: &str,

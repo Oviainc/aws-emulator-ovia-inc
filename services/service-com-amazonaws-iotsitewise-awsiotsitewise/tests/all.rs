@@ -20,6 +20,13 @@
 #[path = "all/query_results.rs"]
 mod query_results;
 
+// `task_create_time_tags` is declared HERE, beside the note above, for the
+// reason it gives: the sorted list and the END of this file are both stretches
+// every concurrent iotsitewise change puts a declaration of its own in. Fold it
+// into the list once the churn settles.
+#[path = "all/task_create_time_tags.rs"]
+mod task_create_time_tags;
+
 // `client_token_spent_on_another_request` is declared HERE, beside the note
 // above, for the reason it gives: the sorted list and the END of this file are
 // both stretches every concurrent iotsitewise change puts a declaration of its
