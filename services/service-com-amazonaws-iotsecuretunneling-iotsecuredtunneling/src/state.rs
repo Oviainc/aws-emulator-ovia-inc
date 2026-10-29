@@ -112,7 +112,9 @@ pub const MAX_TAGS_PER_TUNNEL: usize = 50;
 /// [`MAX_TAGS_PER_TUNNEL`] tags.
 ///
 /// Kept beside the constant so every tagging entry point refuses in the same
-/// words. `count` is the number of distinct keys the tunnel would end up
+/// words, and reached only through
+/// [`ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState::tag_limit_refusal`],
+/// the one place the rule's comparison lives. `count` is the number of distinct keys the tunnel would end up
 /// carrying, so the text names the limit and how far past it the request goes
 /// and nothing else; both entry points carry the tags on the `tags` member, so
 /// that is the member the text names.
@@ -511,10 +513,28 @@ impl ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
         self.arn_index.get(&tunnel_key(region, arn)).cloned()
     }
 
+    /// The message refusing a request that would take the resource `arn` names
+    /// past [`MAX_TAGS_PER_TUNNEL`] tags, or `None` when `incoming` keeps it
+    /// within the limit.
+    ///
+    /// The single place that rule is applied — the merged count, the comparison
+    /// against the constant and the wording all live here — so every tagging
+    /// entry point, `OpenTunnel`'s `tags` and `TagResource`'s `tags`, refuses at
+    /// the same count in the same words, and neither can drift from the other.
+    /// Like [`stored_destination_config`], it hands back the MESSAGE so each
+    /// caller wraps it in its own operation's `LimitExceededException` variant.
+    /// Stores nothing: a caller asks this before it writes, so a refused request
+    /// applies none of its tags.
+    pub fn tag_limit_refusal(&self, arn: &str, incoming: &[Tag]) -> Option<String> {
+        let merged = self.merged_tag_count(arn, incoming);
+        (merged > MAX_TAGS_PER_TUNNEL).then(|| tag_limit_message(merged))
+    }
+
     /// The number of distinct tag keys `arn` would carry after merging
-    /// `incoming` into what is already stored. Stores nothing: a caller checks
-    /// this against [`MAX_TAGS_PER_TUNNEL`] before writing.
-    pub fn merged_tag_count(&self, arn: &str, incoming: &[Tag]) -> usize {
+    /// `incoming` into what is already stored. Stores nothing, and is private to
+    /// this module: a handler asks [`Self::tag_limit_refusal`], which is where
+    /// the count is compared against [`MAX_TAGS_PER_TUNNEL`].
+    fn merged_tag_count(&self, arn: &str, incoming: &[Tag]) -> usize {
         let mut keys: ::std::collections::BTreeSet<&str> = self
             .tags
             .get(arn)

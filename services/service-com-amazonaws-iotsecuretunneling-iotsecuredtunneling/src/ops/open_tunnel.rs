@@ -227,17 +227,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tunnel_arn = crate::state::tunnel_arn(&region, &tunnel_id);
 
         // A tunnel carries at most `MAX_TAGS_PER_TUNNEL` tags, and the two tagging
-        // entry points agree because both count through
-        // `state::merged_tag_count`: refused here as well as in `TagResource`,
-        // before anything is stored. The modelled `TagList` length bounds one
-        // request's list; this bounds what one tunnel accumulates, and an
-        // exhausted limit is reported with the same modelled
-        // `LimitExceededException` (HTTP 403) as the tunnel count above.
-        let tag_count = store.merged_tag_count(&tunnel_arn, input.tags.as_deref().unwrap_or(&[]));
-        if tag_count > crate::state::MAX_TAGS_PER_TUNNEL {
+        // entry points agree because both apply the rule through the one state
+        // helper `state::tag_limit_refusal`: refused here as well as in
+        // `TagResource`, at the same count and in the same words, before
+        // anything is stored. The modelled `TagList` length bounds one request's
+        // list; this bounds what one tunnel accumulates, and an exhausted limit
+        // is reported with the same modelled `LimitExceededException` (HTTP 403)
+        // as the tunnel count above, which this handler wraps the message in.
+        if let Some(message) =
+            store.tag_limit_refusal(&tunnel_arn, input.tags.as_deref().unwrap_or(&[]))
+        {
             return Err(OpenTunnelErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(crate::state::tag_limit_message(tag_count)),
+                    message: Some(message),
                 },
             )
             .into());

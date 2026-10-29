@@ -183,16 +183,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A tunnel carries at most `MAX_TAGS_PER_TUNNEL` tags. The modelled list
         // length bounds one request, not the set a resource accumulates over
-        // repeated calls, so the merged key count is checked here — and the store
-        // is left untouched when the request would take it past the limit. An
-        // exhausted limit is what this service's `LimitExceededException` (HTTP
-        // 403) reports, so the refusal goes out as that modelled error, the same
-        // one `OpenTunnel` answers for this limit and for the tunnel count.
-        let merged = store.merged_tag_count(&input.resource_arn, &input.tags);
-        if merged > crate::state::MAX_TAGS_PER_TUNNEL {
+        // repeated calls, so the rule is applied through the one state helper
+        // both tagging entry points share — and the store is left untouched when
+        // the request would take it past the limit. An exhausted limit is what
+        // this service's `LimitExceededException` (HTTP 403) reports, so this
+        // handler wraps the helper's message in that modelled error, the same one
+        // `OpenTunnel` answers for this limit and for the tunnel count.
+        if let Some(message) = store.tag_limit_refusal(&input.resource_arn, &input.tags) {
             return Err(TagResourceErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(crate::state::tag_limit_message(merged)),
+                    message: Some(message),
                 },
             )
             .into());

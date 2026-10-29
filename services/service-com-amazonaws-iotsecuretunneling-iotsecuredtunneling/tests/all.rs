@@ -27,6 +27,8 @@ mod record_eviction_order;
 mod reserved_tag_keys;
 #[path = "all/rotate_refusal_error_contract.rs"]
 mod rotate_refusal_error_contract;
+#[path = "all/shared_tag_limit_rule.rs"]
+mod shared_tag_limit_rule;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_key_count.rs"]
