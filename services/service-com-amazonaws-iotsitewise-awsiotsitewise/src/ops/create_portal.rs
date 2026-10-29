@@ -235,14 +235,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `clientToken` makes this create idempotent, as the member documents: "A
         // unique case-sensitive identifier that you can provide to ensure the
-        // idempotency of the request." A retry — an SDK's own, after a timeout —
-        // carries the token of the call it repeats, so it answers from the portal THAT
-        // call minted and writes nothing. This operation's error list declares no
-        // conflict error, so the token alone names the call it repeats: a request
-        // reusing it is answered from that call rather than refused with an error this
-        // operation does not model, exactly as `CreateDashboard` answers a reused
-        // token. Decided BEFORE the request is resolved against the store, because the
-        // call it repeats was already served.
+        // idempotency of the request." A RETRY — an SDK's own, after a timeout —
+        // carries the token of the call it repeats AND repeats that call's request, so
+        // it answers from the portal THAT call minted and writes nothing. It is
+        // decided BEFORE the request is resolved against the store, because the call
+        // it repeats was already served.
+        //
+        // A token already spent on a DIFFERENT request repeats no call, and this
+        // create's answer carries nothing but the portal it minted: answering from the
+        // earlier call would hand this caller a portal it never asked for — another
+        // name, another contact email, another start url and IAM Identity Center
+        // application — and mint nothing for the request it actually sent. Such a
+        // request is therefore served as the fresh create it is, and the token's record
+        // moves to the portal it mints: the token stops a repeat from creating a second
+        // portal, it never turns another request into a success that created nothing.
         let mut store = state.lock();
 
         let fingerprint = crate::state::request_fingerprint(
@@ -263,8 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.tags.as_ref(),
         );
         match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
-            crate::state::TokenVerdict::Replay(replayed)
-            | crate::state::TokenVerdict::Spent(replayed) => {
+            crate::state::TokenVerdict::Replay(replayed) => {
                 // One deleted since leaves the retry nothing to answer from, so that
                 // retry is served as the fresh create it now is.
                 if let Some(portal) = store.portals.get(&replayed) {
@@ -277,7 +282,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     });
                 }
             }
-            crate::state::TokenVerdict::Serve => {}
+            // A request that differs from the call its token was spent on is a
+            // different create, served below exactly like one carrying no token.
+            crate::state::TokenVerdict::Spent(_) | crate::state::TokenVerdict::Serve => {}
         }
 
         // The store is bounded: a create is the only thing that adds a portal and

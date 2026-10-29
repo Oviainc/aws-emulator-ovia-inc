@@ -13,13 +13,16 @@
 //! call removed what it addressed. A token already spent on a DIFFERENT request is
 //! refused `ConflictingOperationException` (409) naming the resource the first
 //! call acted on, where the operation declares that error; where it declares no
-//! conflict error at all, a CREATE answers from the resource its token was spent
-//! on, because that minted resource is the whole of what its answer carries. A
-//! request carrying NO token is a new call every time.
+//! conflict error at all, that request is carried out as the call it is, so a
+//! CREATE mints a resource of its own and answers with ITS identifiers — a
+//! create's answer carries nothing but the resource it minted, so answering from
+//! the earlier call would name a resource this request never asked for. A request
+//! carrying NO token is a new call every time.
 //!
 //! What a token spent on a different request means for the operations whose
 //! answer carries nothing of the call the token names is pinned by the
-//! `client_token_spent_on_another_request` suite beside this one.
+//! `client_token_spent_on_another_request` suite beside this one, and for the
+//! Monitor creates by `client_token_spent_on_another_create`.
 //!
 //! The rows span what the rule generalises over: the operation kind (create,
 //! update, delete, batch association, batch data-segment write), the resource kind
@@ -78,14 +81,18 @@ enum Reuse {
     /// The modelled `ConflictingOperationException` (409), naming the resource
     /// the first call acted on.
     Conflict,
-    /// The answer of the call the token names: the operation declares no error
-    /// that states a token conflict, so the token alone identifies its call.
-    Replay,
+    /// Served as the create it is: the operation declares no error that states a
+    /// token conflict, and its answer carries nothing of the earlier call, so the
+    /// request mints a resource of its own.
+    Served,
 }
 
 /// Which map of the store a row's resources are counted in.
+///
+/// `pub(crate)` beside [`held`] because the sibling token suites count the same
+/// maps, so they share one definition rather than growing a second.
 #[derive(Debug, Clone, Copy)]
-enum Kind {
+pub(crate) enum Kind {
     Portal,
     Project,
     AccessPolicy,
@@ -94,7 +101,7 @@ enum Kind {
 
 /// How many resources of `kind` the store holds — the only way to tell a retry
 /// minted nothing from one that answered the same id twice.
-fn held(engine: &Arc<engine::InMemoryEngine>, kind: Kind) -> usize {
+pub(crate) fn held(engine: &Arc<engine::InMemoryEngine>, kind: Kind) -> usize {
     let state = service_state(&**engine).expect("the IoT SiteWise store");
     let store = state.lock();
     match kind {
@@ -143,7 +150,7 @@ fn create_rows(portal_id: &str) -> Vec<CreateRow> {
             }),
             id_member: "portalId",
             arn_member: "portalArn",
-            reuse: Reuse::Replay,
+            reuse: Reuse::Served,
         },
         CreateRow {
             case: "CreateProject, differing in the description",
@@ -158,7 +165,7 @@ fn create_rows(portal_id: &str) -> Vec<CreateRow> {
             }),
             id_member: "projectId",
             arn_member: "projectArn",
-            reuse: Reuse::Replay,
+            reuse: Reuse::Served,
         },
         CreateRow {
             case: "CreateAccessPolicy, differing in the permission",
@@ -177,7 +184,7 @@ fn create_rows(portal_id: &str) -> Vec<CreateRow> {
             }),
             id_member: "accessPolicyId",
             arn_member: "accessPolicyArn",
-            reuse: Reuse::Replay,
+            reuse: Reuse::Served,
         },
         CreateRow {
             case: "CreateDataset, differing in the tags",
@@ -256,7 +263,7 @@ async fn a_retried_create_replays_the_first_answer_and_mints_nothing_more() {
         // A DIFFERENT request reusing the spent token.
         let (reused_status, reused) =
             call(&router, "POST", path, Some(with_token(&changed, &token))).await;
-        match reuse {
+        let after_reuse = match reuse {
             Reuse::Conflict => {
                 assert_eq!(
                     (reused_status, error_code(&reused)),
@@ -274,24 +281,29 @@ async fn a_retried_create_replays_the_first_answer_and_mints_nothing_more() {
                     "case {case:?}: the refusal must carry that resource's ARN, got {reused} \
                      after {first}"
                 );
+                // A refused create wrote nothing.
+                after_first
             }
-            Reuse::Replay => {
+            Reuse::Served => {
                 assert_eq!(
                     reused_status, status,
-                    "case {case:?}: a token this operation models no conflict for must \
-                     answer from the call it names, got {reused_status} {reused}"
+                    "case {case:?}: a token this operation models no conflict for must serve \
+                     the differing request, got {reused_status} {reused}"
                 );
-                assert_eq!(
-                    reused[id_member], first[id_member],
-                    "case {case:?}: that answer is the first call's, got {reused} after \
-                     {first}"
-                );
+                for member in [id_member, arn_member] {
+                    assert_ne!(
+                        reused[member], first[member],
+                        "case {case:?}: the differing request must answer with its OWN \
+                         {member}, got {reused} after {first}"
+                    );
+                }
+                after_first + 1
             }
-        }
+        };
         assert_eq!(
             held(&engine, kind),
-            after_first,
-            "case {case:?}: reusing a spent token must mint nothing, got {} resources",
+            after_reuse,
+            "case {case:?}: reusing a spent token must leave {after_reuse} resources, got {}",
             held(&engine, kind)
         );
 
@@ -311,8 +323,8 @@ async fn a_retried_create_replays_the_first_answer_and_mints_nothing_more() {
         let after_fresh = held(&engine, kind);
         assert_eq!(
             after_fresh,
-            after_first + 1,
-            "case {case:?}: the fresh-token call must mint one resource, {after_first} -> \
+            after_reuse + 1,
+            "case {case:?}: the fresh-token call must mint one resource, {after_reuse} -> \
              {after_fresh}"
         );
     }

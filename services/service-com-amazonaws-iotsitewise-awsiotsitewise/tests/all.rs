@@ -45,6 +45,13 @@ mod task_create_time_tags;
 #[path = "all/client_token_spent_on_another_request.rs"]
 mod client_token_spent_on_another_request;
 
+// `client_token_spent_on_another_create` is declared HERE, beside the suite it
+// belongs with, for the reason that suite's note gives: the sorted list and the
+// END of this file are both where every concurrent iotsitewise change puts a
+// declaration of its own. Fold it into the list once the churn settles.
+#[path = "all/client_token_spent_on_another_create.rs"]
+mod client_token_spent_on_another_create;
+
 // `workspace_scoped_path_resolution` is declared HERE, beside the note above,
 // for the reason it gives: the sorted list and the END of this file are both
 // where every concurrent iotsitewise change puts a declaration of its own. Fold
