@@ -154,13 +154,25 @@ const COMPLETION_STATUS_SET: [&str; 2] = ["ready", "failed"];
 /// value the model declines is worded exactly as every other constraint violation this
 /// emulator refuses — `1 validation error detected: Value '<value>' at 'status' failed
 /// to satisfy constraint: Member must satisfy enum value set: [...]`.
+///
+/// The echo carries the SAME per-clause ceiling as every refusal this service words from
+/// the framework's own violations ([`service_common::validation::quoted_echo`], the
+/// ceiling `service.rs::refused_by` holds those to): `Status` targets an enum and declares
+/// no `@length`, so the value a caller can put here is unbounded, and a clause that
+/// interpolated it whole would answer a request-sized message. The CHECK below is still
+/// made against the value as submitted; only the quoting is bounded.
+///
+/// This is the operation's OWN enforcement of the value set: a request whose `Status` the
+/// model does not declare is refused by the validating walk over the input schema before
+/// any handler runs, and this clause is what words the same refusal when the handler is
+/// the one that reaches it — so neither wording can be the one that is sized by a request.
 fn enum_violation(value: &str) -> CompleteRolloutError {
     let violation = ::aws_smithy_schema_server::Violation {
         path: "status".to_string(),
         kind: ::aws_smithy_schema_server::ViolationKind::EnumValue(
             COMPLETION_STATUS_SET.iter().map(|v| (*v).to_string()).collect(),
         ),
-        value: Some(value.to_string()),
+        value: Some(service_common::validation::quoted_echo(value).into_owned()),
     };
     let message = ::aws_smithy_schema_server::envelope(std::slice::from_ref(&violation))
         .unwrap_or_else(|| violation.message());
@@ -269,8 +281,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 #[cfg(test)]
 mod tests {
-    use super::COMPLETION_STATUS_SET;
+    use super::{enum_violation, COMPLETION_STATUS_SET};
     use crate::ops::types::COMPLETION_STATUS_VALUES;
+
+    /// The per-clause ceiling the shared quoting step holds every clause of this emulator
+    /// to. Source: `quoted_echo` in `services/common/src/validation.rs`, which states it
+    /// with its rationale.
+    const MAX_RESTORED_ECHO: usize = 16 * 1024;
+
+    /// The value the refusal's message quotes, read by stripping the clause's fixed halves
+    /// (never by splitting on a quote, so a value carrying the delimiter is read whole).
+    fn quoted_value(refusal: &super::CompleteRolloutError) -> String {
+        let crate::scaffolded::Scaffolded::Modeled(
+            super::CompleteRolloutErrorModeled::ValidationException(error),
+        ) = refusal
+        else {
+            panic!("expected the modelled ValidationException, got {refusal:?}");
+        };
+        let head = "1 validation error detected: Value '";
+        let tail = format!(
+            "' at 'status' failed to satisfy constraint: Member must satisfy enum value set: \
+             [{}]",
+            COMPLETION_STATUS_SET.join(", ")
+        );
+        error
+            .message
+            .strip_prefix(head)
+            .and_then(|rest| rest.strip_suffix(tail.as_str()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected the enum clause, got a {} byte message",
+                    error.message.len()
+                )
+            })
+            .to_string()
+    }
 
     /// The order-carrying set this operation states a refusal with must hold EXACTLY the
     /// values the generated model data carries, so neither copy can drift from the model.
@@ -295,6 +340,71 @@ mod tests {
             assert!(
                 crate::state::CompletionStatus::from_wire(value).is_some(),
                 "case {value:?}: expected a modelled CompletionStatus to resolve"
+            );
+        }
+    }
+
+    /// RULE: the clause this operation words itself quotes the submitted value up to the
+    /// ONE per-clause ceiling this emulator states, and no further — `Status` declares no
+    /// `@length`, so an unquoted-in-full clause would be sized by the request.
+    ///
+    /// Rows differ along the value's size (within, exactly at, and past the ceiling) and
+    /// its encoding (ASCII, and a three-byte character so the ceiling falls inside one).
+    #[test]
+    fn a_refused_status_is_quoted_up_to_the_ceiling() {
+        for (case, value) in [
+            ("a value no ceiling touches", "bogus-status".to_string()),
+            ("a kilobyte", "s".repeat(1024)),
+            ("exactly at the ceiling", "s".repeat(MAX_RESTORED_ECHO)),
+            (
+                "multibyte characters just under the ceiling",
+                // 5460 * 3 = 16380 bytes.
+                "€".repeat(5460),
+            ),
+        ] {
+            let quoted = quoted_value(&enum_violation(&value));
+            assert_eq!(
+                quoted, value,
+                "case {case:?}: expected the submitted value quoted byte for byte, got {} \
+                 bytes",
+                quoted.len()
+            );
+        }
+
+        for (case, value) in [
+            ("one byte past the ceiling", "s".repeat(MAX_RESTORED_ECHO + 1)),
+            ("a megabyte", "s".repeat(1024 * 1024)),
+            (
+                // 16384 is not a multiple of three, so the ceiling falls inside a
+                // character and the prefix must step back to a boundary.
+                "multibyte characters past the ceiling",
+                "€".repeat(16 * 1024),
+            ),
+        ] {
+            let quoted = quoted_value(&enum_violation(&value));
+            let marker = format!("... [{} bytes]", value.len());
+            let prefix = quoted.strip_suffix(marker.as_str()).unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected the clause to name the submitted {} bytes with \
+                     {marker:?}, got {} quoted bytes",
+                    value.len(),
+                    quoted.len()
+                )
+            });
+            assert!(
+                value.starts_with(prefix),
+                "case {case:?}: expected the quoted {} bytes to be a prefix of the submitted \
+                 value",
+                prefix.len()
+            );
+            // At the ceiling, less only what a character boundary forces back (at most two
+            // bytes for UTF-8): the fidelity the echo exists for still lands, and the
+            // clause cannot grow with the request.
+            assert!(
+                prefix.len() <= MAX_RESTORED_ECHO && prefix.len() + 3 > MAX_RESTORED_ECHO,
+                "case {case:?}: expected a prefix at the {MAX_RESTORED_ECHO} byte ceiling, \
+                 got {} bytes",
+                prefix.len()
             );
         }
     }

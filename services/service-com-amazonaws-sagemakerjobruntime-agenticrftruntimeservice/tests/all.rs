@@ -13,6 +13,9 @@
 #[path = "all/harness.rs"]
 mod harness;
 
+#[path = "all/enum_refusal_echo_is_bounded.rs"]
+mod enum_refusal_echo_is_bounded;
+
 #[path = "all/job_arn_is_the_callers_job.rs"]
 mod job_arn_is_the_callers_job;
 
