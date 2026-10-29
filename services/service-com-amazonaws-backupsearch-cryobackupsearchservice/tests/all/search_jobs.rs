@@ -52,12 +52,51 @@ pub(crate) const WITHIN_THE_DUE_INSTANT: Duration = Duration::from_millis(50);
 /// One emulator holding one service over one shared engine, as the router builds it,
 /// with that engine so a test can seed the store directly where driving thousands of
 /// requests would only be a slow way to reach the same state.
+///
+/// KMS is mounted beside this service, on the SAME engine the router gives both, because
+/// `StartSearchJob`'s `EncryptionKeyArn` is an `@arnReference` to a KMS key and is
+/// resolved in KMS's own store: a row that starts a job under a key creates that key here
+/// first ([`create_kms_key`]).
 pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(
+        service_com_amazonaws_kms_trentservice::EmulatedService::new(Arc::clone(&engine)),
+    );
     (router, engine)
+}
+
+/// Create a customer managed KMS key through KMS's OWN `CreateKey` and answer its key
+/// ARN, so a value passed as `EncryptionKeyArn` names a key the store really holds.
+pub(crate) async fn create_kms_key(emulator: &MultiServiceRouter, region: &str) -> String {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", "kms.amazonaws.com")
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", "TrentService.CreateKey")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261021/{region}/kms/aws4_request, \
+                 SignedHeaders=host, Signature=0123456789abcdef"
+            ),
+        )
+        .body(Bytes::from(b"{}".to_vec()))
+        .expect("a well-formed request");
+    let response = emulator.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body: Value = serde_json::from_slice(&response.into_body()).unwrap_or(Value::Null);
+    assert_eq!(
+        status, 200,
+        "seed: kms:CreateKey must succeed, got {status} ({body:?})"
+    );
+    body["KeyMetadata"]["Arn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// One emulator holding one service over one shared engine, as the router builds it.
@@ -245,6 +284,21 @@ struct StartCase {
     case: &'static str,
     region: &'static str,
     body: Value,
+    /// Whether the row starts its job under a customer managed KMS key. The ARN cannot be
+    /// written into the row: `EncryptionKeyArn` is an `@arnReference` to a KMS key, so the
+    /// value has to name a key the emulator serving the row HOLDS, which
+    /// [`request_body`] creates in it.
+    encryption_key: bool,
+}
+
+/// The row's request body, with `EncryptionKeyArn` set to a key created in `emulator` when
+/// the row asks to be encrypted under one.
+async fn request_body(emulator: &MultiServiceRouter, row: &StartCase) -> Value {
+    let mut body = row.body.clone();
+    if row.encryption_key {
+        body["EncryptionKeyArn"] = json!(create_kms_key(emulator, row.region).await);
+    }
+    body
 }
 
 fn start_cases() -> Vec<StartCase> {
@@ -260,6 +314,7 @@ fn start_cases() -> Vec<StartCase> {
                 }]},
                 "Tags": {"env": "test"}
             }),
+            encryption_key: false,
         },
         StartCase {
             // `ResourceType` accepts S3 and EBS (model enum `ResourceType`); EBS is the
@@ -276,13 +331,13 @@ fn start_cases() -> Vec<StartCase> {
                     "Sizes": [{"Value": 1024, "Operator": "GREATER_THAN_EQUAL_TO"}]
                 }]}
             }),
+            encryption_key: false,
         },
         StartCase {
             case: "s3 scope with source arns and an encryption key, no item filters",
             region: "us-east-1",
             body: json!({
                 "Name": "scoped-to-two-buckets",
-                "EncryptionKeyArn": "arn:aws:kms:us-east-1:000000000000:key/11111111-2222-3333-4444-555555555555",
                 "SearchScope": {
                     "BackupResourceTypes": ["S3"],
                     "SourceResourceArns": ["arn:aws:s3:::alpha", "arn:aws:s3:::beta"],
@@ -290,14 +345,17 @@ fn start_cases() -> Vec<StartCase> {
                 },
                 "Tags": {"env": "prod", "owner": "platform"}
             }),
+            encryption_key: true,
         },
     ]
 }
 
 #[tokio::test]
 async fn a_started_job_is_persisted_and_every_member_is_read_back_out_of_the_store() {
-    for StartCase { case, region, body } in start_cases() {
+    for row in start_cases() {
+        let (case, region) = (row.case, row.region);
         let emulator = emulator();
+        let body = request_body(&emulator, &row).await;
         let started = call(&emulator, region, "PUT", "/search-jobs", Some(body.clone())).await;
         assert_eq!(
             started.status, 200,
@@ -452,7 +510,9 @@ async fn a_started_job_is_persisted_and_every_member_is_read_back_out_of_the_sto
 async fn a_started_job_appears_in_the_list_with_the_members_it_was_stored_with() {
     let emulator = emulator();
     let mut expected: Vec<(String, Value)> = Vec::new();
-    for StartCase { case, region, body } in start_cases() {
+    for row in start_cases() {
+        let (case, region) = (row.case, row.region);
+        let body = request_body(&emulator, &row).await;
         let started = call(&emulator, region, "PUT", "/search-jobs", Some(body.clone())).await;
         assert_eq!(
             started.status, 200,
@@ -790,8 +850,10 @@ async fn a_page_token_cannot_resume_a_differently_filtered_listing() {
 
 #[tokio::test]
 async fn a_client_token_is_idempotent_for_the_same_body_and_conflicts_for_a_different_one() {
-    for StartCase { case, region, body } in start_cases() {
+    for row in start_cases() {
+        let (case, region) = (row.case, row.region);
         let emulator = emulator();
+        let body = request_body(&emulator, &row).await;
         let mut first_body = body.clone();
         first_body["ClientToken"] = json!("token-1");
 
@@ -892,10 +954,12 @@ async fn an_identifier_no_job_exists_for_is_not_found_on_every_operation_that_ta
     // `tests/all/job_identifier_syntax.rs`.
     let unknown = "48434c42-40a0-4057-b04d-3b484c610e2b";
     // Routes that resolve a search job by identifier, and the tagging routes that
-    // resolve one by ARN. The last element says whether the refusal carries this
-    // service's fixed not-found text: every JOB-IDENTIFIER lookup does, and none of them
-    // echoes the identifier back (`state::RESOURCE_NOT_FOUND`), while the tag APIs, which
-    // resolve a resource by ARN, are recorded with a refusal of their own.
+    // resolve one by ARN. The last element says WHICH refusal the route answers: a
+    // JOB-IDENTIFIER lookup answers the modelled `ResourceNotFoundException` with this
+    // service's fixed not-found text, echoing nothing of the request
+    // (`state::RESOURCE_NOT_FOUND`), while the tag APIs, which resolve a resource by ARN,
+    // are recorded with a refusal of their own — the `NotFoundException` code and
+    // sentence `tests/all/tag_not_found_refusal.rs` holds all three of them to.
     let cases: Vec<(&str, &str, String, Option<Value>, bool)> = vec![
         (
             "GetSearchJob",
@@ -955,21 +1019,26 @@ async fn an_identifier_no_job_exists_for_is_not_found_on_every_operation_that_ta
         ),
     ];
 
-    for (operation, method, uri, body, fixed_text) in cases {
+    for (operation, method, uri, body, by_identifier) in cases {
         let answer = call(&emulator, "us-west-2", method, &uri, body).await;
         assert_eq!(
             answer.status, 404,
             "case {operation:?}: an unknown resource must be 404, got {} ({:?})",
             answer.status, answer.body
         );
+        let expected_code = if by_identifier {
+            "ResourceNotFoundException"
+        } else {
+            "NotFoundException"
+        };
         assert_eq!(
             answer.error_code.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {operation:?}: the refusal must carry ResourceNotFoundException, got {:?}",
+            Some(expected_code),
+            "case {operation:?}: the refusal must carry {expected_code}, got {:?}",
             answer.error_code
         );
-        if fixed_text {
-            let message = answer.string("message");
+        let message = answer.string("message");
+        if by_identifier {
             // The recorded sentence, pinned literally: the constant the handlers use must
             // be THIS text, so a drift in it fails here rather than passing silently.
             assert_eq!(
@@ -981,11 +1050,17 @@ async fn an_identifier_no_job_exists_for_is_not_found_on_every_operation_that_ta
                 state::RESOURCE_NOT_FOUND,
                 "case {operation:?}: every handler must take that text from one constant, got {message:?}"
             );
-            assert!(
-                !message.contains(unknown),
-                "case {operation:?}: the fixed not-found text must not echo the requested identifier, got {message:?}"
+        } else {
+            assert_eq!(
+                message,
+                state::TAG_RESOURCE_NOT_FOUND,
+                "case {operation:?}: a tag lookup refuses with the tag APIs' own not-found text, got {message:?}"
             );
         }
+        assert!(
+            !message.contains(unknown),
+            "case {operation:?}: a not-found refusal of this service echoes nothing of the request, got {message:?}"
+        );
     }
 }
 

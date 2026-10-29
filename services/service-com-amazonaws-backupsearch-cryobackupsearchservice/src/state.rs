@@ -66,7 +66,7 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     BackupCreationTimeFilter, ConflictException, CurrentSearchProgress, EBSItemFilter,
-    EBSResultItem, ExportSpecification, ItemFilters, LongCondition, ResourceNotFoundException,
+    EBSResultItem, ExportSpecification, ItemFilters, LongCondition,
     ResultItem, S3ItemFilter, S3ResultItem, SearchJobBackupsResult, SearchScope,
     SearchScopeSummary, ServiceQuotaExceededException, StringCondition, TimeCondition,
 };
@@ -761,49 +761,32 @@ pub fn arn_account(arn: &str) -> Option<&str> {
     arn.split(':').nth(4)
 }
 
-/// The resource TYPE an ARN names: the part of its resource field before the first `/`
-/// or `:` separator (`search-job`, `export-job`), and the empty string when the resource
-/// field carries no separator at all — a field like an S3 bucket name is an id alone and
-/// claims no type — or when the string has no resource field.
-///
-/// This is what the tag APIs report as `ResourceNotFoundException$resourceType`, which
-/// the model documents as the "hypothetical type of the resource affected" — the type the
-/// SUBMITTED ARN claims, since no resource of it was found. Reading it off the ARN is
-/// what keeps the refusal from naming one resource type for every miss, now that the
-/// lookup spans more than one.
-pub fn arn_resource_type(arn: &str) -> String {
-    // `splitn(6, ..)` so the resource field keeps its own colons: an ARN is
-    // `arn:<partition>:<service>:<region>:<account>:<resource>` and a resource field may
-    // itself be `<type>:<id>`.
-    arn.splitn(6, ':')
-        .nth(5)
-        .and_then(|resource| resource.split_once(['/', ':']))
-        .map(|(resource_type, _)| resource_type.to_string())
-        .unwrap_or_default()
-}
+/// The text the TAG APIs' not-found refusal carries. Request-independent — it names
+/// neither the ARN nor a resource type — so it is the service's fixed template for this
+/// refusal rather than one call's example text.
+pub const TAG_RESOURCE_NOT_FOUND: &str = "Resource was not found";
 
-/// The REFUSAL an unresolvable `ResourceArn` is answered with: a
-/// `ResourceNotFoundException` (HTTP 404) naming the submitted ARN as the resource that
-/// was not found and, as its hypothetical type, the type that ARN claims
-/// ([`arn_resource_type`]).
+/// The REFUSAL an unresolvable `ResourceArn` is answered with: HTTP 404 under the error
+/// code `NotFoundException`, carrying [`TAG_RESOURCE_NOT_FOUND`].
+///
+/// That code is not the name of any shape in this service's model, which declares
+/// `ResourceNotFoundException` (HTTP 404) on these operations — and it is the code the
+/// service's own recorded responses carry for an ARN that names no resource it holds. A
+/// client branches on the code string, so the code the service answers is the behavioural
+/// fact and the modelled shape name is not: a caller catching `NotFoundException` around
+/// a tag call, as it must against the real service, has to catch this one too. The error
+/// channel that renders it is [`crate::scaffolded::Scaffolded::NotFound`].
 ///
 /// One refusal behind all three tag operations of this service — the read
 /// `ListTagsForResource` and the writes `TagResource` and `UntagResource` — the same way
 /// [`ComAmazonawsBackupsearchCryobackupsearchserviceState::taggable_record`] is the one
 /// resolution behind them: the lookup answers `None` for the same ARNs on every path, so
-/// the sentence it is reported with, which member carries the ARN and which type the
-/// refusal names are decided here once instead of per handler. Each caller lifts it into
-/// its own modelled error channel, which is the only part that is per operation.
-///
-/// The text is the one the service's recordings carry for an ARN-resolved lookup, which
-/// is why it echoes the submitted ARN rather than taking the request-independent
-/// [`RESOURCE_NOT_FOUND`] sentence the job-identifier lookups answer with.
-pub fn tag_arn_not_found(resource_arn: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!("no resource with ARN '{resource_arn}' exists"),
-        resource_id: resource_arn.to_string(),
-        resource_type: arn_resource_type(resource_arn),
-    }
+/// the code and the sentence it is reported with are decided here once instead of per
+/// handler.
+/// The submitted ARN takes no part in it: the refusal is the same for every ARN that
+/// resolves to nothing, so it takes no argument and echoes no caller-supplied value.
+pub fn tag_arn_not_found() -> crate::scaffolded::NotFoundException {
+    crate::scaffolded::NotFoundException::new(TAG_RESOURCE_NOT_FOUND)
 }
 
 /// Whether `arn` is a well-formed ARN at all — the `arn` scheme followed by the six
@@ -1448,8 +1431,8 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// indicated tags", and both of this service's resources are its own
     /// (`SearchJobArn` and `ExportJobArn` are each `@arnReference` to this service) and
     /// both carry the same `TagMap` on the operation that mints them. So an ARN matching
-    /// a held search job or a held export job resolves, and `None` — the
-    /// `ResourceNotFoundException` the tag APIs answer — is reserved for an ARN that
+    /// a held search job or a held export job resolves, and `None` — the not-found
+    /// refusal the tag APIs answer ([`tag_arn_not_found`]) — is reserved for an ARN that
     /// matches no record this store holds.
     ///
     /// It answers WHICH record was matched rather than a borrow of it, so the one

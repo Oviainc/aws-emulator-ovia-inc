@@ -45,6 +45,12 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Whether IAM lets a request to this service perform the action it asks for — the
+/// decision each handler takes before it reaches this service's store. It sits beside the
+/// other request-level seams rather than in `state`, because it reads no state of this
+/// service: the documents it consults are the IAM service's own.
+pub mod authorization;
+
 /// The `com-amazonaws-backupsearch-cryobackupsearchservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///

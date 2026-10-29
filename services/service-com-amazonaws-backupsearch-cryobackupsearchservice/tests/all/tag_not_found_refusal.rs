@@ -4,24 +4,26 @@
 //! ONE refusal, whichever of them was called.
 //!
 //! The rule under test: a tag operation whose `ResourceArn` matches no record this store
-//! holds refuses with `ResourceNotFoundException` (HTTP 404) reporting the submitted ARN
-//! as the resource that was not found and, as its hypothetical type, the type that ARN
-//! claims — so the read `ListTagsForResource` and the writes `TagResource` and
-//! `UntagResource` answer the SAME status, code, message, `resourceId` and `resourceType`
-//! for the same ARN.
+//! holds refuses with HTTP 404 under the error code `NotFoundException`, carrying the
+//! service's own not-found sentence — so the read `ListTagsForResource` and the writes
+//! `TagResource` and `UntagResource` answer the SAME status, code and message for the same
+//! ARN. The code is NOT the name of the shape the model declares on these operations
+//! (`ResourceNotFoundException`): a client matches on the code string, so what the service
+//! answers is what it has to be.
 //!
 //! Each row drives all three operations over one unresolvable ARN and asserts their
 //! refusals agree member for member, so a refusal written out once per handler — which
-//! could drift in its wording or in the type it names — fails here. The rows differ in the
-//! FORM of the ARN, which is what the reported type is read off: a resource field
-//! introduced by `/`, one introduced by `:`, one whose id carries further `/` segments,
-//! one that is an id alone, an empty one, and a string that is not an ARN at all.
+//! could drift in its wording or in the code it carries — fails here. The rows differ in
+//! the FORM of the ARN: a resource field introduced by `/`, one introduced by `:`, one
+//! whose id carries further `/` segments, one that is an id alone, an empty one, and a
+//! string that is not an ARN at all.
 //!
 //! The HTTP harness (`emulator`, `call`, `percent_encode`, `query_value`, `Answer`) is the
 //! search-job suite's: every suite drives the same emulator the same way, so there is one
 //! harness, not several.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::search_jobs::{call, emulator, percent_encode, query_value, Answer};
@@ -84,8 +86,6 @@ struct Refusal {
     status: u16,
     error_code: Option<String>,
     message: String,
-    resource_id: String,
-    resource_type: String,
 }
 
 impl Refusal {
@@ -94,8 +94,6 @@ impl Refusal {
             status: answer.status,
             error_code: answer.error_code.clone(),
             message: answer.string("message"),
-            resource_id: answer.string("resourceId"),
-            resource_type: answer.string("resourceType"),
         }
     }
 }
@@ -131,50 +129,41 @@ async fn every_tag_operation_refuses_an_unresolvable_arn_the_same_way() {
     let held = held_search_job_arn(&emulator, region).await;
 
     let account = engine::emulator_account_id();
-    // Rows: an ARN no record holds, and the type it CLAIMS — the member is documented as
-    // the "hypothetical type of the resource affected"
-    // (smithy_query query="shape" shape="ResourceNotFoundException"), which for an ARN is
-    // the part of its resource field before the first `/` or `:`, and nothing when that
-    // field carries no separator at all.
-    let rows: Vec<(&str, String, &str)> = vec![
+    // Rows: an ARN no record holds. They differ in the form of the resource field, which
+    // is what a refusal built per handler would most easily differ on.
+    let rows: Vec<(&str, String)> = vec![
         (
             "a search-job id no search job holds",
             format!(
                 "arn:aws:backup-search:{region}:{account}:search-job/11111111-2222-4333-8444-555555555555"
             ),
-            "search-job",
         ),
         (
             "an export-job id no export job holds",
             format!(
                 "arn:aws:backup-search:{region}:{account}:export-job/11111111-2222-4333-8444-555555555555"
             ),
-            "export-job",
         ),
         (
             "an id carrying further path segments",
             format!("arn:aws:backup-search:{region}:{account}:export-job/2026/10/29/one"),
-            "export-job",
         ),
         (
             "a resource field whose type is colon-separated",
             format!("arn:aws:backup:{region}:{account}:recovery-point:rp-1"),
-            "recovery-point",
         ),
         (
-            "a resource field that is an id alone, so it claims no type",
+            "a resource field that is an id alone",
             "arn:aws:s3:::some-bucket".to_string(),
-            "",
         ),
         (
             "an ARN whose resource field is empty",
             format!("arn:aws:backup-search:{region}:{account}:"),
-            "",
         ),
-        ("a string that is not an ARN", "not-an-arn".to_string(), ""),
+        ("a string that is not an ARN", "not-an-arn".to_string()),
     ];
 
-    for (case, arn, claimed_type) in &rows {
+    for (case, arn) in &rows {
         let answers = [
             ("ListTagsForResource", list_tags(&emulator, region, arn).await),
             (
@@ -191,10 +180,8 @@ async fn every_tag_operation_refuses_an_unresolvable_arn_the_same_way() {
         // operation was called.
         let expected = Refusal {
             status: 404,
-            error_code: Some("ResourceNotFoundException".to_string()),
-            message: format!("no resource with ARN '{arn}' exists"),
-            resource_id: arn.clone(),
-            resource_type: (*claimed_type).to_string(),
+            error_code: Some("NotFoundException".to_string()),
+            message: state::TAG_RESOURCE_NOT_FOUND.to_string(),
         };
 
         // Each operation is held to that same expectation, which is also what makes the
@@ -206,6 +193,19 @@ async fn every_tag_operation_refuses_an_unresolvable_arn_the_same_way() {
                 refusal, expected,
                 "case {case:?}/{operation}: an ARN no held record carries must be refused \
                  with the one not-found refusal, got {refusal:?} ({:?})",
+                answer.body
+            );
+            // The WHOLE body, so the refusal is pinned to what the service answers rather
+            // than to a subset of it: the sentence, under restJson1's own error
+            // discriminator, and nothing else — the refusal echoes no part of the request.
+            assert_eq!(
+                answer.body,
+                json!({
+                    "__type": "NotFoundException",
+                    "message": state::TAG_RESOURCE_NOT_FOUND,
+                }),
+                "case {case:?}/{operation}: the refusal body must carry the code and the \
+                 sentence alone, got {:?}",
                 answer.body
             );
         }

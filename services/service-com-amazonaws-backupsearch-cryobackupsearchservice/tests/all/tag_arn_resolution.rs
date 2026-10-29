@@ -278,8 +278,8 @@ async fn the_tag_read_path_and_the_tag_write_path_resolve_the_same_arns() {
                 );
                 assert_eq!(
                     answer.error_code.as_deref(),
-                    Some("ResourceNotFoundException"),
-                    "case {case:?}/{operation}: the refusal must carry ResourceNotFoundException, got {:?}",
+                    Some("NotFoundException"),
+                    "case {case:?}/{operation}: the refusal must carry NotFoundException, got {:?}",
                     answer.error_code
                 );
             }

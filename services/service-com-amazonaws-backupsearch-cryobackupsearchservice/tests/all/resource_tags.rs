@@ -483,36 +483,31 @@ async fn an_arn_no_held_resource_matches_is_not_found_on_every_tag_operation() {
     let account = engine::emulator_account_id();
     // Rows differ in HOW the ARN fails to resolve: an identifier no record of either
     // resource type holds, another service's ARN, and a string that is not an ARN.
-    let unknown: Vec<(&str, String, &str)> = vec![
+    let unknown: Vec<(&str, String)> = vec![
         (
             "a search-job id no search job holds",
             format!("arn:aws:backup-search:{region}:{account}:search-job/8d2e0e1f-does-not-exist"),
-            state::SEARCH_JOB_RESOURCE,
         ),
         (
             "an export-job id no export job holds",
             format!("arn:aws:backup-search:{region}:{account}:export-job/8d2e0e1f-does-not-exist"),
-            state::EXPORT_JOB_RESOURCE,
         ),
         (
             "an ARN of this service's region and account with an unknown resource type",
             format!("arn:aws:backup-search:{region}:{account}:search-plan/one"),
-            "search-plan",
         ),
         (
             "an ARN whose resource type is colon-separated",
             format!("arn:aws:backup:{region}:{account}:recovery-point:rp-1"),
-            "recovery-point",
         ),
         (
             "an ARN naming another service's resource, whose resource field is an id alone",
             "arn:aws:s3:::some-bucket".to_string(),
-            "",
         ),
-        ("a string that is not an ARN", "not-an-arn".to_string(), ""),
+        ("a string that is not an ARN", "not-an-arn".to_string()),
     ];
 
-    for (case, arn, resource_type) in unknown {
+    for (case, arn) in unknown {
         let answers = [
             ("ListTagsForResource", list_tags(&emulator, region, &arn).await),
             (
@@ -530,23 +525,20 @@ async fn an_arn_no_held_resource_matches_is_not_found_on_every_tag_operation() {
                 "case {case:?}/{operation}: an unknown resource must be 404, got {} ({:?})",
                 answer.status, answer.body
             );
+            // The CODE the tag APIs answer, which is the one a client branches on and is
+            // not the name of the shape the model declares on them.
             assert_eq!(
                 answer.error_code.as_deref(),
-                Some("ResourceNotFoundException"),
-                "case {case:?}/{operation}: the refusal must carry ResourceNotFoundException, got {:?}",
+                Some("NotFoundException"),
+                "case {case:?}/{operation}: the refusal must carry NotFoundException, got {:?}",
                 answer.error_code
             );
             assert_eq!(
-                answer.string("resourceId"),
-                arn,
-                "case {case:?}/{operation}: the refusal must name the submitted ARN, got {:?}",
-                answer.get("resourceId")
-            );
-            assert_eq!(
-                answer.string("resourceType"),
-                resource_type,
-                "case {case:?}/{operation}: the refusal must report the type the submitted ARN claims, got {:?}",
-                answer.get("resourceType")
+                answer.string("message"),
+                state::TAG_RESOURCE_NOT_FOUND,
+                "case {case:?}/{operation}: the refusal must carry the service's not-found \
+                 sentence, got {:?}",
+                answer.get("message")
             );
         }
     }

@@ -22,11 +22,12 @@
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::export_jobs::{settled_search_job, stored_export_jobs, Settled};
-use crate::search_jobs::{call, emulator_with_engine};
+use crate::search_jobs::{call, create_kms_key, emulator_with_engine};
 
 /// One row of the table: a `StartSearchJob` body under a token of some age.
 struct Row {
@@ -34,6 +35,11 @@ struct Row {
     region: &'static str,
     token: &'static str,
     body: Value,
+    /// Whether the token's request encrypts its job under a customer managed KMS key. The
+    /// ARN cannot be written into the row: `EncryptionKeyArn` is an `@arnReference` to a
+    /// KMS key, so the value has to name a key the emulator serving the row HOLDS, which
+    /// [`under_token`] creates in it.
+    encryption_key: bool,
     /// How long before now the request that first used the token completed.
     age: Duration,
     /// Whether the token still takes part in idempotency at that age.
@@ -50,6 +56,7 @@ fn rows() -> Vec<Row> {
             region: "us-west-2",
             token: "token-fresh",
             body: json!({"SearchScope": {"BackupResourceTypes": ["S3"]}}),
+            encryption_key: false,
             age: Duration::ZERO,
             open: true,
         },
@@ -66,6 +73,7 @@ fn rows() -> Vec<Row> {
                 }]}
             }),
             age: state::CLIENT_TOKEN_VALIDITY.checked_div(2).unwrap(),
+            encryption_key: false,
             open: true,
         },
         Row {
@@ -80,6 +88,7 @@ fn rows() -> Vec<Row> {
                 }
             }),
             age: state::CLIENT_TOKEN_VALIDITY.saturating_sub(ONE_SECOND),
+            encryption_key: false,
             open: true,
         },
         Row {
@@ -87,6 +96,7 @@ fn rows() -> Vec<Row> {
             region: "ap-southeast-2",
             token: "token-at-the-bound",
             body: json!({"SearchScope": {"BackupResourceTypes": ["S3"]}}),
+            encryption_key: false,
             age: state::CLIENT_TOKEN_VALIDITY,
             open: false,
         },
@@ -96,10 +106,9 @@ fn rows() -> Vec<Row> {
             token: "token-stale",
             body: json!({
                 "Name": "stale",
-                "EncryptionKeyArn":
-                    "arn:aws:kms:eu-central-1:000000000000:key/11111111-2222-3333-4444-555555555555",
                 "SearchScope": {"BackupResourceTypes": ["EBS"]}
             }),
+            encryption_key: true,
             age: Duration::from_secs(24 * 60 * 60),
             open: false,
         },
@@ -143,10 +152,15 @@ fn age_held_client_tokens(engine: &engine::InMemoryEngine, age: Duration) {
     }
 }
 
-/// The body with its `ClientToken` set, as a client sends it.
-fn under_token(body: &Value, token: &str) -> Value {
-    let mut body = body.clone();
-    body["ClientToken"] = json!(token);
+/// The body with its `ClientToken` set, as a client sends it — and, for a row that
+/// encrypts its job under a customer managed key, with `EncryptionKeyArn` naming a key
+/// created in this emulator, since the member is resolved against KMS's own store.
+async fn under_token(emulator: &MultiServiceRouter, row: &Row) -> Value {
+    let mut body = row.body.clone();
+    body["ClientToken"] = json!(row.token);
+    if row.encryption_key {
+        body["EncryptionKeyArn"] = json!(create_kms_key(emulator, row.region).await);
+    }
     body
 }
 
@@ -206,7 +220,7 @@ async fn the_window_a_client_token_is_valid_for_is_the_one_the_model_publishes()
 async fn a_repeat_under_a_search_job_client_token_is_the_same_job_only_inside_the_window() {
     for row in rows() {
         let (emulator, engine) = emulator_with_engine();
-        let body = under_token(&row.body, row.token);
+        let body = under_token(&emulator, &row).await;
 
         let first = call(&emulator, row.region, "PUT", "/search-jobs", Some(body.clone())).await;
         assert_eq!(
@@ -316,7 +330,7 @@ async fn a_repeat_under_a_search_job_client_token_is_the_same_job_only_inside_th
 async fn a_different_body_under_a_search_job_client_token_conflicts_only_inside_the_window() {
     for row in rows() {
         let (emulator, engine) = emulator_with_engine();
-        let body = under_token(&row.body, row.token);
+        let body = under_token(&emulator, &row).await;
 
         let first = call(&emulator, row.region, "PUT", "/search-jobs", Some(body.clone())).await;
         assert_eq!(

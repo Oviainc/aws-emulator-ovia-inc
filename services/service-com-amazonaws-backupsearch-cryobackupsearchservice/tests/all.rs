@@ -21,6 +21,8 @@ mod client_token_window;
 mod completed_with_issues_status_message;
 #[path = "all/empty_scope_filter_states_no_requirement.rs"]
 mod empty_scope_filter_states_no_requirement;
+#[path = "all/encryption_key_resolution.rs"]
+mod encryption_key_resolution;
 #[path = "all/export_client_token_expiry.rs"]
 mod export_client_token_expiry;
 #[path = "all/export_jobs.rs"]
@@ -31,6 +33,8 @@ mod export_listing;
 mod export_listing_order;
 #[path = "all/export_refusal_classes.rs"]
 mod export_refusal_classes;
+#[path = "all/iam_authorization.rs"]
+mod iam_authorization;
 #[path = "all/job_identifier_syntax.rs"]
 mod job_identifier_syntax;
 #[path = "all/owed_status_due_instants.rs"]

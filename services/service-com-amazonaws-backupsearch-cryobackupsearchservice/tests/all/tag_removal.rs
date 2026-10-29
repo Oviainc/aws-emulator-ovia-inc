@@ -377,8 +377,8 @@ async fn untagging_an_arn_no_resource_matches_is_not_found_and_writes_nothing() 
         );
         assert_eq!(
             answer.error_code.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {case:?}: the refusal must carry ResourceNotFoundException, got {:?}",
+            Some("NotFoundException"),
+            "case {case:?}: the refusal must carry NotFoundException, got {:?}",
             answer.error_code
         );
     }

@@ -154,8 +154,9 @@ pub enum StartSearchResultExportJobErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
-    /// Declared on the service, not on this operation: the pass-role check refused the
-    /// submitted `RoleArn`, which is an authorization failure (HTTP 403).
+    /// Declared on the service, not on this operation: the caller's permissions do not
+    /// cover this action, or the pass-role check refused the submitted `RoleArn` — both
+    /// authorization failures (HTTP 403).
     AccessDeniedException(AccessDeniedException),
     /// Declared on the service, not on this operation: the store this emulator keeps
     /// its jobs in could not be reached, or the request carried an `ExportSpecification`
@@ -214,6 +215,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS decides authorization at the IAM layer, ahead of the service looking at the
+        // request's own input, so this is the first thing the handler does: a caller whose
+        // permissions do not cover this action is refused without being told anything
+        // about the job it named, and no export job is minted.
+        crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME)
+            .map_err(StartSearchResultExportJobErrorModeled::AccessDeniedException)?;
+
         // The identifier's SYNTAX is judged before anything is looked up or minted: a
         // string that cannot be an identifier of this service is invalid input, not a
         // missing resource.

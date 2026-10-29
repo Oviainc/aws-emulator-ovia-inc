@@ -33,6 +33,13 @@
 //! covered recovery points it could not read runs to `COMPLETED` carrying the
 //! `StatusMessage` that says how much of the scope was left unscanned.
 //!
+//! A caller the IAM documents in force do not allow is refused before any of that
+//! happens, with the service-common `AccessDeniedException` (403) and no job created
+//! ([`crate::service::authorization`]), and a submitted `EncryptionKeyArn` is RESOLVED
+//! before a job is minted — the member is an `@arnReference` to a KMS key, so a value
+//! naming none is the modelled `ResourceNotFoundException` (404), see
+//! [`encryption_key_refusal`].
+//!
 //! `ClientToken` is idempotent while the token's validity window is open: the same token
 //! with the same body answers with the job the first call minted, and the same token with
 //! a different body is a `ConflictException` (409). The window is the one the model
@@ -138,7 +145,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupsearch-cryobackup
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.backupsearch#StartSearchJob",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["AccessDeniedException", "InternalServerException"]
 )]
 #[derive(Debug)]
 pub enum StartSearchJobErrorModeled {
@@ -148,6 +155,10 @@ pub enum StartSearchJobErrorModeled {
     /// Declared on the service, not on this operation: the store this emulator keeps
     /// its search jobs in could not be reached, which is a server fault.
     InternalServerException(InternalServerException),
+    /// Declared on the service, not on this operation: the caller's permissions do not
+    /// cover this action, which is an authorization failure (HTTP 403) taken before any
+    /// job is minted.
+    AccessDeniedException(AccessDeniedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -201,6 +212,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS decides authorization at the IAM layer, ahead of the service looking at the
+        // request's own input, so this is the first thing the handler does: a caller whose
+        // permissions do not cover this action is refused and NO job is created.
+        crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME)
+            .map_err(StartSearchJobErrorModeled::AccessDeniedException)?;
+
+        // `EncryptionKeyArn` is an `@arnReference` to `AWS::KMS::Key`
+        // (`smithy_query(query="shape",shape="EncryptionKeyArn")`), so the member is a
+        // REFERENCE the service resolves rather than a string it stores: a value naming no
+        // key is the modelled `ResourceNotFoundException` (404) and no job is minted.
+        // Resolved here, before this service's store is locked, because the lookup reads
+        // the KMS store.
+        if let Some(key_arn) = input.encryption_key_arn.as_deref() {
+            if let Some(refusal) = encryption_key_refusal(&*self.engine, ctx, key_arn) {
+                return Err(StartSearchJobErrorModeled::ResourceNotFoundException(refusal).into());
+            }
+        }
+
         let now = SystemTime::now();
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(store_unavailable());
@@ -394,3 +423,55 @@ fn store_unavailable() -> StartSearchJobError {
     })
     .into()
 }
+
+/// Why `key_arn` names no encryption key this job can be created under, or `None` when it
+/// names one.
+///
+/// The member is an `@arnReference` to `AWS::KMS::Key`, so what decides is whether the
+/// value resolves to a KMS key of this account at the endpoint the request was signed for
+/// — the same resolution KMS's own handlers perform, in KMS's own store, so a key created
+/// through `kms:CreateKey` can be used from the very next call and one scheduled for
+/// deletion stops being resolvable exactly when KMS stops resolving it. Nothing is cached
+/// and nothing of the key is copied here: the search job keeps the ARN the caller sent.
+///
+/// The refusal RELAYS the sentence KMS states for an identifier that names no key, since
+/// that is the failure being reported; the `resourceId` is the submitted ARN and the
+/// `resourceType` the type that reference names.
+///
+/// `None` when no KMS service is mounted beside this one: there is no store to resolve the
+/// reference in, so nothing can be attributed to the key, and a deployment that serves no
+/// KMS endpoint cannot have had a key created at one either. The assembled emulator mounts
+/// both.
+fn encryption_key_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    key_arn: &str,
+) -> Option<ResourceNotFoundException> {
+    let Some(kms) = ::service_com_amazonaws_kms_trentservice::state::service_state(engine) else {
+        // Visible to an operator: a reference nothing resolved is accepted, which without
+        // this line is indistinguishable from one a held key answered for.
+        ::tracing::warn!(
+            "no KMS service is mounted beside BackupSearch; an EncryptionKeyArn is accepted \
+             without resolving it"
+        );
+        return None;
+    };
+    let region = crate::state::request_region(ctx);
+    let store = kms.lock();
+    if let ::service_com_amazonaws_kms_trentservice::state::KeyRef::Found(_) =
+        store.resolve(&region, key_arn)
+    {
+        return None;
+    }
+    Some(ResourceNotFoundException {
+        message: ::service_com_amazonaws_kms_trentservice::state::key_not_found_message(
+            &region, key_arn,
+        ),
+        resource_id: key_arn.to_string(),
+        resource_type: ENCRYPTION_KEY_RESOURCE.to_string(),
+    })
+}
+
+/// The resource type the refusal above names, as the ARN the reference points at spells
+/// it: a KMS key ARN's resource field is `key/<key id>`, so the type it claims is `key`.
+const ENCRYPTION_KEY_RESOURCE: &str = "key";

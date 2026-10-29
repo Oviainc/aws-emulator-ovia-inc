@@ -111,7 +111,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupsearch-cryobackup
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.backupsearch#GetSearchJob",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["AccessDeniedException", "InternalServerException"]
 )]
 #[derive(Debug)]
 pub enum GetSearchJobErrorModeled {
@@ -119,6 +119,10 @@ pub enum GetSearchJobErrorModeled {
     /// Declared on the service, not on this operation: the store this emulator keeps
     /// its search jobs in could not be reached, which is a server fault.
     InternalServerException(InternalServerException),
+    /// Declared on the service, not on this operation: the caller's permissions do not
+    /// cover this action, which is an authorization failure (HTTP 403) taken before
+    /// anything is read.
+    AccessDeniedException(AccessDeniedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -170,8 +174,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS decides authorization at the IAM layer, ahead of the service looking at the
+        // request's own input, so this is the first thing the handler does: a caller whose
+        // permissions do not cover this action is refused without being told anything
+        // about the resource it named, and nothing of this service is read.
+        crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME)
+            .map_err(GetSearchJobErrorModeled::AccessDeniedException)?;
+
         // The identifier's SYNTAX is judged before any store lookup: a string that cannot
         // be an identifier of this service is invalid input, not a missing resource.
         crate::state::check_job_identifier(&input.search_job_identifier)

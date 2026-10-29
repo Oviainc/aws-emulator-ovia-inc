@@ -84,7 +84,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupsearch-cryobackup
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.backupsearch#TagResource",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["AccessDeniedException", "InternalServerException"]
 )]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
@@ -92,6 +92,10 @@ pub enum TagResourceErrorModeled {
     /// Declared on the service, not on this operation: the store this emulator keeps
     /// its search jobs in could not be reached, which is a server fault.
     InternalServerException(InternalServerException),
+    /// Declared on the service, not on this operation: the caller's permissions do not
+    /// cover this action, which is an authorization failure (HTTP 403) taken before
+    /// anything is read.
+    AccessDeniedException(AccessDeniedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -148,8 +152,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS decides authorization at the IAM layer, ahead of the service looking at the
+        // request's own input, so this is the first thing the handler does: a caller whose
+        // permissions do not cover this action is refused without being told anything
+        // about the resource it named, and nothing of this service is read or written.
+        crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME)
+            .map_err(TagResourceErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -165,15 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // jobs: `ResourceArn` is documented as "the resource that will have the
         // indicated tags", and both of this service's resources carry a tag set.
         // A miss is refused through the one refusal all three tag operations answer an
-        // unresolvable ARN with (`crate::state::tag_arn_not_found`), so the sentence, the
-        // reported resource id and the type the refusal names cannot differ between the
-        // read path and the two write paths. Only lifting it into THIS operation's error
-        // channel is per handler.
-        let stored = state.tags_by_arn_mut(&input.resource_arn).ok_or_else(|| {
-            TagResourceError::from(TagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::tag_arn_not_found(&input.resource_arn),
-            ))
-        })?;
+        // unresolvable ARN with (`crate::state::tag_arn_not_found`) — the code and the
+        // sentence the service answers, which the error channel renders as 404
+        // `NotFoundException`.
+        let stored = state
+            .tags_by_arn_mut(&input.resource_arn)
+            .ok_or_else(crate::state::tag_arn_not_found)?;
 
         // What a tag entry has to satisfy before it can be stored, through the admission
         // rule every write of a tag in this service passes
