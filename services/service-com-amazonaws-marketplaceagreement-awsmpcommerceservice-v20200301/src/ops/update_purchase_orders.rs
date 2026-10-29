@@ -14,10 +14,10 @@
 //!
 //! The list is refused whole, before anything is written, when an element names a
 //! charge no agreement holds, names one twice, carries no reference, states no
-//! `chargeRevision` or states one other than the revision the charge it names is
-//! at (`crate::state::validate_purchase_orders`, the rule `AcceptAgreementRequest`
-//! refuses its own `purchaseOrders` under) or states an `agreementId` other than
-//! the agreement holding the charge it names.
+//! `chargeRevision`, states one other than the revision the charge it names is
+//! at, or states an `agreementId` other than the agreement holding the charge it
+//! names (`crate::state::validate_purchase_orders`, the rule
+//! `AcceptAgreementRequest` refuses its own `purchaseOrders` under).
 //!
 //! ## Shape of an operation
 //!
@@ -178,21 +178,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is one this call can associate a purchase order with.
         store.settle_agreements(now);
         store.settle_payment_requests(now);
-        let owners = store.charge_owners();
-        // The revision each of those charges is at, as the charge report states
-        // it, which is what an element's `chargeRevision` precondition is
+        // The state of each of those charges — the revision it is at, as the
+        // charge report states it, and the agreement holding it — which is what
+        // an element's `chargeRevision` and `agreementId` preconditions are
         // checked against.
-        let revisions = store.charge_revisions();
+        let targets = store.charge_association_targets();
 
         // The same rule `AcceptAgreementRequest` refuses its own
         // `purchaseOrders` under, applied to the charges of every agreement this
         // call can reach: an element must name a charge that exists, name it at
         // most once across the list, carry the reference the association exists
-        // to record, and state the revision that charge is actually at
+        // to record, state the revision that charge is actually at, and, where
+        // it names an agreement at all, name the one holding the charge it names
         // (`crate::state::validate_purchase_orders`). The list is refused BEFORE
         // anything is written, so a refused call associates nothing.
         if let Err(refusal) =
-            crate::state::validate_purchase_orders(&input.purchase_orders, &revisions)
+            crate::state::validate_purchase_orders(&input.purchase_orders, &targets)
         {
             return Err(UpdatePurchaseOrdersErrorModeled::ValidationException(
                 crate::state::validation_exception(&refusal.reason, refusal.path),
@@ -202,8 +203,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // One spelling of "this element's member is not acceptable": the
         // modelled `ValidationException` whose reason is resolved FROM the
-        // member (`INVALID_CHARGE_ID`, `INVALID_AGREEMENT_ID`) and whose
-        // `fields` entry names that element's own request path.
+        // member (`INVALID_CHARGE_ID`) and whose `fields` entry names that
+        // element's own request path.
         let refuse = |index: usize, member: &str| -> UpdatePurchaseOrdersError {
             let path = crate::state::purchase_order_member_path(index, member);
             UpdatePurchaseOrdersErrorModeled::ValidationException(
@@ -221,31 +222,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut plan: Vec<(usize, String, PurchaseOrder)> =
             Vec::with_capacity(input.purchase_orders.len());
         for (index, order) in input.purchase_orders.iter().enumerate() {
-            let Some(agreement_id) = owners.get(&order.charge_id) else {
+            let Some(agreement_id) = targets
+                .get(&order.charge_id)
+                .and_then(|target| target.agreement_id.as_deref())
+            else {
                 // `validate_purchase_orders` already refused an unresolvable
                 // `chargeId` against this same map, so this cannot be reached —
                 // and it is spelled as that same refusal rather than a panic.
                 return Err(refuse(index, "chargeId"));
             };
-            // THE RULE THIS LOOP IS FOR: "the unique identifier of the agreement
-            // associated with this charge" — an element may state it, and a
-            // value that is not the agreement holding the charge contradicts the
-            // charge the same element names, so the member is refused rather
-            // than ignored.
-            if order
-                .agreement_id
-                .as_deref()
-                .is_some_and(|named| named != agreement_id)
-            {
-                return Err(refuse(index, "agreementId"));
-            }
             plan.push((
                 index,
-                agreement_id.clone(),
+                agreement_id.to_string(),
                 PurchaseOrder {
                     // The agreement the charge belongs to, resolved from the
-                    // store rather than taken from the request.
-                    agreement_id: Some(agreement_id.clone()),
+                    // store rather than taken from the request — which cannot
+                    // disagree with it, because an element naming another
+                    // agreement was refused by the validator above.
+                    agreement_id: Some(agreement_id.to_string()),
                     ..order.clone()
                 },
             ));
@@ -254,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut updated: Vec<String> = Vec::new();
         for (index, agreement_id, association) in plan {
             let Some(agreement) = store.agreements.get_mut(&agreement_id) else {
-                // Unreachable: `owners` was read from `store.agreements` under
+                // Unreachable: `targets` was read from `store.agreements` under
                 // the lock still held here, so the agreement a charge resolved
                 // to is still there. Spelled as the refusal an unresolvable
                 // `chargeId` earns rather than as a write silently dropped and

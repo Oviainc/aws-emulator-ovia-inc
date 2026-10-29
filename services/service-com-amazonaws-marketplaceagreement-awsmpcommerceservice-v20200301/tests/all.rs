@@ -77,6 +77,8 @@ mod payment_request_rejection;
 mod payment_request_selector_resolution;
 #[path = "all/payment_requests.rs"]
 mod payment_requests;
+#[path = "all/purchase_order_agreement_ids.rs"]
+mod purchase_order_agreement_ids;
 #[path = "all/purchase_order_associations.rs"]
 mod purchase_order_associations;
 #[path = "all/purchase_order_charge_revisions.rs"]

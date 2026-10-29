@@ -17,7 +17,8 @@
 //! the offending member — `INVALID_CHARGE_ID`, `DUPLICATE_CHARGES` or
 //! `MISSING_PURCHASE_ORDER_REFERENCE` — and `fields[0].name` at that member's
 //! own dotted request path. The revision member has its own suites
-//! (`purchase_order_charge_revisions`, `purchase_order_required_members`).
+//! (`purchase_order_charge_revisions`, `purchase_order_required_members`), and
+//! the optional `agreementId` member has `purchase_order_agreement_ids`.
 //!
 //! The rows below differ in what the rule generalises over: how many charges the
 //! quote minted (none, one, several), which of them the list names, how many

@@ -212,16 +212,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the agreement charges": each supplied `PurchaseOrder` associates one
         // reference with ONE charge of the agreement being accepted, and the
         // charges of that agreement are the ones this request's quote minted
-        // into `ChargeSummary$expectedCharges` — each at its first revision,
-        // since this call is what mints them. A list that names a charge the
-        // request does not hold, names one twice, carries no reference to
-        // associate, or states no `chargeRevision`, or one other than the
-        // revision its charge is at, is refused before anything is stored — see
+        // into `ChargeSummary$expectedCharges` — each at its first revision and
+        // held by no agreement yet, since this call is what mints them and the
+        // agreement that will hold them. A list that names a charge the request
+        // does not hold, names one twice, carries no reference to associate,
+        // states no `chargeRevision`, or one other than the revision its charge
+        // is at, or states an `agreementId` — which cannot be the agreement
+        // holding its charge, as that agreement does not exist when the request
+        // is made — is refused before anything is stored; see
         // `crate::state::validate_purchase_orders` for the rule.
         let purchase_orders = input.purchase_orders.unwrap_or_default();
         if let Err(refusal) = crate::state::validate_purchase_orders(
             &purchase_orders,
-            &crate::state::expected_charge_revisions(&request.charge_summary),
+            &crate::state::expected_charge_targets(&request.charge_summary),
         ) {
             return Err(AcceptAgreementRequestErrorModeled::ValidationException(
                 crate::state::validation_exception(&refusal.reason, refusal.path),
@@ -322,7 +325,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into_iter()
                 .map(|order| PurchaseOrder {
                     // "The unique identifier of the agreement associated with
-                    // this charge": the agreement being accepted.
+                    // this charge": the agreement being accepted, which is the
+                    // one minted here — an element that stated any agreement of
+                    // its own was refused above, so nothing a caller sent is
+                    // being overwritten.
                     agreement_id: Some(id.clone()),
                     ..order
                 })

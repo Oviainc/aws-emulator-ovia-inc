@@ -3856,31 +3856,60 @@ pub fn expected_charge_ids(summary: &ChargeSummary) -> BTreeSet<&str> {
         .collect()
 }
 
-/// The revision of each charge a quote minted, which is the state a purchase
-/// order's `chargeRevision` has to agree with when the charges it names are the
-/// ones the call being validated is about to mint.
+/// The state of ONE charge a purchase-order association can be made against:
+/// everything an element of a `purchaseOrders` list restates about the charge it
+/// names, and therefore everything [`validate_purchase_orders`] checks such an
+/// element against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChargeAssociationTarget {
+    /// The revision the charge is at, which an element's `chargeRevision`
+    /// precondition has to agree with.
+    pub revision: i64,
+    /// The agreement holding the charge, which an element's `agreementId` has to
+    /// name when it states one — `None` for a charge no agreement holds YET,
+    /// which is every charge at the door that mints the agreement they will
+    /// belong to, so no value a caller can state is the holder there.
+    pub agreement_id: Option<String>,
+}
+
+/// The state of each charge a quote minted, which is what a purchase order's
+/// members are checked against when the charges it names are the ones the call
+/// being validated is about to mint.
 ///
 /// Each of those charges comes into existence with the call that is being
-/// validated, so each is at its first revision ([`INITIAL_CHARGE_REVISION`]);
-/// the ids are the quote's own ([`expected_charge_ids`]).
-pub fn expected_charge_revisions(summary: &ChargeSummary) -> BTreeMap<String, i64> {
+/// validated, so each is at its first revision ([`INITIAL_CHARGE_REVISION`]) and
+/// none of them is held by an agreement yet — the agreement that will hold them
+/// is minted by that same call; the ids are the quote's own
+/// ([`expected_charge_ids`]).
+pub fn expected_charge_targets(
+    summary: &ChargeSummary,
+) -> BTreeMap<String, ChargeAssociationTarget> {
     expected_charge_ids(summary)
         .into_iter()
-        .map(|id| (id.to_string(), INITIAL_CHARGE_REVISION))
+        .map(|id| {
+            (
+                id.to_string(),
+                ChargeAssociationTarget {
+                    revision: INITIAL_CHARGE_REVISION,
+                    agreement_id: None,
+                },
+            )
+        })
         .collect()
 }
 
 /// Refuse a purchase-order association list that cannot be resolved against
-/// `charges` — the revision of every charge the list can name, keyed by charge
-/// id — BEFORE anything is stored, so a list naming a charge that does not
-/// exist associates nothing.
+/// `charges` — the state of every charge the list can name
+/// ([`ChargeAssociationTarget`]), keyed by charge id — BEFORE anything is
+/// stored, so a list naming a charge that does not exist associates nothing.
 ///
 /// `PurchaseOrder` is "information about a purchase order association to a
 /// charge within an agreement": `chargeId` is "the unique identifier of the
 /// charge to associate the purchase order with", `chargeRevision` is "the
-/// revision of the charge" and `purchaseOrderReference` is "the purchase order
-/// reference to associate with the charge". An association therefore resolves
-/// only when
+/// revision of the charge", `agreementId` is "the unique identifier of the
+/// agreement associated with this charge" and `purchaseOrderReference` is "the
+/// purchase order reference to associate with the charge". An association
+/// therefore resolves only when
 ///
 /// * the charge it names is one of the agreement's own charges — otherwise
 ///   there is nothing to associate with (`INVALID_CHARGE_ID`);
@@ -3900,7 +3929,17 @@ pub fn expected_charge_revisions(summary: &ChargeSummary) -> BTreeMap<String, i6
 ///   dedicated reason for each of these members being absent
 ///   (`MISSING_CHARGE_REVISION`, `MISSING_PURCHASE_ORDER_REFERENCE`): an
 ///   association is made of the charge, the revision it is at and the reference
-///   to record, so every one of the three has to be stated.
+///   to record, so every one of the three has to be stated;
+/// * where it states `agreementId` at all — the member is optional — the value
+///   is the agreement holding the charge the SAME element names. That member
+///   restates which agreement the association belongs to, and the agreement is
+///   resolved from the charge rather than named by the request, so any other
+///   value contradicts the element's own `chargeId` and is refused
+///   (`INVALID_AGREEMENT_ID`) rather than ignored. A charge no agreement holds
+///   yet ([`ChargeAssociationTarget::agreement_id`] is `None`, which is every
+///   charge at the door that MINTS the agreement they will belong to) is
+///   contradicted by every value a caller can state, since the agreement does
+///   not exist when the request is made.
 ///
 /// Each refusal names the element that carried the offending member and the
 /// member of it that failed ([`purchase_order_member_path`]), so a caller with
@@ -3910,12 +3949,12 @@ pub fn expected_charge_revisions(summary: &ChargeSummary) -> BTreeMap<String, i6
 /// reports a modelled constraint on the same member under.
 pub fn validate_purchase_orders(
     orders: &[PurchaseOrder],
-    charges: &BTreeMap<String, i64>,
+    charges: &BTreeMap<String, ChargeAssociationTarget>,
 ) -> Result<(), PurchaseOrderRefusal> {
     let mut associated: BTreeSet<&str> = BTreeSet::new();
     for (index, order) in orders.iter().enumerate() {
         let charge_path = purchase_order_member_path(index, "chargeId");
-        let Some(revision) = charges.get(order.charge_id.as_str()).copied() else {
+        let Some(target) = charges.get(order.charge_id.as_str()) else {
             return Err(PurchaseOrderRefusal {
                 reason: member_reason(&charge_path, RefusalKind::Invalid),
                 path: charge_path,
@@ -3945,10 +3984,26 @@ pub fn validate_purchase_orders(
                 path: revision_path,
             });
         };
-        if stated != revision {
+        if stated != target.revision {
             return Err(PurchaseOrderRefusal {
                 reason: member_reason(&revision_path, RefusalKind::Invalid),
                 path: revision_path,
+            });
+        }
+        // The other member that restates the state of the charge being written:
+        // the agreement the charge belongs to. Naming the holder of some other
+        // charge — or any agreement at all for a charge nothing holds yet —
+        // contradicts this element's own `chargeId`, so the member is refused
+        // rather than overwritten with the agreement the charge is actually of.
+        if order
+            .agreement_id
+            .as_deref()
+            .is_some_and(|named| target.agreement_id.as_deref() != Some(named))
+        {
+            let agreement_path = purchase_order_member_path(index, "agreementId");
+            return Err(PurchaseOrderRefusal {
+                reason: member_reason(&agreement_path, RefusalKind::Invalid),
+                path: agreement_path,
             });
         }
     }
@@ -5309,6 +5364,31 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
             }
         }
         revisions
+    }
+
+    /// The state of every charge this store holds, as a purchase-order
+    /// association is checked against it ([`validate_purchase_orders`]): the
+    /// revision the charge is at and the agreement holding it.
+    ///
+    /// Composed from the two reports that already answer those questions
+    /// ([`Self::charge_revisions`], [`Self::charge_owners`]), so a charge's
+    /// revision and its agreement are still read from the one copy of the
+    /// resource `ListAgreementCharges` reports.
+    pub fn charge_association_targets(&self) -> BTreeMap<String, ChargeAssociationTarget> {
+        let owners = self.charge_owners();
+        self.charge_revisions()
+            .into_iter()
+            .map(|(id, revision)| {
+                let agreement_id = owners.get(&id).cloned();
+                (
+                    id,
+                    ChargeAssociationTarget {
+                        revision,
+                        agreement_id,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// The charges of `agreement`, in the order its quote minted them followed
