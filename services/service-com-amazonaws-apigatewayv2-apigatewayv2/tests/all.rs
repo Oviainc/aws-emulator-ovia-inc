@@ -141,6 +141,8 @@ mod route_response_update;
 mod route_update;
 #[path = "all/route_validation.rs"]
 mod route_validation;
+#[path = "all/routing_rule_deletion.rs"]
+mod routing_rule_deletion;
 #[path = "all/routing_rule_lifecycle.rs"]
 mod routing_rule_lifecycle;
 #[path = "all/routing_rule_read_back.rs"]
