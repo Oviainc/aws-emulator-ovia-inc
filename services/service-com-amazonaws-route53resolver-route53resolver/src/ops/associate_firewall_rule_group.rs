@@ -191,6 +191,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // Every tag the association carries has to be one the service accepts
+        // before anything is written: the model's `TagValue` (length 0..256)
+        // lets the boundary validator serve a value the service's acceptance
+        // criteria do not admit, so the criterion is enforced here — with the
+        // `ValidationException` this operation models — before the store is
+        // locked, so a refused write persists nothing.
+        if let Some(refusal) =
+            crate::state::unacceptable_tag_validation(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(
+                AssociateFirewallRuleGroupErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+
         // `Name`'s pattern carries a negative lookahead, outside what the
         // boundary validator's regex engine accepts, so it is enforced here —
         // before the store is locked, so nothing is written.

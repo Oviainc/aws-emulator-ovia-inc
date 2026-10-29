@@ -107,3 +107,7 @@ mod resolver_rules;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_acceptance.rs"]
+mod tag_acceptance;
+#[path = "all/vpc_configuration_inventory.rs"]
+mod vpc_configuration_inventory;

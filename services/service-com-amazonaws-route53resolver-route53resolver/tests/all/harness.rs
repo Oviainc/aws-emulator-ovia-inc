@@ -172,6 +172,19 @@ impl Emulator {
         }
     }
 
+    /// Every VPC the account's own Amazon EC2 store holds, in the order that
+    /// store reports and pages over them (by `VpcId`) — what a client joining
+    /// Resolver's per-VPC configurations to Amazon EC2 reads with
+    /// `DescribeVpcs`. Read out of that store, never written here.
+    ///
+    /// An account holds the ambient default VPC of its Region from the moment it
+    /// exists, so this is never empty.
+    pub fn held_vpc_ids(&self) -> Vec<String> {
+        let ec2_state = self.ec2_store();
+        let store = ec2_state.lock();
+        store.vpcs.keys().cloned().collect()
+    }
+
     /// Take the VPC `vpc_id` names out of the account's Amazon EC2 store, so a
     /// Resolver write that names it afterwards resolves to nothing.
     pub fn release_vpc(&self, vpc_id: &str) {
@@ -293,6 +306,22 @@ pub fn emulator() -> Emulator {
 pub fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> Emulator {
     let mut router = MultiServiceRouter::new();
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    Emulator { router, engine }
+}
+
+/// A fresh emulator with this service AND the account's own Amazon EC2 service
+/// on ONE shared engine.
+///
+/// The per-VPC singleton configurations this service maintains belong to the
+/// VPCs the ACCOUNT holds, and which VPCs those are is a fact of the Amazon EC2
+/// inventory, so a suite that asserts the two services agree creates its VPCs
+/// through the Amazon EC2 API — over the wire, exactly as an account does — and
+/// never by writing that store itself ([`Emulator::hold_vpcs`]).
+pub fn emulator_with_ec2() -> Emulator {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(ec2::EmulatedService::new(Arc::clone(&engine)));
     Emulator { router, engine }
 }
 

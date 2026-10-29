@@ -206,11 +206,11 @@ struct Row {
 ///
 /// The rows differ along what the rule generalises over: how many tags one call
 /// carries, whether a key is new or already held, the form of the value (ASCII,
-/// the empty string `TagValue`'s length 0..256 admits, non-ASCII text, the
-/// 256-character maximum), the form of the key (`TagKey` is length 1..128, so a
-/// 128-character key is tested too), one key named twice in a single call, a
-/// removal of a key the resource does not carry, a repeated removal and an empty
-/// removal.
+/// the one-character value that is the shortest the service's tag acceptance
+/// criteria admit, non-ASCII text, the 256-character maximum), the form of the
+/// key (`TagKey` is length 1..128, so a 128-character key is tested too), one
+/// key named twice in a single call, a removal of a key the resource does not
+/// carry, a repeated removal and an empty removal.
 fn lifecycle_rows() -> Vec<Row> {
     // The published maxima of `TagKey` (length 1..128) and `TagValue`
     // (length 0..256).
@@ -224,14 +224,14 @@ fn lifecycle_rows() -> Vec<Row> {
             expected: vec![pair("team", "net")],
         },
         Row {
-            case: "two more keys at once, one with the empty value",
-            write: Write::Tag(vec![pair("env", "prod"), pair("note", "")]),
-            expected: vec![pair("team", "net"), pair("env", "prod"), pair("note", "")],
+            case: "two more keys at once, one with a one-character value",
+            write: Write::Tag(vec![pair("env", "prod"), pair("note", "-")]),
+            expected: vec![pair("team", "net"), pair("env", "prod"), pair("note", "-")],
         },
         Row {
             case: "a key the resource already carries takes the new value",
             write: Write::Tag(vec![pair("team", "dns")]),
-            expected: vec![pair("team", "dns"), pair("env", "prod"), pair("note", "")],
+            expected: vec![pair("team", "dns"), pair("env", "prod"), pair("note", "-")],
         },
         Row {
             case: "a value of non-ASCII text",
@@ -239,7 +239,7 @@ fn lifecycle_rows() -> Vec<Row> {
             expected: vec![
                 pair("team", "dns"),
                 pair("env", "prod"),
-                pair("note", ""),
+                pair("note", "-"),
                 pair("propriétaire", "équipe-réseau-αβγ-🌐"),
             ],
         },
@@ -249,7 +249,7 @@ fn lifecycle_rows() -> Vec<Row> {
             expected: vec![
                 pair("team", "dns"),
                 pair("env", "prod"),
-                pair("note", ""),
+                pair("note", "-"),
                 pair("propriétaire", "équipe-réseau-αβγ-🌐"),
                 pair(&longest_key, &longest_value),
             ],
@@ -260,7 +260,7 @@ fn lifecycle_rows() -> Vec<Row> {
             expected: vec![
                 pair("team", "dns"),
                 pair("env", "prod"),
-                pair("note", ""),
+                pair("note", "-"),
                 pair("propriétaire", "équipe-réseau-αβγ-🌐"),
                 pair(&longest_key, &longest_value),
                 pair("stage", "two"),
@@ -271,7 +271,7 @@ fn lifecycle_rows() -> Vec<Row> {
             write: Write::Untag(vec!["env".to_string(), "absent".to_string()]),
             expected: vec![
                 pair("team", "dns"),
-                pair("note", ""),
+                pair("note", "-"),
                 pair("propriétaire", "équipe-réseau-αβγ-🌐"),
                 pair(&longest_key, &longest_value),
                 pair("stage", "two"),
@@ -282,7 +282,7 @@ fn lifecycle_rows() -> Vec<Row> {
             write: Write::Untag(vec!["env".to_string(), "absent".to_string()]),
             expected: vec![
                 pair("team", "dns"),
-                pair("note", ""),
+                pair("note", "-"),
                 pair("propriétaire", "équipe-réseau-αβγ-🌐"),
                 pair(&longest_key, &longest_value),
                 pair("stage", "two"),
@@ -293,7 +293,7 @@ fn lifecycle_rows() -> Vec<Row> {
             write: Write::Untag(Vec::new()),
             expected: vec![
                 pair("team", "dns"),
-                pair("note", ""),
+                pair("note", "-"),
                 pair("propriétaire", "équipe-réseau-αβγ-🌐"),
                 pair(&longest_key, &longest_value),
                 pair("stage", "two"),
@@ -304,7 +304,7 @@ fn lifecycle_rows() -> Vec<Row> {
             write: Write::Tag(Vec::new()),
             expected: vec![
                 pair("team", "dns"),
-                pair("note", ""),
+                pair("note", "-"),
                 pair("propriétaire", "équipe-réseau-αβγ-🌐"),
                 pair(&longest_key, &longest_value),
                 pair("stage", "two"),
@@ -393,7 +393,7 @@ async fn tags_given_at_create_are_the_tags_the_tag_operations_see() {
 
     for kind in RESOURCE_KINDS {
         let creator = format!("tag-at-create-{kind}");
-        let created_with = vec![pair("owner", "netops"), pair("note", "")];
+        let created_with = vec![pair("owner", "netops"), pair("note", "-")];
         let arn = create_resource(
             &router,
             kind,
@@ -416,7 +416,7 @@ async fn tags_given_at_create_are_the_tags_the_tag_operations_see() {
         .await;
         assert_eq!(
             all_tags(&router, &arn, None).await,
-            vec![pair("owner", "dnsops"), pair("note", ""), pair("env", "prod")],
+            vec![pair("owner", "dnsops"), pair("note", "-"), pair("env", "prod")],
             "case {kind:?}: a later write must update the create's key in place and append the new one"
         );
 
@@ -632,8 +632,10 @@ async fn the_tag_page_is_cut_at_max_results_and_resumed_by_its_cursor() {
 /// 400, and the resource's stored tags are left exactly as they were.
 ///
 /// The rows walk the published bounds: `TagKey` is length 1..128 and `TagValue`
-/// length 0..256, so each is tested one character past its maximum and at the
-/// empty string.
+/// length 0..256, so each is tested one character past its maximum, and the key
+/// at the empty string its minimum excludes. The empty VALUE the model admits is
+/// refused by the service itself rather than at the boundary, which
+/// `tag_acceptance` pins.
 #[tokio::test]
 async fn a_tag_outside_the_modelled_constraints_is_refused() {
     let router = emulator_with_outposts();
@@ -673,8 +675,10 @@ async fn a_tag_outside_the_modelled_constraints_is_refused() {
     }
 
     // The bounds themselves are legal, so the refusals above are about the
-    // constraint and not about refusing long tags outright.
-    let at_the_bound = vec![pair(&"k".repeat(128), &"v".repeat(256)), pair("empty", "")];
+    // constraint and not about refusing long tags outright. The empty VALUE the
+    // model's length 0..256 also admits is NOT here: the service's own tag
+    // acceptance criteria refuse it, which `tag_acceptance` pins.
+    let at_the_bound = vec![pair(&"k".repeat(128), &"v".repeat(256))];
     ok(&router, "TagResource", tag_request(&arn, &at_the_bound)).await;
     let mut expected = held.clone();
     expected.extend(at_the_bound);

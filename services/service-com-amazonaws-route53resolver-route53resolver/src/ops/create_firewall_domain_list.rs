@@ -164,6 +164,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // Every tag the create carries has to be one the service accepts
+        // before anything is written: the model's `TagValue` (length 0..256)
+        // lets the boundary validator serve a value the service's acceptance
+        // criteria do not admit, so the criterion is enforced here — with the
+        // `ValidationException` this operation models — before the store is
+        // locked, so a refused create writes nothing.
+        if let Some(refusal) =
+            crate::state::unacceptable_tag_validation(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(
+                CreateFirewallDomainListErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+
         // `Name`'s pattern (`^(?!^[0-9]+$)([a-zA-Z0-9\-_' ']+)$`) admits only
         // letters, digits, hyphens, underscores, apostrophes and spaces, and at
         // least one of them, and excludes a name made of digits alone. Its

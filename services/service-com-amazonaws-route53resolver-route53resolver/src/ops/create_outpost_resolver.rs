@@ -173,6 +173,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // Every tag the create carries has to be one the service accepts
+        // before anything is written: the model's `TagValue` (length 0..256)
+        // lets the boundary validator serve a value the service's acceptance
+        // criteria do not admit, so the criterion is enforced here — with the
+        // `ValidationException` this operation models — before the store is
+        // locked, so a refused create writes nothing.
+        if let Some(refusal) =
+            crate::state::unacceptable_tag_validation(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(CreateOutpostResolverErrorModeled::ValidationException(refusal).into());
+        }
+
         // `InstanceCount`: "The default and minimal value is 4." The model puts
         // no `range` on the member, so the minimum is enforced here — before
         // the store is locked, so a refused create writes nothing. The refusal

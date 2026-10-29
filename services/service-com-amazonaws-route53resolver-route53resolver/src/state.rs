@@ -316,6 +316,17 @@ pub const RSLVR_CODE_RULE_VPC_ASSOCIATION_NOT_FOUND: &str = "RSLVR-00800";
 /// caller names but cannot address. See [`resource_not_found_message`].
 pub const RSLVR_CODE_RESOURCE_NOT_FOUND: &str = "RSLVR-02025";
 
+/// The Route 53 Resolver service error code reported when a request carries a
+/// tag the service will not store, because one of the tag's parameters is
+/// outside what it accepts.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP
+/// status (400) and the exception shape name together do not say which Resolver
+/// fault occurred, and the model states no message text, so this code comes
+/// from the recorded responses of the tag write. See
+/// [`unacceptable_tag_message`].
+pub const RSLVR_CODE_TAG_NOT_ACCEPTABLE: &str = "RSLVR-00908";
+
 /// The service error code Route 53 Resolver reports for an IAM policy document
 /// it will not attach to a resource, carried for the same reason as
 /// [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP status and the error shape alone
@@ -1205,6 +1216,35 @@ pub fn unresolvable_vpc_id<'a, Eng: Send + Sync + 'static>(
     unresolvable_ec2_id(engine, vpc_ids, |store, vpc_id| {
         store.vpcs.contains_key(vpc_id)
     })
+}
+
+/// Every VPC the account's own Amazon EC2 inventory holds, in the order that
+/// inventory reports and pages over them (by `VpcId`).
+///
+/// Which VPCs an account HAS is a fact of that inventory — the one
+/// `DescribeVpcs` answers from — and not of this service's own records, exactly
+/// as in [`unresolvable_vpc_id`]: a VPC the account created carries this
+/// service's per-VPC singleton configurations
+/// ([`ComAmazonawsRoute53resolverRoute53resolverState::firewall_config`],
+/// [`ComAmazonawsRoute53resolverRoute53resolverState::resolver_config`]) whether
+/// or not any Resolver call has ever named it, so this is what the operations
+/// that LIST those configurations enumerate, beside the VPCs this service's own
+/// records name
+/// ([`ComAmazonawsRoute53resolverRoute53resolverState::known_vpc_ids`]).
+///
+/// A pure read: nothing is written to either store.
+///
+/// LOCKING. As [`unresolvable_vpc_id`]: the Amazon EC2 store lock is taken for
+/// this one pass and released before returning, and a handler calls this with no
+/// lock of its own held.
+pub fn account_vpc_ids<Eng: Send + Sync + 'static>(engine: &Eng) -> Vec<String> {
+    let Some(state) = ec2::service_state(engine) else {
+        // No Amazon EC2 store on this engine is no inventory to enumerate, so
+        // the VPCs this service's own records name are all it knows of.
+        return Vec::new();
+    };
+    let store = state.lock();
+    store.vpcs.keys().cloned().collect()
 }
 
 /// The first of `ids` the account's own Amazon EC2 store does not hold, by the
@@ -4411,6 +4451,66 @@ pub fn merge_tags(stored: &mut Vec<Tag>, requested: &[Tag]) -> bool {
     true
 }
 
+/// Whether every tag of `tags` meets the criteria Route 53 Resolver accepts a
+/// tag by: neither its `Key` nor its `Value` is an empty string.
+///
+/// The model's `TagValue` is length 0..256, so an empty value satisfies the
+/// modelled constraint and the boundary validator serves it: the rule that a
+/// stored tag names a value is the SERVICE's, which is why it is decided here.
+/// An empty `Key` is already outside `TagKey`'s length 1..128 and so never
+/// reaches a handler, and it is tested here anyway so one function states the
+/// whole criterion for both members. The lengths themselves are the modelled
+/// constraints and stay the boundary validator's.
+///
+/// Asked by every operation that WRITES tags — the tag operation and each
+/// create that takes a `Tags` list — before it touches the store, so a refused
+/// write persists nothing.
+pub fn tags_are_acceptable(tags: &[Tag]) -> bool {
+    tags.iter()
+        .all(|tag| !tag.key.is_empty() && !tag.value.is_empty())
+}
+
+/// The message Route 53 Resolver answers for a tag that does not meet its
+/// acceptance criteria.
+///
+/// The whole sentence pair is FIXED text for this fault, from the recorded
+/// responses of the tag write: it states that one of the tag parameters is not
+/// acceptable and what the caller has to do, and it interpolates nothing from
+/// the request — so the rejected key and value are not echoed back.
+fn unacceptable_tag_message() -> String {
+    rslvr_message_sentences(
+        RSLVR_CODE_TAG_NOT_ACCEPTABLE,
+        &[
+            "One of the input parameters of the tags does not meet the acceptance criteria specified in the restrictions",
+            "Please fix the invalid parameter before retrying",
+        ],
+    )
+}
+
+/// The `InvalidParameterException` a tag write answers for a `Tags` list
+/// carrying a tag outside [`tags_are_acceptable`], or `None` when every tag is
+/// acceptable.
+///
+/// The parameter at fault is the tag list the sentence already names, so no
+/// `FieldName` is added beside it, exactly as for [`vpc_not_found`].
+pub fn unacceptable_tag(tags: &[Tag]) -> Option<InvalidParameterException> {
+    (!tags_are_acceptable(tags)).then(|| InvalidParameterException {
+        message: unacceptable_tag_message(),
+        field_name: None,
+    })
+}
+
+/// The same refusal as [`unacceptable_tag`] in the `ValidationException` shape,
+/// for an operation whose model gives it that error and no
+/// `InvalidParameterException` to report a parameter it will not accept —
+/// exactly as [`vpc_not_found_validation`] is the other shape of
+/// [`vpc_not_found`].
+pub fn unacceptable_tag_validation(tags: &[Tag]) -> Option<ValidationException> {
+    (!tags_are_acceptable(tags)).then(|| ValidationException {
+        message: Some(unacceptable_tag_message()),
+    })
+}
+
 /// Drop every tag of `stored` whose key is named in `keys`, and leave the rest
 /// in the order they were written in.
 ///
@@ -5246,26 +5346,35 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         self.firewall_configs.len() < MAX_STORED_FIREWALL_CONFIGS
     }
 
-    /// Every VPC this store knows the account has, in the order the service came
-    /// to know of each one.
+    /// Every VPC the account has that this service can know of: the account's
+    /// own VPC inventory first, in the order that inventory reports them, and
+    /// then the VPCs only this service's records name, in the order it came to
+    /// know of each one.
     ///
     /// A per-VPC singleton configuration ([`FirewallConfigRecord`],
     /// [`ResolverConfigRecord`]) exists for every VPC of the account, not only
     /// for those a caller moved off the default, so the operation that LISTS
-    /// such configurations enumerates VPCs and not override records. This
-    /// emulator keeps no VPC inventory of its own, so the VPCs it knows the
-    /// account has are exactly those its own records name: a VPC a Resolver rule
-    /// is associated with, a VPC a Resolver endpoint is hosted in, a VPC a DNS
-    /// Firewall rule group is associated with, and a VPC one of the per-VPC
-    /// configurations was written for.
+    /// such configurations enumerates VPCs and not override records. Which VPCs
+    /// the account HAS is a fact of its own Amazon EC2 inventory, which
+    /// [`account_vpc_ids`] reads and the caller passes in as `inventory` — a VPC
+    /// the account created carries its configurations with no Resolver call ever
+    /// naming it. Beside the inventory come the VPCs this service's OWN records
+    /// name, which an account can hold records for without that store holding
+    /// the VPC: a VPC a Resolver rule is associated with, a VPC a Resolver
+    /// endpoint is hosted in, a VPC a DNS Firewall rule group is associated
+    /// with, and a VPC one of the per-VPC configurations was written for.
     ///
-    /// Ordered by the position in the store's creation order ([`Self::id_seq`])
-    /// of the FIRST record that named the VPC, so the sequence never depends on
-    /// the hash order of the maps holding those records and a VPC that becomes
-    /// known later only ever appends — which is what lets a list operation cut a
-    /// page at an offset into it. A pure read: a VPC is not given any record
-    /// here.
-    pub fn known_vpc_ids(&self) -> Vec<String> {
+    /// The inventory leads, because every VPC of an account is in it and a VPC
+    /// it reports later is one minted later: a list operation cuts a page at an
+    /// offset into this sequence, so a VPC that appears while a caller is paging
+    /// has to append past the page already read. The records that name a VPC the
+    /// inventory does not hold follow, ordered by the position in the store's
+    /// creation order ([`Self::id_seq`]) of the FIRST record that named it, so
+    /// that tail never depends on the hash order of the maps holding those
+    /// records and it, too, only appends. Each VPC appears ONCE, however many
+    /// records name it and however often the inventory repeats it. A pure read:
+    /// a VPC is not given any record here.
+    pub fn known_vpc_ids(&self, inventory: &[String]) -> Vec<String> {
         let named = self
             .resolver_rule_associations
             .values()
@@ -5303,17 +5412,30 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
             *earliest = (*earliest).min(seq);
         }
 
-        // The id and the sequence number together, so VPCs that became known in
-        // the same call still have ONE order rather than the map's.
-        let mut ordered: Vec<(u64, &str)> = first_seen
-            .into_iter()
-            .map(|(vpc_id, seq)| (seq, vpc_id))
+        // The account's inventory leads, each id once however often it repeats.
+        let mut listed: HashSet<&str> = HashSet::new();
+        let mut ids: Vec<String> = Vec::new();
+        for vpc_id in inventory {
+            if listed.insert(vpc_id.as_str()) {
+                ids.push(vpc_id.clone());
+            }
+        }
+
+        // Then the VPCs only this service's records name, by the id and the
+        // sequence number together, so VPCs that became known in the same call
+        // still have ONE order rather than the map's.
+        let mut record_only: Vec<(u64, &str)> = first_seen
+            .iter()
+            .filter(|(vpc_id, _)| !listed.contains(**vpc_id))
+            .map(|(vpc_id, seq)| (*seq, *vpc_id))
             .collect();
-        ordered.sort_unstable();
-        ordered
-            .into_iter()
-            .map(|(_, vpc_id)| vpc_id.to_string())
-            .collect()
+        record_only.sort_unstable();
+        ids.extend(
+            record_only
+                .into_iter()
+                .map(|(_, vpc_id)| vpc_id.to_string()),
+        );
+        ids
     }
 
     /// The Resolver behavior configuration of the VPC `resource_id`, which every

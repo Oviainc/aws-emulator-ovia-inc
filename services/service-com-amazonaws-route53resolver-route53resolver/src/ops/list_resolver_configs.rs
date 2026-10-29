@@ -182,15 +182,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so the collection is "one `ResolverConfigs` element for each Resolver
         // configuration that is associated with the current Amazon Web Services
         // account": the configuration `GetResolverConfig` reports for each VPC
-        // of the account, and not one per stored override. The store's own
-        // records are what say which VPCs the account has, in the order the
-        // service came to know of them, so a VPC that becomes known while a
-        // caller is paging only appends past the page it already read.
+        // of the account, and not one per stored override. Which VPCs the
+        // account has is a fact of its own Amazon EC2 inventory, so that
+        // inventory is read first — with no lock of this service's held — and
+        // the store adds to it the VPCs its own records name, in the order it
+        // came to know of them, so a VPC that becomes known while a caller is
+        // paging only appends past the page it already read.
+        let inventory = crate::state::account_vpc_ids(&*self.engine);
         let page = {
             let store = state.lock();
             let now = ::std::time::Instant::now();
             let all: Vec<ResolverConfig> = store
-                .known_vpc_ids()
+                .known_vpc_ids(&inventory)
                 .iter()
                 .map(|vpc_id| store.resolver_config(vpc_id).to_resolver_config(now))
                 .collect();

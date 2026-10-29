@@ -66,8 +66,9 @@ async fn a_created_domain_list_is_read_back_from_state() {
                 "Tags": [
                     { "Key": "team", "Value": "net" },
                     { "Key": "env", "Value": "prod" },
-                    // `TagValue` is length 0..256, so the empty value is legal.
-                    { "Key": "note", "Value": "" },
+                    // The shortest value the service's tag acceptance criteria
+                    // admit: a tag it stores names a value.
+                    { "Key": "note", "Value": "-" },
                 ],
             }),
         },

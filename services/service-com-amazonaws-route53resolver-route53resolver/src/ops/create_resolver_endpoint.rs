@@ -241,6 +241,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Every tag the create carries has to be one the service accepts before
+        // anything is written: the model's `TagValue` (length 0..256) lets the
+        // boundary validator serve a value the service's acceptance criteria do
+        // not admit, so the criterion is enforced here — with the
+        // `InvalidParameterException` this operation models — before the store
+        // is locked, so a refused create writes nothing.
+        if let Some(refusal) =
+            crate::state::unacceptable_tag(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(
+                CreateResolverEndpointErrorModeled::InvalidParameterException(refusal).into(),
+            );
+        }
+
         // Documented pairing: "OutpostArn ... If you specify this, you must also
         // specify a value for the PreferredInstanceType", and the converse on
         // `PreferredInstanceType`. The model cannot express it, so the service

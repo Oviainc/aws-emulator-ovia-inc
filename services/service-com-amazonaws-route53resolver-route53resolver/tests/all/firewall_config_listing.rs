@@ -10,10 +10,13 @@
 //!
 //! What these cases pin is the rule the operation follows: a VPC's DNS Firewall
 //! configuration is a per-VPC singleton the service maintains itself, so the
-//! listing reports ONE entry per VPC the service knows the account has — the
-//! very configuration `GetFirewallConfig` reports for that VPC — however that
-//! VPC became known, paged by the `MaxResults` range the model puts on THIS
-//! operation and resumed only by a cursor this service minted for it.
+//! listing reports ONE entry per VPC of the account — the very configuration
+//! `GetFirewallConfig` reports for that VPC — however that VPC became known,
+//! paged by the `MaxResults` range the model puts on THIS operation and resumed
+//! only by a cursor this service minted for it. Which VPCs the account HAS is a
+//! fact of its own Amazon EC2 inventory, which `vpc_configuration_inventory`
+//! pins; these cases take the VPCs that inventory already holds as the
+//! collection's starting point.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -184,19 +187,22 @@ async fn update_firewall_config(router: &MultiServiceRouter, resource_id: &str, 
     .await;
 }
 
-/// An account whose VPCs the service knows nothing of yet is reported as an
-/// empty collection — a `FirewallConfigs` array with no entries and no cursor,
-/// not a missing member — and reading a VPC's configuration does not add it to
-/// the collection, because a read creates no configuration.
+/// Reading a VPC's configuration creates nothing: the collection is the VPCs
+/// the account HOLDS — the ambient default VPC of its Region to begin with — and
+/// a read of a configuration for a VPC the account does not hold leaves that
+/// collection exactly as it was.
 #[tokio::test]
-async fn an_account_the_service_knows_no_vpc_of_is_listed_as_empty() {
+async fn reading_a_configuration_adds_no_vpc_to_the_listing() {
     let router = emulator();
 
+    // The collection an account starts with: the VPCs its own Amazon EC2
+    // inventory holds, reported as a list and with no cursor owed.
     let page = ok(&router, "ListFirewallConfigs", json!({})).await;
+    let ambient = page_items(&page);
     assert_eq!(
-        page_items(&page),
-        Vec::<Value>::new(),
-        "case \"a store nobody wrote to\": the listing must be an empty array, got {page}"
+        ambient.iter().map(|item| string_member(item, "ResourceId")).collect::<Vec<String>>(),
+        router.held_vpc_ids(),
+        "case \"a store nobody wrote to\": the listing must report the VPCs the account holds, got {page}"
     );
     assert_eq!(
         page.get("NextToken"),
@@ -220,16 +226,15 @@ async fn an_account_the_service_knows_no_vpc_of_is_listed_as_empty() {
 
         let walked = walk(&router, &json!({}), case).await;
         assert_eq!(
-            walked,
-            Vec::<Value>::new(),
+            walked, ambient,
             "case {case:?}: reading a configuration must not add a VPC to the listing, got {walked:?}"
         );
     }
 }
 
 /// Every VPC the service knows the account has is listed exactly once, with the
-/// configuration its reader reports for that VPC, and the entries stay in the
-/// order the service came to know of the VPCs.
+/// configuration its reader reports for that VPC, and the entries follow the
+/// order the collection is defined in.
 ///
 /// The rows span what the rule generalises over — HOW the service came to know
 /// of the VPC, which is every way one of its records can name one: a firewall
@@ -325,19 +330,25 @@ async fn every_vpc_the_service_knows_of_is_listed_once_with_its_own_configuratio
         );
     }
 
-    // The order is the order the VPCs became known, so a VPC the service learns
-    // of later only appends past what a caller already read.
+    // The order is the account's own inventory first, in the order that
+    // inventory reports it, and then the VPCs only this service's records name,
+    // in the order the service came to know of them — so a VPC the service
+    // learns of later only appends past what a caller already read.
     let order: Vec<String> = listed
         .iter()
         .map(|item| string_member(item, "ResourceId"))
         .collect();
-    let becoming_known: Vec<String> = expected
-        .iter()
-        .map(|(_, resource_id, _)| resource_id.clone())
-        .collect();
+    let held = router.held_vpc_ids();
+    let mut by_rule: Vec<String> = held.clone();
+    by_rule.extend(
+        expected
+            .iter()
+            .map(|(_, resource_id, _)| resource_id.clone())
+            .filter(|resource_id| !held.contains(resource_id)),
+    );
     assert_eq!(
-        order, becoming_known,
-        "case \"every known VPC\": the entries must stay in the order the VPCs became known"
+        order, by_rule,
+        "case \"every known VPC\": the inventory's VPCs must lead, then the VPCs only a record names"
     );
 
     update_firewall_config(&router, "vpc-00000000000000015", "USE_LOCAL_RESOURCE_SETTING").await;
@@ -361,11 +372,14 @@ async fn every_vpc_the_service_knows_of_is_listed_once_with_its_own_configuratio
 async fn paging_walks_every_firewall_configuration_exactly_once() {
     let router = emulator();
     // More VPCs than the largest page the model lets a caller ask for, so every
-    // page size below needs at least two pages.
-    let known = usize::try_from(MAX_RESULTS_BOUNDS.1).expect("the bound is positive") + 3;
-    for index in 0..known {
+    // page size below needs at least two pages. The VPCs the account already
+    // holds count towards the collection, so the total is read off the listing
+    // rather than assumed to be the writes below.
+    let written = usize::try_from(MAX_RESULTS_BOUNDS.1).expect("the bound is positive") + 3;
+    for index in 0..written {
         update_firewall_config(&router, &format!("vpc-paged-{index}"), "ENABLED").await;
     }
+    let known = written + router.held_vpc_ids().len();
 
     let expected: Vec<String> = walk(&router, &json!({}), "MaxResults omitted")
         .await
@@ -491,6 +505,9 @@ async fn a_next_token_this_query_did_not_mint_is_refused() {
     for index in 0..8 {
         update_firewall_config(&router, &format!("vpc-cursor-{index}"), "ENABLED").await;
     }
+    // The VPCs the account already holds are part of the collection, so what the
+    // resumed page must hold is read off its size rather than assumed.
+    let known = 8 + router.held_vpc_ids().len();
 
     let page = ok(
         &router,
@@ -565,7 +582,7 @@ async fn a_next_token_this_query_did_not_mint_is_refused() {
     .await;
     assert_eq!(
         page_items(&resumed).len(),
-        3,
+        known - usize::try_from(MAX_RESULTS_BOUNDS.0).expect("the bound is positive"),
         "case \"the minted cursor\": the walk must resume where the first page stopped, got {resumed}"
     );
 }

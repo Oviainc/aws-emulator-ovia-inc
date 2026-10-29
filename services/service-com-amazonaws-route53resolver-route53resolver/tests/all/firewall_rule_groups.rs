@@ -65,8 +65,9 @@ async fn a_created_rule_group_is_read_back_from_state() {
                 "Tags": [
                     { "Key": "team", "Value": "net" },
                     { "Key": "env", "Value": "prod" },
-                    // `TagValue` is length 0..256, so the empty value is legal.
-                    { "Key": "note", "Value": "" },
+                    // The shortest value the service's tag acceptance criteria
+                    // admit: a tag it stores names a value.
+                    { "Key": "note", "Value": "-" },
                 ],
             }),
         },
@@ -220,11 +221,11 @@ async fn the_tags_a_create_carried_are_the_tags_the_group_holds() {
             json!([{ "Key": "team", "Value": "net" }]),
         ),
         (
-            "several tags, one with an empty value",
+            "several tags, one with a one-character value",
             json!([
                 { "Key": "team", "Value": "net" },
                 { "Key": "env", "Value": "prod" },
-                { "Key": "note", "Value": "" },
+                { "Key": "note", "Value": "-" },
             ]),
         ),
     ] {

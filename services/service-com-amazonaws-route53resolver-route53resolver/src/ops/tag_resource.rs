@@ -156,6 +156,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Every tag of the request has to be one the service accepts before
+        // anything is written: the value of a stored tag is a string the
+        // service's acceptance criteria admit, and the model's `TagValue`
+        // (length 0..256) lets the boundary validator serve one it does not, so
+        // the criterion is enforced here — with the `InvalidParameterException`
+        // this operation models — and before the store is locked, so a refused
+        // write persists nothing.
+        if let Some(refusal) = crate::state::unacceptable_tag(&input.tags) {
+            return Err(TagResourceErrorModeled::InvalidParameterException(refusal).into());
+        }
+
         // "Adds one or more tags to a SPECIFIED resource": the tags are written
         // onto the resource the ARN names, so an ARN this store holds no
         // resource under is reported as missing instead of being accepted and

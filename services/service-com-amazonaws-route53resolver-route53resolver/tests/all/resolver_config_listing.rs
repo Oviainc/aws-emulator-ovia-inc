@@ -10,10 +10,13 @@
 //!
 //! What these cases pin is the rule the operation follows: a VPC's Resolver
 //! behavior configuration is a per-VPC singleton the service maintains itself,
-//! so the listing reports ONE entry per VPC the service knows the account has —
-//! the very configuration `GetResolverConfig` reports for that VPC, at the
-//! status the clock owes it — paged by the `MaxResults` range the model puts on
-//! THIS operation and resumed only by a cursor this service minted for it.
+//! so the listing reports ONE entry per VPC of the account — the very
+//! configuration `GetResolverConfig` reports for that VPC, at the status the
+//! clock owes it — paged by the `MaxResults` range the model puts on THIS
+//! operation and resumed only by a cursor this service minted for it. Which
+//! VPCs the account HAS is a fact of its own Amazon EC2 inventory, which
+//! `vpc_configuration_inventory` pins; these cases take the VPCs that inventory
+//! already holds as the collection's starting point.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -199,19 +202,25 @@ async fn associate_rule_with_vpc(router: &Emulator, endpoint: &str, vpc: &str) {
     .await;
 }
 
-/// An account whose VPCs the service knows nothing of yet is reported as an
-/// empty collection — a `ResolverConfigs` array with no entries and no cursor,
-/// not a missing member — and reading a VPC's configuration does not add it to
-/// the collection, because a read creates no configuration.
+/// Reading a VPC's configuration creates nothing: the collection is the VPCs
+/// the account HOLDS — the ambient default VPC of its Region to begin with — and
+/// a read of a configuration for a VPC the account does not hold leaves that
+/// collection exactly as it was.
 #[tokio::test]
-async fn an_account_the_service_knows_no_vpc_of_is_listed_as_empty() {
+async fn reading_a_configuration_adds_no_vpc_to_the_listing() {
     let router = emulator();
 
+    // The collection an account starts with: the VPCs its own Amazon EC2
+    // inventory holds, reported as a list and with no cursor owed.
     let page = ok(&router, "ListResolverConfigs", json!({})).await;
+    let ambient = page_items(&page);
     assert_eq!(
-        page_items(&page),
-        Vec::<Value>::new(),
-        "case \"a store nobody wrote to\": the listing must be an empty array, got {page}"
+        ambient
+            .iter()
+            .map(|item| string_member(item, "ResourceId"))
+            .collect::<Vec<String>>(),
+        router.held_vpc_ids(),
+        "case \"a store nobody wrote to\": the listing must report the VPCs the account holds, got {page}"
     );
     assert_eq!(
         page.get("NextToken"),
@@ -240,8 +249,7 @@ async fn an_account_the_service_knows_no_vpc_of_is_listed_as_empty() {
 
         let walked = walk(&router, &json!({}), case).await;
         assert_eq!(
-            walked,
-            Vec::<Value>::new(),
+            walked, ambient,
             "case {case:?}: reading a configuration must not add a VPC to the listing, got {walked:?}"
         );
     }
@@ -351,19 +359,25 @@ async fn every_vpc_the_service_knows_of_is_listed_once_with_its_own_configuratio
         );
     }
 
-    // The order is the order the VPCs became known, so a VPC the service learns
-    // of later only appends past what a caller already read.
+    // The order is the account's own inventory first, in the order that
+    // inventory reports it, and then the VPCs only this service's records name,
+    // in the order the service came to know of them — so a VPC the service
+    // learns of later only appends past what a caller already read.
     let order: Vec<String> = listed
         .iter()
         .map(|item| string_member(item, "ResourceId"))
         .collect();
-    let becoming_known: Vec<String> = expected
-        .iter()
-        .map(|(_, resource_id, _)| resource_id.clone())
-        .collect();
+    let held = router.held_vpc_ids();
+    let mut by_rule: Vec<String> = held.clone();
+    by_rule.extend(
+        expected
+            .iter()
+            .map(|(_, resource_id, _)| resource_id.clone())
+            .filter(|resource_id| !held.contains(resource_id)),
+    );
     assert_eq!(
-        order, becoming_known,
-        "case \"every known VPC\": the entries must stay in the order the VPCs became known"
+        order, by_rule,
+        "case \"every known VPC\": the inventory's VPCs must lead, then the VPCs only a record names"
     );
 
     update_resolver_config(
@@ -488,9 +502,11 @@ async fn the_listing_reports_the_status_the_clock_owes() {
 async fn paging_walks_every_resolver_configuration_exactly_once() {
     let router = emulator();
     // More VPCs than the smallest page the model lets a caller ask for, so the
-    // page sizes below need more than one page.
-    let known = usize::try_from(MAX_RESULTS_BOUNDS.0).expect("the bound is positive") + 8;
-    for index in 0..known {
+    // page sizes below need more than one page. The VPCs the account already
+    // holds count towards the collection, so the total is the writes below plus
+    // those.
+    let written = usize::try_from(MAX_RESULTS_BOUNDS.0).expect("the bound is positive") + 8;
+    for index in 0..written {
         update_resolver_config(
             &router,
             &format!("vpc-paged-{index}"),
@@ -499,6 +515,7 @@ async fn paging_walks_every_resolver_configuration_exactly_once() {
         .await;
     }
     settle().await;
+    let known = written + router.held_vpc_ids().len();
 
     let expected: Vec<String> = walk(&router, &json!({}), "MaxResults omitted")
         .await
@@ -644,6 +661,9 @@ async fn a_next_token_this_query_did_not_mint_is_refused() {
         )
         .await;
     }
+    // The VPCs the account already holds are part of the collection, so what the
+    // resumed page must hold is read off its size rather than assumed.
+    let known = 8 + router.held_vpc_ids().len();
 
     let page = ok(
         &router,
@@ -739,7 +759,7 @@ async fn a_next_token_this_query_did_not_mint_is_refused() {
     .await;
     assert_eq!(
         page_items(&resumed).len(),
-        3,
+        known - usize::try_from(MAX_RESULTS_BOUNDS.0).expect("the bound is positive"),
         "case \"the minted cursor\": the walk must resume where the first page stopped, got {resumed}"
     );
 }
