@@ -259,20 +259,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The set's own `ResourceTypeList` and its current membership, both read
-        // ONCE before anything is written. The identifier resolved above, so this
-        // lookup finds the record under the same held lock; it is read through
-        // the same not-found channel rather than a default, so no future change
-        // can classify a batch against an empty `ResourceTypeList`.
-        let Some(record) = store.resource_sets.get(&id) else {
-            return Err(
-                BatchDisassociateResourceErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(),
-                )
-                .into(),
-            );
-        };
-        let resource_types = record.resource_set.resource_type_list.clone();
-        let held = record.resources.clone();
+        // ONCE before anything is written, through the step both batch
+        // membership operations share
+        // ([`crate::state::resource_set_batch_basis`]) — including its not-found
+        // channel, so no change here can classify a batch against an empty
+        // `ResourceTypeList`.
+        let crate::state::ResourceSetBatchBasis {
+            resource_types,
+            held,
+        } = crate::state::resource_set_batch_basis(&store, &id)
+            .map_err(BatchDisassociateResourceErrorModeled::ResourceNotFoundException)?;
         let partition = crate::state::emulator_partition();
         let accounts = crate::state::organization_accounts(&store, discoverable);
         let mut failed_items = Vec::new();
@@ -308,14 +304,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the set's `LastUpdateTime` moves to the instant its membership changed
         // and stays put when a call changed nothing — a URI the set does not hold
         // leaves nothing to remove
-        // ([`crate::state::ResourceSetRecord::set_resources`]).
-        if let Some(record) = store.resource_sets.get_mut(&id) {
-            let mut membership = record.resources.clone();
-            for uri in &disassociated {
-                membership.remove(uri);
-            }
-            record.set_resources(membership, now);
+        // ([`crate::state::ResourceSetRecord::set_resources`]), reached through
+        // the shared writer so the write cannot be dropped silently.
+        let mut membership = held;
+        for uri in &disassociated {
+            membership.remove(uri);
         }
+        crate::state::write_resource_set_resources(&mut store, &id, membership, now)
+            .map_err(BatchDisassociateResourceErrorModeled::ResourceNotFoundException)?;
         Ok(BatchDisassociateResourceOutput {
             resource_set_identifier: id,
             failed_items,

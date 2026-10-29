@@ -271,13 +271,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Classified against the resource set's own `ResourceTypeList` and the
-        // store, all read ONCE before the membership is written.
-        let resource_types = store
-            .resource_sets
-            .get(&id)
-            .map(|record| record.resource_set.resource_type_list.clone())
-            .unwrap_or_default();
+        // The set's own `ResourceTypeList` and its current membership, both read
+        // ONCE before anything is written, through the step both batch
+        // membership operations share
+        // ([`crate::state::resource_set_batch_basis`]) — including its not-found
+        // channel, so no change here can classify a batch against an empty
+        // `ResourceTypeList`.
+        let crate::state::ResourceSetBatchBasis {
+            resource_types,
+            held,
+        } = crate::state::resource_set_batch_basis(&store, &id)
+            .map_err(BatchAssociateResourceErrorModeled::ResourceNotFoundException)?;
         let partition = crate::state::emulator_partition();
         let accounts = crate::state::organization_accounts(&store, discoverable);
         let mut failed_items = Vec::new();
@@ -301,19 +305,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The stored membership is bounded too, counting only what this call
         // would ADD: re-associating a resource the set already holds changes
         // nothing, so it cannot be refused for crossing the bound.
-        let already_held = store
-            .resource_sets
-            .get(&id)
-            .map(|record| &record.resources);
-        let added = already_held.map_or(associated.len(), |held| {
-            associated.iter().filter(|uri| !held.contains(*uri)).count()
-        });
-        let held = already_held.map_or(0, ::std::collections::BTreeSet::len);
-        if held + added > MAX_RESOURCES_PER_RESOURCE_SET {
+        let added = associated
+            .iter()
+            .filter(|uri| !held.contains(*uri))
+            .count();
+        let holding = held.len();
+        if holding + added > MAX_RESOURCES_PER_RESOURCE_SET {
             return Err(BatchAssociateResourceErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(format!(
-                        "resource set {id} holds {held} of the maximum \
+                        "resource set {id} holds {holding} of the maximum \
                          {MAX_RESOURCES_PER_RESOURCE_SET} resources, so {added} more cannot be \
                          associated"
                     )),
@@ -326,12 +327,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the set's `LastUpdateTime` moves to the instant its membership changed
         // and stays put when a call changed nothing — re-associating a resource
         // the set already holds is the same association
-        // ([`crate::state::ResourceSetRecord::set_resources`]).
-        if let Some(record) = store.resource_sets.get_mut(&id) {
-            let mut membership = record.resources.clone();
-            membership.extend(associated);
-            record.set_resources(membership, now);
-        }
+        // ([`crate::state::ResourceSetRecord::set_resources`]), reached through
+        // the shared writer so the write cannot be dropped silently.
+        let mut membership = held;
+        membership.extend(associated);
+        crate::state::write_resource_set_resources(&mut store, &id, membership, now)
+            .map_err(BatchAssociateResourceErrorModeled::ResourceNotFoundException)?;
         Ok(BatchAssociateResourceOutput {
             resource_set_identifier: id,
             failed_items,

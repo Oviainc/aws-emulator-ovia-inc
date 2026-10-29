@@ -2874,6 +2874,70 @@ pub fn resolve_resource_set_id(
         .map(|record| record.id.clone())
 }
 
+/// What a batch membership call classifies its items against: the resource
+/// set's own declared `ResourceTypeList` and the membership it currently holds,
+/// both read ONCE from the stored record.
+#[derive(Debug, Clone)]
+pub struct ResourceSetBatchBasis {
+    /// The set's declared `ResourceTypeList`, the catalog
+    /// [`resource_set_item_failure_reason`] classifies an item against.
+    pub resource_types: Vec<String>,
+    /// The resource URIs the set holds right now.
+    pub held: BTreeSet<String>,
+}
+
+/// Re-read the resource set `id` names under the lock the caller already holds
+/// and hand back the basis a batch membership call classifies against.
+///
+/// The step both batch membership operations have to take between resolving the
+/// `ResourceSetIdentifier` ([`resolve_resource_set_id`]) and classifying their
+/// items, single-homed here like every other rule those two share
+/// ([`MAX_RESOURCE_SET_ITEMS_PER_CALL`], [`resource_set_item_failure_reason`],
+/// [`ResourceSetRecord::set_resources`]), so neither of them can classify a
+/// batch differently from the other.
+///
+/// A record the identifier resolved to is found under the same held lock, so
+/// the miss is the service's own not-found answer rather than a default: no
+/// future change can classify a batch against an empty `ResourceTypeList`, in
+/// which [`resource_set_item_failure_reason`] fails every item. The caller
+/// lifts the returned exception into its own modelled `ResourceNotFoundException`
+/// variant.
+pub fn resource_set_batch_basis(
+    store: &ComAmazonawsFmsAwsfms20180101State,
+    id: &str,
+) -> Result<ResourceSetBatchBasis, ResourceNotFoundException> {
+    let Some(record) = store.resource_sets.get(id) else {
+        return Err(resource_not_found());
+    };
+    Ok(ResourceSetBatchBasis {
+        resource_types: record.resource_set.resource_type_list.clone(),
+        held: record.resources.clone(),
+    })
+}
+
+/// Make `resources` the membership of the resource set `id` names, through the
+/// record's own single writer ([`ResourceSetRecord::set_resources`]), so the
+/// set's `LastUpdateTime` moves exactly when its membership changed.
+///
+/// The write half of [`resource_set_batch_basis`], single-homed for the same
+/// reason: a record the identifier resolved to is still there under the same
+/// held lock, so the miss is the service's own not-found answer rather than a
+/// write that is silently dropped. Whether the membership CHANGED is the
+/// record's own writer's answer, for a caller that has something to do with it;
+/// the batch operations do not, so this reports only whether the write landed.
+pub fn write_resource_set_resources(
+    store: &mut ComAmazonawsFmsAwsfms20180101State,
+    id: &str,
+    resources: BTreeSet<String>,
+    now: SystemTime,
+) -> Result<(), ResourceNotFoundException> {
+    let Some(record) = store.resource_sets.get_mut(id) else {
+        return Err(resource_not_found());
+    };
+    record.set_resources(resources, now);
+    Ok(())
+}
+
 /// Compare two names that spell the same thing differently on the wire: the
 /// `AWS::NetworkFirewall::Firewall` resource type's `Firewall` and the
 /// `firewall/<name>` of a Network Firewall ARN, or `ResolverQueryLogConfig` and
