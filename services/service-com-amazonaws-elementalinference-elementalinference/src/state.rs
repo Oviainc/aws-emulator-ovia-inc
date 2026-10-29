@@ -351,6 +351,25 @@ pub fn duplicate_output_name_message(name: &str) -> String {
     )
 }
 
+/// An APPEND that asks a feed to hold an output under a name it already holds under a
+/// DIFFERENT definition ([`Feed::outputs_to_append`]).
+///
+/// The other half of the rule [`first_duplicate_output_name`] states — an output's `name`
+/// IDENTIFIES it within its feed — so it is worded here, beside its sibling and in the
+/// same convention, rather than built in the handler: appending that output would MODIFY
+/// the one the feed holds, which the append cannot do ("You can't modify an existing
+/// output (for example to change its name). Instead, use UpdateFeed"). The sentence is
+/// the rule's, so it carries no value read out of the stored record — not the feed, not
+/// its status, and nothing of the held output's definition — and names at most the output
+/// name the REQUEST supplied, exactly as [`duplicate_output_name_message`] does: the same
+/// text whichever feed refused the append and whatever that feed holds.
+pub fn output_not_appendable_message(name: &str) -> String {
+    format!(
+        "The feed already has an output named {name}. AssociateFeed can only append new \
+         outputs; use UpdateFeed to modify an existing one."
+    )
+}
+
 /// An `UpdateFeed` output whose `fromAssociation` disagrees with the value the service
 /// holds for the output of that name.
 ///
@@ -1023,7 +1042,8 @@ impl Feed {
     /// and is not appendable either: appending it would MODIFY the stored output, which
     /// this operation cannot do ("You can't modify an existing output (for example to
     /// change its name). Instead, use UpdateFeed"). That one is refused, and the `Err`
-    /// carries its name for the refusal to report.
+    /// carries the name the REQUEST supplied for it, which is all the refusal's sentence
+    /// ([`output_not_appendable_message`]) names.
     pub fn outputs_to_append(&self, requested: Vec<Output>) -> Result<Vec<Output>, String> {
         let mut to_append = Vec::with_capacity(requested.len());
         for candidate in requested {

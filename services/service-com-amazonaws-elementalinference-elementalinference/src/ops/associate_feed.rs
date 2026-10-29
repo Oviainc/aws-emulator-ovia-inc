@@ -14,10 +14,14 @@
 //!   with the modelled `ValidationException`;
 //! * "You can associate only one resource with each feed": a different resource name on
 //!   an already-claimed feed is refused;
-//! * a refusal decided from the STORED feed carries that rule's invariant sentence
+//! * a refusal decided from the STORED feed carries that rule's invariant sentence, and
+//!   that sentence lives in `crate::state` beside the rule it words
 //!   (`crate::state::FEED_ALREADY_ASSOCIATED_MESSAGE`,
-//!   `crate::state::FEED_NOT_ASSOCIABLE_MESSAGE`): the message interpolates no value
-//!   read out of state — not the feed's status and not the resource that holds it;
+//!   `crate::state::FEED_NOT_ASSOCIABLE_MESSAGE`,
+//!   `crate::state::output_not_appendable_message`): the message interpolates no value
+//!   read out of state — not the feed, not its status, not the resource that holds it and
+//!   nothing of an output the feed holds — so at most it names a value the REQUEST
+//!   supplied;
 //! * PATCH semantics — "You can add more outputs to the existing outputs. New outputs
 //!   will be appended", and an output that would modify an existing one (same name
 //!   carrying a different definition) is refused with the modelled `ConflictException`
@@ -427,12 +431,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let to_append = match feed.outputs_to_append(requested) {
             Ok(to_append) => to_append,
             Err(name) => {
+                // Decided from the STORED output list, so the sentence is the rule's and
+                // is worded in state, beside the one that answers the other half of the
+                // same name-identity rule (`crate::state::duplicate_output_name_message`,
+                // above): it names at most the output name the request supplied and no
+                // value read off the record, so a client can match it against a constant.
+                // All this handler adds is the modelled error class.
                 return Err(AssociateFeedErrorModeled::ConflictException(ConflictException {
-                    message: format!(
-                        "Feed {} already has an output named {}. AssociateFeed can only append \
-                         new outputs; use UpdateFeed to modify an existing one.",
-                        feed.id, name
-                    ),
+                    message: crate::state::output_not_appendable_message(&name),
                 })
                 .into());
             }
