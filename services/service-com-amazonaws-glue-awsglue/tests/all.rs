@@ -161,6 +161,8 @@ mod job_regions;
 mod job_run_listing;
 #[path = "all/job_run_miss_message.rs"]
 mod job_run_miss_message;
+#[path = "all/job_run_retries.rs"]
+mod job_run_retries;
 #[path = "all/job_runs.rs"]
 mod job_runs;
 #[path = "all/job_updates.rs"]

@@ -8276,8 +8276,9 @@ impl JobBookmarkState {
     /// Record that `run_id` ran: the bookmark advances to that run, keeping the run it
     /// followed as its `PreviousRunId`.
     ///
-    /// Called by the only thing that writes a bookmark, the START of a run — a bookmark
-    /// never moves because something was read.
+    /// Called by the only thing that writes a bookmark, the START of a run — whether a
+    /// caller started it or the job's retry policy owed it — so a bookmark never moves
+    /// because something was read, only because a further run of the job began.
     pub fn record_run(&mut self, run_id: &str, attempt: i32) {
         self.previous_run_id = self.run_id.take();
         self.run_id = Some(run_id.to_string());
@@ -8466,16 +8467,65 @@ impl JobEntry {
             .max(DEFAULT_MAX_CONCURRENT_RUNS)
     }
 
-    /// Give every run of this job the state the CLOCK already owed it at `now`.
+    /// Give every run of this job the state the CLOCK already owed it at `now`, and record
+    /// the retries those states left owed.
     ///
     /// This is the one write a reporting operation performs: a run's next state was due
     /// at [`JobRunEntry::settles_at`] whether or not anybody called, so materialising it
     /// on read reports the state the clock had already reached. It never moves a run
     /// because something was read.
+    ///
+    /// A retry is owed on exactly the same terms. "The maximum number of times to retry
+    /// this job after a JobRun fails" (`Job$MaxRetries`) is a policy of the JOB, so the
+    /// SERVICE — not the caller — runs the next attempt of a run that ended in the failure
+    /// state while the job still has retry budget: a further run of the same job under the
+    /// same configuration, carrying the next `Attempt` and naming the attempt it retries in
+    /// its `PreviousRunId` ([`JobRunEntry::retry`]). That attempt was due the instant the
+    /// failure was, so it is materialised here rather than slept for, and it is recorded
+    /// once: a run another attempt already retries is retried by nothing further, so two
+    /// reads of the same chain report the same runs.
     pub fn settle_due_runs(&mut self, now: SystemTime) {
-        for run in &mut self.runs {
-            run.settle_if_due(now);
+        // A retry can itself fail and be retried, so what the clock owes is materialised in
+        // passes: each settles the states that fell due and records at most one further
+        // attempt. The passes are bounded by the runs one job can hold
+        // ([`MAX_RUNS_PER_JOB`]), each pass but the last adding one.
+        for _ in 0..=MAX_RUNS_PER_JOB {
+            for run in &mut self.runs {
+                run.settle_if_due(now);
+            }
+            let Some(retry) = self.owed_retry() else {
+                return;
+            };
+            self.record_run(retry);
         }
+    }
+
+    /// The next attempt this job's stored runs leave owed, or `None` when they leave none.
+    ///
+    /// The run it retries is one that ended in the failure state — a run ended any other
+    /// way (a submitted stop) failed at nothing and is retried by nothing — whose `Attempt`
+    /// is still below the job's `MaxRetries`, so the chain one start begins is one original
+    /// attempt plus at most that many retries, and which no other run already names as the
+    /// attempt it retries, so a chain never forks.
+    ///
+    /// The attempt it answers is not in flight yet: it takes the slot the failed attempt
+    /// released, so materialising it can never put more runs in flight than
+    /// `ExecutionProperty$MaxConcurrentRuns` admitted starts.
+    fn owed_retry(&self) -> Option<JobRunEntry> {
+        if self.max_retries <= 0 {
+            return None;
+        }
+        let retried: BTreeSet<&str> = self
+            .runs
+            .iter()
+            .filter_map(|run| run.previous_run_id.as_deref())
+            .collect();
+        let failed = self.runs.iter().find(|run| {
+            run.state == JOB_RUN_STATE_FAILED
+                && run.attempt < self.max_retries
+                && !retried.contains(run.id.as_str())
+        })?;
+        Some(failed.retry(new_job_run_id()))
     }
 
     /// The stored run with this `Id`, or `None` when this job has no such run.
@@ -8501,9 +8551,10 @@ impl JobEntry {
     ///
     /// This is also where the job's BOOKMARK is written: a bookmark is the point a job
     /// resumes processing at, which a run is what establishes — so the first run of a job
-    /// gives it one ([`JobBookmarkState::record_run`]) and every later run advances it.
-    /// Nothing else writes it except a reset, so a bookmark never moves because something
-    /// was read.
+    /// gives it one ([`JobBookmarkState::record_run`]) and every later run advances it,
+    /// including an attempt the job's retry policy owed ([`JobEntry::owed_retry`]), which is
+    /// a further run of the job and not a re-read of an earlier one. Nothing else writes it
+    /// except a reset, so a bookmark never moves because something was read.
     pub fn record_run(&mut self, run: JobRunEntry) {
         self.bookmark
             .get_or_insert_with(JobBookmarkState::default)
@@ -8905,6 +8956,47 @@ impl JobRunEntry {
     /// Whether this run has finished, by [`TERMINAL_JOB_RUN_STATES`].
     pub fn is_terminal(&self) -> bool {
         TERMINAL_JOB_RUN_STATES.contains(&self.state.as_str())
+    }
+
+    /// The RETRY of this run: the next attempt of the same job, under the configuration
+    /// this attempt ran with, carrying one past this run's `Attempt` ("The number of the
+    /// attempt to run this job") and naming this run as the `PreviousRunId` it retries
+    /// ("The ID of the previous run of this job").
+    ///
+    /// It begins the instant this attempt FINISHED, because that is the instant the retry
+    /// became owed — taking it from the stored instant rather than from when somebody read
+    /// the chain is what makes two reads of the chain report the same runs — and like any
+    /// other run it owes its own terminal state one span later
+    /// ([`JOB_RUN_SETTLES_AFTER`]), so a caller walking the chain observes each attempt in
+    /// flight before the next one exists. Nothing has failed in the new attempt yet, so it
+    /// carries no `ErrorMessage` of its own and no completion instant.
+    ///
+    /// Scheduled by [`JobEntry::settle_due_runs`], which decides WHETHER an attempt is owed;
+    /// this builds the record of one. A retry of a run a TRIGGER began keeps that run's
+    /// `TriggerName`, because the attempt is of the work that firing initiated; the workflow
+    /// run that firing belongs to still reports the attempt IT recorded, since its actions
+    /// name the run ids they began.
+    fn retry(&self, id: String) -> Self {
+        let started_on = self.completed_on.unwrap_or(self.last_modified_on);
+        Self {
+            id,
+            attempt: self.attempt.saturating_add(1),
+            previous_run_id: Some(self.id.clone()),
+            started_on,
+            last_modified_on: started_on,
+            completed_on: None,
+            state: JOB_RUN_STATE_STARTING.to_string(),
+            settles_at: Some(
+                started_on
+                    .checked_add(JOB_RUN_SETTLES_AFTER)
+                    .unwrap_or(started_on),
+            ),
+            // Nothing executes the job script for this attempt either, so the state the
+            // clock owes it is the same modelled failure state.
+            settles_to: JOB_RUN_STATE_FAILED.to_string(),
+            error_message: None,
+            ..self.clone()
+        }
     }
 
     /// Move this run into the state the clock owed it at `now`, if it owed one.

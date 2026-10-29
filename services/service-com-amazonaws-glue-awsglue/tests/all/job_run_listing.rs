@@ -487,7 +487,10 @@ async fn a_retry_chain_is_listed_newest_first_with_each_link_intact() {
             "Name": name,
             "Role": ROLE_ARN,
             "Command": { "Name": "glueetl", "ScriptLocation": "s3://etl-scripts/etl.py" },
-            "MaxRetries": 2,
+            // No retry budget: the chain under test is the one these rows build with
+            // explicit `StartJobRun$JobRunId` starts, so the service owes the job no
+            // further attempts of its own (`Job$MaxRetries`, covered by
+            // `crate::job_run_retries`).
         }),
     )
     .await;

@@ -14,6 +14,13 @@
 //! state the clock owes is the modelled failure state carrying
 //! [`crate::state::JOB_RUN_NOT_EXECUTED_MESSAGE`] rather than a result nothing computed.
 //!
+//! A job whose `MaxRetries` is above zero then owes that failed attempt a RETRY, which the
+//! service runs rather than the caller: one start of such a job settles into its original
+//! attempt plus up to `MaxRetries` further runs, each carrying the next `Attempt` and
+//! naming the attempt it retries in its `PreviousRunId`. Those attempts are owed by the
+//! clock exactly as a run's terminal state is, so they are materialised by
+//! [`crate::state::JobEntry::settle_due_runs`] and nothing here sleeps for them.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
