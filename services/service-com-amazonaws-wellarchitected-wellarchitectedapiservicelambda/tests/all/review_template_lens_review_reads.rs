@@ -184,7 +184,7 @@ async fn repeated_reads_report_the_same_review_and_change_nothing() {
                 &template_arn,
                 read_by,
                 question_id,
-                answered(&["choice"], &[("choice", "SELECTED")], true, None),
+                answered(&[("choice", "SELECTED")], true, None),
             );
         }
 

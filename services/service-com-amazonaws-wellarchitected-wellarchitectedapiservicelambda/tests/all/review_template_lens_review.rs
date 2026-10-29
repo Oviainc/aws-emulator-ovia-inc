@@ -426,7 +426,7 @@ async fn the_lens_review_is_derived_from_the_lens_and_the_stored_answers() {
                 &template_arn,
                 FRAMEWORK_LENS,
                 question_id,
-                answered(&["choice"], &[("choice", "SELECTED")], true, None),
+                answered(&[("choice", "SELECTED")], true, None),
             );
         }
         recorded.extend(answers.iter().copied());

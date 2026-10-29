@@ -19,11 +19,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::{
-    self, AnswerRecord,
-};
+use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
 
-use super::workload_harness::{answered, review_template as template, Answer, Client};
+use super::workload_harness::{
+    answered, answered_over, framework_choice_ids, review_template as template, Answer, Client,
+};
 
 /// The published question numbering of the AWS Well-Architected Framework lens, pillar
 /// by pillar in the order the framework presents them: OPS 1-11, SEC 1-11, REL 1-13,
@@ -286,15 +286,36 @@ async fn every_question_of_the_applied_lens_is_reported_unanswered() {
     );
 }
 
-/// One row of the stored-answer table: the question an answer is recorded on, the answer
-/// as the store holds it, and the members the summary must then report for it.
+/// One row of the answer table: the question answered, and the status its answer records
+/// for each choice the question asks about — its WHOLE choice set, in the lens's own
+/// order, which is the key space those statuses live in. What the summary must report
+/// follows from them.
 struct AnswerCase {
     question_id: &'static str,
-    answer: AnswerRecord,
-    selected_choices: Value,
-    choice_answer_summaries: Value,
+    statuses: Vec<(String, &'static str)>,
     is_applicable: bool,
     reason: Option<&'static str>,
+}
+
+/// One case's per-choice statuses over a framework question's OWN choice set: the choices
+/// at the positions `named` carry the status named with them, and every other choice of
+/// the question carries `rest`.
+fn statuses_of(
+    question_id: &str,
+    named: &[(usize, &'static str)],
+    rest: &'static str,
+) -> Vec<(String, &'static str)> {
+    framework_choice_ids(question_id)
+        .into_iter()
+        .enumerate()
+        .map(|(position, choice_id)| {
+            let status = named
+                .iter()
+                .find(|(named_position, _)| *named_position == position)
+                .map_or(rest, |(_, status)| *status);
+            (choice_id, status)
+        })
+        .collect()
 }
 
 /// A stored answer is reported on ITS question, and only there; the template's own
@@ -307,42 +328,29 @@ async fn a_stored_answer_is_reported_on_its_question() {
     let cases: Vec<AnswerCase> = vec![
         AnswerCase {
             question_id: "ops-01",
-            answer: answered(&["bp-1"], &[("bp-1", "SELECTED")], true, None),
-            selected_choices: json!(["bp-1"]),
-            choice_answer_summaries: json!([{ "ChoiceId": "bp-1", "Status": "SELECTED" }]),
+            statuses: statuses_of("ops-01", &[(0, "SELECTED")], "UNSELECTED"),
             is_applicable: true,
             reason: None,
         },
         AnswerCase {
             question_id: "sec-04",
-            answer: answered(
-                &["bp-1", "bp-2"],
-                &[("bp-1", "SELECTED"), ("bp-2", "SELECTED"), ("bp-3", "UNSELECTED")],
-                true,
-                None,
+            statuses: statuses_of(
+                "sec-04",
+                &[(0, "SELECTED"), (1, "SELECTED")],
+                "UNSELECTED",
             ),
-            selected_choices: json!(["bp-1", "bp-2"]),
-            choice_answer_summaries: json!([
-                { "ChoiceId": "bp-1", "Status": "SELECTED" },
-                { "ChoiceId": "bp-2", "Status": "SELECTED" },
-                { "ChoiceId": "bp-3", "Status": "UNSELECTED" },
-            ]),
             is_applicable: true,
             reason: None,
         },
         AnswerCase {
             question_id: "rel-13",
-            answer: answered(&[], &[], false, Some("OUT_OF_SCOPE")),
-            selected_choices: json!([]),
-            choice_answer_summaries: json!([]),
+            statuses: statuses_of("rel-13", &[], "UNSELECTED"),
             is_applicable: false,
             reason: Some("OUT_OF_SCOPE"),
         },
         AnswerCase {
             question_id: "sus-06",
-            answer: answered(&["bp-9"], &[("bp-9", "NOT_APPLICABLE")], true, None),
-            selected_choices: json!(["bp-9"]),
-            choice_answer_summaries: json!([{ "ChoiceId": "bp-9", "Status": "NOT_APPLICABLE" }]),
+            statuses: statuses_of("sus-06", &[(0, "NOT_APPLICABLE")], "SELECTED"),
             is_applicable: true,
             reason: None,
         },
@@ -354,7 +362,33 @@ async fn a_stored_answer_is_reported_on_its_question() {
     let mut recorded = 0i64;
     for case in cases {
         let question_id = case.question_id;
-        client.record_template_answer(&template_arn, FRAMEWORK_LENS, question_id, case.answer);
+        // The choices in place are the ones recorded `SELECTED`, and the per-choice
+        // answers are one entry per choice of the question, in the lens's own order.
+        let selected: Vec<&str> = case
+            .statuses
+            .iter()
+            .filter(|(_, status)| *status == "SELECTED")
+            .map(|(choice_id, _)| choice_id.as_str())
+            .collect();
+        let selected_choices = Value::Array(
+            selected
+                .iter()
+                .map(|choice_id| json!(choice_id))
+                .collect::<Vec<Value>>(),
+        );
+        let choice_answer_summaries = Value::Array(
+            case.statuses
+                .iter()
+                .map(|(choice_id, status)| json!({ "ChoiceId": choice_id, "Status": status }))
+                .collect::<Vec<Value>>(),
+        );
+        let status_refs: Vec<(&str, &str)> = case
+            .statuses
+            .iter()
+            .map(|(choice_id, status)| (choice_id.as_str(), *status))
+            .collect();
+        let record = answered(&status_refs, case.is_applicable, case.reason);
+        client.record_template_answer(&template_arn, FRAMEWORK_LENS, question_id, record);
         recorded += 1;
 
         let (summaries, _) = collect_answers(
@@ -379,15 +413,14 @@ async fn a_stored_answer_is_reported_on_its_question() {
         );
         assert_eq!(
             summary.get("SelectedChoices"),
-            Some(&case.selected_choices),
-            "case {question_id:?}: expected SelectedChoices {:?}, got {summary:?}",
-            case.selected_choices
+            Some(&selected_choices),
+            "case {question_id:?}: expected SelectedChoices {selected_choices:?}, got {summary:?}"
         );
         assert_eq!(
             summary.get("ChoiceAnswerSummaries"),
-            Some(&case.choice_answer_summaries),
-            "case {question_id:?}: expected ChoiceAnswerSummaries {:?}, got {summary:?}",
-            case.choice_answer_summaries
+            Some(&choice_answer_summaries),
+            "case {question_id:?}: expected ChoiceAnswerSummaries \
+             {choice_answer_summaries:?}, got {summary:?}"
         );
         assert_eq!(
             summary.get("IsApplicable").and_then(Value::as_bool),
@@ -742,11 +775,17 @@ async fn an_applied_lens_resolves_by_either_name() {
 async fn listing_the_answers_writes_nothing() {
     let client = Client::new();
     let template_arn = template(&client, "report-template", &[FRAMEWORK_LENS]).await;
+    let answered_question_choices = framework_choice_ids("cost-05");
+    let in_place: Vec<&str> = answered_question_choices
+        .iter()
+        .take(1)
+        .map(String::as_str)
+        .collect();
     client.record_template_answer(
         &template_arn,
         FRAMEWORK_LENS,
         "cost-05",
-        answered(&["bp-1"], &[("bp-1", "SELECTED")], true, None),
+        answered_over(&answered_question_choices, &in_place, true, None),
     );
 
     let before = question_counts(&client, &template_arn).await;

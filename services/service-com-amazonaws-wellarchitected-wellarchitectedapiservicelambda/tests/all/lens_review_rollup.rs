@@ -24,7 +24,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::AnswerRecord;
 
 use super::workload_harness::{
-    answered, created_id, encode_path_segment, minimal_create, official_lens_arn, Answer, Client,
+    answered, created_id, encode_path_segment, framework_answer,
+    framework_answer_that_does_not_apply, minimal_create, official_lens_arn, Answer, Client,
+    InPlace,
 };
 
 /// The AWS Well-Architected Framework lens's pillars: the `PillarId` each is named by on
@@ -306,40 +308,35 @@ async fn an_answer_moves_the_counts_of_its_pillar_and_of_the_whole_review() {
             "no-best-practice-in-place",
             "reliability",
             "rel-01",
-            answered(&[], &[], true, None),
+            framework_answer("rel-01", InPlace::Nothing),
             "HIGH",
         ),
         (
             "a-best-practice-still-unselected",
             "security",
             "sec-02",
-            answered(
-                &["sec-02-c1"],
-                &[("sec-02-c1", "SELECTED"), ("sec-02-c2", "UNSELECTED")],
-                true,
-                None,
-            ),
+            framework_answer("sec-02", InPlace::AllButLast),
             "MEDIUM",
         ),
         (
             "every-best-practice-in-place",
             "operationalExcellence",
             "ops-03",
-            answered(&["ops-03-c1"], &[("ops-03-c1", "SELECTED")], true, None),
+            framework_answer("ops-03", InPlace::Every),
             "NONE",
         ),
         (
             "question-does-not-apply",
             "sustainability",
             "sus-06",
-            answered(&[], &[], false, Some("OUT_OF_SCOPE")),
+            framework_answer_that_does_not_apply("sus-06", "OUT_OF_SCOPE"),
             "NOT_APPLICABLE",
         ),
         (
             "second-answer-in-the-same-pillar",
             "reliability",
             "rel-02",
-            answered(&[], &[], true, None),
+            framework_answer("rel-02", InPlace::Nothing),
             "HIGH",
         ),
     ];
@@ -401,7 +398,7 @@ async fn every_spelling_of_the_lens_reaches_the_same_review() {
         &workload_id,
         FRAMEWORK_LENS,
         "cost-01",
-        answered(&[], &[], true, None),
+        answered(&[], true, None),
     );
 
     for (case, lens) in [
@@ -457,7 +454,7 @@ async fn a_milestone_scoped_read_reports_the_review_that_milestone_recorded() {
             &workload_id,
             FRAMEWORK_LENS,
             question_id,
-            answered(&[], &[], true, None),
+            answered(&[], true, None),
         );
         let number = i64::try_from(index + 1).unwrap_or(0);
         let recorded = create_milestone(
@@ -478,7 +475,7 @@ async fn a_milestone_scoped_read_reports_the_review_that_milestone_recorded() {
         &workload_id,
         FRAMEWORK_LENS,
         "sec-01",
-        answered(&[], &[], true, None),
+        answered(&[], true, None),
     );
 
     for number in 1..=i64::try_from(questions.len()).unwrap_or(0) {

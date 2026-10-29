@@ -269,8 +269,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .pillar_id
                         .as_deref()
                         .is_none_or(|pillar| pillar == question.pillar_id)
-                    && improvement_risk(workload.answer(&input.lens_alias, &question.question_id))
-                        .is_some()
+                    && improvement_risk(
+                        question,
+                        workload.answer(&input.lens_alias, &question.question_id),
+                    )
+                    .is_some()
             },
             resume_after.as_deref(),
             page_size,
@@ -281,8 +284,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .questions
             .iter()
             .filter_map(|question| {
-                let risk =
-                    improvement_risk(workload.answer(&input.lens_alias, &question.question_id))?;
+                let risk = improvement_risk(
+                    question,
+                    workload.answer(&input.lens_alias, &question.question_id),
+                )?;
                 Some(improvement_summary(
                     question,
                     risk,
@@ -321,8 +326,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// out is rated `NONE`, one the workload says does not apply is `NOT_APPLICABLE`, and one
 /// with no stored answer is `UNANSWERED` — none of the three is a risk the review
 /// identified in the workload, so none of them is an improvement item.
-fn improvement_risk(answer: Option<&crate::state::AnswerRecord>) -> Option<&'static str> {
-    let risk = answer?.risk();
+///
+/// The risk is of the QUESTION, so it is derived against the question's own choice set
+/// (`crate::state::AnswerRecord::risk`), which is what the review's lens version asks
+/// about.
+fn improvement_risk(
+    question: &crate::state::ReviewQuestion,
+    answer: Option<&crate::state::AnswerRecord>,
+) -> Option<&'static str> {
+    let risk = answer?.risk(question);
     matches!(risk, crate::state::RISK_HIGH | crate::state::RISK_MEDIUM).then_some(risk)
 }
 

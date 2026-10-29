@@ -27,7 +27,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Value};
 
 use super::workload_harness::{
-    answered, created_id, encode_path_segment, minimal_create, official_lens_arn, Answer, Client,
+    answered_over, created_id, encode_path_segment, minimal_create, official_lens_arn, Answer,
+    Client,
 };
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
@@ -101,6 +102,18 @@ const QUESTION_ID_LENGTH: (usize, usize) = (1, 128);
 /// The `Risk` bucket a question with no stored answer counts under
 /// (`smithy_query(query="shape", shape="Risk")`).
 const UNANSWERED: &str = "UNANSWERED";
+
+/// Which of a question's best practices an answer records as in place, out of the
+/// question's OWN choice set: the plans span the risk an applicable answer is rated at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Selection {
+    /// None of them, so no best practice is in place.
+    Nothing,
+    /// All but the last, so one best practice is still unselected.
+    AllButLast,
+    /// Every one of them, so nothing is left unselected.
+    Every,
+}
 
 fn member(value: &Value, name: &str) -> String {
     value
@@ -632,15 +645,21 @@ async fn an_answer_recorded_against_a_specialised_lens_moves_its_roll_up() {
     let answered_lens = "serverless";
     let untouched_lens = "iot";
 
-    let cases: [(&str, bool, bool, &str); 4] = [
-        // (case, select the best practices, every choice selected, the risk that rates)
-        ("no-best-practice-selected", false, false, "HIGH"),
-        ("some-choice-unselected", true, false, "MEDIUM"),
-        ("nothing-left-unselected", true, true, "NONE"),
-        ("not-applicable", true, true, "NOT_APPLICABLE"),
+    let cases: [(&str, Selection, bool, &str); 4] = [
+        // (case, which of the question's best practices are in place, whether the question
+        // applies, the risk that rates)
+        ("no-best-practice-selected", Selection::Nothing, true, "HIGH"),
+        (
+            "some-choice-unselected",
+            Selection::AllButLast,
+            true,
+            "MEDIUM",
+        ),
+        ("nothing-left-unselected", Selection::Every, true, "NONE"),
+        ("not-applicable", Selection::Every, false, "NOT_APPLICABLE"),
     ];
 
-    for (case, select, all_selected, risk) in cases {
+    for (case, selection, is_applicable, risk) in cases {
         let client = Client::new();
         let mut request = minimal_create(&format!("rollup-{case}"), &format!("tok-rollup-{case}"));
         request["Lenses"] = json!([answered_lens, untouched_lens]);
@@ -662,29 +681,28 @@ async fn an_answer_recorded_against_a_specialised_lens_moves_its_roll_up() {
             .iter()
             .map(|choice| member(choice, "ChoiceId"))
             .collect();
+        assert!(
+            choices.len() > 1,
+            "case {case:?}: the question under test must offer more than one best \
+             practice, so leaving one out differs from leaving none out, got {choices:?}"
+        );
 
-        let selected: Vec<&str> = if select {
-            choices.iter().map(String::as_str).collect()
-        } else {
-            Vec::new()
+        // The best practices in place, out of the question's OWN choice set: every other
+        // choice of the question is left unselected, which is what rates the answer.
+        let selected: Vec<&str> = match selection {
+            Selection::Nothing => Vec::new(),
+            Selection::AllButLast => choices
+                .iter()
+                .take(choices.len().saturating_sub(1))
+                .map(String::as_str)
+                .collect(),
+            Selection::Every => choices.iter().map(String::as_str).collect(),
         };
-        let statuses: Vec<(&str, &str)> = choices
-            .iter()
-            .enumerate()
-            .map(|(index, choice_id)| {
-                let status = if all_selected || index == 0 {
-                    "SELECTED"
-                } else {
-                    "UNSELECTED"
-                };
-                (choice_id.as_str(), status)
-            })
-            .collect();
         client.record_answer(
             &workload_id,
             answered_lens,
             &question_id,
-            answered(&selected, &statuses, risk != "NOT_APPLICABLE", None),
+            answered_over(&choices, &selected, is_applicable, None),
         );
 
         let before_total = i64::try_from(answers.len()).unwrap_or(-1);

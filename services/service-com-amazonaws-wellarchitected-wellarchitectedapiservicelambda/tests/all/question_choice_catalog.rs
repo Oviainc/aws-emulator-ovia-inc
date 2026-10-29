@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Value};
 
 use super::workload_harness::{
-    answered, created_id, encode_path_segment, minimal_create, Answer, Client,
+    answered_over, created_id, encode_path_segment, minimal_create, Answer, Client,
 };
 
 /// The alias of the one lens this emulator ships a question set — and therefore a choice
@@ -48,14 +48,11 @@ type Catalog = Vec<(String, String)>;
 /// The catalog of every question one read reported, keyed by `QuestionId`.
 type Catalogs = BTreeMap<String, Catalog>;
 
-/// One row of the answer table: the case name, the `ChoiceId`s the answer selects, the
-/// status recorded for each choice it speaks about, and the `Risk` that answer carries.
-type AnswerRow = (
-    &'static str,
-    Vec<String>,
-    Vec<(String, String)>,
-    &'static str,
-);
+/// One row of the answer table: the case name, the `ChoiceId`s the answer records as in
+/// place, and the `Risk` that answer carries. The status of every choice of the question
+/// follows from the first: the choices named are `SELECTED` and every other choice of the
+/// question `UNSELECTED`, which is the key space those statuses live in.
+type AnswerRow = (&'static str, Vec<String>, &'static str);
 
 /// `GET /workloads/{WorkloadId}/lensReviews/{LensAlias}/answers`. The query members
 /// arrive owned, so the future this builds borrows nothing from its caller's page loop.
@@ -401,48 +398,34 @@ async fn a_discovered_choice_id_round_trips_through_the_stored_answer() {
         let last = ids.last().cloned().expect("a non-empty catalog");
 
         let rows: Vec<AnswerRow> = vec![
-            (
-                "first-choice-only",
-                vec![ids[0].clone()],
-                vec![
-                    (ids[0].clone(), SELECTED.to_string()),
-                    (last.clone(), UNSELECTED.to_string()),
-                ],
-                "MEDIUM",
-            ),
-            (
-                "last-choice-only",
-                vec![last.clone()],
-                vec![
-                    (last.clone(), SELECTED.to_string()),
-                    (ids[0].clone(), UNSELECTED.to_string()),
-                ],
-                "MEDIUM",
-            ),
-            (
-                "every-choice",
-                ids.clone(),
-                ids.iter()
-                    .map(|id| (id.clone(), SELECTED.to_string()))
-                    .collect(),
-                "NONE",
-            ),
-            ("no-choice", Vec::new(), Vec::new(), "HIGH"),
+            ("first-choice-only", vec![ids[0].clone()], "MEDIUM"),
+            ("last-choice-only", vec![last.clone()], "MEDIUM"),
+            ("every-choice", ids.clone(), "NONE"),
+            ("no-choice", Vec::new(), "HIGH"),
         ];
 
-        for (row, selected, choice_answers, expected_risk) in rows {
+        for (row, selected, expected_risk) in rows {
             let case = format!("{question_id}/{row}");
             let selected_refs: Vec<&str> = selected.iter().map(String::as_str).collect();
-            let choice_refs: Vec<(&str, &str)> = choice_answers
-                .iter()
-                .map(|(id, status)| (id.as_str(), status.as_str()))
-                .collect();
             client.record_answer(
                 &workload_id,
                 FRAMEWORK_LENS,
                 question_id,
-                answered(&selected_refs, &choice_refs, true, None),
+                answered_over(&ids, &selected_refs, true, None),
             );
+            // What the read must report for every choice of the question: the ids the
+            // answer named are in place and the rest are not.
+            let choice_answers: Vec<(String, String)> = ids
+                .iter()
+                .map(|choice_id| {
+                    let status = if selected.contains(choice_id) {
+                        SELECTED
+                    } else {
+                        UNSELECTED
+                    };
+                    (choice_id.clone(), status.to_string())
+                })
+                .collect();
 
             let summaries = collect_summaries(&case, &[], Some(50), |query| {
                 list_answers(&client, &workload_id, FRAMEWORK_LENS, query)

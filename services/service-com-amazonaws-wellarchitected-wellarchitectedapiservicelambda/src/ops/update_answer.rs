@@ -315,11 +315,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 answer.notes = Some(notes);
             }
 
-            // The selected choices of an answer ARE the choices it records `SELECTED` for,
-            // so the two members a client reads back agree whichever of them the request
-            // wrote through.
-            answer.resolve_selected_choices(&question);
-
             // Answering a question changes the workload's review, which is what a workload
             // read and its lens reviews report as the instant they were last updated.
             workload.updated_at = ::std::time::SystemTime::now();

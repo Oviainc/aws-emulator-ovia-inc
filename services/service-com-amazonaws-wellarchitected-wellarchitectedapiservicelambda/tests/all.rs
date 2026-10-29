@@ -436,3 +436,8 @@ mod workload_pillar_order;
 // here so a new suite does not collide with another insertion.
 #[path = "all/workload_path_id_resolution.rs"]
 mod workload_path_id_resolution;
+
+// Declared last for the same reason as the declarations above: modules are appended here so
+// a new suite does not collide with another insertion.
+#[path = "all/answer_choice_set_changes.rs"]
+mod answer_choice_set_changes;

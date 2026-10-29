@@ -66,10 +66,11 @@ const FRAMEWORK_PILLAR_QUESTIONS: [(&str, usize); 6] = [
 const ANSWERED: &str = "ANSWERED";
 const UNANSWERED: &str = "UNANSWERED";
 
-/// Two of the `ChoiceStatus` values, from
+/// Three of the `ChoiceStatus` values, from
 /// `smithy_query(query="shape", shape="ChoiceStatus")` (`SELECTED` | `NOT_APPLICABLE` |
 /// `UNSELECTED`).
 const SELECTED: &str = "SELECTED";
+const UNSELECTED: &str = "UNSELECTED";
 const NOT_APPLICABLE: &str = "NOT_APPLICABLE";
 
 /// One of the `AnswerReason` values, from
@@ -129,14 +130,20 @@ fn recorded_answer(state: Recorded, offered: &[String]) -> (Option<AnswerRecord>
         Recorded::EveryChoice => offered.to_vec(),
     };
     let choice_statuses: BTreeMap<String, String> = match state {
-        Recorded::Nothing | Recorded::NoChoice => BTreeMap::new(),
-        Recorded::FirstChoice => offered[..1]
+        // The key space an answer's per-choice statuses live in is the question's own
+        // choice set, so every state that records an answer records one status per choice
+        // the question offers — a best practice is not in place until an answer says it is.
+        Recorded::Nothing => BTreeMap::new(),
+        Recorded::NoChoice | Recorded::FirstChoice | Recorded::EveryChoice => offered
             .iter()
-            .map(|choice_id| (choice_id.clone(), SELECTED.to_string()))
-            .collect(),
-        Recorded::EveryChoice => offered
-            .iter()
-            .map(|choice_id| (choice_id.clone(), SELECTED.to_string()))
+            .map(|choice_id| {
+                let status = if selected.contains(choice_id) {
+                    SELECTED
+                } else {
+                    UNSELECTED
+                };
+                (choice_id.clone(), status.to_string())
+            })
             .collect(),
         Recorded::NotApplicable => offered
             .iter()
@@ -164,17 +171,11 @@ fn recorded_answer(state: Recorded, offered: &[String]) -> (Option<AnswerRecord>
     let record = if state == Recorded::Nothing {
         None
     } else {
-        let selected_choices: Vec<&str> = selected.iter().map(String::as_str).collect();
         let choice_answers: Vec<(&str, &str)> = choice_statuses
             .iter()
             .map(|(choice_id, status)| (choice_id.as_str(), status.as_str()))
             .collect();
-        Some(answered(
-            &selected_choices,
-            &choice_answers,
-            is_applicable,
-            reason,
-        ))
+        Some(answered(&choice_answers, is_applicable, reason))
     };
     (record, expected)
 }

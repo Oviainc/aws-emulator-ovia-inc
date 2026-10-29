@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::{
     AnswerRecord, ChoiceAnswerRecord,
 };
@@ -698,19 +699,18 @@ pub(crate) async fn review_template(client: &Client, name: &str, lenses: &[&str]
         .to_string()
 }
 
-/// An `AnswerRecord` that records `selected` as the best practices in place, `choices` as
-/// the status of each choice it speaks about, whether the question applies and the reason
-/// it does not — the one answer builder the suites in this crate share. The answer's own
+/// An `AnswerRecord` that records `choices` as the status of each choice it speaks about,
+/// whether the question applies and the reason it does not — the one answer builder the
+/// suites in this crate share. An answer's `SelectedChoices` is DERIVED from those statuses
+/// on every read, so a seeded answer records no separate list of them; the answer's own
 /// notes and each choice's notes are what `UpdateAnswer` / `UpdateReviewTemplateAnswer`
 /// write over the wire, so a seeded answer carries none.
 pub(crate) fn answered(
-    selected: &[&str],
     choices: &[(&str, &str)],
     is_applicable: bool,
     reason: Option<&str>,
 ) -> AnswerRecord {
     AnswerRecord {
-        selected_choices: selected.iter().map(ToString::to_string).collect(),
         choice_answers: choices
             .iter()
             .map(|(choice_id, status)| {
@@ -728,6 +728,113 @@ pub(crate) fn answered(
         reason: reason.map(ToString::to_string),
         notes: None,
     }
+}
+
+/// An `AnswerRecord` that records `selected` as the best practices in place out of
+/// `choices` — the question's WHOLE choice set — and every other choice of the question
+/// as `UNSELECTED`.
+///
+/// The key space an answer's per-choice statuses live in is the question's own choice set,
+/// which is what `UpdateAnswer` / `UpdateReviewTemplateAnswer` record an answer over
+/// ("the values entered replace the previously selected choices", the `SelectedChoices`
+/// doc), so a seeded answer speaks about the same choices a written one would.
+pub(crate) fn answered_over(
+    choices: &[String],
+    selected: &[&str],
+    is_applicable: bool,
+    reason: Option<&str>,
+) -> AnswerRecord {
+    let statuses: Vec<(&str, &str)> = choices
+        .iter()
+        .map(|choice_id| {
+            let status = if selected.contains(&choice_id.as_str()) {
+                state::CHOICE_STATUS_SELECTED
+            } else {
+                state::CHOICE_STATUS_UNSELECTED
+            };
+            (choice_id.as_str(), status)
+        })
+        .collect();
+    answered(&statuses, is_applicable, reason)
+}
+
+/// Every `ChoiceId` one question of the AWS-official framework lens offers, in the lens's
+/// own order, from the catalog that lens's content IS
+/// (`state::FRAMEWORK_LENS_QUESTIONS`).
+///
+/// A seeded answer has to speak about the question's OWN choices, and a suite about some
+/// other read should not have to restate the framework's published best-practice count per
+/// question to seed one; `super::question_choice_catalog` is the suite that pins the ids
+/// and the catalog itself over the wire.
+pub(crate) fn framework_choice_ids(question_id: &str) -> Vec<String> {
+    let question = state::FRAMEWORK_LENS_QUESTIONS
+        .iter()
+        .find(|question| question.question_id == question_id)
+        .unwrap_or_else(|| panic!("the framework lens must ask {question_id:?}"));
+    (0..question.best_practices.len())
+        .map(|position| question.choice_id(position))
+        .collect()
+}
+
+/// Which of a question's best practices a seeded answer records as in place. The plans
+/// span the `Risk` the service derives from an applicable answer, and each is stated over
+/// the question's OWN choice set rather than a fixed number of choices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InPlace {
+    /// Every best practice the question asks about: nothing is left unselected, so the
+    /// question is rated `NONE`.
+    Every,
+    /// None of them: no best practice is in place, so the question is rated `HIGH`.
+    Nothing,
+    /// All but the last: one best practice is still unselected, so the question is rated
+    /// `MEDIUM` (for a question offering more than one choice).
+    AllButLast,
+    /// All but the last, which is recorded `NOT_APPLICABLE` rather than unselected:
+    /// nothing is left unselected, so the question is rated `NONE`.
+    AllButLastWhichDoesNotApply,
+}
+
+/// A seeded answer to one question of the framework lens that records `in_place` out of
+/// that question's own choices ([`framework_choice_ids`]), with the question applying.
+pub(crate) fn framework_answer(question_id: &str, in_place: InPlace) -> AnswerRecord {
+    let choices = framework_choice_ids(question_id);
+    let ids: Vec<&str> = choices.iter().map(String::as_str).collect();
+    let all_but_last: Vec<&str> = ids
+        .iter()
+        .take(ids.len().saturating_sub(1))
+        .copied()
+        .collect();
+    match in_place {
+        InPlace::Every => answered_over(&choices, &ids, true, None),
+        InPlace::Nothing => answered_over(&choices, &[], true, None),
+        InPlace::AllButLast => answered_over(&choices, &all_but_last, true, None),
+        InPlace::AllButLastWhichDoesNotApply => {
+            let statuses: Vec<(&str, &str)> = ids
+                .iter()
+                .map(|choice_id| {
+                    let status = if all_but_last.contains(choice_id) {
+                        state::CHOICE_STATUS_SELECTED
+                    } else {
+                        "NOT_APPLICABLE"
+                    };
+                    (*choice_id, status)
+                })
+                .collect();
+            answered(&statuses, true, None)
+        }
+    }
+}
+
+/// A seeded answer that says one question of the framework lens does NOT apply to the
+/// reviewed resource, for the `AnswerReason` given: the question is rated
+/// `NOT_APPLICABLE` whatever its choices record.
+pub(crate) fn framework_answer_that_does_not_apply(question_id: &str, reason: &str) -> AnswerRecord {
+    answered_over(
+        &framework_choice_ids(question_id),
+        &[],
+        false,
+        Some(reason),
+    )
 }
 
 /// The ARN an AWS-OFFICIAL lens carries: "the lens ARN, such as

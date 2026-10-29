@@ -213,7 +213,7 @@ async fn deleting_a_review_template_drops_it_and_everything_it_holds() {
                 &arn,
                 FRAMEWORK_LENS,
                 question_id,
-                answered(&["bp-1"], &[("bp-1", "SELECTED")], true, None),
+                answered(&[("bp-1", "SELECTED")], true, None),
             );
         }
 

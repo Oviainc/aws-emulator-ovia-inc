@@ -26,8 +26,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::AnswerRecord;
 
 use super::workload_harness::{
-    answered, created_id, encode_path_segment, minimal_create, official_lens_arn, stored_workload,
-    Answer, Client,
+    created_id, encode_path_segment, framework_answer, framework_answer_that_does_not_apply,
+    framework_choice_ids, minimal_create, official_lens_arn, stored_workload, Answer, Client,
+    InPlace,
 };
 
 /// The AWS Well-Architected Framework lens's pillars: the `PillarId` each is named by on
@@ -226,41 +227,25 @@ async fn framework_workload(client: &Client, name: &str) -> String {
 
 /// One of the four ratings an answered question can carry, chosen by `index` so a seeded
 /// question set mixes all of them: the record to store and the `Risk` it is rated at.
-fn spread_answer(index: usize) -> (AnswerRecord, &'static str) {
+fn spread_answer(question_id: &str, index: usize) -> (AnswerRecord, &'static str) {
     match index % 4 {
         // Nothing left out: no risk.
-        0 => (
-            answered(
-                &["bp-1", "bp-2"],
-                &[("bp-1", "SELECTED"), ("bp-2", "SELECTED")],
-                true,
-                None,
-            ),
-            "NONE",
-        ),
+        0 => (framework_answer(question_id, InPlace::Every), "NONE"),
         // No best practice in place at all.
-        1 => (
-            answered(
-                &[],
-                &[("bp-1", "UNSELECTED"), ("bp-2", "UNSELECTED")],
-                true,
-                None,
-            ),
-            "HIGH",
-        ),
-        // Some in place, one still out.
-        2 => (
-            answered(
-                &["bp-1"],
-                &[("bp-1", "SELECTED"), ("bp-2", "UNSELECTED")],
-                true,
-                None,
-            ),
-            "MEDIUM",
-        ),
+        1 => (framework_answer(question_id, InPlace::Nothing), "HIGH"),
+        // Some in place, one still out — unless the question offers a single best
+        // practice, where "all but the last" leaves nothing in place at all.
+        2 => {
+            let risk = if framework_choice_ids(question_id).len() > 1 {
+                "MEDIUM"
+            } else {
+                "HIGH"
+            };
+            (framework_answer(question_id, InPlace::AllButLast), risk)
+        }
         // The question does not apply to this workload.
         _ => (
-            answered(&[], &[("bp-1", "NOT_APPLICABLE")], false, Some("OUT_OF_SCOPE")),
+            framework_answer_that_does_not_apply(question_id, "OUT_OF_SCOPE"),
             "NOT_APPLICABLE",
         ),
     }
@@ -287,7 +272,7 @@ async fn workload_with_spread_answers(
 fn seed_spread_answers(client: &Client, workload_id: &str) -> Vec<(String, String, String)> {
     let mut seeded: Vec<(String, String, String)> = Vec::new();
     for (index, (pillar, question_id)) in catalog().into_iter().enumerate() {
-        let (record, risk) = spread_answer(index);
+        let (record, risk) = spread_answer(&question_id, index);
         client.record_answer(workload_id, FRAMEWORK_LENS, &question_id, record);
         seeded.push((pillar, question_id, risk.to_string()));
     }
@@ -321,55 +306,36 @@ async fn only_identified_risks_appear_in_the_improvement_plan() {
         Rated {
             case: "nothing-in-place",
             question_id: "ops-02",
-            record: Some(answered(
-                &[],
-                &[("bp-1", "UNSELECTED"), ("bp-2", "UNSELECTED")],
-                true,
-                None,
-            )),
+            record: Some(framework_answer("ops-02", InPlace::Nothing)),
             plan_risk: Some("HIGH"),
         },
         Rated {
             case: "one-best-practice-missing",
             question_id: "sec-03",
-            record: Some(answered(
-                &["bp-1"],
-                &[("bp-1", "SELECTED"), ("bp-2", "UNSELECTED")],
-                true,
-                None,
-            )),
+            record: Some(framework_answer("sec-03", InPlace::AllButLast)),
             plan_risk: Some("MEDIUM"),
         },
         Rated {
             case: "every-best-practice-in-place",
             question_id: "rel-04",
-            record: Some(answered(
-                &["bp-1", "bp-2"],
-                &[("bp-1", "SELECTED"), ("bp-2", "SELECTED")],
-                true,
-                None,
-            )),
+            record: Some(framework_answer("rel-04", InPlace::Every)),
             plan_risk: None,
         },
         Rated {
             case: "unselected-choice-does-not-apply",
             question_id: "perf-02",
-            record: Some(answered(
-                &["bp-1"],
-                &[("bp-1", "SELECTED"), ("bp-2", "NOT_APPLICABLE")],
-                true,
-                None,
+            record: Some(framework_answer(
+                "perf-02",
+                InPlace::AllButLastWhichDoesNotApply,
             )),
             plan_risk: None,
         },
         Rated {
             case: "question-does-not-apply",
             question_id: "cost-06",
-            record: Some(answered(
-                &[],
-                &[("bp-1", "NOT_APPLICABLE")],
-                false,
-                Some("OUT_OF_SCOPE"),
+            record: Some(framework_answer_that_does_not_apply(
+                "cost-06",
+                "OUT_OF_SCOPE",
             )),
             plan_risk: None,
         },
@@ -714,7 +680,8 @@ async fn paging_enumerates_every_improvement_exactly_once() {
     // Every question answered at an identified risk, so the plan is the whole question
     // set: HIGH where nothing is in place, MEDIUM where something still is not.
     for (index, (_, question_id)) in catalog().into_iter().enumerate() {
-        let (record, risk) = spread_answer(if index % 2 == 0 { 1 } else { 2 });
+        let (record, risk) =
+            spread_answer(&question_id, if index % 2 == 0 { 1 } else { 2 });
         assert!(
             is_identified_risk(risk),
             "case {question_id:?}: the seed must leave an identified risk, got {risk}"
@@ -995,7 +962,7 @@ async fn a_milestone_freezes_the_improvement_plan_it_recorded() {
         &workload_id,
         FRAMEWORK_LENS,
         "rel-01",
-        answered(&[], &[("bp-1", "UNSELECTED")], true, None),
+        framework_answer("rel-01", InPlace::Nothing),
     );
     let recorded = client
         .send(
@@ -1018,18 +985,13 @@ async fn a_milestone_freezes_the_improvement_plan_it_recorded() {
         &workload_id,
         FRAMEWORK_LENS,
         "rel-01",
-        answered(&["bp-1"], &[("bp-1", "SELECTED")], true, None),
+        framework_answer("rel-01", InPlace::Every),
     );
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
         "cost-02",
-        answered(
-            &["bp-1"],
-            &[("bp-1", "SELECTED"), ("bp-2", "UNSELECTED")],
-            true,
-            None,
-        ),
+        framework_answer("cost-02", InPlace::AllButLast),
     );
 
     for (case, filters, expected) in [

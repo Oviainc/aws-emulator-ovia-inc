@@ -284,19 +284,18 @@ fn answer_summary(
         choices: Some(question.choices()),
         selected_choices: Some(
             answer
-                .map(|answer| answer.selected_choices.clone())
+                .map(|answer| answer.selected_choices_of(question))
                 .unwrap_or_default(),
         ),
         choice_answer_summaries: Some(
             answer
                 .map(|answer| {
                     answer
-                        .choice_answers
-                        .iter()
-                        .map(|(choice_id, choice)| ChoiceAnswerSummary {
-                            choice_id: Some(choice_id.clone()),
-                            status: Some(choice.status.clone()),
-                            reason: choice.reason.clone(),
+                        .reported_choice_answers(question)
+                        .map(|choice| ChoiceAnswerSummary {
+                            choice_id: Some(choice.choice_id.to_string()),
+                            status: Some(choice.status.to_string()),
+                            reason: choice.reason.map(str::to_string),
                         })
                         .collect()
                 })

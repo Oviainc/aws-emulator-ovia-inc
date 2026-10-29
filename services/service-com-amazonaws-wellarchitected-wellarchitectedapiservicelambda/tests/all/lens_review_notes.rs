@@ -733,7 +733,7 @@ async fn writing_notes_leaves_the_derived_members_alone() {
         &workload_id,
         FRAMEWORK_LENS,
         "rel-01",
-        answered(&[], &[], true, None),
+        answered(&[], true, None),
     );
 
     let before = get_lens_review(&client, &workload_id, FRAMEWORK_LENS, None).await;

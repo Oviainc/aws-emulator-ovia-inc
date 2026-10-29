@@ -19,10 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::AnswerRecord;
-
 use super::workload_harness::{
-    answered, created_id, minimal_create, official_lens_arn, Answer, Client,
+    answered, answered_over, created_id, framework_choice_ids, minimal_create, official_lens_arn,
+    Answer, Client,
 };
 
 /// The published question numbering of the AWS Well-Architected Framework lens, pillar
@@ -649,15 +648,15 @@ async fn a_review_that_does_not_exist_is_a_not_found() {
     );
 }
 
-/// One row of the rating table: an answer, and the summary the read must report for it.
+/// One row of the rating table: the status an answer records for each choice of the
+/// question — its WHOLE choice set, in the lens's own order, which is the key space those
+/// statuses live in — and the summary the read must report for it.
 struct RatedAnswer {
     case: &'static str,
-    record: AnswerRecord,
-    risk: &'static str,
-    selected: Value,
-    choice_answers: Value,
+    statuses: Vec<(String, &'static str)>,
     is_applicable: bool,
     reason: Option<&'static str>,
+    risk: &'static str,
 }
 
 /// A stored answer is what the summary reports, and the question's `Risk` is DERIVED
@@ -667,99 +666,106 @@ struct RatedAnswer {
 /// roll-up, so the rows check both. Rows differ along what the answer records.
 #[tokio::test]
 async fn a_stored_answer_is_reported_and_rated() {
-    // The question answered is the same in every row; what varies is the answer.
+    // The question answered is the same in every row; what varies is the answer. Its
+    // choices are the question's own, so a row records a status for each of them.
     const QUESTION: &str = "sec-01";
+    let choices = framework_choice_ids(QUESTION);
+    let last = choices
+        .last()
+        .cloned()
+        .expect("the question under test offers choices");
+
+    // One status per choice of the question, from a plan that says which of them carry
+    // something other than `SELECTED`.
+    let statuses = |other: &[(&str, &'static str)]| -> Vec<(String, &'static str)> {
+        choices
+            .iter()
+            .map(|choice_id| {
+                let status = other
+                    .iter()
+                    .find(|(named, _)| *named == choice_id.as_str())
+                    .map_or("SELECTED", |(_, status)| *status);
+                (choice_id.clone(), status)
+            })
+            .collect()
+    };
+    let every_choice_unselected: Vec<(&str, &'static str)> = choices
+        .iter()
+        .map(|choice_id| (choice_id.as_str(), "UNSELECTED"))
+        .collect();
 
     let cases: Vec<RatedAnswer> = vec![
         RatedAnswer {
             case: "every-best-practice-in-place",
-            record: answered(
-                &["bp-1", "bp-2"],
-                &[("bp-1", "SELECTED"), ("bp-2", "SELECTED")],
-                true,
-                None,
-            ),
-            risk: "NONE",
-            selected: json!(["bp-1", "bp-2"]),
-            choice_answers: json!([
-                {"ChoiceId": "bp-1", "Status": "SELECTED"},
-                {"ChoiceId": "bp-2", "Status": "SELECTED"},
-            ]),
+            statuses: statuses(&[]),
             is_applicable: true,
             reason: None,
+            risk: "NONE",
         },
         RatedAnswer {
             case: "one-best-practice-missing",
-            record: answered(
-                &["bp-1"],
-                &[("bp-1", "SELECTED"), ("bp-2", "UNSELECTED")],
-                true,
-                None,
-            ),
-            risk: "MEDIUM",
-            selected: json!(["bp-1"]),
-            choice_answers: json!([
-                {"ChoiceId": "bp-1", "Status": "SELECTED"},
-                {"ChoiceId": "bp-2", "Status": "UNSELECTED"},
-            ]),
+            statuses: statuses(&[(last.as_str(), "UNSELECTED")]),
             is_applicable: true,
             reason: None,
+            risk: "MEDIUM",
         },
         RatedAnswer {
             case: "nothing-in-place",
-            record: answered(
-                &[],
-                &[("bp-1", "UNSELECTED"), ("bp-2", "UNSELECTED")],
-                true,
-                None,
-            ),
-            risk: "HIGH",
-            selected: json!([]),
-            choice_answers: json!([
-                {"ChoiceId": "bp-1", "Status": "UNSELECTED"},
-                {"ChoiceId": "bp-2", "Status": "UNSELECTED"},
-            ]),
+            statuses: statuses(&every_choice_unselected),
             is_applicable: true,
             reason: None,
+            risk: "HIGH",
         },
         RatedAnswer {
             case: "unselected-choice-does-not-apply",
-            record: answered(
-                &["bp-1"],
-                &[("bp-1", "SELECTED"), ("bp-2", "NOT_APPLICABLE")],
-                true,
-                None,
-            ),
-            risk: "NONE",
-            selected: json!(["bp-1"]),
-            choice_answers: json!([
-                {"ChoiceId": "bp-1", "Status": "SELECTED"},
-                {"ChoiceId": "bp-2", "Status": "NOT_APPLICABLE"},
-            ]),
+            statuses: statuses(&[(last.as_str(), "NOT_APPLICABLE")]),
             is_applicable: true,
             reason: None,
+            risk: "NONE",
         },
         RatedAnswer {
             case: "question-does-not-apply",
-            record: answered(&[], &[("bp-1", "NOT_APPLICABLE")], false, Some("OUT_OF_SCOPE")),
-            risk: "NOT_APPLICABLE",
-            selected: json!([]),
-            choice_answers: json!([{"ChoiceId": "bp-1", "Status": "NOT_APPLICABLE"}]),
+            statuses: statuses(&every_choice_unselected),
             is_applicable: false,
             reason: Some("OUT_OF_SCOPE"),
+            risk: "NOT_APPLICABLE",
         },
     ];
 
     for row in cases {
         let RatedAnswer {
             case,
-            record,
-            risk,
-            selected,
-            choice_answers,
+            statuses,
             is_applicable,
             reason,
+            risk,
         } = row;
+        // What the read must report follows from the statuses the answer records: the
+        // choices in place are the ones recorded `SELECTED`, and the per-choice answers
+        // are one entry per choice of the question, in the lens's own choice order.
+        let selected: Vec<&str> = statuses
+            .iter()
+            .filter(|(_, status)| *status == "SELECTED")
+            .map(|(choice_id, _)| choice_id.as_str())
+            .collect();
+        let expected_selected = Value::Array(
+            selected
+                .iter()
+                .map(|choice_id| json!(choice_id))
+                .collect::<Vec<Value>>(),
+        );
+        let expected_choice_answers = Value::Array(
+            statuses
+                .iter()
+                .map(|(choice_id, status)| json!({ "ChoiceId": choice_id, "Status": status }))
+                .collect::<Vec<Value>>(),
+        );
+        let status_refs: Vec<(&str, &str)> = statuses
+            .iter()
+            .map(|(choice_id, status)| (choice_id.as_str(), *status))
+            .collect();
+        let record = answered(&status_refs, is_applicable, reason);
+
         let client = Client::new();
         let workload_id = framework_workload(&client, &format!("rated-{case}")).await;
         client.record_answer(&workload_id, FRAMEWORK_LENS, QUESTION, record);
@@ -785,13 +791,14 @@ async fn a_stored_answer_is_reported_and_rated() {
         );
         assert_eq!(
             summary.get("SelectedChoices"),
-            Some(&selected),
-            "case {case:?}: expected SelectedChoices {selected:?}, got {summary:?}"
+            Some(&expected_selected),
+            "case {case:?}: expected SelectedChoices {expected_selected:?}, got {summary:?}"
         );
         assert_eq!(
             summary.get("ChoiceAnswerSummaries"),
-            Some(&choice_answers),
-            "case {case:?}: expected ChoiceAnswerSummaries {choice_answers:?}, got {summary:?}"
+            Some(&expected_choice_answers),
+            "case {case:?}: expected ChoiceAnswerSummaries {expected_choice_answers:?}, \
+             got {summary:?}"
         );
         assert_eq!(
             summary.get("IsApplicable"),
@@ -834,11 +841,13 @@ async fn a_milestone_freezes_the_answers_it_recorded() {
     let workload_id = framework_workload(&client, "frozen-host").await;
 
     // Before the milestone: one question answered with nothing in place.
+    let frozen_question_choices = framework_choice_ids("rel-01");
+    let later_question_choices = framework_choice_ids("cost-02");
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
         "rel-01",
-        answered(&[], &[("bp-1", "UNSELECTED")], true, None),
+        answered_over(&frozen_question_choices, &[], true, None),
     );
     let recorded = client
         .send(
@@ -853,17 +862,22 @@ async fn a_milestone_freezes_the_answers_it_recorded() {
     );
 
     // After it: that answer improves and a second question is answered.
+    let frozen_all: Vec<&str> = frozen_question_choices
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let later_all: Vec<&str> = later_question_choices.iter().map(String::as_str).collect();
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
         "rel-01",
-        answered(&["bp-1"], &[("bp-1", "SELECTED")], true, None),
+        answered_over(&frozen_question_choices, &frozen_all, true, None),
     );
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
         "cost-02",
-        answered(&["bp-9"], &[("bp-9", "SELECTED")], true, None),
+        answered_over(&later_question_choices, &later_all, true, None),
     );
 
     let risk_of = |summaries: &[Value], question_id: &str| -> String {

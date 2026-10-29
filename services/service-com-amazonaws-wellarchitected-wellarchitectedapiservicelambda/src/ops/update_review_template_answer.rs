@@ -342,11 +342,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 answer.notes = Some(notes);
             }
 
-            // The selected choices of an answer ARE the choices it records `SELECTED` for,
-            // so the two members a client reads back agree whichever of them the request
-            // wrote through.
-            answer.resolve_selected_choices(&question);
-
             // Answering a question changes the template and the lens review that asks it,
             // so both report this write as the instant they were last updated.
             template

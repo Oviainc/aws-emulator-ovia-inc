@@ -312,18 +312,17 @@ fn answer_summary(
         // about are reported below, from the answer itself.
         choices: Some(question.choices()),
         selected_choices: Some(
-            answer.map(|answer| answer.selected_choices.clone()).unwrap_or_default(),
+            answer.map(|answer| answer.selected_choices_of(question)).unwrap_or_default(),
         ),
         choice_answer_summaries: Some(
             answer
                 .map(|answer| {
                     answer
-                        .choice_answers
-                        .iter()
-                        .map(|(choice_id, choice)| ChoiceAnswerSummary {
-                            choice_id: Some(choice_id.clone()),
-                            status: Some(choice.status.clone()),
-                            reason: choice.reason.clone(),
+                        .reported_choice_answers(question)
+                        .map(|choice| ChoiceAnswerSummary {
+                            choice_id: Some(choice.choice_id.to_string()),
+                            status: Some(choice.status.to_string()),
+                            reason: choice.reason.map(str::to_string),
                         })
                         .collect()
                 })
@@ -333,7 +332,7 @@ fn answer_summary(
         is_applicable: Some(answer.is_none_or(|answer| answer.is_applicable)),
         risk: Some(
             answer
-                .map_or(crate::state::RISK_UNANSWERED, crate::state::AnswerRecord::risk)
+                .map_or(crate::state::RISK_UNANSWERED, |answer| answer.risk(question))
                 .to_string(),
         ),
         // `Reason` exists only once an answer gives one.

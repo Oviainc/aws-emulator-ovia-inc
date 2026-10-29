@@ -451,7 +451,7 @@ async fn unapplying_a_lens_drops_the_answers_recorded_under_it() {
         .to_string();
     // Answered means a record exists for the question; which best practices it selects is
     // what `super::review_template_answer_updates` is about, so this one selects none.
-    client.record_template_answer(&template_arn, SECOND_LENS, &question_id, answered(&[], &[], true, None));
+    client.record_template_answer(&template_arn, SECOND_LENS, &question_id, answered(&[], true, None));
 
     let answer_status = |answer: &Answer| -> String {
         answer

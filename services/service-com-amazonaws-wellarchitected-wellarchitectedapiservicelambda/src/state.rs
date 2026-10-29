@@ -176,7 +176,7 @@ pub const CHOICE_STATUS_UNSELECTED: &str = "UNSELECTED";
 /// (`smithy_query(query="shape", shape="ChoiceStatus")`): the status every `ChoiceId` a
 /// `SelectedChoices` names carries, and the only status a selected choice carries — which
 /// is what keeps an answer's `SelectedChoices` and its `ChoiceAnswers` in agreement
-/// ([`AnswerRecord::resolve_selected_choices`]).
+/// ([`AnswerRecord::selected_choices_of`], which derives the one from the other).
 pub const CHOICE_STATUS_SELECTED: &str = "SELECTED";
 
 /// `TrustedAdvisorIntegrationStatus$DISABLED`: what a workload's discovery
@@ -1319,16 +1319,21 @@ pub fn page_size_up_to(max_results: Option<i32>, ceiling: i32) -> usize {
 /// One stored answer to one question of one lens review, as the operations that answer
 /// a question record it.
 ///
-/// Only the members a projection reports are held: `AnswerSummary` carries the selected
-/// choices, the per-choice answers, whether the question applies and the reason it does
-/// not, and `Answer` / `ReviewTemplateAnswer` carry the answer's notes too. The
-/// question's RISK is not stored — it is derived from these by [`AnswerRecord::risk`] on
-/// every read, so it moves when the answer does.
+/// Only the members a projection reports are held: `AnswerSummary` carries the per-choice
+/// answers, whether the question applies and the reason it does not, and `Answer` /
+/// `ReviewTemplateAnswer` carry the answer's notes too. Neither the question's RISK nor
+/// its `SelectedChoices` is stored — both are derived from what IS stored, against the
+/// question the answer answers ([`AnswerRecord::risk`],
+/// [`AnswerRecord::selected_choices_of`]), on every read, so they move when the answer or
+/// the question's choice set does.
 #[derive(Debug, Clone)]
 pub struct AnswerRecord {
-    /// `SelectedChoices`: the `ChoiceId`s of the best practices that are in place.
-    pub selected_choices: Vec<String>,
     /// The answer recorded for each choice the answer speaks about, keyed by `ChoiceId`.
+    ///
+    /// How this answer REMEMBERS the per-choice statuses, which is not the same thing as
+    /// the choices it reports them for: the key space they live in is the question's own
+    /// choice set, so a read resolves this map against that question
+    /// ([`Self::reported_choice_answers`]) rather than reporting or rating it as stored.
     pub choice_answers: BTreeMap<String, ChoiceAnswerRecord>,
     /// `IsApplicable`: false when the question does not apply to this workload.
     pub is_applicable: bool,
@@ -1336,6 +1341,26 @@ pub struct AnswerRecord {
     pub reason: Option<String>,
     /// `Notes`: the notes recorded against this answer, absent until one is written.
     pub notes: Option<String>,
+}
+
+/// One per-choice answer as a read of an answer REPORTS it: the choice of the question,
+/// the status it carries, and the reason and notes recorded with it.
+///
+/// Distinct from [`ChoiceAnswerRecord`], which is what the store HOLDS: an answer is read
+/// against the QUESTION it answers ([`AnswerRecord::reported_choice_answers`]), so a
+/// choice the question asks about that the record holds no status for is reported too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportedChoiceAnswer<'answer> {
+    /// `ChoiceAnswer$ChoiceId` / `ChoiceAnswerSummary$ChoiceId` — a choice of the question
+    /// the answer was read against.
+    pub choice_id: &'answer str,
+    /// `Status`: a `ChoiceStatus` (`SELECTED` | `UNSELECTED` | `NOT_APPLICABLE`).
+    pub status: &'answer str,
+    /// `Reason`: a `ChoiceReason`, when one was given.
+    pub reason: Option<&'answer str>,
+    /// `ChoiceAnswer$Notes`, when any were given. `ChoiceAnswerSummary` models no notes
+    /// member, so only the full answer reports it.
+    pub notes: Option<&'answer str>,
 }
 
 /// One stored per-choice answer: the choice's status, the reason for it and its notes.
@@ -1361,7 +1386,6 @@ impl AnswerRecord {
     /// question however it was answered.
     pub fn for_question(question: &ReviewQuestion) -> Self {
         Self {
-            selected_choices: Vec::new(),
             choice_answers: question
                 .each_choice_id()
                 .map(|choice_id| {
@@ -1407,25 +1431,55 @@ impl AnswerRecord {
         }
     }
 
-    /// Bring [`Self::selected_choices`] back into agreement with the per-choice statuses:
-    /// the selected choices of an answer ARE the choices of `question` it records
-    /// [`CHOICE_STATUS_SELECTED`] for, in the lens's own choice order.
+    /// This answer read against the question it answers: one entry per choice `question`
+    /// asks about, in the lens's own choice order.
     ///
-    /// Run after every write to an answer, so the two members a client reads back cannot
-    /// contradict each other whichever of them the request wrote through.
-    pub fn resolve_selected_choices(&mut self, question: &ReviewQuestion) {
-        self.selected_choices = question
-            .each_choice_id()
-            .filter(|choice_id| {
-                self.choice_answers
-                    .get(*choice_id)
-                    .is_some_and(|choice| choice.status == CHOICE_STATUS_SELECTED)
-            })
-            .map(str::to_string)
-            .collect();
+    /// The key space an answer's per-choice statuses live in is the QUESTION's choice set
+    /// (the `ChoiceId` of each best practice it asks about), and the stored map is only how
+    /// this answer remembers them, so the two are reconciled HERE on every read: a choice
+    /// the question asks about that the map holds no status for is
+    /// [`CHOICE_STATUS_UNSELECTED`] — a best
+    /// practice is not in place until an answer says it is — and a `ChoiceId` the question
+    /// does not ask about is not part of this answer at all and is left out. That matters
+    /// because a review can be moved to another version of its lens
+    /// (`UpgradeLensReview`, `UpgradeReviewTemplateLensReview`) and a template's answers
+    /// can be carried into a workload's review of another version, either of which changes
+    /// the choice set the same `QuestionId` asks about.
+    ///
+    /// The one place a stored answer is resolved against a question, so the choices an
+    /// answer reports, the ones it reports as selected ([`Self::selected_choices_of`]) and
+    /// the risk derived from it ([`Self::risk`]) cannot disagree with each other or with
+    /// the question's own choice catalog ([`ReviewQuestion::choices`]).
+    pub fn reported_choice_answers<'answer>(
+        &'answer self,
+        question: &'answer ReviewQuestion,
+    ) -> impl Iterator<Item = ReportedChoiceAnswer<'answer>> + 'answer {
+        question.each_choice_id().map(move |choice_id| {
+            let stored = self.choice_answers.get(choice_id);
+            ReportedChoiceAnswer {
+                choice_id,
+                status: stored.map_or(CHOICE_STATUS_UNSELECTED, |choice| choice.status.as_str()),
+                reason: stored.and_then(|choice| choice.reason.as_deref()),
+                notes: stored.and_then(|choice| choice.notes.as_deref()),
+            }
+        })
     }
 
-    /// The `Risk` this answer carries, derived from what it records.
+    /// The `SelectedChoices` this answer reports for `question`: the choices of the
+    /// question it records [`CHOICE_STATUS_SELECTED`] for, in the lens's own choice order.
+    ///
+    /// Derived rather than stored, so the selected choices and the per-choice answers a
+    /// client reads back cannot contradict each other whichever of them the request wrote
+    /// through — and so neither of them can name a choice the question does not ask about.
+    pub fn selected_choices_of(&self, question: &ReviewQuestion) -> Vec<String> {
+        self.reported_choice_answers(question)
+            .filter(|choice| choice.status == CHOICE_STATUS_SELECTED)
+            .map(|choice| choice.choice_id.to_string())
+            .collect()
+    }
+
+    /// The `Risk` this answer carries for the question it answers, derived from what it
+    /// records for that question's own choices.
     ///
     /// The Well-Architected Tool rates a question by how many of its best practices are
     /// in place: a question that does not apply is `NOT_APPLICABLE`, one answered with
@@ -1433,18 +1487,28 @@ impl AnswerRecord {
     /// unselected is `MEDIUM`, and one with nothing left unselected is `NONE`.
     /// `UNANSWERED` is not reachable here — it is what a question with NO stored answer
     /// reports ([`RISK_UNANSWERED`]), which is why this takes an answer.
-    pub fn risk(&self) -> &'static str {
+    ///
+    /// The best practices rated are the ones `question` asks about — the rating is of that
+    /// question, so it moves with the choice set the review's lens version defines for it
+    /// ([`Self::reported_choice_answers`]), not with whatever the stored map happens to
+    /// hold.
+    pub fn risk(&self, question: &ReviewQuestion) -> &'static str {
         if !self.is_applicable {
             return RISK_NOT_APPLICABLE;
         }
-        if self.selected_choices.is_empty() {
+        let mut any_in_place = false;
+        let mut any_left_out = false;
+        for choice in self.reported_choice_answers(question) {
+            if choice.status == CHOICE_STATUS_SELECTED {
+                any_in_place = true;
+            } else if choice.status == CHOICE_STATUS_UNSELECTED {
+                any_left_out = true;
+            }
+        }
+        if !any_in_place {
             return RISK_HIGH;
         }
-        if self
-            .choice_answers
-            .values()
-            .any(|choice| choice.status == CHOICE_STATUS_UNSELECTED)
-        {
+        if any_left_out {
             return RISK_MEDIUM;
         }
         RISK_NONE
@@ -1484,20 +1548,19 @@ pub fn answer_projection(
         choices: Some(question.choices()),
         selected_choices: Some(
             answer
-                .map(|answer| answer.selected_choices.clone())
+                .map(|answer| answer.selected_choices_of(question))
                 .unwrap_or_default(),
         ),
         choice_answers: Some(
             answer
                 .map(|answer| {
                     answer
-                        .choice_answers
-                        .iter()
-                        .map(|(choice_id, choice)| crate::ops::types::ChoiceAnswer {
-                            choice_id: Some(choice_id.clone()),
-                            status: Some(choice.status.clone()),
-                            reason: choice.reason.clone(),
-                            notes: choice.notes.clone(),
+                        .reported_choice_answers(question)
+                        .map(|choice| crate::ops::types::ChoiceAnswer {
+                            choice_id: Some(choice.choice_id.to_string()),
+                            status: Some(choice.status.to_string()),
+                            reason: choice.reason.map(str::to_string),
+                            notes: choice.notes.map(str::to_string),
                         })
                         .collect()
                 })
@@ -1505,7 +1568,11 @@ pub fn answer_projection(
         ),
         // A question applies unless an answer says it does not.
         is_applicable: Some(answer.is_none_or(|answer| answer.is_applicable)),
-        risk: Some(answer.map_or(RISK_UNANSWERED, AnswerRecord::risk).to_string()),
+        risk: Some(
+            answer
+                .map_or(RISK_UNANSWERED, |answer| answer.risk(question))
+                .to_string(),
+        ),
         // `Notes` and `Reason` exist only once an answer records them.
         notes: answer.and_then(|answer| answer.notes.clone()),
         reason: answer.and_then(|answer| answer.reason.clone()),
@@ -2380,7 +2447,7 @@ impl WorkloadRecord {
         let mut counts = empty_risk_counts();
         for question in questions {
             let risk = match self.answer(lens, &question.question_id) {
-                Some(answer) => answer.risk(),
+                Some(answer) => answer.risk(question),
                 None => RISK_UNANSWERED,
             };
             counts
@@ -3327,20 +3394,19 @@ pub fn review_template_answer(
         choices: Some(question.choices()),
         selected_choices: Some(
             answer
-                .map(|answer| answer.selected_choices.clone())
+                .map(|answer| answer.selected_choices_of(question))
                 .unwrap_or_default(),
         ),
         choice_answers: Some(
             answer
                 .map(|answer| {
                     answer
-                        .choice_answers
-                        .iter()
-                        .map(|(choice_id, choice)| ChoiceAnswer {
-                            choice_id: Some(choice_id.clone()),
-                            status: Some(choice.status.clone()),
-                            reason: choice.reason.clone(),
-                            notes: choice.notes.clone(),
+                        .reported_choice_answers(question)
+                        .map(|choice| ChoiceAnswer {
+                            choice_id: Some(choice.choice_id.to_string()),
+                            status: Some(choice.status.to_string()),
+                            reason: choice.reason.map(str::to_string),
+                            notes: choice.notes.map(str::to_string),
                         })
                         .collect()
                 })
