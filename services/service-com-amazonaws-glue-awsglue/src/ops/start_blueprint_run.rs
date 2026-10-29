@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartBlueprintRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartBlueprintRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartBlueprintRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a run of the blueprint this account holds under the requested name and answers
+//! with the id minted for that run, which is what `GetBlueprintRun` addresses it by. The
+//! run is recorded ON the blueprint ([`crate::state::BlueprintEntry::runs`]), in the
+//! modelled running state with its next state due a span out
+//! ([`crate::state::BLUEPRINT_RUN_SETTLES_AFTER`]), so a caller that reads the run straight
+//! afterwards still sees it in progress.
+//!
+//! A run produces a WORKFLOW — "the name of a workflow that is created as a result of a
+//! successful blueprint run" — so the start lays that workflow out too
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::start_blueprint_run`]), carrying the run
+//! that created it, and the run reaches the succeeded state once the clock owes it. A run
+//! whose workflow name this account already holds a workflow under creates nothing and
+//! fails, rather than overwriting what is stored.
+//!
+//! KNOWN DIVERGENCE, visible to a caller: what a run creates is the WORKFLOW RECORD and
+//! nothing inside it. The jobs, crawlers and triggers a blueprint's layout adds to that
+//! workflow — and the parameter spec that says which parameters the layout takes — are
+//! defined by the archive published at the blueprint's `BlueprintLocation`, which nothing
+//! here fetches, so a `GetWorkflow` of what a run produced reports a workflow with no graph
+//! and no entry point, and a `StartWorkflowRun` of it is refused for having no starting
+//! trigger. The workflow's NAME is the `WorkflowName` the start's `Parameters` asked for, and
+//! the blueprint's own name when they ask for none
+//! ([`crate::state::blueprint_run_workflow_name`]).
+//!
+//! A run may only be started of a registration that has FINISHED: a blueprint whose
+//! registration is still in flight is refused with the modelled
+//! `IllegalBlueprintStateException` rather than run. A run already in flight does not stop
+//! another beginning — a blueprint publishes no ceiling on its concurrent runs.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +174,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartBlueprintRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartBlueprintRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartBlueprintRun"))
+        // Blueprints live in one per-account namespace, so nothing here depends on the
+        // request's Region — the same way `CreateBlueprint` and `GetBlueprint` serve one.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(StartBlueprintRunErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue blueprint store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // `BlueprintName` and `RoleArn` are `@required` and their lengths and patterns —
+        // including the IAM role ARN form `RoleArn` has to take — are refused at the
+        // boundary, as is `Parameters`' length, so every check left is one the STORE
+        // answers.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The ONE place a blueprint run is started: it materialises the registration status
+        // the clock already owed the blueprint, lays out the workflow the run produces and
+        // records the run of it, so a run and its workflow are written together.
+        let run_id = match store.start_blueprint_run(&input, now) {
+            Ok(run_id) => run_id,
+            Err(crate::state::BlueprintRunNotStarted::NoSuchBlueprint) => {
+                return Err(StartBlueprintRunErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::blueprint_not_found(
+                            &input.blueprint_name,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+            // Only a blueprint with an ACTIVE definition can be run: "Active — The
+            // blueprint has been successfully registered" is the one status in which the
+            // template a run would lay out is registered, so a run of a blueprint in any
+            // other is refused with this operation's modelled state error.
+            Err(crate::state::BlueprintRunNotStarted::NoActiveDefinition) => {
+                return Err(
+                    StartBlueprintRunErrorModeled::IllegalBlueprintStateException(
+                        IllegalBlueprintStateException {
+                            message: Some(
+                                crate::state::messages::blueprint_has_no_active_definition(
+                                    &input.blueprint_name,
+                                ),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // The run creates a workflow, so a store already holding as many workflows as it
+            // will cannot serve the start: refused with this operation's own modelled limit
+            // error rather than recording a run that could create nothing.
+            Err(crate::state::BlueprintRunNotStarted::WorkflowCeilingReached(ceiling)) => {
+                return Err(
+                    StartBlueprintRunErrorModeled::ResourceNumberLimitExceededException(
+                        ResourceNumberLimitExceededException {
+                            message: Some(format!(
+                                "This account already holds the maximum of {ceiling} workflows"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+        ::tracing::info!(
+            operation = "StartBlueprintRun",
+            blueprint = %input.blueprint_name,
+            run = %run_id,
+            "started a Glue blueprint run"
+        );
+
+        // "The run ID for this blueprint run" — the id the record is held under, which is
+        // what a later read of the run addresses it by.
+        Ok(StartBlueprintRunOutput {
+            run_id: Some(run_id),
+        })
     }
 }
