@@ -58,8 +58,8 @@
 //!
 //! The model lists NONE for this operation
 //! (`smithy_query(query="operation",operation="TagResource")` reports `errors: []`), so
-//! both of the shapes below are widened in through `extra_errors`; each is a shape this
-//! SERVICE models and another operation declares:
+//! all three of the shapes below are widened in through `extra_errors`; each is a shape
+//! this SERVICE models and another operation declares:
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — `resourceArn` names no resource of this
 //!   service, exactly as `GetDomain` answers a `domainId` that names no domain.
@@ -69,6 +69,8 @@
 //!   the condition is COMPARED in one place for both
 //!   ([`crate::service::tag_bounds::merged_within_cap`]), which merges first and bounds
 //!   the result, so neither operation can count a different set.
+//! * `InternalServerException` (HTTP 500) — the one server-side failure this handler can
+//!   meet: a store it cannot reach ([`crate::state::store_unreachable`]).
 //!
 //! A tag entry this service does not accept — a key or value outside its modelled length,
 //! or a key in the reserved `crate::state::RESERVED_TAG_KEY_PREFIX` namespace — is refused
@@ -119,7 +121,11 @@ impl ::aws_smithy_schema::serde::SerializableStruct for TagResourceOutput {
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.connecthealth#TagResource",
-    extra_errors = ["ResourceNotFoundException", "ServiceQuotaExceededException"]
+    extra_errors = [
+        "ResourceNotFoundException",
+        "ServiceQuotaExceededException",
+        "InternalServerException"
+    ]
 )]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
@@ -129,6 +135,9 @@ pub enum TagResourceErrorModeled {
     /// Declared on the service (and on `CreateDomain`), not on this operation: the
     /// resource cannot hold the merged tag set.
     ServiceQuotaExceededException(ServiceQuotaExceededException),
+    /// Declared on the service (and on six of its operations), not on this one: the
+    /// store this write goes to could not be reached.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -183,11 +192,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The store is unreachable only when this service was mounted on a foreign
-        // engine; a refusal is the only channel this operation has for that.
+        // engine — a fault on this service's side, not a property of the request — so it
+        // is reported through the server-side shape this service models, built in the one
+        // place every handler builds it.
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "TagResource could not reach this service's store",
-            ));
+            return Err(TagResourceErrorModeled::InternalServerException(
+                crate::state::store_unreachable(Self::NAME),
+            )
+            .into());
         };
         // This service's endpoint is regional: the ARN has to name a resource of the
         // Region the request was signed for.

@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     CreateWebAppConfiguration, EncryptionContext, InputDataConfig, InsightsContext, InsightsOutput,
-    MedicalScribeChannelDefinition, MedicalScribeListeningSessionDetails,
+    InternalServerException, MedicalScribeChannelDefinition, MedicalScribeListeningSessionDetails,
     MedicalScribePostStreamActionSettingsResponse, MedicalScribePostStreamActionsResult,
     OutputDataConfig, PatientInsightsEncounterContext, PatientInsightsPatientContext,
     SubscriptionDescription, UserContext, WebAppConfiguration,
@@ -1601,11 +1601,29 @@ impl Page {
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
-/// Answer `None` with a modelled server error, never with a fresh engine.
+/// Answer `None` with the modelled server error [`store_unreachable`] builds, never with
+/// a fresh engine.
 pub fn service_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<ComAmazonawsConnecthealthConnecthealthState>> {
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsConnecthealthConnecthealthState>)
+}
+
+/// The failure every handler answers an unreachable store with — the one
+/// [`service_state`] returning `None` is reported through.
+///
+/// A store this service cannot reach is a fault on the SERVICE's side: nothing about the
+/// request caused it and no member of the request can be changed to avoid it. So it is
+/// reported through the shape this service models for a server-side failure, which
+/// carries that classification, its status and its retryability on the wire — never
+/// through a client-input refusal, which tells the caller to fix a request that was
+/// never wrong. Built HERE, once, so every handler words and classifies the condition
+/// identically; each lifts it into its own operation's error enum, widening the shape in
+/// through `extra_errors` where the operation's own `errors` list omits it.
+pub fn store_unreachable(operation: &str) -> InternalServerException {
+    InternalServerException {
+        message: Some(format!("{operation} could not reach this service's store")),
+    }
 }

@@ -60,12 +60,14 @@
 //!
 //! The model lists NONE for this operation
 //! (`smithy_query(query="operation",operation="UntagResource")` reports `errors: []`), so
-//! the shape below is widened in through `extra_errors`; it is a shape this SERVICE
-//! models and other operations declare:
+//! both of the shapes below are widened in through `extra_errors`; each is a shape this
+//! SERVICE models and other operations declare:
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — `resourceArn` names no resource of this
 //!   service, resolved exactly as `TagResource` and `ListTagsForResource` resolve the
 //!   same label.
+//! * `InternalServerException` (HTTP 500) — the one server-side failure this handler can
+//!   meet: a store it cannot reach ([`crate::state::store_unreachable`]).
 //!
 //! A tag key this service does not accept — one outside the modelled `TagKey` length, or
 //! one in the reserved `crate::state::RESERVED_TAG_KEY_PREFIX` namespace, which names a
@@ -116,13 +118,16 @@ impl ::aws_smithy_schema::serde::SerializableStruct for UntagResourceOutput {
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.connecthealth#UntagResource",
-    extra_errors = ["ResourceNotFoundException"]
+    extra_errors = ["ResourceNotFoundException", "InternalServerException"]
 )]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
     /// Declared on the service (and on `GetDomain`), not on this operation: the ARN
     /// names no resource this service holds.
     ResourceNotFoundException(ResourceNotFoundException),
+    /// Declared on the service (and on six of its operations), not on this one: the
+    /// store this removal goes to could not be reached.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -177,11 +182,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The store is unreachable only when this service was mounted on a foreign
-        // engine; a refusal is the only channel this operation has for that.
+        // engine — a fault on this service's side, not a property of the request — so it
+        // is reported through the server-side shape this service models, built in the one
+        // place every handler builds it.
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "UntagResource could not reach this service's store",
-            ));
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                crate::state::store_unreachable(Self::NAME),
+            )
+            .into());
         };
         // This service's endpoint is regional: the ARN has to name a resource of the
         // Region the request was signed for.

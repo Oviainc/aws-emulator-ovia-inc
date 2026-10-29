@@ -142,11 +142,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetSubscriptionErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some(
-                        "GetSubscription could not reach this service's store".to_string(),
-                    ),
-                },
+                crate::state::store_unreachable(Self::NAME),
             )
             .into());
         };

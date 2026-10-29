@@ -89,6 +89,9 @@
 //! * `ValidationException` (HTTP 400) — widened in through `extra_errors` (see below):
 //!   this SERVICE models the shape, this operation's own `errors` list does not name it,
 //!   and it is the error the account-wide Domain cap is surfaced as.
+//! * `InternalServerException` (HTTP 500) — widened in the same way, for the one
+//!   server-side failure this handler can meet: a store it cannot reach
+//!   ([`crate::state::store_unreachable`]).
 //! * `ValidationException` (HTTP 400), through `crate::scaffolded::Scaffolded::validation`
 //!   — a `tags` entry this service does not accept: one outside the modelled
 //!   `TagKey`/`TagValue` lengths (key 1..128 characters, value 0..256), or one whose key
@@ -198,14 +201,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-connecthealth-connecthe
 // list names only `ServiceQuotaExceededException` — while the account-wide Domain cap is
 // surfaced as a `ValidationException`, so the modelled shape is what this handler
 // answers with rather than the framework's synthetic one.
+//
+// `InternalServerException` is widened in for the same reason and through the same
+// mechanism (`smithy_query(query="shape", shape="InternalServerException")`, errorKind
+// server, httpError 500, retryable): it is the shape this SERVICE models for a
+// server-side failure, declared by six of its operations, and the channel this handler
+// reports an unreachable store through.
 #[smithy_macros::operation_error(
     "com.amazonaws.connecthealth#CreateDomain",
-    extra_errors = ["ValidationException"]
+    extra_errors = ["ValidationException", "InternalServerException"]
 )]
 #[derive(Debug)]
 pub enum CreateDomainErrorModeled {
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
+    /// Declared on the service (and on six of its operations), not on this one: the
+    /// store this handler reads and writes could not be reached.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -260,12 +272,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The store is unreachable only when this service was mounted on a foreign
-        // engine; this operation models no server-side error, so a refusal is the only
-        // channel it has.
+        // engine — a fault on this service's side, not a property of the request — so it
+        // is reported through the server-side shape this service models, built in the one
+        // place every handler builds it.
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "CreateDomain could not reach this service's store",
-            ));
+            return Err(CreateDomainErrorModeled::InternalServerException(
+                crate::state::store_unreachable(Self::NAME),
+            )
+            .into());
         };
         let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();

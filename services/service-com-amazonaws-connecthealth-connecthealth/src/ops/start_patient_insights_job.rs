@@ -186,17 +186,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The store is unreachable only when this service was mounted on a foreign
-        // engine. This operation models `InternalServerException`, so that is the
-        // channel for a server-side failure.
+        // engine — a fault on this service's side, not a property of the request — so it
+        // is reported through the server-side shape this service models, built in the one
+        // place every handler builds it.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 StartPatientInsightsJobErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: Some(
-                            "StartPatientInsightsJob could not reach this service's store"
-                                .to_string(),
-                        ),
-                    },
+                    crate::state::store_unreachable(Self::NAME),
                 )
                 .into(),
             );

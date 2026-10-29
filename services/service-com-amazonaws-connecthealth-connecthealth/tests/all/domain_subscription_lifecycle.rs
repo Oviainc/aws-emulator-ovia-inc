@@ -93,29 +93,7 @@ impl Emulator {
         path: &str,
         body: Option<&Value>,
     ) -> (u16, Value) {
-        let payload = body
-            .map(|body| serde_json::to_vec(body).expect("a serializable body"))
-            .unwrap_or_default();
-        let credential = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/health-agent/aws4_request, \
-             SignedHeaders=host, Signature=0000"
-        );
-        let request = http::Request::builder()
-            .method(method)
-            .uri(path)
-            .header("content-type", "application/json")
-            .header("authorization", credential)
-            .body(Bytes::from(payload))
-            .expect("a well-formed request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let bytes = response.into_body();
-        let parsed = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-        };
-        (status, parsed)
+        dispatch_signed(&self.router, region, method, path, body).await
     }
 
     /// `CreateDomain`, asserting it was accepted, and the created domain's id.
@@ -132,6 +110,45 @@ impl Emulator {
         );
         created
     }
+}
+
+/// Dispatch ONE signed restJson1 request against `router` and return its status and
+/// parsed JSON body.
+///
+/// The one way this test target drives this service over the wire, free of any
+/// particular emulator: [`Emulator::send_in`] is this function applied to the shared
+/// in-memory store, and a suite that has to mount the service on a DIFFERENT engine
+/// builds its own router and calls this directly rather than copying the request walk.
+pub(crate) async fn dispatch_signed(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
+    let payload = body
+        .map(|body| serde_json::to_vec(body).expect("a serializable body"))
+        .unwrap_or_default();
+    let credential = format!(
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/health-agent/aws4_request, \
+         SignedHeaders=host, Signature=0000"
+    );
+    let request = http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("authorization", credential)
+        .body(Bytes::from(payload))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let bytes = response.into_body();
+    let parsed = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, parsed)
 }
 
 /// The wire error code (`__type`), without any namespace prefix.

@@ -56,6 +56,20 @@
 //!
 //! * `domains` (DomainSummaryList) **required** — List of Domains.
 //! * `nextToken` (String) — Token for the next page of results.
+//!
+//! ## Errors
+//!
+//! The model lists NONE for this operation
+//! (`smithy_query(query="operation",operation="ListDomains")` reports `errors: []`).
+//!
+//! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see
+//!   below): it is a shape this SERVICE models and other operations declare, and the
+//!   channel for the one server-side failure this handler can meet — a store it cannot
+//!   reach ([`crate::state::store_unreachable`]).
+//! * `ValidationException` (HTTP 400), through `crate::scaffolded::Scaffolded::validation`
+//!   — a request this listing cannot serve: a page size outside the modelled
+//!   `maxResults` range, a `nextToken` this service did not issue, or a `status` outside
+//!   the modelled enum.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -71,9 +85,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-connecthealth-connecthe
 // here — hence the `ListDomainsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.connecthealth#ListDomains")]
+// `InternalServerException` is widened in through `extra_errors`: this operation's own
+// `errors` list is EMPTY, but the shape is one this SERVICE models
+// (`smithy_query(query="shape", shape="InternalServerException")`, errorKind server,
+// httpError 500, retryable) and six of its operations declare — and a server-side
+// failure has to be reported as one.
+#[smithy_macros::operation_error(
+    "com.amazonaws.connecthealth#ListDomains",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListDomainsErrorModeled {
+    /// Declared on the service (and on six of its operations), not on this one: the
+    /// store this listing enumerates could not be reached.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -128,12 +153,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The store is unreachable only when this service was mounted on a foreign
-        // engine; this operation's model declares no error at all, so a refusal is the
-        // only channel it has.
+        // engine — a fault on this service's side, not a property of the request — so it
+        // is reported through the server-side shape this service models, built in the one
+        // place every handler builds it.
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "ListDomains could not reach this service's store",
-            ));
+            return Err(ListDomainsErrorModeled::InternalServerException(
+                crate::state::store_unreachable(Self::NAME),
+            )
+            .into());
         };
         // This service's endpoint is regional, so the inventory this call enumerates is
         // the Region the request was signed for, and no other. The model documents the
@@ -164,8 +191,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the cursor it resumes from. Both are decided by the pagination rule this
         // service states ONCE in `crate::state::Page`, which the other listing obeys
         // too; what belongs to this operation is only the channel a refusal travels on —
-        // and this operation's model declares no error at all, so a refusal is the only
-        // channel it has.
+        // and this is a fault in the REQUEST, which the model carries no shape of its own
+        // for, so the scaffold channel's client refusal is what words it.
         let page = match crate::state::Page::resolve(
             crate::state::domains_page_scope(&region),
             input.max_results,

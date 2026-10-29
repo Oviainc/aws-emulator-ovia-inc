@@ -66,6 +66,10 @@
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — This error is thrown when the requested
 //!   resource is not found.
+//! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see
+//!   below): this SERVICE models the shape, this operation's own `errors` list does not
+//!   name it, and it is the channel for the one server-side failure this handler can
+//!   meet — a store it cannot reach ([`crate::state::store_unreachable`]).
 //!
 //! Beside it, this operation answers the front door's own
 //! `AuthorizerConfigurationException` for a `domainId` that was never allocated — see
@@ -114,10 +118,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-connecthealth-connecthe
 // here — hence the `DeleteDomainError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.connecthealth#DeleteDomain")]
+// `InternalServerException` is widened in through `extra_errors`: this SERVICE models
+// the shape (`smithy_query(query="shape", shape="InternalServerException")`, errorKind
+// server, httpError 500, retryable) and six of its operations list it, but
+// `DeleteDomain`'s own `errors` list names only `ResourceNotFoundException` — and a
+// server-side failure has to be reported as one.
+#[smithy_macros::operation_error(
+    "com.amazonaws.connecthealth#DeleteDomain",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteDomainErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    /// Declared on the service (and on six of its operations), not on this one: the
+    /// store this deletion is recorded in could not be reached.
+    InternalServerException(InternalServerException),
 }
 
 /// Schema for the `AuthorizerConfigurationException` this operation answers for a
@@ -310,11 +325,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The store is unreachable only when this service was mounted on a foreign
-        // engine; this operation models no server-side error, so a refusal is the only
-        // channel it has.
+        // engine — a fault on this service's side, not a property of the request — so it
+        // is reported through the server-side shape this service models, built in the one
+        // place every handler builds it.
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "DeleteDomain could not reach this service's store",
+            return Err(DeleteDomainErrorModeled::InternalServerException(
+                crate::state::store_unreachable(Self::NAME),
             )
             .into());
         };
