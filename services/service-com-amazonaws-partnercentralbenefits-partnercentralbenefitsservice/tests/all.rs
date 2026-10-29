@@ -49,6 +49,8 @@ mod details_document_guard;
 mod disassociate_benefit_application_resource;
 #[path = "all/entitlement_denial.rs"]
 mod entitlement_denial;
+#[path = "all/file_name_length_bound.rs"]
+mod file_name_length_bound;
 #[path = "all/get_benefit.rs"]
 mod get_benefit;
 #[path = "all/get_benefit_allocation.rs"]

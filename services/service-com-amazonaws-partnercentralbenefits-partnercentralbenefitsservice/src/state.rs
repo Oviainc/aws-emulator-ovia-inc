@@ -387,6 +387,20 @@ pub const MAX_CLIENT_TOKEN_LEN: usize = 64;
 /// halves of one trait move together.
 pub const MIN_CLIENT_TOKEN_LEN: usize = 1;
 
+/// The longest `FileName` a stored `FileDetail` carries, which is the `max` half of the
+/// modelled `FileDetail$FileName` `@length(min: 1, max: 255)`
+/// (`smithy_query(query="shape",shape="FileDetail")`).
+///
+/// The member is DERIVED from the caller's `FileURI` rather than supplied, so the
+/// centralized walk never sees it and [`file_name_of`] applies this bound itself with
+/// [`length_clause`].
+pub const MAX_FILE_NAME_LEN: usize = 255;
+
+/// The shortest `FileName` a stored `FileDetail` carries: the `min` half of the same
+/// modelled `@length(min: 1, max: 255)` [`MAX_FILE_NAME_LEN`] is the `max` half of, so
+/// both halves of one trait move together.
+pub const MIN_FILE_NAME_LEN: usize = 1;
+
 /// The longest `StatusReason` this service stores on a benefit application.
 ///
 /// It is the model's own bound on the member the value is REPORTED through —
@@ -2595,7 +2609,11 @@ pub fn same_file_details(stored: &[FileDetail], supplied: &[FileInput]) -> bool 
 
 /// The last path segment of `uri`, which is the file's name, with any query or fragment
 /// removed. `None` when the URI names no segment, or one outside the modelled
-/// `FileDetail$FileName` length (1..255).
+/// `FileDetail$FileName` length ([`MIN_FILE_NAME_LEN`]..[`MAX_FILE_NAME_LEN`]).
+///
+/// The bound goes through [`length_clause`], the one length check this service makes for
+/// itself, so a name this crate accepts in a value it refuses is not possible and the
+/// length means here what it means everywhere else in the crate.
 pub fn file_name_of(uri: &str) -> Option<String> {
     let path = uri
         .split(['?', '#'])
@@ -2603,7 +2621,9 @@ pub fn file_name_of(uri: &str) -> Option<String> {
         .unwrap_or(uri)
         .trim_end_matches('/');
     let name = path.rsplit('/').next()?;
-    (1..=255).contains(&name.len()).then(|| name.to_string())
+    length_clause(name, MIN_FILE_NAME_LEN, MAX_FILE_NAME_LEN)
+        .is_none()
+        .then(|| name.to_string())
 }
 
 /// The `FileType` the extension of `uri` names, or `None` for an extension
