@@ -4,9 +4,11 @@
 //! Reads billing groups back out of state, applying the modelled filters and
 //! `MaxResults`/`NextToken` paging. A pure read: it writes nothing.
 //!
-//! `BillingPeriod` selects the month to report for: a group is listed only for the
-//! periods from the one it was created in onward, its `Size` is the membership that was
-//! in force in that month (`crate::state::billing_group_sizes_in`) and its own
+//! `BillingPeriod` selects the month to report for: the groups listed are the ones that
+//! were billing in that month (`crate::state::billing_groups_in`) — from the period a
+//! group was created in through the last one before a delete took it, so a period a group
+//! since deleted billed in still reports it — each group's `Size` is the membership that
+//! was in force in that month (`crate::state::billing_group_sizes_in`) and its own
 //! preferences are the generation that was in force then
 //! (`crate::state::BillingGroupRecord::effective_in`). A page is always bounded — by the
 //! request's `MaxResults`, or by `crate::state::DEFAULT_PAGE_SIZE` when it names none.
@@ -285,11 +287,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `BillingPeriod` selects the month the report is read for, and an absent one
         // means the current month ("If you don't provide a billing group, the current
-        // billing period is used"): the listing answers for THAT month, so a group is
-        // reported only for the periods it existed in — from the one it was created in
-        // onward — with the generation of it that was in force then
-        // (`crate::state::BillingGroupRecord::effective_in`) and the membership that was
-        // in force then. The modelled pattern is enforced before the handler runs.
+        // billing period is used"): the listing answers for THAT month, so the groups it
+        // reports are the ones that were billing in that month
+        // (`crate::state::billing_groups_in`) — from the period a group was created in
+        // through the last one before a delete took it — each with the generation of it
+        // that was in force then and the membership that was in force then. The modelled
+        // pattern is enforced before the handler runs.
         let billing_period = input
             .billing_period
             .unwrap_or_else(crate::state::current_billing_period);
@@ -301,15 +304,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::BillingGroupVersion,
             ),
         )> = Vec::new();
-        // `billing_groups` is ordered by ARN, and an ARN carries the monotonic id
-        // this service mints, so the sequence is creation order and a `NextToken`
-        // names the same cut point on the next call.
-        for (arn, group) in &state.billing_groups {
-            let Some(version) = group.effective_in(&billing_period) else {
-                continue;
-            };
+        // `billing_groups_in` is the crate's ONE answer to "which groups does this
+        // billing period hold, and as which generation of themselves": the stored groups
+        // that existed by then and the groups a delete has since removed, for the periods
+        // before that delete took effect. It is keyed by ARN, and an ARN carries the
+        // monotonic id this service mints, so the sequence is creation order and a
+        // `NextToken` names the same cut point on the next call.
+        for (arn, (group, version)) in state.billing_groups_in(&billing_period) {
             if matches(group, &version, &filters)? {
-                selected.push((arn.clone(), (group, version)));
+                selected.push((arn, (group, version)));
             }
         }
 

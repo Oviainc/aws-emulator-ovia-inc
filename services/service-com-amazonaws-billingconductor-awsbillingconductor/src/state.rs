@@ -1568,6 +1568,29 @@ impl DeletedBillingGroupRecord {
         }
     }
 
+    /// Does a read of the billing groups scoped to `billing_period` still REPORT this
+    /// deleted group? From the period it was created in up to, but NOT including, the
+    /// period the delete was made in.
+    ///
+    /// A delete takes effect in the billing period it is made in: that is the period the
+    /// memberships the group held end at
+    /// ([`release_account`](ComAmazonawsBillingconductorAwsbillingconductorState::release_account)),
+    /// so from that period on the group holds no accounts and no read reports it, while
+    /// every earlier period it billed in still reports it as it stood then. That is
+    /// narrower than [`Self::existed_in`], which spans the periods the group's NAME stays
+    /// occupied for — the period of the delete keeps the name the group carried there even
+    /// though no read of the groups reports the group itself for it.
+    pub fn reported_in(&self, billing_period: &str) -> bool {
+        match (
+            billing_period_key(billing_period),
+            billing_period_key(&self.record.creation_billing_period()),
+            billing_period_key(&self.deletion_billing_period()),
+        ) {
+            (Some(wanted), Some(created), Some(deleted)) => (created..deleted).contains(&wanted),
+            _ => false,
+        }
+    }
+
     /// The name this group carried in `billing_period` — the name it OCCUPIED there —
     /// or `None` when it did not exist in that period.
     ///
@@ -2371,7 +2394,10 @@ pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
     /// periods it billed in: the record of each deleted group is kept here, which is
     /// what makes a billing period's occupancy of a group's name decidable after the
     /// group is gone (see
-    /// [`deleted_billing_group_occupying_name`](ComAmazonawsBillingconductorAwsbillingconductorState::deleted_billing_group_occupying_name)).
+    /// [`deleted_billing_group_occupying_name`](ComAmazonawsBillingconductorAwsbillingconductorState::deleted_billing_group_occupying_name))
+    /// and what lets a read scoped to one of those periods still report the group as it
+    /// stood then (see
+    /// [`billing_groups_in`](ComAmazonawsBillingconductorAwsbillingconductorState::billing_groups_in)).
     /// Written only by
     /// [`remove_billing_group`](ComAmazonawsBillingconductorAwsbillingconductorState::remove_billing_group),
     /// which is where the cap is enforced; the oldest deletion is forgotten first,
@@ -2818,6 +2844,59 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         sizes
     }
 
+    /// Every billing group a read scoped to `billing_period` reports, keyed by full ARN
+    /// and paired with the generation of it that was in force in that period.
+    ///
+    /// Which groups a billing period holds is fixed by THAT period, not by what the store
+    /// holds now: a billing group bills a consolidated family for a billing period, so the
+    /// groups a period reports are the ones that were billing in it — the stored groups
+    /// that existed by then ([`BillingGroupRecord::effective_in`]) together with the groups
+    /// a delete has since removed, for the periods before that delete took effect
+    /// ([`DeletedBillingGroupRecord::reported_in`]). ONE rule answers every period-scoped
+    /// read of a group, so the group a period reports cannot disagree with the membership
+    /// the same period reports for it ([`Self::billing_group_sizes_in`],
+    /// [`Self::linked_accounts`]): for a period a deleted group held accounts in, the ARN
+    /// the account listing reports resolves to the group it names.
+    ///
+    /// Keyed by ARN, and an ARN carries the monotonic id this service mints, so the
+    /// sequence is creation order whether or not a group is still stored, and a `NextToken`
+    /// names the same cut point on the next call.
+    pub fn billing_groups_in(
+        &self,
+        billing_period: &str,
+    ) -> BTreeMap<String, (&BillingGroupRecord, BillingGroupVersion)> {
+        let mut groups: BTreeMap<String, (&BillingGroupRecord, BillingGroupVersion)> =
+            BTreeMap::new();
+        for deleted in &self.deleted_billing_groups {
+            if !deleted.reported_in(billing_period) {
+                continue;
+            }
+            if let Some(version) = deleted.record.effective_in(billing_period) {
+                groups.insert(deleted.record.arn.clone(), (&deleted.record, version));
+            }
+        }
+        for (arn, group) in &self.billing_groups {
+            if let Some(version) = group.effective_in(billing_period) {
+                groups.insert(arn.clone(), (group, version));
+            }
+        }
+        groups
+    }
+
+    /// The record a delete kept of the billing group `group_arn`, if any: the NEWEST
+    /// deletion of it, the way [`Self::deleted_billing_group_occupying_name`] takes the
+    /// newest deletion that held a name.
+    ///
+    /// How a read that addresses ONE group by ARN reaches a group the store no longer
+    /// holds; which periods that record still answers for is
+    /// [`DeletedBillingGroupRecord::reported_in`].
+    pub fn deleted_billing_group(&self, group_arn: &str) -> Option<&DeletedBillingGroupRecord> {
+        self.deleted_billing_groups
+            .iter()
+            .rev()
+            .find(|deleted| deleted.record.arn == group_arn)
+    }
+
     /// Delete a billing group and everything that only existed because of it: its
     /// name index entry, the account memberships it held (which END at the current
     /// billing period, so those accounts become `UNMONITORED` from now on while the
@@ -2827,7 +2906,9 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// What the delete does NOT erase is the group's own record of the billing periods
     /// it billed in: the removed record is kept as a
     /// [`DeletedBillingGroupRecord`](crate::state::DeletedBillingGroupRecord), so the
-    /// name it occupied in those periods stays occupied for them.
+    /// name it occupied in those periods stays occupied for them and a read scoped to one
+    /// of the periods before the delete still reports the group as it stood then
+    /// ([`Self::billing_groups_in`]).
     pub fn remove_billing_group(&mut self, group_arn: &str) -> Option<BillingGroupRecord> {
         let removed = self.billing_groups.remove(group_arn)?;
         self.billing_group_names.remove(&removed.name);

@@ -6,6 +6,9 @@
 //! billing periods the request's range covers — the actual Amazon Web Services charges of
 //! the group, the pro forma charges computed from the custom line items the store holds
 //! for it, and the margin between them — broken down by the attributes `GroupBy` names.
+//! The subject is a group that was billing in one of those periods, so a group a delete
+//! has since removed is still reported on for the periods before that delete took effect
+//! (`crate::state::billing_groups_in`).
 //! The group, that breakdown and those periods together name the sequence a page is cut
 //! out of, so all three travel in the scope of the `NextToken` a truncated page mints.
 //! It writes nothing. This file is the ONLY file to touch for this operation.
@@ -224,17 +227,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The Amazon Resource Number (ARN) that uniquely identifies the billing group" —
         // in either spelling the pattern admits, so it is normalised before the lookup. A
-        // report is of a group that exists.
+        // report is of a group that was BILLING in the periods it is asked about, which a
+        // group a delete has since removed still was for the periods before that delete
+        // took effect — the same groups the period-scoped listings report
+        // (`crate::state::billing_groups_in`). So the record the delete kept is resolved
+        // here too, and which periods it answers for is checked once the range below is
+        // known; an ARN no stored and no deleted group carries names no group at all.
         let group_arn = crate::state::normalize_billing_group_arn(&input.arn);
-        let Some(group) = state.billing_groups.get(&group_arn) else {
-            return Err(GetBillingGroupCostReportErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: "the billing group does not exist".to_string(),
-                    resource_id: group_arn,
-                    resource_type: "billinggroup".to_string(),
-                },
-            )
-            .into());
+        let live = state.billing_groups.get(&group_arn);
+        let deleted = match live {
+            Some(_) => None,
+            None => state.deleted_billing_group(&group_arn),
+        };
+        let Some(group) = live.or(deleted.map(|deleted| &deleted.record)) else {
+            return Err(no_such_billing_group(&group_arn));
         };
 
         // "A time range for which the margin summary is effective. You can specify up to
@@ -277,6 +283,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::billing_periods_in_range(start, end)
             }
         };
+
+        // A group the store no longer holds is the subject of a report only for the
+        // billing periods before the delete took it
+        // (`crate::state::DeletedBillingGroupRecord::reported_in`): a range that covers
+        // none of them asks about a period that held no such group.
+        if let Some(deleted) = deleted {
+            if !billing_periods
+                .iter()
+                .any(|period| deleted.reported_in(period))
+            {
+                return Err(no_such_billing_group(&group_arn));
+            }
+        }
 
         // "A list of strings that specify the attributes that are used to break down
         // costs in the margin summary reports": each attribute named splits the summary
@@ -398,6 +417,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
         })
     }
+}
+
+/// This operation's modelled `ResourceNotFoundException` (HTTP 404): the ARN names no
+/// billing group the periods this report covers held — neither one the store holds nor one
+/// a delete removed while those periods were still open.
+fn no_such_billing_group(group_arn: &str) -> GetBillingGroupCostReportError {
+    GetBillingGroupCostReportErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: "the billing group does not exist".to_string(),
+        resource_id: group_arn.to_string(),
+        resource_type: "billinggroup".to_string(),
+    })
+    .into()
 }
 
 /// This operation's modelled `ValidationException` (HTTP 400), built the way every other

@@ -2,12 +2,14 @@
 
 //! @op ListBillingGroupCostReports
 //!
-//! IMPLEMENTED: this operation reports the margin summary of EVERY billing group the
-//! store holds for one billing period — the actual Amazon Web Services charges of the
+//! IMPLEMENTED: this operation reports the margin summary of EVERY billing group that was
+//! billing in one billing period — the actual Amazon Web Services charges of the
 //! group, the pro forma charges computed from the custom line items in effect for it in
 //! that period, and the margin between them — narrowed to the groups the request's
-//! filter names and cut into pages. It writes nothing. This file is the ONLY file to
-//! touch for this operation.
+//! filter names and cut into pages. The groups a period holds are the stored ones that
+//! existed by then and the ones a delete has since removed, for the periods before that
+//! delete took effect (`crate::state::billing_groups_in`). It writes nothing. This file
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -192,21 +194,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect()
             });
 
-        // One row per billing group that existed in that period, keyed by its ARN: the
-        // map is ordered by ARN and an ARN carries the monotonic id this service mints, so
-        // the sequence is creation order and a `NextToken` names the same cut point on the
-        // next call.
+        // One row per billing group that was BILLING in that period, keyed by its ARN:
+        // the groups the period holds are the stored ones that existed by then and the
+        // ones a delete has since removed, for the periods before that delete took effect
+        // (`crate::state::billing_groups_in`) — a month a group billed in still has a cost
+        // report of it. The map is ordered by ARN and an ARN carries the monotonic id this
+        // service mints, so the sequence is creation order and a `NextToken` names the
+        // same cut point on the next call.
         let mut selected: Vec<(String, &crate::state::BillingGroupRecord)> = Vec::new();
-        for (arn, group) in &state.billing_groups {
+        for (arn, (group, _version)) in state.billing_groups_in(&billing_period) {
             if wanted_arns
                 .as_ref()
-                .is_some_and(|wanted| !wanted.contains(arn))
+                .is_some_and(|wanted| !wanted.contains(&arn))
             {
                 continue;
             }
-            if group.exists_in(&billing_period) {
-                selected.push((arn.clone(), group));
-            }
+            selected.push((arn, group));
         }
 
         // The page is cut FIRST — at the request's `MaxResults`, or at this service's
