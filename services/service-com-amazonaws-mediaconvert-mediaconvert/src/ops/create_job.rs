@@ -131,6 +131,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The classification of a tag-set refusal — which modelled error it is — lives once in
+// this trait's `of_tag_refusal`, for every door onto a record's tag set; the impl at the
+// foot of this module states only how THIS operation's errors are built.
+use crate::state::TagRefusalError;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -276,7 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation reads.)
         let tags = match crate::state::tags_to_store(input.tags) {
             Ok(tags) => tags,
-            Err(refusal) => return Err(tag_refusal_error(refusal).into()),
+            Err(refusal) => return Err(CreateJobErrorModeled::of_tag_refusal(refusal).into()),
         };
 
         let region = crate::state::request_region(ctx.parts());
@@ -637,20 +642,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled error this operation answers a tag-set refusal with: the request-shaped
-/// one is a bad request and the quota-shaped one the quota error, both worded by
-/// [`crate::state::TagRefusal`] so every door onto a record's tags refuses alike.
-fn tag_refusal_error(refusal: crate::state::TagRefusal) -> CreateJobErrorModeled {
-    let message = Some(refusal.message());
-    match refusal {
-        crate::state::TagRefusal::EmptyKey => {
-            CreateJobErrorModeled::BadRequestException(BadRequestException { message })
-        }
-        crate::state::TagRefusal::PastCap => {
-            CreateJobErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
-                message,
-            })
-        }
+/// How this operation's modelled errors state a tag-set refusal. Which refusal is which
+/// error, and the sentence each states, belong to [`crate::state::TagRefusal`] and its
+/// [`crate::state::TagRefusalError::of_tag_refusal`], so every door onto a record's tags
+/// refuses alike.
+impl TagRefusalError for CreateJobErrorModeled {
+    fn bad_request(message: String) -> Self {
+        Self::BadRequestException(BadRequestException {
+            message: Some(message),
+        })
+    }
+
+    fn quota_exceeded(message: String) -> Self {
+        Self::ServiceQuotaExceededException(ServiceQuotaExceededException {
+            message: Some(message),
+        })
     }
 }
 

@@ -1557,6 +1557,37 @@ impl TagRefusal {
     }
 }
 
+/// What a [`TagRefusal`] needs of ONE operation's modelled error enum: how that operation
+/// states the two errors the refusals map onto.
+///
+/// Every door onto a record's tag set — the four `Create*` paths and `TagResource` — has
+/// its own generated error enum, which is the only part of answering a refusal that
+/// differs between them. So each door states just those two constructors and the
+/// CLASSIFICATION itself lives once, in [`Self::of_tag_refusal`], exactly as the ordering
+/// of a paged listing lives once in [`page_of_records`] over [`PagedRecord`]: a sixth door
+/// gets the mapping by implementing this trait, and no door can carry a different one.
+pub trait TagRefusalError: Sized {
+    /// This operation's modelled `BadRequestException` (HTTP 400), stating `message`.
+    fn bad_request(message: String) -> Self;
+
+    /// This operation's modelled `ServiceQuotaExceededException` (HTTP 402), stating
+    /// `message`.
+    fn quota_exceeded(message: String) -> Self;
+
+    /// The modelled error a door answers `refusal` with, stated ONCE for every door: a tag
+    /// key that names nothing is a problem in the request ([`TagRefusal::EmptyKey`] ->
+    /// `BadRequestException`, HTTP 400) and a tag set past
+    /// [`MAX_TAGS_PER_RESOURCE`] is a quota refusal ([`TagRefusal::PastCap`] ->
+    /// `ServiceQuotaExceededException`, HTTP 402), both worded by [`TagRefusal::message`].
+    fn of_tag_refusal(refusal: TagRefusal) -> Self {
+        let message = refusal.message();
+        match refusal {
+            TagRefusal::EmptyKey => Self::bad_request(message),
+            TagRefusal::PastCap => Self::quota_exceeded(message),
+        }
+    }
+}
+
 /// How this service words the refusal of a tag whose key carries no characters.
 pub fn empty_tag_key_message() -> String {
     "Tags must not contain an empty tag key.".to_string()

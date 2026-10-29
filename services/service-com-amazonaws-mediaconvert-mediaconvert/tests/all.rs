@@ -111,6 +111,8 @@ mod shared_next_token_refusal;
 mod shared_paging;
 #[path = "all/shared_set_selection.rs"]
 mod shared_set_selection;
+#[path = "all/shared_tag_refusal.rs"]
+mod shared_tag_refusal;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/system_job_templates.rs"]
