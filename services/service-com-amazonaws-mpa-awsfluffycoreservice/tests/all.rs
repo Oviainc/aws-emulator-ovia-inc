@@ -87,6 +87,8 @@ mod resource_policies;
 mod resource_tags;
 #[path = "all/seq_token_pagination.rs"]
 mod seq_token_pagination;
+#[path = "all/session_arn_nondisclosure.rs"]
+mod session_arn_nondisclosure;
 #[path = "all/session_cancellation.rs"]
 mod session_cancellation;
 #[path = "all/session_filter_value_bound.rs"]

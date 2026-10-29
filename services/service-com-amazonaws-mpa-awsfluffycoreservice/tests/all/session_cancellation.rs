@@ -18,8 +18,8 @@
 //!   `ConflictException` (409), and the stored record is left as it stood.
 //! * the ARN-addressed boundary every operation of this service shares, applied to a
 //!   WRITE: an ARN outside the caller's account is refused 403 before any lookup, an ARN
-//!   this store holds nothing under is 404 with the one not-found sentence this service
-//!   states, and a value that is not a well-formed MPA ARN is 400 with
+//!   this store holds nothing under is refused 403 too — whether a session exists is not
+//!   disclosed — and a value that is not a well-formed MPA ARN is 400 with
 //!   `state::INVALID_ARN_MESSAGE`.
 //!
 //! The tables span the classes each rule generalises over (the status the session was
@@ -424,8 +424,9 @@ async fn cancelling_one_session_leaves_the_others_outstanding() {
     }
 }
 
-/// A well-formed session ARN this store holds nothing under cannot be cancelled: 404 with
-/// the one not-found sentence this service states, whatever the ARN names.
+/// A well-formed session ARN this store holds nothing under cannot be cancelled: 403 with
+/// the one access-denied sentence this service states, whatever the ARN names — a caller
+/// is never told the session is merely absent.
 #[tokio::test]
 async fn an_unknown_session_arn_cannot_be_cancelled() {
     let harness = Harness::new();
@@ -454,18 +455,18 @@ async fn an_unknown_session_arn_cannot_be_cancelled() {
     for (label, session_arn) in cases {
         let (status, body) = cancel_session(&harness, &session_arn).await;
         assert_eq!(
-            status, 404,
-            "case {label}: expected 404 for {session_arn:?}, got {status} with {body:?}"
+            status, 403,
+            "case {label}: expected 403 for {session_arn:?}, got {status} with {body:?}"
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
+            "AccessDeniedException",
             "case {label}: wrong error code in {body:?}"
         );
         assert_eq!(
             text(&body, "Message"),
-            state::RESOURCE_NOT_FOUND_MESSAGE,
-            "case {label}: wrong not-found message in {body:?}"
+            state::ACCESS_DENIED_MESSAGE,
+            "case {label}: wrong access-denied message in {body:?}"
         );
     }
 

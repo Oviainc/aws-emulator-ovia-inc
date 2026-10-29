@@ -345,8 +345,8 @@ async fn a_deletion_approval_owed_before_its_session_ran_out_is_recorded_first()
                 );
                 let (status, orphan) = get_session(&harness, &session_arn).await;
                 assert_eq!(
-                    status, 404,
-                    "case {label}: a session of a removed team must answer 404, got {status} \
+                    status, 403,
+                    "case {label}: a session of a removed team must answer 403, got {status} \
                      with {orphan:?}"
                 );
             }

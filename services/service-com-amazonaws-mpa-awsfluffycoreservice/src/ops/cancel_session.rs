@@ -19,8 +19,10 @@
 //!   to the one sentence this service answers that class with
 //!   ([`crate::state::INVALID_ARN_MESSAGE`], `ValidationException` 400).
 //! * A session ARN inside the caller's account that this store holds nothing under earns
-//!   `ResourceNotFoundException` (404), with the one not-found sentence this service
-//!   states ([`crate::state::resource_not_found`]).
+//!   the SAME `AccessDeniedException` (403): whether a session exists is not something
+//!   this service discloses, so a cancellation of a session the caller cannot see is
+//!   refused rather than reported as one of an absent session
+//!   ([`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::visible_session`]).
 //! * Only an OUTSTANDING session (`CREATING` or `PENDING`) can be cancelled. The
 //!   operation is `@idempotent`, so a session already `CANCELLED` is a success that writes
 //!   nothing and keeps the completion instant the first call recorded; a session that
@@ -189,14 +191,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         state.materialize_due(now);
 
-        let Some(session) = state.session_mut(&input.session_arn) else {
-            // The one message this service answers every resource lookup that resolves
-            // to nothing with (`crate::state::resource_not_found`).
-            return Err(CancelSessionErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(),
-            )
-            .into());
-        };
+        // Whether a session exists is not disclosed: a session ARN this store holds
+        // nothing under is refused with the same `AccessDeniedException` (403) a session
+        // ARN the caller may not address earns, not with a not-found
+        // (`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::visible_session`).
+        let session = state
+            .visible_session_mut(&input.session_arn)
+            .map_err(CancelSessionErrorModeled::AccessDeniedException)?;
 
         match session.status {
             // An outstanding session is what a cancellation ends, whether it is still

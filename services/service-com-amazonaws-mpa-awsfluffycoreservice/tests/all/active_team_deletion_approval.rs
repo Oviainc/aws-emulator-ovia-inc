@@ -295,8 +295,8 @@ async fn an_active_team_is_deleted_only_after_the_team_approves_it() {
         );
         let (status, orphan) = get_session(&harness, &session_arn).await;
         assert_eq!(
-            status, 404,
-            "case {label}: a session of a removed team must answer 404, got {status} with \
+            status, 403,
+            "case {label}: a session of a removed team must answer 403, got {status} with \
              {orphan:?}"
         );
     }

@@ -171,6 +171,10 @@
 //! * [`authorize_resource_arn`] — an operation that identifies its resource by ARN is
 //!   refused with `AccessDeniedException` (403) when that ARN is outside the caller's
 //!   own account, whatever is stored under it.
+//! * [`ComAmazonawsMpaAwsfluffycoreserviceState::visible_session`] — an operation
+//!   addressed by a SESSION ARN is refused with `AccessDeniedException` (403) when that
+//!   ARN resolves to no session the caller can see, because this service does not
+//!   disclose whether such a session exists.
 //! * [`ComAmazonawsMpaAwsfluffycoreserviceState::is_management_account`] /
 //!   [`not_management_account`] — an operation an organization restricts to its
 //!   management account is refused the same way for any other caller.
@@ -182,7 +186,10 @@
 //! through these constructors instead of formatting prose of its own:
 //!
 //! * [`resource_not_found`] — the one message every ARN-addressed resource lookup in
-//!   this service answers with ([`RESOURCE_NOT_FOUND_MESSAGE`]).
+//!   this service answers with ([`RESOURCE_NOT_FOUND_MESSAGE`]), for the resources whose
+//!   existence it does report.
+//! * [`access_denied`] / [`ACCESS_DENIED_MESSAGE`] — the one message a lookup whose
+//!   resource's existence this service does NOT disclose is refused with.
 //! * [`tagged_resource_not_found`] — the tag family's not-found, whose message IS the
 //!   `ResourceArn` the request sent.
 //! * [`invalid_arn`] / [`INVALID_ARN_MESSAGE`] — the one message a member that should
@@ -3371,6 +3378,30 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
         self.sessions.get_mut(arn)
     }
 
+    /// The session an operation ADDRESSED BY A SESSION ARN may act on, or the refusal a
+    /// `SessionArn` that resolves to no session this caller can see earns.
+    ///
+    /// Whether a session exists is not something this service tells a caller: a session
+    /// ARN this store holds nothing under is an AUTHORIZATION refusal
+    /// ([`access_denied`], 403) and never the not-found an ARN-addressed team, policy,
+    /// identity source or tagged resource answers ([`resource_not_found`], 404) — so the
+    /// answer to a session ARN cannot be read as "that session is gone" by a caller who
+    /// may simply not be permitted to see it. The ONE place that decision is made, so
+    /// every session-addressed operation refuses alike.
+    pub fn visible_session(&self, arn: &str) -> Result<&Session, AccessDeniedException> {
+        self.session(arn).ok_or_else(access_denied)
+    }
+
+    /// The session an operation addressed by a session ARN may act on, for update — the
+    /// write path's half of [`Self::visible_session`], refused identically, so a mutation
+    /// of a session the caller cannot see is never reported as one of an absent session.
+    pub fn visible_session_mut(
+        &mut self,
+        arn: &str,
+    ) -> Result<&mut Session, AccessDeniedException> {
+        self.session_mut(arn).ok_or_else(access_denied)
+    }
+
     /// Record a session, replacing any entry under the same ARN.
     pub fn insert_session(&mut self, session: Session) {
         self.sessions.insert(session.arn.clone(), session);
@@ -3718,6 +3749,30 @@ pub fn not_management_account() -> AccessDeniedException {
     AccessDeniedException {
         message: "Action can only be performed by an organization\u{2019}s management account."
             .to_string(),
+    }
+}
+
+/// The one message this service refuses a caller it does not tell whether the addressed
+/// resource exists with.
+///
+/// `AccessDeniedException$Message` is `@required` with `@length(max: 1000)` and the model
+/// fixes no text for it, so the rule is RECORDED behaviour: the refusal is this one bare
+/// sentence, with no part taken from the request — naming neither the operation, nor the
+/// caller, nor the ARN asked for, because a refusal that quoted any of them would be the
+/// very disclosure it exists to withhold.
+pub const ACCESS_DENIED_MESSAGE: &str = "Access Denied.";
+
+/// The `AccessDeniedException` (403) a lookup whose resource's EXISTENCE this service does
+/// not disclose answers with: [`ACCESS_DENIED_MESSAGE`].
+///
+/// Raised where the answer must not depend on whether the resource is stored — see
+/// [`ComAmazonawsMpaAwsfluffycoreserviceState::visible_session`], the one resolution of a
+/// `SessionArn` — rather than for the account boundary, which is decided from the ARN
+/// alone and is worded by [`cross_account_access_denied`].
+#[must_use]
+pub fn access_denied() -> AccessDeniedException {
+    AccessDeniedException {
+        message: ACCESS_DENIED_MESSAGE.to_string(),
     }
 }
 

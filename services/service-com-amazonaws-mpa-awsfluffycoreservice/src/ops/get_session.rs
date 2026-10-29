@@ -4,7 +4,9 @@
 //! Reports one stored approval session, looked up by ARN in [`crate::state`]. A session
 //! ARN outside the caller's own account is refused with `AccessDeniedException` (403)
 //! BEFORE the lookup ([`crate::state::authorize_resource_arn`]); an ARN inside it that no
-//! stored session carries earns `ResourceNotFoundException` (404).
+//! stored session carries earns the SAME `AccessDeniedException` (403), because this
+//! service does not disclose whether a session a caller cannot see exists
+//! ([`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::visible_session`]).
 //!
 //! Every member is read off the stored [`crate::state::Session`] that
 //! `StartApprovalTeamBaseline` recorded — the one place a session of this service comes
@@ -215,15 +217,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.materialize_due(::std::time::SystemTime::now());
 
-        let Some(session) = state.session(&input.session_arn) else {
-            // The one message this service answers every resource lookup that resolves
-            // to nothing with: a service constant that names neither the operation nor
-            // the ARN asked for (`crate::state::resource_not_found`).
-            return Err(GetSessionErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(),
-            )
-            .into());
-        };
+        // Whether a session exists is not disclosed: a session ARN this store holds
+        // nothing under is refused with the same `AccessDeniedException` (403) a session
+        // ARN the caller may not address earns, not with a not-found
+        // (`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::visible_session`).
+        let session = state
+            .visible_session(&input.session_arn)
+            .map_err(GetSessionErrorModeled::AccessDeniedException)?;
 
         let crate::state::StoredApprovalStrategy::MofN {
             min_approvals_required,

@@ -8,8 +8,9 @@
 //! * a session is a STORED record. `StartApprovalTeamBaseline` records one against the
 //!   team its ARN names and `GetSession` reports every member off that record, so a
 //!   session ARN the store holds answers with the team, the strategy, the approvers and
-//!   the timestamps that were recorded, and a session ARN it does not hold answers 404
-//!   with the one not-found sentence this service states — whatever the ARN's shape.
+//!   the timestamps that were recorded, and a session ARN it does not hold answers 403
+//!   with the one access-denied sentence this service states — whatever the ARN's shape,
+//!   because whether a session exists is not disclosed.
 //! * the ARN-addressed boundary every read of this service shares: an ARN outside the
 //!   caller's account is refused 403 BEFORE the lookup, and a value that is not a
 //!   well-formed MPA ARN is refused 400 with `state::INVALID_ARN_MESSAGE`.
@@ -704,10 +705,11 @@ async fn the_team_read_reports_the_approver_s_outstanding_baseline_session() {
     }
 }
 
-/// A well-formed session ARN this store holds nothing under answers 404 with the one
-/// not-found sentence this service states — whatever the ARN names.
+/// A well-formed session ARN this store holds nothing under answers 403 with the one
+/// access-denied sentence this service states — whatever the ARN names. Whether a session
+/// exists is not disclosed, so the refusal is an authorization one.
 #[tokio::test]
-async fn an_unknown_session_arn_is_not_found() {
+async fn an_unknown_session_arn_is_denied() {
     let harness = Harness::new();
     let team_arn = active_team(&harness, "known-team", 1, 1).await;
     let (status, started) = start_baseline(&harness, &team_arn, None).await;
@@ -737,18 +739,18 @@ async fn an_unknown_session_arn_is_not_found() {
     for (label, session_arn) in cases {
         let (status, body) = get_session(&harness, &session_arn).await;
         assert_eq!(
-            status, 404,
-            "case {label}: expected 404 for {session_arn:?}, got {status} with {body:?}"
+            status, 403,
+            "case {label}: expected 403 for {session_arn:?}, got {status} with {body:?}"
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
+            "AccessDeniedException",
             "case {label}: wrong error code in {body:?}"
         );
         assert_eq!(
             text(&body, "Message"),
-            state::RESOURCE_NOT_FOUND_MESSAGE,
-            "case {label}: wrong not-found message in {body:?}"
+            state::ACCESS_DENIED_MESSAGE,
+            "case {label}: wrong access-denied message in {body:?}"
         );
     }
 }
@@ -923,10 +925,10 @@ async fn a_baseline_request_the_team_cannot_answer_is_refused() {
 }
 
 /// A session cannot outlive the team it asks: once the team has approved its deletion and
-/// the pending window has elapsed, the team is gone and its sessions answer the same 404
-/// the team does.
+/// the pending window has elapsed, the team is gone — the team read answers 404 and its
+/// sessions answer the 403 every session ARN this store holds nothing under earns.
 #[tokio::test]
-async fn a_session_of_a_removed_team_is_not_found() {
+async fn a_session_of_a_removed_team_is_denied() {
     let harness = Harness::new();
     let team_arn = active_team(&harness, "doomed-team", 1, 1).await;
     let (status, started) = start_baseline(&harness, &team_arn, None).await;
@@ -941,12 +943,12 @@ async fn a_session_of_a_removed_team_is_not_found() {
 
     let (status, body) = get_session(&harness, &session_arn).await;
     assert_eq!(
-        status, 404,
-        "case the team is gone: expected 404, got {status} with {body:?}"
+        status, 403,
+        "case the team is gone: expected 403, got {status} with {body:?}"
     );
     assert_eq!(
         error_code(&body),
-        "ResourceNotFoundException",
+        "AccessDeniedException",
         "case the team is gone: wrong error code in {body:?}"
     );
     let (status, body) = get_team(&harness, &team_arn).await;
