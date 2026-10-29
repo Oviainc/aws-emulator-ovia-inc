@@ -11,8 +11,11 @@
 //! `updateType` saying what to do with the component the key names:
 //! `componentUpdates` is keyed by component name and
 //! `compositeComponentUpdates` by the `componentPath` of a composite component
-//! (resolved by [`crate::state::resolve_composite_component_path`], the one
-//! path rule a create and an update share) — `CREATE` adds the component,
+//! (the stored record the path names, through
+//! [`crate::state::stored_composite_component_path`], or else the declaration
+//! it resolves through — [`crate::state::resolve_composite_component_path`],
+//! the one path rule a create and an update share for a composite component
+//! that does not exist yet) — `CREATE` adds the component,
 //! `UPDATE` patches the one that is there, `DELETE` removes it, and removing
 //! one takes with it whatever is addressed THROUGH it: a component's composite
 //! components, and the composite components declared below a composite one. An
@@ -474,10 +477,18 @@ fn apply_component_update(
 
 /// Apply one `compositeComponentUpdates` entry to the entity being patched.
 ///
-/// The key is the composite component's `componentPath`, resolved against the
+/// The key is the composite component's `componentPath`, read against the
 /// entity's components as they stand after the `componentUpdates` have been
-/// applied and against the workspace's component types — the same resolution a
-/// create uses, so one path rule answers both.
+/// applied: a path the entity already HOLDS a composite component at names that
+/// stored record ([`crate::state::stored_composite_component_path`], the
+/// resolution every reader of a `componentPath` uses), and only a path holding
+/// no record yet is resolved through the component types'
+/// `compositeComponentTypes` declarations
+/// ([`crate::state::resolve_composite_component_path`]) — the same resolution a
+/// create uses, so one path rule answers both writers. A stored composite
+/// component therefore stays updatable and removable however the holding
+/// component type's declarations have moved since it was created, which is what
+/// keeps every record this entity holds removable by the writer that owns it.
 fn apply_composite_component_update(
     workspace: &crate::state::Workspace,
     entity: &mut crate::state::Entity,
@@ -485,21 +496,20 @@ fn apply_composite_component_update(
     update: CompositeComponentUpdateRequest,
 ) -> Result<(), UpdateEntityError> {
     let member = format!("{COMPOSITE_MEMBER}.{component_path}");
-    let resolved = crate::state::resolve_composite_component_path(
-        &entity.components,
-        &workspace.component_types,
-        COMPOSITE_MEMBER,
-        component_path,
-    )
-    .map_err(validation)?;
-    let exists = entity
-        .components
-        .get(&resolved.component_name)
-        .is_some_and(|component| {
-            component
-                .composite_components
-                .contains_key(&resolved.composite_path)
-        });
+    let stored = crate::state::stored_composite_component_path(&entity.components, component_path);
+    // A record the entity holds is what the path names; a declaration is what a
+    // composite component that does not exist yet has to be resolved through.
+    let exists = stored.is_some();
+    let resolved = match stored {
+        Some(resolved) => resolved,
+        None => crate::state::resolve_composite_component_path(
+            &entity.components,
+            &workspace.component_types,
+            COMPOSITE_MEMBER,
+            component_path,
+        )
+        .map_err(validation)?,
+    };
     let action = map_entry_action(
         &member,
         update.update_type.as_deref(),

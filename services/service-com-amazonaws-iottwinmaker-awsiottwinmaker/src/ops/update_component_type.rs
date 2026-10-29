@@ -372,6 +372,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(validation_exception(message));
             }
         }
+        // A declaration this patch DROPS is not checked against the entities
+        // standing on it, and needs no check: a composite component an entity
+        // already stores is a record of its own, addressed through the store by
+        // every reader and by its writer alike
+        // (`crate::state::stored_composite_component_path`), so it stays
+        // readable, patchable and removable after the declaration that produced
+        // it is gone. The declarations are what a composite component is brought
+        // INTO BEING through, which is why only the ones this request declares
+        // are resolved above.
         // The property groups, by contrast, are checked over the WHOLE patched
         // record whenever this request touches the set of properties they can
         // resolve against — the groups themselves, the own definitions, or the

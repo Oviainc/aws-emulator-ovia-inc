@@ -53,6 +53,9 @@ mod component_type_update_references;
 #[path = "all/composite_component_inherited_declaration.rs"]
 mod composite_component_inherited_declaration;
 
+#[path = "all/composite_component_stranded_declaration.rs"]
+mod composite_component_stranded_declaration;
+
 #[path = "all/entity_component_type_filter.rs"]
 mod entity_component_type_filter;
 

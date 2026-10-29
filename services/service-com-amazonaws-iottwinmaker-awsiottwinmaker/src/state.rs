@@ -3533,11 +3533,14 @@ pub fn component_type_chain_in<'a>(
 /// the reason, built from the request so the refusal names the member and the
 /// segment that failed to resolve.
 ///
-/// Shared by every writer of an entity's composite components, so a create and
-/// an update hold one path to one rule. `member` is the request member the path
-/// arrived in (`compositeComponents` on a create,
+/// Shared by every writer that BRINGS a composite component into being, so a
+/// create and an update hold one path to one rule. `member` is the request
+/// member the path arrived in (`compositeComponents` on a create,
 /// `compositeComponentUpdates` on an update), so a refusal names the member the
-/// caller has to fix rather than another operation's.
+/// caller has to fix rather than another operation's. A path that names a
+/// composite component the entity ALREADY HOLDS is answered from the store
+/// instead ([`stored_composite_component_path`]): the declarations are what a
+/// NEW composite component needs, not what keeps a stored one addressable.
 ///
 /// Two limits are deliberate, both inherited from how this service stores
 /// component types. A path of a single segment names a top-level component and
@@ -3615,6 +3618,42 @@ pub fn resolve_composite_component_path(
         composite_path: segments[1..].join(COMPONENT_PATH_SEPARATOR),
         composite_name: segments[segments.len() - 1].to_string(),
         component_type_id,
+    })
+}
+
+/// The composite component an entity ALREADY STORES at a `ComponentPath`,
+/// resolved from the STORE rather than from the component types.
+///
+/// A stored composite component is a record of its own: it carries the
+/// `componentTypeId` it instantiates, and the entity holds it under the path
+/// below its component whatever the holding component type declares TODAY. So
+/// a path that names a record the entity holds is answerable without the
+/// declarations — exactly how every reader of a `componentPath` answers it
+/// ([`component_at_path`]) — and a writer addressing an EXISTING composite
+/// component resolves it here, while [`resolve_composite_component_path`]
+/// stays the rule for a path that has to be resolved against the declarations
+/// because no record stands at it yet (a create). Without this, a component
+/// type patch that drops a `compositeComponentTypes` declaration would leave
+/// the composite components standing on it readable but unwritable: nothing
+/// could update or remove a record the store still holds and the reference scan
+/// ([`Workspace::component_type_references`]) still counts.
+///
+/// `None` when the entity holds no composite component at the path, including
+/// when the path names no composite component at all (a single segment).
+pub fn stored_composite_component_path(
+    components: &BTreeMap<String, ComponentRecord>,
+    component_path: &str,
+) -> Option<ResolvedComponentPath> {
+    let (component_name, composite_path) = component_path.split_once(COMPONENT_PATH_SEPARATOR)?;
+    let composite = components
+        .get(component_name)?
+        .composite_components
+        .get(composite_path)?;
+    Some(ResolvedComponentPath {
+        component_name: component_name.to_string(),
+        composite_path: composite_path.to_string(),
+        composite_name: composite.component_name.clone(),
+        component_type_id: composite.component_type_id.clone(),
     })
 }
 
