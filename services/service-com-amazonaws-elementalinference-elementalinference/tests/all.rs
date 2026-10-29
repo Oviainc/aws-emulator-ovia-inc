@@ -77,6 +77,8 @@ mod resource_tagging;
 mod resource_untagging;
 #[path = "all/response_members.rs"]
 mod response_members;
+#[path = "all/shared_create_quota_rule.rs"]
+mod shared_create_quota_rule;
 #[path = "all/shared_pagination_rules.rs"]
 mod shared_pagination_rules;
 #[path = "all/state_roundtrip.rs"]

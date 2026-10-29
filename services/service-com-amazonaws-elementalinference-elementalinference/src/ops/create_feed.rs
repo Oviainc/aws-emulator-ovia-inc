@@ -366,7 +366,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // state by another record, which is also what the real service answers once
         // that Region's feed quota is exhausted. Another Region's feeds neither consume
         // this Region's quota nor are consumed by it, and the refusal states the bound
-        // it was decided from (`crate::state::feed_quota_refusal`).
+        // it was decided from. WHICH clauses a create is held to and in which order live
+        // in `crate::state::create_quota_refusal`, the one statement of the rule both of
+        // this service's creates follow; `feed_quota_refusal` supplies the feed store,
+        // the feed quota and this resource kind's sentences.
         if let Some(message) = state.feed_quota_refusal(&region) {
             return Err(CreateFeedErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException { message },

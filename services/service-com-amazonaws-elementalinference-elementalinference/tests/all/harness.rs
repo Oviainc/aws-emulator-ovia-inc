@@ -369,20 +369,37 @@ pub fn expected_tags(tags: &[(String, String)]) -> BTreeMap<String, String> {
     tags.iter().cloned().collect()
 }
 
-/// The create body of `kind`, named `name` and carrying `tags` — the smallest resource of
-/// either kind, so a suite about TAGS states nothing else about the resource.
-pub fn tagged_create_body(kind: &str, name: &str, tags: &[(String, String)]) -> Value {
+/// The `language` every dictionary a suite creates is tagged with, when the language is
+/// not what it is testing: one value of the modelled `DictionaryLanguage` enum, which
+/// `CreateDictionary` requires.
+pub const DICTIONARY_LANGUAGE: &str = "eng";
+
+/// The path one resource kind is CREATED under (`OPERATIONS.md`: `POST /v1/feed`,
+/// `POST /v1/dictionary`).
+pub fn create_path(kind: &str) -> String {
+    format!("/v1/{kind}")
+}
+
+/// The smallest create body of `kind` named `name`: a feed with one enabled cropping
+/// output ([`minimal_feed`]), a dictionary with just its required language — the resource
+/// a suite creates when the resource's own shape is not what it is testing.
+pub fn create_body(kind: &str, name: &str) -> Value {
     match kind {
-        "feed" => json!({
-            "name": name,
-            "outputs": [
-                {"name": "crop1", "outputConfig": output_config("cropping"), "status": "ENABLED"}
-            ],
-            "tags": tag_object(tags),
-        }),
-        "dictionary" => json!({"name": name, "language": "eng", "tags": tag_object(tags)}),
+        "feed" => minimal_feed(name),
+        "dictionary" => json!({"name": name, "language": DICTIONARY_LANGUAGE}),
         other => panic!("no such resource kind: {other}"),
     }
+}
+
+/// The create body of `kind`, named `name` and carrying `tags` — the smallest resource of
+/// either kind ([`create_body`]) with a tag set on it, so a suite about TAGS states
+/// nothing else about the resource.
+pub fn tagged_create_body(kind: &str, name: &str, tags: &[(String, String)]) -> Value {
+    let mut body = create_body(kind, name);
+    body.as_object_mut()
+        .expect("a create body is a JSON object")
+        .insert("tags".to_string(), tag_object(tags));
+    body
 }
 
 /// Create one resource of `kind` carrying `tags`, and return its id and its ARN.
@@ -407,7 +424,7 @@ pub async fn create_tagged_resource_in(
 ) -> (String, String) {
     let body = tagged_create_body(kind, name, tags);
     let (status, created) =
-        call_in_region(router, region, "POST", &format!("/v1/{kind}"), Some(body)).await;
+        call_in_region(router, region, "POST", &create_path(kind), Some(body)).await;
     assert_eq!(
         status, 202,
         "creating a {kind} named {name:?} in {region:?} answers 202, got {status} with {created}"

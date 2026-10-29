@@ -30,11 +30,14 @@
 //!   output;
 //! * "This name must not resemble an ARN" — the member's own pattern admits `:` and
 //!   `/`, so the boundary validator cannot enforce that one;
-//! * the request supplies "an array of one or more outputs" (`AssociateFeedRequest$
-//!   outputs`), so a list carrying none is refused with the modelled
-//!   `ValidationException` (`crate::state::MISSING_OUTPUTS_MESSAGE`), exactly as it is
-//!   refused of the operations that replace a feed's stored list; the list shape carries
-//!   no `@length`, so the boundary validator cannot decide that one either;
+//! * the request's outputs are "an array of one or more outputs that you want to add to
+//!   this feed now, to supplement any outputs that you specified when you created or
+//!   updated the feed" (`AssociateFeedRequest$outputs`), and this is a PATCH, where
+//!   "parameters that you don't include will not be affected": a list that adds no output
+//!   leaves the feed holding exactly the outputs it already held, so it is SERVED and the
+//!   claim it carries is taken — only the rules about the values the list does carry apply
+//!   (`crate::state::first_duplicate_output_name`), the same ones the operations that
+//!   REPLACE a feed's stored list are held to;
 //! * an appended output that names another resource — a dictionary, or a fixture of the
 //!   data source — is stored only when that id resolves, so an append cannot leave a
 //!   feed carrying a reference to nothing
@@ -238,37 +241,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // The request SUPPLIES a feed's output list, so the list is held to the rules
-        // every operation that carries one is held to, decided from the request's own
-        // members: the list carries at least one output ("An array of one or more outputs
-        // that you want to add to this feed now", `AssociateFeedRequest$outputs`), and an
-        // output's name identifies it within the list — "You can't modify an existing
-        // output (for example to change its name). Instead, use UpdateFeed", so two
-        // outputs named alike in one request cannot both be appended. Which rules, in
-        // which order and with which message live in
-        // `crate::state::supplied_output_list_refusal`, the one statement the operations
-        // that REPLACE a stored list go through too, so none of them can come to disagree
-        // with the others; all this handler adds is the modelled error class each refusal
-        // is reported as. The bound on the list is NOT one of them: an append is bounded
-        // by the stored length plus what it really adds, which only the stored feed can
-        // say, so that one is decided further down.
-        if let Some(refusal) = crate::state::supplied_output_list_refusal(
+        // The request SUPPLIES outputs to APPEND, so the rules it is held to are the ones
+        // about the values it carries, decided from the request's own members: an output's
+        // name identifies it within the feed — "You can't modify an existing output (for
+        // example to change its name). Instead, use UpdateFeed" — so two outputs named
+        // alike in one request cannot both be appended. The scan and the sentence are the
+        // ones every operation that carries a feed's output list goes through
+        // (`crate::state::first_duplicate_output_name`,
+        // `crate::state::duplicate_output_name_message`, reached by the operations that
+        // REPLACE the list through `crate::state::output_list_refusal`), so none of them
+        // can come to disagree with the others; all this handler adds is the modelled
+        // error class — a ConflictException, since the request's own values conflict.
+        //
+        // The CARDINALITY of the list is not one of those rules here: an append
+        // "supplement[s] any outputs that you specified when you created or updated the
+        // feed" and this operation is a PATCH, so a list that adds no output leaves the
+        // feed holding the outputs it already holds — at least one, which the create made
+        // sure of — and the call is served, taking the claim alone. The bound is not one
+        // of them either: an append is bounded by the stored length plus what it really
+        // adds, which only the stored feed can say, so that one is decided further down.
+        if let Some(name) = crate::state::first_duplicate_output_name(
             input.outputs.iter().map(|output| output.name.as_str()),
         ) {
-            let message = refusal.message();
-            return Err(match refusal {
-                crate::state::OutputListRefusal::MissingOutputs => {
-                    AssociateFeedErrorModeled::ValidationException(ValidationException { message })
-                }
-                crate::state::OutputListRefusal::DuplicateName(_) => {
-                    AssociateFeedErrorModeled::ConflictException(ConflictException { message })
-                }
-                crate::state::OutputListRefusal::TooManyOutputs => {
-                    AssociateFeedErrorModeled::ServiceQuotaExceededException(
-                        ServiceQuotaExceededException { message },
-                    )
-                }
-            }
+            return Err(AssociateFeedErrorModeled::ConflictException(ConflictException {
+                message: crate::state::duplicate_output_name_message(name),
+            })
             .into());
         }
 

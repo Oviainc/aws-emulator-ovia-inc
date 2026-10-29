@@ -8,15 +8,18 @@
 //! runs, and the response is serialized as `restJson1` — so what these tests assert is
 //! what a client sees.
 //!
-//! THE RULE under test: an operation whose request carries a feed's output list requires
-//! at least one output in it — a create "must specify at least one output"
-//! (`CreateFeedRequest$outputs`), an update's list is the one the feed is left holding,
-//! and a claim supplies "an array of one or more outputs that you want to add to this
-//! feed now" (`AssociateFeedRequest$outputs`) — so a list carrying none is refused with
-//! the modelled `ValidationException` (HTTP 400) and one invariant sentence, whichever
-//! operation carried it and whatever else the request says, and nothing is written. The
-//! list shape carries no `@length`, so the boundary validator decides none of this and
-//! the service's own rule does.
+//! THE RULE under test: a feed always HOLDS at least one output ("The key contents of the
+//! feed is an array of outputs"; a create "must specify at least one output",
+//! `CreateFeedRequest$outputs`), so an operation whose list would leave the feed holding
+//! none refuses it with the modelled `ValidationException` (HTTP 400) and one invariant
+//! sentence, whatever else the request says, and writes nothing. That is the operations
+//! which SET the whole list: `CreateFeed`, which mints it, and `UpdateFeed`, whose list is
+//! the one the feed is left holding. An APPEND is not one of them: `AssociateFeed`
+//! supplies outputs "to supplement any outputs that you specified when you created or
+//! updated the feed" and is a PATCH, where "parameters that you don't include will not be
+//! affected", so a list that adds no output leaves the feed holding exactly the outputs it
+//! already held and the claim is SERVED. The list shape carries no `@length`, so the
+//! boundary validator decides none of this and the service's own rule does.
 //!
 //! Both halves are asserted over a TABLE whose rows differ along what the rule
 //! generalises over: which operation carries the list, the optional members the request
@@ -251,6 +254,11 @@ fn empty_list_cases() -> Vec<EmptyListCase> {
             claimed: true,
             extra: json!({}),
         },
+    ]
+}
+
+fn empty_append_cases() -> Vec<EmptyListCase> {
+    vec![
         EmptyListCase {
             label: "a claim of a feed no resource holds yet",
             supplier: Supplier::Associate { dry_run: false },
@@ -289,8 +297,8 @@ fn empty_list_cases() -> Vec<EmptyListCase> {
     ]
 }
 
-/// A request that supplies no output at all is refused by every operation that carries a
-/// feed's output list, with one invariant sentence — and writes nothing.
+/// A request whose list would leave the feed holding no output at all is refused by every
+/// operation that SETS the whole list, with one invariant sentence — and writes nothing.
 #[tokio::test]
 async fn a_supplied_output_list_carrying_no_output_is_refused_by_every_operation() {
     let mut sentences: Vec<String> = Vec::new();
@@ -342,6 +350,71 @@ async fn a_supplied_output_list_carrying_no_output_is_refused_by_every_operation
         "the rule is about the shape of the request, so every row answers one sentence, got \
          {sentences:?}"
     );
+}
+
+/// An APPEND that carries no output is SERVED: the feed keeps the outputs it already
+/// holds — so the list leaves it holding at least one — and the claim the request carries
+/// is taken, while a dry run of the same request leaves the feed exactly as it was.
+#[tokio::test]
+async fn an_appended_output_list_carrying_no_output_is_served() {
+    for case in empty_append_cases() {
+        let label = case.label;
+        let dry_run = matches!(case.supplier, Supplier::Associate { dry_run: true });
+        let router = router();
+        let id = stored_feed(&router, label, case.held, case.claimed).await;
+        let before = get_feed(&router, label, &id).await;
+        let feeds_before = feed_count(&router, label).await;
+
+        let (status, body) = supply(&router, case.supplier, &id, &json!([]), &case.extra).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: a list that adds no output is served with HTTP 200, got {status} \
+             with {body}"
+        );
+        assert_eq!(
+            (&body["id"], &body["arn"]),
+            (&before["id"], &before["arn"]),
+            "case {label:?}: the claim answers for the feed it named, got {body}"
+        );
+
+        // Nothing was minted, and the feed holds exactly the outputs it held before: an
+        // append of none adds none, and takes none away.
+        assert_eq!(
+            feed_count(&router, label).await,
+            feeds_before,
+            "case {label:?}: the claim minted no feed"
+        );
+        let after = get_feed(&router, label, &id).await;
+        assert_eq!(
+            output_names(&after),
+            output_names(&before),
+            "case {label:?}: the feed holds the outputs it held before ({:?}), got {:?}",
+            before["outputs"],
+            after["outputs"]
+        );
+
+        if dry_run {
+            // "Elemental Inference will validate that the real request would succeed
+            // without actually making any changes": the whole record is as it was.
+            assert_eq!(
+                after, before,
+                "case {label:?}: a dry run persists nothing, so the feed is as it was \
+                 ({before}), got {after}"
+            );
+            continue;
+        }
+
+        // The real call took the claim the request carried, which is the only thing a
+        // list adding no output leaves it to do.
+        assert_eq!(
+            (&after["status"], &after["association"]),
+            (
+                &json!("ACTIVE"),
+                &json!({"associatedResourceName": CLAIMING_RESOURCE})
+            ),
+            "case {label:?}: the claimed feed reports ACTIVE and its association, got {after}"
+        );
+    }
 }
 
 /// The control: a list carrying one output or more is SERVED by each of those operations,

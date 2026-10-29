@@ -67,7 +67,7 @@
 //! [`ComAmazonawsElementalinferenceElementalinferenceState::clear_fixtures`]) still
 //! installs or drops records, and no request mutates what a later caller sees.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
@@ -386,32 +386,35 @@ pub fn too_many_outputs_message() -> String {
     )
 }
 
-/// A request that supplies a feed's output list and carries NO output in it.
+/// A request whose output list would leave a feed holding NO output at all.
 ///
-/// Every operation whose request carries a feed's output list documents that list as
-/// carrying at least one output — a create "must specify at least one output"
-/// (`CreateFeedRequest$outputs`), an update's list is the one the feed is left holding,
-/// and an append is "an array of one or more outputs that you want to add to this feed
-/// now" (`AssociateFeedRequest$outputs`) — so an empty list is a request that supplies
-/// no output at all and is refused whichever operation carried it. The rule is about the
-/// shape of the request rather than about any one value it carried, so the message is
-/// the rule's invariant sentence and interpolates nothing.
+/// "The key contents of the feed is an array of outputs", and a create "must specify at
+/// least one output" (`CreateFeedRequest$outputs`), so a feed always holds one: the
+/// operations that SET the feed's whole list — `CreateFeed`, which mints it, and
+/// `UpdateFeed`, whose list is the one the feed is left holding — refuse an empty list,
+/// because the feed it describes holds nothing. An APPEND is not one of them: it leaves
+/// the feed holding what it already holds, so a list that adds nothing takes nothing
+/// away either (see [`appended_output_list_refusal`]). The rule is about the shape of the
+/// request rather than about any one value it carried, so the message is the rule's
+/// invariant sentence and interpolates nothing.
 pub const MISSING_OUTPUTS_MESSAGE: &str = "You must specify at least one output.";
 
 /// Why a supplied output list is not one a feed may hold.
 ///
 /// An operation whose request carries a feed's output list holds it to three rules: the
-/// list carries at least one output, an output's name identifies it within the list, and
-/// the list leaves the feed holding no more than [`MAX_OUTPUTS_PER_FEED`] outputs. Which
-/// rules are checked, in which order, and which message and modelled error class each
-/// failure earns are stated ONCE here, so no two operations that carry such a list can
-/// come to disagree about what a feed's outputs may look like. A handler only lifts the
-/// outcome into its own modelled error enum, which is per-operation.
+/// list leaves the feed holding at least one output, an output's name identifies it
+/// within the list, and the feed is left holding no more than [`MAX_OUTPUTS_PER_FEED`]
+/// outputs. Which rules are checked, in which order, and which message and modelled error
+/// class each failure earns are stated ONCE here, so no two operations that carry such a
+/// list can come to disagree about what a feed's outputs may look like — the operations
+/// that REPLACE the list through [`output_list_refusal`] and the one that APPENDS to it
+/// through [`appended_output_list_refusal`]. A handler only lifts the outcome into its
+/// own modelled error enum, which is per-operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputListRefusal<'a> {
-    /// The list is EMPTY, so it describes a feed holding no output
-    /// ([`MISSING_OUTPUTS_MESSAGE`]). Reported as the modelled `ValidationException`
-    /// (HTTP 400).
+    /// The list is EMPTY and would be the feed's WHOLE list, so it describes a feed
+    /// holding no output ([`MISSING_OUTPUTS_MESSAGE`]). Reported as the modelled
+    /// `ValidationException` (HTTP 400).
     MissingOutputs,
     /// The list names one output twice, under the name carried here — the first one it
     /// repeats ([`first_duplicate_output_name`]). Reported as the modelled
@@ -434,45 +437,91 @@ impl OutputListRefusal<'_> {
     }
 }
 
-/// Which refusal, if any, an output list whose entries are named by `names` earns from
-/// the rules EVERY operation whose request carries such a list holds, whether that list
-/// replaces the stored one (`CreateFeed`, `UpdateFeed`) or is appended to it
-/// (`AssociateFeed`).
+/// Which refusal, if any, an output list that REPLACES a feed's whole stored list earns.
 ///
-/// The order is the order the rules are decided in: the SHAPE of the list first (a list
-/// carrying no output supplies none, whatever else the request says), then a name that
-/// is not unique (a property of the request's own values, which an empty list cannot
-/// carry). Both outcomes are decided from the request alone, so a handler can run this
-/// before it takes the store, and `names` is only walked — the caller still owns the
-/// outputs it goes on to store.
+/// The operations that replace the list are `CreateFeed`, which mints it, and
+/// `UpdateFeed`, whose list is the one the feed is left holding, so the list the REQUEST
+/// carries is the list the feed ends up with: all three rules are decided from it alone.
+/// The order below is the order they are decided in: the SHAPE of the list first (a list
+/// carrying no output describes a feed holding none, whatever else the request says), then
+/// a name that is not unique (a property of the request's own values, which an empty list
+/// cannot carry), then the bound on the list the feed would be left holding, which for a
+/// replacement is the request's own length. `names` is only walked, so a handler can run
+/// this before it takes the store and still owns the outputs it goes on to store.
 ///
-/// The bound on a feed's output list is NOT decided here, because it is not a rule about
-/// the request alone: a list that REPLACES the stored one is bounded by its own length
-/// ([`output_list_refusal`]), while an APPEND is bounded by the stored length plus what
-/// it really adds, which only the stored feed can say.
-pub fn supplied_output_list_refusal<'a>(
+/// An APPEND (`AssociateFeed`) is held to the name rule below through the same scan
+/// ([`first_duplicate_output_name`], whose refusal is worded by
+/// [`duplicate_output_name_message`]), and to neither of the other two: a list that adds
+/// no output leaves the feed holding what it already holds, and what an append may leave
+/// the feed holding depends on the stored list, so only that feed can say it.
+pub fn output_list_refusal<'a>(
     names: impl Iterator<Item = &'a str> + Clone,
 ) -> Option<OutputListRefusal<'a>> {
     if names.clone().next().is_none() {
         return Some(OutputListRefusal::MissingOutputs);
     }
-    first_duplicate_output_name(names).map(OutputListRefusal::DuplicateName)
-}
-
-/// Which refusal, if any, an output list that REPLACES a feed's whole stored list earns
-/// — the rules every supplied list is held to ([`supplied_output_list_refusal`]), plus
-/// the bound on the list the feed would be left holding, which for a replacement is the
-/// request's own length.
-///
-/// The operations that replace the list are `CreateFeed` and `UpdateFeed`.
-pub fn output_list_refusal<'a>(
-    names: impl Iterator<Item = &'a str> + Clone,
-) -> Option<OutputListRefusal<'a>> {
-    if let Some(refusal) = supplied_output_list_refusal(names.clone()) {
-        return Some(refusal);
+    if let Some(name) = first_duplicate_output_name(names.clone()) {
+        return Some(OutputListRefusal::DuplicateName(name));
     }
     if names.count() > MAX_OUTPUTS_PER_FEED {
         return Some(OutputListRefusal::TooManyOutputs);
+    }
+    None
+}
+
+/// Which clause of the per-Region create quota refuses one more record of a resource
+/// kind.
+///
+/// A create of EITHER kind is held to the same two-clause rule, so which clauses there
+/// are, which comparison each makes and the order they are decided in are stated once
+/// ([`create_quota_refusal`]) instead of once per kind. Each kind only words the clause
+/// it earned, since the sentence names the resource and the bound it was decided from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateQuotaRefusal {
+    /// The Region already holds as many records of the kind as its quota allows.
+    /// Reported as the modelled `ServiceQuotaExceededException` (HTTP 402).
+    RegionFull,
+    /// The create would open a record in a Region this store holds none of this kind in,
+    /// and the store already partitions this kind across [`MAX_REGIONS`] Regions.
+    /// Reported as the modelled `ServiceQuotaExceededException` (HTTP 402).
+    NewRegionBeyondBound,
+}
+
+/// Which clause of the per-Region create quota rule, if any, refuses one more record in
+/// `region` — `None` while that Region may take one.
+///
+/// The ONE statement of the rule both of this service's creates follow. `regions` is the
+/// Region of every record of the kind the store holds and `max_per_region` that kind's
+/// own bound, so a kind supplies its map and its figure and the rule itself is written
+/// here: a service quota is a PER-REGION figure, so what the Region already holds is what
+/// decides the first clause — another Region's records neither consume it nor are consumed
+/// by it, and a record whose deletion has completed holds nothing, since the record went
+/// with the resource. The second clause is the STORE's own bound rather than a quota of
+/// the service (see [`MAX_REGIONS`]): a Region this store holds no record of the kind in
+/// is a new partition, and there are at most that many. The Region's own quota is decided
+/// FIRST, so a Region that is full is told so whether or not it is also a new partition.
+///
+/// Walks the kind's records once, counting both what `region` holds and how many distinct
+/// Regions the store partitions the kind across.
+pub fn create_quota_refusal<'a>(
+    regions: impl Iterator<Item = &'a str>,
+    region: &str,
+    max_per_region: usize,
+) -> Option<CreateQuotaRefusal> {
+    let mut held_in_region = 0usize;
+    let mut partitions: BTreeSet<&str> = BTreeSet::new();
+    for held in regions {
+        if held == region {
+            held_in_region += 1;
+        }
+        partitions.insert(held);
+    }
+    if held_in_region >= max_per_region {
+        return Some(CreateQuotaRefusal::RegionFull);
+    }
+    // A Region holding no record of the kind is one this store has no partition for yet.
+    if held_in_region == 0 && partitions.len() >= MAX_REGIONS {
+        return Some(CreateQuotaRefusal::NewRegionBeyondBound);
     }
     None
 }
@@ -1161,55 +1210,45 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
     /// The refusal `CreateFeed` answers in `region`, or `None` while that Region may
     /// take one more feed.
     ///
-    /// A service quota is a PER-REGION figure, so what the Region already holds is what
-    /// decides it: another Region's feeds neither consume it nor are consumed by it, and
-    /// a feed whose deletion has completed holds nothing, since the record went with the
-    /// resource ([`Self::feeds_in`]).
-    /// The second clause is the STORE's own bound rather than a quota of the service
-    /// (see [`MAX_REGIONS`]): a Region this store holds no record of is a new partition,
-    /// and there are at most that many. Each refusal states the bound it was decided
-    /// from and reports nothing else about what the account holds.
+    /// WHICH clauses a create is held to, and in which order, is [`create_quota_refusal`]
+    /// — the one rule both of this service's creates follow; this supplies the feed
+    /// store, the feed quota ([`MAX_FEEDS`]) and the sentence each clause is worded with.
+    /// Each refusal states the bound it was decided from and reports nothing else about
+    /// what the account holds.
     pub fn feed_quota_refusal(&self, region: &str) -> Option<String> {
-        let held = self.feeds_in(region).count();
-        if held >= MAX_FEEDS {
-            return Some(format!(
+        let regions = self.feeds.values().map(|feed| feed.region.as_str());
+        create_quota_refusal(regions, region, MAX_FEEDS).map(|refusal| match refusal {
+            CreateQuotaRefusal::RegionFull => format!(
                 "This account already holds the maximum of {MAX_FEEDS} feeds in this Region. \
                  Delete unused feeds or request a quota increase."
-            ));
-        }
-        let new_partition = !self.feeds.values().any(|feed| feed.region == region);
-        if new_partition && self.feed_region_count() >= MAX_REGIONS {
-            return Some(format!(
+            ),
+            CreateQuotaRefusal::NewRegionBeyondBound => format!(
                 "This account already holds feeds in the maximum of {MAX_REGIONS} Regions. \
                  Delete the feeds of a Region you no longer use or request a quota increase."
-            ));
-        }
-        None
+            ),
+        })
     }
 
     /// The refusal `CreateDictionary` answers in `region`, or `None` while that Region
     /// may take one more dictionary — the dictionary's counterpart of
-    /// [`Self::feed_quota_refusal`], against [`MAX_DICTIONARIES`].
+    /// [`Self::feed_quota_refusal`], on the same rule ([`create_quota_refusal`]) against
+    /// the dictionary store and [`MAX_DICTIONARIES`].
     pub fn dictionary_quota_refusal(&self, region: &str) -> Option<String> {
-        let held = self.dictionaries_in(region).count();
-        if held >= MAX_DICTIONARIES {
-            return Some(format!(
-                "This account already holds the maximum of {MAX_DICTIONARIES} dictionaries in \
-                 this Region. Delete unused dictionaries or request a quota increase."
-            ));
-        }
-        let new_partition = !self
+        let regions = self
             .dictionaries
             .values()
-            .any(|dictionary| dictionary.region == region);
-        if new_partition && self.dictionary_region_count() >= MAX_REGIONS {
-            return Some(format!(
+            .map(|dictionary| dictionary.region.as_str());
+        create_quota_refusal(regions, region, MAX_DICTIONARIES).map(|refusal| match refusal {
+            CreateQuotaRefusal::RegionFull => format!(
+                "This account already holds the maximum of {MAX_DICTIONARIES} dictionaries in \
+                 this Region. Delete unused dictionaries or request a quota increase."
+            ),
+            CreateQuotaRefusal::NewRegionBeyondBound => format!(
                 "This account already holds dictionaries in the maximum of {MAX_REGIONS} \
                  Regions. Delete the dictionaries of a Region you no longer use or request a \
                  quota increase."
-            ));
-        }
-        None
+            ),
+        })
     }
 
     /// The feed a `CreateFeed` request has ALREADY minted in `region`, if this store
@@ -1275,26 +1314,6 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
                 && dictionary.entries == entries
                 && &dictionary.tags == tags
         })
-    }
-
-    /// How many distinct Regions this store holds a feed record in, since what this
-    /// bounds is how many PARTITIONS the store holds (see [`MAX_REGIONS`]).
-    fn feed_region_count(&self) -> usize {
-        self.feeds
-            .values()
-            .map(|feed| feed.region.as_str())
-            .collect::<std::collections::BTreeSet<&str>>()
-            .len()
-    }
-
-    /// How many distinct Regions this store holds a dictionary record in, on the same
-    /// rule as [`Self::feed_region_count`].
-    fn dictionary_region_count(&self) -> usize {
-        self.dictionaries
-            .values()
-            .map(|dictionary| dictionary.region.as_str())
-            .collect::<std::collections::BTreeSet<&str>>()
-            .len()
     }
 
     /// The resource a `resourceArn` names IN `region`, if that Region holds it.

@@ -257,7 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The dictionary store is BOUNDED, and a service quota is a PER-REGION figure:
         // past the Region's quota the service refuses the create rather than growing
         // its state by another record, which is also what the real service answers once
-        // that Region's quota is exhausted.
+        // that Region's quota is exhausted. The clauses and their order are the ones
+        // every create of this service is held to
+        // (`crate::state::create_quota_refusal`), read here against the dictionary store
+        // and the dictionary quota.
         if let Some(message) = state.dictionary_quota_refusal(&region) {
             return Err(CreateDictionaryErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException { message },
