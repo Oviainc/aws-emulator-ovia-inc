@@ -279,6 +279,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateWorkloadErrorModeled::ValidationException(exception).into());
         }
 
+        // The lenses this request attaches, each kept once and in the order it first named
+        // them, AS SENT: a lens is one lens however it is spelled, so a list naming one
+        // twice attaches ONE lens and asks for ONE lens review — resolved through the one
+        // place that identity rule lives (`crate::state::distinct_lenses`), the same rule
+        // `AssociateLenses` applies to the lenses it attaches to a stored workload, so
+        // which path a workload's lenses arrived through cannot change the list it reports.
+        let mut lenses = crate::state::distinct_lenses(&input.lenses);
+
         // How many lenses one workload may attach is a QUOTA this emulator sets, not a
         // modelled constraint: `WorkloadLenses` publishes no `@length`, so the boundary
         // validator does not bound the list, and the number this emulator holds to is the
@@ -286,10 +294,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // can be specified", the `LensAliases` doc). It is answered with the modelled
         // `ServiceQuotaExceededException` — "The user has reached their resource quota" —
         // rather than a `ValidationException`, so a caller is not told the model refused a
-        // list the model allows. It is what keeps a STORED workload's lens list, the lens
+        // list the model allows. What it counts is the DISTINCT lenses the workload would
+        // end up reviewed against — the list it would store — as the ceiling
+        // `AssociateLenses` holds a stored workload to counts the distinct lenses it
+        // reviews. It is what keeps a STORED workload's lens list, the lens
         // resolution below and the per-lens work of every read of its lens reviews bounded
         // by something other than the request body size.
-        if input.lenses.len() > crate::state::MAX_LENSES_PER_WORKLOAD {
+        if lenses.len() > crate::state::MAX_LENSES_PER_WORKLOAD {
             return Err(CreateWorkloadErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: format!(
@@ -345,7 +356,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "Industry": &input.industry,
             "IndustryType": &input.industry_type,
             "JiraConfiguration": jira_configuration_fingerprint(input.jira_configuration.as_ref()),
-            "Lenses": &input.lenses,
+            // The lenses as this request attaches them: two requests whose lists differ
+            // only in naming one lens twice ask for the SAME workload, so one token over
+            // both is a retry rather than a conflict.
+            "Lenses": &lenses,
             "NonAwsRegions": &non_aws_regions,
             "Notes": &input.notes,
             "PillarPriorities": &pillar_priorities,
@@ -402,7 +416,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with the original request's result, and over a list the lens quota above has
         // already bounded, so the work it costs is bounded too.
         let now = std::time::SystemTime::now();
-        match store.unapplicable_lenses_refusal(&input.lenses, crate::state::LENSES_MEMBER, now) {
+        match store.unapplicable_lenses_refusal(&lenses, crate::state::LENSES_MEMBER, now) {
             Some(crate::state::LensesRefusal::NotFound(exception)) => {
                 return Err(
                     CreateWorkloadErrorModeled::ResourceNotFoundException(exception).into(),
@@ -458,7 +472,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The merge is LINEAR in the two lens lists: the aliases already attached go into
         // a set once, so the work is |workload lenses| + |template lenses| rather than
         // their product, and neither caller-chosen list length multiplies the other.
-        let mut lenses = input.lenses;
         let mut notes = input.notes;
         // The review content the applied templates contribute to the created workload,
         // by lens alias: a template is applied to PRE-POPULATE the workload's review, so

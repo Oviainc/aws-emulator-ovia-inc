@@ -175,6 +175,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The lenses this request applies, each kept once and in the order it first named
+        // them, AS SENT: a lens is one lens however it is spelled, so a list naming one
+        // twice applies ONE lens and asks for ONE lens review — resolved through the one
+        // place that identity rule lives (`crate::state::distinct_lenses`), the same rule
+        // the sibling `UpdateReviewTemplate` applies to the lenses it attaches to a stored
+        // template, so which path a template's lenses arrived through cannot change the
+        // list it reports. It is what every step below — the quota, the catalog
+        // resolution, the lens reviews and the stored record — is over, so the template's
+        // `Lenses` and its lens reviews cannot disagree about how many lenses it applies.
+        let lenses = crate::state::distinct_lenses(&input.lenses);
+
         // How many lenses one review template may apply is a QUOTA this emulator sets,
         // not a modelled constraint: `ReviewTemplateLenses` publishes no `@length`, so the
         // boundary validator does not bound the list, and the number this emulator holds
@@ -182,10 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`ReviewTemplateLensAliases`, `@length(1, 10)`). It is answered with the modelled
         // `ServiceQuotaExceededException` — "The user has reached their resource quota" —
         // rather than a `ValidationException`, so a caller is not told the model refused a
-        // list the model allows. It is what keeps a STORED template's lens list, and the
-        // work of applying that template to a workload, bounded by something other than
-        // the request body size.
-        if input.lenses.len() > crate::state::MAX_LENSES_PER_REVIEW_TEMPLATE {
+        // list the model allows. What it counts is the DISTINCT lenses the template would
+        // end up applying — the list it would store, which is what a read of the template
+        // reports — so a request naming one lens many times is metered for the one lens it
+        // applies. It is what keeps a STORED template's lens list, and the work of applying
+        // that template to a workload, bounded by something other than the request body
+        // size.
+        if lenses.len() > crate::state::MAX_LENSES_PER_REVIEW_TEMPLATE {
             return Err(CreateReviewTemplateErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: format!(
@@ -205,7 +219,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.tags.unwrap_or_default().into_iter().collect();
         let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
             "Description": &input.description,
-            "Lenses": &input.lenses,
+            // The lenses as this request applies them: two requests whose lists differ
+            // only in naming one lens twice ask for the SAME template, so one token over
+            // both is a retry rather than a conflict.
+            "Lenses": &lenses,
             "Notes": &input.notes,
             "Tags": &tags,
             "TemplateName": &input.template_name,
@@ -260,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // handler has already bounded, and before the template quota below, so a caller
         // learns that its request named no lens rather than that the account is full.
         let now = std::time::SystemTime::now();
-        match store.unapplicable_lenses_refusal(&input.lenses, crate::state::LENSES_MEMBER, now) {
+        match store.unapplicable_lenses_refusal(&lenses, crate::state::LENSES_MEMBER, now) {
             Some(crate::state::LensesRefusal::NotFound(exception)) => {
                 return Err(
                     CreateReviewTemplateErrorModeled::ResourceNotFoundException(exception).into(),
@@ -304,14 +321,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // version of that lens's content as of the instant the lenses above resolved, so
         // the review is pinned to the version it was applied at rather than following
         // whatever `CreateLensVersion` publishes next.
-        let lens_reviews = store.applied_lens_reviews(&input.lenses, now);
+        let lens_reviews = store.applied_lens_reviews(&lenses, now);
         let template_arn = store.mint_review_template_arn(&region);
         let record = crate::state::ReviewTemplateRecord {
             template_arn: template_arn.clone(),
             template_name: input.template_name,
             description: input.description,
             notes: input.notes,
-            lenses: input.lenses,
+            lenses,
             // The account that created the template owns it (`ReviewTemplate$Owner` is an
             // `AwsAccountId`), and this emulator serves one account.
             owner: ::engine::emulator_account_id().to_string(),

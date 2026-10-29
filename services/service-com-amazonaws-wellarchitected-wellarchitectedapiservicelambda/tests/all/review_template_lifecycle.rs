@@ -85,9 +85,10 @@ fn template_of(answer: &Answer) -> Value {
 /// template is projected from its own state, not from one recorded request.
 #[tokio::test]
 async fn a_created_review_template_round_trips_through_get() {
-    // (case, request overrides, questions the applied lenses ask)
-    let cases: Vec<(&str, Value, i64)> = vec![
-        ("minimal", json!({}), FRAMEWORK_LENS_QUESTIONS),
+    // (case, request overrides, questions the applied lenses ask, the `Lenses` the
+    // template reports when they are not the list as sent)
+    let cases: Vec<(&str, Value, i64, Option<Value>)> = vec![
+        ("minimal", json!({}), FRAMEWORK_LENS_QUESTIONS, None),
         (
             "notes-and-tags",
             json!({
@@ -95,8 +96,9 @@ async fn a_created_review_template_round_trips_through_get() {
                 "Tags": { "Env": "test", "Team": "core" },
             }),
             FRAMEWORK_LENS_QUESTIONS,
+            None,
         ),
-        ("no-lenses", json!({ "Lenses": [] }), 0),
+        ("no-lenses", json!({ "Lenses": [] }), 0, None),
         // "For Amazon Web Services official lenses, this is either the lens alias ... or
         // the lens ARN, such as arn:aws:wellarchitected:us-east-1::lens/serverless"
         // (`LensAlias` doc), so both names resolve to the same question set.
@@ -104,7 +106,12 @@ async fn a_created_review_template_round_trips_through_get() {
             "lens-by-arn",
             json!({ "Lenses": ["arn:aws:wellarchitected:us-east-1::lens/wellarchitected"] }),
             FRAMEWORK_LENS_QUESTIONS,
+            None,
         ),
+        // Both names above name ONE lens, so the template applies one lens and reports it
+        // once, under the name the list first used. The identity rule over every spelling
+        // and every path a lens arrives through is pinned by
+        // `super::applied_lens_identity`.
         (
             "lens-named-twice",
             json!({
@@ -114,6 +121,7 @@ async fn a_created_review_template_round_trips_through_get() {
                 ]
             }),
             FRAMEWORK_LENS_QUESTIONS,
+            Some(json!(["wellarchitected"])),
         ),
         // A lens whose content this emulator's AWS-official catalog does not carry asks no
         // questions here, so it adds nothing to the roll-up. The catalog it does carry is
@@ -122,11 +130,13 @@ async fn a_created_review_template_round_trips_through_get() {
             "uncarried-lens-only",
             json!({ "Lenses": ["mergersandacquisitions"] }),
             0,
+            None,
         ),
         (
             "framework-and-uncarried-lens",
             json!({ "Lenses": ["wellarchitected", "mergersandacquisitions"] }),
             FRAMEWORK_LENS_QUESTIONS,
+            None,
         ),
         // `TemplateName` is @length(3, 100) and `Description` @length(3, 250): each at
         // its published minimum, then at its published maximum.
@@ -134,16 +144,19 @@ async fn a_created_review_template_round_trips_through_get() {
             "name-and-description-at-the-minimum-length",
             json!({ "TemplateName": "abc", "Description": "xyz" }),
             FRAMEWORK_LENS_QUESTIONS,
+            None,
         ),
         (
             "name-and-description-at-the-maximum-length",
             json!({ "TemplateName": "n".repeat(100), "Description": "d".repeat(250) }),
             FRAMEWORK_LENS_QUESTIONS,
+            None,
         ),
         (
             "notes-at-the-maximum-length",
             json!({ "Notes": "o".repeat(2084) }),
             FRAMEWORK_LENS_QUESTIONS,
+            None,
         ),
     ];
 
@@ -151,7 +164,7 @@ async fn a_created_review_template_round_trips_through_get() {
     let client = Client::new();
     let mut arns: BTreeSet<String> = BTreeSet::new();
 
-    for (case, overrides, unanswered) in cases {
+    for (case, overrides, unanswered, applied_lenses) in cases {
         let mut request = minimal_template(&format!("template-{case}"), &format!("tok-{case}"));
         for (name, value) in overrides.as_object().expect("overrides are an object") {
             request[name] = value.clone();
@@ -172,13 +185,23 @@ async fn a_created_review_template_round_trips_through_get() {
         let template = template_of(&fetched);
 
         // The members the REQUEST set come back exactly as sent.
-        for name in ["TemplateName", "Description", "Lenses"] {
+        for name in ["TemplateName", "Description"] {
             assert_eq!(
                 template.get(name),
                 request.get(name),
                 "case {case:?}: {name} must round-trip as sent, got {template:?}"
             );
         }
+        // `Lenses` comes back as sent too, except that a list naming one lens several ways
+        // applies that lens once: a lens is one lens however it is spelled.
+        let expected_lenses = applied_lenses
+            .or_else(|| request.get("Lenses").cloned())
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            template.get("Lenses").cloned().unwrap_or(Value::Null),
+            expected_lenses,
+            "case {case:?}: expected Lenses {expected_lenses:?}, got {template:?}"
+        );
         assert_eq!(
             template.get("Notes").cloned().unwrap_or(Value::Null),
             request.get("Notes").cloned().unwrap_or(Value::Null),

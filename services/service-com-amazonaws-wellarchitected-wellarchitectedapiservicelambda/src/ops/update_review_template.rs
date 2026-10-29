@@ -172,19 +172,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
 
         // The lenses the request applies, each kept once and in the order it first named
-        // them, AS SENT: a lens is one lens however it is spelled
-        // (`crate::state::lens_alias` resolves an alias and an ARN to the same lens), so a
-        // list naming one twice asks for ONE review. The name as sent is what is recorded,
-        // because that is the `LensAlias` every read of the template reports. The walk is
-        // over a list `ReviewTemplateLensAliases` bounds at ten entries, so it costs a
-        // constant number of lookups.
-        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        let mut to_associate: Vec<String> = Vec::new();
-        for lens in input.lenses_to_associate.iter().flatten() {
-            if seen.insert(crate::state::lens_alias(lens)) {
-                to_associate.push(lens.clone());
-            }
-        }
+        // them, AS SENT: a lens is one lens however it is spelled, so a list naming one
+        // twice asks for ONE review. Resolved through the one place that identity rule
+        // lives (`crate::state::distinct_lenses`), the same rule the create that mints a
+        // template applies to its `Lenses`, so a template's stored lens list does not
+        // depend on which path its lenses arrived through. The name as sent is what is
+        // recorded, because that is the `LensAlias` every read of the template reports. The
+        // walk is over a list `ReviewTemplateLensAliases` bounds at ten entries, so it
+        // costs a constant number of lookups.
+        let to_associate = crate::state::distinct_lenses(
+            input.lenses_to_associate.as_deref().unwrap_or_default(),
+        );
         let to_disassociate: &[String] = input
             .lenses_to_disassociate
             .as_deref()

@@ -1159,8 +1159,10 @@ pub const MAX_REVIEW_TEMPLATES: usize = 10_000;
 /// (`smithy_query(query="shape", shape="ReviewTemplateLensAliases")`). Because it is an
 /// emulator quota rather than a modelled constraint, `CreateReviewTemplate` answers a
 /// longer list with the modelled `ServiceQuotaExceededException`, not a
-/// `ValidationException`. It is what bounds a STORED template's lens list, and with it
-/// the work of applying that template to a workload.
+/// `ValidationException`. What is counted against it is the DISTINCT lenses the template
+/// would end up applying ([`distinct_lenses`]), which is the list it stores: it is what
+/// bounds a STORED template's lens list, and with it the work of applying that template to
+/// a workload.
 pub const MAX_LENSES_PER_REVIEW_TEMPLATE: usize = 10;
 
 /// The most lenses one `CreateWorkload` request attaches — the same kind of quota as
@@ -1174,7 +1176,9 @@ pub const MAX_LENSES_PER_REVIEW_TEMPLATE: usize = 10;
 /// (`smithy_query(query="shape", shape="LensAliases")`). Being an emulator quota rather
 /// than a modelled constraint, `CreateWorkload` answers a longer list with the modelled
 /// `ServiceQuotaExceededException` — as `CreateReviewTemplate` does for a template's — and
-/// it is what bounds the lens list ONE create attaches, the lens resolution that
+/// what is counted against it is the DISTINCT lenses the workload would end up reviewed
+/// against ([`distinct_lenses`]), which is the list it stores. It is what bounds the lens
+/// list ONE create attaches, the lens resolution that
 /// create runs ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::unapplicable_lenses_refusal`])
 /// and the per-lens work of every read that reports its lens reviews. What bounds the
 /// list a STORED workload carries once further lenses are associated with it is the
@@ -4037,6 +4041,30 @@ pub fn lens_reviews_of(lenses: &[String]) -> BTreeMap<&str, &str> {
         reviews.entry(lens_alias(lens)).or_insert(lens.as_str());
     }
     reviews
+}
+
+/// The lenses a list names, each kept ONCE and in the order the list first named it, AS
+/// SENT.
+///
+/// A lens is one lens however it is spelled — [`lens_alias`] resolves a bare alias, an
+/// official lens ARN and a version-pinned ARN to the same lens — so a list naming one lens
+/// twice names ONE lens, asks for ONE lens review ([`lens_reviews_of`]) and counts ONCE
+/// against a lens quota. The name as sent is what is kept, because that is the `LensAlias`
+/// every read of the resource reports.
+///
+/// One place, because every operation that applies lenses to a resource — a create that
+/// mints it with lenses and an association that adds lenses to the stored one — stores the
+/// list this returns, and the lens list a resource reports and the lens reviews it holds
+/// cannot disagree about which lens is one lens. Linear in the list it is given.
+pub fn distinct_lenses(lenses: &[String]) -> Vec<String> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut distinct: Vec<String> = Vec::new();
+    for lens in lenses {
+        if seen.insert(lens_alias(lens)) {
+            distinct.push(lens.clone());
+        }
+    }
+    distinct
 }
 
 /// The lens a `LensAlias` names, as its bare alias.

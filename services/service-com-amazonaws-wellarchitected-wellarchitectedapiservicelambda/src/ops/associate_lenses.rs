@@ -182,20 +182,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The lenses the request named, each kept once and in the order it first named
-        // them, AS SENT: a lens is one lens however it is spelled
-        // (`crate::state::lens_alias` resolves an alias and an ARN to the same lens), so a
-        // list naming one twice asks for ONE review, and what the per-workload ceiling
-        // counts is the distinct lenses the workload would end up reviewed against. The
-        // name as sent is what is recorded, because that is the `LensAlias` every read of
-        // the workload reports. The walk is over a list the quota above has already
-        // bounded, so it costs a constant number of lookups.
-        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        let mut named: Vec<String> = Vec::with_capacity(input.lens_aliases.len());
-        for lens in &input.lens_aliases {
-            if seen.insert(crate::state::lens_alias(lens)) {
-                named.push(lens.clone());
-            }
-        }
+        // them, AS SENT: a lens is one lens however it is spelled, so a list naming one
+        // twice asks for ONE review, and what the per-workload ceiling counts is the
+        // distinct lenses the workload would end up reviewed against. Resolved through the
+        // one place that identity rule lives (`crate::state::distinct_lenses`), the same
+        // rule the create that mints a workload applies to its `Lenses`. The name as sent
+        // is what is recorded, because that is the `LensAlias` every read of the workload
+        // reports. The walk is over a list the quota above has already bounded, so it costs
+        // a constant number of lookups.
+        let named = crate::state::distinct_lenses(&input.lens_aliases);
 
         let mut store = state.lock();
         // "Associate a lens to a workload": the lenses are a member OF the workload, so the
