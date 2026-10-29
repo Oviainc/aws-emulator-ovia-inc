@@ -177,6 +177,8 @@ mod runtime_management_config;
 mod signing_name_routing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stream_mapping_iterator_age_series.rs"]
+mod stream_mapping_iterator_age_series;
 #[path = "all/tag_resource_arn_constraint.rs"]
 mod tag_resource_arn_constraint;
 #[path = "all/untrusted_name_parsing.rs"]

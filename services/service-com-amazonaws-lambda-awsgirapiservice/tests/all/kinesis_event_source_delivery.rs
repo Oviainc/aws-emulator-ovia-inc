@@ -11,7 +11,7 @@
 //! the MAPPING's — `StartingPosition` is "The position in a stream from which to start
 //! reading", fixed when the mapping is created — so pausing does not move it: records put
 //! while a mapping is paused stay in the shard and are read once it is enabled again. For
-//! every batch it reads, Lambda publishes `IteratorAgeMilliseconds` to the `AWS/Lambda`
+//! every batch it reads, Lambda publishes `IteratorAge` to the `AWS/Lambda`
 //! namespace, dimensioned on the function's name and carrying the unit `Milliseconds`,
 //! equal to how long the newest record of that batch had been sitting in the shard at the
 //! instant the batch was read — so a batch held back behind a paused mapping meters the
@@ -54,7 +54,7 @@ const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 
 /// Where `CreateEventSourceMapping` is bound, and under which `GetEventSourceMapping` and
 /// `UpdateEventSourceMapping` address one mapping.
-const MAPPINGS_URI: &str = "/2015-03-31/event-source-mappings";
+pub(crate) const MAPPINGS_URI: &str = "/2015-03-31/event-source-mappings";
 
 /// The `X-Amz-Target` prefix of the Kinesis service (its `OPERATIONS.md`, "Wire
 /// protocol").
@@ -66,15 +66,15 @@ const CLOUDWATCH_TARGET_PREFIX: &str = "GraniteServiceVersion20100801";
 /// How long a wait for work the mapping has to do — a batch read, or a datapoint
 /// appearing — is given before the row is a failure. Well above the poll interval and the
 /// state-settle span, so a row fails only when the mapping did not do the work at all.
-const BUDGET: Duration = Duration::from_secs(20);
+pub(crate) const BUDGET: Duration = Duration::from_secs(20);
 
 /// How long between two looks while waiting.
-const LOOK_AGAIN: Duration = Duration::from_millis(50);
+pub(crate) const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
 /// What the two-sided bound on a metered age allows for: the instant a record is stamped
 /// with is taken inside `PutRecords`, the age is measured when the batch is read and the
 /// series is read later still, so neither side of the bound is exact to the millisecond.
-const SKEW: f64 = 1_500.0;
+pub(crate) const SKEW: f64 = 1_500.0;
 
 /// One row: how a mapping's position is fixed, and what happens to the records.
 struct Row {
@@ -97,7 +97,7 @@ struct Row {
 /// Lambda, Kinesis and CloudWatch on one engine: the mapping's event source is a stream
 /// and the series it publishes is CloudWatch's, so both are reached in-process — the shape
 /// `core/router/src/lib.rs` mounts them in.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -125,7 +125,12 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// One Lambda call, over its own restJson1 routes.
-async fn lambda(router: &MultiServiceRouter, method: &str, uri: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn lambda(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: &Value,
+) -> (u16, Value) {
     let payload = if body.is_null() {
         Vec::new()
     } else {
@@ -180,7 +185,11 @@ async fn rpc(
 }
 
 /// One Kinesis call.
-async fn kinesis(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn kinesis(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     rpc(
         router,
         "kinesis",
@@ -193,7 +202,11 @@ async fn kinesis(router: &MultiServiceRouter, operation: &str, body: &Value) -> 
 }
 
 /// One CloudWatch call.
-async fn cloudwatch(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn cloudwatch(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     rpc(
         router,
         "monitoring",
@@ -206,7 +219,12 @@ async fn cloudwatch(router: &MultiServiceRouter, operation: &str, body: &Value) 
 }
 
 /// A stream of `shards` shards, waited out to `ACTIVE`; answers its ARN.
-async fn given_stream(router: &MultiServiceRouter, case: &str, name: &str, shards: i64) -> String {
+pub(crate) async fn given_stream(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    shards: i64,
+) -> String {
     let (status, created) = kinesis(
         router,
         "CreateStream",
@@ -245,7 +263,7 @@ async fn given_stream(router: &MultiServiceRouter, case: &str, name: &str, shard
 }
 
 /// A function for a mapping to invoke, waited out to `Active`.
-async fn given_function(router: &MultiServiceRouter, case: &str, name: &str) {
+pub(crate) async fn given_function(router: &MultiServiceRouter, case: &str, name: &str) {
     let package: Vec<u8> = (0..64u16)
         .map(|byte| u8::try_from(byte % 251).unwrap_or(0))
         .collect();
@@ -291,7 +309,12 @@ async fn given_function(router: &MultiServiceRouter, case: &str, name: &str) {
 }
 
 /// Put `count` records to the stream `name` names, each carrying its own payload.
-async fn put_records(router: &MultiServiceRouter, case: &str, name: &str, count: usize) {
+pub(crate) async fn put_records(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    count: usize,
+) {
     let records: Vec<Value> = (0..count)
         .map(|index| {
             json!({
@@ -318,7 +341,7 @@ async fn put_records(router: &MultiServiceRouter, case: &str, name: &str, count:
     );
 }
 
-/// The `IteratorAgeMilliseconds` datapoints CloudWatch holds for one function.
+/// The `IteratorAge` datapoints CloudWatch holds for one function.
 async fn iterator_age_datapoints(
     router: &MultiServiceRouter,
     case: &str,
@@ -349,7 +372,7 @@ async fn iterator_age_datapoints(
     stats["Datapoints"].as_array().cloned().unwrap_or_default()
 }
 
-/// Wait until CloudWatch holds an `IteratorAgeMilliseconds` datapoint for `function`,
+/// Wait until CloudWatch holds an `IteratorAge` datapoint for `function`,
 /// answering them.
 async fn wait_for_iterator_age(
     router: &MultiServiceRouter,

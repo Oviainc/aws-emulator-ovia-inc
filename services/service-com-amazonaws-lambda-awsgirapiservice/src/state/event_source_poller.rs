@@ -25,7 +25,7 @@
 //!   OBSERVABLE rather than skipped.
 //! * EACH BATCH READ IS METERED. The age of the newest record of the batch, at the instant
 //!   the batch was read off the shard, is published as this function's
-//!   `IteratorAgeMilliseconds` ([`crate::state::metrics`]) — so a batch that sat in the
+//!   `IteratorAge` ([`crate::state::metrics`]) — so a batch that sat in the
 //!   shard while the mapping was paused meters that whole wait, and a batch read as its
 //!   records arrive meters almost nothing.
 //! * A BATCH IS CHECKPOINTED PAST ONLY ONCE DELIVERED. An invocation that did not succeed

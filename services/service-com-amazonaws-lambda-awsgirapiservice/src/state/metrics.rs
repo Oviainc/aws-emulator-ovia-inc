@@ -84,7 +84,14 @@ pub const DELETED_EVENT_COUNT_METRIC: &str = "DeletedEventCount";
 
 /// How long the newest record of a batch had been sitting in the shard when the event
 /// source mapping read that batch.
-pub const ITERATOR_AGE_METRIC: &str = "IteratorAgeMilliseconds";
+///
+/// The name is the one Lambda's own series carries in [`METRIC_NAMESPACE`]: `IteratorAge`,
+/// "the age of the last record in the event" for an event source mapping that reads from a
+/// stream. It is NOT the name the stream service uses for the same quantity in its own
+/// namespace — a series is identified by its namespace, its name and its dimensions
+/// together, so a client reading Lambda's backlog age asks for Lambda's name and finds
+/// nothing under any other.
+pub const ITERATOR_AGE_METRIC: &str = "IteratorAge";
 
 /// The unit that age carries: it is a span of milliseconds, which CloudWatch's
 /// `StandardUnit` spells `Milliseconds`.
