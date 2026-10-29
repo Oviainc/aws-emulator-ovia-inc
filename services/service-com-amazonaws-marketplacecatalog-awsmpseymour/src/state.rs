@@ -2767,6 +2767,9 @@ pub fn is_assessment_id(value: &str) -> bool {
 /// are the caller's: this service serves one catalog, whatever region a caller
 /// signs for, so they do not select the record.
 pub fn assessment_id_of<'a>(identifier: &'a str, catalog: &str) -> Option<&'a str> {
+    if !(1..=ASSESSMENT_IDENTIFIER_MAX).contains(&identifier.chars().count()) {
+        return None;
+    }
     if is_assessment_id(identifier) {
         return Some(identifier);
     }
@@ -2803,10 +2806,20 @@ pub fn assessment_id_of<'a>(identifier: &'a str, catalog: &str) -> Option<&'a st
 /// pattern constrains only the SHAPE of an ARN, so one naming another service's
 /// namespace or another catalog satisfies it while naming no assessment of this
 /// catalog, and such an identifier is refused too.
+///
+/// The modelled pattern states no length either, so the shape's
+/// `@length(min: 1, max: 2048)` ([`ASSESSMENT_IDENTIFIER_MAX`]) is enforced by
+/// [`assessment_id_of`] beside it — the string stays the one the model declares
+/// and the service quotes.
 pub const ASSESSMENT_IDENTIFIER_PATTERN: &str = concat!(
     r"^(assessment-[a-zA-Z0-9]+|arn:[a-zA-Z0-9-]+:[a-zA-Z0-9-]+:[a-zA-Z0-9-]*:",
     r"[0-9]*:[a-zA-Z0-9-]+/Assessment/assessment-[a-zA-Z0-9]+)$"
 );
+
+/// How long an `AssessmentIdentifier` may be: that shape's modelled
+/// `@length(min: 1, max: 2048)`, which [`ASSESSMENT_IDENTIFIER_PATTERN`] does
+/// not state, so the bound is enforced where the identifier is read.
+pub const ASSESSMENT_IDENTIFIER_MAX: usize = 2048;
 
 /// The modelled `ValidationException` payload for an `AssessmentIdentifier` that
 /// is neither of the forms [`assessment_id_of`] resolves — built from the
@@ -3374,9 +3387,30 @@ pub fn entity_type_of(reference: &str) -> &str {
     reference.split('@').next().unwrap_or(reference)
 }
 
+/// How long any member of this service that names an entity, an entity type or
+/// a revision of one may be: the `@length(max: …)` the model puts on every one
+/// of those shapes — `EntityType`, `Identifier`, `EntityId` and the wider
+/// `ResourceId` all carry `@length(min: 1, max: 255)`
+/// (`smithy_query(query="shape", shape="Entity,Identifier,EntityType,EntityId")`).
+///
+/// A member whose boundary validation this service replaces with a predicate of
+/// its own is still bounded by it: the predicate stands in for the whole
+/// constraint, length included, so no value past it is accepted, stored or
+/// served back in a shape that forbids it.
+pub const ENTITY_MEMBER_MAX: usize = 255;
+
 /// Whether `reference` is an `Entity$Type`: one of [`ENTITY_TYPES`], on its own
-/// or at a version (`<EntityType>@<version>`).
+/// or at a version (`<EntityType>@<version>`), within the modelled
+/// [`ENTITY_MEMBER_MAX`] characters the member is bounded by.
+///
+/// The length is judged on the whole reference, which is the value the member
+/// carries: a type this catalog has at a version long enough to take the
+/// reference past that bound is a reference no `EntityType` can hold, so it is
+/// refused rather than stored and reported back out of contract.
 pub fn is_entity_type_reference(reference: &str) -> bool {
+    if !(1..=ENTITY_MEMBER_MAX).contains(&reference.chars().count()) {
+        return false;
+    }
     match reference.split_once('@') {
         Some((entity_type, version)) => {
             is_entity_type(entity_type) && is_entity_type_version(version)
@@ -3406,6 +3440,12 @@ fn is_entity_type_version(version: &str) -> bool {
 /// wider than the modelled `Identifier` `@pattern` (`^[\w\-@]+$`) in the
 /// characters they admit (`.` and `/`) and narrower in their shape, so the
 /// model's pattern is not what a caller is told to satisfy.
+///
+/// The string states no length: it is the syntax this service's own recorded
+/// refusals quote, and they quote it with the unbounded runs written here. The
+/// member's modelled `@length` is a requirement all the same, so
+/// [`is_entity_identifier`] enforces [`ENTITY_MEMBER_MAX`] beside this pattern
+/// rather than inside it.
 pub const ENTITY_IDENTIFIER_PATTERN: &str =
     r"(^[a-zA-Z0-9][.a-zA-Z0-9/-]+[a-zA-Z0-9](@\d+)?$)|(^\$[a-zA-Z]{1,72}\.Entity\.Identifier$)";
 
@@ -3417,7 +3457,14 @@ const CHANGE_REFERENCE_SUFFIX: &str = ".Entity.Identifier";
 ///
 /// Only the change-reference alternative begins with `$` — no entity id does —
 /// so that character is what decides which alternative a value is read as.
+///
+/// The modelled [`ENTITY_MEMBER_MAX`] bounds the whole value, whichever
+/// alternative it is read as, so an identifier past it is refused here — before
+/// any entity is looked up — rather than reported missing.
 pub fn is_entity_identifier(value: &str) -> bool {
+    if !(1..=ENTITY_MEMBER_MAX).contains(&value.chars().count()) {
+        return false;
+    }
     if let Some(rest) = value.strip_prefix('$') {
         return rest
             .strip_suffix(CHANGE_REFERENCE_SUFFIX)
@@ -3628,6 +3675,12 @@ pub fn invalid_page_token() -> ValidationException {
 /// The form an entity id takes, as the model's own `EntityId` shape states it
 /// (`@pattern("^[a-zA-Z0-9][.a-zA-Z0-9/-]+[a-zA-Z0-9]$")`).
 ///
+/// The pattern states no length, and is reported verbatim in the refusal — the
+/// form this service's own recorded refusals quote. The shape's
+/// `@length(min: 1, max: 255)` ([`ENTITY_MEMBER_MAX`]) is a requirement all the
+/// same, so [`is_entity_id`] enforces it beside this pattern rather than inside
+/// it.
+///
 /// `EntityId` is the shape every member that NAMES an entity targets —
 /// `EntityRequest$EntityId`, the `EntityDetails` / `Errors` map keys of
 /// `BatchDescribeEntities`, `ValidationExceptionField$EntityId` — so it is this
@@ -3642,8 +3695,12 @@ pub const ENTITY_ID_PATTERN: &str = "^[a-zA-Z0-9][.a-zA-Z0-9/-]+[a-zA-Z0-9]$";
 /// Whether `value` is an entity id: [`ENTITY_ID_PATTERN`], spelled out as a
 /// predicate — an alphanumeric first and last character with one or more
 /// alphanumeric, `.`, `/` or `-` characters between them (so the shortest entity
-/// id is three characters long).
+/// id is three characters long), the whole id within the modelled
+/// [`ENTITY_MEMBER_MAX`].
 pub fn is_entity_id(value: &str) -> bool {
+    if value.chars().count() > ENTITY_MEMBER_MAX {
+        return false;
+    }
     let mut middle = value.chars();
     let (Some(first), Some(last)) = (middle.next(), middle.next_back()) else {
         return false;

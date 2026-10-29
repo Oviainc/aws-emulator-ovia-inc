@@ -59,7 +59,9 @@ const CATALOG_PATTERN: &str =
 
 /// The syntax the service publishes for an `Entity$Identifier`: an entity id optionally
 /// at a revision, or the `$<ChangeName>.Entity.Identifier` reference one change uses to
-/// name the entity another change of the same change set creates.
+/// name the entity another change of the same change set creates. The published syntax
+/// states no length; the modelled `Identifier` `@length(min: 1, max: 255)` is a
+/// requirement beside it.
 const ENTITY_IDENTIFIER_PATTERN: &str =
     r"(^[a-zA-Z0-9][.a-zA-Z0-9/-]+[a-zA-Z0-9](@\d+)?$)|(^\$[a-zA-Z]{1,72}\.Entity\.Identifier$)";
 

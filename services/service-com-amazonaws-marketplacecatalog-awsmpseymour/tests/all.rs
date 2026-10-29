@@ -45,6 +45,8 @@ mod entity_reads;
 mod entity_type_projections;
 #[path = "all/filter_validation.rs"]
 mod filter_validation;
+#[path = "all/modelled_member_lengths.rs"]
+mod modelled_member_lengths;
 #[path = "all/page_size_rule.rs"]
 mod page_size_rule;
 #[path = "all/page_token_rule.rs"]
