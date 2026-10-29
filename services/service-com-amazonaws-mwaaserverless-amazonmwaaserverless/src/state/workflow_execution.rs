@@ -25,6 +25,11 @@
 //!   declared as dependencies have finished. The run finishes in the modelled `SUCCESS`
 //!   status with no `ErrorMessage`, which is the outcome `WorkflowRunDetail$ErrorMessage`
 //!   documents ("This value is null if the run completed successfully").
+//! * Which of the values the definition DECLARES each instance reports: a value read out
+//!   of the caller's definition is reported only when it is one the modelled member that
+//!   carries it can hold, so an operator name outside that member is not reported at all
+//!   and an unreportable task identifier makes the graph unbuildable, because an instance
+//!   is reported BY its identifier.
 //! * A graph that CANNOT be ordered is a workflow definition no run of it can execute: a
 //!   task that depends on a task the definition does not declare, a dependency cycle, two
 //!   tasks declaring one identifier, a task identifier outside what the modelled
@@ -43,7 +48,7 @@
 use std::collections::HashMap;
 
 use super::workflow_definition::{self, TaskDeclaration, MAX_DECLARED_TASKS};
-use super::{ConstrainedValue, M_TASK_INSTANCE_ID};
+use super::{ConstrainedValue, M_OPERATOR_NAME, M_TASK_INSTANCE_ID};
 
 /// The most characters a run's `ErrorMessage` carries: the modelled length of the
 /// `GenericString` it targets (`smithy_query(query="shape", shape="WorkflowRunDetail")`
@@ -61,7 +66,7 @@ pub struct PlannedTask {
     /// `TaskId`: the task in the workflow definition this instance executes.
     pub task_id: String,
     /// `OperatorName`: the operator the definition declared for the task, when it
-    /// declared one.
+    /// declared one this service can REPORT (see `reportable_operator_name`).
     pub operator_name: Option<String>,
     /// How many dependency levels deep this task sits: 0 for a task that waits for
     /// nothing, and otherwise one past the deepest task it waits for. Tasks at one level
@@ -217,7 +222,10 @@ fn plan_tasks(declared: &[TaskDeclaration]) -> Result<Vec<PlannedTask>, String> 
         .map(|((task_id, task), level)| PlannedTask {
             task_instance_id: (*task_id).to_string(),
             task_id: (*task_id).to_string(),
-            operator_name: task.operator_name.clone(),
+            operator_name: task
+                .operator_name
+                .clone()
+                .filter(|name| reportable_operator_name(name)),
             level: level.unwrap_or_default(),
         })
         .collect())
@@ -232,6 +240,22 @@ fn plan_tasks(declared: &[TaskDeclaration]) -> Result<Vec<PlannedTask>, String> 
 /// this module's.
 fn reportable_task_id(task_id: &str) -> bool {
     super::validate_members(&[(&M_TASK_INSTANCE_ID, ConstrainedValue::Text(task_id))]).is_empty()
+}
+
+/// Whether a declared operator name is one this service can REPORT:
+/// `GetTaskInstanceResponse$OperatorName` and `TaskInstanceSummary$OperatorName` both
+/// target the modelled `GenericString`, so one check covers both readers of the value.
+///
+/// The check is the same framework constraint walk [`reportable_task_id`] runs, over that
+/// member's own schema ([`super::M_OPERATOR_NAME`]), so the length and pattern are the
+/// model's rather than this module's. An unreportable value is not clipped into one that
+/// fits: a cut operator name names a DIFFERENT operator than the definition declared,
+/// where a cut reason ([`clipped`]) is still the reason. It is left out instead, the
+/// conclusion the snapshot reader reaches for definition content the member that carries
+/// it cannot hold — the task itself still runs, because an operator name is not what an
+/// instance is reported BY.
+fn reportable_operator_name(operator_name: &str) -> bool {
+    super::validate_members(&[(&M_OPERATOR_NAME, ConstrainedValue::Text(operator_name))]).is_empty()
 }
 
 /// `message`, cut to what the modelled `ErrorMessage` can carry

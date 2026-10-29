@@ -2295,6 +2295,25 @@ pub static M_TASK_INSTANCE_ID: Schema = Schema::new_member(
 )
 .with_traits(&ID_STRING_TRAITS);
 
+/// `OperatorName`, which targets `GenericString`.
+///
+/// Unlike its siblings this member is not one a REQUEST carries: it is reported
+/// out of the caller's workflow definition by `GetTaskInstance` and
+/// `ListTaskInstances`, and the walk over this schema is what decides whether a
+/// declared value is one that member can carry (see
+/// [`workflow_execution`]).
+pub static M_OPERATOR_NAME: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$OperatorName",
+        NAMESPACE,
+        "OperatorName",
+    ),
+    ShapeType::String,
+    "OperatorName",
+    17,
+)
+.with_traits(&GENERIC_STRING_TRAITS);
+
 /// `WorkflowVersion` where the operation targets `WorkflowVersion` — a version
 /// IDENTIFIER, exactly 32 characters (`GetWorkflow`, `DeleteWorkflow`).
 pub static M_WORKFLOW_VERSION_ID: Schema = Schema::new_member(

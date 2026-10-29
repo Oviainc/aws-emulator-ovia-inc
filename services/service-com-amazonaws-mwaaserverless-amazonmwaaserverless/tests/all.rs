@@ -65,6 +65,8 @@ mod tag_writes_while_deleting;
 mod task_instance_listing;
 #[path = "all/task_instance_reads.rs"]
 mod task_instance_reads;
+#[path = "all/task_operator_reporting.rs"]
+mod task_operator_reporting;
 #[path = "all/validation_errors.rs"]
 mod validation_errors;
 #[path = "all/workflow_configuration_digest.rs"]
