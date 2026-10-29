@@ -318,18 +318,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Logs: the two refusals are read off the store, so they are taken under its lock
         // and the group is created in the gap between that lock and the insert.
         let enables_delivery = input.cw_log_enabled == Some(true);
-        if enables_delivery {
-            if let Err(denial) = crate::state::cw_log_delivery::caller_may_enable_delivery(
+        if enables_delivery
+            && crate::state::cw_log_delivery::caller_may_enable_delivery(
                 &*self.engine,
                 ctx,
                 &region,
                 &input.name,
-            ) {
-                return Err(CreateAppMonitorErrorModeled::AccessDeniedException(
-                    crate::state::access_denied(&denial),
-                )
-                .into());
-            }
+            )
+            .is_err()
+        {
+            // The same refusal the sibling answers, in the same words: RUM reports the
+            // operation it could not carry out and the app monitor the request named,
+            // not the IAM projection of an action this caller never asked for.
+            return Err(CreateAppMonitorErrorModeled::AccessDeniedException(
+                crate::state::cw_log_delivery::delivery_denied(
+                    crate::state::cw_log_delivery::Doing::Creating,
+                    &input.name,
+                ),
+            )
+            .into());
         }
 
         // The refusals this create is subject to, read off the store under a SHORT

@@ -14,7 +14,10 @@
 //!    install one may not turn delivery on either. The check is an identity-based
 //!    decision in the CloudWatch Logs namespace ([`authorization::LOGS_PUT_RESOURCE_POLICY`])
 //!    against the log group's ARN, and it is made BEFORE anything is written: a refused
-//!    request leaves `CwLogEnabled` exactly as it was.
+//!    request leaves `CwLogEnabled` exactly as it was. The refusal is RUM's own sentence
+//!    ([`delivery_denied`]) from every handler that can turn delivery on, since the caller
+//!    asked for an app-monitor write and never named the CloudWatch Logs action RUM would
+//!    exercise for it.
 //! 2. **the log group is created.** `GetAppMonitor` reports
 //!    `DataStorage.CwLog.CwLogGroup` for a monitor with delivery on, and that name has to
 //!    name a REAL CloudWatch Logs log group — a client that reads it and then tails it,
@@ -76,6 +79,7 @@
 //! which asked for none of this and whose own buffer already holds the batch.
 
 use super::{authorization, StoredRumEvent};
+use crate::ops::types::AccessDeniedException;
 
 /// The most bytes ONE `PutLogEvents` batch may carry, from that operation's documented
 /// quota: "The maximum batch size is 1,048,576 bytes."
@@ -143,6 +147,49 @@ pub fn caller_may_enable_delivery<Eng: Send + Sync + 'static>(
         authorization::LOGS_PUT_RESOURCE_POLICY,
         &super::cw_log_group_arn(region, &log_group),
     )
+}
+
+/// What the refused call was doing to the app monitor, for [`delivery_denied`]: one
+/// variant per handler that can turn `CwLogEnabled` on, so the vocabulary the refusal is
+/// worded in is closed rather than a string a later handler could spell any way it liked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Doing {
+    /// `CreateAppMonitor` was asked to create the monitor with delivery already on. The
+    /// gerund is the create side of the sentence the sibling's refusal is pinned to: the
+    /// crate has the update wording on record and words this one the same way, since one
+    /// check cannot be reported in two vocabularies.
+    Creating,
+    /// `UpdateAppMonitor` was asked to turn delivery on for an existing monitor.
+    Updating,
+}
+
+impl Doing {
+    /// The gerund RUM's sentence carries for this call.
+    fn gerund(self) -> &'static str {
+        match self {
+            Self::Creating => "creating",
+            Self::Updating => "updating",
+        }
+    }
+}
+
+/// RUM's own wording for refusing a call because the caller may not have RUM install the
+/// vended log group's delivery policy ([`caller_may_enable_delivery`]).
+///
+/// The IAM-style projection (`crate::state::access_denied`) reports a refusal of the
+/// action the CALLER itself asked for, naming the principal, that action and its resource.
+/// This precondition is different in kind: the caller asked for an app-monitor write and
+/// never named the CloudWatch Logs action RUM would exercise on its behalf, so RUM reports
+/// the operation it could not carry out, naming the app monitor the request named. One
+/// condition, decided by one check, is therefore reported in ONE vocabulary by every
+/// handler that can turn delivery on.
+pub fn delivery_denied(doing: Doing, app_monitor_name: &str) -> AccessDeniedException {
+    AccessDeniedException {
+        message: format!(
+            "Error {} the application {app_monitor_name}",
+            doing.gerund()
+        ),
+    }
 }
 
 /// Create the vended log group for `app_monitor_name`, so the `CwLogGroup` RUM reports

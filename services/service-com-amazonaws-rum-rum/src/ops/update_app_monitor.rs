@@ -288,11 +288,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_err()
             {
                 // The wording AWS answers this refusal with, built from the request's
-                // `Name` member.
+                // `Name` member — one sentence, shared with the create path
+                // (`crate::state::cw_log_delivery::delivery_denied`).
                 return Err(UpdateAppMonitorErrorModeled::AccessDeniedException(
-                    AccessDeniedException {
-                        message: format!("Error updating the application {}", input.name),
-                    },
+                    crate::state::cw_log_delivery::delivery_denied(
+                        crate::state::cw_log_delivery::Doing::Updating,
+                        &input.name,
+                    ),
                 )
                 .into());
             }
