@@ -43,12 +43,15 @@ const UNTOUCHED_REGION: &str = "eu-west-3";
 
 /// One emulator, called with a SigV4 credential scope per request, so one test drives
 /// several Regions against the one store.
-struct RegionalEmulator {
+///
+/// Shared with [`crate::region_scoped_page_tokens`], so there is ONE multi-Region harness
+/// for this service rather than a copy per file.
+pub(crate) struct RegionalEmulator {
     router: MultiServiceRouter,
 }
 
 impl RegionalEmulator {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signature verification is the emulator's own concern and is exercised
@@ -63,7 +66,7 @@ impl RegionalEmulator {
 
     /// Call one operation as a client signed for `region`, and return its HTTP status and
     /// parsed JSON body.
-    async fn call(&self, region: &str, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, region: &str, operation: &str, body: Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method(http::Method::POST)
             .uri("/")
@@ -100,7 +103,7 @@ impl RegionalEmulator {
 }
 
 /// The published keyspace ARN form, qualified by `region`.
-fn keyspace_arn_in(region: &str, keyspace: &str) -> String {
+pub(crate) fn keyspace_arn_in(region: &str, keyspace: &str) -> String {
     format!(
         "arn:aws:cassandra:{region}:{}:/keyspace/{keyspace}/",
         engine::emulator_account_id()

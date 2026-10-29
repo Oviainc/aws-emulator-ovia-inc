@@ -12,11 +12,12 @@
 //! nothing issued) resumes nothing and is refused with the modelled `ValidationException`
 //! rather than silently skipping items.
 //!
-//! The rows of the table are the three scope-qualified `@paginated` listings this service
-//! models (`ListTables`, `ListTypes` and `ListTagsForResource` — `ListKeyspaces` pages the
-//! account's one unscoped collection and carries no scope half), each over TWO scopes, so
-//! each row's token is foreign to five others and the rule is asserted over the whole
-//! cross product rather than one example.
+//! The rows of the table are the three listings this service models over a collection a
+//! keyspace holds (`ListTables`, `ListTypes` and `ListTagsForResource`), each over TWO
+//! keyspaces of the one Region this suite drives, so each row's token is foreign to five
+//! others and the rule is asserted over the whole cross product rather than one example.
+//! `ListKeyspaces` pages what a REGION holds, and the Region half of every one of these
+//! scopes is driven in [`crate::region_scoped_page_tokens`].
 
 use serde_json::{json, Value};
 use service_com_amazonaws_keyspaces_keyspacesservice::state as keyspaces;
@@ -46,20 +47,28 @@ struct Listing {
 }
 
 /// The `tableName` of a `TableSummary`.
-fn table_name(item: &Value) -> String {
+///
+/// This and the three namers below are shared with [`crate::region_scoped_page_tokens`],
+/// which pages the same kinds of collection once per Region.
+pub(crate) fn table_name(item: &Value) -> String {
     member_string(item, "tableName")
 }
 
 /// A `ListTypes` item, which is the type name itself rather than a structure.
-fn type_name(item: &Value) -> String {
+pub(crate) fn type_name(item: &Value) -> String {
     item.as_str()
         .unwrap_or_else(|| panic!("a types item must be a string, got {item}"))
         .to_string()
 }
 
 /// The `key` of a `Tag`.
-fn tag_key(item: &Value) -> String {
+pub(crate) fn tag_key(item: &Value) -> String {
     member_string(item, "key")
+}
+
+/// The `keyspaceName` of a `KeyspaceSummary`.
+pub(crate) fn keyspace_name(item: &Value) -> String {
+    member_string(item, "keyspaceName")
 }
 
 fn member_string(item: &Value, member: &str) -> String {
@@ -182,8 +191,9 @@ async fn seeded_listings(emulator: &Emulator) -> Vec<Listing> {
             request: json!({"keyspaceName": keyspace}),
             member: "tables",
             item_name: table_name,
-            // `ListTables` qualifies its tokens with the keyspace name alone.
-            token_scope: keyspace.to_string(),
+            // `ListTables` qualifies its tokens with the kind of collection and the
+            // keyspace's own ARN, hex-encoded.
+            token_scope: format!("tables/{}", hex::encode(&arn)),
         });
         listings.push(Listing {
             case: format!("ListTypes of {keyspace}"),
@@ -192,8 +202,8 @@ async fn seeded_listings(emulator: &Emulator) -> Vec<Listing> {
             member: "types",
             item_name: type_name,
             // `ListTypes` pages the same keyspace by a name of the same shape as a table's,
-            // so it prefixes its scope to stay apart from `ListTables`.
-            token_scope: format!("types/{keyspace}"),
+            // so the kind half of its scope is what keeps it apart from `ListTables`.
+            token_scope: format!("types/{}", hex::encode(&arn)),
         });
         listings.push(Listing {
             case: format!("ListTagsForResource of {arn}"),
@@ -201,9 +211,10 @@ async fn seeded_listings(emulator: &Emulator) -> Vec<Listing> {
             request: json!({"resourceArn": arn}),
             member: "tags",
             item_name: tag_key,
-            // The tag listing's scope is the resource ARN, hex-encoded so the scope half
-            // cannot carry the separator whatever the ARN does.
-            token_scope: hex::encode(&arn),
+            // The tag listing's scope is the kind of collection and the resource ARN,
+            // hex-encoded so the scope half cannot carry the separator whatever the ARN
+            // does.
+            token_scope: format!("tags/{}", hex::encode(&arn)),
         });
     }
     listings

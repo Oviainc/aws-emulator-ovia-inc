@@ -84,16 +84,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The scope a `ListTables` resume point is qualified by, which is the keyspace whose
-/// tables the page came from: a token this listing issued resumes only a listing of the
-/// SAME keyspace, and [`crate::state::decode_page_token`] refuses one minted for another.
-///
-/// A `keyspaceName` cannot contain the codec's separator (its modelled pattern is
-/// `^[a-zA-Z0-9][a-zA-Z0-9_]{0,47}$`), so the scope half of the token is unambiguous, and
-/// a listing of the same keyspace by a name of the same shape qualifies its own scope
-/// further rather than colliding with this bare one.
-fn page_token_scope(keyspace_name: &str) -> &str {
-    keyspace_name
+/// The scope a `ListTables` resume point is qualified by, which names the collection the
+/// page came from: the tables of ONE keyspace, named by that keyspace's ARN, which carries
+/// the Region the keyspace is a resource of. A token this listing issued therefore resumes
+/// only a listing of the same keyspace of the same Region — the same `keyspaceName` names a
+/// different keyspace, holding a different set of tables, in another Region — and
+/// [`crate::state::decode_page_token`] refuses one minted for any other collection.
+fn page_token_scope(region: &str, keyspace_name: &str) -> String {
+    crate::state::listing_scope("tables", &crate::state::keyspace_arn(region, keyspace_name))
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -178,22 +176,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx);
 
+        // The collection this call pages, which is what its own tokens are qualified by and
+        // the only collection a token it issued resumes.
+        let scope = page_token_scope(&region, &input.keyspace_name);
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(crate::state::decode_page_token(
-                token,
-                page_token_scope(&input.keyspace_name),
-            )
-            .ok_or_else(
-                || {
+            Some(token) => Some(
+                crate::state::decode_page_token(token, &scope).ok_or_else(|| {
                     ListTablesErrorModeled::ValidationException(ValidationException {
                         message: Some(format!(
-                            "nextToken is not a pagination token this service issued for keyspace '{}'.",
+                            "nextToken is not a pagination token this service issued for \
+                             keyspace '{}'.",
                             input.keyspace_name
                         )),
                     })
-                },
-            )?),
+                })?,
+            ),
         };
 
         let mut store = state.lock();
@@ -227,12 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.max_results,
         );
         let next_token = match truncated {
-            true => page.last().map(|table| {
-                crate::state::encode_page_token(
-                    page_token_scope(&table.keyspace_name),
-                    &table.table_name,
-                )
-            }),
+            true => page
+                .last()
+                .map(|table| crate::state::encode_page_token(&scope, &table.table_name)),
             false => None,
         };
 

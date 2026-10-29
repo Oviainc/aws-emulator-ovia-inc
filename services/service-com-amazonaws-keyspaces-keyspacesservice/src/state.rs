@@ -452,9 +452,9 @@ const PAGE_TOKEN_SEPARATOR: char = '#';
 ///
 /// The `scope` is also what keeps the listings apart. Two listings of this service page
 /// collections whose item names have the same shape, so a token one issued must not resume
-/// the other: a listing whose scope expression could collide with another's qualifies it
-/// further (a prefix no other scope can carry), and [`decode_page_token`] then refuses a
-/// foreign token rather than resuming at a point that would silently skip items.
+/// the other: every scope-qualified listing builds its scope through [`listing_scope`], so
+/// no two name the same scope, and [`decode_page_token`] then refuses a foreign token
+/// rather than resuming at a point that would silently skip items.
 pub fn encode_page_token(scope: &str, item: &str) -> String {
     ::hex::encode(format!("{scope}{PAGE_TOKEN_SEPARATOR}{item}"))
 }
@@ -467,6 +467,29 @@ pub fn decode_page_token(token: &str, scope: &str) -> Option<String> {
     let (token_scope, item) = decoded.split_once(PAGE_TOKEN_SEPARATOR)?;
     (token_scope == scope && !item.is_empty()).then(|| item.to_string())
 }
+
+/// The scope half every scope-qualified listing of this service qualifies its resume points
+/// with: `listing`, which names the collection's KIND, over `collection`, which names the
+/// one collection that kind was paged over.
+///
+/// `collection` has to name that collection completely, and completely includes the Amazon
+/// Web Services Region holding it: every collection this service pages belongs to ONE
+/// Region, and the same resource name names a different collection — holding different
+/// items — in another Region, so a scope that left the Region out would let a token issued
+/// over one Region's collection resume another Region's at a resume point that silently
+/// skips the items sorting at or before it. A resource ARN of this service is such a name
+/// (it carries the Region); for the listing of what a Region itself holds, the Region is.
+///
+/// `collection` is hex-encoded, so the scope half can carry neither
+/// [`PAGE_TOKEN_SEPARATOR`] nor the separator below whatever the ARN or the Region contains,
+/// and the `listing` half keeps two listings over the SAME collection apart.
+pub fn listing_scope(listing: &str, collection: &str) -> String {
+    format!("{listing}{LISTING_SCOPE_SEPARATOR}{}", ::hex::encode(collection))
+}
+
+/// The separator between the two halves of a [`listing_scope`]: the kind of collection, and
+/// the collection itself. No `listing` of this service carries it.
+const LISTING_SCOPE_SEPARATOR: char = '/';
 
 /// The most keyspaces this emulator holds in one Amazon Web Services Region, and — with
 /// [`MAX_TABLES_PER_KEYSPACE`] and [`MAX_REGIONS`] — the caps that bound caller-driven

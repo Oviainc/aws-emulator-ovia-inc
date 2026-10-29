@@ -80,34 +80,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// Encode the resume point of a page as the opaque `nextToken` the caller hands back.
-///
-/// The token names the LAST keyspace on the page just returned, hex-encoded so a caller
-/// is not invited to read a resource name out of it or to assemble one by hand.
-fn encode_page_token(keyspace_name: &str) -> String {
-    ::hex::encode(keyspace_name)
-}
-
-/// The keyspace name a `nextToken` resumes after, or `None` when the token is not one
-/// this operation could have issued — one minted elsewhere resumes nothing here and is
-/// refused rather than silently ignored.
-///
-/// A token this operation issued decodes to a `keyspaceName`, so anything that is not one
-/// is foreign: that rules out the keyspace-qualified tokens `ListTables` mints (a
-/// `keyspaceName` cannot contain `#`) along with every other hand-built string.
-fn decode_page_token(token: &str) -> Option<String> {
-    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    is_keyspace_name(&decoded).then_some(decoded)
-}
-
-/// Whether `value` is a name a keyspace could carry: the modelled `KeyspaceName` length
-/// (`1..48`) and pattern (`^[a-zA-Z0-9][a-zA-Z0-9_]{0,47}$`).
-fn is_keyspace_name(value: &str) -> bool {
-    (1..=48).contains(&value.len())
-        && value.starts_with(|first: char| first.is_ascii_alphanumeric())
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+/// The scope a `ListKeyspaces` resume point is qualified by, which names the collection the
+/// page came from: the keyspaces of ONE Amazon Web Services Region, named by that Region.
+/// "Keyspace names must be unique within each Region" (`CreateKeyspace`), so each Region
+/// holds a collection of its own and a token this listing issued resumes only a listing
+/// signed for the same Region; [`crate::state::decode_page_token`] refuses one minted for
+/// another Region, or by another listing of this service, rather than resuming at a point
+/// that would silently skip keyspaces.
+fn page_token_scope(region: &str) -> String {
+    crate::state::listing_scope("keyspaces", region)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -192,16 +173,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx);
 
+        // The collection this call pages, which is what its own tokens are qualified by and
+        // the only collection a token it issued resumes.
+        let scope = page_token_scope(&region);
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
-                ListKeyspacesErrorModeled::ValidationException(ValidationException {
-                    message: Some(
-                        "nextToken is not a pagination token this operation issued."
-                            .to_string(),
-                    ),
-                })
-            })?),
+            Some(token) => Some(
+                crate::state::decode_page_token(token, &scope).ok_or_else(|| {
+                    ListKeyspacesErrorModeled::ValidationException(ValidationException {
+                        message: Some(
+                            "nextToken is not a pagination token this operation issued."
+                                .to_string(),
+                        ),
+                    })
+                })?,
+            ),
         };
 
         let mut store = state.lock();
@@ -229,7 +215,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.max_results,
         );
         let next_token = match truncated {
-            true => page.last().map(|keyspace| encode_page_token(&keyspace.name)),
+            true => page
+                .last()
+                .map(|keyspace| crate::state::encode_page_token(&scope, &keyspace.name)),
             false => None,
         };
 

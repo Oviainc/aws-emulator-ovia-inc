@@ -85,13 +85,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The scope a `ListTagsForResource` resume point is qualified by: the resource the page's
-/// tags are held on, hex-encoded so the scope half cannot contain the codec's separator
-/// whatever the ARN carries, and so no other listing's scope collides with it. A token this
-/// listing issued therefore resumes only a listing of the SAME resource, and
-/// [`crate::state::decode_page_token`] refuses one minted for another.
+/// The scope a `ListTagsForResource` resume point is qualified by, which names the
+/// collection the page came from: the tags held on ONE resource, named by that resource's
+/// ARN, which carries the Region the resource belongs to. A token this listing issued
+/// therefore resumes only a listing of the SAME resource, and
+/// [`crate::state::decode_page_token`] refuses one minted for another resource or by
+/// another listing of this service.
 fn page_token_scope(resource_arn: &str) -> String {
-    ::hex::encode(resource_arn)
+    crate::state::listing_scope("tags", resource_arn)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
