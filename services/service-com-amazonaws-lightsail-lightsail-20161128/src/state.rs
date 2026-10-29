@@ -12809,6 +12809,20 @@ pub struct RemovedInstance {
     pub released_attachments: Vec<ReleasedAttachment>,
 }
 
+/// The outcome of removing one bucket: the record itself, and every reference
+/// another record held to it that the removal released
+/// (see [`ComAmazonawsLightsailLightsail20161128State::remove_bucket`]).
+#[derive(Debug)]
+pub struct RemovedBucket {
+    /// The bucket record that was removed.
+    pub bucket: StoredBucket,
+    /// One entry per reference the removal released, in the store's own stable
+    /// order: the buckets whose access logs were saved in the removed one, by
+    /// region and name (that map is a `BTreeMap`, so the order is the same on
+    /// every call).
+    pub released_references: Vec<ReleasedAttachment>,
+}
+
 // ---------------------------------------------------------------------------
 // VPC peering
 // ---------------------------------------------------------------------------
@@ -14399,15 +14413,82 @@ impl ComAmazonawsLightsailLightsail20161128State {
         );
     }
 
-    /// Remove the bucket `name` names in `region`, answering it. `None` when
-    /// nothing matched.
+    /// Remove the bucket `name` names in `region`, answering it together with
+    /// every reference the removal released. `None` when nothing matched.
     ///
     /// Only the control-plane RECORD: the bucket's objects live in this emulator's
     /// one object store, which [`release_bucket_object_store`] is what releases
     /// (it takes that store's lock, so it is called with no guard of this store
     /// held).
-    pub fn remove_bucket(&mut self, region: &str, name: &str) -> Option<StoredBucket> {
-        self.buckets.remove(&(region.to_string(), name.to_string()))
+    ///
+    /// One kind of record can hold a live reference to a bucket that the removal
+    /// itself has to release: ANOTHER bucket's access log configuration, whose
+    /// `destination` "can be a Lightsail bucket in the same account, and in the
+    /// same Amazon Web Services Region as the source bucket" — see
+    /// [`Self::release_access_log_destinations`]. A DISTRIBUTION's origin is not
+    /// among them, for the reason spelled out on
+    /// [`Self::release_attachments_to_instance`]: a distribution cannot be left
+    /// holding none, so that reference stands in the delete's way instead.
+    pub fn remove_bucket(&mut self, region: &str, name: &str) -> Option<RemovedBucket> {
+        let bucket = self
+            .buckets
+            .remove(&(region.to_string(), name.to_string()))?;
+        // Released AFTER the record is gone, so the walk cannot reach the bucket
+        // being removed: a bucket whose access logs were saved in itself holds
+        // no reference once its own record is removed, and nothing is logged
+        // against a record this account no longer holds.
+        let released_references = self.release_access_log_destinations(region, name);
+        Some(RemovedBucket {
+            bucket,
+            released_references,
+        })
+    }
+
+    /// Release every access log configuration that saved its logs in the bucket
+    /// `name` in `region`, answering one entry per release so the caller can log
+    /// it.
+    ///
+    /// A bucket's access logs are saved in another bucket of the same account and
+    /// the same Region, and the destination "is required when enabling the access
+    /// log for a bucket, and should be omitted when disabling the access log", so
+    /// a source bucket whose destination this account no longer holds has nowhere
+    /// to write: its configuration returns to the state it has while it names no
+    /// destination — the DISABLED form, exactly the write `UpdateBucket` makes
+    /// when it is asked to turn the access log off. Only buckets of the SAME
+    /// Region are walked, because that is the only Region a destination resolves
+    /// in.
+    ///
+    /// The walk is bounded by [`MAX_BUCKETS`].
+    fn release_access_log_destinations(
+        &mut self,
+        region: &str,
+        name: &str,
+    ) -> Vec<ReleasedAttachment> {
+        let mut released = Vec::new();
+        for ((bucket_region, _), bucket) in self.buckets.iter_mut() {
+            if bucket_region != region
+                || bucket.access_log_config.destination.as_deref() != Some(name)
+            {
+                continue;
+            }
+            bucket.access_log_config = BucketAccessLogConfig {
+                enabled: false,
+                destination: None,
+                prefix: None,
+            };
+            // The configuration lives on the SOURCE bucket's record, so taking
+            // the destination back is the same write `UpdateBucket` makes when
+            // disabling the access log — which is why the release is logged
+            // under that modelled `OperationType`, against the bucket whose
+            // record changed.
+            released.push(ReleasedAttachment {
+                operation_type: OPERATION_TYPE_UPDATE_BUCKET,
+                resource_type: RESOURCE_TYPE_BUCKET,
+                resource_name: bucket.name.clone(),
+                location: bucket.location.clone(),
+            });
+        }
+        released
     }
 
     /// The load balancer `name` names in `region`, for a reporting operation.

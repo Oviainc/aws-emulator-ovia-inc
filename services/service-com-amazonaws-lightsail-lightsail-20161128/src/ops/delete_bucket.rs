@@ -2,8 +2,9 @@
 
 //! @op DeleteBucket
 //! Removes one bucket record from this service's store, releases the object store it was
-//! served from, withdraws the access keys it held, and answers the operation-log entry
-//! the delete wrote. This is the ONLY file to touch for this operation.
+//! served from, withdraws the access keys it held, releases the access log configuration
+//! of every bucket whose logs were saved in it, and answers the operation-log entries the
+//! delete wrote. This is the ONLY file to touch for this operation.
 //!
 //! Without `forceDelete` the delete is refused while the bucket still has any of the
 //! conditions that member documents as needing a force delete — objects, access keys,
@@ -287,10 +288,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // between the two locks another call may have deleted the bucket, and a
             // delete of a bucket that is no longer there is the same 404 as a name that
             // never named one.
-            let bucket = store
+            //
+            // The removal also releases the one live reference another record of
+            // this account can hold to a bucket: another bucket's access log
+            // configuration, whose destination "can be a Lightsail bucket in the
+            // same account, and in the same Amazon Web Services Region as the
+            // source bucket". The release is part of the same step, so no read can
+            // observe an access log saved in a bucket this account no longer holds.
+            let removed = store
                 .remove_bucket(&region, &input.bucket_name)
                 .ok_or_else(|| not_found(&input.bucket_name))?;
-            let access_key_ids: Vec<String> = bucket
+            let access_key_ids: Vec<String> = removed
+                .bucket
                 .access_keys
                 .iter()
                 .map(|key| key.access_key_id.clone())
@@ -303,13 +312,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::OPERATION_TYPE_DELETE_BUCKET,
                 crate::state::RESOURCE_TYPE_BUCKET,
                 &input.bucket_name,
-                &bucket.location,
+                &removed.bucket.location,
                 None,
             );
+            // `operations` is a list because a Lightsail call can act on several
+            // resources at once, and this one did: each reference the removal
+            // released is a mutation of the record that held it, so it is logged
+            // as that record's own update — already done when this call returns,
+            // and so terminal too.
+            let mut operations = vec![operation.view()];
+            for released in &removed.released_references {
+                let entry = store.start_operation(
+                    now,
+                    released.operation_type,
+                    released.resource_type,
+                    &released.resource_name,
+                    &released.location,
+                    None,
+                );
+                operations.push(entry.view());
+            }
             Ok::<_, DeleteBucketError>((
                 access_key_ids,
                 DeleteBucketOutput {
-                    operations: Some(vec![operation.view()]),
+                    operations: Some(operations),
                 },
             ))
         })

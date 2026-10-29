@@ -35,6 +35,8 @@ mod availability_zone_publication;
 mod blueprint_catalog;
 #[path = "all/bucket_access_keys.rs"]
 mod bucket_access_keys;
+#[path = "all/bucket_access_log_destination_delete.rs"]
+mod bucket_access_log_destination_delete;
 #[path = "all/bucket_bundle_update.rs"]
 mod bucket_bundle_update;
 #[path = "all/bucket_bundles.rs"]
