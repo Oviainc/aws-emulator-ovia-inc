@@ -37,6 +37,8 @@ mod firewall_rule_group_deletion;
 mod firewall_rule_group_listing;
 #[path = "all/firewall_rule_group_policies.rs"]
 mod firewall_rule_group_policies;
+#[path = "all/firewall_rule_group_policy_refusal_message.rs"]
+mod firewall_rule_group_policy_refusal_message;
 #[path = "all/firewall_rule_groups.rs"]
 mod firewall_rule_groups;
 #[path = "all/firewall_rules_and_associations.rs"]

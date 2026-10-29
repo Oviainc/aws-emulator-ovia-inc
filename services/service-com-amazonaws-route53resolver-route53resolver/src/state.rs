@@ -636,9 +636,30 @@ pub const MAX_TARGET_IPS: usize = 100;
 /// terminating period.
 ///
 /// `sentence` is passed WITHOUT its final period, so the shape of the message
-/// is decided in exactly one place.
+/// is decided in exactly one place. A fault the service words with more than
+/// one sentence is rendered through [`rslvr_message_sentences`], which this is
+/// the one-sentence case of.
 pub fn rslvr_message(code: &str, sentence: &str) -> String {
-    format!("[{code}] {sentence}.")
+    rslvr_message_sentences(code, &[sentence])
+}
+
+/// Render one Route 53 Resolver exception message whose body is `sentences`:
+/// the service error code in square brackets, a space, and then every sentence
+/// in order, each closed by its own period and separated from the next by a
+/// single space.
+///
+/// A Resolver refusal states the fault it found and, where the service has one,
+/// what the caller has to supply instead; both belong in the one message, so
+/// the number of sentences is the caller's to decide and not the formatter's.
+/// Each sentence is passed WITHOUT its final period, as for [`rslvr_message`].
+pub fn rslvr_message_sentences(code: &str, sentences: &[&str]) -> String {
+    let mut message = format!("[{code}]");
+    for sentence in sentences {
+        message.push(' ');
+        message.push_str(sentence);
+        message.push('.');
+    }
+    message
 }
 
 /// The message Route 53 Resolver answers for a resource the caller named but
@@ -1480,19 +1501,39 @@ pub fn invalid_policy_document(fault: &str) -> InvalidPolicyDocument {
 /// reports through that shape are reported here through the exception this
 /// operation does model.
 ///
-/// The sentence carries the service's code for an invalid IAM policy
+/// The body carries the service's code for an invalid IAM policy
 /// ([`RSLVR_CODE_INVALID_IAM_POLICY`]) and echoes the document it was handed, so
-/// the caller sees exactly which document was refused. WHY it was refused is not
-/// part of it, so one sentence covers a document outside the policy grammar and
-/// one that shares the resource with nobody but its owner.
+/// the caller sees exactly which document was refused, and then the remediation
+/// sentence that states what a document the service WOULD attach has to do
+/// ([`FIREWALL_RULE_GROUP_POLICY_REMEDIATION`]). WHY the document was refused is
+/// not part of it, so the one body covers a document outside the policy grammar
+/// and one that shares the resource with nobody but its owner.
 pub fn invalid_iam_policy(policy: &str) -> ValidationException {
     ValidationException {
-        message: Some(rslvr_message(
+        message: Some(rslvr_message_sentences(
             RSLVR_CODE_INVALID_IAM_POLICY,
-            &format!("The specified IAM policy isn't valid: \"{policy}\""),
+            &[
+                &format!("The specified IAM policy isn't valid: \"{policy}\""),
+                FIREWALL_RULE_GROUP_POLICY_REMEDIATION,
+            ],
         )),
     }
 }
+
+/// The remediation sentence a DNS Firewall rule-group policy refusal closes
+/// with: what a document the service would attach has to do.
+///
+/// It is the only part of the refusal that says what to send instead, and it is
+/// fixed text — it echoes nothing from the request or the store. Carried as a
+/// constant, WITHOUT its final period (as every sentence handed to
+/// [`rslvr_message_sentences`] is), so the refusals of both classes of document
+/// the rule-group policy write rejects cannot word it differently. The model
+/// states no message text for `ValidationException`
+/// (`smithy_query(query="shape",shape="ValidationException")` carries `Message`
+/// alone), so this wording is the recorded behaviour of the operation.
+pub const FIREWALL_RULE_GROUP_POLICY_REMEDIATION: &str =
+    "Provide a valid policy that allows a DNS Firewall rule group to be shared with another AWS \
+     account";
 
 /// The policy document a resource with no stored resource policy reports: the
 /// empty JSON object, a document that states no statement and so shares the
