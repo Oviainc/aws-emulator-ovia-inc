@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePartition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePartition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePartition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes ONE partition of a stored table: the partition the request's `PartitionValues`
+//! address, matched exactly as sent, so no later read of the catalog serves it while the
+//! table's other partitions are left as they were. The whole delete decision lives on the
+//! table (`crate::state::TableEntry::delete_partition`), so this single delete and each
+//! item of `BatchDeletePartition` accept and refuse exactly the same value lists: the
+//! batch reports its refusal as a per-item `ErrorDetail` and this operation raises the
+//! modelled exception that refusal's error code names.
 //!
 //! ## Shape of an operation
 //!
@@ -144,20 +143,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePartition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePartitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePartition"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeletePartitionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // A delete removes a stored definition rather than writing one, so there is no key
+        // for it to be encrypted under and nothing of the catalog's encryption settings to
+        // read: this operation models no encryption failure at all, unlike the partition
+        // create that stores a definition.
+        let mut store = state.lock();
+        let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
+            return Err(DeletePartitionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::database_not_found(
+                        &input.database_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        let database_name = database.name.clone();
+        let Some(table) = database
+            .tables
+            .get_mut(&crate::state::fold_name(&input.table_name))
+        else {
+            return Err(DeletePartitionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        let table_name = table.name.clone();
+        match table.delete_partition(&input.partition_values) {
+            Ok(()) => {
+                ::tracing::info!(
+                    operation = "DeletePartition",
+                    catalog_id = %catalog_id,
+                    database = %database_name,
+                    table = %table_name,
+                    values = ?input.partition_values,
+                    "deleted a Data Catalog partition"
+                );
+                // "Deletes a specified partition": the removal is the whole answer, and
+                // `DeletePartitionResponse` carries no member at all, so nothing of the
+                // removed definition is handed back.
+                Ok(DeletePartitionOutput {})
+            }
+            // The refusal already carries the error code it is reported under and its
+            // wording; this delete raises the modelled exception that code names, so the
+            // single delete and the batch refuse the same value lists for the same reasons.
+            Err(refusal) => {
+                let message = Some(refusal.message());
+                Err(match refusal {
+                    crate::state::PartitionDeleteRefusal::NotFound => {
+                        DeletePartitionErrorModeled::EntityNotFoundException(
+                            EntityNotFoundException {
+                                message,
+                                from_federation_source: None,
+                            },
+                        )
+                    }
+                }
+                .into())
+            }
+        }
     }
 }

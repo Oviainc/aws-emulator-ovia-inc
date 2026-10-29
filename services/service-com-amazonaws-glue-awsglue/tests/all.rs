@@ -109,6 +109,8 @@ mod data_quality_rule_recommendation_runs;
 mod data_quality_rulesets;
 #[path = "all/database_listing.rs"]
 mod database_listing;
+#[path = "all/delete_partition.rs"]
+mod delete_partition;
 #[path = "all/error_messages.rs"]
 mod error_messages;
 #[path = "all/etl_connections.rs"]
