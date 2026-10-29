@@ -262,10 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let vault_type = store
-            .vaults
-            .get(&job.backup_vault_name)
-            .map(|vault| vault.vault_type.clone());
+        let vault_type = store.vault_type_of(&job.backup_vault_name);
 
         Ok(DescribeBackupJobOutput {
             account_id: Some(::engine::emulator_account_id().to_string()),

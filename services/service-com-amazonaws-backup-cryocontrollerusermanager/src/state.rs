@@ -206,6 +206,13 @@ pub const IDEMPOTENCY_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// ([`BackupJob::settles_at`]) so no handler ever sleeps for it.
 pub const JOB_SETTLE_AFTER: Duration = Duration::from_millis(500);
 
+/// How far back a backup-job listing reaches: "Returns a list of existing
+/// backup jobs for an authenticated account for the last 30 days. For a longer
+/// period of time, consider using these monitoring tools" (the `ListBackupJobs`
+/// doc). A DOCUMENTED span, so it is the span the listing uses; a job older
+/// than it is still stored and still reported by a read that names it.
+pub const BACKUP_JOB_LIST_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 /// How long after a create the vault settles from `CREATING` to `AVAILABLE`.
 ///
 /// A CHOSEN span, not a documented one: AWS takes as long as provisioning the
@@ -1292,6 +1299,31 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
                 job.bytes_transferred = job.backup_size_in_bytes;
             }
         }
+    }
+
+    /// The same for every stored job, for an operation that reports them all:
+    /// a list and a describe of the same job can then never disagree about its
+    /// state, its completion instant or how far it got.
+    pub fn settle_jobs(&mut self, now: SystemTime) {
+        let job_ids: Vec<String> = self
+            .backup_jobs
+            .iter()
+            .filter(|(_, job)| job.state == BACKUP_JOB_STATE_CREATED)
+            .map(|(job_id, _)| job_id.clone())
+            .collect();
+        for job_id in job_ids {
+            self.settle_job(&job_id, now);
+        }
+    }
+
+    /// The `VaultType` of the vault a job or recovery point was stored in, or
+    /// `None` when the account no longer holds that vault. Derived from the
+    /// stored vault, so a job read never states a type the vault disagrees
+    /// with.
+    pub fn vault_type_of(&self, vault_name: &str) -> Option<String> {
+        self.vaults
+            .get(vault_name)
+            .map(|vault| vault.vault_type.clone())
     }
 
     /// The same, for the recovery points of ONE vault: the `CREATING` ->

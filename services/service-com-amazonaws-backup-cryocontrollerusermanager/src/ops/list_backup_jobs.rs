@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBackupJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBackupJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBackupJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the backup jobs this account holds, in the order they were started,
+//! after applying the `By*` filters the model declares and the listing window
+//! the operation documents ([`crate::state::BACKUP_JOB_LIST_WINDOW`]). Every
+//! `CREATED` -> `COMPLETED` transition the clock has already made due is
+//! materialised first, through the same step `DescribeBackupJob` uses, so a
+//! listed job and a described one never disagree.
 //!
 //! ## Shape of an operation
 //!
@@ -118,6 +116,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `ByMessageCategory` value the model documents as the wildcard over every
+/// message category ("The wildcard (*) returns count of all message
+/// categories"), so it filters nothing out.
+const MESSAGE_CATEGORY_WILDCARD: &str = "*";
+
+/// The `ByMessageCategory` value that stands for every message category at
+/// once ("AGGREGATE_ALL aggregates job counts for all message categories and
+/// returns the sum"), so it filters nothing out either.
+const MESSAGE_CATEGORY_AGGREGATE_ALL: &str = "AGGREGATE_ALL";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -187,18 +195,199 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBackupJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBackupJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBackupJobs"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        // A page size outside the model's `@range` is this service's own
+        // `InvalidParameterValueException`, answered before anything is read so
+        // the body is the modelled shape carrying `Code` and `Message`.
+        if let Some(refusal) = crate::state::rejected_max_results(input.max_results) {
+            return Err(ListBackupJobsErrorModeled::InvalidParameterValueException(refusal).into());
+        }
+        // The model types `ByResourceArn` as `ARN` with no pattern, so the
+        // framework cannot refuse a malformed one; AWS does, rather than
+        // answering an empty page for a filter it could never match. The check
+        // and its sentence are this service's one ARN rule.
+        if let Some(refusal) = input
+            .by_resource_arn
+            .as_deref()
+            .and_then(|arn| crate::state::rejected_arn("ByResourceArn", arn))
+        {
+            return Err(ListBackupJobsErrorModeled::InvalidParameterValueException(refusal).into());
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListBackupJobsErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let mut store = state.lock();
+        // Every stored job is reported here, so this is the one write this
+        // report performs: a job whose settle instant has passed completed
+        // then, whether or not anybody looked.
+        store.settle_jobs(now);
+
+        // The instant filters are closed over as `SystemTime`, the form the
+        // stored dates are held in.
+        let created_before = input
+            .by_created_before
+            .and_then(|at| ::std::time::SystemTime::try_from(at).ok());
+        let created_after = input
+            .by_created_after
+            .and_then(|at| ::std::time::SystemTime::try_from(at).ok());
+        let complete_before = input
+            .by_complete_before
+            .and_then(|at| ::std::time::SystemTime::try_from(at).ok());
+        let complete_after = input
+            .by_complete_after
+            .and_then(|at| ::std::time::SystemTime::try_from(at).ok());
+        // The oldest job this listing reaches. An instant that far back may not
+        // be expressible, in which case no stored job is outside the window.
+        let window_floor = now.checked_sub(crate::state::BACKUP_JOB_LIST_WINDOW);
+        // This emulator holds exactly one account's jobs, so any other account
+        // id names an account it holds no jobs of.
+        let own_account = input
+            .by_account_id
+            .as_deref()
+            .is_none_or(|account| account == ::engine::emulator_account_id());
+
+        let mut matching: Vec<&crate::state::BackupJob> = if own_account {
+            store
+                .backup_jobs
+                .values()
+                .filter(|job| {
+                    window_floor.is_none_or(|floor| job.creation_date >= floor)
+                        && input
+                            .by_backup_vault_name
+                            .as_deref()
+                            .is_none_or(|vault| job.backup_vault_name == vault)
+                        && input
+                            .by_resource_arn
+                            .as_deref()
+                            .is_none_or(|arn| job.resource_arn == arn)
+                        && input
+                            .by_resource_type
+                            .as_deref()
+                            .is_none_or(|ty| job.resource_type.as_deref() == Some(ty))
+                        && input
+                            .by_state
+                            .as_deref()
+                            .is_none_or(|asked| job.state == asked)
+                        && created_before.is_none_or(|before| job.creation_date <= before)
+                        && created_after.is_none_or(|after| job.creation_date >= after)
+                        // A job that has not completed has no completion
+                        // instant, so a filter on one selects none of them.
+                        && complete_before
+                            .is_none_or(|before| job.completion_date.is_some_and(|at| at <= before))
+                        && complete_after
+                            .is_none_or(|after| job.completion_date.is_some_and(|at| at >= after))
+                        // Nothing in this slice composes backup jobs, so no
+                        // stored job has a parent to match.
+                        && input.by_parent_job_id.is_none()
+                        // A job this slice runs records no `MessageCategory`,
+                        // so a filter naming one selects no job; the two values
+                        // the model documents as standing for every category
+                        // filter nothing out.
+                        && input.by_message_category.as_deref().is_none_or(|category| {
+                            category == MESSAGE_CATEGORY_WILDCARD
+                                || category == MESSAGE_CATEGORY_AGGREGATE_ALL
+                        })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // The order a caller pages through: the order the jobs were started,
+        // with the job id breaking a tie between two started in the same
+        // instant. ONE total order is what makes the id-valued cursor below
+        // resolve to the same position on every request.
+        matching.sort_by(|left, right| {
+            left.creation_date
+                .cmp(&right.creation_date)
+                .then_with(|| left.job_id.cmp(&right.job_id))
+        });
+
+        // The cursor names the first item of the page being asked for.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let key = crate::state::decode_page_token(token);
+                let position =
+                    key.and_then(|key| matching.iter().position(|job| job.job_id == key));
+                let Some(position) = position else {
+                    return Err(ListBackupJobsErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(
+                                "NextToken does not name a page of this result set".to_string(),
+                            ),
+                            ..Default::default()
+                        },
+                    )
+                    .into());
+                };
+                position
+            }
+        };
+        // No `MaxResults` means one page: the model's own maximum. A page size
+        // the model's `@range(1..1000)` refuses was answered above, so the
+        // clamp here only applies the default.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+        let end = start.saturating_add(page_size).min(matching.len());
+        let next_token = matching
+            .get(end)
+            .map(|job| crate::state::encode_page_token(&job.job_id));
+
+        let backup_jobs: Vec<BackupJob> = matching[start..end]
+            .iter()
+            .map(|job| BackupJob {
+                account_id: Some(::engine::emulator_account_id().to_string()),
+                backup_job_id: Some(job.job_id.clone()),
+                backup_vault_name: Some(job.backup_vault_name.clone()),
+                backup_vault_arn: Some(job.backup_vault_arn.clone()),
+                // Derived from the stored vault, through the same step
+                // `DescribeBackupJob` derives it with.
+                vault_type: store.vault_type_of(&job.backup_vault_name),
+                recovery_point_arn: Some(job.recovery_point_arn.clone()),
+                recovery_point_lifecycle: job.lifecycle.clone(),
+                encryption_key_arn: job.encryption_key_arn.clone(),
+                is_encrypted: job.is_encrypted,
+                resource_arn: Some(job.resource_arn.clone()),
+                resource_type: job.resource_type.clone(),
+                creation_date: Some(::aws_smithy_types::DateTime::from(job.creation_date)),
+                completion_date: job.completion_date.map(::aws_smithy_types::DateTime::from),
+                expected_completion_date: Some(::aws_smithy_types::DateTime::from(job.settles_at)),
+                start_by: job.start_by.map(::aws_smithy_types::DateTime::from),
+                state: Some(job.state.clone()),
+                status_message: job.status_message.clone(),
+                percent_done: Some(job.percent_done.clone()),
+                backup_size_in_bytes: Some(job.backup_size_in_bytes),
+                bytes_transferred: Some(job.bytes_transferred),
+                iam_role_arn: Some(job.iam_role_arn.clone()),
+                backup_options: Some(job.backup_options.clone().into_iter().collect()),
+                is_parent: job.is_parent,
+                // Left unset for the reasons `DescribeBackupJob` states: a job
+                // started directly has no backup plan behind it and no parent
+                // or child jobs, and vault lock, backup type, message
+                // categories and the separate initiation instant are reached
+                // only by operations still at 501 or by machinery this slice
+                // does not have.
+                initiation_date: None,
+                created_by: None,
+                vault_lock_state: None,
+                backup_type: None,
+                parent_job_id: None,
+                resource_name: None,
+                message_category: None,
+            })
+            .collect();
+
+        Ok(ListBackupJobsOutput {
+            backup_jobs: Some(backup_jobs),
+            next_token,
+        })
     }
 }
