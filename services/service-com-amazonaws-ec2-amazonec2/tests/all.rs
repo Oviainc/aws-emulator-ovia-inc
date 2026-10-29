@@ -253,6 +253,10 @@ mod byoip_cidr_lifecycle;
 mod byoip_cidrs;
 #[path = "all/capacity_block_offerings.rs"]
 mod capacity_block_offerings;
+// The Capacity Block extension offered for one stored Capacity Block reservation: the window
+// that continues it, the capacity and tenancy it already holds, and what the search refuses.
+#[path = "all/capacity_block_extension_offerings.rs"]
+mod capacity_block_extension_offerings;
 // The availability of the capacity of the account's Capacity Blocks, summed over the
 // Capacity Reservations each block holds its capacity as.
 #[path = "all/capacity_block_status.rs"]

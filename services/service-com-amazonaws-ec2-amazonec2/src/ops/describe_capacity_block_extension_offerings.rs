@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCapacityBlockExtensionOfferings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCapacityBlockExtensionOfferings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCapacityBlockExtensionOfferings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: answers the Capacity Block extension offered for the Capacity Reservation
+//! the request names — the window that continues that block from its own end date for the
+//! requested hours, for the capacity, zone and tenancy the reservation already holds, priced
+//! the way every Capacity Block offering of this service is priced. An extension offering is
+//! DERIVED from the stored reservation rather than stored itself, and its terms travel inside
+//! its id, so this search writes nothing. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +142,211 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCapacityBlockExtensionOfferings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCapacityBlockExtensionOfferingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            availability_zones_in_region, invalid_pagination_token_for, request_region,
+            require_extendable_capacity_reservation, require_service_state,
+        };
+
+        // "available for purchase in the Amazon Web Services Region that you're currently
+        // using" (this operation's own doc), which is the Region of the request's SigV4
+        // credential scope. A Capacity Reservation reserves capacity in one Availability
+        // Zone, so the Region it belongs to is the Region that zone is in.
+        let region = request_region(ctx.parts());
+        let zones = availability_zones_in_region(&region);
+
+        // "The token to use to retrieve the next page of results": this search describes the
+        // ONE Capacity Block the request names, so it answers at most one offering and never
+        // has a page after it — "This value is null when there are no more results to
+        // return" ($NextToken) always holds. A token presented back is therefore one this
+        // operation never issued, and is refused rather than read as a cursor into a set it
+        // never described. It is refused before any member that selects what to report is
+        // looked at, so whether a bogus token is caught never depends on the rest of the
+        // request.
+        if let Some(token) = input.next_token.as_deref() {
+            return Err(invalid_pagination_token_for(token));
+        }
+
+        // "The duration of the Capacity Block extension offering in hours"
+        // (`$CapacityBlockExtensionDurationHours`): an extension of no hours extends the
+        // block by nothing, and one beyond the longest term a Capacity Block is sold for
+        // ([`MAX_CAPACITY_BLOCK_TERM_HOURS`]) is a term nothing is on sale in.
+        let duration_hours = input.capacity_block_extension_duration_hours;
+        if !(1..=MAX_CAPACITY_BLOCK_TERM_HOURS).contains(&duration_hours) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "CapacityBlockExtensionDurationHours must be between 1 and \
+                 {MAX_CAPACITY_BLOCK_TERM_HOURS} hours ({MAX_CAPACITY_BLOCK_TERM_DAYS} days); \
+                 got {duration_hours}"
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // Where the clock stands is OBSERVED, not written: `view_at` derives the
+        // reservation's `State` from what the record already holds, so this report changes
+        // nothing a later caller sees.
+        let now = ::std::time::SystemTime::now();
+
+        // "The ID of the Capacity reservation to be extended" ($CapacityReservationId): an
+        // id that names no reservation of the account in this Region is an error, not an
+        // empty report.
+        let reservation =
+            require_extendable_capacity_reservation(&store, &zones, &input.capacity_reservation_id)?
+                .view_at(now);
+
+        // DryRun sits AFTER every parameter has been validated and the reservation resolved:
+        // the flag asks whether the request WOULD have succeeded, so one that would have been
+        // refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "The recommended Capacity Block extension offerings for the dates specified"
+        // ($CapacityBlockExtensionOfferings): the one extension of the one block the request
+        // names, or nothing at all when that reservation holds no Capacity Block capacity
+        // left to extend — a well-formed search nothing on sale fits, the empty answer
+        // `DescribeCapacityBlockOfferings` gives a window no zone offers.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCapacityBlockExtensionOfferings"))
+        // `MaxResults` is "the maximum number of items to return for this request" and
+        // carries the modelled `range 1..1000`
+        // (`smithy_query(query="shape",shape="DescribeCapacityBlockExtensionOfferingsMaxResults")`),
+        // so the boundary validator has already refused anything outside it and the page
+        // always has room for the single offering this search answers.
+        let _ = input.max_results;
+        let offerings = extension_offering(&reservation, &zones, duration_hours, now)
+            .into_iter()
+            .collect();
+
+        Ok(DescribeCapacityBlockExtensionOfferingsOutput {
+            capacity_block_extension_offerings: Some(offerings),
+            next_token: None,
+        })
     }
+}
+
+/// The longest term a Capacity Block is sold for, in days: "You must specify the duration in
+/// 1-day increments up 14 days, and in 7-day increments up to 182 days"
+/// (`DescribeCapacityBlockOfferingsRequest$CapacityDurationHours`). The model publishes no
+/// bound of its own for an extension's duration, and an extension continues the same
+/// Capacity Block, so the block's own longest term is what bounds it.
+const MAX_CAPACITY_BLOCK_TERM_DAYS: i32 = 182;
+
+/// That bound in hours, the unit this request gives a duration in.
+const MAX_CAPACITY_BLOCK_TERM_HOURS: i32 = HOURS_PER_DAY * MAX_CAPACITY_BLOCK_TERM_DAYS;
+
+/// The hours in one day, in the width this module's durations are typed in. The calendar
+/// fact itself is the crate's one [`crate::state::HOURS_PER_DAY`].
+const HOURS_PER_DAY: i32 = crate::state::HOURS_PER_DAY as i32;
+
+/// The seconds in one hour, the unit an extension's duration is given in.
+const SECONDS_PER_HOUR: i64 = 3_600;
+
+/// The Capacity Block extension offered for `reservation` for `duration_hours`, or `None`
+/// when that reservation has no Capacity Block extension on sale.
+///
+/// Every member is read off the stored reservation and the requested duration, so the
+/// offering cannot report capacity, a zone or a window that differs from what
+/// `DescribeCapacityReservations` reports for the same reservation:
+///
+/// * "The instance type of the Capacity Block that will be extended" ($InstanceType), "The
+///   number of instances in the Capacity Block extension offering" ($InstanceCount) and the
+///   zone members are the capacity the reservation holds. A block of EC2 UltraServers
+///   reserves its capacity under the UltraServer type (`PurchaseCapacityBlock`), and the
+///   modelled offering carries no UltraServer member, so that is the type reported.
+/// * "The start date of the Capacity Block that will be extended" ($StartDate) is the
+///   reservation's start date, and the extension's start "is also the same as the end date of
+///   the Capacity Block that will be extended" ($CapacityBlockExtensionStartDate), so it is
+///   that reservation's end date and the extension closes `duration_hours` after it.
+/// * The fee is the reserved units times the reserved hours at this service's one rate
+///   ([`crate::state::capacity_block_upfront_fee`]), so an extension is priced exactly as the
+///   purchase of the same capacity for the same hours is.
+///
+/// `None` — no offering — where there is no Capacity Block left to extend: a reservation that
+/// is not a Capacity Block at all (only "the Capacity Block that will be extended" has an
+/// extension), one with no end date for an extension to continue from, one whose window has
+/// already closed (when "a Capacity Block expires, the reserved capacity is released"
+/// $CapacityBlockExtensionEndDate, so there is nothing left to hold), and one whose extended
+/// window the clock cannot represent.
+fn extension_offering(
+    reservation: &CapacityReservation,
+    zones: &[crate::state::AvailabilityZoneRecord],
+    duration_hours: i32,
+    now: ::std::time::SystemTime,
+) -> Option<CapacityBlockExtensionOffering> {
+    use crate::state::{
+        capacity_block_upfront_fee, encode_capacity_block_offering_id, CapacityBlockOfferingTerms,
+        CAPACITY_BLOCK_OFFERING_CURRENCY_CODE, CAPACITY_RESERVATION_TYPE_CAPACITY_BLOCK,
+    };
+
+    if reservation.reservation_type.as_deref() != Some(CAPACITY_RESERVATION_TYPE_CAPACITY_BLOCK) {
+        return None;
+    }
+
+    let now_secs = i64::try_from(
+        now.duration_since(::std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .ok()?;
+    let extension_start = reservation.end_date?;
+    if extension_start.secs() <= now_secs {
+        return None;
+    }
+    let span = i64::from(duration_hours).checked_mul(SECONDS_PER_HOUR)?;
+    let extension_end_secs = extension_start.secs().checked_add(span)?;
+    let extension_end = ::aws_smithy_types::DateTime::from_secs_and_nanos(
+        extension_end_secs,
+        extension_start.subsec_nanos(),
+    );
+
+    let availability_zone = reservation.availability_zone.clone()?;
+    // The zone's type is a fact of the zone the capacity sits in, read off the Region's zone
+    // set rather than stored twice — and the reservation was resolved as one of this Region,
+    // so its zone is one of them.
+    let zone_type = zones
+        .iter()
+        .find(|zone| zone.zone_name == availability_zone)
+        .map(|zone| zone.zone_type.to_string());
+
+    let instance_count = reservation.total_instance_count;
+    let reserved_units = u64::from(instance_count.unwrap_or_default().max(0).unsigned_abs());
+    let upfront_fee =
+        capacity_block_upfront_fee(reserved_units, u64::from(duration_hours.unsigned_abs()));
+
+    // The id carries the extension's own terms and a checksum over them, the way every
+    // offering id of this service does, so the same search answers the same id and a purchase
+    // of the extension can read the window, zone and counts it was reported with back out of
+    // it without a stored offering.
+    let terms = CapacityBlockOfferingTerms {
+        instance_type: reservation.instance_type.clone(),
+        instance_count,
+        ultraserver_type: None,
+        ultraserver_count: None,
+        availability_zone: availability_zone.clone(),
+        availability_zone_id: reservation.availability_zone_id.clone().unwrap_or_default(),
+        start_date_secs: extension_start.secs(),
+        end_date_secs: extension_end_secs,
+    };
+
+    Some(CapacityBlockExtensionOffering {
+        capacity_block_extension_offering_id: Some(encode_capacity_block_offering_id(&terms)),
+        instance_type: reservation.instance_type.clone(),
+        instance_count,
+        availability_zone: Some(availability_zone),
+        availability_zone_id: reservation.availability_zone_id.clone(),
+        start_date: reservation.start_date,
+        capacity_block_extension_start_date: Some(extension_start),
+        capacity_block_extension_end_date: Some(extension_end),
+        capacity_block_extension_duration_hours: Some(duration_hours),
+        upfront_fee: Some(upfront_fee),
+        // The currency every Capacity Block offering of this service is priced in, from the
+        // one place this crate words it.
+        currency_code: Some(CAPACITY_BLOCK_OFFERING_CURRENCY_CODE.to_string()),
+        // "Indicates the tenancy of the Capacity Block extension offering" ($Tenancy): the
+        // tenancy the reservation already holds its capacity under, not a second opinion
+        // about it.
+        tenancy: reservation.tenancy.clone(),
+        zone_type,
+    })
 }
