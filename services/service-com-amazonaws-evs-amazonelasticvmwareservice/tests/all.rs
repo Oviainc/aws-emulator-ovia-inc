@@ -102,6 +102,8 @@ mod page_size_bound;
 mod public_vlan_netmask;
 #[path = "all/put_account_settings_due_transitions.rs"]
 mod put_account_settings_due_transitions;
+#[path = "all/record_stamp_backwards_guard.rs"]
+mod record_stamp_backwards_guard;
 #[path = "all/record_stamp_monotonicity.rs"]
 mod record_stamp_monotonicity;
 #[path = "all/reserved_tag_keys.rs"]

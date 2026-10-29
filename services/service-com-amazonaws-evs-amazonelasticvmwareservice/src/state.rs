@@ -345,6 +345,34 @@ pub fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
+/// When a transition this service owes a record becomes due: the monotonic instant the
+/// materialisation waits for and the wall-clock instant it dates the record at, both
+/// [`TRANSITION_DELAY`] after this call.
+///
+/// The ONE reading behind every pending change — a [`PendingTransition`], a
+/// [`PendingStatus`] and a [`PendingConnectorState`] all take their due instant from here,
+/// so the two forms can only ever denote one instant.
+///
+/// The WALL clock is read first, and so is never read later than the monotonic clock the
+/// due instant is waited for on. That order is what keeps the stamp a materialisation
+/// writes ([`StoredConnector::materialise_due_transition`] and its host and environment
+/// counterparts) from landing AHEAD of a wall-clock instant read once the monotonic due
+/// instant has passed: the handler that materialises a transition then dates its own
+/// change at an instant it reads with the store lock held
+/// ([`ComAmazonawsEvsAmazonelasticvmwareserviceState::materialise_due_transitions`]), and
+/// a stamp ahead of that instant would move the record's `modifiedAt` BACKWARDS over the
+/// transition the same call just materialised. Read in the other order, a wall-clock
+/// reading a fraction of a millisecond later than the monotonic one truncates to the next
+/// millisecond and puts the stamp one millisecond past the earliest instant the
+/// materialisation can run at.
+fn due_after_transition_delay() -> (Instant, i64) {
+    let wall_ms = now_ms();
+    (
+        Instant::now() + TRANSITION_DELAY,
+        wall_ms + TRANSITION_DELAY.as_millis() as i64,
+    )
+}
+
 /// Date one stored record's `modifiedAt` at a change applied at `at_ms`, taking the
 /// LATER of that instant and the instant the record already carries.
 ///
@@ -362,7 +390,9 @@ pub fn now_ms() -> i64 {
 /// dated from the instant their change is applied, read with the store lock held and
 /// after the materialisation ([`ComAmazonawsEvsAmazonelasticvmwareserviceState::materialise_due_transitions`]),
 /// which is never earlier than a stamp that materialisation wrote: a transition is
-/// materialised only once its due instant has passed.
+/// materialised only once its due instant has passed, and the instant it stamps the
+/// record with is read from the wall clock no later than that due instant
+/// ([`due_after_transition_delay`]).
 pub fn note_modified_at(modified_at_ms: &mut i64, at_ms: i64) {
     *modified_at_ms = (*modified_at_ms).max(at_ms);
 }
@@ -659,9 +689,10 @@ impl PendingTransition {
     /// The transition `CreateEnvironment`/`DeleteEnvironment` starts, due
     /// [`TRANSITION_DELAY`] after the call.
     pub fn starting_now(environment_state: &'static str, vlan_state: &'static str) -> Self {
+        let (due_at, due_at_ms) = due_after_transition_delay();
         Self {
-            due_at: Instant::now() + TRANSITION_DELAY,
-            due_at_ms: now_ms() + TRANSITION_DELAY.as_millis() as i64,
+            due_at,
+            due_at_ms,
             environment_state,
             vlan_state,
         }
@@ -689,9 +720,10 @@ pub struct PendingStatus {
 impl PendingStatus {
     /// The change a create starts, due [`TRANSITION_DELAY`] after the call.
     pub fn starting_now(status: &'static str) -> Self {
+        let (due_at, due_at_ms) = due_after_transition_delay();
         Self {
-            due_at: Instant::now() + TRANSITION_DELAY,
-            due_at_ms: now_ms() + TRANSITION_DELAY.as_millis() as i64,
+            due_at,
+            due_at_ms,
             status,
         }
     }
@@ -718,9 +750,10 @@ impl PendingConnectorState {
     /// The change `CreateEnvironmentConnector`/`UpdateEnvironmentConnector` starts,
     /// due [`TRANSITION_DELAY`] after the call.
     pub fn starting_now(state: &'static str) -> Self {
+        let (due_at, due_at_ms) = due_after_transition_delay();
         Self {
-            due_at: Instant::now() + TRANSITION_DELAY,
-            due_at_ms: now_ms() + TRANSITION_DELAY.as_millis() as i64,
+            due_at,
+            due_at_ms,
             state,
         }
     }
