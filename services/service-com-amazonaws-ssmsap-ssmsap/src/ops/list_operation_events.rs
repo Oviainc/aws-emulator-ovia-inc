@@ -6,8 +6,10 @@
 //! request's `OperationId` names, in the Region the request was signed for. A milestone
 //! is derived from that record ([`crate::state::StoredOperation::events`]) and projected
 //! by [`crate::state::OperationEventRecord::view`], so the listing reports the start of
-//! the operation's work and — once the clock has brought the record to a terminal status
-//! — the instant it reached it, and nothing the operation did not pass. `Filters` narrow
+//! the operation's work, one milestone per resource the operation acted on besides the
+//! one the call named ([`crate::state::OperationTarget`]) and — once the clock has
+//! brought the record to a terminal status — the instant it reached it, and nothing the
+//! operation did not pass. `Filters` narrow
 //! the result by the attributes this operation documents
 //! ([`crate::state::OPERATION_EVENT_FILTER_NAMES`]), and the page is taken by
 //! [`crate::state::page`] so a `NextToken` resumes exactly where the previous page

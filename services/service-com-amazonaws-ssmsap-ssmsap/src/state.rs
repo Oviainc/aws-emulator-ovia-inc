@@ -225,6 +225,14 @@ pub const APPLICATION_RESOURCE_TYPE: &str = "APPLICATION";
 /// this is that same spelling for its application resource. See [`event_resource_type`].
 pub const OPERATION_EVENT_RESOURCE_TYPE_APPLICATION: &str = "AWS::SystemsManagerSAP::Application";
 
+/// `Resource$ResourceType` of an Amazon EC2 instance an operation acted on.
+///
+/// The spelling `Resource$ResourceType`'s own documentation gives for that resource
+/// (`smithy_query(query="doc", shape="com.amazonaws.ssmsap#Resource",
+/// member="ResourceType")` lists it beside the component one), so a milestone about an
+/// instance names its kind exactly as the model does.
+pub const OPERATION_EVENT_RESOURCE_TYPE_EC2_INSTANCE: &str = "AWS::EC2::Instance";
+
 /// `OperationEventStatus` of a milestone of an operation that is still running. One of
 /// the model's `OperationEventStatus` values (see
 /// [`crate::ops::types::OPERATION_EVENT_STATUS_VALUES`]).
@@ -1269,6 +1277,75 @@ pub struct StoredOperation {
     pub last_updated_time: SystemTime,
     /// When this operation's terminal status falls due. See [`TRANSITION_SPAN`].
     pub success_due_at: SystemTime,
+    /// The resources BESIDES the one the call named that this operation acted on, in the
+    /// order it acted on them; see [`OperationTarget`]. Empty for a call that acted on
+    /// its own resource alone.
+    pub targets: Vec<OperationTarget>,
+}
+
+/// One resource OTHER than the one the call named that an operation acted on: the record
+/// the milestone of that work is derived from ([`StoredOperation::events`]).
+///
+/// An operation of this service can reach past the application the call named — the
+/// instance shutdown `StopApplication$IncludeEc2InstanceShutdown` asks for
+/// ([`ec2_shutdown::stop_instances`]) acts on an Amazon EC2 instance — and such a
+/// resource is part of the work the operation was asked to do, so the operation reports
+/// reaching it. One record per resource acted on, holding that resource's OWN identity
+/// (its ARN, its id and its `Resource$ResourceType`) rather than the application's, and
+/// the outcome the service that owns it answered with — never a status for work that was
+/// never asked or never answered.
+#[derive(Debug, Clone)]
+pub struct OperationTarget {
+    /// The id of the resource, which is what a `resourceID` filter compares against.
+    pub resource_id: String,
+    /// Its `Resource$ResourceArn`.
+    pub resource_arn: String,
+    /// Its `Resource$ResourceType`: `AWS::<Service>::<Resource>`, as the
+    /// `OperationEventResourceType` pattern (`^[\w]+::[\w]+::[\w]+$`) describes. See
+    /// [`OPERATION_EVENT_RESOURCE_TYPE_EC2_INSTANCE`].
+    pub resource_type: String,
+    /// `OperationEvent$Description`: what the operation asked of this resource, worded
+    /// the way the model's own example words it ("Stop the EC2 instance i-…").
+    pub description: String,
+    /// When the operation asked for that work.
+    pub asked_at: SystemTime,
+    /// What the service that owns the resource REFUSED the work with, absent when it
+    /// accepted it. A refusal is a milestone that failed, and it is reported as the
+    /// failure it was rather than as work that completed.
+    pub refusal: Option<String>,
+}
+
+impl OperationTarget {
+    /// The `OperationEventStatus` of this resource's milestone, what explains it and when
+    /// it was reached, given the status of the operation it belongs to.
+    ///
+    /// The work was asked for as part of that operation, so — unless the owning service
+    /// refused it, which is a failure at the instant it answered — it is under way while
+    /// the operation is and is done when the operation is done.
+    fn milestone(
+        &self,
+        operation_status: &str,
+        operation_ended_at: SystemTime,
+        operation_status_message: Option<String>,
+    ) -> (&'static str, Option<String>, SystemTime) {
+        if let Some(refusal) = &self.refusal {
+            return (
+                OPERATION_EVENT_STATUS_FAILED,
+                Some(refusal.clone()),
+                self.asked_at,
+            );
+        }
+        match operation_status {
+            OPERATION_STATUS_SUCCESS => (OPERATION_EVENT_STATUS_COMPLETED, None, operation_ended_at),
+            OPERATION_STATUS_ERROR => (
+                OPERATION_EVENT_STATUS_FAILED,
+                operation_status_message,
+                operation_ended_at,
+            ),
+            // Work that is still running has no status to explain.
+            _ => (OPERATION_EVENT_STATUS_IN_PROGRESS, None, self.asked_at),
+        }
+    }
 }
 
 impl StoredOperation {
@@ -1295,18 +1372,21 @@ impl StoredOperation {
     /// DERIVED from this record rather than held beside it, the way an application's
     /// databases are derived from its registration ([`StoredApplication::databases`]):
     /// every record starts `INPROGRESS`, so its first milestone is the start of its work,
-    /// and a record the clock has brought to a terminal status has a second milestone at
+    /// and a record the clock has brought to a terminal status has a last milestone at
     /// the instant it reached it — `COMPLETED` for a success and `FAILED` for an error,
     /// carrying whatever that record explains its status with. A milestone therefore
     /// exists exactly because the operation passed it, and the events of an operation
     /// still running move to its terminal milestone at the same instant
     /// [`Self::settle`] moves its status.
     ///
-    /// Nothing else is reported: the milestones an operation has are the ones of the
-    /// resource the call named, so a change this service asked ANOTHER service to make on
-    /// its own resource (the instance shutdown of
-    /// [`ec2_shutdown::stop_instances`]) is a milestone of that resource there, and none
-    /// of this record here.
+    /// Between those two, ONE milestone per resource the operation acted on besides the
+    /// one the call named ([`Self::targets`]): the work an operation was asked to do can
+    /// reach a resource of another kind, or of another service, and each such resource is
+    /// a milestone of this operation, naming that resource's own ARN, id and
+    /// `Resource$ResourceType` and carrying the outcome the service that owns it answered
+    /// with ([`OperationTarget::milestone`]). The order is the order the work happened
+    /// in, which is also what the ordinals a page resumes at count
+    /// ([`OperationEventRecord::page_key`]).
     pub fn events(&self) -> Vec<OperationEventRecord> {
         // The resource kind as a `Resource$ResourceType`, and as the word a description
         // names it by — the record's own kind either way, so neither is written out per
@@ -1334,6 +1414,24 @@ impl StoredOperation {
             None,
             self.start_time,
         )];
+        // A record that reached a terminal status reached it at its `EndTime`; the
+        // fallback is for one that carries none, whose last change is the most this
+        // record knows about when that status was taken.
+        let ended_at = self.end_time.unwrap_or(self.last_updated_time);
+        for target in &self.targets {
+            let (status, status_message, timestamp) =
+                target.milestone(&self.status, ended_at, self.status_message.clone());
+            events.push(OperationEventRecord {
+                ordinal: events.len(),
+                description: target.description.clone(),
+                resource_arn: target.resource_arn.clone(),
+                resource_id: target.resource_id.clone(),
+                resource_type: Some(target.resource_type.clone()),
+                status: status.to_string(),
+                status_message,
+                timestamp,
+            });
+        }
         let terminal = if self.status == OPERATION_STATUS_SUCCESS {
             Some((OPERATION_EVENT_STATUS_COMPLETED, "completed"))
         } else if self.status == OPERATION_STATUS_ERROR {
@@ -1347,10 +1445,7 @@ impl StoredOperation {
                 format!("{} {verb} for {kind} {}", self.op_type, self.resource_id),
                 status,
                 self.status_message.clone(),
-                // A record that reached a terminal status reached it at its `EndTime`;
-                // the fallback is for one that carries none, whose last change is the
-                // most this record knows about when that status was taken.
-                self.end_time.unwrap_or(self.last_updated_time),
+                ended_at,
             ));
         }
         events
@@ -1412,7 +1507,9 @@ pub fn event_resource_type(resource_type: &str) -> Option<&'static str> {
 
 /// How many digits an event's ordinal is rendered with in its listing key: see
 /// [`OperationEventRecord::page_key`]. An operation has one milestone per status it has
-/// passed, so no record comes close to this many.
+/// passed plus one per resource it acted on besides the one the call named — at most
+/// [`MAX_COMPONENTS_PER_APPLICATION`] Amazon EC2 instances of one application — so no
+/// record comes close to this many.
 const EVENT_PAGE_KEY_WIDTH: usize = 4;
 
 /// One milestone of an operation: the record `ListOperationEvents` reports as an
@@ -3131,10 +3228,28 @@ impl RegionState {
                 end_time: None,
                 last_updated_time: now,
                 success_due_at: now + TRANSITION_SPAN,
+                // The resources an operation reaches beyond the one the call named are
+                // recorded as the work on each of them is asked for and answered
+                // ([`Self::record_operation_target`]); a record starts with none.
+                targets: Vec::new(),
             },
         );
         evict_oldest(&mut self.operations, StoredOperation::eviction_rank);
         id
+    }
+
+    /// Record that the operation `operation_id` acted on `target`, a resource other than
+    /// the one the call named, so the operation reports reaching it
+    /// ([`StoredOperation::events`]).
+    ///
+    /// Called once the service that owns that resource has answered, which is what lets
+    /// the milestone carry the outcome rather than a status nothing produced. A record
+    /// this Region no longer holds — one a later call's eviction already dropped — gets
+    /// nothing, which is why no record is minted here.
+    pub fn record_operation_target(&mut self, operation_id: &str, target: OperationTarget) {
+        if let Some(record) = self.operations.get_mut(operation_id) {
+            record.targets.push(target);
+        }
     }
 
     /// The operation records filed against `application_id`, in the order a listing
@@ -3416,6 +3531,22 @@ pub fn app_registry_arn(region: &str, app_registry_application_id: &str) -> Stri
         region,
         &format!("/applications/{app_registry_application_id}"),
     )
+}
+
+/// The ARN namespace of an Amazon EC2 instance — an instance is EC2's resource, so its
+/// ARN carries that service's namespace and not this one's.
+pub const EC2_ARN_SERVICE: &str = "ec2";
+
+/// The ARN of the Amazon EC2 instance `instance_id` in `region`:
+/// `arn:aws:ec2:<region>:<account>:instance/<Ec2InstanceId>`, which is the form
+/// `Resource$ResourceArn`'s own documentation gives for an instance
+/// (`smithy_query(query="doc", shape="com.amazonaws.ssmsap#Resource",
+/// member="ResourceArn")`).
+///
+/// The account segment comes from the core's single source of truth, never a literal,
+/// exactly as in [`application_arn`].
+pub fn ec2_instance_arn(region: &str, instance_id: &str) -> String {
+    ::engine::emulator_arn(EC2_ARN_SERVICE, region, &format!("instance/{instance_id}"))
 }
 
 /// A fresh AppRegistry application id: the id of the AppRegistry application the

@@ -59,6 +59,8 @@ mod list_element_validation_messages;
 mod list_operation_events;
 #[path = "all/list_operations.rs"]
 mod list_operations;
+#[path = "all/operation_event_resources.rs"]
+mod operation_event_resources;
 #[path = "all/pattern_violation_messages.rs"]
 mod pattern_violation_messages;
 #[path = "all/register_application_conditional_requirements.rs"]

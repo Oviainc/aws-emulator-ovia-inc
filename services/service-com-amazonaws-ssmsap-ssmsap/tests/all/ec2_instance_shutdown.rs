@@ -39,7 +39,7 @@ const AMI: &str = "ami-00112233445566778";
 /// An instance id no launch in this emulator ever mints (EC2 issues `i-` and 17
 /// hexadecimal digits of a counter that starts at one), so EC2 holds no such instance
 /// while it satisfies the `Ec2InstanceId` pattern a registration requires.
-const UNHELD_INSTANCE: &str = "i-0ffffffffffffffff";
+pub(crate) const UNHELD_INSTANCE: &str = "i-0ffffffffffffffff";
 
 /// How long a launch is given to reach `running`: the EC2 emulator moves an instance out
 /// of `pending` on its own clock, a fraction of a second after the launch.
@@ -48,7 +48,7 @@ const LAUNCH_BUDGET: Duration = Duration::from_secs(10);
 /// Comfortably longer than [`TRANSITION_SPAN`], so a change the clock owes an
 /// application — and the one EC2 owes an instance it has just begun stopping — has come
 /// due. Nothing in the emulator sleeps; this is the test waiting for the clock.
-fn settle_wait() -> Duration {
+pub(crate) fn settle_wait() -> Duration {
     TRANSITION_SPAN + Duration::from_millis(400)
 }
 
@@ -58,19 +58,23 @@ fn settle_wait() -> Duration {
 /// (`crate::application_lifecycle::Emulator`), mounted with EC2 beside it; the EC2 half is
 /// the AWS SDK over that harness's own in-process callback, which is the seam the
 /// handler's own shutdown reaches EC2 through.
-struct Emulator {
+///
+/// `pub(crate)` because the two suites whose rule spans both services share it: the one
+/// here, about what the shutdown does to an instance, and
+/// `tests/all/operation_event_resources.rs`, about what the operation reports for it.
+pub(crate) struct Emulator {
     sap: crate::application_lifecycle::Emulator,
     callback: EmbeddedEmulator,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (sap, callback) = crate::application_lifecycle::Emulator::with_ec2();
         Self { sap, callback }
     }
 
     /// One Systems Manager for SAP call, required to answer 200, as its response body.
-    async fn ssm_sap(&self, path: &str, body: Value) -> Value {
+    pub(crate) async fn ssm_sap(&self, path: &str, body: Value) -> Value {
         let reply = self.sap.send(path, body).await;
         assert_eq!(
             reply.status, 200,
@@ -81,7 +85,7 @@ impl Emulator {
 
     /// An EC2 client for [`REGION`] over the in-process callback — the same seam the
     /// handler's own shutdown reaches EC2 through.
-    fn ec2(&self) -> ::aws_sdk_ec2::Client {
+    pub(crate) fn ec2(&self) -> ::aws_sdk_ec2::Client {
         let config = ::aws_sdk_ec2::Config::builder()
             .behavior_version(::aws_sdk_ec2::config::BehaviorVersion::latest())
             .region(::aws_sdk_ec2::config::Region::new(REGION.to_string()))
@@ -100,7 +104,7 @@ impl Emulator {
 
     /// Launch `count` instances through EC2 itself and answer their ids, once every one
     /// of them is `running`.
-    async fn launch_running(&self, count: i32) -> Vec<String> {
+    pub(crate) async fn launch_running(&self, count: i32) -> Vec<String> {
         let launched = self
             .ec2()
             .run_instances()
@@ -136,7 +140,7 @@ impl Emulator {
     }
 
     /// The `InstanceState$Name` EC2 reports for each of `ids`.
-    async fn instance_states(&self, ids: &[String]) -> BTreeMap<String, String> {
+    pub(crate) async fn instance_states(&self, ids: &[String]) -> BTreeMap<String, String> {
         let described = self
             .ec2()
             .describe_instances()
@@ -168,7 +172,7 @@ impl Emulator {
 ///
 /// Built on the registration builder every suite of this target shares, so the members a
 /// HANA registration conditionally requires are the ones that builder supplies.
-fn registration(id: &str, instance: &str, components: &[(&str, &str)]) -> Value {
+pub(crate) fn registration(id: &str, instance: &str, components: &[(&str, &str)]) -> Value {
     let mut body = crate::application_lifecycle::valid_registration(id, "HANA");
     body["Instances"] = json!([instance]);
     if !components.is_empty() {
@@ -213,7 +217,7 @@ async fn operation_status(emulator: &Emulator, operation_id: &str) -> String {
 }
 
 /// Register `id` on `instance` with `components` and wait until it is `ACTIVATED`.
-async fn register_activated(
+pub(crate) async fn register_activated(
     emulator: &Emulator,
     id: &str,
     instance: &str,
@@ -235,7 +239,7 @@ async fn register_activated(
 
 /// Stop `id`, carrying `IncludeEc2InstanceShutdown` exactly when `flag` is `Some`, and
 /// answer the `OperationId` the call filed.
-async fn stop(emulator: &Emulator, id: &str, flag: Option<bool>) -> String {
+pub(crate) async fn stop(emulator: &Emulator, id: &str, flag: Option<bool>) -> String {
     let mut body = json!({"ApplicationId": id});
     if let Some(shutdown) = flag {
         body["IncludeEc2InstanceShutdown"] = json!(shutdown);

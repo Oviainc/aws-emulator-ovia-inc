@@ -12,9 +12,11 @@
 //! RULE under test: the listing REPORTS the milestones of the one operation record its
 //! `OperationId` names — the start of its work, timestamped at that record's `StartTime`
 //! and `IN_PROGRESS` while it runs, and, once the clock has brought the record to a
-//! terminal status, a second milestone at the instant it reached it, `COMPLETED` for a
+//! terminal status, a milestone at the instant it reached it, `COMPLETED` for a
 //! success and `FAILED` for an error with whatever the record explains that status with —
-//! every milestone naming the resource the record names, narrowed by every `Filter` the
+//! every milestone of the record's own work naming the resource the record names (the
+//! milestones of the OTHER resources an operation acted on are the subject of
+//! `tests/all/operation_event_resources.rs`), narrowed by every `Filter` the
 //! request carries over the attributes this operation documents, and handed out in pages
 //! of at most `MaxResults` whose `NextToken` resumes exactly where the previous page
 //! stopped; an `OperationId` this account and Region holds no record for is refused, and
@@ -131,6 +133,23 @@ fn resource_field(event: &Value, name: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// The milestones of the operation's OWN resource, the registered application.
+///
+/// An operation also reports one milestone per resource it acted on besides the one the
+/// call named — a stop asked for with `IncludeEc2InstanceShutdown` reports one per Amazon
+/// EC2 instance it reached — and those are pinned by
+/// `tests/all/operation_event_resources.rs`, which drives them against the service that
+/// owns an instance; the rows here are about the record's own milestones.
+fn application_milestones(events: &[Value]) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|event| {
+            resource_field(event, "ResourceType") == OPERATION_EVENT_RESOURCE_TYPE_APPLICATION
+        })
+        .cloned()
+        .collect()
 }
 
 /// One row of the operation table: a kind of operation an API of this service files, and
@@ -319,7 +338,7 @@ async fn reports_the_milestones_of_every_kind_of_operation() {
         // The running assertions hold only while the clock still owes the transition:
         // past that instant the record was due to end whether or not anybody listed.
         if filed_at.elapsed() < TRANSITION_SPAN {
-            let events = listed(&reply);
+            let events = application_milestones(&listed(&reply));
             assert_eq!(
                 statuses(&events),
                 vec![OPERATION_EVENT_STATUS_IN_PROGRESS.to_string()],
@@ -347,7 +366,7 @@ async fn reports_the_milestones_of_every_kind_of_operation() {
         let reply = emulator
             .list_events(json!({"OperationId": operation_id}))
             .await;
-        let events = listed(&reply);
+        let events = application_milestones(&listed(&reply));
         assert_eq!(
             statuses(&events),
             vec![
@@ -365,7 +384,7 @@ async fn reports_the_milestones_of_every_kind_of_operation() {
             .list_events(json!({"OperationId": operation_id}))
             .await;
         assert_eq!(
-            listed(&again),
+            application_milestones(&listed(&again)),
             events,
             "case {label:?}: listing the milestones must not change them, got {again:?}"
         );

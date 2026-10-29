@@ -12,7 +12,9 @@
 //! * `IncludeEc2InstanceShutdown` set to true stops the Amazon EC2 instances the
 //!   registration associated with the application, through the service that owns them
 //!   ([`crate::state::ec2_shutdown::stop_instances`]), so the shutdown is observable
-//!   where an instance's state lives.
+//!   where an instance's state lives — and each instance it reached is a milestone of
+//!   this operation, which `ListOperationEvents` then reports against that instance's own
+//!   ARN and resource type ([`crate::state::OperationTarget`]).
 //! * `StopConnectedEntity` stops the connected database management system
 //!   ([`crate::state::StoredDbms::stop`]): it is `STOPPING` now and `STOPPED` one
 //!   [`crate::state::TRANSITION_SPAN`] later, which is what every `GetDatabase` of this
@@ -175,11 +177,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stop stands whatever EC2 answers (see
         // [`crate::state::ec2_shutdown::stop_instances`]): this service holds no instance
         // state to move on its own.
-        crate::state::ec2_shutdown::stop_instances(ctx, &region, &instances_to_shut_down).await;
+        let asked =
+            crate::state::ec2_shutdown::stop_instances(ctx, &region, &instances_to_shut_down).await;
+
+        // Each instance the stop reached is a milestone of this operation, recorded with
+        // the outcome EC2 answered for it — which is why it is recorded here, after the
+        // hop, rather than where the record was filed.
+        record_instance_milestones(&state, &region, &operation_id, &asked, now);
 
         Ok(StopApplicationOutput {
             operation_id: Some(operation_id),
         })
+    }
+}
+
+/// Record one milestone per Amazon EC2 instance this stop asked to have shut down, on the
+/// operation record the call answers with.
+///
+/// The instance is EC2's resource, so its milestone names that resource's OWN identity —
+/// its instance ARN, its id and the `Resource$ResourceType` the model spells for an
+/// instance — and the description is worded the way the model's own `OperationEvent`
+/// example words such a milestone. The work is reported as EC2 answered it: an instance
+/// EC2 refused carries that refusal.
+///
+/// SYNCHRONOUS, like [`record_stop`]: the guard lives for exactly these writes.
+fn record_instance_milestones(
+    state: &::engine::ServiceState<crate::state::ComAmazonawsSsmsapSsmsapState>,
+    region: &str,
+    operation_id: &str,
+    asked: &[crate::state::ec2_shutdown::InstanceStop],
+    now: ::std::time::SystemTime,
+) {
+    if asked.is_empty() {
+        return;
+    }
+    let mut state = state.lock();
+    let region_state = state.region_entry(region);
+    for instance in asked {
+        region_state.record_operation_target(
+            operation_id,
+            crate::state::OperationTarget {
+                resource_id: instance.instance_id.clone(),
+                resource_arn: crate::state::ec2_instance_arn(region, &instance.instance_id),
+                resource_type: crate::state::OPERATION_EVENT_RESOURCE_TYPE_EC2_INSTANCE
+                    .to_string(),
+                description: format!("Stop the EC2 instance {}", instance.instance_id),
+                // The instant the stop was filed: the shutdown is part of that call's
+                // work, asked for as the application's own stop was.
+                asked_at: now,
+                refusal: instance.refusal.clone(),
+            },
+        );
     }
 }
 
