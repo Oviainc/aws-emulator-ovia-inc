@@ -982,6 +982,38 @@ pub struct RestoreWindow {
     pub latest: ::aws_smithy_types::DateTime,
 }
 
+/// Take the transition the clock has ALREADY made due out of `pending`, as
+/// `(the status it moves to, the message that status comes with, the WALL-CLOCK
+/// instant it fell due)`; `None` while nothing is due yet, which leaves
+/// `pending` untouched.
+///
+/// The wall-clock instant is why this is shared. A due instant is stored as a
+/// monotonic [`Instant`] — the only clock a span can be measured on — while
+/// every timestamp a response reports is wall-clock, so a record that reports
+/// WHEN it changed has to convert the one into the other. `now` and `wall_now`
+/// are the two clocks read at the same moment by the caller walking the
+/// records: a transition that fell due `now - due` ago fell due that same span
+/// before `wall_now`, which is the instant it happened whether or not anybody
+/// called — never the instant of the call that materialises it. Every job record
+/// here settles through this one function, so no two of them can disagree about
+/// which instant that is.
+fn take_due_transition<S>(
+    pending: &mut Option<(Instant, S, Option<String>)>,
+    now: Instant,
+    wall_now: SystemTime,
+) -> Option<(S, Option<String>, SystemTime)> {
+    // Taken only when it is due, so a record whose transition is still ahead of
+    // the clock keeps it.
+    let (due, next, message) = pending.take_if(|(due, _, _)| now >= *due)?;
+    // `due` is at or before `now`, so the span since it fell due is what
+    // separates the answer from `wall_now`. A wall clock that cannot reach that
+    // far back answers `wall_now` rather than underflowing.
+    let due_at = wall_now
+        .checked_sub(now.saturating_duration_since(due))
+        .unwrap_or(wall_now);
+    Some((next, message, due_at))
+}
+
 /// The states a FHIR job moves through, as the modelled `JobStatus` enum names
 /// them on the wire (`JOB_STATUS_VALUES`).
 ///
@@ -1070,7 +1102,9 @@ pub struct ExportJob {
     /// `SubmitTime`: the instant the job was started.
     pub submitted_at: ::aws_smithy_types::DateTime,
     /// `EndTime`: the instant the job reached a terminal status, written ONCE
-    /// by [`ExportJob::settle`] so two reads of a finished job cannot differ.
+    /// by [`ExportJob::settle`] — from the instant that status fell due, not
+    /// from the clock of the call that materialised it — so two reads of a
+    /// finished job cannot differ.
     pub ended_at: Option<::aws_smithy_types::DateTime>,
     /// The `OutputDataConfig` the request supplied, reported back verbatim.
     pub output_data_config: OutputDataConfig,
@@ -1113,15 +1147,10 @@ impl ExportJob {
     /// The transition was owed at `now` whether or not anybody called, so a
     /// reporting operation applying it is the record catching up with the clock
     /// rather than a read with a side effect.
-    fn settle(&mut self, now: Instant) {
-        if self
-            .pending
-            .as_ref()
-            .is_none_or(|(due, _, _)| now < *due)
-        {
-            return;
-        }
-        let Some((_, next, message)) = self.pending.take() else {
+    fn settle(&mut self, now: Instant, wall_now: SystemTime) {
+        let Some((next, message, due_at)) =
+            take_due_transition(&mut self.pending, now, wall_now)
+        else {
             return;
         };
         self.status = next;
@@ -1130,9 +1159,10 @@ impl ExportJob {
         // text.
         self.message = message;
         // `EndTime` is owed once, by the step that reaches a status the job
-        // never leaves, and is then stored — never re-derived per read.
+        // never leaves, and is stamped with the instant that step fell DUE —
+        // the instant the job ended — then stored, never re-derived per read.
         if next.is_terminal() && self.ended_at.is_none() {
-            self.ended_at = Some(::aws_smithy_types::DateTime::from(SystemTime::now()));
+            self.ended_at = Some(::aws_smithy_types::DateTime::from(due_at));
         }
     }
 }
@@ -1166,7 +1196,9 @@ pub struct ImportJob {
     /// `SubmitTime`: the instant the job was submitted for processing.
     pub submitted_at: ::aws_smithy_types::DateTime,
     /// `EndTime`: the instant the job reached a terminal status, written ONCE
-    /// by [`ImportJob::settle`] so two reads of a finished job cannot differ.
+    /// by [`ImportJob::settle`] — from the instant that status fell due, not
+    /// from the clock of the call that materialised it — so two reads of a
+    /// finished job cannot differ.
     pub ended_at: Option<::aws_smithy_types::DateTime>,
     /// The `InputDataConfig` the request supplied, reported back verbatim.
     pub input_data_config: InputDataConfig,
@@ -1208,15 +1240,10 @@ impl ImportJob {
     /// The transition was owed at `now` whether or not anybody called, so a
     /// reporting operation applying it is the record catching up with the clock
     /// rather than a read with a side effect.
-    fn settle(&mut self, now: Instant) {
-        if self
-            .pending
-            .as_ref()
-            .is_none_or(|(due, _, _)| now < *due)
-        {
-            return;
-        }
-        let Some((_, next, message)) = self.pending.take() else {
+    fn settle(&mut self, now: Instant, wall_now: SystemTime) {
+        let Some((next, message, due_at)) =
+            take_due_transition(&mut self.pending, now, wall_now)
+        else {
             return;
         };
         self.status = next;
@@ -1225,9 +1252,10 @@ impl ImportJob {
         // text.
         self.message = message;
         // `EndTime` is owed once, by the step that reaches a status the job
-        // never leaves, and is then stored — never re-derived per read.
+        // never leaves, and is stamped with the instant that step fell DUE —
+        // the instant the job ended — then stored, never re-derived per read.
         if next.is_terminal() && self.ended_at.is_none() {
-            self.ended_at = Some(::aws_smithy_types::DateTime::from(SystemTime::now()));
+            self.ended_at = Some(::aws_smithy_types::DateTime::from(due_at));
         }
     }
 }
@@ -1306,8 +1334,9 @@ pub struct TransformationJob {
     /// `SubmitTime`: the instant the job was submitted.
     pub submitted_at: ::aws_smithy_types::DateTime,
     /// `EndTime`: the instant the job reached a terminal status, written ONCE
-    /// by [`TransformationJob::settle`] so two reads of a finished job cannot
-    /// differ.
+    /// by [`TransformationJob::settle`] — from the instant that status fell
+    /// due, not from the clock of the call that materialised it — so two reads
+    /// of a finished job cannot differ.
     pub ended_at: Option<::aws_smithy_types::DateTime>,
     /// The `InputDataConfig` the request supplied, reported back verbatim.
     pub input_data_config: TransformationInputDataConfig,
@@ -1389,11 +1418,10 @@ impl TransformationJob {
     /// The transition was owed at `now` whether or not anybody called, so a
     /// reporting operation applying it is the record catching up with the clock
     /// rather than a read with a side effect.
-    fn settle(&mut self, now: Instant) {
-        if self.pending.as_ref().is_none_or(|(due, _, _)| now < *due) {
-            return;
-        }
-        let Some((_, next, message)) = self.pending.take() else {
+    fn settle(&mut self, now: Instant, wall_now: SystemTime) {
+        let Some((next, message, due_at)) =
+            take_due_transition(&mut self.pending, now, wall_now)
+        else {
             return;
         };
         self.status = next;
@@ -1402,9 +1430,10 @@ impl TransformationJob {
         // text.
         self.message = message;
         // `EndTime` is owed once, by the step that reaches a status the job
-        // never leaves, and is then stored — never re-derived per read.
+        // never leaves, and is stamped with the instant that step fell DUE —
+        // the instant the job ended — then stored, never re-derived per read.
         if next.is_terminal() && self.ended_at.is_none() {
-            self.ended_at = Some(::aws_smithy_types::DateTime::from(SystemTime::now()));
+            self.ended_at = Some(::aws_smithy_types::DateTime::from(due_at));
         }
     }
 }
@@ -1810,9 +1839,13 @@ impl ComAmazonawsHealthlakeHealthlakeState {
                     datastore.status = next;
                     datastore.pending = None;
                     // A record that has reached its terminal status starts its
-                    // retention clock; everything else stays live.
+                    // retention clock; everything else stays live. The
+                    // retention runs from the instant the record BECAME
+                    // terminal — the instant the transition fell due — not from
+                    // the call that materialised it, so a store a caller polls
+                    // late is not kept past its retention.
                     if next == DatastoreStatus::Deleted {
-                        datastore.reap_at = Some(now + DELETED_RETENTION);
+                        datastore.reap_at = Some(due + DELETED_RETENTION);
                     }
                 }
             }
@@ -1930,9 +1963,9 @@ impl ComAmazonawsHealthlakeHealthlakeState {
     /// them (`StartFHIRExportJob`), the only place a job count can be refused —
     /// so it costs the same whatever a caller does.
     pub fn settle_export_jobs(&mut self) {
-        let now = Instant::now();
+        let (now, wall_now) = (Instant::now(), SystemTime::now());
         for job in self.export_jobs.values_mut() {
-            job.settle(now);
+            job.settle(now, wall_now);
         }
     }
 
@@ -1972,9 +2005,9 @@ impl ComAmazonawsHealthlakeHealthlakeState {
     /// (`StartFHIRImportJob`, still a scaffold stub), which is the only place a
     /// job count can be refused, so none is asserted here.
     pub fn settle_import_jobs(&mut self) {
-        let now = Instant::now();
+        let (now, wall_now) = (Instant::now(), SystemTime::now());
         for job in self.import_jobs.values_mut() {
-            job.settle(now);
+            job.settle(now, wall_now);
         }
     }
 
@@ -1990,9 +2023,9 @@ impl ComAmazonawsHealthlakeHealthlakeState {
     /// (`StartDataTransformationJob`), the only place a job count can be
     /// refused — so it costs the same whatever a caller does.
     pub fn settle_transformation_jobs(&mut self) {
-        let now = Instant::now();
+        let (now, wall_now) = (Instant::now(), SystemTime::now());
         for job in self.transformation_jobs.values_mut() {
-            job.settle(now);
+            job.settle(now, wall_now);
         }
     }
 

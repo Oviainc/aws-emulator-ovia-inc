@@ -55,6 +55,8 @@ mod fhir_rest_and_validate_source;
 mod fhir_update_interaction;
 #[path = "all/idempotency_replay_precedes_state_gates.rs"]
 mod idempotency_replay_precedes_state_gates;
+#[path = "all/job_end_time_is_the_due_instant.rs"]
+mod job_end_time_is_the_due_instant;
 #[path = "all/list_data_transformation_profile_versions.rs"]
 mod list_data_transformation_profile_versions;
 #[path = "all/list_data_transformation_profiles.rs"]
