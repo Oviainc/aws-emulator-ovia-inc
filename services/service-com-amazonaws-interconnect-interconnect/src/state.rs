@@ -146,12 +146,54 @@ pub fn owed_progression(state: &str, entered: Instant) -> Option<PendingTransiti
     })
 }
 
+/// The parameters a connection's `activationKey` CAPTURED: what the initial
+/// creation request asked for, which is what the proposal that key names offers.
+///
+/// Kept beside the record rather than read back off it, because the two are
+/// different things once the connection has been modified: `Connection$bandwidth` is
+/// "the specific selected bandwidth of this connection", which `UpdateConnection`
+/// ("we support modifications to the connection's description and/or bandwidth")
+/// reassigns, while the proposal's is "the bandwidth of the proposed Connection" —
+/// the one the key "captures … from the initial creation request", chosen before
+/// there was a connection to modify. So this is written ONCE, where the key is
+/// minted, and never again; the same reason [`IdempotentCreate`] holds the request's
+/// own members instead of reading the record back.
+#[derive(Debug, Clone)]
+pub struct CapturedProposal {
+    /// The Environment "upon which the Connection would be placed if this proposal
+    /// were accepted", as the creation request named it.
+    pub environment_id: String,
+    /// "The bandwidth of the proposed Connection", as the creation request asked
+    /// for it.
+    pub bandwidth: String,
+}
+
+impl CapturedProposal {
+    /// What `input` asked for, taken straight off the creation request that minted
+    /// the key — the one place a proposal's parameters enter the store.
+    ///
+    /// `environment` is the catalog entry that request resolved against, so the
+    /// capture names the Environment the connection is actually placed upon rather
+    /// than however the request spelled its identifier.
+    pub fn of(input: &CreateConnectionInput, environment: &Environment) -> Self {
+        Self {
+            environment_id: environment.environment_id.clone(),
+            bandwidth: input.bandwidth.clone(),
+        }
+    }
+}
+
 /// A persisted connection: the modelled resource plus the bookkeeping that is not
 /// part of any response shape.
 #[derive(Debug)]
 pub struct StoredConnection {
     /// The resource exactly as `GetConnection` returns it.
     pub connection: Connection,
+    /// The parameters this connection's `activationKey` captured, which are what
+    /// `DescribeConnectionProposal` reports for that key: the proposal's Environment
+    /// and bandwidth "cannot be modified", so they are read from here and no later
+    /// write to the record changes them.
+    pub proposal: CapturedProposal,
     /// The Region this connection belongs to: the one the `CreateConnection` that
     /// allocated it was signed for, which its ARN also carries. Only a request
     /// signed for this Region sees the record ([`visible_in`]).

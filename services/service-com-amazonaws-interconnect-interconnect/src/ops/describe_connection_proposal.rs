@@ -164,7 +164,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store
                 .proposal_in(&region, &input.activation_key)
                 .map(|stored| {
-                    let connection = &stored.connection;
+                    // The proposal's own parameters, as the activation key captured
+                    // them from the initial creation request: this key names the
+                    // proposal that request made, and the Environment and bandwidth
+                    // it offers "cannot be modified", so they are read from the
+                    // capture and not from the connection record, whose
+                    // `bandwidth` — "the specific selected bandwidth of this
+                    // connection" — a later `UpdateConnection` reassigns.
+                    let captured = &stored.proposal;
                     // `provider` and `location` are documented as belonging to "the
                     // specific Environment of the proposal", so they are read from the
                     // catalog entry the proposal names; the record's own copies (taken
@@ -172,16 +179,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // that is no longer in the catalog.
                     let (provider, location) = store
                         .environments
-                        .get(&connection.environment_id)
+                        .get(&captured.environment_id)
                         .map_or_else(
-                            || (connection.provider.clone(), connection.location.clone()),
+                            || {
+                                (
+                                    stored.connection.provider.clone(),
+                                    stored.connection.location.clone(),
+                                )
+                            },
                             |environment| {
                                 (environment.provider.clone(), environment.location.clone())
                             },
                         );
                     DescribeConnectionProposalOutput {
-                        bandwidth: connection.bandwidth.clone(),
-                        environment_id: connection.environment_id.clone(),
+                        bandwidth: captured.bandwidth.clone(),
+                        environment_id: captured.environment_id.clone(),
                         provider,
                         location,
                     }

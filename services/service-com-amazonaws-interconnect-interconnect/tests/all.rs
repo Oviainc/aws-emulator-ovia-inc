@@ -49,6 +49,8 @@ mod create_connection_remote_account;
 mod emulator;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/proposal_parameters_are_captured.rs"]
+mod proposal_parameters_are_captured;
 #[path = "all/refusals_and_gateway_attach_points.rs"]
 mod refusals_and_gateway_attach_points;
 #[path = "all/region_scoped_connections.rs"]

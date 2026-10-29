@@ -489,6 +489,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id.clone(),
             crate::state::StoredConnection {
                 connection: connection.clone(),
+                // What this connection's `activationKey` captures: the parameters of
+                // THIS creation request, which is what the proposal the key names
+                // offers from now on, whatever the record is later updated to.
+                proposal: crate::state::CapturedProposal::of(&input, &environment),
                 // The Region this record belongs to from now on: only a request
                 // signed for it resolves this connection.
                 region: region.clone(),
