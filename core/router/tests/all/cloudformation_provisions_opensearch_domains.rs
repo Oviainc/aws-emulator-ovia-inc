@@ -66,7 +66,12 @@ const POLL_LIMIT: usize = 40;
 
 /// The emulator with the three services this suite exercises, mounted on ONE engine exactly
 /// as `core/router/src/lib.rs` mounts them.
-fn build_router() -> MultiServiceRouter {
+///
+/// This router and the readers below are `pub(crate)` because a sibling suite deploys the same
+/// resource type and reads it back the same way
+/// ([`crate::cloudformation_opensearch_domain_deployments`]): one copy, called twice, rather
+/// than a second copy that can drift from this one.
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -124,7 +129,7 @@ async fn query(
 }
 
 /// Call one CloudFormation operation (API version 2010-05-15).
-async fn cloudformation(
+pub(crate) async fn cloudformation(
     router: &MultiServiceRouter,
     action: &str,
     members: &[(&str, &str)],
@@ -143,7 +148,7 @@ async fn sns(
 
 /// Call one Amazon OpenSearch Service operation over its `restJson1` wire (signing name
 /// `es`), answered with the status and the parsed document.
-async fn opensearch(
+pub(crate) async fn opensearch(
     router: &MultiServiceRouter,
     method: &'static str,
     path: &str,
@@ -170,7 +175,7 @@ async fn opensearch(
 
 /// The `DomainStatus` Amazon OpenSearch Service reports for `name`, with the status it
 /// answered: `DescribeDomain`, `GET /2021-01-01/opensearch/domain/{DomainName}`.
-async fn describe_domain(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
+pub(crate) async fn describe_domain(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
     let (status, body) = opensearch(
         router,
         "GET",
@@ -259,7 +264,7 @@ async fn offered_instance_types(router: &MultiServiceRouter, engine_version: &st
 }
 
 /// The text of the first `<tag>` of an XML answer, or the empty string.
-fn xml_text(xml: &str, tag: &str) -> String {
+pub(crate) fn xml_text(xml: &str, tag: &str) -> String {
     opt_element(xml, tag).unwrap_or_default()
 }
 
@@ -277,7 +282,11 @@ fn is_terminal(status: &str) -> bool {
 /// Poll `DescribeStacks` until the stack reaches a terminal status, and answer the last body
 /// it was described with. Nothing sleeps inside a handler: what each poll collects is what
 /// the clock already owed.
-async fn settle_stack(router: &MultiServiceRouter, case: &str, stack_name: &str) -> String {
+pub(crate) async fn settle_stack(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack_name: &str,
+) -> String {
     let mut last = String::new();
     for _ in 0..POLL_LIMIT {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -489,7 +498,10 @@ fn template(row: &Row) -> String {
 
 /// Every `ResourceStatusReason` the stack's events carry, which is where the owning
 /// service's own refusal of one resource is reported.
-async fn resource_reasons(router: &MultiServiceRouter, stack_name: &str) -> Vec<String> {
+pub(crate) async fn resource_reasons(
+    router: &MultiServiceRouter,
+    stack_name: &str,
+) -> Vec<String> {
     let (_, events) =
         cloudformation(router, "DescribeStackEvents", &[("StackName", stack_name)]).await;
     elements(&events, "ResourceStatusReason")
