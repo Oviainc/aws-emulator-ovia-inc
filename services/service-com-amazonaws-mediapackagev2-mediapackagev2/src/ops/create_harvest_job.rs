@@ -13,7 +13,7 @@
 //! equal to it, is `ValidationException` (400) with `END_TIME_EARLIER_THAN_START_TIME` /
 //! `INVALID_HARVEST_JOB_DURATION`; an unresolved parent chain is
 //! `ResourceNotFoundException` (404) with the service's fixed per-resource sentence; a
-//! name already taken on that endpoint is `ConflictException` (409); a harvested manifest
+//! name already taken anywhere in that CHANNEL is `ConflictException` (409); a harvested manifest
 //! the endpoint does not publish is `HARVESTED_MANIFEST_NOT_FOUND_ON_ENDPOINT`; an
 //! endpoint already holding as many jobs as it may is `ServiceQuotaExceededException`
 //! (402), worded by the crate's one quota refusal builder like every sibling create's.
@@ -311,8 +311,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let Some(endpoint) = channel.origin_endpoints.get_mut(&input.origin_endpoint_name)
-        else {
+        // The endpoint is read, not yet held mutably: the checks below are scoped to the
+        // whole CHANNEL, which cannot be borrowed again while one of its endpoints is
+        // held for writing. The write re-acquires it once every refusal has been judged.
+        let Some(endpoint) = channel.origin_endpoints.get(&input.origin_endpoint_name) else {
             return Err(CreateHarvestJobErrorModeled::ResourceNotFoundException(
                 crate::state::ResourceKind::OriginEndpoint.not_found(),
             )
@@ -380,23 +382,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let created_at = crate::state::now();
-        // `HarvestJobName` is optional: with none given the service names the job itself,
-        // from the endpoint it belongs to and the instant it was created, so the name is
-        // unique within the endpoint and is reported back for the caller to address it.
-        let name = input.harvest_job_name.clone().unwrap_or_else(|| {
-            let derived = crate::state::etag(&[
-                endpoint.arn.clone(),
-                created_at.as_secs_f64().to_string(),
-                endpoint.harvest_jobs.len().to_string(),
-            ]);
-            derived[..32].to_string()
-        });
-        if endpoint.harvest_jobs.contains_key(&name) {
-            return Err(CreateHarvestJobErrorModeled::ConflictException(
-                crate::state::resource_already_exists(),
-            )
-            .into());
-        }
+        // A harvest job's name lives in the CHANNEL's namespace, not the addressed
+        // endpoint's, so both halves of naming the job are decided over every job the
+        // channel holds (`crate::state::Channel::harvest_jobs`): a name the caller chose
+        // that any endpoint of this channel already uses is the duplicate-create refusal,
+        // and a name the SERVICE chooses for a create that carried none is picked so that
+        // no job of this channel holds it either. The service-chosen name is reported back
+        // for the caller to address the job by.
+        let name = match input.harvest_job_name.clone() {
+            Some(chosen) => {
+                if channel.holds_harvest_job(&chosen) {
+                    return Err(CreateHarvestJobErrorModeled::ConflictException(
+                        crate::state::resource_already_exists(),
+                    )
+                    .into());
+                }
+                chosen
+            }
+            None => {
+                let Some(derived) =
+                    channel.unused_harvest_job_name(&endpoint.arn, created_at)
+                else {
+                    return Err(CreateHarvestJobErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: Some(
+                                "the MediaPackageV2 store could not name this harvest job"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                derived
+            }
+        };
         // The endpoint's job map never shrinks (a finished job stays readable), so its
         // size is bounded here rather than by how many requests arrive. The refusal is
         // worded by the crate's one quota builder, like every other create's: it names
@@ -410,6 +429,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+
+        // The same endpoint again, now held for the write. Every refusal above has been
+        // judged, so this resolves exactly as it did when the path was walked.
+        let Some(endpoint) = channel.origin_endpoints.get_mut(&input.origin_endpoint_name)
+        else {
+            return Err(CreateHarvestJobErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::OriginEndpoint.not_found(),
+            )
+            .into());
+        };
 
         let mut job = crate::state::HarvestJobRecord {
             name: name.clone(),

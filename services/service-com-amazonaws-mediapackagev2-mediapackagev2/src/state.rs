@@ -1095,6 +1095,67 @@ impl Channel {
     pub fn receives_ingest(&self) -> bool {
         !self.ingest_endpoints.is_empty()
     }
+
+    /// Every harvest job this channel holds, whichever of its origin endpoints owns it.
+    ///
+    /// A job record is persisted on the endpoint whose content it exports, but the model
+    /// gives the job's NAME the CHANNEL's namespace
+    /// (`CreateHarvestJobRequest$HarvestJobName`: "This name must be unique within the
+    /// channel"), so this walk — not one endpoint's map — is the collection a job name is
+    /// judged against.
+    pub fn harvest_jobs(&self) -> impl Iterator<Item = &HarvestJobRecord> {
+        self.origin_endpoints
+            .values()
+            .flat_map(|endpoint| endpoint.harvest_jobs.values())
+    }
+
+    /// Whether any origin endpoint of this channel already holds a harvest job called
+    /// `name` — the question a create naming its job is refused by.
+    pub fn holds_harvest_job(&self, name: &str) -> bool {
+        self.harvest_jobs().any(|job| job.name == name)
+    }
+
+    /// A harvest job name no job of this channel holds, derived from `seed` and the
+    /// instant the job is created — what the service calls a job the caller left unnamed.
+    ///
+    /// Each candidate is [`derived_harvest_job_name`] under its own salt, so successive
+    /// candidates differ; one more candidate is tried than the channel holds names, which
+    /// is enough for one of them to be free unless two digests agree. `None` reports that
+    /// impossible case rather than handing back a name already in use. The names the
+    /// channel holds are gathered once, so the walk costs one pass over them however many
+    /// candidates it has to try.
+    pub fn unused_harvest_job_name(
+        &self,
+        seed: &str,
+        at: ::aws_smithy_types::DateTime,
+    ) -> Option<String> {
+        let taken: ::std::collections::BTreeSet<&str> =
+            self.harvest_jobs().map(|job| job.name.as_str()).collect();
+        (0..=taken.len())
+            .map(|attempt| derived_harvest_job_name(seed, at, taken.len() + attempt))
+            .find(|candidate| !taken.contains(candidate.as_str()))
+    }
+}
+
+/// How many characters of the digest a service-chosen harvest job name carries.
+const DERIVED_HARVEST_JOB_NAME_CHARS: usize = 32;
+
+/// One candidate name for a harvest job the caller did not name: a prefix of the digest
+/// over the endpoint the job belongs to (`seed`), the instant it was created and `salt`.
+///
+/// Hex, so the name satisfies the model's `ResourceName` pattern `^[a-zA-Z0-9_-]+$` and
+/// its 1..256 length, which is what lets every later request address the job by it.
+fn derived_harvest_job_name(
+    seed: &str,
+    at: ::aws_smithy_types::DateTime,
+    salt: usize,
+) -> String {
+    let digest = etag(&[
+        seed.to_string(),
+        at.as_secs_f64().to_string(),
+        salt.to_string(),
+    ]);
+    digest[..DERIVED_HARVEST_JOB_NAME_CHARS].to_string()
 }
 
 /// A persisted origin endpoint: the output side, holding the manifests whose URLs

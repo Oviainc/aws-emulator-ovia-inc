@@ -111,7 +111,10 @@ async fn populate(emulator: &Emulator) -> Vec<(Listing, Vec<String>)> {
                 "case \"setup\": CreateOriginEndpoint {endpoint} expected 200, got {status} {body}"
             );
             for index in 0..COLLECTION_SIZE / (channels.len() * endpoints.len()) {
-                let name = format!("job-{index}");
+                // A harvest job's name is unique within the CHANNEL, not within the
+                // endpoint it hangs off, so the name carries the endpoint: the two
+                // endpoints of one channel cannot both hold a `job-0`.
+                let name = format!("job-{endpoint}-{index}");
                 let mut request = harvest_body(start, start + 3600.0, &["index"]);
                 request["HarvestJobName"] = json!(name);
                 let (status, body) = emulator

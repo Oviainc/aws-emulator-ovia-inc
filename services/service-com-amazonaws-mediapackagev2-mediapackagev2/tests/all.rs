@@ -100,3 +100,5 @@ mod shared_manifest_count_builder;
 mod create_idempotency_optional_members;
 #[path = "all/default_child_manifest_name.rs"]
 mod default_child_manifest_name;
+#[path = "all/harvest_job_name_namespace.rs"]
+mod harvest_job_name_namespace;
