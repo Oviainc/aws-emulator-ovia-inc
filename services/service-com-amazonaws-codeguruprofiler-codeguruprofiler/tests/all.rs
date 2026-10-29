@@ -17,6 +17,8 @@ mod agent_reported_state;
 mod analysis_list_presence;
 #[path = "all/anomaly_feedback.rs"]
 mod anomaly_feedback;
+#[path = "all/document_read_concurrency.rs"]
+mod document_read_concurrency;
 #[path = "all/findings_report_account_summary.rs"]
 mod findings_report_account_summary;
 #[path = "all/findings_reports_listing.rs"]

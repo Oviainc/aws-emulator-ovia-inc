@@ -285,27 +285,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let mut guard = state.lock();
         // The group the request addresses is resolved first: the profile is submitted TO
         // a profiling group, so a name that names none is answered before the submitted
-        // data is looked at.
-        if !guard.groups.contains_key(&input.profiling_group_name) {
-            return Err(PostAgentProfileErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    // The agent plane words a missing group its own way:
-                    // account-qualified, unlike every other operation's text.
-                    message: crate::state::agent_group_not_found_message(
-                        &input.profiling_group_name,
-                    ),
-                },
-            )
-            .into());
+        // data is looked at. The guard is taken for that resolution ALONE and released
+        // with it: reading the submitted document below is work whose size the caller
+        // chose, and holding the store's lock across it would make one submission's size
+        // every other caller's latency.
+        {
+            let guard = state.lock();
+            if !guard.groups.contains_key(&input.profiling_group_name) {
+                return Err(PostAgentProfileErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        // The agent plane words a missing group its own way:
+                        // account-qualified, unlike every other operation's text.
+                        message: crate::state::agent_group_not_found_message(
+                            &input.profiling_group_name,
+                        ),
+                    },
+                )
+                .into());
+            }
         }
+
         // Submitted profiling data is PARSED before anything is stored, so data that is
         // not an agent profile is refused and leaves the group exactly as it was — its
         // `profilingStatus` reports no profile reported, and no aggregated profile
         // carries it.
-        if let Some(refused) = not_a_profile(&input.agent_profile) {
+        //
+        // Reading the submitted bytes as a document is CPU work over a payload whose size
+        // and shape the caller chose, so it runs on the blocking pool instead of on the
+        // async worker serving this request — and `spawn_blocking(..).await` is a real
+        // await point, so a health check, a timeout and a shutdown all still land while
+        // one submission is being read. The bytes are MOVED into the task and handed back
+        // with the verdict, so the task owns everything it reads and the payload is not
+        // copied to be read.
+        let submitted = input.agent_profile;
+        let read = ::tokio::task::spawn_blocking(move || {
+            let verdict = not_a_profile(&submitted);
+            (verdict, submitted)
+        })
+        .await;
+        let (refused, submitted) = read.map_err(|_| {
+            PostAgentProfileErrorModeled::InternalServerException(InternalServerException {
+                message: "reading the submitted profile did not complete".to_string(),
+            })
+        })?;
+        if let Some(refused) = refused {
             return Err(PostAgentProfileErrorModeled::ValidationException(
                 ValidationException {
                     message: refused.message(),
@@ -313,6 +338,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // The store is locked again only now, for the write itself: the group was
+        // resolved before the data was read, and a group deleted while it was being read
+        // is reported by the single writer below, which resolves the group again.
+        let mut guard = state.lock();
         // `post_profile` is the single writer: it honours `profileToken` as an
         // idempotency token (a replay stores nothing and still succeeds), records
         // `profilingStatus.latestAgentProfileReportedAt`, and applies every retention
@@ -322,7 +352,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.profiling_group_name,
             input.profile_token.as_deref(),
             crate::state::AgentProfile {
-                bytes: input.agent_profile.clone(),
+                bytes: submitted,
                 content_type: input.content_type.clone(),
                 received_at: crate::state::now(),
             },
