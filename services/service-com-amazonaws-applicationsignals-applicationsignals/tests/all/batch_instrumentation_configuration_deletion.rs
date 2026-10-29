@@ -14,10 +14,15 @@
 //! configurations the call removed, which is the length of `SuccessfulDeletions`, and
 //! nothing outside the selected set changes.
 //!
+//! WHICH configuration a listed ARN resolves to is the identity its RESOURCE field spells:
+//! the partition and region an ARN carries narrow nothing, so an ARN of this service and
+//! account names the one stored configuration in every spelling of them.
+//!
 //! Every assertion is made over a TABLE of selections rather than on one request: the rows
 //! differ in the selection METHOD, in how many configurations the selection names (none, one,
-//! several), in whether the named resources exist, and in the instrumentation type the target
-//! carries. The request helpers drive the same `restJson1` surface `slo_lifecycle` mounts.
+//! several), in whether the named resources exist, in the instrumentation type the target
+//! carries, and in the scope fields the listed ARNs are written with. The request helpers
+//! drive the same `restJson1` surface `slo_lifecycle` mounts.
 
 use std::collections::BTreeSet;
 
@@ -25,6 +30,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::slo_lifecycle::{arn_uri_segment, call, router, ACCOUNT, REGION};
+// The scope spellings an ARN of this service may be written with, and the rewriter that
+// produces them, shared with the suite that asserts the same rule for the tagging operations.
+use crate::tagged_arn_identity::{respelled, spellings};
 
 /// The only `DynamicInstrumentationSignalType` the model declares
 /// (`smithy_query(query="shape",shape="DynamicInstrumentationSignalType")` ->
@@ -706,6 +714,121 @@ async fn an_arn_list_selection_deletes_what_resolves_and_reports_the_rest_per_it
         gone.len(),
         stored.len(),
         "expected the table to delete every stored configuration, got {gone:?}"
+    );
+}
+
+/// An ARN-list selection resolves each listed ARN by the identity its RESOURCE field spells,
+/// whatever PARTITION and REGION that ARN carries: this process holds one account's and one
+/// Region's records, so those two fields render the writer's credential scope rather than any
+/// part of a configuration's identity, and the modelled `InstrumentationConfigurationArn`
+/// pattern (`^arn:[^:]+:application-signals:[^:]+:…`) leaves both unconstrained.
+///
+/// One request mixes the spellings: every configuration a listed ARN names goes and is
+/// reported by the ARN that named it, while the items whose ARN names no stored configuration
+/// of that type fail per item however their scope is written — a SECOND spelling of one the
+/// same request has already deleted (the identity, not the spelling, is what makes it a
+/// repeat), an ARN of another account, and an ARN naming another signal type.
+#[tokio::test]
+async fn an_arn_list_selection_resolves_each_arn_whatever_scope_it_carries() {
+    let router = router();
+    let stored = store_all(&router).await;
+    let spellings = spellings();
+    let elsewhere = spellings
+        .last()
+        .copied()
+        .expect("the spelling table holds at least one row");
+
+    // One row per instrumentation type, each listing several configurations spanning two
+    // scopes. Indexes follow `definitions()`: 0..3 scope A (BREAKPOINT), 3..5 scope B (PROBE),
+    // 5..7 scope C (BREAKPOINT), 7 scope D (PROBE) — so the two rows between them name every
+    // stored configuration.
+    let rows: [(&str, &str, &[usize]); 2] = [
+        (
+            "BREAKPOINT ARNs spanning two scopes",
+            BREAKPOINT,
+            &[0, 5, 1, 6, 2],
+        ),
+        ("PROBE ARNs spanning two scopes", PROBE, &[3, 7, 4]),
+    ];
+
+    let mut gone: BTreeSet<usize> = BTreeSet::new();
+    for (case, instrumentation_type, indexes) in rows {
+        // Each ARN of the list carries the next spelling in turn, so one request addresses its
+        // configurations through several partitions and regions at once.
+        let listed: Vec<String> = indexes
+            .iter()
+            .enumerate()
+            .map(|(position, index)| {
+                respelled(&stored[*index].arn, &spellings[position % spellings.len()])
+            })
+            .collect();
+
+        // The ARNs that must fail their own item, in the order they are listed: the first
+        // configuration again, under a spelling it was not listed with, and two ARNs differing
+        // in a field that IS part of the identity — both also written with a foreign scope.
+        let first = &stored[indexes[0]].arn;
+        let repeated = respelled(first, &elsewhere);
+        let other_account = respelled(&first.replace(ACCOUNT, "111111111111"), &elsewhere);
+        let other_signal = respelled(&first.replace(SNAPSHOT, "OTHER_SIGNAL"), &elsewhere);
+        assert_ne!(
+            repeated, listed[0],
+            "case {case:?}: expected the repeat to be spelled differently from the listing it repeats, got {repeated}"
+        );
+
+        let mut requested = listed.clone();
+        requested.extend([
+            repeated.clone(),
+            other_account.clone(),
+            other_signal.clone(),
+        ]);
+
+        let (status, answer) =
+            batch_delete(&router, arn_list_target(instrumentation_type, &requested)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from the batch delete, got {status} with {answer}"
+        );
+        assert_deleted_count(case, &answer, listed.len());
+        assert_eq!(
+            arn_deletions(case, &answer),
+            listed,
+            "case {case:?}: expected every spelling to delete the configuration it names, reported by the ARN that named it, got {answer}"
+        );
+
+        let expected_errors = vec![repeated, other_account, other_signal];
+        let errors = answer["Errors"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            errors
+                .iter()
+                .map(|error| error["ResourceArn"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<String>>(),
+            expected_errors,
+            "case {case:?}: expected only the ARNs naming no stored configuration to fail, got {answer}"
+        );
+        for error in &errors {
+            assert_eq!(
+                error["Code"].as_str(),
+                Some(RESOURCE_NOT_FOUND),
+                "case {case:?}: expected the {RESOURCE_NOT_FOUND} code for an ARN that names nothing, got {error}"
+            );
+            let message = error["Message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(error["ResourceArn"].as_str().unwrap_or_default()),
+                "case {case:?}: expected the per-item message to name the ARN it is about, got {error}"
+            );
+        }
+
+        // The deletes landed on the configurations the spellings named, and on nothing else.
+        gone.extend(indexes.iter().copied());
+        for (index, record) in stored.iter().enumerate() {
+            assert_readable(&router, case, record, !gone.contains(&index)).await;
+        }
+    }
+
+    assert_eq!(
+        gone.len(),
+        stored.len(),
+        "expected the table to name every stored configuration, got {gone:?}"
     );
 }
 

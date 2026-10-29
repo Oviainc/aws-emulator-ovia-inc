@@ -47,10 +47,10 @@ const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 /// One spelling of an ARN's scope fields: the PARTITION and REGION a caller may write, which
 /// the rule says name no part of a resource's identity.
 #[derive(Clone, Copy, Debug)]
-struct Spelling {
-    label: &'static str,
-    partition: &'static str,
-    region: &'static str,
+pub(crate) struct Spelling {
+    pub(crate) label: &'static str,
+    pub(crate) partition: &'static str,
+    pub(crate) region: &'static str,
 }
 
 /// The scope spellings the rule is asserted over.
@@ -60,7 +60,7 @@ struct Spelling {
 /// bound `service_common::arn` reads a Region under), and the partitions are the two the
 /// modelled `ServiceLevelObjectiveArn` pattern spells
 /// (`^arn:(aws|aws-us-gov):application-signals:…`).
-fn spellings() -> Vec<Spelling> {
+pub(crate) fn spellings() -> Vec<Spelling> {
     vec![
         Spelling {
             label: "the region the create minted the ARN in",
@@ -97,7 +97,7 @@ fn spellings() -> Vec<Spelling> {
 /// An ARN is six colon-separated fields with the resource LAST, so splitting into six parts
 /// keeps a resource field that itself carries `:` (which an instrumentation configuration's
 /// environment may, per the modelled `InstrumentationConfigurationArn` doc) whole.
-fn respelled(arn: &str, spelling: &Spelling) -> String {
+pub(crate) fn respelled(arn: &str, spelling: &Spelling) -> String {
     let fields: Vec<&str> = arn.splitn(6, ':').collect();
     assert_eq!(
         fields.len(),
