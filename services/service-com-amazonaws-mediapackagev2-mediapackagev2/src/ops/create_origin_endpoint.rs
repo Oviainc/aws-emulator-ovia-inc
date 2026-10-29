@@ -12,9 +12,12 @@
 //! endpoint name already used on that channel is a `ConflictException`.
 //!
 //! The rules the model states but cannot express as a member constraint are enforced
-//! before anything is stored, all through [`crate::state::manifest_set_violation`]: the
+//! before anything is stored, through [`crate::state::manifest_set_violation`]: the
 //! manifest count stays inside the permitted range (`NUM_MANIFESTS_LOW` /
-//! `NUM_MANIFESTS_HIGH`), and no manifest family its `ContainerType` cannot serve. The
+//! `NUM_MANIFESTS_HIGH`), and no manifest family its `ContainerType` cannot serve. A
+//! `Segment.OutputTimestampMode` is refused on a channel whose output locking mode may
+//! not carry the member ([`crate::state::output_timestamp_mode_violation`], a 400
+//! `ValidationException` / `ONLY_NON_EPOCH_LOCKED_ALLOW_OUTPUT_TIMESTAMP_MODE`). The
 //! operation is also `@idempotent` and binds
 //! `ClientToken` with `@idempotencyToken`: an unchanged repeat under the same token
 //! replays the endpoint it created, and a changed one is a `ConflictException` /
@@ -349,6 +352,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // A segment output-timestamp mode is only configurable under a channel whose
+        // output locking mode carries the member, so a mode this request names is judged
+        // against the channel the endpoint is being created under — before the endpoint
+        // is minted, and through the same reading of the restriction the stored mode is
+        // materialised by.
+        if let Some(rejection) = crate::state::output_timestamp_mode_violation(
+            input.segment.as_ref(),
+            channel.output_locking_mode.as_deref(),
+        ) {
+            return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
+        }
+        let channel_output_locking_mode = channel.output_locking_mode.clone();
         // The request's own fingerprint: every member it carried EXCEPT the token that
         // identifies the attempt.
         let tags = input.tags.clone().unwrap_or_default();
@@ -486,8 +501,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             container_type: input.container_type,
             // `Segment` is required in the response: the service applies its own
             // segmentation settings to whatever the request left out and reports the
-            // result, so the materialized configuration is what is stored.
-            segment: crate::state::materialized_segment(input.segment),
+            // result, so the materialized configuration is what is stored — including
+            // the output-timestamp mode of an endpoint whose channel carries that
+            // member, which is what leaves no later update to be the write that sets it.
+            segment: crate::state::materialized_segment(
+                input.segment,
+                channel_output_locking_mode.as_deref(),
+            ),
             description: input.description,
             startover_window_seconds,
             hls_manifests,

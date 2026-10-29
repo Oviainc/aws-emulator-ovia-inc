@@ -15,6 +15,11 @@
 //!   `StreamNameOutputMode` (`STREAM_NAME_OUTPUT_MODE_IMMUTABLE`) and
 //!   `Segment.OutputTimestampMode` (`OUTPUT_TIMESTAMP_MODE_IMMUTABLE`), each a 400
 //!   `ValidationException` naming the member, with the stored endpoint untouched;
+//! * a `Segment.OutputTimestampMode` on an endpoint whose channel's output locking mode
+//!   may not carry the member at all — the same 400 `ValidationException` /
+//!   `ONLY_NON_EPOCH_LOCKED_ALLOW_OUTPUT_TIMESTAMP_MODE` `CreateOriginEndpoint` answers,
+//!   because the restriction is read in one place
+//!   ([`crate::state::output_timestamp_mode_violation`]);
 //! * a manifest set the new `ContainerType` cannot serve, no manifest at all, or more
 //!   manifests than [`crate::state::MAX_MANIFESTS_PER_ORIGIN_ENDPOINT`] — the same rules
 //!   `CreateOriginEndpoint` applies, because an update carries the whole manifest set;
@@ -246,7 +251,9 @@ const STREAM_NAME_OUTPUT_MODE: ImmutableMember = ImmutableMember {
              a new origin endpoint",
 };
 
-/// The segment output-timestamp mode of an endpoint that was created with one is fixed:
+/// The segment output-timestamp mode of an endpoint whose channel carries one is fixed
+/// from the create onwards — the service materialises the member's documented default,
+/// so there is no endpoint without a mode for an update to set:
 /// `Segment$OutputTimestampMode` is documented "immutable after endpoint creation", and
 /// `ValidationExceptionType` names `OUTPUT_TIMESTAMP_MODE_IMMUTABLE` for it.
 const OUTPUT_TIMESTAMP_MODE: ImmutableMember = ImmutableMember {
@@ -399,6 +406,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let channel_name = channel.name.clone();
+        let channel_output_locking_mode = channel.output_locking_mode.clone();
         let Some(endpoint) = channel
             .origin_endpoints
             .get_mut(&input.origin_endpoint_name)
@@ -412,13 +420,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The immutable members: `ContainerType` is required on every update, so it is
         // compared always; `StreamNameOutputMode` and `Segment.OutputTimestampMode` only
         // when the request provides one, because an absent request value means "keep what
-        // is there". Every endpoint HAS a stored stream-name output mode — the service
-        // applies one at create whether or not the request named it — so a request that
-        // names a different one is asking to change an immutable member; the segment's
-        // output-timestamp mode is reported only when it was configured, so a request
-        // naming one is compared against it only where the endpoint has one. All are
-        // refused BEFORE a single field is written, so a rejected update leaves the
-        // endpoint — and its ETag — exactly as it was.
+        // is there". Every endpoint HAS a stored stream-name output mode, and every
+        // endpoint whose channel carries an output-timestamp mode has one of those too —
+        // the service applies both at create whether or not the request named them — so a
+        // request naming a different value is asking to change an immutable member, while
+        // a mode named where the channel carries none is refused as not configurable at
+        // all rather than as a change. All are refused BEFORE a single field is written,
+        // so a rejected update leaves the endpoint — and its ETag — exactly as it was.
         if input.container_type != endpoint.container_type {
             return Err(UpdateOriginEndpointErrorModeled::ValidationException(
                 immutable_violation(&CONTAINER_TYPE),
@@ -434,6 +442,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 immutable_violation(&STREAM_NAME_OUTPUT_MODE),
             )
             .into());
+        }
+        if let Some(rejection) = crate::state::output_timestamp_mode_violation(
+            input.segment.as_ref(),
+            channel_output_locking_mode.as_deref(),
+        ) {
+            return Err(UpdateOriginEndpointErrorModeled::ValidationException(rejection).into());
         }
         if let (Some(requested), Some(stored)) = (
             input
@@ -504,13 +518,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request, the current value is preserved") or cannot be changed at all. The
         // members the SERVICE applies are re-materialised here exactly as the create
         // materialises them, so an update that names none of them leaves the endpoint
-        // reporting the service's own settings rather than nothing. The segment's
-        // output-timestamp mode is immutable, so the stored one is carried over when the
-        // replacement segment does not name it.
-        let mut segment = crate::state::materialized_segment(input.segment);
-        segment.output_timestamp_mode = segment
-            .output_timestamp_mode
-            .or(endpoint.segment.output_timestamp_mode.clone());
+        // reporting the service's own settings rather than nothing.
+        let mut segment = crate::state::materialized_segment(
+            input.segment,
+            channel_output_locking_mode.as_deref(),
+        );
+        // Except the output-timestamp mode: that member is immutable after creation, so
+        // the mode the create materialised stands whatever the replacement segment
+        // carries — a request naming a different one, or naming one at all under a
+        // channel that carries none, was refused above, and a channel cannot start or
+        // stop carrying the member later (`UpdateChannel` takes no `OutputLockingMode`).
+        segment.output_timestamp_mode = endpoint.segment.output_timestamp_mode.clone();
         endpoint.segment = segment;
         endpoint.description = input.description;
         endpoint.startover_window_seconds =

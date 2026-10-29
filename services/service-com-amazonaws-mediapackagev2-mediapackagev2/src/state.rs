@@ -66,6 +66,17 @@ pub const DEFAULT_INPUT_TYPE: &str = "HLS";
 /// says "If you don't specify a value, the default is EPOCH_LOCKED".
 pub const DEFAULT_OUTPUT_LOCKING_MODE: &str = "EPOCH_LOCKED";
 
+/// The `OutputLockingMode` a channel has to carry for the origin endpoints under it to
+/// carry a segment output-timestamp mode at all: the model's `Segment$OutputTimestampMode`
+/// doc says the setting "is only configurable on channels with OutputLockingMode set to
+/// NON_EPOCH_LOCKED". One of the two values the `OutputLockingMode` enum publishes.
+pub const OUTPUT_TIMESTAMP_MODE_LOCKING_MODE: &str = "NON_EPOCH_LOCKED";
+
+/// The `OutputTimestampMode` an origin endpoint whose channel may carry one is created
+/// with when the request omits it: the same member's doc says "If you don't specify a
+/// value, the default is PASSTHROUGH".
+pub const DEFAULT_OUTPUT_TIMESTAMP_MODE: &str = "PASSTHROUGH";
+
 /// How many ingest endpoints a channel that receives ingest of its own is given.
 /// MediaPackage v2 hands such a channel a redundant pair, which is why `IngestEndpoints`
 /// is a list rather than a single URL.
@@ -291,6 +302,9 @@ pub const VALIDATION_MULTIVIEW_INPUT_TYPE_WITH_HARVEST_JOB: &str =
     "MULTIVIEW_INPUT_TYPE_WITH_HARVEST_JOB";
 /// See [`VALIDATION_END_TIME_EARLIER_THAN_START_TIME`].
 pub const VALIDATION_INVALID_PAGINATION_TOKEN: &str = "INVALID_PAGINATION_TOKEN";
+/// See [`VALIDATION_END_TIME_EARLIER_THAN_START_TIME`].
+pub const VALIDATION_ONLY_NON_EPOCH_LOCKED_ALLOW_OUTPUT_TIMESTAMP_MODE: &str =
+    "ONLY_NON_EPOCH_LOCKED_ALLOW_OUTPUT_TIMESTAMP_MODE";
 
 /// The 409 for a conditional update that lost the race: the entity tag the caller
 /// presented is no longer the committed one.
@@ -1401,6 +1415,44 @@ pub fn materialized_output_locking_mode(
     Some(submitted.unwrap_or_else(|| DEFAULT_OUTPUT_LOCKING_MODE.to_string()))
 }
 
+/// Whether an origin endpoint on a channel with this output locking mode may carry a
+/// segment output-timestamp mode at all.
+///
+/// `Segment$OutputTimestampMode` is "only configurable on channels with
+/// `OutputLockingMode` set to `NON_EPOCH_LOCKED`", and a channel that may not carry an
+/// output locking mode at all ([`materialized_output_locking_mode`]) carries none — so
+/// its endpoints may not carry the mode either. The ONE reading of that restriction:
+/// both the materialisation of the member's documented default
+/// ([`materialized_segment`]) and the refusal of a SUBMITTED mode
+/// ([`output_timestamp_mode_violation`]) decide through it, so a stored mode and a
+/// refused one can never disagree about which channels carry the member.
+pub fn channel_carries_output_timestamp_mode(channel_output_locking_mode: Option<&str>) -> bool {
+    channel_output_locking_mode == Some(OUTPUT_TIMESTAMP_MODE_LOCKING_MODE)
+}
+
+/// The refusal for a request that names a segment output-timestamp mode on a channel
+/// whose output locking mode may not carry one, or `None` when the channel may — the
+/// `ValidationExceptionType` the model declares for exactly this combination.
+pub fn output_timestamp_mode_violation(
+    submitted: Option<&Segment>,
+    channel_output_locking_mode: Option<&str>,
+) -> Option<ValidationException> {
+    let names_mode = submitted.is_some_and(|segment| segment.output_timestamp_mode.is_some());
+    if !names_mode || channel_carries_output_timestamp_mode(channel_output_locking_mode) {
+        return None;
+    }
+    Some(validation_failed(
+        "segment.outputTimestampMode",
+        &format!(
+            "OutputTimestampMode can only be configured when the channel OutputLockingMode \
+             is {OUTPUT_TIMESTAMP_MODE_LOCKING_MODE}. To use OutputTimestampMode, create an \
+             origin endpoint on a channel with {OUTPUT_TIMESTAMP_MODE_LOCKING_MODE} output \
+             locking mode"
+        ),
+        VALIDATION_ONLY_NON_EPOCH_LOCKED_ALLOW_OUTPUT_TIMESTAMP_MODE,
+    ))
+}
+
 /// The segment configuration an origin endpoint is stored with.
 ///
 /// `Segment` is required on every origin-endpoint response and optional on the request,
@@ -1408,11 +1460,31 @@ pub fn materialized_output_locking_mode(
 /// and reports the result: the duration and the base name from
 /// [`DEFAULT_SEGMENT_DURATION_SECONDS`] and [`DEFAULT_SEGMENT_NAME`], the TS passthrough
 /// toggles on and the extra I-frame-only stream off — the state the recorded service
-/// reports for an endpoint created without a segment configuration. `Scte`, `Encryption`
-/// and `OutputTimestampMode` are reported only when they were configured, so they pass
-/// through untouched.
-pub fn materialized_segment(submitted: Option<Segment>) -> Segment {
+/// reports for an endpoint created without a segment configuration — and
+/// [`DEFAULT_OUTPUT_TIMESTAMP_MODE`] on an endpoint whose channel may carry an
+/// output-timestamp mode. `Scte` and `Encryption` are reported only when they were
+/// configured, so they pass through untouched.
+///
+/// The output-timestamp mode is materialised the way a channel's own output locking mode
+/// is: the member has a documented service-applied default AND the model restricts which
+/// parents may carry it, so the default is applied exactly where the endpoint's channel
+/// may carry one ([`channel_carries_output_timestamp_mode`]) and the member stays absent
+/// on an endpoint whose channel may not. Every endpoint that can report a mode therefore
+/// holds a concrete one from its create onwards, which is what makes a member documented
+/// "immutable after endpoint creation" immutable from the first write on.
+pub fn materialized_segment(
+    submitted: Option<Segment>,
+    channel_output_locking_mode: Option<&str>,
+) -> Segment {
     let mut segment = submitted.unwrap_or_default();
+    let submitted_output_timestamp_mode = segment.output_timestamp_mode.take();
+    segment.output_timestamp_mode = channel_carries_output_timestamp_mode(
+        channel_output_locking_mode,
+    )
+    .then(|| {
+        submitted_output_timestamp_mode
+            .unwrap_or_else(|| DEFAULT_OUTPUT_TIMESTAMP_MODE.to_string())
+    });
     segment.segment_duration_seconds = Some(
         segment
             .segment_duration_seconds
@@ -4082,7 +4154,10 @@ mod tests {
             ts_include_dvb_subtitles: Some(false),
             ..Segment::default()
         };
-        let materialized = materialized_segment(Some(submitted));
+        // On a channel whose output locking mode carries no output-timestamp mode, so the
+        // member stays absent; the carrying case is the table in
+        // `tests/all/segment_output_timestamp_mode.rs`.
+        let materialized = materialized_segment(Some(submitted), Some(DEFAULT_OUTPUT_LOCKING_MODE));
         assert_eq!(
             materialized.segment_duration_seconds,
             Some(12),
@@ -4248,7 +4323,7 @@ mod tests {
             group_name: "group".to_string(),
             arn: origin_endpoint_arn("us-west-2", "group", "channel", "endpoint"),
             container_type: "TS".to_string(),
-            segment: materialized_segment(None),
+            segment: materialized_segment(None, None),
             description: None,
             startover_window_seconds: materialized_startover_window_seconds(None),
             hls_manifests: Vec::new(),

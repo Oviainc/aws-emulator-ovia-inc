@@ -574,35 +574,44 @@ async fn an_update_replaces_the_endpoints_manifests_and_startover_window() {
 /// * `Segment.OutputTimestampMode` — "This value is immutable after endpoint creation."
 #[tokio::test]
 async fn a_member_documented_as_preserved_survives_an_update_that_omits_it() {
-    // (label, the fragment the endpoint is created with, where to read the member back)
-    let rows: &[(&str, Value, &[&str])] = &[
+    // (label, the channel the endpoint hangs off, the fragment the endpoint is created
+    // with, where to read the member back). The channel matters for one row:
+    // `Segment.OutputTimestampMode` is "only configurable on channels with
+    // OutputLockingMode set to NON_EPOCH_LOCKED".
+    let rows: &[(&str, Value, Value, &[&str])] = &[
         (
             "UriSeparator HYPHEN",
+            json!({}),
             json!({"UriSeparator": "HYPHEN"}),
             &["UriSeparator"],
         ),
         (
             "UriSeparator UNDERSCORE",
+            json!({}),
             json!({"UriSeparator": "UNDERSCORE"}),
             &["UriSeparator"],
         ),
         (
             "StreamNameOutputMode PASSTHROUGH_NAME",
+            json!({}),
             json!({"StreamNameOutputMode": "PASSTHROUGH_NAME"}),
             &["StreamNameOutputMode"],
         ),
         (
             "Segment.OutputTimestampMode REBASED_TO_CHANNEL_START",
+            json!({"InputType": "CMAF", "OutputLockingMode": "NON_EPOCH_LOCKED"}),
             json!({"Segment": {"OutputTimestampMode": "REBASED_TO_CHANNEL_START"}}),
             &["Segment", "OutputTimestampMode"],
         ),
     ];
     let base = minimal_endpoint("TS");
 
-    for (label, created_fragment, path) in rows {
+    for (label, channel_body, created_fragment, path) in rows {
         let emulator = Emulator::new();
         emulator.create_group(GROUP, json!({})).await;
-        emulator.create_channel(GROUP, CHANNEL, json!({})).await;
+        emulator
+            .create_channel(GROUP, CHANNEL, channel_body.clone())
+            .await;
         let (status, created) = emulator
             .create_endpoint(
                 GROUP,
@@ -681,12 +690,17 @@ async fn a_member_documented_as_preserved_survives_an_update_that_omits_it() {
 
 /// RULE 5, the refusal half for the segment's output-timestamp mode: "This value is
 /// immutable after endpoint creation" (`Segment$OutputTimestampMode`), and the service's
-/// `ValidationExceptionType` names `OUTPUT_TIMESTAMP_MODE_IMMUTABLE` for it. A member
-/// with no stored value is not a member an update changes, so the first update that names
-/// one sets it — the same shape as `StreamNameOutputMode`.
+/// `ValidationExceptionType` names `OUTPUT_TIMESTAMP_MODE_IMMUTABLE` for it. Every
+/// endpoint whose channel carries the member HAS a stored mode — the service applies the
+/// documented default at create — so there is no first update that sets one; the whole
+/// table of channels that carry it and channels that do not lives in
+/// [`crate::segment_output_timestamp_mode`].
 #[tokio::test]
 async fn the_segments_output_timestamp_mode_is_fixed_once_the_endpoint_has_one() {
     let base = minimal_endpoint("TS");
+    // The member is "only configurable on channels with OutputLockingMode set to
+    // NON_EPOCH_LOCKED", so the endpoints below hang off such a channel.
+    let channel_body = json!({"InputType": "CMAF", "OutputLockingMode": "NON_EPOCH_LOCKED"});
     // Both published values of the model's `OutputTimestampMode` enum, each as the stored
     // mode and as the one an update tries to put in its place.
     for (stored, other) in [
@@ -695,7 +709,9 @@ async fn the_segments_output_timestamp_mode_is_fixed_once_the_endpoint_has_one()
     ] {
         let emulator = Emulator::new();
         emulator.create_group(GROUP, json!({})).await;
-        emulator.create_channel(GROUP, CHANNEL, json!({})).await;
+        emulator
+            .create_channel(GROUP, CHANNEL, channel_body.clone())
+            .await;
         let (status, created) = emulator
             .create_endpoint(
                 GROUP,
@@ -758,15 +774,23 @@ async fn the_segments_output_timestamp_mode_is_fixed_once_the_endpoint_has_one()
         );
     }
 
-    // An endpoint created without the member has nothing to change, so the first update
-    // naming one sets it.
+    // An endpoint created without the member still HAS one: the service applied the
+    // documented default, so the first update naming a different mode is refused like any
+    // other change to it.
     let emulator = Emulator::new();
     emulator.create_group(GROUP, json!({})).await;
-    emulator.create_channel(GROUP, CHANNEL, json!({})).await;
     emulator
+        .create_channel(GROUP, CHANNEL, channel_body.clone())
+        .await;
+    let (_, created) = emulator
         .create_endpoint(GROUP, CHANNEL, ENDPOINT, base.clone())
         .await;
-    let (status, updated) = emulator
+    assert_eq!(
+        at(&created, &["Segment", "OutputTimestampMode"]),
+        json!("PASSTHROUGH"),
+        "case \"the create omitted the mode\": the documented default must be stored, got {created}"
+    );
+    let (status, refused) = emulator
         .update_endpoint(
             GROUP,
             CHANNEL,
@@ -779,14 +803,21 @@ async fn the_segments_output_timestamp_mode_is_fixed_once_the_endpoint_has_one()
         )
         .await;
     assert_eq!(
-        status, 200,
-        "case \"the create omitted the mode\": expected 200, got {status} {updated}"
+        status, 400,
+        "case \"the create omitted the mode\": expected 400, got {status} {refused}"
+    );
+    assert_eq!(
+        refused["ValidationExceptionType"],
+        json!("OUTPUT_TIMESTAMP_MODE_IMMUTABLE"),
+        "case \"the create omitted the mode\": expected OUTPUT_TIMESTAMP_MODE_IMMUTABLE, \
+         got {refused}"
     );
     let (_, read) = emulator.get_endpoint(GROUP, CHANNEL, ENDPOINT).await;
     assert_eq!(
         at(&read, &["Segment", "OutputTimestampMode"]),
-        json!("REBASED_TO_CHANNEL_START"),
-        "case \"the create omitted the mode\": the submitted mode must be stored, got {read}"
+        json!("PASSTHROUGH"),
+        "case \"the create omitted the mode\": the refused update must leave the default \
+         mode alone, got {read}"
     );
 }
 
