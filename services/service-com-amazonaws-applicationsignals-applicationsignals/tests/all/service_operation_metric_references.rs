@@ -201,7 +201,8 @@ async fn seed(router: &MultiServiceRouter) {
 /// The dimension names are the ones `src/state.rs` maps the `Attributes` entries onto
 /// (`NEAR_END_DIMENSIONS` and `OPERATION_DIMENSION`): an entity contributes the service it
 /// is and the environment it runs in, plus the operation the metrics were collected for. A
-/// resource identity names no `Name`, so it contributes no `Service` dimension.
+/// resource identity names no `Name`, so it contributes the resource pair that identifies it
+/// instead of a `Service` dimension.
 struct Row {
     case: &'static str,
     entity: Value,
@@ -274,12 +275,27 @@ fn rows() -> Vec<Row> {
         Row {
             case: "a resource identity, which names no Name",
             entity: resource_entity("AWS::Lambda::Function", "ship-fn", Some("prod")),
-            expected: vec![("Invoke", &["Environment=prod", "Operation=Invoke"])],
+            expected: vec![(
+                "Invoke",
+                &[
+                    "Environment=prod",
+                    "ResourceType=AWS::Lambda::Function",
+                    "ResourceIdentifier=ship-fn",
+                    "Operation=Invoke",
+                ],
+            )],
         },
         Row {
             case: "a resource identity that also names no Environment",
             entity: resource_entity("AWS::S3::Bucket", "assets", None),
-            expected: vec![("GetObject", &["Operation=GetObject"])],
+            expected: vec![(
+                "GetObject",
+                &[
+                    "ResourceType=AWS::S3::Bucket",
+                    "ResourceIdentifier=assets",
+                    "Operation=GetObject",
+                ],
+            )],
         },
         Row {
             case: "an entity whose only SLO names no operation",

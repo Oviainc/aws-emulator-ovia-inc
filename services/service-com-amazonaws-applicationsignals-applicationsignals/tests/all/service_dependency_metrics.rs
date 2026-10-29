@@ -355,8 +355,12 @@ fn rows() -> Vec<Row> {
             operation: "Invoke",
             callee: remote_service("rates", "prod"),
             callee_operation: "Quote",
+            // The caller names no `Name`, so it contributes the resource dimensions its
+            // `Type` does define instead of `Service`.
             dimensions: dimensions(&[
                 "Environment=prod",
+                "ResourceType=AWS::Lambda::Function",
+                "ResourceIdentifier=ship-fn",
                 "Operation=Invoke",
                 "RemoteService=rates",
                 "RemoteOperation=Quote",

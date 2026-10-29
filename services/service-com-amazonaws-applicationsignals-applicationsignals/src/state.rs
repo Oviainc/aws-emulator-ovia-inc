@@ -2136,7 +2136,8 @@ fn attribute_key(attributes: &HashMap<String, String>) -> String {
 /// dimension names in [`metric_dimensions`] — is the one the Amazon CloudWatch User Guide's
 /// Application Signals chapter documents: Application Signals collects `Latency`, `Fault`
 /// and `Error` in the `ApplicationSignals` namespace, dimensioned by the entity that emits
-/// them (`Service`, `Environment`, `Operation`) and, for a call that entity makes, by the
+/// them (`Service`, `Environment`, `Operation`, and the `Resource*` pair for an entity
+/// identified as a resource rather than named) and, for a call that entity makes, by the
 /// far end of that call (the `Remote*` dimensions).
 ///
 /// Every dimension VALUE is read out of the stored record the reference describes, so the
@@ -2165,21 +2166,68 @@ const STANDARD_METRICS: [(&str, &str); 3] = [
 /// if the value of the Type field is Service, RemoteService, or AWS::Service",
 /// `Environment` "specifies the location where this object is hosted", and `ResourceType`
 /// and `Identifier` are used "only when the value of the Type field is Resource or
-/// AWS::Resource". So the near end of an edge contributes the service it is and the
-/// environment it runs in, and the far end contributes either the remote service it is or
-/// the remote resource it identifies — which is why the two sides map the same attributes
-/// to different dimensions.
-const NEAR_END_DIMENSIONS: [(&str, &str); 2] = [
+/// AWS::Resource". So an end of an edge contributes the environment it runs in plus WHAT IT
+/// IS — the service it is named as, or the kind of resource it is and which one of them —
+/// whichever of those its own `Type` makes applicable ([`attribute_states_identity`]).
+///
+/// Every attribute an identity can be read by therefore has a dimension on both ends: the
+/// four entries here, and on the far end of a call the same facts under the `Remote`-prefixed
+/// names the catalogue states them with ([`FAR_END_DIMENSIONS`]). An entity identified as a
+/// resource is dimensioned by the pair that identifies it exactly as a named one is by its
+/// name, so the references of two entities differ wherever their stored identities do.
+const NEAR_END_DIMENSIONS: [(&str, &str); 4] = [
     (ENVIRONMENT_ATTRIBUTE, "Environment"),
     (NAME_ATTRIBUTE, "Service"),
+    (RESOURCE_TYPE_ATTRIBUTE, "ResourceType"),
+    (IDENTIFIER_ATTRIBUTE, "ResourceIdentifier"),
 ];
 
-/// [`NEAR_END_DIMENSIONS`], for the far end of a call.
+/// [`NEAR_END_DIMENSIONS`], for the far end of a call: the same facts under the names the
+/// catalogue gives the far end of a call, which are the near-end ones prefixed `Remote`.
+///
+/// The far end carries no environment dimension: the catalogue names none for it, so where
+/// the call went is stated by the remote service or remote resource it reached.
 const FAR_END_DIMENSIONS: [(&str, &str); 3] = [
     (NAME_ATTRIBUTE, "RemoteService"),
     (RESOURCE_TYPE_ATTRIBUTE, "RemoteResourceType"),
     (IDENTIFIER_ATTRIBUTE, "RemoteResourceIdentifier"),
 ];
+
+/// Whether the kind of object a record designates makes `attribute` part of what that record
+/// states about it.
+///
+/// An attribute is applicable to an identity only for the types its own doc names: `Name` "is
+/// used only if the value of the `Type` field is `Service`, `RemoteService`, or
+/// `AWS::Service`" and `ResourceType`/`Identifier` "only when the value of the `Type` field
+/// is `Resource` or `AWS::Resource`" — the same per-`Type` split [`identifying_attributes`]
+/// reads an identity by. So an attribute the designated type does not make applicable states
+/// nothing about the entity and contributes no dimension, just as an absent one does.
+/// `Environment` is restricted to no type, and a record designating no documented kind of
+/// object ([`ENTITY_TYPES`]) restricts nothing: all its mapped attributes state what they
+/// state.
+fn attribute_states_identity(entity_type: Option<&str>, attribute: &str) -> bool {
+    let Some(entity_type) = entity_type.filter(|entity_type| ENTITY_TYPES.contains(entity_type))
+    else {
+        return true;
+    };
+    attribute == ENVIRONMENT_ATTRIBUTE || identifying_attributes(entity_type).contains(&attribute)
+}
+
+/// The dimensions one end of a reference contributes: one per entry of `table` that the
+/// record holds and its `Type` makes applicable to it.
+fn end_dimensions(attributes: &HashMap<String, String>, table: &[(&str, &str)]) -> Vec<Dimension> {
+    let entity_type = attributes.get(TYPE_ATTRIBUTE).map(String::as_str);
+    table
+        .iter()
+        .filter(|(attribute, _)| attribute_states_identity(entity_type, attribute))
+        .filter_map(|(attribute, dimension)| {
+            attributes.get(*attribute).map(|value| Dimension {
+                name: (*dimension).to_string(),
+                value: value.clone(),
+            })
+        })
+        .collect()
+}
 
 /// The dimension carrying the operation of the entity the metrics were collected for.
 const OPERATION_DIMENSION: &str = "Operation";
@@ -2191,8 +2239,9 @@ const REMOTE_OPERATION_DIMENSION: &str = "RemoteOperation";
 /// edge out of it: the entity's own identity and operation, plus the far end's identity and
 /// operation when the reference describes a call.
 ///
-/// A dimension whose attribute the stored identity does not carry is LEFT OUT rather than
-/// reported empty — `Dimension.Value` is `length 1..1024`
+/// A dimension whose attribute the stored identity does not carry, or whose attribute that
+/// identity's own `Type` makes no part of it ([`attribute_states_identity`]), is LEFT OUT
+/// rather than reported empty — `Dimension.Value` is `length 1..1024`
 /// (`smithy_query(shape="Dimension")`), so an absent fact is an absent dimension, and the
 /// dimension set states exactly what the record states.
 fn metric_dimensions(
@@ -2200,15 +2249,7 @@ fn metric_dimensions(
     operation_name: Option<&str>,
     far_end: Option<(&HashMap<String, String>, &str)>,
 ) -> Vec<Dimension> {
-    let mut dimensions = Vec::new();
-    for (attribute, dimension) in NEAR_END_DIMENSIONS {
-        if let Some(value) = key_attributes.get(attribute) {
-            dimensions.push(Dimension {
-                name: dimension.to_string(),
-                value: value.clone(),
-            });
-        }
-    }
+    let mut dimensions = end_dimensions(key_attributes, &NEAR_END_DIMENSIONS);
     if let Some(operation_name) = operation_name {
         dimensions.push(Dimension {
             name: OPERATION_DIMENSION.to_string(),
@@ -2216,14 +2257,7 @@ fn metric_dimensions(
         });
     }
     if let Some((far_attributes, far_operation_name)) = far_end {
-        for (attribute, dimension) in FAR_END_DIMENSIONS {
-            if let Some(value) = far_attributes.get(attribute) {
-                dimensions.push(Dimension {
-                    name: dimension.to_string(),
-                    value: value.clone(),
-                });
-            }
-        }
+        dimensions.extend(end_dimensions(far_attributes, &FAR_END_DIMENSIONS));
         dimensions.push(Dimension {
             name: REMOTE_OPERATION_DIMENSION.to_string(),
             value: far_operation_name.to_string(),
@@ -2240,15 +2274,21 @@ fn metric_dimensions(
 /// (`smithy_query(shape="MetricReference")`) and this store is one account's, so the metric
 /// is in the caller's own account and there is no source account to name.
 ///
+/// A dimension set with nothing to state leaves `Dimensions` ABSENT rather than reporting an
+/// empty list: the member is "an array of one or more dimensions that further define the
+/// metric" (`smithy_query(shape="MetricReference")`), so an absent fact is an absent member,
+/// exactly as it is for every other derived list here.
+///
 /// Single-homed here so the five topology projections cannot differ on the catalogue, and
 /// so this reasoning is stated once.
 fn standard_metric_references(dimensions: Vec<Dimension>) -> Vec<MetricReference> {
+    let dimensions = (!dimensions.is_empty()).then_some(dimensions);
     STANDARD_METRICS
         .iter()
         .map(|(metric_name, metric_type)| MetricReference {
             namespace: APPLICATION_SIGNALS_NAMESPACE.to_string(),
             metric_type: (*metric_type).to_string(),
-            dimensions: Some(dimensions.clone()),
+            dimensions: dimensions.clone(),
             metric_name: (*metric_name).to_string(),
             account_id: None,
         })
