@@ -9,8 +9,11 @@
 //! An ARN outside the caller's own account is refused with `AccessDeniedException` (403)
 //! BEFORE the lookup ([`crate::state::authorize_resource_arn`]); an ARN inside it that no
 //! stored team carries earns `ResourceNotFoundException` (404); a team that is not
-//! `ACTIVE`, and an `ApproverIds` entry that is not an approver of that team, earn the
-//! modelled `ValidationException` (400), this operation declaring no `ConflictException`.
+//! `ACTIVE`, an `ApproverIds` entry that is not an approver of that team, and an approver
+//! who is already asked by an outstanding baseline session of that team
+//! ([`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::approver_with_pending_baseline_session`])
+//! earn the modelled `ValidationException` (400), this operation declaring no
+//! `ConflictException`.
 //!
 //! The session is recorded `CREATING` with its activation due
 //! ([`crate::state::SESSION_ACTIVATION_DELAY`]) and its expiration recorded
@@ -257,6 +260,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 response_time: None,
             })
             .collect();
+
+        // An approver has at most ONE pending baseline session: `PendingBaselineSessionArn`
+        // is a single `SessionArn` and is documented as "the pending baseline session" of
+        // an approver, so a second outstanding baseline session asking the same approver
+        // is a session no read could report. A start that would ask an approver who
+        // already has one is therefore refused, through the SAME resolver the team read
+        // answers that member with. This operation declares no `ConflictException`, so the
+        // refusal is the `ValidationException` (400) it does declare, and it names the
+        // approver and the session that is already waiting on them.
+        if let Some((approver_id, pending)) = state.approver_with_pending_baseline_session(
+            &input.arn,
+            approvers
+                .iter()
+                .map(|approver| approver.approver_id.as_str()),
+        ) {
+            return Err(StartApprovalTeamBaselineErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::bounded_message(format!(
+                        "Approver '{approver_id}' of approval team '{}' already has baseline \
+                         session '{pending}' pending, so another baseline session cannot be \
+                         started for them.",
+                        input.arn
+                    )),
+                },
+            )
+            .into());
+        }
 
         // The store is bounded, so a caller looping on this operation cannot grow this
         // process's memory without end (`crate::state::MAX_SESSIONS`). This operation

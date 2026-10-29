@@ -42,7 +42,7 @@ use crate::approval_sessions::{
 use crate::approval_team_lifecycle::{encode_label, error_code, instant, text, Harness, REGION};
 
 /// `PUT /sessions/{SessionArn}` — `CancelSession`.
-async fn cancel_session(harness: &Harness, session_arn: &str) -> (u16, Value) {
+pub(crate) async fn cancel_session(harness: &Harness, session_arn: &str) -> (u16, Value) {
     harness
         .call(
             "PUT",

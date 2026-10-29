@@ -172,6 +172,51 @@ pub(crate) fn expire_session(harness: &Harness, session_arn: &str, expiration: S
     session.expiration_time = expiration;
 }
 
+/// Record `count` further OUTSTANDING baseline sessions for `team_arn` straight through
+/// the state the handlers share, each minted by `start_session` — the one path every
+/// handler of this service records a session through — and answer their ARNs in
+/// initiation order.
+///
+/// `StartApprovalTeamBaseline` records at most ONE outstanding baseline session per
+/// approver, so a fixture that needs more outstanding sessions on one team than that team
+/// has approvers writes the extra records rather than making requests the service
+/// (correctly) refuses, exactly as the quota fixtures fill the store directly. Every
+/// member the records carry is the service's own, and the listing under test still reads
+/// them back through the operation.
+pub(crate) fn record_baseline_sessions(
+    harness: &Harness,
+    team_arn: &str,
+    count: usize,
+) -> Vec<String> {
+    let store = state::service_state(&*harness.engine).expect("the service store");
+    let mut guard = store.lock();
+    let team = guard.team(team_arn).expect("a stored team").clone();
+    let approvers: Vec<state::SessionApprover> = team
+        .approvers
+        .iter()
+        .map(|approver| state::SessionApprover {
+            approver_id: approver.approver_id.clone(),
+            identity_id: approver.primary_identity_id.clone(),
+            identity_source_arn: approver.primary_identity_source_arn.clone(),
+            response: state::SessionResponse::NoResponse,
+            response_time: None,
+        })
+        .collect();
+    (0..count)
+        .map(|nth| {
+            guard
+                .start_session(
+                    state::SessionKind::Baseline,
+                    &team,
+                    approvers.clone(),
+                    REGION.to_string(),
+                    SystemTime::now(),
+                )
+                .unwrap_or_else(|| panic!("fixture session {nth} could not be recorded"))
+        })
+        .collect()
+}
+
 /// A team made ACTIVE: created, then the clock-owed invitation responses waited out.
 pub(crate) async fn active_team(
     harness: &Harness,

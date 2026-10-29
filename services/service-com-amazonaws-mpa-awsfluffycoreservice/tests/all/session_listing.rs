@@ -44,7 +44,8 @@ use service_com_amazonaws_mpa_awsfluffycoreservice::ops::types::shared_types as 
 use service_com_amazonaws_mpa_awsfluffycoreservice::state;
 
 use crate::approval_sessions::{
-    active_team, expire_session, get_session, message, start_baseline, wait_for_the_clock,
+    active_team, expire_session, get_session, message, record_baseline_sessions, start_baseline,
+    wait_for_the_clock,
 };
 use crate::approval_team_lifecycle::{encode_label, error_code, instant, text, Harness, REGION};
 
@@ -107,17 +108,27 @@ fn set_initiation_time(harness: &Harness, session_arn: &str, initiated: SystemTi
         .initiation_time = initiated;
 }
 
-/// Start `count` baseline sessions on `team_arn` and return their ARNs in start order.
+/// Give `team_arn` `count` outstanding baseline sessions and return their ARNs in start
+/// order.
+///
+/// The first is STARTED through `StartApprovalTeamBaseline`, so the listing pages over a
+/// record the operation really wrote; the rest are recorded through the shared state
+/// (`record_baseline_sessions`), since the operation records at most one outstanding
+/// baseline session per approver and a listing fixture needs more sessions on one team
+/// than a team may have approvers. That is deliberately MORE outstanding sessions than the
+/// API can mint for one team: it is a paging fixture, not the shape the service supports.
 async fn start_sessions(harness: &Harness, team_arn: &str, count: usize, case: &str) -> Vec<String> {
     let mut arns = Vec::with_capacity(count);
-    for n in 0..count {
-        let (status, started) = start_baseline(harness, team_arn, None).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: starting session {n} returned {status} with {started:?}"
-        );
-        arns.push(text(&started, "BaselineSessionArn"));
+    if count == 0 {
+        return arns;
     }
+    let (status, started) = start_baseline(harness, team_arn, None).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: starting the first session returned {status} with {started:?}"
+    );
+    arns.push(text(&started, "BaselineSessionArn"));
+    arns.extend(record_baseline_sessions(harness, team_arn, count - 1));
     arns
 }
 

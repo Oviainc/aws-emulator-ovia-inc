@@ -3293,6 +3293,21 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
         sessions
     }
 
+    /// The team's OUTSTANDING baseline sessions, in initiation order: the sessions an
+    /// approver can be waiting on. The ONE predicate both the team read's resolver
+    /// ([`Self::pending_baseline_session_arn`]) and the guard a baseline session is minted
+    /// behind ([`Self::approver_with_pending_baseline_session`]) ask, so the two cannot
+    /// mean different sessions by "pending".
+    #[must_use]
+    pub fn outstanding_baseline_sessions(&self, team_arn: &str) -> Vec<&Session> {
+        self.team_sessions_in_initiation_order(team_arn)
+            .into_iter()
+            .filter(|session| {
+                session.kind == SessionKind::Baseline && session.status.is_outstanding()
+            })
+            .collect()
+    }
+
     /// The ARN of the team's OUTSTANDING baseline session that asks `approver_id`, or
     /// `None` when that approver has no baseline session awaiting them.
     ///
@@ -3300,20 +3315,50 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     /// so the team read and `GetSession` report the same session for the same approver.
     /// A session that has completed, expired or been cancelled is no longer pending and
     /// so is not reported.
+    ///
+    /// At most one outstanding baseline session can ask an approver — a start that would
+    /// ask one who already has such a session is refused
+    /// ([`Self::approver_with_pending_baseline_session`]) — so the single session this
+    /// answers with is the approver's only pending baseline session, never the first of
+    /// several.
     #[must_use]
     pub fn pending_baseline_session_arn(
         &self,
         team_arn: &str,
         approver_id: &str,
     ) -> Option<String> {
-        self.team_sessions_in_initiation_order(team_arn)
+        self.outstanding_baseline_sessions(team_arn)
             .into_iter()
-            .find(|session| {
-                session.kind == SessionKind::Baseline
-                    && session.status.is_outstanding()
-                    && session.includes_approver(approver_id)
-            })
+            .find(|session| session.includes_approver(approver_id))
             .map(|session| session.arn.clone())
+    }
+
+    /// The first of `approver_ids` that is ALREADY asked by an outstanding baseline
+    /// session of `team_arn`, with that session's ARN — or `None` when none of them is.
+    ///
+    /// An approver has at most ONE pending baseline session, so a start that would ask an
+    /// approver who is already waiting on one is refused rather than recorded. The sessions
+    /// searched are the ones [`Self::outstanding_baseline_sessions`] answers with — the
+    /// same sessions, in the same order, that the team read resolves an approver's pending
+    /// baseline session out of — so the guard a session is minted behind and the session
+    /// that read reports can never be about different sessions. The team's sessions are
+    /// gathered ONCE, whatever the approver set's size.
+    #[must_use]
+    pub fn approver_with_pending_baseline_session<'a, I>(
+        &self,
+        team_arn: &str,
+        approver_ids: I,
+    ) -> Option<(&'a str, String)>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let outstanding = self.outstanding_baseline_sessions(team_arn);
+        approver_ids.into_iter().find_map(|approver_id| {
+            outstanding
+                .iter()
+                .find(|session| session.includes_approver(approver_id))
+                .map(|session| (approver_id, session.arn.clone()))
+        })
     }
 
     /// The next initiation-order sequence number, which is also the id a session's ARN

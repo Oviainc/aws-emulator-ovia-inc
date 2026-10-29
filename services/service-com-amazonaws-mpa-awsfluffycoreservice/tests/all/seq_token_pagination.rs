@@ -34,7 +34,7 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use service_com_amazonaws_mpa_awsfluffycoreservice::state;
 
-use crate::approval_sessions::{active_team, message, start_baseline};
+use crate::approval_sessions::{active_team, message, record_baseline_sessions, start_baseline};
 use crate::approval_team_lifecycle::{encode_label, error_code, text, Harness, REGION};
 
 /// `MaxResults` is modelled `range(min: 1, max: 20)` with `default: 20` on every
@@ -272,13 +272,19 @@ async fn fixture(kind: Kind, total: usize) -> (Harness, Listing, Vec<String>) {
         Kind::Sessions => {
             let team_arn = active_team(&harness, "paged-session-team", 1, 1).await;
             let mut stored = Vec::with_capacity(total);
-            for n in 1..=total {
+            if total > 0 {
+                // The first session is started through the operation; the rest are
+                // recorded through the shared state, since the operation records at most
+                // one outstanding baseline session per approver — deliberately more
+                // outstanding sessions on one team than the API can mint, because this
+                // fixture pages over as many as 20 of them.
                 let (status, started) = start_baseline(&harness, &team_arn, None).await;
                 assert_eq!(
                     status, 200,
-                    "starting session {n} of {total} returned {status} with {started:?}"
+                    "starting the first session of {total} returned {status} with {started:?}"
                 );
                 stored.push(text(&started, "BaselineSessionArn"));
+                stored.extend(record_baseline_sessions(&harness, &team_arn, total - 1));
             }
             let listing = Listing { kind, team_arn };
             (harness, listing, stored)

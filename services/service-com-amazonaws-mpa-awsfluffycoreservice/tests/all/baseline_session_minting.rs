@@ -23,6 +23,7 @@
 //! `approval_team_lifecycle.rs` mounts.
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 
 use serde_json::Value;
 use service_com_amazonaws_mpa_awsfluffycoreservice::state;
@@ -38,9 +39,12 @@ struct MintingCase {
     team_name: String,
     approvers: usize,
     min_approvals: i64,
-    /// One entry per start the row makes, naming how many of the team's approvers that
-    /// start selects; `None` leaves `ApproverIds` absent, which asks the whole team.
-    starts: Vec<Option<usize>>,
+    /// One entry per start the row makes, naming the team approvers (by position in team
+    /// order) that start selects; `None` leaves `ApproverIds` absent, which asks the whole
+    /// team. The selections of one row are DISJOINT, since an approver is asked by at most
+    /// one outstanding baseline session, so a row that leaves `ApproverIds` absent makes
+    /// that start on its own.
+    starts: Vec<Option<Range<usize>>>,
 }
 
 /// The minting table: rows differ along approver count, the number of starts, how many
@@ -55,26 +59,26 @@ fn minting_cases() -> Vec<MintingCase> {
             starts: vec![None],
         },
         MintingCase {
-            case: "two approvers, two starts, absent then explicit",
+            case: "two approvers, two starts of one approver each",
             team_name: "Mint.Team_2".to_string(),
             approvers: 2,
             min_approvals: 1,
-            starts: vec![None, Some(1)],
+            starts: vec![Some(0..1), Some(1..2)],
         },
         MintingCase {
-            case: "four approvers, three starts selecting growing subsets",
+            case: "four approvers, three starts selecting disjoint subsets",
             team_name: "m".to_string(),
             approvers: 4,
             min_approvals: 2,
-            starts: vec![Some(1), Some(2), Some(4)],
+            starts: vec![Some(0..1), Some(1..3), Some(3..4)],
         },
         MintingCase {
-            case: "maximum approvers, longest name, five starts",
+            case: "maximum approvers, longest name, four starts covering the whole team",
             // `ApprovalTeamName` is `length(max: 64)`; `Approvers` is `length(1..20)`.
             team_name: "n".repeat(MAX_TEAM_NAME),
             approvers: MAX_APPROVERS,
             min_approvals: 20,
-            starts: vec![Some(MAX_APPROVERS), None, Some(1), Some(7), None],
+            starts: vec![Some(0..1), Some(1..8), Some(8..12), Some(12..MAX_APPROVERS)],
         },
     ]
 }
@@ -117,8 +121,9 @@ async fn every_accepted_start_mints_a_new_distinct_session() {
         let mut minted: Vec<String> = Vec::new();
         let mut expected_ids: Vec<Vec<String>> = Vec::new();
         for (nth, selected) in case.starts.iter().enumerate() {
-            let selection: Option<Vec<String>> =
-                selected.map(|count| team_approver_ids[..count].to_vec());
+            let selection: Option<Vec<String>> = selected
+                .clone()
+                .map(|range| team_approver_ids[range].to_vec());
             let (status, started) = start_baseline(&harness, &team_arn, selection.as_deref()).await;
             assert_eq!(
                 status, 200,
@@ -195,6 +200,9 @@ async fn every_accepted_start_mints_a_new_distinct_session() {
 async fn a_start_past_the_session_quota_is_refused() {
     let harness = Harness::new();
     let team_arn = active_team(&harness, "quota-session-team", 2, 1).await;
+    // A second ACTIVE team no session asks: the ceiling under test is the STORE's, so the
+    // start it refuses is one nothing about the request itself could refuse.
+    let free_team_arn = active_team(&harness, "quota-free-team", 1, 1).await;
     let (status, started) = start_baseline(&harness, &team_arn, None).await;
     assert_eq!(status, 200, "the first start returned {started:?}");
     let first = text(&started, "BaselineSessionArn");
@@ -215,7 +223,7 @@ async fn a_start_past_the_session_quota_is_refused() {
         }
     }
 
-    let (status, body) = start_baseline(&harness, &team_arn, None).await;
+    let (status, body) = start_baseline(&harness, &free_team_arn, None).await;
     assert_eq!(
         status, 400,
         "case past the session quota: expected 400, got {status} with {body:?}"

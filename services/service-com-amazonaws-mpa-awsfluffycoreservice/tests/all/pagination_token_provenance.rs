@@ -28,7 +28,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_mpa_awsfluffycoreservice::state;
 
-use crate::approval_sessions::{active_team, message, start_baseline};
+use crate::approval_sessions::{active_team, message, record_baseline_sessions, start_baseline};
 use crate::approval_team_lifecycle::{encode_label, error_code, text, Harness, REGION};
 
 /// `MaxResults` is modelled `range(min: 1, max: 20)`: the narrowest page a client may ask
@@ -326,13 +326,17 @@ async fn fixtures() -> (Harness, Vec<Listing>) {
     let mut session_teams: Vec<String> = Vec::new();
     for name in ["token-sessions-a", "token-sessions-b"] {
         let team_arn = active_team(&harness, name, 1, 1).await;
-        for n in 1..=RECORDS {
-            let (status, started) = start_baseline(&harness, &team_arn, None).await;
-            assert_eq!(
-                status, 200,
-                "starting session {n} of {name} returned {status} with {started:?}"
-            );
-        }
+        // The first session is started through the operation; the rest are recorded
+        // through the shared state, since the operation records at most one outstanding
+        // baseline session per approver — deliberately more outstanding sessions on one
+        // team than the API can mint, because this fixture needs a team whose listing
+        // hands out a token.
+        let (status, started) = start_baseline(&harness, &team_arn, None).await;
+        assert_eq!(
+            status, 200,
+            "starting the first session of {name} returned {status} with {started:?}"
+        );
+        record_baseline_sessions(&harness, &team_arn, RECORDS - 1);
         session_teams.push(team_arn);
     }
 
