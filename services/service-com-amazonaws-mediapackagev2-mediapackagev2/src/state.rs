@@ -1659,17 +1659,21 @@ pub fn parse_tag_arn(arn: &str) -> Option<TagTarget> {
 
 /// Whether `policy` lets an UNAUTHENTICATED caller perform `action`.
 ///
-/// An anonymous request is the `*` principal, so a statement reaches it only by naming
+/// An anonymous request is the `*` principal, so a statement GRANTS it only by naming
 /// `*` as its principal. `Deny` wins over `Allow`, as in IAM. Used by the egress data
 /// plane, where the endpoint's resource policy is the only thing that can authorize a
 /// player with no credentials.
 ///
 /// This evaluator understands `Effect`, `Action`, `Principal` and `Resource` only, so it
-/// fails CLOSED on anything else: a statement carrying a member it cannot evaluate
+/// fails CLOSED on anything else — in BOTH directions, which are opposite readings of the
+/// same ignorance. A statement carrying a member it cannot evaluate
 /// ([`UNEVALUATED_STATEMENT_MEMBERS`] — `Condition`, `NotAction`, `NotPrincipal`,
 /// `NotResource`) never GRANTS, because honouring a conditional `Allow` as an
 /// unconditional one would authorize a fetch on a condition nothing checked. A `Deny`
-/// carrying one still denies, which is the closed side there too.
+/// still DENIES unless a member this evaluator can judge rules this request out
+/// ([`statement_excludes_anonymous_request`]), so a `Deny` written in the inverted or
+/// conditional form — which reaches everything outside what it names, an anonymous player
+/// included — is honoured rather than dropped.
 ///
 /// `resource` is the ARN of the resource the request addresses, which a statement's
 /// `Resource` is matched against: a statement that names no `Resource` applies to the
@@ -1683,21 +1687,92 @@ pub fn policy_allows_anonymous(policy: &str, action: &str, resource: &str) -> bo
         Some(single @ ::serde_json::Value::Object(_)) => vec![single],
         _ => return false,
     };
-    let matching = |statement: &::serde_json::Value, effect: &str| {
+    let has_effect = |statement: &::serde_json::Value, effect: &str| {
         statement.get("Effect").and_then(::serde_json::Value::as_str) == Some(effect)
+    };
+    // The DENY pass: an explicit `Deny` the caller stored applies to this request unless a
+    // member this evaluator CAN judge rules the request out of it.
+    if statements.iter().any(|statement| {
+        has_effect(statement, "Deny")
+            && !statement_excludes_anonymous_request(statement, action, resource)
+    }) {
+        return false;
+    }
+    // The ALLOW pass: a grant has to be stated in full, in members this evaluator judges,
+    // and narrowed by nothing it cannot.
+    statements.iter().any(|statement| {
+        has_effect(statement, "Allow")
+            && !carries_unevaluated_member(statement)
             && statement_names_action(statement, action)
             && statement_names_anonymous_principal(statement)
             && statement_names_resource(statement, resource)
-    };
-    if statements
-        .iter()
-        .any(|statement| matching(statement, "Deny"))
-    {
-        return false;
-    }
-    statements.iter().any(|statement| {
-        matching(statement, "Allow") && !carries_unevaluated_member(statement)
     })
+}
+
+/// Whether a member this evaluator CAN judge puts this anonymous request outside the
+/// statement — the reading the `Deny` pass of [`policy_allows_anonymous`] needs.
+///
+/// A statement reaches a request unless one of its dimensions says otherwise, so the
+/// question per dimension is not "does a member name this request" but "does a member
+/// this evaluator reads name something else": an `Action` list none of whose entries is
+/// the action, a `Principal` naming someone other than everyone, or a `Resource` list no
+/// pattern of which covers the addressed ARN. A dimension stated only in its inverted
+/// form (`NotAction`, `NotPrincipal`, `NotResource`), left unstated, or written in a shape
+/// this evaluator cannot read, is judged by nothing and so excludes nothing — the closed
+/// side for a `Deny`, since an inverted member matches everything OUTSIDE what it names
+/// and an anonymous request can be exactly that.
+fn statement_excludes_anonymous_request(
+    statement: &::serde_json::Value,
+    action: &str,
+    resource: &str,
+) -> bool {
+    statement_excludes_action(statement, action)
+        || statement_excludes_anonymous_principal(statement)
+        || statement_excludes_resource(statement, resource)
+}
+
+/// Whether the statement's `Action` names actions and none of them is `action`.
+fn statement_excludes_action(statement: &::serde_json::Value, action: &str) -> bool {
+    statement
+        .get("Action")
+        .and_then(declared_names)
+        .is_some_and(|names| !names.iter().any(|name| action_name_matches(name, action)))
+}
+
+/// Whether the statement's `Principal` names principals and everyone is not among them.
+fn statement_excludes_anonymous_principal(statement: &::serde_json::Value) -> bool {
+    statement.get("Principal").is_some_and(|declared| {
+        principal_is_readable(declared) && !statement_names_anonymous_principal(statement)
+    })
+}
+
+/// Whether a `Principal` is written in a form this evaluator reads in FULL, so that a
+/// value of it not being `*` is a judgement rather than a gap: the bare string, an array
+/// of strings, or a map of either ([`statement_names_anonymous_principal`]).
+fn principal_is_readable(declared: &::serde_json::Value) -> bool {
+    let names_principals = |value: &::serde_json::Value| match value {
+        ::serde_json::Value::String(_) => true,
+        ::serde_json::Value::Array(list) => {
+            list.iter().all(::serde_json::Value::is_string)
+        }
+        _ => false,
+    };
+    match declared {
+        ::serde_json::Value::Object(map) => map.values().all(names_principals),
+        other => names_principals(other),
+    }
+}
+
+/// Whether the statement's `Resource` names patterns and none of them covers `resource`.
+fn statement_excludes_resource(statement: &::serde_json::Value, resource: &str) -> bool {
+    statement
+        .get("Resource")
+        .and_then(declared_names)
+        .is_some_and(|patterns| {
+            !patterns
+                .iter()
+                .any(|pattern| arn_pattern_matches(pattern, resource))
+        })
 }
 
 /// The statement members [`policy_allows_anonymous`] cannot evaluate, and so refuses to
@@ -1726,16 +1801,27 @@ fn statement_names_resource(statement: &::serde_json::Value, resource: &str) -> 
     let Some(declared) = statement.get("Resource") else {
         return true;
     };
-    let patterns = match declared {
-        ::serde_json::Value::String(one) => vec![one.as_str()],
-        ::serde_json::Value::Array(list) => {
-            list.iter().filter_map(::serde_json::Value::as_str).collect()
-        }
-        _ => return false,
-    };
-    patterns
-        .iter()
-        .any(|pattern| arn_pattern_matches(pattern, resource))
+    declared_names(declared).is_some_and(|patterns| {
+        patterns
+            .iter()
+            .any(|pattern| arn_pattern_matches(pattern, resource))
+    })
+}
+
+/// The names a statement member declares, or `None` when the member is written in a shape
+/// this evaluator cannot read as a list of names.
+///
+/// IAM writes `Action` and `Resource` either as one string or as an array of them, and
+/// every member of such a list is read the same way whichever member carries it. A list
+/// is read only when EVERY entry is a name: one entry this evaluator cannot read could
+/// have been the name that decides the statement, so the member as a whole is a gap rather
+/// than a shorter list.
+fn declared_names(declared: &::serde_json::Value) -> Option<Vec<&str>> {
+    match declared {
+        ::serde_json::Value::String(one) => Some(vec![one.as_str()]),
+        ::serde_json::Value::Array(list) => list.iter().map(::serde_json::Value::as_str).collect(),
+        _ => None,
+    }
 }
 
 /// Whether an IAM resource pattern matches `value`.
@@ -1775,20 +1861,19 @@ fn arn_pattern_matches(pattern: &str, value: &str) -> bool {
 /// Whether a statement's `Action` covers `action`, honouring the `*` wildcard IAM allows
 /// both on its own and as a trailing one (`service:*`).
 fn statement_names_action(statement: &::serde_json::Value, action: &str) -> bool {
-    let Some(declared) = statement.get("Action") else {
-        return false;
-    };
-    let names = match declared {
-        ::serde_json::Value::String(one) => vec![one.as_str()],
-        ::serde_json::Value::Array(list) => {
-            list.iter().filter_map(::serde_json::Value::as_str).collect()
-        }
-        _ => return false,
-    };
-    names.iter().any(|name| match name.strip_suffix('*') {
+    statement
+        .get("Action")
+        .and_then(declared_names)
+        .is_some_and(|names| names.iter().any(|name| action_name_matches(name, action)))
+}
+
+/// Whether one declared action name covers `action`, honouring the `*` wildcard IAM
+/// allows both on its own and as a trailing one (`service:*`).
+fn action_name_matches(name: &str, action: &str) -> bool {
+    match name.strip_suffix('*') {
         Some(prefix) => action.starts_with(prefix),
         None => name.eq_ignore_ascii_case(action),
-    })
+    }
 }
 
 /// Whether a statement's `Principal` names everyone — the only principal an anonymous

@@ -104,3 +104,5 @@ mod default_child_manifest_name;
 mod harvest_job_name_namespace;
 #[path = "all/harvest_job_multiview_refusal.rs"]
 mod harvest_job_multiview_refusal;
+#[path = "all/inverted_deny_statements.rs"]
+mod inverted_deny_statements;
