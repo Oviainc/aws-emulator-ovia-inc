@@ -20,12 +20,16 @@
 //!   publish, or a detailed resource that resolves to nothing is a modelled
 //!   refusal that records nothing;
 //! * a retried call carrying the `clientToken` of one that already took an action
-//!   replays that action rather than taking a second one.
+//!   replays that action rather than taking a second one;
+//! * a token names the CALL that spent it, so only a repeat of that same request
+//!   replays it: any OTHER request reusing the token is the modelled
+//!   `ConflictingOperationException` (409) naming the resource the spent call
+//!   acted on, and records neither an action nor a run of one.
 //!
 //! The HTTP harness (`call`, `router`, `error_code`, `is_modelled_id`, the asset
-//! creates) is the one `asset_lifecycle` already defines, and the
-//! computation-model create is `computation_model_lifecycle`'s, re-used rather
-//! than copied.
+//! creates) is the one `asset_lifecycle` already defines, the computation-model
+//! create is `computation_model_lifecycle`'s and the token helpers are
+//! `client_token_idempotency`'s, re-used rather than copied.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -40,6 +44,7 @@ use service_com_amazonaws_iotsitewise_awsiotsitewise::state::{
 use crate::asset_lifecycle::{
     call, create_asset, create_model, error_code, is_modelled_id, property_catalog, router,
 };
+use crate::client_token_idempotency::{client_token, with_token};
 use crate::computation_model_lifecycle::{anomaly_detection, asset_model_property, id_of};
 use crate::hierarchies_etags_and_refusals::error_message;
 
@@ -761,4 +766,229 @@ async fn an_action_on_a_target_resource_that_is_still_settling_is_the_modelled_c
         vec![taken["actionId"].as_str().unwrap_or("").to_string()],
         "the action taken must be the one the listing holds, got {listed}"
     );
+}
+
+/// One row of the spent-token table: a request differing from the one the token
+/// was spent on in exactly ONE of the members that say WHAT action to take.
+struct SpentRow {
+    /// What this row is in the suite, named in every assertion.
+    case: &'static str,
+    /// The seed this row's own token is built from, so no two rows share a
+    /// token.
+    seed: &'static str,
+    /// The DIFFERENT request that reuses that spent token.
+    other: Value,
+}
+
+/// The payload the call that spends each row's token carries.
+fn spent_payload() -> String {
+    json!({ "window": 300, "unit": "seconds" }).to_string()
+}
+
+/// The request every row spends its token on.
+fn spent_body(fixture: &Fixture) -> Value {
+    execute_body(
+        &fixture.computation_model,
+        fixture.definition(0),
+        &spent_payload(),
+        Some(&fixture.asset_a),
+    )
+}
+
+/// The rows, one per member a second request can differ in: which action it
+/// runs, what payload it carries, which resource it is taken on, and what it
+/// resolves to — another asset, or nothing at all. Source: the members
+/// `ExecuteActionRequest` declares beside its `clientToken`
+/// (`smithy_query(query="shape", shape="ExecuteActionRequest")`).
+fn spent_rows(fixture: &Fixture, other_model: &str, other_definition: &str) -> Vec<SpentRow> {
+    vec![
+        SpentRow {
+            case: "another actionDefinitionId",
+            seed: "execute-action-another-definition",
+            other: execute_body(
+                &fixture.computation_model,
+                fixture.definition(1),
+                &spent_payload(),
+                Some(&fixture.asset_a),
+            ),
+        },
+        SpentRow {
+            case: "another actionPayload",
+            seed: "execute-action-another-payload",
+            other: execute_body(
+                &fixture.computation_model,
+                fixture.definition(0),
+                &json!({ "window": 600, "unit": "seconds" }).to_string(),
+                Some(&fixture.asset_a),
+            ),
+        },
+        SpentRow {
+            case: "another targetResource",
+            seed: "execute-action-another-target",
+            other: execute_body(
+                other_model,
+                other_definition,
+                &spent_payload(),
+                Some(&fixture.asset_a),
+            ),
+        },
+        SpentRow {
+            case: "another resolveTo asset",
+            seed: "execute-action-another-resolve-to",
+            other: execute_body(
+                &fixture.computation_model,
+                fixture.definition(0),
+                &spent_payload(),
+                Some(&fixture.asset_b),
+            ),
+        },
+        SpentRow {
+            case: "no resolveTo at all",
+            seed: "execute-action-without-resolve-to",
+            other: execute_body(
+                &fixture.computation_model,
+                fixture.definition(0),
+                &spent_payload(),
+                None,
+            ),
+        },
+    ]
+}
+
+/// The `actionId`s recorded against one target resource.
+async fn recorded_actions(router: &MultiServiceRouter, query: &str) -> Vec<String> {
+    let (status, listed) = list_actions(router, query).await;
+    assert_eq!(status, 200, "list actions {query}: got {status} {listed}");
+    listed_action_ids(&listed)
+}
+
+/// The `executionId`s recorded against one target resource. The ids alone: an
+/// execution's state and end time are the clock's to move, so they are no part
+/// of what a refused call has to leave untouched.
+async fn recorded_executions(router: &MultiServiceRouter, query: &str) -> Vec<String> {
+    let (status, listed) = list_executions(router, query).await;
+    assert_eq!(status, 200, "list executions {query}: got {status} {listed}");
+    listed_executions(&listed)
+        .iter()
+        .map(|summary| summary["executionId"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_token_one_call_spent_refuses_a_different_action_and_records_nothing() {
+    let fixture = fixture().await;
+
+    // A second computation model, so a row can differ in the resource the action
+    // is taken on. Its own actions are taken once its create has settled.
+    let other_model = create_computation_model(&fixture.router, "pump-anomaly").await;
+    tokio::time::sleep(settled()).await;
+    let other_published = published_actions(&fixture.router, &other_model).await;
+    let other_definition = other_published
+        .first()
+        .map(|(_, id)| id.clone())
+        .unwrap_or_else(|| panic!("the second model publishes no action: {other_published:?}"));
+    let other_query =
+        format!("targetResourceType=COMPUTATION_MODEL&targetResourceId={other_model}");
+
+    // The ARN the conflict has to carry is the one the resource itself reports.
+    let (status, described) = call(
+        &fixture.router,
+        "GET",
+        &format!("/computation-models/{}", fixture.computation_model),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "describe the target: got {status} {described}");
+    let model_arn = described["computationModelArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no computationModelArn in {described}"))
+        .to_string();
+
+    let spent = spent_body(&fixture);
+    for row in spent_rows(&fixture, &other_model, &other_definition) {
+        let case = row.case;
+        let token = client_token(row.seed);
+
+        let (status, served) = execute(&fixture.router, with_token(&spent, &token)).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: expected 202, got {status} {served}"
+        );
+        let action_id = served["actionId"].as_str().unwrap_or("").to_string();
+        assert!(
+            is_modelled_id(&action_id),
+            "case {case:?}: expected an id of the modelled form, got {served}"
+        );
+
+        // The SAME request under that token is a retry of the call above, so it
+        // replays the action that call took.
+        let (status, retried) = execute(&fixture.router, with_token(&spent, &token)).await;
+        assert_eq!(
+            (status, retried["actionId"].as_str()),
+            (202, Some(action_id.as_str())),
+            "case {case:?}: a retry must replay the action the token took, got {status} {retried}"
+        );
+
+        let actions_before = recorded_actions(&fixture.router, &fixture.target_query()).await;
+        let runs_before = recorded_executions(&fixture.router, &fixture.target_query()).await;
+        let other_actions_before = recorded_actions(&fixture.router, &other_query).await;
+
+        // A DIFFERENT request reusing that spent token is the modelled conflict,
+        // naming the resource the spent call acted on.
+        let (status, refused) = execute(&fixture.router, with_token(&row.other, &token)).await;
+        assert_eq!(
+            (status, error_code(&refused)),
+            (409, "ConflictingOperationException"),
+            "case {case:?}: a spent token expected the modelled conflict, got {status} {refused}"
+        );
+        assert_eq!(
+            error_message(&refused),
+            "Another Action is already using the same clientToken",
+            "case {case:?}: unexpected message, got {refused}"
+        );
+        assert_eq!(
+            refused["resourceId"].as_str(),
+            Some(fixture.computation_model.as_str()),
+            "case {case:?}: the conflict must name the resource the spent call acted on, got \
+             {refused}"
+        );
+        assert_eq!(
+            refused["resourceArn"].as_str(),
+            Some(model_arn.as_str()),
+            "case {case:?}: the conflict must carry that resource's ARN, got {refused}"
+        );
+
+        // The refused call recorded nothing: neither an action nor a run of one,
+        // under the resource it addressed or the one the token was spent on.
+        let actions_after = recorded_actions(&fixture.router, &fixture.target_query()).await;
+        assert_eq!(
+            actions_after, actions_before,
+            "case {case:?}: a refused call must record no action, got {actions_after:?}"
+        );
+        let runs_after = recorded_executions(&fixture.router, &fixture.target_query()).await;
+        assert_eq!(
+            runs_after, runs_before,
+            "case {case:?}: a refused call must start no execution, got {runs_after:?}"
+        );
+        let other_actions_after = recorded_actions(&fixture.router, &other_query).await;
+        assert_eq!(
+            other_actions_after, other_actions_before,
+            "case {case:?}: a refused call must record nothing against the resource it addressed, \
+             got {other_actions_after:?}"
+        );
+
+        // That very request carrying NO token is served, so what the refusal was
+        // about is the spent token and not the action the request asked for.
+        let (status, taken) = execute(&fixture.router, row.other.clone()).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: the same request carrying no token must be served, got {status} \
+             {taken}"
+        );
+        assert_ne!(
+            taken["actionId"].as_str(),
+            Some(action_id.as_str()),
+            "case {case:?}: a request carrying no token must take an action of its own, got {taken}"
+        );
+    }
 }

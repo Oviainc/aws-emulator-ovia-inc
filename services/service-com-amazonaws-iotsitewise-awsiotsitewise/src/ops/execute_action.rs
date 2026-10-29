@@ -7,7 +7,10 @@
 //! summarises, plus the one execution of it `ListExecutions` reports. The target
 //! resource and the action definition it names must both exist, so a request naming
 //! one of them that is not there is a modelled refusal rather than an action taken
-//! on nothing. This is the ONLY file to touch for it.
+//! on nothing. A `clientToken` makes the call idempotent as a RETRY of itself: the
+//! same request under a spent token replays the action that token took, and any
+//! other request under it is the modelled conflict. This is the ONLY file to touch
+//! for it.
 //!
 //! ## Shape of an operation
 //!
@@ -166,10 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| internal_failure("the IoT SiteWise store is unavailable".to_string()))?;
-        // Nothing this operation records or answers is scoped to the caller's
-        // region: it mints an id, stores the references the request itself
-        // carries, and reports no ARN.
-        let _ = ctx;
+        // What this operation records are the references the request itself
+        // carries, and the one ARN it ever reports is the one its conflict
+        // refusal names — which is what the caller's region is read for.
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
@@ -182,17 +185,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(invalid_request)?;
 
         // "A unique case-sensitive identifier that you can provide to ensure the
-        // idempotency of the request": a token this service has already taken an
-        // action under replays THAT action's id and records nothing, so a retry
-        // the client cannot tell apart from a first attempt does not act twice.
-        if let Some(recorded) = input
-            .client_token
-            .as_deref()
-            .and_then(|token| store.action_for_client_token(token))
-        {
-            return Ok(ExecuteActionOutput {
-                action_id: recorded.action_id.clone(),
-            });
+        // idempotency of the request. Don't reuse this client token if a new
+        // idempotent request is required": a token identifies the CALL that spent
+        // it, so a retry — the SAME request under that token — replays the action
+        // that call took and records nothing, while a DIFFERENT request reusing
+        // the token belongs to another call and is the modelled conflict rather
+        // than an action the caller is told was taken and never was. Resolved
+        // through the registry every other idempotent write of this service uses,
+        // over the members that say WHAT action to take, and decided BEFORE the
+        // request is resolved against the store, because the call a retry repeats
+        // was already served whatever has changed since.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.target_resource,
+                &input.action_definition_id,
+                &input.action_payload,
+                &input.resolve_to,
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // The retry writes nothing and replays the id the original call
+                // minted. One whose action this store no longer holds leaves the
+                // retry nothing to answer from, so it is served as the fresh call
+                // it now is.
+                if store.actions.contains_key(&replayed) {
+                    return Ok(ExecuteActionOutput {
+                        action_id: replayed,
+                    });
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                if let Some((resource_id, resource_arn)) = store
+                    .actions
+                    .get(&spent_on)
+                    .and_then(|recorded| conflicting_target(&store, &region, recorded))
+                {
+                    return Err(token_spent(resource_id, resource_arn));
+                }
+            }
+            crate::state::TokenVerdict::Serve => {}
         }
 
         // One match over `TargetResourceType` decides BOTH which store the id is
@@ -352,8 +385,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         );
 
+        // The call SUCCEEDED, so the token it carried is spent on THIS request:
+        // remembered against the action it took, which is what a retry of it
+        // replays and what any other request reusing that token collides with. A
+        // call carrying no token remembers nothing, so it acts every time.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &action_id,
+            now,
+        );
+
         Ok(ExecuteActionOutput { action_id })
     }
+}
+
+/// The `resourceId`/`resourceArn` pair a conflict with the already-recorded
+/// `recorded` names: an action carries no ARN of its own in this API, so the
+/// conflict names the resource that action was taken ON — the resource this
+/// operation's other conflict names too, so one operation reports one kind of
+/// conflicting resource. The ARN is the one that resource CARRIES, read back
+/// from the store so the refusal cannot name an ARN no resource of this store
+/// has; one deleted since the action ran leaves only its id to build one from.
+fn conflicting_target(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    region: &str,
+    recorded: &crate::state::ActionRecord,
+) -> Option<(String, String)> {
+    let (target_type, target_id) =
+        crate::state::target_resource_reference(&recorded.target_resource).ok()?;
+    let resource_arn = match target_type {
+        crate::state::TARGET_RESOURCE_TYPE_ASSET => store
+            .assets
+            .get(target_id)
+            .map(|asset| asset.arn.clone())
+            .unwrap_or_else(|| crate::state::asset_arn(region, target_id)),
+        crate::state::TARGET_RESOURCE_TYPE_COMPUTATION_MODEL => store
+            .computation_models
+            .get(target_id)
+            .map(|model| model.arn.clone())
+            .unwrap_or_else(|| crate::state::computation_model_arn(region, target_id)),
+        // A target kind the model gains later names a resource this operation
+        // cannot resolve, so there is no conflicting resource to report.
+        _ => return None,
+    };
+    Some((target_id.to_string(), resource_arn))
 }
 
 /// HTTP 400 `InvalidRequestException` carrying `message`.
@@ -381,6 +458,18 @@ fn conflicting_operation(
         resource_arn,
     })
     .into()
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the action that request took, so
+/// `resourceId`/`resourceArn` name the resource it was taken on — the resource
+/// the caller has to look at.
+fn token_spent(resource_id: String, resource_arn: String) -> ExecuteActionError {
+    conflicting_operation(
+        crate::state::already_using_message(crate::state::RESOURCE_ACTION, "clientToken"),
+        resource_id,
+        resource_arn,
+    )
 }
 
 /// HTTP 410 `LimitExceededException` carrying `message`.

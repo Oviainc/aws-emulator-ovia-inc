@@ -3203,8 +3203,11 @@ pub struct ActionRecord {
     /// When the action ran.
     pub execution_time: SystemTime,
     /// The `clientToken` the call that took this action carried, if it carried
-    /// one, so a retry of that same call is recognised as the retry it is rather
-    /// than taking the action a second time.
+    /// one, recorded as part of what that call asked for. What recognises a
+    /// RETRY of that call is the store's registry of spent tokens
+    /// ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::idempotent_verdict`]),
+    /// which compares the request too: a token alone says only that some call
+    /// used it, not that this one repeats it.
     pub client_token: Option<String>,
 }
 
@@ -4952,20 +4955,6 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .keys()
             .filter(|(workspace, _)| workspace == workspace_name)
             .count()
-    }
-
-    /// The action this store already recorded under `client_token`, if any.
-    ///
-    /// What makes `ExecuteAction` idempotent on its token, which the member
-    /// documents as "a unique case-sensitive identifier that you can provide to
-    /// ensure the idempotency of the request": a token an action was already
-    /// taken under names that action rather than a second one. An action is
-    /// addressed by its id alone, so the lookup is over every action this store
-    /// holds, as `ListActions` and `DescribeAction` are.
-    pub fn action_for_client_token(&self, client_token: &str) -> Option<&ActionRecord> {
-        self.actions
-            .values()
-            .find(|record| record.client_token.as_deref() == Some(client_token))
     }
 
     /// The enrichment job of `workspace_name` that is doing the same work as
