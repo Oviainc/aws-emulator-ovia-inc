@@ -175,6 +175,8 @@ mod ml_transform_reads;
 mod ml_transform_updates;
 #[path = "all/ml_transforms.rs"]
 mod ml_transforms;
+#[path = "all/owed_status_materialisation.rs"]
+mod owed_status_materialisation;
 #[path = "all/partitions.rs"]
 mod partitions;
 #[path = "all/registries.rs"]

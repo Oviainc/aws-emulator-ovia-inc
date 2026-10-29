@@ -22,7 +22,7 @@
 //! description and the argument map — each published bound included.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
@@ -31,6 +31,7 @@ use service_com_amazonaws_glue_awsglue::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::job_runs::far_future;
 use crate::wire::{
     assert_echoed, call, call_in_region, emulator, emulator_on, error_code, error_message, ok,
     REGION,
@@ -114,6 +115,23 @@ fn rewind(engine: &Arc<engine::InMemoryEngine>, id: &str, elapsed: Duration) {
     entry.created_on = back(entry.created_on);
     entry.last_active_on = back(entry.last_active_on);
     entry.settles_at = entry.settles_at.map(back);
+}
+
+/// Put the instant the clock owes a stored session its next status at `at`.
+///
+/// A row that means "the clock has not reached the due instant yet" holds that instant far
+/// enough ahead that the wall clock cannot cross it while the row's calls are made: the
+/// status turns on the stored due instant, so positioning the instant is what fixes which
+/// side of it a call lands on, and a margin measured against the clock is not.
+fn set_due_instant(engine: &Arc<engine::InMemoryEngine>, id: &str, at: SystemTime) {
+    let state = engine.state::<ComAmazonawsGlueAwsglueState>();
+    let mut store = state.lock();
+    let entry = store
+        .session_mut(REGION, id)
+        .unwrap_or_else(|| panic!("{id} was created"));
+    if entry.settles_at.is_some() {
+        entry.settles_at = Some(at);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -545,25 +563,38 @@ async fn an_id_no_session_has_is_a_miss() {
 // The statuses the clock owes a session
 // ---------------------------------------------------------------------------
 
-/// A session leaves `PROVISIONING` for `READY` when the span the clock owed it has passed,
-/// and not before — and the change is materialised by whichever read happens next, so
-/// nothing sleeps and two reads of a settled session agree.
+/// A session leaves `PROVISIONING` for `READY` when the instant the clock owed it has
+/// passed, and not before — and the change is materialised by whichever read happens next,
+/// so nothing sleeps and two reads of one session agree.
+///
+/// The status turns on the stored DUE instant, so each row positions that instant: a row
+/// that reads a session still provisioning holds it ahead of the clock, and a row that reads
+/// a provisioned one leaves it at or behind the clock, where the clock only moves further.
 #[tokio::test]
 async fn a_session_reaches_ready_once_the_clock_owes_it() {
-    // (case, how long ago the session was created, the status a read must report)
-    let rows: &[(&str, Duration, &str)] = &[
-        ("the instant it was created", Duration::ZERO, STATUS_PROVISIONING),
-        ("halfway through the span", SESSION_SETTLES_AFTER / 2, STATUS_PROVISIONING),
+    // (case, how long ago the session was created, whether its due instant is held ahead of
+    //  the clock, the status a read must report)
+    let rows: &[(&str, Duration, bool, &str)] = &[
+        ("the instant it was created", Duration::ZERO, false, STATUS_PROVISIONING),
         (
-            "one millisecond short of the span",
-            SESSION_SETTLES_AFTER - Duration::from_millis(1),
+            "halfway through the span, the due instant still ahead",
+            SESSION_SETTLES_AFTER / 2,
+            true,
             STATUS_PROVISIONING,
         ),
-        ("exactly at the due instant", SESSION_SETTLES_AFTER, STATUS_READY),
-        ("well past the due instant", SESSION_SETTLES_AFTER * 4, STATUS_READY),
+        (
+            // A session as old as the span still reports the status its DUE instant says,
+            // not one computed from how long ago it was created.
+            "a hair short of the span, the due instant still ahead",
+            SESSION_SETTLES_AFTER - Duration::from_millis(1),
+            true,
+            STATUS_PROVISIONING,
+        ),
+        ("exactly at the due instant", SESSION_SETTLES_AFTER, false, STATUS_READY),
+        ("well past the due instant", SESSION_SETTLES_AFTER * 4, false, STATUS_READY),
     ];
 
-    for (case, elapsed, expected) in rows {
+    for (case, elapsed, due_held_ahead, expected) in rows {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let router = emulator_on(engine.clone());
         create(
@@ -577,6 +608,9 @@ async fn a_session_reaches_ready_once_the_clock_owes_it() {
         )
         .await;
         rewind(&engine, "settling", *elapsed);
+        if *due_held_ahead {
+            set_due_instant(&engine, "settling", far_future());
+        }
 
         let read = get(&router, "settling").await;
         assert_eq!(

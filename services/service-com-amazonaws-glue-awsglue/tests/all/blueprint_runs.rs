@@ -31,6 +31,7 @@ use service_com_amazonaws_glue_awsglue::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::job_runs::far_future;
 use crate::wire::{assert_echoed, call, emulator_on, error_code, error_message, ok};
 
 /// The longest `RoleArn` the model accepts: `OrchestrationIAMRoleArn`, "len 1..1024"
@@ -99,6 +100,29 @@ fn rewind(engine: &Arc<engine::InMemoryEngine>, name: &str, elapsed: Duration) {
         run.started_on = back(run.started_on);
         run.settles_at = run.settles_at.map(back);
         run.completed_on = run.completed_on.map(back);
+    }
+}
+
+/// Put the instants the clock owes a stored blueprint, and every run of it still in flight,
+/// at `at`.
+///
+/// A row that means "the clock has not reached the due instant yet" holds that instant far
+/// enough ahead that the wall clock cannot cross it while the row's calls are made: the
+/// status and the state turn on the stored due instant, so positioning the instant is what
+/// fixes which side of it a call lands on, and a margin measured against the clock is not.
+fn set_due_instants(engine: &Arc<engine::InMemoryEngine>, name: &str, at: SystemTime) {
+    let state = engine.state::<ComAmazonawsGlueAwsglueState>();
+    let mut store = state.lock();
+    let entry = store
+        .blueprint_mut(name)
+        .unwrap_or_else(|| panic!("{name} was registered"));
+    if entry.settles_at.is_some() {
+        entry.settles_at = Some(at);
+    }
+    for run in &mut entry.runs {
+        if run.settles_at.is_some() {
+            run.settles_at = Some(at);
+        }
     }
 }
 
@@ -359,27 +383,40 @@ async fn each_start_records_its_own_run() {
     }
 }
 
-/// A run leaves the running state for the terminal one when the span the clock owed it has
-/// passed, and not before — and the change is materialised by whichever read happens next,
-/// so nothing sleeps and two reads of a settled run agree. A run that created the workflow
+/// A run leaves the running state for the terminal one when the instant the clock owed it
+/// has passed, and not before — and the change is materialised by whichever read happens
+/// next, so nothing sleeps and two reads of one run agree. A run that created the workflow
 /// it lays out comes to rest in the modelled succeeded state, carrying that workflow's name
 /// and no error.
+///
+/// The state turns on the stored DUE instant, so each row positions that instant: a row that
+/// reads a run still in flight holds it ahead of the clock, and a row that reads a settled
+/// one leaves it at or behind the clock, where the clock only moves further.
 #[tokio::test]
 async fn a_run_reaches_its_terminal_state_once_the_clock_owes_it() {
-    // (case, how long ago the run started, the state a read must report)
-    let rows: &[(&str, Duration, &str)] = &[
-        ("the instant it started", Duration::ZERO, STATE_RUNNING),
-        ("halfway through the span", BLUEPRINT_RUN_SETTLES_AFTER / 2, STATE_RUNNING),
+    // (case, how long ago the run started, whether its due instant is held ahead of the
+    //  clock, the state a read must report)
+    let rows: &[(&str, Duration, bool, &str)] = &[
+        ("the instant it started", Duration::ZERO, false, STATE_RUNNING),
         (
-            "one millisecond short of the span",
-            BLUEPRINT_RUN_SETTLES_AFTER - Duration::from_millis(1),
+            "halfway through the span, the due instant still ahead",
+            BLUEPRINT_RUN_SETTLES_AFTER / 2,
+            true,
             STATE_RUNNING,
         ),
-        ("exactly at the due instant", BLUEPRINT_RUN_SETTLES_AFTER, STATE_SUCCEEDED),
-        ("well past the due instant", BLUEPRINT_RUN_SETTLES_AFTER * 4, STATE_SUCCEEDED),
+        (
+            // A run as old as the span still reports the state its DUE instant says, not
+            // one computed from how long ago it started.
+            "a hair short of the span, the due instant still ahead",
+            BLUEPRINT_RUN_SETTLES_AFTER - Duration::from_millis(1),
+            true,
+            STATE_RUNNING,
+        ),
+        ("exactly at the due instant", BLUEPRINT_RUN_SETTLES_AFTER, false, STATE_SUCCEEDED),
+        ("well past the due instant", BLUEPRINT_RUN_SETTLES_AFTER * 4, false, STATE_SUCCEEDED),
     ];
 
-    for (case, elapsed, expected) in rows {
+    for (case, elapsed, due_held_ahead, expected) in rows {
         let (router, engine) = emulator_with_engine();
         register_active(&router, &engine, "settling").await;
         let run_id = start(
@@ -392,6 +429,9 @@ async fn a_run_reaches_its_terminal_state_once_the_clock_owes_it() {
         )
         .await;
         rewind(&engine, "settling", *elapsed);
+        if *due_held_ahead {
+            set_due_instants(&engine, "settling", far_future());
+        }
 
         let read = get_run(&router, "settling", &run_id).await;
         assert_eq!(
@@ -801,22 +841,35 @@ async fn starting_a_run_of_an_unknown_blueprint_is_refused() {
 /// `IllegalBlueprintStateException` saying the blueprint has no active definition, and
 /// nothing is recorded; from the instant the clock owes the registration its terminal status,
 /// the same start is served.
+///
+/// The refusal turns on the registration's stored DUE instant, so each row positions that
+/// instant: a row whose start is refused holds it ahead of the clock, and a row whose start
+/// is served leaves it at or behind the clock, where the clock only moves further.
 #[tokio::test]
 async fn starting_a_run_of_a_registration_in_flight_is_refused() {
-    // (case, how long ago the blueprint was registered, whether the start is served)
-    let rows: &[(&str, Duration, bool)] = &[
-        ("the instant it was registered", Duration::ZERO, false),
-        ("halfway through the registration span", BLUEPRINT_SETTLES_AFTER / 2, false),
+    // (case, how long ago the blueprint was registered, whether its due instant is held
+    //  ahead of the clock, whether the start is served)
+    let rows: &[(&str, Duration, bool, bool)] = &[
+        ("the instant it was registered", Duration::ZERO, false, false),
         (
-            "one millisecond short of the registration span",
-            BLUEPRINT_SETTLES_AFTER - Duration::from_millis(1),
+            "halfway through the registration span, the due instant still ahead",
+            BLUEPRINT_SETTLES_AFTER / 2,
+            true,
             false,
         ),
-        ("exactly at the due instant", BLUEPRINT_SETTLES_AFTER, true),
-        ("well past the due instant", BLUEPRINT_SETTLES_AFTER * 4, true),
+        (
+            // A registration as old as the span is still in flight while its DUE instant
+            // is ahead of the clock.
+            "a hair short of the registration span, the due instant still ahead",
+            BLUEPRINT_SETTLES_AFTER - Duration::from_millis(1),
+            true,
+            false,
+        ),
+        ("exactly at the due instant", BLUEPRINT_SETTLES_AFTER, false, true),
+        ("well past the due instant", BLUEPRINT_SETTLES_AFTER * 4, false, true),
     ];
 
-    for (case, elapsed, served) in rows {
+    for (case, elapsed, due_held_ahead, served) in rows {
         let (router, engine) = emulator_with_engine();
         ok(
             &router,
@@ -828,6 +881,9 @@ async fn starting_a_run_of_a_registration_in_flight_is_refused() {
         )
         .await;
         rewind(&engine, "in-flight", *elapsed);
+        if *due_held_ahead {
+            set_due_instants(&engine, "in-flight", far_future());
+        }
 
         let request = json!({
             "BlueprintName": "in-flight",

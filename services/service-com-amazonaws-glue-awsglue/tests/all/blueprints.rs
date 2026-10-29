@@ -18,7 +18,7 @@
 //! the S3 location — each published length bound, and one past it, included.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::ops::types::CreateBlueprintInput;
@@ -27,6 +27,7 @@ use service_com_amazonaws_glue_awsglue::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::job_runs::far_future;
 use crate::wire::{assert_echoed, call, emulator, emulator_on, error_code, error_message, ok};
 
 /// The longest `Name` the model accepts: `OrchestrationNameString`, "len 1..128"
@@ -91,6 +92,23 @@ fn rewind(engine: &Arc<engine::InMemoryEngine>, name: &str, elapsed: Duration) {
     entry.created_on = back(entry.created_on);
     entry.last_modified_on = back(entry.last_modified_on);
     entry.settles_at = entry.settles_at.map(back);
+}
+
+/// Put the instant the clock owes a stored registration its next status at `at`.
+///
+/// A row that means "the clock has not reached the due instant yet" holds that instant far
+/// enough ahead that the wall clock cannot cross it while the row's calls are made: the
+/// status turns on the stored due instant, so positioning the instant is what fixes which
+/// side of it a call lands on, and a margin measured against the clock is not.
+fn set_due_instant(engine: &Arc<engine::InMemoryEngine>, name: &str, at: SystemTime) {
+    let state = engine.state::<ComAmazonawsGlueAwsglueState>();
+    let mut store = state.lock();
+    let entry = store
+        .blueprint_mut(name)
+        .unwrap_or_else(|| panic!("{name} was registered"));
+    if entry.settles_at.is_some() {
+        entry.settles_at = Some(at);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -306,25 +324,38 @@ async fn the_tags_a_registration_carried_narrow_a_filtered_listing() {
 // The status the clock owes a registration
 // ---------------------------------------------------------------------------
 
-/// A registration leaves `CREATING` for `ACTIVE` when the span the clock owed it has
+/// A registration leaves `CREATING` for `ACTIVE` when the instant the clock owed it has
 /// passed, and not before — and the change is materialised by whichever read happens next,
-/// so nothing sleeps and two reads of a settled registration agree.
+/// so nothing sleeps and two reads of one registration agree.
+///
+/// The status turns on the stored DUE instant, so each row positions that instant: a row
+/// that reads a registration still in flight holds it ahead of the clock, and a row that
+/// reads a settled one leaves it at or behind the clock, where the clock only moves further.
 #[tokio::test]
 async fn a_registration_reaches_active_once_the_clock_owes_it() {
-    // (case, how long ago the registration was made, the status a read must report)
-    let rows: &[(&str, Duration, &str)] = &[
-        ("the instant it was registered", Duration::ZERO, STATUS_CREATING),
-        ("halfway through the span", BLUEPRINT_SETTLES_AFTER / 2, STATUS_CREATING),
+    // (case, how long ago the registration was made, whether its due instant is held ahead
+    //  of the clock, the status a read must report)
+    let rows: &[(&str, Duration, bool, &str)] = &[
+        ("the instant it was registered", Duration::ZERO, false, STATUS_CREATING),
         (
-            "one millisecond short of the span",
-            BLUEPRINT_SETTLES_AFTER - Duration::from_millis(1),
+            "halfway through the span, the due instant still ahead",
+            BLUEPRINT_SETTLES_AFTER / 2,
+            true,
             STATUS_CREATING,
         ),
-        ("exactly at the due instant", BLUEPRINT_SETTLES_AFTER, STATUS_ACTIVE),
-        ("well past the due instant", BLUEPRINT_SETTLES_AFTER * 4, STATUS_ACTIVE),
+        (
+            // A registration as old as the span still reports the status its DUE instant
+            // says, not one computed from how long ago it was made.
+            "a hair short of the span, the due instant still ahead",
+            BLUEPRINT_SETTLES_AFTER - Duration::from_millis(1),
+            true,
+            STATUS_CREATING,
+        ),
+        ("exactly at the due instant", BLUEPRINT_SETTLES_AFTER, false, STATUS_ACTIVE),
+        ("well past the due instant", BLUEPRINT_SETTLES_AFTER * 4, false, STATUS_ACTIVE),
     ];
 
-    for (case, elapsed, expected) in rows {
+    for (case, elapsed, due_held_ahead, expected) in rows {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let router = emulator_on(engine.clone());
         create(
@@ -337,6 +368,9 @@ async fn a_registration_reaches_active_once_the_clock_owes_it() {
         )
         .await;
         rewind(&engine, "settling", *elapsed);
+        if *due_held_ahead {
+            set_due_instant(&engine, "settling", far_future());
+        }
 
         let read = get(&router, "settling").await;
         assert_eq!(
