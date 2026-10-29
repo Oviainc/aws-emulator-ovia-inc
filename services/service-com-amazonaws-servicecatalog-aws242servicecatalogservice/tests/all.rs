@@ -17,6 +17,8 @@ mod catalog_error_paths;
 mod catalog_resource_lifecycle;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/launch_paths.rs"]
+mod launch_paths;
 #[path = "all/portfolio_lifecycle.rs"]
 mod portfolio_lifecycle;
 #[path = "all/state_roundtrip.rs"]

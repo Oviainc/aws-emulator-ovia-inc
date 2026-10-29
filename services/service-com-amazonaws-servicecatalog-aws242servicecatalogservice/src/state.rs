@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    ConstraintDetail, PortfolioDetail, ProductViewDetail, ProductViewSummary,
+    ConstraintDetail, ConstraintSummary, PortfolioDetail, ProductViewDetail, ProductViewSummary,
     ProvisioningArtifact as ModelledProvisioningArtifact, ProvisioningArtifactDetail,
     ProvisioningArtifactSummary, ServiceActionDetail, ServiceActionSummary, SourceConnectionDetail,
     Tag, TagOptionDetail,
@@ -160,6 +160,16 @@ impl Constraint {
             owner: Some(::emulator_server::emulator_account_id().to_string()),
             product_id: Some(self.product_id.clone()),
             portfolio_id: Some(self.portfolio_id.clone()),
+        }
+    }
+
+    /// This record as the modelled `ConstraintSummary` — the shorter form every
+    /// response that reports the constraints ON a portfolio-product relationship
+    /// carries, which the model gives only a type and a description.
+    pub fn summary(&self) -> ConstraintSummary {
+        ConstraintSummary {
+            r#type: Some(self.constraint_type.clone()),
+            description: self.description.clone(),
         }
     }
 }

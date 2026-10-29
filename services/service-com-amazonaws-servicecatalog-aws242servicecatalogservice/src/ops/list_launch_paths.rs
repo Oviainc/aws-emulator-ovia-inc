@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLaunchPaths
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLaunchPaths`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLaunchPaths::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the launch paths of one product: one path per portfolio the product is
+//! associated with, each carrying that portfolio-product relationship's constraints.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +146,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLaunchPaths` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLaunchPathsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // A pure read: listing a product's paths reports the portfolio associations and
+        // the constraints on them, and changes neither.
+        let state = state.lock();
+
+        // A page token is this service's own opaque cursor: the portfolio id the next
+        // page resumes AT. Anything that is not one of ours is a bad parameter.
+        let resume_at = match input.page_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(token) => match crate::state::decode_page_cursor(token) {
+                Some(id) => Some(id),
+                None => {
+                    return Err(ListLaunchPathsErrorModeled::InvalidParametersException(
+                        InvalidParametersException {
+                            message: Some("PageToken is not a valid page token.".to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        // The emulated service verifies no caller identity, so the principal half of
+        // "a path is dependent on a specific product, porfolio, and principal" cannot be
+        // evaluated here: a request carries only the access key id of its signature, and
+        // this crate holds no resolution from that to the principal ARN an association
+        // names. The paths reported are therefore the product-portfolio ones, unfiltered
+        // by the stored `Portfolio::principals`; a path that exists for one principal is
+        // reported to every caller.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLaunchPaths"))
+        // A launch path is a portfolio the product can be launched through, so the
+        // paths ARE the product's portfolio associations — the same stored set
+        // `DescribeProduct` reports as `LaunchPaths` and `HasDefaultPath` is derived
+        // from, so two responses of this service cannot contradict each other. A
+        // product no portfolio holds therefore resolves no path at all, and neither
+        // does a product id nothing stored carries: that is what this operation's path
+        // resolution refuses, rather than answering an empty page.
+        let paths: Vec<&crate::state::Portfolio> = state
+            .products
+            .get(&input.product_id)
+            .into_iter()
+            .flat_map(|product| product.portfolio_ids.iter())
+            .filter_map(|portfolio_id| state.portfolios.get(portfolio_id))
+            .collect();
+        if paths.is_empty() {
+            return Err(ListLaunchPathsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No launch paths found for resource: {}",
+                        input.product_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `PageSize` is modelled `0..20` with a default of 0, and 0 asks for no
+        // caller-imposed bound: the whole remaining set is returned, which the store's
+        // own bound on how many portfolios can hold the product caps.
+        let page_size = if input.page_size > 0 {
+            input.page_size as usize
+        } else {
+            crate::state::MAX_PORTFOLIOS
+        };
+
+        // The constraints of every path on this page, grouped by portfolio id in ONE
+        // pass over the store: a constraint belongs to a path when it names both that
+        // path's portfolio and this product
+        // (`smithy_query query="doc" shape="LaunchPathSummary" member="ConstraintSummaries"`
+        // — "The constraints on the portfolio-product relationship"). `constraints` is
+        // keyed by constraint id, so each group comes out in the one order every list of
+        // them walks.
+        let mut constraints_by_portfolio: std::collections::BTreeMap<&str, Vec<ConstraintSummary>> =
+            std::collections::BTreeMap::new();
+        for constraint in state
+            .constraints
+            .values()
+            .filter(|constraint| constraint.product_id == input.product_id)
+        {
+            constraints_by_portfolio
+                .entry(constraint.portfolio_id.as_str())
+                .or_default()
+                .push(constraint.summary());
+        }
+
+        let mut launch_path_summaries = Vec::new();
+        let mut next_page_token = None;
+        // `Product::portfolio_ids` is a `BTreeSet`, so the paths are walked in ascending
+        // portfolio-id order — the order the cursor below compares against, which is
+        // what makes a resumed page pick up exactly where the previous one stopped and
+        // report every path across the pages exactly once.
+        for portfolio in paths
+            .into_iter()
+            .filter(|portfolio| resume_at.as_deref().is_none_or(|at| portfolio.id.as_str() >= at))
+        {
+            if launch_path_summaries.len() == page_size {
+                // More remain: hand back a cursor that resumes at this path.
+                next_page_token = Some(crate::state::encode_page_cursor(&portfolio.id));
+                break;
+            }
+            launch_path_summaries.push(LaunchPathSummary {
+                // The path IS the portfolio-product relationship, so the path's
+                // identifier and name are the portfolio's — the pair a later
+                // `PathId`/`PathName` names.
+                id: Some(portfolio.id.clone()),
+                name: Some(portfolio.display_name.clone()),
+                // "The constraints on the portfolio-product relationship": the stored
+                // constraints that name BOTH this portfolio and this product.
+                constraint_summaries: Some(
+                    constraints_by_portfolio
+                        .get(portfolio.id.as_str())
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+                // "The tags associated with this product path"
+                // (`smithy_query query="doc" shape="LaunchPathSummary" member="Tags"`):
+                // the path is the portfolio-product relationship, and the tags that
+                // relationship carries are the portfolio's — the model's own `Tag` doc
+                // says tags "are propagated to the resources created when provisioning a
+                // product", and launching through this path is what propagates the
+                // portfolio's. Read from the same stored map `DescribePortfolio` reports,
+                // so a tag added to the portfolio shows up on its path. The product's own
+                // tags stay where `DescribeProduct` reports them.
+                tags: Some(portfolio.tag_list()),
+            });
+        }
+
+        Ok(ListLaunchPathsOutput {
+            launch_path_summaries: Some(launch_path_summaries),
+            next_page_token,
+        })
     }
 }
