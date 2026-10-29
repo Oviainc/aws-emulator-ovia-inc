@@ -51,6 +51,8 @@ mod origin_endpoint_contents;
 mod origin_endpoint_defaults;
 #[path = "all/origin_endpoint_durations.rs"]
 mod origin_endpoint_durations;
+#[path = "all/origin_endpoint_packaging_bounds.rs"]
+mod origin_endpoint_packaging_bounds;
 #[path = "all/playback_path_is_one_rule.rs"]
 mod playback_path_is_one_rule;
 #[path = "all/refusal_order.rs"]

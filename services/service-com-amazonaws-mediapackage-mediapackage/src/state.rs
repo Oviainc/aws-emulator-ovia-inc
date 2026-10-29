@@ -96,8 +96,10 @@ pub const PAGE_SIZE_QUERY: &str = "maxResults";
 // `UnprocessableEntityException` (HTTP 422, "The parameters sent in the request are not
 // valid"), so one request cannot decide how much memory its record occupies. The product
 // is finite: at most MAX_CHANNELS channels and MAX_ORIGIN_ENDPOINTS endpoints, each with
-// at most MAX_TAGS tags, MAX_WHITELIST_ENTRIES whitelist entries and
-// MAX_CMAF_HLS_MANIFESTS child CMAF manifests, every caller-supplied string capped.
+// at most MAX_TAGS tags, MAX_WHITELIST_ENTRIES whitelist entries,
+// MAX_CMAF_HLS_MANIFESTS child CMAF manifests and MAX_PACKAGE_LIST_ENTRIES entries in
+// every other list a packaging configuration carries, every caller-supplied string
+// capped.
 // ---------------------------------------------------------------------------
 
 /// The most channels this store holds. The emulator's own resource guard, not a
@@ -148,6 +150,16 @@ pub const MAX_WHITELIST_ENTRIES: usize = 100;
 /// Emulator resource guard, NOT an AWS quota: the most child HLS manifests stored for
 /// one `CmafPackage`.
 pub const MAX_CMAF_HLS_MANIFESTS: usize = 50;
+
+/// Emulator resource guard, NOT an AWS quota: the most entries stored for any OTHER
+/// caller-sized list inside an origin endpoint's packaging configuration — a SPEKE key
+/// provider's `systemIds`, and the `adTriggers` / `periodTriggers` trigger lists of a
+/// packaging block or of a CMAF child manifest.
+///
+/// One constant for all of them, because the model publishes no `@length` for any of them
+/// and they are the same kind of value: a list whose length is the caller's to choose and
+/// whose entries the record keeps verbatim.
+pub const MAX_PACKAGE_LIST_ENTRIES: usize = 100;
 
 /// Emulator resource guard, NOT an AWS quota: the longest caller-supplied string this
 /// service stores for a member whose length the model publishes no limit for.
@@ -650,11 +662,33 @@ pub fn bound_tags(
     bound_tag_entries(tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
 }
 
+/// Refuse a caller-supplied list of strings that would grow a record past `max_entries`
+/// entries, or past [`MAX_STRING_CHARS`] characters in any one entry.
+///
+/// A list lets a caller decide how much memory a record occupies in two ways — how many
+/// entries it carries, and how long each entry is — so both are bounded, here, for every
+/// such list of this service: one place, so no two lists are judged differently, and the
+/// refusal names the member and which of the two bounds it broke.
+fn bound_string_list(
+    member: &str,
+    entries: &[String],
+    max_entries: usize,
+) -> Result<(), ServiceError> {
+    bound_entries(member, entries.len(), max_entries)?;
+    for entry in entries {
+        bound_part_chars(member, "an entry", entry, MAX_STRING_CHARS)?;
+    }
+    Ok(())
+}
+
 /// Refuse the caller-sized members an OriginEndpoint create and update share.
 ///
 /// Both handlers call this, so the bounds one enforces cannot drift from the other's: an
 /// update must not be able to grow a record past what the create would have refused. Each
 /// refusal is keyed by the member path the wire names, as every other refused member is.
+///
+/// The members nested inside an `Authorization` or a packaging configuration are bounded by
+/// [`bound_origin_endpoint_packaging_members`], which both handlers call beside this one.
 pub fn bound_origin_endpoint_members(
     description: Option<&str>,
     manifest_name: Option<&str>,
@@ -670,10 +704,7 @@ pub fn bound_origin_endpoint_members(
         }
     }
     if let Some(whitelist) = whitelist {
-        bound_entries("whitelist", whitelist.len(), MAX_WHITELIST_ENTRIES)?;
-        for entry in whitelist {
-            bound_part_chars("whitelist", "an entry", entry, MAX_STRING_CHARS)?;
-        }
+        bound_string_list(WHITELIST_MEMBER, whitelist, MAX_WHITELIST_ENTRIES)?;
     }
     if let Some(manifests) = cmaf_package.and_then(|package| package.hls_manifests.as_ref()) {
         bound_entries(
@@ -697,6 +728,137 @@ pub fn bound_origin_endpoint_members(
                 )?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Refuse the caller-sized strings and lists INSIDE the `Authorization` and the packaging
+/// configuration an OriginEndpoint create and update share.
+///
+/// The same rule [`bound_origin_endpoint_members`] applies to the request's top-level
+/// members, applied at every depth a packaging configuration reaches: the store copies each
+/// of these values verbatim onto the record and every later projection of the endpoint
+/// echoes them, so one request must not be able to decide how much memory its record
+/// occupies. Both handlers call this, before anything is written, so the bounds one
+/// enforces cannot drift from the other's and a refused request persists nothing.
+///
+/// Every member judged here targets the unconstrained `__string` shape, or a list of one,
+/// and the model publishes no `@length` for any of them
+/// (`smithy_query(query="shape",shape="com.amazonaws.mediapackage#Authorization,com.amazonaws.mediapackage#SpekeKeyProvider,com.amazonaws.mediapackage#HlsEncryption,com.amazonaws.mediapackage#CmafEncryption,com.amazonaws.mediapackage#CmafPackageCreateOrUpdateParameters,com.amazonaws.mediapackage#DashPackage",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`),
+/// so the framework's constraint walk cannot bound them. A member targeting an `enum` shape
+/// is NOT judged here: its value set is closed, so the longest value it could carry is the
+/// longest one the model declares. What a caller still decides about a LIST of such values
+/// is how many entries it carries, so each of those lists is bounded by entry count.
+///
+/// Members are judged in a fixed order — the authorization block, then each packaging
+/// block's own strings, then the trigger lists, then the SPEKE key provider — so one
+/// request is always refused by the same member, and a member's PATH is built only when
+/// that member is the one being refused.
+pub fn bound_origin_endpoint_packaging_members(
+    authorization: Option<&Authorization>,
+    hls_package: Option<&HlsPackage>,
+    dash_package: Option<&DashPackage>,
+    cmaf_package: Option<&CmafPackageCreateOrUpdateParameters>,
+    mss_package: Option<&MssPackage>,
+) -> Result<(), ServiceError> {
+    let hls_encryption = hls_package.and_then(|package| package.encryption.as_ref());
+    let cmaf_encryption = cmaf_package.and_then(|package| package.encryption.as_ref());
+    for (member, value) in [
+        (
+            "authorization.cdnIdentifierSecret",
+            authorization.map(|block| block.cdn_identifier_secret.as_str()),
+        ),
+        (
+            "authorization.secretsRoleArn",
+            authorization.map(|block| block.secrets_role_arn.as_str()),
+        ),
+        (
+            "hlsPackage.encryption.constantInitializationVector",
+            hls_encryption.and_then(|encryption| {
+                encryption.constant_initialization_vector.as_deref()
+            }),
+        ),
+        (
+            "cmafPackage.encryption.constantInitializationVector",
+            cmaf_encryption.and_then(|encryption| {
+                encryption.constant_initialization_vector.as_deref()
+            }),
+        ),
+        (
+            "cmafPackage.segmentPrefix",
+            cmaf_package.and_then(|package| package.segment_prefix.as_deref()),
+        ),
+        (
+            "dashPackage.utcTimingUri",
+            dash_package.and_then(|package| package.utc_timing_uri.as_deref()),
+        ),
+    ] {
+        if let Some(value) = value {
+            bound_chars(member, value, MAX_STRING_CHARS)?;
+        }
+    }
+
+    // The trigger lists a packaging block carries: every entry is a member of a modelled
+    // enum, so what the caller decides is how MANY of them the record keeps.
+    for (member, entries) in [
+        (
+            "hlsPackage.adTriggers",
+            hls_package.and_then(|package| package.ad_triggers.as_deref()),
+        ),
+        (
+            "dashPackage.adTriggers",
+            dash_package.and_then(|package| package.ad_triggers.as_deref()),
+        ),
+        (
+            "dashPackage.periodTriggers",
+            dash_package.and_then(|package| package.period_triggers.as_deref()),
+        ),
+    ] {
+        if let Some(entries) = entries {
+            bound_string_list(member, entries, MAX_PACKAGE_LIST_ENTRIES)?;
+        }
+    }
+
+    // A CMAF child manifest carries a trigger list of its own, under a path naming the
+    // entry the way the wire indexes a list member. Its `id` and `manifestName` are bounded
+    // with the manifest list itself, by [`bound_origin_endpoint_members`].
+    for (index, manifest) in cmaf_package
+        .and_then(|package| package.hls_manifests.as_ref())
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        if let Some(entries) = manifest.ad_triggers.as_deref() {
+            bound_string_list(
+                &format!("cmafPackage.hlsManifests[{index}].adTriggers"),
+                entries,
+                MAX_PACKAGE_LIST_ENTRIES,
+            )?;
+        }
+    }
+
+    // The SPEKE key provider of whichever packaging block carries an encryption
+    // configuration: the same four strings and one list under each block's own wire path,
+    // read from the one walk of the blocks the ARN rules read ([`speke_key_providers`]).
+    for (block, provider) in
+        speke_key_providers(hls_package, dash_package, cmaf_package, mss_package)
+    {
+        let path = format!("{block}.encryption.spekeKeyProvider");
+        for (member, value) in [
+            ("resourceId", Some(provider.resource_id.as_str())),
+            ("roleArn", Some(provider.role_arn.as_str())),
+            ("url", Some(provider.url.as_str())),
+            ("certificateArn", provider.certificate_arn.as_deref()),
+        ] {
+            if let Some(value) = value {
+                bound_chars(&format!("{path}.{member}"), value, MAX_STRING_CHARS)?;
+            }
+        }
+        bound_string_list(
+            &format!("{path}.systemIds"),
+            &provider.system_ids,
+            MAX_PACKAGE_LIST_ENTRIES,
+        )?;
     }
     Ok(())
 }
@@ -854,6 +1016,37 @@ fn speke_arn_members<'a>(block: &str, provider: &'a SpekeKeyProvider) -> Vec<Arn
     members
 }
 
+/// Every SPEKE key provider an OriginEndpoint create or update request carries, each under
+/// the wire path of the packaging block that carries it.
+///
+/// The provider sits at the same place under all four packaging formats, so this is the ONE
+/// walk of the four blocks: the ARN rules below and the size bounds above read the same set
+/// in the same order, so neither can judge a provider the other does not see.
+fn speke_key_providers<'a>(
+    hls_package: Option<&'a HlsPackage>,
+    dash_package: Option<&'a DashPackage>,
+    cmaf_package: Option<&'a CmafPackageCreateOrUpdateParameters>,
+    mss_package: Option<&'a MssPackage>,
+) -> Vec<(&'static str, &'a SpekeKeyProvider)> {
+    [
+        hls_package
+            .and_then(|package| package.encryption.as_ref())
+            .map(|encryption| ("hlsPackage", &encryption.speke_key_provider)),
+        dash_package
+            .and_then(|package| package.encryption.as_ref())
+            .map(|encryption| ("dashPackage", &encryption.speke_key_provider)),
+        cmaf_package
+            .and_then(|package| package.encryption.as_ref())
+            .map(|encryption| ("cmafPackage", &encryption.speke_key_provider)),
+        mss_package
+            .and_then(|package| package.encryption.as_ref())
+            .map(|encryption| ("mssPackage", &encryption.speke_key_provider)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 /// EVERY member of an OriginEndpoint create or update request that the model documents as
 /// an ARN, with the requirement each one has to satisfy.
 ///
@@ -883,21 +1076,9 @@ fn origin_endpoint_arn_members<'a>(
             IAM_ROLE_ARN,
         ));
     }
-    let providers = [
-        hls_package
-            .and_then(|package| package.encryption.as_ref())
-            .map(|encryption| ("hlsPackage", &encryption.speke_key_provider)),
-        dash_package
-            .and_then(|package| package.encryption.as_ref())
-            .map(|encryption| ("dashPackage", &encryption.speke_key_provider)),
-        cmaf_package
-            .and_then(|package| package.encryption.as_ref())
-            .map(|encryption| ("cmafPackage", &encryption.speke_key_provider)),
-        mss_package
-            .and_then(|package| package.encryption.as_ref())
-            .map(|encryption| ("mssPackage", &encryption.speke_key_provider)),
-    ];
-    for (block, provider) in providers.into_iter().flatten() {
+    for (block, provider) in
+        speke_key_providers(hls_package, dash_package, cmaf_package, mss_package)
+    {
         members.extend(speke_arn_members(block, provider));
     }
     members

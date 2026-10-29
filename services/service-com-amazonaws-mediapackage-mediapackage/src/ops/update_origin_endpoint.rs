@@ -254,6 +254,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.whitelist.as_deref(),
             input.cmaf_package.as_ref(),
         )?;
+        // The strings and lists INSIDE the authorization and packaging blocks are bounded
+        // by the same function the create bounds them with, so an update cannot grow a
+        // packaging configuration past what a create of it would have refused, and a
+        // refused update leaves the stored record exactly as it was.
+        crate::state::bound_origin_endpoint_packaging_members(
+            input.authorization.as_ref(),
+            input.hls_package.as_ref(),
+            input.dash_package.as_ref(),
+            input.cmaf_package.as_ref(),
+            input.mss_package.as_ref(),
+        )?;
         // The duration floor the create enforces, enforced by the same function here: an
         // update must not be able to store a negative window a create would have refused,
         // and a refused update leaves the stored record exactly as it was.

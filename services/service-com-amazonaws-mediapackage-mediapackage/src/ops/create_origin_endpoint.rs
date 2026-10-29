@@ -226,6 +226,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.whitelist.as_deref(),
             input.cmaf_package.as_ref(),
         )?;
+        // The strings and lists INSIDE the authorization and packaging blocks are the
+        // caller's to size too, and the store keeps every one of them verbatim, so they are
+        // bounded by the same rule — by the one function the update bounds them with.
+        crate::state::bound_origin_endpoint_packaging_members(
+            input.authorization.as_ref(),
+            input.hls_package.as_ref(),
+            input.dash_package.as_ref(),
+            input.cmaf_package.as_ref(),
+            input.mss_package.as_ref(),
+        )?;
         // Every member of an endpoint that is a NUMBER OF SECONDS is a count of seconds of
         // media, so none of them may be negative. Judged by the one function the update
         // calls too, before anything is stored, so a refused request persists nothing.
