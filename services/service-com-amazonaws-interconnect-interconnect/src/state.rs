@@ -125,11 +125,18 @@ pub struct PendingTransition {
 /// remain here until the Connection is accepted on the Partner portal" ->
 /// "pending: the connection has been accepted and is being provisioned between AWS
 /// and the Partner" -> "available: the connection has been fully provisioned" — and
-/// it is owed by the CLOCK here because the emulator has no partner portal for
-/// anyone to accept at. Every other state is either terminal (`available`,
+/// the CLOCK carries a connection along it so no connection is left sitting in a
+/// non-terminal state for ever. Every other state is either terminal (`available`,
 /// `deleted`), impaired by a circuit fault the emulator cannot have (`down`,
 /// `failed`), or already owed a transition by the call that set it (`deleting`,
 /// `updating`), so none of them is advanced from here.
+///
+/// The clock stands in for the TIME each leg takes and for nothing a caller decides:
+/// it records no acceptance ([`StoredConnection::proposal_accepted`] is what records
+/// one), so a proposal nobody has accepted stays acceptable however far along this
+/// progression its connection has been carried, and [`apply_acceptance`] — the one
+/// writer of an acceptance — re-enters the accepted state and takes the rest of the
+/// progression from the instant the acceptance is made.
 ///
 /// Derived from the state alone, so EVERY path that leaves a connection in a
 /// provisioning state hands it on along the same progression — the create that
@@ -208,6 +215,18 @@ pub struct StoredConnection {
     pub remote_account: Option<RemoteAccountIdentifier>,
     /// The transition the clock owes this connection, if any.
     pub pending_transition: Option<PendingTransition>,
+    /// Whether this connection's proposal HAS been accepted — the call that selects
+    /// the Attach Point "to which the connection should be associated". Set by
+    /// [`apply_acceptance`], which is the only writer of an acceptance, and by
+    /// nothing else.
+    ///
+    /// Kept beside the record rather than read back off its `state`, because the two
+    /// are different things here: the clock carries a connection along the
+    /// provisioning progression on its own ([`owed_progression`]), standing in for
+    /// the time each leg takes and not for anyone's acceptance, so a connection that
+    /// has left `requested` has not necessarily been accepted by anybody. This is
+    /// what a second acceptance of one proposal is judged against.
+    pub proposal_accepted: bool,
     /// When this record leaves the store, set once it reaches `deleted`.
     pub evict_due: Option<Instant>,
 }
@@ -1328,12 +1347,15 @@ fn holds_arn(stored: &StoredConnection, arn: &str) -> bool {
     stored.connection.arn == arn && stored.connection.state != DELETED_CONNECTION_STATE
 }
 
-/// The `ConnectionState` a connection whose proposal has not been accepted yet
-/// reports ("requested: The initial state of a connection. The state will remain here
-/// until the Connection is accepted on the Partner portal").
+/// The `ConnectionState` a new connection is returned in ("requested: The initial
+/// state of a connection. The state will remain here until the Connection is accepted
+/// on the Partner portal"), which is also the first leg of the progression the clock
+/// carries it along.
 ///
-/// It is the one state an acceptance can be made from: before it there is no
-/// connection to accept, and after it the acceptance has already happened.
+/// It is not what says whether an acceptance can still be made: the clock carries a
+/// connection out of this state by itself, so whether the proposal has been accepted
+/// is [`StoredConnection::proposal_accepted`]'s to say and which states have no
+/// acceptance left to make is [`acceptance_possible_in`]'s.
 pub const AWAITING_ACCEPTANCE_CONNECTION_STATE: &str = "requested";
 
 /// The `ConnectionState` an accepted proposal's connection enters ("pending: The
@@ -1346,10 +1368,10 @@ pub const ACCEPTED_CONNECTION_STATE: &str = "pending";
 /// state `UpdateConnection`'s own change hands the connection to the clock in.
 pub const UPDATING_CONNECTION_STATE: &str = "updating";
 
-/// The `ConnectionState` values a connection whose proposal HAS been accepted, and
-/// whose circuit has not since been torn down or failed, reports: the accepted state
-/// itself, the fully provisioned one, the one a provisioned circuit that is not
-/// passing traffic reports, and the one an in-flight change reports.
+/// The `ConnectionState` values a connection that has been carried past the state it
+/// was created in, and whose circuit has not since been torn down or failed, reports:
+/// the accepted state itself, the fully provisioned one, the one a provisioned circuit
+/// that is not passing traffic reports, and the one an in-flight change reports.
 pub const ACCEPTED_CONNECTION_STATES: [&str; 4] = [
     ACCEPTED_CONNECTION_STATE,
     "available",
@@ -1357,9 +1379,71 @@ pub const ACCEPTED_CONNECTION_STATES: [&str; 4] = [
     UPDATING_CONNECTION_STATE,
 ];
 
-/// Whether `state` is one a connection reports once its proposal has been accepted.
+/// Whether `state` is one a connection reports once it has been carried past the state
+/// it was created in.
 pub fn is_accepted_state(state: &str) -> bool {
     ACCEPTED_CONNECTION_STATES.contains(&state)
+}
+
+/// The terminal `ConnectionState` a connection that never came up reports ("failed:
+/// The connection has failed to be created").
+pub const FAILED_CONNECTION_STATE: &str = "failed";
+
+/// Whether a connection in `state` still has an acceptance to make on it.
+///
+/// A connection a `DeleteConnection` has been made on is losing, or has lost, the very
+/// connectivity an acceptance brings up, and one whose creation failed never had it, so
+/// on those states there is nothing left to accept. Every other modelled state is a
+/// connection that exists and that an acceptance can therefore be made on — whether it
+/// already HAS been is [`StoredConnection::proposal_accepted`]'s to say, not the
+/// state's, because the clock carries a connection along the provisioning progression
+/// by itself.
+pub fn acceptance_possible_in(state: &str) -> bool {
+    !is_deleted_or_deleting(state) && state != FAILED_CONNECTION_STATE
+}
+
+/// Accept a connection's proposal: the ONE writer of everything an acceptance decides.
+///
+/// "Upon accepting the proposal a connection will be made between the AWS network as
+/// accessed via the selected Attach Point and the network previously selected network
+/// on the partner's portal" — so the selected attach point is what the connection is
+/// associated with from now on, a `description` the request supplies distinguishes the
+/// resulting Connection (one it omits leaves the proposal's own alone), and the tags it
+/// carries are MERGED onto the ones the connection holds, the way every tag writer of
+/// this service writes them. The Environment and the bandwidth were chosen on the
+/// partner's portal and "cannot be modified", so nothing here touches them, nor any
+/// other server-owned member of the record.
+///
+/// Making the connection onto the selected attach point is provisioning work, so the
+/// connection enters the accepted state ("pending: the connection has been accepted and
+/// is being provisioned between AWS and the Partner") and is handed the rest of the
+/// documented progression ([`owed_progression`]) from `now` — whatever state the clock
+/// had carried it to beforehand, exactly as a re-provisioning bandwidth change hands a
+/// connection back to the clock. The due instant is stored and materialised by
+/// whichever call comes next; nothing ever waits for it.
+pub fn apply_acceptance(
+    stored: &mut StoredConnection,
+    attach_point: &AttachPoint,
+    description: Option<&String>,
+    tags: Option<&std::collections::HashMap<String, String>>,
+    now: Instant,
+) {
+    stored.connection.attach_point = attach_point.clone();
+    if let Some(description) = description {
+        stored.connection.description = description.clone();
+    }
+    // "No tags" keeps its one representation in the store (`None`) when the request
+    // carries none.
+    if let Some(tags) = tags.filter(|tags| !tags.is_empty()) {
+        stored
+            .connection
+            .tags
+            .get_or_insert_with(std::collections::HashMap::new)
+            .extend(tags.iter().map(|(key, value)| (key.clone(), value.clone())));
+    }
+    stored.proposal_accepted = true;
+    stored.connection.state = ACCEPTED_CONNECTION_STATE.to_string();
+    stored.pending_transition = owed_progression(ACCEPTED_CONNECTION_STATE, now);
 }
 
 /// Whether accepting `connection`'s proposal with `attach_point`, `description` and

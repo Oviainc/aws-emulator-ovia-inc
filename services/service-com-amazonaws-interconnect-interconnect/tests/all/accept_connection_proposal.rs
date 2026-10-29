@@ -273,9 +273,8 @@ async fn accepting_a_proposal_makes_the_connection_its_activation_key_names() {
         let label = case.label();
         let before = stored_connections(&emulator, case.region).await.len();
 
-        // The proposal, and then — as the very next call — the acceptance of it, so
-        // the proposal is accepted through the API rather than at the partner portal
-        // the clock stands in for.
+        // The proposal, and then the acceptance of it: the acceptance is the caller's
+        // to make whatever the clock has done in between, so no row has to beat it.
         let proposal = create_proposal(&emulator, case).await;
         let activation_key = text(&proposal, "activationKey");
         let (status, body) = emulator
@@ -654,9 +653,8 @@ async fn an_attach_point_that_resolves_to_nothing_is_refused_and_accepts_nothing
 
     for (shape, attach_point) in &unresolvable {
         let label = format!("{} / {shape}", case.label());
-        // A proposal of its own per row, accepted as the very next call, so each row
-        // is refused for its attach point and not for a proposal an earlier row has
-        // already accepted.
+        // A proposal of its own per row, so each row is refused for its attach point
+        // and not for a proposal an earlier row has already accepted.
         let proposal = create_proposal(&emulator, &case).await;
         let (status, body) = emulator
             .ic_in(

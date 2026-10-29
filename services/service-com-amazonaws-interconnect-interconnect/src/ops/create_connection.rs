@@ -472,7 +472,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // here until the Connection is accepted on the Partner portal" — the
             // state every new connection is returned in, and the first leg of the
             // progression the clock owes it below.
-            state: "requested".to_string(),
+            state: crate::state::AWAITING_ACCEPTANCE_CONNECTION_STATE.to_string(),
             shared_id: crate::state::new_shared_id(),
             // `billingTier` is OPTIONAL and the rule AWS assigns it by is not
             // published anywhere — not in the model, which gives only the
@@ -516,6 +516,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // instant is stored and materialised by whichever call comes next;
                 // this one never waits for it.
                 pending_transition: crate::state::owed_progression(&connection.state, now),
+                // Nobody has accepted this connection's proposal yet: the create is
+                // what MAKES the proposal, and `AcceptConnectionProposal` is the one
+                // call that accepts it. The clock's progression above moves the
+                // connection's state but records no acceptance, so this stays false
+                // until that call is made.
+                proposal_accepted: false,
                 evict_due: None,
             },
         );

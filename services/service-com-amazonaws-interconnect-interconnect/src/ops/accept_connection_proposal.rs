@@ -159,8 +159,8 @@ impl<Eng> AcceptConnectionProposal<Eng> {
 
 /// What this service's own store says about an `AcceptConnectionProposal` request.
 enum StoreVerdict {
-    /// The proposal the `activationKey` names is still awaiting acceptance: this is
-    /// the connection the acceptance makes, and the Environment it is placed upon,
+    /// The proposal the `activationKey` names has not been accepted yet: this is the
+    /// connection the acceptance is made on, and the Environment it is placed upon,
     /// which is what an attach-point refusal is worded from.
     Accept {
         connection_id: String,
@@ -174,8 +174,8 @@ enum StoreVerdict {
 }
 
 /// Judge a request against everything this service's OWN store answers: the proposal
-/// the `activationKey` resolves to, whether it is still awaiting acceptance, the tag
-/// set the acceptance would leave on it, and the `arn` attach point.
+/// the `activationKey` resolves to, whether that proposal has already been accepted,
+/// the tag set the acceptance would leave on it, and the `arn` attach point.
 ///
 /// `region` is the Region the request addressed, which is the scope the proposal is
 /// resolved in: a connection belongs to the Region it was created in, so neither an
@@ -234,32 +234,14 @@ fn judge_against_store(
         );
     }
 
-    // An acceptance can only be made on a proposal that is still awaiting it. Once
-    // the connection has been accepted, a request asking for exactly what that
-    // connection already holds is the SAME acceptance reported again — the operation
-    // is `@idempotent` — while one asking for anything else would re-associate a
-    // connection that is already being provisioned, which is this service's own
-    // client fault. A connection that is being deleted, deleted or failed has no
-    // acceptance left to make at all.
-    if connection.state != crate::state::AWAITING_ACCEPTANCE_CONNECTION_STATE {
-        if crate::state::is_accepted_state(&connection.state) {
-            if crate::state::acceptance_already_applied(
-                connection,
-                &input.attach_point,
-                input.description.as_ref(),
-                input.tags.as_ref(),
-            ) {
-                return Ok(StoreVerdict::AlreadyAccepted(Box::new(connection.clone())));
-            }
-            return Err(
-                AcceptConnectionProposalErrorModeled::InterconnectClientException(
-                    InterconnectClientException {
-                        message: crate::state::proposal_already_accepted_message(&connection.id),
-                    },
-                )
-                .into(),
-            );
-        }
+    // An acceptance is made on a connection that still EXISTS: one being deleted,
+    // deleted or failed has no connectivity an acceptance could bring up, so there is
+    // nothing left to accept on it at all
+    // (`crate::state::acceptance_possible_in`). Every other state is a connection an
+    // acceptance can still be made on — including the states the clock carries a new
+    // connection into on its own, because the clock stands in for the time
+    // provisioning takes and accepts nothing.
+    if !crate::state::acceptance_possible_in(&connection.state) {
         return Err(
             AcceptConnectionProposalErrorModeled::InterconnectClientException(
                 InterconnectClientException {
@@ -267,6 +249,35 @@ fn judge_against_store(
                         &connection.id,
                         &connection.state,
                     ),
+                },
+            )
+            .into(),
+        );
+    }
+
+    // A proposal is accepted ONCE, and what records that it HAS been is the
+    // acceptance itself (`StoredConnection::proposal_accepted`), never the state the
+    // connection reports: the clock carries a connection out of the state it was
+    // created in whether or not anybody has accepted it, so judging the acceptance by
+    // the state would refuse the very call the model says selects the attach point.
+    // Once the acceptance HAS been made, a request asking for exactly what that
+    // connection already holds is the SAME acceptance reported again — the operation
+    // is `@idempotent` — while one asking for anything else would re-associate a
+    // connection whose attach point that acceptance already settled, which is this
+    // service's own client fault.
+    if stored.proposal_accepted {
+        if crate::state::acceptance_already_applied(
+            connection,
+            &input.attach_point,
+            input.description.as_ref(),
+            input.tags.as_ref(),
+        ) {
+            return Ok(StoreVerdict::AlreadyAccepted(Box::new(connection.clone())));
+        }
+        return Err(
+            AcceptConnectionProposalErrorModeled::InterconnectClientException(
+                InterconnectClientException {
+                    message: crate::state::proposal_already_accepted_message(&connection.id),
                 },
             )
             .into(),
@@ -333,6 +344,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// by construction, because it makes no new resource — it accepts the one proposal
     /// the key names, and a repeat asking for what that connection already holds is
     /// answered with that same connection.
+    ///
+    /// The acceptance is this operation's to make, and no amount of elapsed time takes
+    /// it away: the clock carries a new connection along the provisioning progression
+    /// on its own, but it stands in for the time each leg takes and accepts nothing, so
+    /// a proposal no caller has accepted is accepted here whatever state that
+    /// progression has reached, and the answer to one and the same well-formed request
+    /// does not depend on how long the caller took to make it.
     async fn handle(
         &self,
         input: Self::Input,
@@ -396,9 +414,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The acceptance is applied under a fresh lock, and judged against the store
         // once more under THAT lock: the store may have moved while the attach point
-        // above was being resolved — the clock may have accepted the proposal at the
-        // partner portal in the meantime, or the connection may have been deleted —
-        // so check and write happen together.
+        // above was being resolved — a concurrent acceptance may have accepted the
+        // proposal in the meantime, or the connection may have been deleted — so check
+        // and write happen together.
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
         store.materialise_due_transitions(now);
@@ -422,38 +440,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // The Attach Point the acceptance selected is what the connection is
-        // associated with from now on; the Environment, the bandwidth and every
-        // server-owned member of the record are untouched, because the proposal's
-        // parameters cannot be modified by the acceptance.
-        stored.connection.attach_point = input.attach_point.clone();
-        // A description the request supplies distinguishes the resulting Connection;
-        // one it omits leaves the proposal's own description alone.
-        if let Some(description) = input.description.clone() {
-            stored.connection.description = description;
-        }
-        // Merge, never replace, the way every tag writer of this service does: each
-        // key the request carries is written over whatever the connection held for it,
-        // and "no tags" keeps its one representation in the store (`None`) when the
-        // request carries none.
-        if let Some(tags) = input.tags.as_ref().filter(|tags| !tags.is_empty()) {
-            stored
-                .connection
-                .tags
-                .get_or_insert_with(::std::collections::HashMap::new)
-                .extend(
-                    tags.iter()
-                        .map(|(key, value)| (key.clone(), value.clone())),
-                );
-        }
-        // The proposal is accepted NOW, so the connection reports the accepted state
-        // at once, and the rest of the progression — being provisioned between AWS and
-        // the Partner, then fully provisioned — is what the clock owes it. The due
-        // instant is stored and materialised by whichever call comes next; this one
-        // never waits for it.
-        stored.connection.state = crate::state::ACCEPTED_CONNECTION_STATE.to_string();
-        stored.pending_transition =
-            crate::state::owed_progression(crate::state::ACCEPTED_CONNECTION_STATE, now);
+        // The acceptance is applied by the ONE writer of everything an acceptance
+        // decides (`crate::state::apply_acceptance`): the Attach Point it selected is
+        // what the connection is associated with from now on, the description and tags
+        // it carries are written onto the resulting Connection, the proposal is
+        // recorded as accepted, and the connection enters the accepted state with the
+        // rest of the documented progression owed by the clock from this instant. The
+        // Environment, the bandwidth and every server-owned member of the record are
+        // untouched, because the proposal's parameters cannot be modified by the
+        // acceptance.
+        crate::state::apply_acceptance(
+            stored,
+            &input.attach_point,
+            input.description.as_ref(),
+            input.tags.as_ref(),
+            now,
+        );
 
         Ok(AcceptConnectionProposalOutput {
             connection: Some(stored.connection.clone()),
