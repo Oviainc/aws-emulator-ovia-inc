@@ -27,6 +27,8 @@ mod app_bundle_ingestion_lifecycle;
 mod app_bundle_refusal_wording;
 #[path = "all/app_bundle_region_quota.rs"]
 mod app_bundle_region_quota;
+#[path = "all/bundle_scope_resolved_before_body_rules.rs"]
+mod bundle_scope_resolved_before_body_rules;
 #[path = "all/chain_read_not_found_attribution.rs"]
 mod chain_read_not_found_attribution;
 #[path = "all/client_token_region_scope.rs"]

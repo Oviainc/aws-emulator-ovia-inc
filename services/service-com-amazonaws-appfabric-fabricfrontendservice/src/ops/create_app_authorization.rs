@@ -19,6 +19,12 @@
 //!   the check is taken under the SAME state lock as the insert, so concurrent
 //!   racers for one pair produce exactly one winner and modelled conflicts.
 //!
+//! None of them is judged before `appBundleIdentifier` is resolved: the bundle
+//! the URI names is the scope this call is made in, so an identifier naming
+//! nothing stored is refused as the app bundle (`ResourceNotFoundException`)
+//! whatever else the request carries — the same order every sibling of this
+//! chain applies.
+//!
 //! A new authorization is `PendingConnect`; `ConnectAppAuthorization` is what
 //! moves it to `Connected`, so the clock owes no transition here.
 //!
@@ -206,27 +212,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `authType` is closed by the model (`AUTH_TYPE_VALUES`), so the
-        // boundary validator has already refused anything outside it; `app` is
-        // not, so the supported-application set is checked here.
-        if !crate::state::is_supported_app(&input.app) {
-            return Err(CreateAppAuthorizationErrorModeled::ValidationException(
-                crate::state::app_not_supported(&input.app),
-            )
-            .into());
-        }
-
-        // The credential must be the one the chosen authorization type uses.
-        // Only the KIND is read: the secret inside it is never stored, logged or
-        // reported back.
-        let credential_kind = crate::state::credential_kind(&input.credential);
-        if credential_kind != crate::state::credential_kind_for_auth_type(&input.auth_type) {
-            return Err(CreateAppAuthorizationErrorModeled::ValidationException(
-                crate::state::credential_does_not_match_auth_type(&input.auth_type),
-            )
-            .into());
-        }
-
         // The Region this call was SIGNED for. It scopes the idempotency token
         // below (each Region is its own endpoint, so a token spent elsewhere is
         // not a retry of this request) but it is NOT what the created
@@ -258,6 +243,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The rules this handler owns over the request's own members are judged
+        // only once the bundle this call is nested under has been resolved: the
+        // bundle in the URI is the SCOPE the request is made in, so an
+        // identifier naming nothing stored is refused as the app bundle before
+        // anything inside the request body is looked at — the order every
+        // sibling on this chain applies.
+        //
+        // `authType` is closed by the model (`AUTH_TYPE_VALUES`), so the
+        // boundary validator has already refused anything outside it; `app` is
+        // not, so the supported-application set is checked here.
+        if !crate::state::is_supported_app(&input.app) {
+            return Err(CreateAppAuthorizationErrorModeled::ValidationException(
+                crate::state::app_not_supported(&input.app),
+            )
+            .into());
+        }
+
+        // The credential must be the one the chosen authorization type uses.
+        // Only the KIND is read: the secret inside it is never stored, logged or
+        // reported back.
+        let credential_kind = crate::state::credential_kind(&input.credential);
+        if credential_kind != crate::state::credential_kind_for_auth_type(&input.auth_type) {
+            return Err(CreateAppAuthorizationErrorModeled::ValidationException(
+                crate::state::credential_does_not_match_auth_type(&input.auth_type),
+            )
+            .into());
+        }
 
         // The PARENT and every member the request carries go into the
         // fingerprint: the same token for another bundle, application, tenant or
