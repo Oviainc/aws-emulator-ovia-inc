@@ -27,6 +27,12 @@ mod third_party_firewall_firewall_policies;
 #[path = "all/account_page_token_scoping.rs"]
 mod account_page_token_scoping;
 
+// Declared beside it, for the same reason: this suite's name sorts right into the
+// contended region of the list below. The suite itself is an ordinary
+// `tests/all/<name>.rs` file.
+#[path = "all/protection_status_policy_scope_page.rs"]
+mod protection_status_policy_scope_page;
+
 // Declared beside it, for the same reason: this suite's name sorts right into
 // the contended region of the list below. The suite itself is an ordinary
 // `tests/all/<name>.rs` file.

@@ -74,19 +74,25 @@ const ROSTER_SECOND: &str = ROSTER[1];
 
 /// One row of the scope table: the policy's scope maps, the accounts the policy
 /// therefore applies to, and accounts it does not.
-struct ScopeRow {
-    name: &'static str,
-    include: Option<Value>,
-    exclude: Option<Value>,
-    in_scope: &'static [&'static str],
-    out_of_scope: &'static [&'static str],
+///
+/// `pub(crate)` (with its fields) so a sibling suite in this test target reads
+/// the SAME scope class rather than growing a second copy of it.
+pub(crate) struct ScopeRow {
+    pub(crate) name: &'static str,
+    pub(crate) include: Option<Value>,
+    pub(crate) exclude: Option<Value>,
+    pub(crate) in_scope: &'static [&'static str],
+    pub(crate) out_of_scope: &'static [&'static str],
 }
 
 /// The scope class the resolution ranges over.
 ///
 /// Every row is read against the SAME organisation: the administrator
 /// [`ADMIN`] plus the [`ROSTER`] a second stored policy contributes.
-fn rows() -> Vec<ScopeRow> {
+///
+/// `pub(crate)` so a sibling suite in this test target ranges over this one
+/// table.
+pub(crate) fn rows() -> Vec<ScopeRow> {
     vec![
         ScopeRow {
             name: "no-scope-maps",
@@ -162,7 +168,12 @@ fn rows() -> Vec<ScopeRow> {
 /// recorded and one Shield Advanced policy stored with `row`'s scope maps.
 ///
 /// Returns the router, the shared engine and that policy's `PolicyId`.
-async fn seeded(row: &ScopeRow) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>, String) {
+///
+/// `pub(crate)` so a sibling suite in this test target stands one row's
+/// organisation up through this one fixture.
+pub(crate) async fn seeded(
+    row: &ScopeRow,
+) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>, String) {
     // A fresh emulator per row, so one row's accounts cannot join another row's
     // organisation.
     let (router, engine) = emulator_with_engine();

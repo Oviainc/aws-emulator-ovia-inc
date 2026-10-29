@@ -14,8 +14,10 @@
 //! not-found, the same answer this service's other member-account readers give.
 //! The attacks come from the store's attack inventory
 //! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::shield_attacks`]),
-//! filtered by the request's policy, member account and time period; nothing is
-//! invented and nothing is written.
+//! filtered by the request's policy and time period and by the accounts the
+//! policy applies to — the named member account when the request names one, the
+//! policy's whole scope when it does not; nothing is invented and nothing is
+//! written.
 //!
 //! ## Shape of an operation
 //!
@@ -275,6 +277,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        // The accounts this policy reports about at all, resolved exactly as the
+        // refusal above resolves a named one: the policy's own scope. The whole
+        // page goes through the same resolution the named account does, so the
+        // two paths of this handler cannot disagree about one (policy, account)
+        // pair — the set is also the one `ListComplianceStatus` pages over.
+        let scope = store.policy_scope_accounts(&policy.policy);
+
         // The inventory is keyed by policy, then by the instant the attack
         // started, so this policy's attacks are a contiguous range in
         // chronological order and a page boundary is a key: resume at the first
@@ -288,12 +297,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|(_, attack)| attack)
             // The member account the request names is resolved above, so what is
             // left here is the selection: it picks the attacks on THAT account's
-            // resources; absent, every account in the policy's scope is reported.
-            .filter(|attack| {
-                input
-                    .member_account_id
-                    .as_deref()
-                    .is_none_or(|account| attack.account_id == account)
+            // resources; absent, every account in the policy's scope is
+            // reported. An account the policy does not apply to was never
+            // evaluated against this policy, so the policy holds no attack
+            // report of it either way — a page that carried one would serve an
+            // attack of an account this same handler reports as not found when
+            // the request names it.
+            .filter(|attack| match input.member_account_id.as_deref() {
+                Some(account) => attack.account_id == account,
+                None => scope.contains(&attack.account_id),
             })
             // `StartTime` / `EndTime` are "the start / end of the time period to
             // query for the attacks", so an attack is reported when it overlaps
