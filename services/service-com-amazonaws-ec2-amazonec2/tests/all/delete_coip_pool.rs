@@ -282,9 +282,17 @@ async fn a_pool_id_that_resolves_to_no_pool_is_refused() {
             "case {case:?}: expected {expected_code:?}, got {body}"
         );
         let message = error_message(&body);
+        // Either refusal names the value the request sent; WHICH quotes carry it is the
+        // template's, not this row's — the service's unreadable-id sentence double-quotes
+        // the value it echoes and the not-found sentence single-quotes the pool it names.
+        let quoted = if expected_code == malformed {
+            format!("\"{pool_id}\"")
+        } else {
+            format!("'{pool_id}'")
+        };
         assert!(
-            message.contains(&format!("'{pool_id}'")),
-            "case {case:?}: expected the message to name {pool_id:?}, got {message:?}"
+            message.contains(&quoted),
+            "case {case:?}: expected the message to name {quoted}, got {message:?}"
         );
         if expected_code != malformed {
             assert_eq!(

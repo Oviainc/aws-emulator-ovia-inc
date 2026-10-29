@@ -323,7 +323,7 @@ pub fn unresolvable_instance_event_window_id<E>(instance_event_window_id: &str) 
     Scaffolded::service_error(
         INVALID_INSTANCE_EVENT_WINDOW_ID_MALFORMED,
         400,
-        format!("Invalid id: '{instance_event_window_id}'"),
+        invalid_id_message(instance_event_window_id),
     )
 }
 

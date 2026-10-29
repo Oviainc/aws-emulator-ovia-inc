@@ -926,7 +926,7 @@ async fn the_endpoint_ids_narrow_the_report_to_the_associations_of_those_endpoin
             "case {malformed:?}: expected InvalidVpcEndpointId.Malformed, got {body}"
         );
         assert!(
-            error_message(&body).contains(&format!("Invalid id: '{malformed}'")),
+            error_message(&body).contains(&format!("Invalid id: \"{malformed}\"")),
             "case {malformed:?}: the refusal must name the id, got {body}"
         );
     }

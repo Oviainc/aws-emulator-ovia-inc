@@ -231,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::service_error(
                 state::INVALID_VPC_ENDPOINT_ID_MALFORMED,
                 400,
-                format!("Invalid id: '{malformed}'"),
+                state::invalid_id_message(malformed),
             ));
         }
 

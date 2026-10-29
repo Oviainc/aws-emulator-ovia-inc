@@ -549,7 +549,7 @@ async fn an_id_that_names_no_volume_is_refused_and_removes_nothing() {
 
     for (case, volume_id, expected_code) in rows {
         let expected_message = if expected_code == INVALID_VOLUME_ID_MALFORMED {
-            format!("Invalid id: '{volume_id}'")
+            format!("Invalid id: \"{volume_id}\"")
         } else {
             format!("The volume '{volume_id}' does not exist.")
         };

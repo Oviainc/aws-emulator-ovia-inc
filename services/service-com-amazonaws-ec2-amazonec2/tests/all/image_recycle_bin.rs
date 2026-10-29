@@ -366,7 +366,7 @@ async fn an_image_id_the_recycle_bin_holds_no_entry_for_is_refused() {
         let message = unescaped(&element(&body, "Message").unwrap_or_default());
         assert_eq!(
             message,
-            format!("Invalid id: '{image_id}'"),
+            format!("Invalid id: \"{image_id}\""),
             "case {image_id:?}: the refusal must name the id the request gave, got {message:?}"
         );
         for untouched in [&partner_private, &partner_public] {

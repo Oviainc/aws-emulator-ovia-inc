@@ -589,7 +589,7 @@ fn refusals() -> Vec<Refusal> {
             extra: &[],
             status: 400,
             code: INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
-            message: Some("Invalid id: 'tgw-attach-0123456789abcde'"),
+            message: Some("Invalid id: \"tgw-attach-0123456789abcde\""),
         },
         Refusal {
             name: "a well-formed peering attachment id nothing holds",

@@ -524,7 +524,7 @@ async fn refuses_what_it_cannot_report() {
         extra: Vec::new(),
         status: 400,
         code: "InvalidAMIID.Malformed",
-        message: format!("Invalid id: '{image_id}'"),
+        message: format!("Invalid id: \"{image_id}\""),
     };
     let not_found = |case: &'static str, image_id: &str| Refusal {
         case,

@@ -325,11 +325,14 @@ impl<E> Scaffolded<E> {
 
     /// `InvalidInstanceID.Malformed` (HTTP 400): the request named something that is
     /// not an instance id at all, so there is nothing to look up.
+    ///
+    /// The message is [`crate::state::invalid_id_message`] — the one template this service
+    /// words an unreadable resource id with, whatever kind of id it is.
     pub fn invalid_instance_id_malformed(instance_id: &str) -> Self {
         Self::service_error(
             "InvalidInstanceID.Malformed",
             400,
-            format!("Invalid id: '{instance_id}'"),
+            crate::state::invalid_id_message(instance_id),
         )
     }
 
@@ -340,7 +343,8 @@ impl<E> Scaffolded<E> {
     /// a second named constructor rather than a literal at a call site so both wordings are
     /// visible here: EC2's per-operation validators do not agree about an unresolvable
     /// instance id, and the operations that answer this one say "The instance ID '<id>' is
-    /// malformed" where the syntax check above says "Invalid id: '<id>'". WHICH of the two
+    /// malformed" where the syntax check above says [`crate::state::invalid_id_message`].
+    /// WHICH of the two
     /// an operation answers is a fact of that operation, recorded by its caller:
     ///
     /// * `crate::ops::create_replace_root_volume_task` refuses EVERY id it cannot resolve

@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The one sentence every `Invalid<Kind>.Malformed` of this service words an unreadable
+// resource id with, across the id kinds and the operations that resolve them. Declared
+// beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood and
+// the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/malformed_id_message_template.rs"]
+mod malformed_id_message_template;
 // What `AttachVolume` records on a volume, which requests it admits and refuses, and the
 // `attaching` -> `attached` move the clock owes the attachment. Declared beside
 // `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail

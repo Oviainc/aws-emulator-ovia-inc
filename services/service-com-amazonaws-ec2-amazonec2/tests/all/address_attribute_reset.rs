@@ -385,7 +385,7 @@ async fn reset_refuses_an_id_the_account_holds_no_address_for() {
             "case {case:?}: expected {expected_code}, got body {body}"
         );
         let expected_message = if expected_code == INVALID_ALLOCATION_ID_MALFORMED {
-            format!("Invalid id: '{allocation_id}'")
+            format!("Invalid id: \"{allocation_id}\"")
         } else {
             format!("The allocation ID '{allocation_id}' does not exist")
         };

@@ -11076,7 +11076,7 @@ pub fn invalid_group_id_malformed<E>(group_id: &str) -> crate::scaffolded::Scaff
     crate::scaffolded::Scaffolded::service_error(
         INVALID_GROUP_ID_MALFORMED,
         400,
-        format!("Invalid id: '{group_id}'"),
+        invalid_id_message(group_id),
     )
 }
 
@@ -11173,8 +11173,9 @@ pub fn invalid_pool_id_malformed<E>(pool_id: &str) -> crate::scaffolded::Scaffol
         INVALID_POOL_ID_MALFORMED,
         400,
         format!(
-            "Invalid id: '{pool_id}'. A customer-owned address pool id is \
-             '{COIP_POOL_ID_PREFIX}' followed by 8 or 17 hexadecimal digits"
+            "{}. A customer-owned address pool id is '{COIP_POOL_ID_PREFIX}' followed by \
+             8 or 17 hexadecimal digits",
+            invalid_id_message(pool_id)
         ),
     )
 }
@@ -13377,7 +13378,7 @@ pub fn invalid_volume_id_malformed<E>(volume_id: &str) -> crate::scaffolded::Sca
     crate::scaffolded::Scaffolded::service_error(
         INVALID_VOLUME_ID_MALFORMED,
         400,
-        format!("Invalid id: '{volume_id}'"),
+        invalid_id_message(volume_id),
     )
 }
 
@@ -13392,7 +13393,7 @@ pub fn invalid_volume_id_malformed<E>(volume_id: &str) -> crate::scaffolded::Sca
 /// recorded traffic behind
 /// `issues/things-that-now-work/20261022T235108Z-ec2-restorevolumefromrecyclebin-stub.md`
 /// has the service answering "The volume ID 'vol-…' is malformed" for the restore, where a
-/// describe of the account's volumes answers "Invalid id: 'vol-…'". The message is built
+/// describe of the account's volumes answers [`invalid_id_message`]. The message is built
 /// from the request — the id the caller sent is the only part of it that varies.
 pub fn volume_id_not_in_recycle_bin<E>(volume_id: &str) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
@@ -13793,7 +13794,7 @@ pub fn require_well_formed_import_task_id<E>(
     Err(crate::scaffolded::Scaffolded::service_error(
         INVALID_CONVERSION_TASK_ID,
         400,
-        format!("Invalid id: '{task_id}'"),
+        invalid_id_message(task_id),
     ))
 }
 
@@ -16013,15 +16014,10 @@ pub fn invalid_ami_id_not_found<E>(image_id: &str) -> Scaffolded<E> {
 /// Refuse an AMI id a request named that EC2 cannot resolve as one at all: HTTP 400
 /// `InvalidAMIID.Malformed`.
 ///
-/// The message is built from the request's own id, in the `Invalid id: '<id>'` form every
-/// malformed-id refusal in this crate uses, so one code reads one way across every
-/// operation that answers it.
+/// The message is [`invalid_id_message`], the one wording every malformed-id refusal in
+/// this crate uses, so one code reads one way across every operation that answers it.
 pub fn invalid_ami_id_malformed<E>(image_id: &str) -> Scaffolded<E> {
-    Scaffolded::service_error(
-        INVALID_AMI_ID_MALFORMED,
-        400,
-        format!("Invalid id: '{image_id}'"),
-    )
+    Scaffolded::service_error(INVALID_AMI_ID_MALFORMED, 400, invalid_id_message(image_id))
 }
 
 /// Refuse an owner or executable-by term that names no account and no alias: HTTP 400
@@ -21707,7 +21703,7 @@ pub fn require_known_instance_connect_endpoint<E>(
         return Err(crate::scaffolded::Scaffolded::service_error(
             INVALID_INSTANCE_CONNECT_ENDPOINT_ID_MALFORMED,
             400,
-            format!("Invalid id: '{endpoint_id}'"),
+            invalid_id_message(endpoint_id),
         ));
     }
     if !store.instance_connect_endpoints.contains_key(endpoint_id) {
@@ -24146,7 +24142,7 @@ pub fn invalid_allocation_id_malformed<E>(allocation_id: &str) -> Scaffolded<E> 
     Scaffolded::service_error(
         INVALID_ALLOCATION_ID_MALFORMED,
         400,
-        format!("Invalid id: '{allocation_id}'"),
+        invalid_id_message(allocation_id),
     )
 }
 
@@ -24355,16 +24351,17 @@ pub fn network_interface_id_is_well_formed(id: &str) -> bool {
 /// Refuse a request that named something that is not a network interface id: HTTP 400
 /// `InvalidNetworkInterfaceId.Malformed`.
 ///
-/// The message is the one EC2 answers a value it cannot read as a resource id with: the
-/// literal `Invalid id: ` and the offending value from the REQUEST, in DOUBLE quotes — the
-/// template this corpus records for the network interface family's own ids (a malformed
-/// network interface ATTACHMENT id is refused `Invalid id: "<value>"`), and the quoting the
-/// same template carries wherever a recording shows it.
+/// The message is the one EC2 answers a value it cannot read as a resource id with,
+/// [`invalid_id_message`]: the literal `Invalid id: ` and the offending value from the
+/// REQUEST, in DOUBLE quotes — the template this corpus records for the network interface
+/// family's own ids (a malformed network interface ATTACHMENT id is refused
+/// `Invalid id: "<value>"`), and the quoting the same template carries wherever a recording
+/// shows it.
 pub fn invalid_network_interface_id_malformed<E>(network_interface_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_NETWORK_INTERFACE_ID_MALFORMED,
         400,
-        format!("Invalid id: \"{network_interface_id}\""),
+        invalid_id_message(network_interface_id),
     )
 }
 
@@ -24644,7 +24641,7 @@ pub fn invalid_network_interface_permission_id_malformed<E>(
     Scaffolded::service_error(
         INVALID_NETWORK_INTERFACE_PERMISSION_ID_MALFORMED,
         400,
-        format!("Invalid id: '{network_interface_permission_id}'"),
+        invalid_id_message(network_interface_permission_id),
     )
 }
 
@@ -26549,11 +26546,7 @@ pub fn unresolvable_host_id<E>(host_id: &str) -> Scaffolded<E> {
     if host_id_is_well_formed(host_id) {
         return invalid_host_id_not_found(host_id);
     }
-    Scaffolded::service_error(
-        INVALID_HOST_ID_MALFORMED,
-        400,
-        format!("Invalid id: '{host_id}'"),
-    )
+    Scaffolded::service_error(INVALID_HOST_ID_MALFORMED, 400, invalid_id_message(host_id))
 }
 
 /// The message EC2 answers Dedicated Host ids it cannot resolve with, built from the ids the
@@ -26793,7 +26786,7 @@ pub fn invalid_route_server_id_malformed<E>(route_server_id: &str) -> Scaffolded
     Scaffolded::service_error(
         INVALID_ROUTE_SERVER_ID_MALFORMED,
         400,
-        format!("Invalid id: '{route_server_id}'"),
+        invalid_id_message(route_server_id),
     )
 }
 
@@ -27999,6 +27992,31 @@ pub fn prefixed_id_is_well_formed(prefix: &str, id: &str) -> bool {
         && suffix
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The most characters of a refused resource id that [`invalid_id_message`] repeats back.
+///
+/// The message names the value the REQUEST sent, and a resource id member is a bare string
+/// the model puts no `@length` on (`smithy_query(query="shape",shape="VolumeId")`), so the
+/// echo is bounded here the way [`MAX_ECHOED_COIP_POOL_ID_CHARS`] bounds a refused pool
+/// id's. Far above the longest id EC2 issues (a prefix plus 17 digits), so a real id is
+/// always named in full.
+pub const MAX_ECHOED_RESOURCE_ID_CHARS: usize = 128;
+
+/// The sentence EC2 refuses a value it cannot read as a resource id of the kind the
+/// parameter names with: the fixed prefix `Invalid id: ` and the offending value from the
+/// REQUEST, in DOUBLE quotes.
+///
+/// ONE wording for every `Invalid<Kind>.Malformed` this crate answers, whatever the id kind
+/// and whichever operation carries it. That is what the recorded refusals show: an instance
+/// id, an AMI id, a security group id, a network interface attachment id and a Spot Fleet
+/// request id are each quoted `Invalid id: "<value>"`, so the quoting is a fact of the
+/// service's template rather than of one id kind, and reaching this function is how a
+/// refusal cannot word it a second way. Only the first
+/// [`MAX_ECHOED_RESOURCE_ID_CHARS`] characters of the value are named.
+pub fn invalid_id_message(id: &str) -> String {
+    let echoed: String = id.chars().take(MAX_ECHOED_RESOURCE_ID_CHARS).collect();
+    format!("Invalid id: \"{echoed}\"")
 }
 
 /// Whether `id` is NOT the null id of the kind `prefix` names: `<prefix>-` followed by
@@ -29212,7 +29230,7 @@ pub fn require_well_formed_id<E>(
     Err(Scaffolded::service_error(
         malformed,
         400,
-        format!("Invalid id: '{id}'"),
+        invalid_id_message(id),
     ))
 }
 
@@ -31061,7 +31079,7 @@ pub fn invalid_fpga_image_id_malformed<E>(fpga_image_id: &str) -> Scaffolded<E> 
     Scaffolded::service_error(
         INVALID_FPGA_IMAGE_ID_MALFORMED,
         400,
-        format!("Invalid id: '{fpga_image_id}'"),
+        invalid_id_message(fpga_image_id),
     )
 }
 
@@ -33562,7 +33580,7 @@ pub fn require_well_formed_spot_instance_request_id<E>(
     Err(crate::scaffolded::Scaffolded::service_error(
         INVALID_SPOT_INSTANCE_REQUEST_ID_MALFORMED,
         400,
-        format!("Invalid id: '{request_id}'"),
+        invalid_id_message(request_id),
     ))
 }
 
@@ -34049,7 +34067,7 @@ pub fn spot_fleet_request_id_is_well_formed(id: &str) -> bool {
 /// one the per-fleet [`CANCEL_BATCH_FLEET_REQUEST_ID_MALFORMED`] carries: one definition, so a
 /// request-level refusal and a per-fleet error cannot word it two ways.
 pub fn spot_fleet_request_id_malformed_message(request_id: &str) -> String {
-    format!("Invalid id: \"{request_id}\"")
+    invalid_id_message(request_id)
 }
 
 /// The message EC2 refuses a Spot Fleet request id this account holds no fleet for with, and

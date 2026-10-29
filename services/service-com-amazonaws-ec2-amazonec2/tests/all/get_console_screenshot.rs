@@ -21,7 +21,7 @@
 //!    operation's is the strict one that reports no not-found for a well-formed id. The two
 //!    wordings that code carries split by half: a well-formed id the account does not hold
 //!    is "The instance ID '<id>' is malformed", a value that is no instance id at all is the
-//!    id space's own "Invalid id: '<id>'";
+//!    id space's own "Invalid id: \"<id>\"";
 //! 4. `DryRun` is the permission probe, answered BEFORE the instance store is read: it
 //!    reports `DryRunOperation` whatever the id names, and performs nothing;
 //! 5. the operation is a READ: two calls about one instance answer the same bytes, neither
@@ -435,7 +435,7 @@ async fn an_unresolvable_instance_id_is_refused_before_the_screen_is_drawn() {
         let expected_message = if inside_the_form {
             format!("The instance ID '{instance_id}' is malformed")
         } else {
-            format!("Invalid id: '{instance_id}'")
+            format!("Invalid id: \"{instance_id}\"")
         };
         assert_eq!(
             super::ec2_query::error_message(&body),

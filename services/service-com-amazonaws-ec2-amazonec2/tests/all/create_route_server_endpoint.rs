@@ -228,21 +228,21 @@ async fn create_route_server_endpoint_resolves_the_ids_the_request_names() {
             route_server_id: "rs-zzzzzzzz".to_string(),
             subnet_id: subnet.clone(),
             code: CODE_ROUTE_SERVER_MALFORMED,
-            message: "Invalid id: 'rs-zzzzzzzz'".to_string(),
+            message: "Invalid id: \"rs-zzzzzzzz\"".to_string(),
         },
         RefusalRow {
             case: "another resource kind's id in the route server member",
             route_server_id: "vpc-00000000000000001".to_string(),
             subnet_id: subnet.clone(),
             code: CODE_ROUTE_SERVER_MALFORMED,
-            message: "Invalid id: 'vpc-00000000000000001'".to_string(),
+            message: "Invalid id: \"vpc-00000000000000001\"".to_string(),
         },
         RefusalRow {
             case: "a route server id of neither published length",
             route_server_id: "rs-0123456789abcde".to_string(),
             subnet_id: subnet.clone(),
             code: CODE_ROUTE_SERVER_MALFORMED,
-            message: "Invalid id: 'rs-0123456789abcde'".to_string(),
+            message: "Invalid id: \"rs-0123456789abcde\"".to_string(),
         },
         RefusalRow {
             // The id the request sent is reported back inside an XML envelope, so a value
@@ -252,7 +252,7 @@ async fn create_route_server_endpoint_resolves_the_ids_the_request_names() {
             route_server_id: "rs-<&'\"zz".to_string(),
             subnet_id: subnet.clone(),
             code: CODE_ROUTE_SERVER_MALFORMED,
-            message: "Invalid id: 'rs-<&'\"zz'".to_string(),
+            message: "Invalid id: \"rs-<&'\"zz\"".to_string(),
         },
         RefusalRow {
             case: "a long-form subnet id nothing was created for",

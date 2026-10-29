@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let refusal = if !state::vpc_endpoint_id_is_well_formed(endpoint_id) {
                 Some((
                     state::INVALID_VPC_ENDPOINT_ID_MALFORMED,
-                    format!("Invalid id: '{endpoint_id}'"),
+                    state::invalid_id_message(endpoint_id),
                 ))
             } else {
                 match store.vpc_endpoint_connections.get(endpoint_id) {

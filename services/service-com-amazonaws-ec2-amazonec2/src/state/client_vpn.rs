@@ -623,7 +623,7 @@ pub const SUBNET_ID_PREFIX: &str = "subnet";
 /// The same `Invalid<Kind>.Malformed` question [`require_well_formed_id`] asks of every
 /// resource id of this crate, in the wording the Client VPN surface answers it with — `The
 /// subnet ID '<id>' is malformed`, naming the member's own resource kind rather than the
-/// generic `Invalid id: '<id>'`.
+/// generic [`invalid_id_message`].
 pub const INVALID_SUBNET_ID_MALFORMED: &str = "InvalidSubnetID.Malformed";
 
 /// The most characters of a refused value for a subnet its message repeats back.
