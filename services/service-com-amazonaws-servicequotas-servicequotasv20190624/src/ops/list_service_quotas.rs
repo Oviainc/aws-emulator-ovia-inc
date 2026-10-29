@@ -8,8 +8,9 @@
 //!
 //! * an unknown `ServiceCode`, or a `QuotaCode` the service has no quota for, is
 //!   `NoSuchResourceException`;
-//! * `QuotaAppliedAtLevel` picks the plane the listing reports: `ACCOUNT` (the
-//!   default when the caller names none) lists one account-wide record per quota,
+//! * `QuotaAppliedAtLevel` picks the plane the listing reports, by the crate's one
+//!   `AppliedLevelEnum` filter rule ([`crate::state::requested_at_level`]): `ACCOUNT`
+//!   (the default when the caller names none) lists one account-wide record per quota,
 //!   `RESOURCE` lists one record per resource context a value has been applied to,
 //!   and `ALL` lists both;
 //! * `MaxResults` / `NextToken` page the listing, and a token this service did not
@@ -152,17 +153,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             let level = input.quota_applied_at_level.as_deref();
             let mut quotas: Vec<ServiceQuota> = Vec::new();
-            // ACCOUNT is the level this listing reports when the caller names none.
-            if level.is_none_or(|level| {
-                level == crate::state::LEVEL_ACCOUNT || level == crate::state::LEVEL_ALL
-            }) {
+            // Which plane's records the caller asked for is the crate's ONE
+            // `AppliedLevelEnum` filter rule ([`crate::state::requested_at_level`]),
+            // asked here of the level each plane's records sit at rather than written
+            // out again: `ALL` keeps both planes, and a caller that names no level is
+            // served the ACCOUNT one.
+            if crate::state::requested_at_level(crate::state::LEVEL_ACCOUNT, level) {
                 quotas.extend(codes.iter().filter_map(|code| {
                     quotas_state.applied_quota_view(&region, &input.service_code, code, None)
                 }));
             }
-            if level.is_some_and(|level| {
-                level == crate::state::LEVEL_RESOURCE || level == crate::state::LEVEL_ALL
-            }) {
+            if crate::state::requested_at_level(crate::state::LEVEL_RESOURCE, level) {
                 for code in &codes {
                     for context in
                         quotas_state.applied_contexts(&region, &input.service_code, code)
@@ -190,12 +191,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(&region),
                 Some(&input.service_code),
                 input.quota_code.as_deref(),
-                Some(
-                    input
-                        .quota_applied_at_level
-                        .as_deref()
-                        .unwrap_or(crate::state::LEVEL_ACCOUNT),
-                ),
+                Some(crate::state::level_filter(
+                    input.quota_applied_at_level.as_deref(),
+                )),
             ],
         );
         let page = crate::state::paginate(

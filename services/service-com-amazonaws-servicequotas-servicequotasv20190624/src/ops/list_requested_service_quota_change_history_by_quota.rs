@@ -170,12 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(&input.service_code),
                 Some(&input.quota_code),
                 input.status.as_deref(),
-                Some(
-                    input
-                        .quota_requested_at_level
-                        .as_deref()
-                        .unwrap_or(crate::state::LEVEL_ACCOUNT),
-                ),
+                Some(crate::state::level_filter(
+                    input.quota_requested_at_level.as_deref(),
+                )),
             ],
         );
         let page = crate::state::paginate(

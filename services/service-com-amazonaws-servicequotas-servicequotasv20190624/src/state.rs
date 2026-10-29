@@ -2067,17 +2067,29 @@ fn compare_utilization(
         .then_with(|| left.quota_code.cmp(&right.quota_code))
 }
 
-/// Whether a request made at `level` belongs in a history listing filtered to
-/// `requested`.
+/// The `AppliedLevelEnum` level a listing is filtered to when its caller names
+/// `requested`: that level, or [`LEVEL_ACCOUNT`] when the caller names none.
+///
+/// `ACCOUNT` is the documented default of the level member on every listing that
+/// carries one — the applied-quota listing (`smithy_query(query="doc",
+/// shape="ListServiceQuotasRequest", member="QuotaAppliedAtLevel")`: "ACCOUNT is the
+/// default") and both change-history listings (`smithy_query(query="doc",
+/// shape="ListRequestedServiceQuotaChangeHistoryRequest",
+/// member="QuotaRequestedAtLevel")`, the identical sentence) — so the default lives
+/// here once and the listings and their pagination labels read it from here.
+pub fn level_filter(requested: Option<&str>) -> &str {
+    requested.unwrap_or(LEVEL_ACCOUNT)
+}
+
+/// Whether a record that sits at `level` belongs in a listing filtered to `requested`.
 ///
 /// `ALL` is the level that covers every other one, so it keeps the whole listing; any
-/// other value keeps the requests made at exactly that level. A caller that names no
-/// level gets [`LEVEL_ACCOUNT`], the documented default of the member on both history
-/// listings (`smithy_query(query="doc",
-/// shape="ListRequestedServiceQuotaChangeHistoryRequest",
-/// member="QuotaRequestedAtLevel")`: "ACCOUNT is the default").
+/// other value keeps the records at exactly that level, and a caller that names none
+/// filters to [`level_filter`]'s default. This is the crate's ONE `AppliedLevelEnum`
+/// filter rule: the applied-quota listing applies it to the plane each applied record
+/// sits on, and both change-history listings to the level each request was made at.
 pub fn requested_at_level(level: &str, requested: Option<&str>) -> bool {
-    let filter = requested.unwrap_or(LEVEL_ACCOUNT);
+    let filter = level_filter(requested);
     filter == LEVEL_ALL || level == filter
 }
 
