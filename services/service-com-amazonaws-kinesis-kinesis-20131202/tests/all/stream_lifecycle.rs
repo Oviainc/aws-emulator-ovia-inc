@@ -452,16 +452,21 @@ async fn a_created_stream_is_reported_by_name_and_by_arn() {
             "case {label}: RecordDistributionStrategy must be exactly what the create named, \
              got {summary}"
         );
-        let expected_warm = case
-            .warm_throughput_mi_bps
-            .unwrap_or(case.expected_shards as i64 * i64::from(SHARD_WRITE_MI_BPS));
+        // "Represents the warm throughput configuration on the stream. This is only present
+        // for On-Demand Kinesis Data Streams" (`WarmThroughputObject`): an on-demand stream
+        // reports the target its create named, or the throughput its open shards provide, and
+        // a provisioned stream reports no such configuration at all.
+        let expected_warm = (case.expected_mode == STREAM_MODE_ON_DEMAND).then(|| {
+            case.warm_throughput_mi_bps
+                .unwrap_or(case.expected_shards as i64 * i64::from(SHARD_WRITE_MI_BPS))
+        });
         assert_eq!(
             summary
                 .get("WarmThroughput")
                 .and_then(|warm| warm.get("TargetMiBps"))
                 .and_then(Value::as_i64),
-            Some(expected_warm),
-            "case {label}: expected a warm throughput target of {expected_warm}, got {summary}"
+            expected_warm,
+            "case {label}: expected a warm throughput target of {expected_warm:?}, got {summary}"
         );
         assert_eq!(
             member(&summary, "EnhancedMonitoring"),

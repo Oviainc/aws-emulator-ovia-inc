@@ -97,6 +97,20 @@ pub const RESHARD_DELAY: Duration = Duration::from_millis(500);
 /// it falls due is stored on the record and never slept on.
 pub const MODE_UPDATE_DELAY: Duration = Duration::from_millis(500);
 
+/// How long after a warm-throughput change the stream's `UPDATING` -> `ACTIVE` transition
+/// falls due. A CHOSEN span, not an AWS-documented duration ("Depending on the size of the
+/// stream, the scaling action could take a few minutes to complete" names no value): it only
+/// has to be non-zero, so a caller that reads the stream straight after the change still
+/// observes `UPDATING`, and a second change that overlaps the first is refused rather than
+/// served. The instant it falls due is stored on the record and never slept on.
+pub const WARM_THROUGHPUT_UPDATE_DELAY: Duration = Duration::from_millis(500);
+
+/// The highest warm throughput a stream may be scaled to, in MiB/s: "By default, you cannot
+/// do the following: Scale to more than 10 GiBps for an on-demand stream"
+/// (`UpdateStreamWarmThroughput`). A DOCUMENTED ceiling, expressed in the MiB/s the
+/// `WarmThroughputMiBps` member is stated in, so the 10 GiB/s it names is this many MiB/s.
+pub const MAX_WARM_THROUGHPUT_MI_BPS: i32 = 10 * 1024;
+
 /// An account that holds a standing minimum throughput billing commitment, spelled as
 /// `MinimumThroughputBillingCommitmentOutputStatus` models it
 /// (`smithy_query(query="shape",shape="MinimumThroughputBillingCommitmentOutputStatus")`).
@@ -911,7 +925,7 @@ pub struct Stream {
     /// The shard-level metrics enhanced monitoring reports. Empty until
     /// `EnableEnhancedMonitoring` names some.
     pub shard_level_metrics: Vec<String>,
-    /// `WarmThroughputMiBps`, when the create asked for a target warm throughput.
+    /// `WarmThroughputMiBps`, when a create or an update asked for a target warm throughput.
     pub warm_throughput_mi_bps: Option<i32>,
     /// `MaxRecordSizeInKiB`, when the create named one.
     pub max_record_size_in_ki_b: Option<i32>,
@@ -922,11 +936,12 @@ pub struct Stream {
     /// specified stream is in the DELETING state until Kinesis Data Streams completes the
     /// deletion" (`DeleteStream`). `None` for a stream nothing has deleted.
     pub deleted_at: Option<SystemTime>,
-    /// When the stream's `UPDATING` -> `ACTIVE` transition falls due, set by the
-    /// shard-count change that accepted the re-tiling: "Upon receiving the request...
-    /// sets the status of the stream to UPDATING. After the update is complete, Kinesis
-    /// Data Streams sets the status of the stream back to ACTIVE" (`UpdateShardCount`).
-    /// `None` for a stream nothing has rescaled.
+    /// When the stream's `UPDATING` -> `ACTIVE` transition falls due, set by the accepted
+    /// change that armed it — a shard-count re-tiling, a capacity-mode change or a
+    /// warm-throughput scaling: "Upon receiving the request... sets the status of the stream
+    /// to UPDATING. After the update is complete, Kinesis Data Streams sets the status of the
+    /// stream back to ACTIVE" (`UpdateShardCount`, `UpdateStreamWarmThroughput`). `None` for
+    /// a stream nothing has changed.
     pub updating_until: Option<SystemTime>,
     /// The instants the stream's shard count was changed at, youngest last — what the
     /// documented "ten times per rolling 24-hour period per stream" ceiling
@@ -1068,7 +1083,7 @@ impl Stream {
 
     /// The stream's status at `now`: `DELETING` once a delete has been accepted for it,
     /// `CREATING` until the transition the create armed falls due, `UPDATING` until the
-    /// one a shard-count change armed falls due, `ACTIVE` from then on. Derived from the
+    /// one an accepted change armed falls due, `ACTIVE` from then on. Derived from the
     /// stored instants, so two reads at the same instant agree and no read has to write.
     pub fn status(&self, now: SystemTime) -> &'static str {
         if self.deleted_at.is_some() {
@@ -1539,18 +1554,26 @@ impl Stream {
         before
     }
 
-    /// The warm throughput the stream reports: the target the create asked for, or the
-    /// throughput its open shards provide ([`SHARD_WRITE_MI_BPS`] each). Both members
-    /// carry the same value — the input member's doc calls it "the throughput capacity
-    /// that will be immediately available for write operations".
-    fn warm_throughput(&self) -> WarmThroughputObject {
+    /// The warm throughput the stream reports, which only a stream of the capacity mode the
+    /// configuration exists on has at all: "Represents the warm throughput configuration on
+    /// the stream. This is only present for On-Demand Kinesis Data Streams"
+    /// (`WarmThroughputObject`), so a stream whose shard map its owner sized reports NONE.
+    ///
+    /// For an on-demand stream it is the target a create or an update asked for, or the
+    /// throughput its open shards provide ([`SHARD_WRITE_MI_BPS`] each). Both members carry
+    /// the same value — the input member's doc calls it "the throughput capacity that will be
+    /// immediately available for write operations".
+    pub fn warm_throughput(&self) -> Option<WarmThroughputObject> {
+        if self.stream_mode != STREAM_MODE_ON_DEMAND {
+            return None;
+        }
         let target = self
             .warm_throughput_mi_bps
             .unwrap_or_else(|| self.open_shard_count().saturating_mul(SHARD_WRITE_MI_BPS));
-        WarmThroughputObject {
+        Some(WarmThroughputObject {
             target_mi_bps: Some(target),
             current_mi_bps: Some(target),
-        }
+        })
     }
 
     /// The `StreamModeDetails` the stream reports.
@@ -1602,7 +1625,7 @@ impl Stream {
             // Every consumer `RegisterStreamConsumer` registered with the stream is counted
             // here; no channel is associated until `CreateChannel` creates one.
             consumer_count: Some(self.consumer_count()),
-            warm_throughput: Some(self.warm_throughput()),
+            warm_throughput: self.warm_throughput(),
             max_record_size_in_ki_b: self.max_record_size_in_ki_b,
             channel_count: Some(0),
             record_distribution_strategy: self.record_distribution_strategy.clone(),
@@ -2442,6 +2465,40 @@ fn record_encryption_change(instants: &mut Vec<SystemTime>, at: SystemTime) {
 pub fn stream_on_demand_message(stream_name: &str) -> String {
     format!(
         "Request is invalid. Stream {stream_name} under account {} is in On-Demand mode.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// How an operation that only serves an on-demand stream refuses one whose shard count the
+/// caller owns: "Provisioned capacity mode streams do not support warm throughput
+/// configuration" (`UpdateStreamWarmThroughput`). Built FROM the stored record and this
+/// account, so the stream at fault names it.
+///
+/// The MIRROR of [`stream_on_demand_message`], worded the same way for the same rule read the
+/// other way round: one sentence for every operation a stream's capacity mode excludes.
+pub fn stream_provisioned_message(stream_name: &str) -> String {
+    format!(
+        "Request is invalid. Stream {stream_name} under account {} is in Provisioned mode.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// How an operation refuses a warm throughput past the ceiling one stream may be scaled to:
+/// "By default, you cannot do the following: Scale to more than 10 GiBps for an on-demand
+/// stream... To request an increase in the call rate limit, the shard limit for this API, or
+/// your overall shard limit, use the limits form" (`UpdateStreamWarmThroughput`), which is the
+/// modelled "the requested resource exceeds the maximum number allowed" refusal.
+///
+/// Built FROM the request, this account and the published ceiling
+/// ([`MAX_WARM_THROUGHPUT_MI_BPS`]): the value asked for and the one it passes, so a caller
+/// can compute a target that fits from the refusal alone.
+pub fn warm_throughput_over_ceiling_message(requested: i32) -> String {
+    format!(
+        "This request would exceed the warm throughput limit for the account {}. Requested \
+         warm throughput: {requested} MiBps. Limit: {MAX_WARM_THROUGHPUT_MI_BPS} MiBps. Refer \
+         to the AWS Service Limits page \
+         (http://docs.aws.amazon.com/general/latest/gr/aws_service_limits.html) for current \
+         limits and how to request higher limits.",
         ::engine::emulator_account_id()
     )
 }

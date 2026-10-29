@@ -254,7 +254,7 @@ async fn five_overlapping_mode_changes_admit_exactly_one() {
 }
 
 /// A stream taken to the provisioned mode drops the members only an on-demand stream
-/// carries, so the throughput it reports is the one its own open shards provide.
+/// carries, so it reports no warm throughput configuration at all.
 #[tokio::test]
 async fn a_change_to_provisioned_drops_the_on_demand_only_members() {
     let emulator = Emulator::new();
@@ -304,20 +304,17 @@ async fn a_change_to_provisioned_drops_the_on_demand_only_members() {
         .await;
     tokio::time::sleep(past_mode_update()).await;
 
-    let open = open_shard_ids(&emulator, case, case).await;
     let described = emulator
         .ok(case, "DescribeStreamSummary", &json!({ "StreamName": case }))
         .await;
     let summary = &described["StreamDescriptionSummary"];
-    assert_eq!(
-        summary
-            .get("WarmThroughput")
-            .and_then(|throughput| throughput.get("TargetMiBps"))
-            .and_then(Value::as_i64),
-        Some(i64::try_from(open.len()).unwrap_or_default()),
-        "case {case}: expected the provisioned stream to report the throughput its {} open \
-         shards provide, got {described}",
-        open.len()
+    // "Represents the warm throughput configuration on the stream. This is only present for
+    // On-Demand Kinesis Data Streams" (`WarmThroughputObject`), so the stream carries none
+    // once its shard map is its owner's to size.
+    assert!(
+        summary.get("WarmThroughput").is_none_or(Value::is_null),
+        "case {case}: expected the provisioned stream to carry no warm throughput \
+         configuration, got {described}"
     );
     assert!(
         summary
