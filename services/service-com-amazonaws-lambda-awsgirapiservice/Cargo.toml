@@ -18,7 +18,10 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `time` on top of the workspace features: the event source mapping poller
+# (`state::event_source_poller`) waits between passes with `tokio::time::sleep` rather
+# than parking a worker thread.
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -33,12 +36,34 @@ sha2 = { workspace = true }
 base64 = "0.22"
 # RevisionId is a UUID, minted fresh on every change to a function.
 uuid = { version = "1", features = ["v4"] }
+# The AWS SDK clients the event source mapping poller (`state::event_source_poller`)
+# reaches the other services of THIS emulator through, over the in-process callback
+# (`OperationContext::callback`): the mapped Kinesis data stream it reads
+# (`ListShards`/`GetShardIterator`/`GetRecords`) and the function it hands each batch to
+# (`Invoke`). Only the generated clients are needed: the emulator supplies the transport,
+# so the SDK's own HTTPS stack is left out.
+aws-sdk-kinesis = { version = "1", default-features = false }
+aws-sdk-lambda = { version = "1", default-features = false }
+# The CloudWatch store Lambda publishes its own metrics to (the `AWS/Lambda` namespace,
+# `state::metrics`). CloudWatch refuses a `PutMetricData` into a reserved `AWS/`
+# namespace, so a service's own metrics never travel over that API; this writes the very
+# store `ListMetrics`/`GetMetricStatistics` read.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
+# `time` on top of the workspace features: the data-plane tests wait out the state-settle
+# span and the poller's passes with `tokio::time::sleep`.
+tokio = { workspace = true, features = ["time"] }
+# The services a mapping's event source and its own metrics live in are mounted beside
+# lambda on ONE engine in the data-plane tests, because a delivery is asserted where a
+# client sees it: on the stream the records were put to, and in the series CloudWatch
+# reports for the function.
+service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 
 [lints]
 workspace = true

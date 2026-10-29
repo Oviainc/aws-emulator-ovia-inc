@@ -156,7 +156,7 @@
 //! takes a batch out of the queue through the queue's own delivery bookkeeping and records
 //! what became of it on [`EventSourceMappingRecord::last_processing_result`].
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
@@ -200,11 +200,18 @@ pub use capacity_provider::{
     CAPACITY_PROVIDER_RESOURCE_TYPE,
 };
 
-/// The poller an event source mapping on an Amazon SQS queue runs — the component that
-/// reads from the queue and hands a batch to the mapping's function — lives in
-/// [`sqs_poller`] and is re-exported here, for the same reason as [`capacity_provider`]:
-/// the mapping record, its clock-owed transitions and the store that holds it stay in this
-/// module, and a handler still names the poller as `crate::state::…`.
+/// What an event source mapping does with NO client action at all — the pollers that read
+/// the mapped source and hand each batch to the function — lives beside the record, one
+/// module per KIND of source, because what a source hands over and how a reader keeps its
+/// place in it differ: [`sqs_poller`] for a mapping on an Amazon SQS queue, and
+/// [`event_source_poller`] for one on an Amazon Kinesis data stream, whose shards are read
+/// from a position the mapping carries. The CloudWatch series Lambda publishes about that
+/// work is in [`metrics`]. Each is re-exported here for the same reason as
+/// [`capacity_provider`]: the mapping record, its clock-owed transitions and the store
+/// that holds it stay in this module, and a handler still names a poller as
+/// `crate::state::…`.
+pub mod event_source_poller;
+pub mod metrics;
 pub mod sqs_poller;
 pub use sqs_poller::{drive_sqs_pollers, poll_due, BATCH_NOT_PROCESSED_RESULT, POLL_INTERVAL};
 
@@ -3534,6 +3541,48 @@ pub const EVENT_SOURCE_VENDOR_DOCUMENT_DB: &str = "rds";
 /// The `EventSourcePosition` value that reads "from which to start reading" at a stated
 /// instant, from the model's enum (`AT_TIMESTAMP | LATEST | TRIM_HORIZON`).
 pub const STARTING_POSITION_AT_TIMESTAMP: &str = "AT_TIMESTAMP";
+/// The `EventSourcePosition` value that starts at the oldest record the source still
+/// retains, from that same enum.
+pub const STARTING_POSITION_TRIM_HORIZON: &str = "TRIM_HORIZON";
+/// The `EventSourcePosition` value that starts just past the records the source already
+/// held, from that same enum.
+pub const STARTING_POSITION_LATEST: &str = "LATEST";
+
+/// `LastProcessingResult` ("The result of the event source mapping's last processing
+/// attempt") after an attempt that delivered its batch to the function.
+pub const LAST_PROCESSING_RESULT_OK: &str = "OK";
+
+/// `LastProcessingResult` after an attempt whose invocation of the function was MADE and
+/// did not succeed — whatever refused it — in the `PROBLEM: <reason>` form Lambda words an
+/// unsuccessful attempt in. The batch is not checkpointed past, so it is read again.
+///
+/// Distinct from [`BATCH_NOT_PROCESSED_RESULT`], which a queue mapping's poller reports for
+/// a batch it handed over that nothing ran: there no invocation is attempted at all, while
+/// this one is the result of a call that was attempted and came back refused.
+pub const LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED: &str = "PROBLEM: Function call failed";
+
+/// Where in ONE shard of a mapping's event source that mapping reads next.
+///
+/// `StartingPosition` is "The position in a stream from which to start reading" — a
+/// property of the MAPPING, fixed when the mapping is created — so the position a shard is
+/// read from is this cursor and never the stream's current tip: a mapping that has
+/// consumed batches reads on after the newest record it delivered, and one that has
+/// consumed none still reads from the position its creation fixed, however long it was
+/// paused in between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardCursor {
+    /// From the oldest record the shard still retains, which is what `TRIM_HORIZON`
+    /// names.
+    TrimHorizon,
+    /// From a stated instant: the `StartingPositionTimestamp` of an `AT_TIMESTAMP`
+    /// mapping, and the mapping's own creation instant for a `LATEST` one — "just after
+    /// the most recent record in the shard" AT THE MOMENT the mapping fixed its position
+    /// is the same set of records as "everything that arrived from that instant on".
+    AtTimestamp(SystemTime),
+    /// Past the record this sequence number names: the newest record of the last batch
+    /// this mapping delivered from the shard.
+    AfterSequenceNumber(String),
+}
 
 /// The ARN of an event source mapping:
 /// `arn:aws:lambda:<region>:<account>:event-source-mapping:<uuid>`, as the model's
@@ -3757,8 +3806,11 @@ pub fn queue_visibility_refusal(
 /// echoed straight back to its caller.
 ///
 /// A mapping on an Amazon SQS queue also POLLS that queue once it is enabled, which is
-/// what [`sqs_poller`] does, so the record carries the result of the last attempt that
-/// poller made ([`Self::last_processing_result`]).
+/// what [`sqs_poller`] does, and a mapping on an Amazon Kinesis data stream reads that
+/// stream's shards, which is what [`event_source_poller`] does — so the record carries the
+/// result of the last attempt its poller made ([`Self::last_processing_result`]) and, for
+/// a shard source, the mapping's own READING position: where it reads next in each shard
+/// of its event source.
 #[derive(Debug, Clone)]
 pub struct EventSourceMappingRecord {
     /// `UUID`: "The identifier of the event source mapping", which is also the key it is
@@ -3862,10 +3914,20 @@ pub struct EventSourceMappingRecord {
     /// `LastModified`: "The date that the event source mapping was last updated or that
     /// its state changed."
     pub last_modified: SystemTime,
+    /// When this mapping was created, which is the instant its reading position is fixed
+    /// at; see [`ShardCursor::AtTimestamp`].
+    pub created_at: SystemTime,
+    /// Where this mapping reads next in each shard it has already read from, keyed by
+    /// shard id; a shard absent from the map has not been read yet and is read from
+    /// [`Self::initial_shard_cursor`]. Written by the poller
+    /// ([`crate::state::event_source_poller`]) as it checkpoints past each delivered
+    /// batch.
+    pub shard_cursors: BTreeMap<String, ShardCursor>,
     /// `LastProcessingResult`: "The result of the event source mapping's last processing
     /// attempt" — `None` for a mapping whose poller has not had a batch to attempt yet,
     /// which is every mapping at the instant it is created. Written only by the poller that
-    /// made the attempt; see [`sqs_poller::poll_due`].
+    /// made the attempt; see [`sqs_poller::poll_due`] and
+    /// [`crate::state::event_source_poller`].
     pub last_processing_result: Option<String>,
 }
 
@@ -4042,6 +4104,26 @@ impl EventSourceMappingRecord {
         reported
     }
 
+    /// Where this mapping reads a shard it has not read from yet, which is what its
+    /// `StartingPosition` states: the oldest retained record for `TRIM_HORIZON`, the
+    /// stated instant for `AT_TIMESTAMP`, and the mapping's own creation instant for
+    /// `LATEST` — "When true, the event source mapping is active. When false, Lambda
+    /// pauses polling and invocation", and pausing polling does not move the position, so
+    /// a mapping that was created disabled reads from where it was created rather than
+    /// from where the stream had got to when it was enabled.
+    #[must_use]
+    pub fn initial_shard_cursor(&self) -> ShardCursor {
+        match self.starting_position.as_deref() {
+            Some(STARTING_POSITION_TRIM_HORIZON) => ShardCursor::TrimHorizon,
+            Some(STARTING_POSITION_AT_TIMESTAMP) => ShardCursor::AtTimestamp(
+                self.starting_position_timestamp
+                    .and_then(|stated| SystemTime::try_from(stated).ok())
+                    .unwrap_or(self.created_at),
+            ),
+            _ => ShardCursor::AtTimestamp(self.created_at),
+        }
+    }
+
     /// Whether this mapping is one of the function `name` names, qualified by
     /// `qualifier` when the caller qualified it.
     ///
@@ -4076,6 +4158,9 @@ pub struct ComAmazonawsLambdaAwsgirapiserviceState {
     /// Every event source mapping this emulator holds, keyed by its UUID so
     /// `ListEventSourceMappings` pages through them in a stable order.
     pub event_source_mappings: BTreeMap<String, EventSourceMappingRecord>,
+    /// The UUIDs of the mappings a shard-source poller is already running for, so at most
+    /// one runs per mapping; see [`Self::claim_event_source_poller`].
+    pub event_source_pollers: BTreeSet<String>,
     /// Whether a poll loop is already running over this store's queue mappings; see
     /// [`sqs_poller::drive_sqs_pollers`], which is the only thing that sets it.
     pub sqs_poller_running: bool,
@@ -4184,6 +4269,23 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
         for mapping in self.event_source_mappings.values_mut() {
             mapping.materialize(now);
         }
+    }
+
+    /// Claim the ONE poller of the mapping `uuid` names, reporting whether this caller got
+    /// it.
+    ///
+    /// `false` means a poller is already running for that mapping, so the caller starts
+    /// none: an event source is polled for one function by at most one mapping, and a
+    /// mapping is polled by at most one poller, so two tasks never read the same shard on
+    /// behalf of the same mapping.
+    pub fn claim_event_source_poller(&mut self, uuid: &str) -> bool {
+        self.event_source_pollers.insert(uuid.to_string())
+    }
+
+    /// Release the claim of the poller of the mapping `uuid` names, so a later call can
+    /// start one again.
+    pub fn release_event_source_poller(&mut self, uuid: &str) {
+        self.event_source_pollers.remove(uuid);
     }
 
     /// Every function version configured to run on the capacity provider `provider_arn`

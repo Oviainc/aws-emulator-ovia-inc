@@ -127,6 +127,8 @@ mod function_version_listing;
 mod function_versions_by_capacity_provider;
 #[path = "all/functions_by_code_signing_config.rs"]
 mod functions_by_code_signing_config;
+#[path = "all/kinesis_event_source_delivery.rs"]
+mod kinesis_event_source_delivery;
 #[path = "all/layer_listing.rs"]
 mod layer_listing;
 #[path = "all/layer_version_by_arn.rs"]

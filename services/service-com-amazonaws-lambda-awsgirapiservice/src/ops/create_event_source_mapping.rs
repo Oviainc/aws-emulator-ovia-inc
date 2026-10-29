@@ -655,6 +655,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nobody has deleted this mapping, so no removal is owed.
             removal_due: None,
             last_modified: now,
+            // `StartingPosition` is "The position in a stream from which to start
+            // reading" — a property of the MAPPING — so the instant this call fixes it at
+            // is stored with it: a `LATEST` mapping reads what arrives from here on,
+            // whether or not it is enabled yet (see
+            // [`crate::state::EventSourceMappingRecord::initial_shard_cursor`]).
+            created_at: now,
+            // Nothing has been read from any shard yet, so every shard is read from the
+            // position above.
+            shard_cursors: ::std::collections::BTreeMap::new(),
             // "The result of the event source mapping's last processing attempt": this
             // mapping's poller has not had a batch to attempt yet.
             last_processing_result: None,
@@ -675,12 +684,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let reported = stored.reported();
+
         // Standing the mapping's poller up is what this call started: "Lambda reads items
         // from the event source and invokes the function", and the reading is the poller's.
-        // The store's lock is released first — the poll loop takes it itself — and nothing
-        // here waits for a poll: the loop runs on its own clock (`crate::state::poll_due`).
+        // Which poller depends on the kind of source — the queue loop, or this mapping's own
+        // reader of a Kinesis data stream's shards — and each decides for itself whether it
+        // has anything to do. The store's lock is released first (each poller takes it
+        // itself) and nothing here waits for a poll: they run on their own clock.
         drop(store);
         crate::state::drive_sqs_pollers(&self.engine);
+        crate::state::event_source_poller::drive_mapping(ctx, &self.engine, &uuid);
+
         Ok(reported)
     }
 }

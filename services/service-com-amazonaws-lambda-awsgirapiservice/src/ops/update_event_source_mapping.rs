@@ -557,11 +557,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answered by reading the stored record back, so `GetEventSourceMapping` reports
         // exactly what this call persisted.
         let reported = event_source_mapping_configuration(record.reported());
+
         // An update may be what ENABLES a mapping, or what re-targets it onto another queue
-        // or function, so it arms the poll loop exactly as the create does — the store's
-        // lock is released first, because the loop takes it itself.
+        // or function, so it arms the pollers exactly as the create does — the queue loop,
+        // and this mapping's own reader of a Kinesis data stream's shards, each of which
+        // decides for itself whether it has anything to do (a mapping that already had a
+        // reader keeps the one it has: the claim keeps a second from starting). The store's
+        // lock is released first, because each poller takes it itself.
         drop(store);
         crate::state::drive_sqs_pollers(&self.engine);
+        crate::state::event_source_poller::drive_mapping(ctx, &self.engine, &input.uuid);
+
         Ok(reported)
     }
 }
