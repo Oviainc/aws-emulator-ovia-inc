@@ -320,6 +320,51 @@ pub fn extended_metric(name: &str) -> Option<&'static ExtendedMetric> {
     EXTENDED_METRIC_CATALOG.iter().find(|entry| entry.name == name)
 }
 
+/// Every `DimensionKeys` entry an EXTENDED metric may carry: the event field path the
+/// dimension's value is read out of, and the CloudWatch dimension name RUM publishes that
+/// field under.
+///
+/// Source: the model's `MetricDefinitionRequest$DimensionKeys` documentation — "For
+/// extended metrics, valid values for the entries in this field are the following",
+/// followed by one `field path`/`dimension name` pair per entry
+/// (`smithy_query(query="doc", shape="MetricDefinitionRequest", member="DimensionKeys")`),
+/// in the order it lists them. An extended metric is RUM's own metric, so the dimensions
+/// it may be broken down by are the ones RUM itself computes: the pairing is the rule, not
+/// a default a request can rename.
+///
+/// The crate's tests transcribe the same list independently from the model
+/// (`EXTENDED_DIMENSION_KEYS` in `tests/all/metric_definitions.rs`), so they state the
+/// expectation rather than agreeing with this constant by construction; the two are
+/// expected to hold the same entries.
+pub const EXTENDED_DIMENSION_ENTRIES: &[(&str, &str)] = &[
+    ("metadata.pageId", "PageId"),
+    ("metadata.browserName", "BrowserName"),
+    ("metadata.deviceType", "DeviceType"),
+    ("metadata.osName", "OSName"),
+    ("metadata.countryCode", "CountryCode"),
+    ("event_details.fileType", "FileType"),
+];
+
+/// The dimension name [`EXTENDED_DIMENSION_ENTRIES`] pins for the field path `field`, or
+/// `None` when it lists no entry keyed by that path — which is what makes the entry one an
+/// extended metric may not carry.
+pub fn extended_dimension_name(field: &str) -> Option<&'static str> {
+    EXTENDED_DIMENSION_ENTRIES
+        .iter()
+        .find(|(path, _)| *path == field)
+        .map(|(_, dimension)| *dimension)
+}
+
+/// Every field path an extended metric's `DimensionKeys` may be keyed by, as a refusal
+/// names them.
+fn extended_dimension_fields() -> String {
+    EXTENDED_DIMENSION_ENTRIES
+        .iter()
+        .map(|(field, _)| *field)
+        .collect::<Vec<&str>>()
+        .join(", ")
+}
+
 /// Every field a RUM event carries, which is every FIRST-LEVEL key a custom metric's
 /// `ValueKey`, `EventPattern` and `DimensionKeys` may name.
 ///
@@ -1663,7 +1708,9 @@ fn constraint_refusal(
 /// * `DimensionKeys` (from the model): "For both extended metrics and custom metrics, all
 ///   dimensions listed in this field must also be included in `EventPattern`" — the
 ///   dimension's value is read out of the matched event, so the pattern has to name that
-///   field, and a definition with dimensions but no pattern names none of them.
+///   field, and a definition with dimensions but no pattern names none of them. For an
+///   EXTENDED metric the ENTRIES themselves are pinned too, to the pairs
+///   [`EXTENDED_DIMENSION_ENTRIES`] lists ([`extended_metric_refusal`]).
 /// * The event fields a CUSTOM metric reads and the pattern it reads them by (from the
 ///   model): every first-level key its `ValueKey`, `EventPattern` and `DimensionKeys` name
 ///   has to be a field a RUM event carries, a pattern filtering on `event_details` has to
@@ -1743,8 +1790,12 @@ pub fn metric_definition_refusal(definition: &MetricDefinitionRequest) -> Option
 ///
 /// Reached for a definition whose `Namespace` is omitted or [`EXTENDED_METRICS_NAMESPACE`]
 /// — the namespace extended metrics are published to — so the model's extended-metric
-/// rules are the ones in force: the name has to be one the catalog lists, and the
-/// `ValueKey`/`EventPattern` combination has to be the one that row pins. A name the
+/// rules are the ones in force: the name has to be one the catalog lists, the
+/// `ValueKey`/`EventPattern` combination has to be the one that row pins, and every
+/// `DimensionKeys` entry has to be one of the pairs the model lists for extended metrics
+/// ("For extended metrics, valid values for the entries in this field are the following",
+/// [`EXTENDED_DIMENSION_ENTRIES`]) — RUM computes those dimensions itself, so neither the
+/// field path nor the name it is published under is the caller's to choose. A name the
 /// catalog does NOT list is a custom metric, and a custom metric cannot be published here
 /// at all: "The namespace can't be omitted and can't be `AWS/RUM`. You can use the
 /// `AWS/RUM` namespace only for extended metrics."
@@ -1781,6 +1832,39 @@ fn extended_metric_refusal(
             ),
             None => format!("ValueKey must be omitted for the extended metric {name}."),
         });
+    }
+
+    // "For extended metrics, valid values for the entries in this field are the
+    // following": each `DimensionKeys` entry of an extended metric is one of the
+    // `field path`/`dimension name` pairs the model lists, so a path it does not list
+    // reads a dimension RUM does not compute for its own metrics, and a path it lists
+    // carries only the dimension name pinned beside it. Sorted, so the entry a refusal
+    // names is the same whichever order the request's map iterated in.
+    let mut entries: Vec<(&str, &str)> = definition
+        .dimension_keys
+        .iter()
+        .flatten()
+        .map(|(field, dimension)| (field.as_str(), dimension.as_str()))
+        .collect();
+    entries.sort_unstable();
+    for (field, dimension) in entries {
+        match extended_dimension_name(field) {
+            Some(required) if required == dimension => {}
+            Some(required) => {
+                return Some(format!(
+                    "DimensionKeys maps the field {field} to the dimension {dimension}: the \
+                     extended metric {name} publishes that field as {required}."
+                ));
+            }
+            None => {
+                return Some(format!(
+                    "DimensionKeys names the field {field}, which is not a dimension the \
+                     extended metric {name} can be broken down by: the valid field paths \
+                     are {}.",
+                    extended_dimension_fields()
+                ));
+            }
+        }
     }
 
     // "When you define extended metrics, the metric definition is not valid if

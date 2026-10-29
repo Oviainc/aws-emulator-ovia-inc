@@ -25,15 +25,21 @@
 //! one case sends the offending definition as the SECOND element of a batch, so the position
 //! a clause reports is pinned too; the acceptance table carries each published bound exactly,
 //! a dimension name that merely RESEMBLES what the pattern excludes, and a catalog entry the
-//! report did not cite. Every accepted row is read back through
-//! `BatchGetRumMetricDefinitions`, and every refused one is shown to have changed nothing.
+//! report did not cite. An acceptance row is sent as whichever KIND of metric may carry an
+//! entry of that shape at all — a custom metric where the entry is not one of the six pairs
+//! the model pins for an extended metric, an extended metric where it is — since the bound
+//! under test belongs to the map, declared once on the shape every `DimensionKeys` member
+//! targets. Every accepted row is read back through `BatchGetRumMetricDefinitions`, and every
+//! refused one is shown to have changed nothing.
 
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
-use crate::metric_definitions::{extended_with_dimensions, EXTENDED_DIMENSION_KEYS};
+use crate::metric_definitions::{
+    dimension_keys, event_pattern, extended_with_dimensions, EXTENDED_DIMENSION_KEYS,
+};
 use crate::support::{
     all_metric_definitions, call, create, emulator, message, put_metrics_destination, Reply,
 };
@@ -50,6 +56,13 @@ const DESTINATION: &str = "CloudWatch";
 /// `ValueKey` of null and an `EventPattern`, so each row's only interesting difference is
 /// its `DimensionKeys`.
 const METRIC: &str = "JsErrorCount";
+
+/// The CUSTOM metric a row whose entry the extended list does not name is sent as: a name
+/// of the caller's own, a namespace of the caller's own (which is what makes a definition a
+/// custom metric) and the event type its pattern matches.
+const CUSTOM_METRIC: &str = "CheckoutDimensioned";
+const CUSTOM_NAMESPACE: &str = "MyApp/Checkout";
+const CUSTOM_EVENT_TYPE: &str = "com.example.checkout";
 
 /// `DimensionKey`'s modelled `@length`: the bounds the map's KEY — a dotted event-field path
 /// — is declared within.
@@ -195,62 +208,101 @@ fn offending_entries() -> Vec<Offending> {
     ]
 }
 
-/// Entries inside every constraint the model declares, each with the reason it is one.
-fn admitted_entries() -> Vec<(String, Vec<(String, String)>)> {
+/// Entries inside every constraint the model declares, each as the definition that carries
+/// it and the reason it is one.
+///
+/// A row whose entry the extended list does not name is sent as a CUSTOM metric, since for
+/// an extended metric the entries themselves are pinned to the six pairs the model lists:
+/// the bound under test is the map's, declared once on `DimensionKeysMap`, so it is stated
+/// on whichever kind of metric may carry an entry of that shape at all. `DimensionKey`'s
+/// MINIMUM of one character is reachable by no valid definition — the shortest field path
+/// either kind may name is a RUM event field — so the boundary left to state there is the
+/// empty key one character below it, which the refusal table above carries.
+fn admitted_entries() -> Vec<(String, Value)> {
     vec![
         (
-            "a field path and a dimension name of one character each, at both minimums"
-                .to_string(),
-            vec![("p".to_string(), "D".to_string())],
+            "a dimension name of one character, at DimensionName's minimum".to_string(),
+            custom_definition(&[("userId".to_string(), "D".to_string())]),
         ),
         (
             "a field path exactly at DimensionKey's maximum".to_string(),
-            vec![("p".repeat(KEY_MAX_LENGTH), "PageId".to_string())],
+            custom_definition(&[(longest_field_path(), "PageId".to_string())]),
         ),
         (
             "a dimension name exactly at DimensionName's maximum".to_string(),
-            vec![(
+            custom_definition(&[(
                 "metadata.pageId".to_string(),
                 "D".repeat(NAME_MAX_LENGTH),
-            )],
+            )]),
         ),
         (
             // The pattern's guard is anchored at the start of the value, so a colon
             // anywhere else is just a character.
             "a dimension name carrying a colon past its first character".to_string(),
-            vec![("metadata.pageId".to_string(), "Page:Id".to_string())],
+            custom_definition(&[("metadata.pageId".to_string(), "Page:Id".to_string())]),
         ),
         (
             // Blank is what the pattern forbids, not leading whitespace.
             "a dimension name opening with whitespace around a non-blank run".to_string(),
-            vec![("metadata.browserName".to_string(), " Browser ".to_string())],
+            custom_definition(&[(
+                "metadata.browserName".to_string(),
+                " Browser ".to_string(),
+            )]),
         ),
         (
             "a catalog entry the model lists".to_string(),
-            vec![(
+            definition(&[(
                 EXTENDED_DIMENSION_KEYS[3].0.to_string(),
                 EXTENDED_DIMENSION_KEYS[3].1.to_string(),
-            )],
+            )]),
         ),
         (
             "every dimension the model lists for an extended metric".to_string(),
-            EXTENDED_DIMENSION_KEYS
-                .iter()
-                .map(|(field, dimension)| ((*field).to_string(), (*dimension).to_string()))
-                .collect(),
+            definition(
+                &EXTENDED_DIMENSION_KEYS
+                    .iter()
+                    .map(|(field, dimension)| ((*field).to_string(), (*dimension).to_string()))
+                    .collect::<Vec<(String, String)>>(),
+            ),
         ),
     ]
+}
+
+/// A field path of exactly `DimensionKey`'s maximum length that a definition may name: a
+/// RUM event field, then a leaf filling the rest of the bound.
+fn longest_field_path() -> String {
+    let field = "metadata.";
+    format!("{field}{}", "p".repeat(KEY_MAX_LENGTH - field.len()))
 }
 
 /// The definition each row is sent as: the extended metric's own pinned combination, with
 /// `entries` listed in `DimensionKeys` and their field paths named by the `EventPattern` —
 /// so nothing but the entry under test can be what a refusal is about.
 fn definition(entries: &[(String, String)]) -> Value {
-    let pairs: Vec<(&str, &str)> = entries
+    extended_with_dimensions(METRIC, &pairs(entries))
+}
+
+/// The definition a row whose entry the extended list does not name is sent as: a CUSTOM
+/// metric, under a name and a namespace of its own, with `entries` listed in
+/// `DimensionKeys` and their field paths named by the `EventPattern`. A custom metric's
+/// dimensions are its own, so the rules left on an entry are the modelled constraints under
+/// test and the first-level key naming a RUM event field.
+fn custom_definition(entries: &[(String, String)]) -> Value {
+    let paths: Vec<&str> = entries.iter().map(|(field, _)| field.as_str()).collect();
+    json!({
+        "Name": CUSTOM_METRIC,
+        "Namespace": CUSTOM_NAMESPACE,
+        "EventPattern": event_pattern(CUSTOM_EVENT_TYPE, &paths),
+        "DimensionKeys": dimension_keys(&pairs(entries)),
+    })
+}
+
+/// `entries` as the borrowed pairs the shared definition builders take.
+fn pairs(entries: &[(String, String)]) -> Vec<(&str, &str)> {
+    entries
         .iter()
         .map(|(field, dimension)| (field.as_str(), dimension.as_str()))
-        .collect();
-    extended_with_dimensions(METRIC, &pairs)
+        .collect()
 }
 
 /// One app monitor with a CloudWatch extended-metrics destination — the destination a
@@ -433,8 +485,7 @@ async fn a_dimension_entry_inside_the_modelled_constraints_is_stored_and_read_ba
     let monitor = "dimension-constraints-admitted";
     seeded_monitor(&router, "admitted", monitor).await;
 
-    for (case, entries) in admitted_entries() {
-        let requested = definition(&entries);
+    for (case, requested) in admitted_entries() {
         let reply = batch_create(&router, monitor, std::slice::from_ref(&requested)).await;
         assert_eq!(
             reply.status,
@@ -467,12 +518,10 @@ async fn a_dimension_entry_inside_the_modelled_constraints_is_stored_and_read_ba
         );
 
         // And the same entry through the update, which judges a definition the same way.
-        let replacement = json!({
-            "Name": requested["Name"].clone(),
-            "EventPattern": requested["EventPattern"].clone(),
-            "UnitLabel": "Count",
-            "DimensionKeys": requested["DimensionKeys"].clone(),
-        });
+        // The replacement is the definition that was created, carrying a `UnitLabel` the
+        // create did not set — so the read-back shows the update replaced it.
+        let mut replacement = requested.clone();
+        replacement["UnitLabel"] = json!("Count");
         let reply = update(&router, monitor, &id, &replacement).await;
         assert_eq!(
             reply.status,
