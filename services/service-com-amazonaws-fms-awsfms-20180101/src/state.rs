@@ -244,6 +244,36 @@ pub const POLICY_STATUS_ACTIVE: &str = "ACTIVE";
 /// [`crate::ops::types::CUSTOMER_POLICY_STATUS_VALUES`].
 pub const POLICY_STATUS_OUT_OF_ADMIN_SCOPE: &str = "OUT_OF_ADMIN_SCOPE";
 
+/// The `ResourceTagLogicalOperator` a policy combines its `ResourceTags` with
+/// when the request names none: the member's own documented default
+/// ("Default: `AND`", `Policy$ResourceTagLogicalOperator`) — "a resource must
+/// have all tags to be included or excluded". One of
+/// [`crate::ops::types::RESOURCE_TAG_LOGICAL_OPERATOR_VALUES`].
+pub const RESOURCE_TAG_LOGICAL_OPERATOR_AND: &str = "AND";
+
+/// Materialise the documented defaults of a `Policy` document the caller sent,
+/// so the stored policy is the EFFECTIVE one and every reader of it reports the
+/// value the policy actually behaves by rather than nothing.
+///
+/// A modelled member whose documentation states an explicit default is not
+/// "unset" when the request omits it: it has that value, which is why the
+/// service answers with it. `ResourceTagLogicalOperator` is the one such member
+/// of `Policy` — the others that carry a default (`ExcludeResourceTags`,
+/// `RemediationEnabled`, `DeleteUnusedFMManagedResources`) state it as the
+/// model's own `@default` trait, which the generated type materialises already
+/// by not being nullable.
+///
+/// Applied by the single writer of a policy document ([`crate::ops::put_policy`])
+/// BEFORE the document is stored, so the default is persisted once rather than
+/// re-derived by each reader. A value the caller DID send is left exactly as
+/// sent.
+pub fn apply_policy_document_defaults(policy: &mut Policy) {
+    if policy.resource_tag_logical_operator.is_none() {
+        policy.resource_tag_logical_operator =
+            Some(RESOURCE_TAG_LOGICAL_OPERATOR_AND.to_string());
+    }
+}
+
 /// The `ResourceSetStatus` of a resource set that IS in the Region scope of the
 /// administrative scope governing it: "the administrator can manage and delete
 /// the resource set" (`ResourceSet$ResourceSetStatus`). One of

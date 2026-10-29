@@ -29,6 +29,11 @@
 //! are stripped from the stored document and overlaid from the store for every
 //! reader.
 //!
+//! A member the model documents a DEFAULT for is materialised before the
+//! document is stored, so the stored policy is the effective one and a reader
+//! learns how the policy behaves rather than that the request said nothing —
+//! see [`crate::state::apply_policy_document_defaults`].
+//!
 //! Either way the document itself is checked FIRST — before the `PolicyId` is
 //! resolved and before the token is judged, so an update that carries both an
 //! unknown id and an invalid document reports the document's refusal — against
@@ -515,6 +520,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested_id = policy.policy_id.take();
         let requested_token = policy.policy_update_token.take();
         policy.policy_status = None;
+
+        // A member the model documents a DEFAULT for is not "unset" when the
+        // request omits it: the policy behaves by that default, so the default
+        // is what the service stores and what every reader of the policy is
+        // answered with. Materialised here, by the one writer of a policy
+        // document, before anything is persisted — see
+        // [`crate::state::apply_policy_document_defaults`]. A value the caller
+        // DID send is left exactly as sent.
+        crate::state::apply_policy_document_defaults(&mut policy);
 
         // The semantic rules on the document the model states but cannot
         // express as a constraint. Refused before the store is even reached, so
