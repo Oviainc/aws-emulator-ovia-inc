@@ -28,7 +28,7 @@ use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 use crate::support::{
     all_metric_definitions, call, create, emulator, message, metric_definition_id,
-    put_metrics_destination, Reply,
+    put_metrics_destination, sole_metric_definition, Reply,
 };
 
 /// Every field a RUM event carries, which is every first-level key a custom metric's
@@ -421,10 +421,24 @@ async fn every_custom_metric_naming_only_rum_event_fields_is_created_and_read_ba
     }
 
     // The single-definition update accepts each of them too, judging a definition the same
-    // way the create judges one.
-    let subject = metric_definition_id("accepted", &created[0]);
+    // way the create judges one. It runs against a monitor of its own holding exactly ONE
+    // definition, which every row replaces in turn: a destination holds at most one
+    // definition of a given metric, so an update that copied a definition a SIBLING id of
+    // the same destination already holds is answered as a conflict rather than as a
+    // judgement of the definition's validity (`metric_definition_identity.rs`).
+    let update_monitor = "custom-fields-updated";
+    seeded_monitor(&router, "accepted", update_monitor).await;
+    let subject = sole_metric_definition(
+        &router,
+        "accepted",
+        update_monitor,
+        DESTINATION,
+        None,
+        &rows[0].1,
+    )
+    .await;
     for (case, definition) in &rows {
-        let reply = update(&router, monitor, &subject, definition).await;
+        let reply = update(&router, update_monitor, &subject, definition).await;
         assert_eq!(
             reply.status,
             200,

@@ -8,7 +8,10 @@
 //! [`crate::state::MetricDestinationKey`]) and by its `MetricDefinitionId`, and the WHOLE
 //! definition is replaced under that id — the request carries "the new definition that you
 //! want to use for this metric" — so the id a caller holds keeps naming the same metric.
-//! `BatchGetRumMetricDefinitions` reads the same map back.
+//! A destination holds at most ONE definition of a given metric, the identity the batch
+//! create keys a definition by, so an update that would store a definition another id of
+//! the same destination already defines is refused as a conflict rather than duplicating
+//! it. `BatchGetRumMetricDefinitions` reads the same map back.
 //!
 //! ## Shape of an operation
 //!
@@ -261,6 +264,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        // A metric definition's identity is the definition ITSELF — the members a request
+        // carries — which is what the batch create resolves a requested definition against
+        // ([`crate::state::AppMonitorRecord::metric_definition_defining`]) and what makes
+        // creating one idempotent: a destination holds at most ONE definition of a given
+        // metric. So a definition of the metric this request carries that is already stored
+        // under ANOTHER id of this destination IS that metric's definition, and storing a
+        // second copy of it here would leave the destination holding two definitions of one
+        // metric — the state the create path exists to prevent. That is the condition
+        // `ConflictException` names, so the definition that already exists is reported
+        // instead of duplicated. The definition addressed by THIS id never conflicts with
+        // itself: replacing a definition by the one it already is leaves the destination
+        // with exactly one definition of that metric, which is what makes this update
+        // `@idempotent`.
+        let conflicting_id = monitor
+            .metric_definition_defining(
+                &input.destination,
+                destination_arn,
+                &input.metric_definition,
+            )
+            .map(|held| held.metric_definition_id.clone())
+            .filter(|held| held != &input.metric_definition_id);
+
         let Some(stored) = monitor.metric_definition_mut(
             &input.destination,
             destination_arn,
@@ -276,6 +301,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+        // Judged after the addressed definition is resolved, so a request naming no stored
+        // definition at all is still the missing resource it is, and nothing is written on
+        // either refused path.
+        if let Some(held) = conflicting_id {
+            return Err(UpdateRumMetricDefinitionErrorModeled::ConflictException(
+                crate::state::metric_definition_already_exists(&held),
+            )
+            .into());
+        }
 
         // "Modifies one existing metric definition": the whole definition is replaced by
         // the one the request carried, and the id is NOT part of what a caller may change

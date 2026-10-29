@@ -1070,17 +1070,24 @@ async fn the_reserved_namespace_prefix_is_the_only_namespace_a_definition_cannot
         );
 
         // And the update is judged the same way, against a definition created under a
-        // namespace of its own.
+        // namespace of its own — on a monitor of its own, so the definition the create
+        // above may have stored is not a sibling this update would duplicate: a
+        // destination holds at most one definition of a given metric, and an update that
+        // would store a second one is a conflict rather than a validity judgement
+        // (`metric_definition_identity.rs`).
+        let update_monitor = format!("namespace-{index}-update");
+        create_monitor(&router, case, &update_monitor).await;
+        put_destination(&router, case, &update_monitor, &destination).await;
         let seeded = create_definitions(
             &router,
             case,
-            &monitor,
+            &update_monitor,
             &destination,
             &[custom("Seeded", "MyApp/Seeded")],
         )
         .await;
         let id = id_of(case, &seeded[0]);
-        let reply = update(&router, &monitor, &destination, &id, &definition).await;
+        let reply = update(&router, &update_monitor, &destination, &id, &definition).await;
         let expected = if *accepted { 200 } else { 400 };
         assert_eq!(
             reply.status, expected,

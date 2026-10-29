@@ -426,13 +426,29 @@ async fn every_definition_the_model_declares_valid_is_created_and_read_back() {
         assert_definition(case, read_back, requested);
     }
 
-    // The same definitions are accepted by the update, which judges one the same way.
-    let subject = created[0]["MetricDefinitionId"]
+    // The same definitions are accepted by the update, which judges one the same way. The
+    // update runs against a monitor of its own holding exactly ONE definition, which every
+    // row replaces in turn: a destination holds at most one definition of a given metric,
+    // so an update that copied a definition a SIBLING id of the same destination already
+    // holds is answered as a conflict rather than as a judgement of the definition's
+    // validity (`metric_definition_identity.rs`).
+    let update_monitor = "validation-accepted-update";
+    seeded_monitor(&router, "accepted", update_monitor).await;
+    let seeded = batch_create(&router, update_monitor, &[rows[0].1.clone()]).await;
+    assert_eq!(
+        seeded.status,
+        200,
+        "case {:?}: seeding the update's subject must succeed, got {} {:?}",
+        "accepted",
+        seeded.status,
+        String::from_utf8_lossy(&seeded.body)
+    );
+    let subject = seeded.json("accepted")["MetricDefinitions"][0]["MetricDefinitionId"]
         .as_str()
-        .expect("the first created definition carries an id")
+        .expect("the seeded definition carries an id")
         .to_string();
     for (case, definition) in &rows {
-        let reply = update(&router, monitor, &subject, definition).await;
+        let reply = update(&router, update_monitor, &subject, definition).await;
         assert_eq!(
             reply.status,
             200,

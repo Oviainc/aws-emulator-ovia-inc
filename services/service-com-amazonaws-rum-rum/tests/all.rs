@@ -49,6 +49,8 @@ mod list_tags_for_resource;
 mod member_check_precedence;
 #[path = "all/metric_definition_declared_members.rs"]
 mod metric_definition_declared_members;
+#[path = "all/metric_definition_identity.rs"]
+mod metric_definition_identity;
 #[path = "all/metric_definition_validation.rs"]
 mod metric_definition_validation;
 #[path = "all/metric_definitions.rs"]

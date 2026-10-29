@@ -992,8 +992,10 @@ impl AppMonitorRecord {
     /// definition — under the id it already carries — rather than a second one. Keyed
     /// through the same [`metric_destination_key`] the create, the read and the update use,
     /// so the lookup cannot consult a different destination from the one a create writes to.
-    /// The map is ordered by id, so a destination that somehow holds two equal definitions
-    /// resolves to the same one every time.
+    /// Every writer of the map keeps that identity single-valued — the create resolves a
+    /// requested definition through this lookup, and the update refuses a write that would
+    /// store a definition another id of the destination already defines — so this answers
+    /// THE definition of the requested metric, not one of several.
     pub fn metric_definition_defining(
         &self,
         destination: &str,
@@ -2774,6 +2776,28 @@ pub fn app_monitor_already_exists(name: &str) -> ConflictException {
         message: format!("{CONFLICT_MESSAGE_PREFIX}{name}{CONFLICT_MESSAGE_SUFFIX}"),
         resource_name: name.to_string(),
         resource_type: Some(APP_MONITOR_RESOURCE_TYPE.to_string()),
+    }
+}
+
+/// `ConflictException` for a write that would leave one extended-metrics destination
+/// holding a SECOND definition of a metric it already has a definition for, naming the
+/// definition that already exists by the id it is addressable under
+/// (`metric_definition_id`).
+///
+/// The same error class, and so the same wording, as the duplicate-name conflict above:
+/// the resource the request asked the service to store is already there, under the
+/// identity reported here, and that existing resource is what the caller has to address
+/// instead. No `resourceType` is reported, because the only recorded conflict of this
+/// service reports the app-monitor noun ([`APP_MONITOR_RESOURCE_TYPE`]) and nothing
+/// records the noun RUM would use for a metric definition; the member is optional, and
+/// every other refusal of this service leaves an unrecorded member off the wire.
+pub fn metric_definition_already_exists(metric_definition_id: &str) -> ConflictException {
+    ConflictException {
+        message: format!(
+            "{CONFLICT_MESSAGE_PREFIX}{metric_definition_id}{CONFLICT_MESSAGE_SUFFIX}"
+        ),
+        resource_name: metric_definition_id.to_string(),
+        resource_type: None,
     }
 }
 

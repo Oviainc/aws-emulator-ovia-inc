@@ -440,9 +440,68 @@ pub(crate) async fn created_metric_definitions(
     reported_metric_definitions(&answered)
 }
 
-/// `UpdateRumMetricDefinition`: `PATCH /rummetrics/{AppMonitorName}/metrics`, asserting the
-/// answer the model declares — a 200 whose body carries no member, since
-/// `UpdateRumMetricDefinitionResponse` models none.
+/// Create ONE metric definition under a destination and report the `MetricDefinitionId`
+/// the service minted for it.
+///
+/// The subject a case needs when it drives `UpdateRumMetricDefinition` through a TABLE of
+/// definitions: a destination holds at most one definition of a given metric, so a subject
+/// sharing its destination with the definitions a case is about would be updated into a copy
+/// of a sibling and refused as a conflict. Seeding it alone keeps the update's answer about
+/// the definition the row carries.
+pub(crate) async fn sole_metric_definition(
+    router: &MultiServiceRouter,
+    case: &str,
+    monitor: &str,
+    destination: &str,
+    destination_arn: Option<&str>,
+    definition: &Value,
+) -> String {
+    let created = created_metric_definitions(
+        router,
+        case,
+        monitor,
+        destination,
+        destination_arn,
+        std::slice::from_ref(definition),
+    )
+    .await;
+    assert_eq!(
+        created.len(),
+        1,
+        "case {case:?}: expected the seed to create one definition, got {created:?}"
+    );
+    metric_definition_id(case, &created[0])
+}
+
+/// `UpdateRumMetricDefinition`: `PATCH /rummetrics/{AppMonitorName}/metrics`, as the RAW
+/// answer — for a case that is about a refusal rather than an accepted replacement.
+pub(crate) async fn update_metric_definition_reply(
+    router: &MultiServiceRouter,
+    monitor: &str,
+    destination: &str,
+    destination_arn: Option<&str>,
+    metric_definition_id: &str,
+    definition: &Value,
+) -> Reply {
+    let mut body = json!({
+        "Destination": destination,
+        "MetricDefinitionId": metric_definition_id,
+        "MetricDefinition": definition.clone(),
+    });
+    if let Some(arn) = destination_arn {
+        body["DestinationArn"] = json!(arn);
+    }
+    call(
+        router,
+        "PATCH",
+        &format!("/rummetrics/{monitor}/metrics"),
+        Some(body),
+    )
+    .await
+}
+
+/// `UpdateRumMetricDefinition`, asserting the answer the model declares — a 200 whose body
+/// carries no member, since `UpdateRumMetricDefinitionResponse` models none.
 pub(crate) async fn update_metric_definition(
     router: &MultiServiceRouter,
     case: &str,
@@ -452,19 +511,13 @@ pub(crate) async fn update_metric_definition(
     metric_definition_id: &str,
     definition: &Value,
 ) {
-    let mut body = json!({
-        "Destination": destination,
-        "MetricDefinitionId": metric_definition_id,
-        "MetricDefinition": definition.clone(),
-    });
-    if let Some(arn) = destination_arn {
-        body["DestinationArn"] = json!(arn);
-    }
-    let reply = call(
+    let reply = update_metric_definition_reply(
         router,
-        "PATCH",
-        &format!("/rummetrics/{monitor}/metrics"),
-        Some(body),
+        monitor,
+        destination,
+        destination_arn,
+        metric_definition_id,
+        definition,
     )
     .await;
     assert_eq!(
