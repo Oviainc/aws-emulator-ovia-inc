@@ -665,8 +665,9 @@ pub struct VpcLinkEntry {
     pub tags: BTreeMap<String, String>,
     /// This link's creation rank, from
     /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
-    /// listing can report creation order rather than id order. Nothing reads it yet:
-    /// `GetVpcLinks`, the listing it is stamped for, is still a stub.
+    /// listing can report creation order rather than id order. Read by
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::vpc_link_ids_in_creation_order`],
+    /// the stable sequence [`page_of`] cuts a `GetVpcLinks` page out of.
     pub sequence: u64,
 }
 
@@ -3150,6 +3151,19 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
         let mut ordered: Vec<&UsagePlanEntry> = self.usage_plans.values().collect();
         ordered.sort_by_key(|plan| (plan.sequence, plan.id.clone()));
         ordered.into_iter().map(|plan| plan.id.clone()).collect()
+    }
+
+    /// The ids of every stored VPC link in creation order, the stable sequence
+    /// [`page_of`] cuts a `GetVpcLinks` page out of.
+    ///
+    /// The rank is fixed when each link is created, with the link's own id breaking a
+    /// tie, so nothing a caller can change moves a link in the collection: renaming,
+    /// describing or retargeting a link leaves it where it was, and the `position` cursor
+    /// a page handed back keeps naming the same point in the sequence.
+    pub fn vpc_link_ids_in_creation_order(&self) -> Vec<String> {
+        let mut ordered: Vec<&VpcLinkEntry> = self.vpc_links.values().collect();
+        ordered.sort_by_key(|link| (link.sequence, link.id.clone()));
+        ordered.into_iter().map(|link| link.id.clone()).collect()
     }
 
     /// The ids of every stored API in creation order, the stable sequence [`page_of`]

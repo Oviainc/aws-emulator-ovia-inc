@@ -283,3 +283,5 @@ mod vpc_link_records;
 // Appended for the reason the note above gives.
 #[path = "all/stage_arn_names_the_creation_region.rs"]
 mod stage_arn_names_the_creation_region;
+#[path = "all/vpc_link_collection.rs"]
+mod vpc_link_collection;
