@@ -17,5 +17,7 @@ mod anonymous_routing;
 mod create_token_with_iam;
 #[path = "all/device_authorization_flow.rs"]
 mod device_authorization_flow;
+#[path = "all/error_descriptions.rs"]
+mod error_descriptions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

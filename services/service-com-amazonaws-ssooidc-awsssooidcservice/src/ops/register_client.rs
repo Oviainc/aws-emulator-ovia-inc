@@ -188,9 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             modeled(RegisterClientErrorModeled::InternalServerException(
                 InternalServerException {
                     error: Some("server_error".to_string()),
-                    error_description: Some(
-                        "the service state for AWS SSO OIDC is unavailable".to_string(),
-                    ),
+                    error_description: Some(st::DESCRIPTION_SERVER_ERROR.to_string()),
                 },
             ))
         })?;
@@ -202,10 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 RegisterClientErrorModeled::InvalidClientMetadataException(
                     InvalidClientMetadataException {
                         error: Some("invalid_client_metadata".to_string()),
-                        error_description: Some(format!(
-                            "clientType must be '{}', not '{}'",
-                            st::CLIENT_TYPE_PUBLIC, input.client_type
-                        )),
+                        error_description: Some(st::DESCRIPTION_INVALID_CLIENT_TYPE.to_string()),
                     },
                 ),
             ));
@@ -217,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 RegisterClientErrorModeled::InvalidClientMetadataException(
                     InvalidClientMetadataException {
                         error: Some("invalid_client_metadata".to_string()),
-                        error_description: Some("clientName must not be empty".to_string()),
+                        error_description: Some(st::DESCRIPTION_INVALID_CLIENT_NAME.to_string()),
                     },
                 ),
             ));
@@ -226,18 +221,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let grant_types = input.grant_types.clone().unwrap_or_default();
         // `grantTypes` restricts the flows available to the client, so every entry
         // must be a grant this service actually serves.
-        if let Some(unsupported) = grant_types
+        if grant_types
             .iter()
-            .find(|grant| !st::SUPPORTED_GRANT_TYPES.contains(&grant.as_str()))
+            .any(|grant| !st::SUPPORTED_GRANT_TYPES.contains(&grant.as_str()))
         {
             return Err(modeled(
                 RegisterClientErrorModeled::UnsupportedGrantTypeException(
                     UnsupportedGrantTypeException {
                         error: Some("unsupported_grant_type".to_string()),
-                        error_description: Some(format!(
-                            "grantTypes entry '{unsupported}' is not supported; supported grant types are {}",
-                            st::SUPPORTED_GRANT_TYPES.join(", ")
-                        )),
+                        error_description: Some(st::DESCRIPTION_INVALID_GRANT_TYPE.to_string()),
                     },
                 ),
             ));
@@ -294,10 +286,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(modeled(RegisterClientErrorModeled::SlowDownException(
                 SlowDownException {
                     error: Some("slow_down".to_string()),
-                    error_description: Some(format!(
-                        "the service is holding its maximum of {} client registrations; retry later",
-                        st::MAX_CLIENTS
-                    )),
+                    error_description: Some(st::DESCRIPTION_SLOW_DOWN.to_string()),
                 },
             )));
         }

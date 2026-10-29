@@ -85,6 +85,115 @@ pub const ISSUABLE_TOKEN_TYPE_URIS: &[&str] =
 /// documentation).
 pub const TOKEN_TYPE_BEARER: &str = "Bearer";
 
+// The `error_description` every refusal of this service carries.
+//
+// Each error shape of this API carries `error` and `error_description`, and the
+// model documents the second only as "Human-readable text providing additional
+// information, used to assist the client developer in understanding the error
+// that occurred"
+// (`smithy_query(query="shape",shape="com.amazonaws.ssooidc#InvalidGrantException")`).
+// What the service sends for it is ONE FIXED sentence per refusal class: short,
+// sentence-case English that names the class — and, where the class turns on a
+// single request member, that member in the API's own words — and quotes
+// nothing from the request or from stored state. So a client triaging a refusal
+// by its text reads the same sentence for the same class whatever it sent, no
+// rejected credential is echoed back to whoever presented it, and no refusal
+// states a contract narrower than the API documents. Every refusal in this
+// crate names one of the constants below instead of formatting prose of its own.
+
+/// A request the service cannot act on, where no single member carries the
+/// failure (`invalid_request`).
+pub const DESCRIPTION_INVALID_REQUEST: &str = "Invalid request";
+
+/// The device-code grant presented without a `deviceCode` (`invalid_request`).
+pub const DESCRIPTION_DEVICE_CODE_REQUIRED: &str = "Device code is required";
+
+/// The refresh-token grant presented without a `refreshToken`
+/// (`invalid_request`).
+pub const DESCRIPTION_REFRESH_TOKEN_REQUIRED: &str = "Refresh token is required";
+
+/// The authorization-code grant presented without a `code` (`invalid_request`).
+pub const DESCRIPTION_AUTHORIZATION_CODE_REQUIRED: &str = "Authorization code is required";
+
+/// The token-exchange grant presented without a `subjectToken`
+/// (`invalid_request`).
+pub const DESCRIPTION_SUBJECT_TOKEN_REQUIRED: &str = "Subject token is required";
+
+/// The JWT-bearer grant presented without an `assertion` (`invalid_request`).
+pub const DESCRIPTION_ASSERTION_REQUIRED: &str = "Assertion is required";
+
+/// A `deviceCode` that names no device authorization the caller may redeem —
+/// unknown, already spent, or another client's (`invalid_grant`).
+pub const DESCRIPTION_INVALID_DEVICE_CODE: &str = "Invalid device code provided";
+
+/// A `refreshToken` that names no refresh grant the caller may spend — unknown,
+/// already rotated, or another client's (`invalid_grant`).
+pub const DESCRIPTION_INVALID_REFRESH_TOKEN: &str = "Invalid refresh token provided";
+
+/// A `code` that names no authorization of this service (`invalid_grant`).
+pub const DESCRIPTION_INVALID_AUTHORIZATION_CODE: &str = "Invalid authorization code provided";
+
+/// A `subjectToken` that names no access token this exchange may spend
+/// (`invalid_grant`).
+pub const DESCRIPTION_INVALID_SUBJECT_TOKEN: &str = "Invalid subject token provided";
+
+/// An `assertion` from no token issuer this service trusts (`invalid_grant`).
+pub const DESCRIPTION_INVALID_ASSERTION: &str = "Invalid assertion provided";
+
+/// A grant that resolves to nothing, where no single member carries the failure
+/// (`invalid_grant`).
+pub const DESCRIPTION_INVALID_GRANT: &str = "Invalid grant provided";
+
+/// A `grantType` outside the ones the operation serves
+/// (`unsupported_grant_type`).
+pub const DESCRIPTION_INVALID_GRANT_TYPE: &str = "Invalid grant type provided";
+
+/// A `clientId` that names no registration of this service (`invalid_client`).
+pub const DESCRIPTION_INVALID_CLIENT: &str = "Invalid client provided";
+
+/// A pair whose `clientSecret` is another registration's own, so the `clientId`
+/// beside it is the member that does not belong to the credential
+/// (`invalid_client`).
+pub const DESCRIPTION_INVALID_CLIENT_ID: &str = "Invalid client ID provided";
+
+/// A pair whose `clientSecret` is no usable secret of the registration its
+/// `clientId` names (`invalid_client`).
+pub const DESCRIPTION_INVALID_CLIENT_SECRET: &str = "Invalid client secret provided";
+
+/// A `clientType` the service does not register (`invalid_client_metadata`).
+pub const DESCRIPTION_INVALID_CLIENT_TYPE: &str = "Invalid client type provided";
+
+/// A `clientName` no registration can be recorded under
+/// (`invalid_client_metadata`).
+pub const DESCRIPTION_INVALID_CLIENT_NAME: &str = "Invalid client name provided";
+
+/// A `scope` outside the ones the registration or the grant being spent carries
+/// (`invalid_scope`).
+pub const DESCRIPTION_INVALID_SCOPE: &str = "Invalid scope provided";
+
+/// A device authorization whose approval has not happened yet
+/// (`authorization_pending`).
+pub const DESCRIPTION_AUTHORIZATION_PENDING: &str = "Authorization is pending";
+
+/// A device authorization that was refused (`access_denied`).
+pub const DESCRIPTION_ACCESS_DENIED: &str = "Access denied";
+
+/// A `deviceCode` past its authorization's own lifetime (`expired_token`).
+pub const DESCRIPTION_EXPIRED_DEVICE_CODE: &str = "Expired device code provided";
+
+/// A `refreshToken` past its own lifetime (`expired_token`).
+pub const DESCRIPTION_EXPIRED_REFRESH_TOKEN: &str = "Expired refresh token provided";
+
+/// A `subjectToken` past its own lifetime (`expired_token`).
+pub const DESCRIPTION_EXPIRED_SUBJECT_TOKEN: &str = "Expired subject token provided";
+
+/// A request the service is already holding its maximum of this record for
+/// (`slow_down`).
+pub const DESCRIPTION_SLOW_DOWN: &str = "Slow down";
+
+/// This service's own state is unreachable (`server_error`).
+pub const DESCRIPTION_SERVER_ERROR: &str = "Internal server error";
+
 /// How long a registration's `clientSecret` stays usable. CHOSEN by this
 /// emulator (the model documents only that `clientSecretExpiresAt` "indicates
 /// the time at which the clientId and clientSecret will become invalid"), long
@@ -377,20 +486,36 @@ pub enum RefreshFailure {
 /// Why a `clientId`/`clientSecret` pair was not accepted. Every variant is an
 /// `InvalidClientException`: "this can occur when a client sends an incorrect
 /// clientId or an expired clientSecret".
+///
+/// The variants are the MEMBER of the pair the failure is about, because that is
+/// what the refusal tells the caller: the pair as a whole when the `clientId`
+/// names no registration, the `clientId` when the secret beside it is some other
+/// registration's own, and the `clientSecret` when it is no usable secret of the
+/// registration named.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientAuthFailure {
+    /// No registration carries the presented `clientId`.
     UnknownClient,
-    SecretMismatch,
+    /// The presented `clientSecret` is the secret of no registration at all.
+    UnknownSecret,
+    /// The presented `clientSecret` is another registration's own secret, so the
+    /// credential is one this service issued and the `clientId` beside it is
+    /// what does not belong to it.
+    SecretOfAnotherClient,
+    /// The named registration's own secret, past its `clientSecretExpiresAt`.
     SecretExpired,
 }
 
 impl ClientAuthFailure {
-    /// Text for the failure's `error_description`, naming what the caller must fix.
+    /// The `error_description` this failure answers with: the fixed text for the
+    /// member of the pair the failure is about.
     pub fn description(self) -> &'static str {
         match self {
-            Self::UnknownClient => "no client is registered with the given clientId",
-            Self::SecretMismatch => "the clientSecret does not match the registered clientId",
-            Self::SecretExpired => "the clientSecret for the given clientId has expired",
+            Self::UnknownClient => DESCRIPTION_INVALID_CLIENT,
+            Self::SecretOfAnotherClient => DESCRIPTION_INVALID_CLIENT_ID,
+            // An expired secret is no longer a usable secret of the registration,
+            // so it is refused as the secret it is, not as a separate class.
+            Self::UnknownSecret | Self::SecretExpired => DESCRIPTION_INVALID_CLIENT_SECRET,
         }
     }
 }
@@ -435,7 +560,19 @@ impl ComAmazonawsSsooidcAwsssooidcserviceState {
             .get(client_id)
             .ok_or(ClientAuthFailure::UnknownClient)?;
         if client.client_secret != client_secret {
-            return Err(ClientAuthFailure::SecretMismatch);
+            // A secret that is some OTHER registration's own is a credential
+            // this service issued, so what the pair gets wrong is the `clientId`
+            // standing beside it; a secret no registration carries is the
+            // member at fault itself.
+            let issued_to_another = self
+                .clients
+                .values()
+                .any(|other| other.client_secret == client_secret);
+            return Err(if issued_to_another {
+                ClientAuthFailure::SecretOfAnotherClient
+            } else {
+                ClientAuthFailure::UnknownSecret
+            });
         }
         if epoch_seconds(now) >= client.client_secret_expires_at {
             return Err(ClientAuthFailure::SecretExpired);

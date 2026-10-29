@@ -175,9 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             modeled(StartDeviceAuthorizationErrorModeled::InternalServerException(
                 InternalServerException {
                     error: Some("server_error".to_string()),
-                    error_description: Some(
-                        "the service state for AWS SSO OIDC is unavailable".to_string(),
-                    ),
+                    error_description: Some(st::DESCRIPTION_SERVER_ERROR.to_string()),
                 },
             ))
         })?;
@@ -190,10 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     InvalidRequestException {
                         error: Some("invalid_request".to_string()),
                         reason: None,
-                        error_description: Some(format!(
-                            "startUrl '{}' is not an absolute URI",
-                            input.start_url
-                        )),
+                        error_description: Some(st::DESCRIPTION_INVALID_REQUEST.to_string()),
                     },
                 ),
             ));
@@ -233,10 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(modeled(
                 StartDeviceAuthorizationErrorModeled::SlowDownException(SlowDownException {
                     error: Some("slow_down".to_string()),
-                    error_description: Some(format!(
-                        "the service is holding its maximum of {} device authorizations; retry later",
-                        st::MAX_DEVICE_AUTHORIZATIONS
-                    )),
+                    error_description: Some(st::DESCRIPTION_SLOW_DOWN.to_string()),
                 }),
             ));
         }
@@ -247,9 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(modeled(
                     StartDeviceAuthorizationErrorModeled::SlowDownException(SlowDownException {
                         error: Some("slow_down".to_string()),
-                        error_description: Some(
-                            "the service could not mint a free user code; retry later".to_string(),
-                        ),
+                        error_description: Some(st::DESCRIPTION_SLOW_DOWN.to_string()),
                     }),
                 ))
             }

@@ -180,46 +180,44 @@ fn invalid_client(failure: st::ClientAuthFailure) -> CreateTokenError {
     .into()
 }
 
-/// `InvalidRequestException` (400): a member this grant needs is missing.
-fn invalid_request(description: impl Into<String>) -> CreateTokenError {
+/// `InvalidRequestException` (400): a member this grant needs is missing. The
+/// text is the FIXED one of the class, so the parameter is a `&'static str`: a
+/// refusal cannot be handed prose formatted out of the request.
+fn invalid_request(description: &'static str) -> CreateTokenError {
     CreateTokenErrorModeled::InvalidRequestException(InvalidRequestException {
         error: Some("invalid_request".to_string()),
         reason: None,
-        error_description: Some(description.into()),
+        error_description: Some(description.to_string()),
     })
     .into()
 }
 
 /// `InvalidGrantException` (400): the grant presented resolves to nothing this
-/// service issued, or to something already spent.
-fn invalid_grant(description: impl Into<String>) -> CreateTokenError {
+/// service issued, or to something already spent. Fixed text, as above.
+fn invalid_grant(description: &'static str) -> CreateTokenError {
     CreateTokenErrorModeled::InvalidGrantException(InvalidGrantException {
         error: Some("invalid_grant".to_string()),
-        error_description: Some(description.into()),
+        error_description: Some(description.to_string()),
     })
     .into()
 }
 
 /// `UnsupportedGrantTypeException` (400): the service serves no such grant.
-fn unsupported_grant_type(grant_type: &str) -> CreateTokenError {
+/// The grant types it does serve are [`st::SUPPORTED_GRANT_TYPES`].
+fn unsupported_grant_type() -> CreateTokenError {
     CreateTokenErrorModeled::UnsupportedGrantTypeException(UnsupportedGrantTypeException {
         error: Some("unsupported_grant_type".to_string()),
-        error_description: Some(format!(
-            "grantType '{grant_type}' is not supported; supported grant types are {}",
-            st::SUPPORTED_GRANT_TYPES.join(", ")
-        )),
+        error_description: Some(st::DESCRIPTION_INVALID_GRANT_TYPE.to_string()),
     })
     .into()
 }
 
 /// `InvalidScopeException` (400): a requested scope is outside the ones the
-/// registration named.
-fn invalid_scope(scope: &str) -> CreateTokenError {
+/// registration named, or the ones the grant being spent carries.
+fn invalid_scope() -> CreateTokenError {
     CreateTokenErrorModeled::InvalidScopeException(InvalidScopeException {
         error: Some("invalid_scope".to_string()),
-        error_description: Some(format!(
-            "scope '{scope}' is not among the scopes the client registered"
-        )),
+        error_description: Some(st::DESCRIPTION_INVALID_SCOPE.to_string()),
     })
     .into()
 }
@@ -252,15 +250,10 @@ fn presented_grant(
                 .as_deref()
                 .filter(|code| !code.is_empty())
             else {
-                return Err(invalid_request(format!(
-                    "deviceCode is required for the {} grant",
-                    st::GRANT_TYPE_DEVICE_CODE
-                )));
+                return Err(invalid_request(st::DESCRIPTION_DEVICE_CODE_REQUIRED));
             };
             if !store.device_auths.contains_key(device_code) {
-                return Err(invalid_grant(
-                    "the deviceCode does not name a device authorization of this service",
-                ));
+                return Err(invalid_grant(st::DESCRIPTION_INVALID_DEVICE_CODE));
             }
             Ok(PresentedGrant::DeviceCode(device_code.to_string()))
         }
@@ -270,33 +263,23 @@ fn presented_grant(
                 .as_deref()
                 .filter(|token| !token.is_empty())
             else {
-                return Err(invalid_request(format!(
-                    "refreshToken is required for the {} grant",
-                    st::GRANT_TYPE_REFRESH_TOKEN
-                )));
+                return Err(invalid_request(st::DESCRIPTION_REFRESH_TOKEN_REQUIRED));
             };
             if !store.refresh_tokens.contains_key(refresh_token) {
-                return Err(invalid_grant(
-                    "the refreshToken does not name a refresh grant of this service",
-                ));
+                return Err(invalid_grant(st::DESCRIPTION_INVALID_REFRESH_TOKEN));
             }
             Ok(PresentedGrant::RefreshToken(refresh_token.to_string()))
         }
         st::GRANT_TYPE_AUTHORIZATION_CODE => {
             if input.code.as_deref().is_none_or(str::is_empty) {
-                return Err(invalid_request(format!(
-                    "code is required for the {} grant",
-                    st::GRANT_TYPE_AUTHORIZATION_CODE
-                )));
+                return Err(invalid_request(st::DESCRIPTION_AUTHORIZATION_CODE_REQUIRED));
             }
             // An authorization code is minted at the authorization endpoint, which
             // this API does not serve, so no code presented here was ever issued by
             // this service.
-            Err(invalid_grant(
-                "the authorization code does not name an authorization of this service",
-            ))
+            Err(invalid_grant(st::DESCRIPTION_INVALID_AUTHORIZATION_CODE))
         }
-        other => Err(unsupported_grant_type(other)),
+        _ => Err(unsupported_grant_type()),
     }
 }
 
@@ -340,9 +323,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             CreateTokenError::from(CreateTokenErrorModeled::InternalServerException(
                 InternalServerException {
                     error: Some("server_error".to_string()),
-                    error_description: Some(
-                        "the service state for AWS SSO OIDC is unavailable".to_string(),
-                    ),
+                    error_description: Some(st::DESCRIPTION_SERVER_ERROR.to_string()),
                 },
             ))
         })?;
@@ -375,11 +356,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // granting an access token", so a requested scope outside them is refused
         // and a request naming none is granted the registration's own scopes.
         let requested_scopes = input.scope.clone().unwrap_or_default();
-        if let Some(outside) = requested_scopes
+        if requested_scopes
             .iter()
-            .find(|scope| !client.allows_scope(scope))
+            .any(|scope| !client.allows_scope(scope))
         {
-            return Err(invalid_scope(outside));
+            return Err(invalid_scope());
         }
         // A client may only be handed a refresh token for a grant it registered.
         let with_refresh_token = client.allows_grant(st::GRANT_TYPE_REFRESH_TOKEN);
@@ -393,23 +374,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // the same store below.
                 {
                     let Some(authorization) = store.device_auths.get_mut(device_code) else {
-                        return Err(invalid_grant(
-                            "the deviceCode does not name a device authorization of this service",
-                        ));
+                        return Err(invalid_grant(st::DESCRIPTION_INVALID_DEVICE_CODE));
                     };
+                    // A device code issued to another registration is no grant of
+                    // the caller's, and the refusal says no more about it than
+                    // that: the code is a credential, and which registration it
+                    // belongs to is not the presenter's to learn.
                     if authorization.client_id != input.client_id {
-                        return Err(invalid_grant(
-                            "the deviceCode was not issued to the authenticating client",
-                        ));
+                        return Err(invalid_grant(st::DESCRIPTION_INVALID_DEVICE_CODE));
                     }
                     if authorization.is_expired(now) {
                         return Err(CreateTokenErrorModeled::ExpiredTokenException(
                             ExpiredTokenException {
                                 error: Some("expired_token".to_string()),
-                                error_description: Some(format!(
-                                    "the device authorization expired {} seconds after it was created",
-                                    authorization.expires_in
-                                )),
+                                error_description: Some(
+                                    st::DESCRIPTION_EXPIRED_DEVICE_CODE.to_string(),
+                                ),
                             },
                         )
                         .into());
@@ -421,16 +401,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                     error: Some("access_denied".to_string()),
                                     reason: None,
                                     error_description: Some(
-                                        "the device authorization was denied".to_string(),
+                                        st::DESCRIPTION_ACCESS_DENIED.to_string(),
                                     ),
                                 },
                             )
                             .into());
                         }
                         st::DeviceAuthStatus::Consumed => {
-                            return Err(invalid_grant(
-                                "the deviceCode has already been exchanged for a token",
-                            ));
+                            return Err(invalid_grant(st::DESCRIPTION_INVALID_DEVICE_CODE));
                         }
                         st::DeviceAuthStatus::Pending => {
                             if !authorization.approval_is_due(now) {
@@ -438,10 +416,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                     CreateTokenErrorModeled::AuthorizationPendingException(
                                         AuthorizationPendingException {
                                             error: Some("authorization_pending".to_string()),
-                                            error_description: Some(format!(
-                                                "the device authorization is pending; poll again in {} seconds",
-                                                authorization.interval
-                                            )),
+                                            error_description: Some(
+                                                st::DESCRIPTION_AUTHORIZATION_PENDING.to_string(),
+                                            ),
                                         },
                                     )
                                     .into(),
@@ -466,10 +443,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !store.has_room_for_token() {
                     return Err(CreateTokenErrorModeled::SlowDownException(SlowDownException {
                         error: Some("slow_down".to_string()),
-                        error_description: Some(format!(
-                            "the service is holding its maximum of {} access tokens; retry later",
-                            st::MAX_ACCESS_TOKENS
-                        )),
+                        error_description: Some(st::DESCRIPTION_SLOW_DOWN.to_string()),
                     })
                     .into());
                 }
@@ -500,34 +474,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     now,
                 ) {
                     Ok(token) => token,
+                    // Unknown, already rotated, or another client's: the refusal
+                    // is the same one for all three, so a rotated token tells
+                    // whoever presents it nothing about who holds the grant.
                     Err(st::RefreshFailure::InvalidGrant) => {
-                        return Err(invalid_grant(
-                            "the refreshToken is unknown, has already been rotated, or was not issued to the authenticating client",
-                        ));
+                        return Err(invalid_grant(st::DESCRIPTION_INVALID_REFRESH_TOKEN));
                     }
                     Err(st::RefreshFailure::Expired) => {
                         return Err(CreateTokenErrorModeled::ExpiredTokenException(
                             ExpiredTokenException {
                                 error: Some("expired_token".to_string()),
-                                error_description: Some(format!(
-                                    "the refreshToken expired {} seconds after it was issued",
-                                    st::REFRESH_TOKEN_EXPIRES_IN
-                                )),
+                                error_description: Some(
+                                    st::DESCRIPTION_EXPIRED_REFRESH_TOKEN.to_string(),
+                                ),
                             },
                         )
                         .into());
                     }
                     Err(st::RefreshFailure::ScopeTooBroad) => {
-                        return Err(CreateTokenErrorModeled::InvalidScopeException(
-                            InvalidScopeException {
-                                error: Some("invalid_scope".to_string()),
-                                error_description: Some(
-                                    "the requested scope is broader than the scope the refreshToken was granted"
-                                        .to_string(),
-                                ),
-                            },
-                        )
-                        .into());
+                        return Err(invalid_scope());
                     }
                 }
             }
