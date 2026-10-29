@@ -39,6 +39,8 @@ mod provider_service_catalog;
 mod resource_policy;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/response_fidelity.rs"]
+mod response_fidelity;
 #[path = "all/response_messages.rs"]
 mod response_messages;
 #[path = "all/schema_mapping_workflow_lifecycle.rs"]

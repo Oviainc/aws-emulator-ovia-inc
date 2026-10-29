@@ -10,12 +10,13 @@
 //! The rule under test: each message this service returns — the @required `message`
 //! member of a `Delete*` output, and the `message` of a `ResourceNotFoundException`
 //! or `ConflictException` — is that OPERATION'S OWN text, naming the resource TYPE as
-//! the API spells it (`SchemaMapping`, `MatchingWorkflow`) and substituting the
-//! requested name only where that operation's template includes one. It is never a
-//! sentence composed from the request or from the stored record, so for every path
-//! but one the text is INVARIANT over the name, the size and the shape of the
+//! the API spells it (`SchemaMapping`, `MatchingWorkflow`, `IdNamespace`) and
+//! substituting the requested name only where that operation's template includes one.
+//! It is never a sentence composed from the stored record, so for a path whose text
+//! carries no name it is INVARIANT over the name, the size and the shape of the
 //! resource; and the wording is per-operation, so `GetMatchingWorkflow`'s not-found
-//! text and `DeleteMatchingWorkflow`'s are different strings.
+//! text and `DeleteMatchingWorkflow`'s are different strings, and two `Delete*`
+//! success texts need not even share their capitalization.
 //!
 //! Each table row differs along what the rule generalises over: the resource name
 //! (every character class the modelled `EntityName` pattern `^[a-zA-Z_0-9-]*$`
@@ -40,16 +41,24 @@ const SCHEMA_MAPPING_ALREADY_EXISTS: &str = "SchemaMapping already exists.";
 const MATCHING_WORKFLOW_DELETED: &str = "MatchingWorkflow Deleted.";
 const MATCHING_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
 const MATCHING_WORKFLOW_ALREADY_EXISTS: &str = "MatchingWorkflow already exists.";
-/// The not-found text every ID-namespace path answers, as the recorded corpus shows
+/// The not-found text the ID-namespace READERS answer, as the recorded corpus shows
 /// it: a CONSTANT that names no namespace, in the same `<ResourceType> Not Found` form
-/// as [`MATCHING_WORKFLOW_NOT_FOUND`].
+/// as [`MATCHING_WORKFLOW_NOT_FOUND`]. The DELETE path is worded differently (see
+/// [`delete_id_namespace_not_found`]).
 const ID_NAMESPACE_NOT_FOUND: &str = "IdNamespace Not Found";
-const ID_NAMESPACE_DELETED: &str = "IdNamespace Deleted.";
+/// `DeleteIdNamespace`'s success text, as AWS words it — `deleted` lowercase, which is
+/// not the casing of [`SCHEMA_MAPPING_DELETED`].
+const ID_NAMESPACE_DELETED: &str = "IdNamespace deleted.";
 
-/// `DeleteMatchingWorkflow` is the one path whose text is a template over the
-/// request: the `workflowName` `@httpLabel` the caller asked for is substituted in.
+/// A DELETE path's text is a template over the request: the `@httpLabel` the caller
+/// asked for is substituted into it.
 fn delete_matching_workflow_not_found(workflow_name: &str) -> String {
     format!("MatchingWorkflow {workflow_name} does not exist")
+}
+
+/// The same template for the ID-namespace delete.
+fn delete_id_namespace_not_found(id_namespace_name: &str) -> String {
+    format!("IdNamespace {id_namespace_name} does not exist")
 }
 
 /// One resource name plus the size of the record it is used with: the two things the
@@ -343,7 +352,7 @@ async fn delete_matching_workflow_not_found_substitutes_the_requested_name() {
 }
 
 #[tokio::test]
-async fn every_id_namespace_path_answers_the_same_constant_not_found_text() {
+async fn every_id_namespace_reader_answers_the_same_constant_not_found_text() {
     let emulator = Emulator::new();
     let mut texts = BTreeSet::new();
     // The whole configuration `UpdateIdNamespace` models is optional, so an empty body
@@ -353,18 +362,15 @@ async fn every_id_namespace_path_answers_the_same_constant_not_found_text() {
     for case in name_cases() {
         let label = case.case;
 
-        // The three operations that address an ID namespace by its name: all three are
+        // The two READ paths that address an ID namespace by its name: both are
         // lookups of the SAME resource by the SAME key, and the recorded text names no
-        // namespace, so none of them composes its message from the request.
+        // namespace, so neither composes its message from the request. The DELETE path
+        // does name it, which is asserted below.
         for (operation, reply) in [
             ("GetIdNamespace", emulator.get_id_namespace(&case.name).await),
             (
                 "UpdateIdNamespace",
                 emulator.update_id_namespace(&case.name, &update).await,
-            ),
-            (
-                "DeleteIdNamespace",
-                emulator.delete_id_namespace(&case.name).await,
             ),
         ] {
             assert_error(
@@ -376,12 +382,23 @@ async fn every_id_namespace_path_answers_the_same_constant_not_found_text() {
             );
             texts.insert((operation, string_member(&reply.body, "message")));
         }
+
+        // The delete of the same absent name names it, so it is NOT in the invariant
+        // set above.
+        let deleted = emulator.delete_id_namespace(&case.name).await;
+        assert_error(
+            label,
+            &deleted,
+            404,
+            "ResourceNotFoundException",
+            &delete_id_namespace_not_found(&case.name),
+        );
     }
 
     assert_eq!(
         texts.len(),
-        3,
-        "each ID-namespace path must answer ONE text, invariant over the name it was \
+        2,
+        "each ID-namespace reader must answer ONE text, invariant over the name it was \
          asked for, saw {texts:?}"
     );
 }

@@ -239,8 +239,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DeleteIdMappingWorkflowErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(
-                            crate::state::messages::DELETE_ID_MAPPING_WORKFLOW_NOT_FOUND
-                                .to_string(),
+                            crate::state::messages::delete_id_mapping_workflow_not_found(
+                                &input.workflow_name,
+                            ),
                         ),
                     },
                 )

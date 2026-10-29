@@ -222,9 +222,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Err(DeleteIdNamespaceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(
-                        crate::state::messages::DELETE_ID_NAMESPACE_NOT_FOUND.to_string(),
-                    ),
+                    message: Some(crate::state::messages::delete_id_namespace_not_found(
+                        &input.id_namespace_name,
+                    )),
                 },
             )
             .into());
@@ -239,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // `message` is a modelled @required output member carrying this operation's
-        // own constant success text, not a sentence about the removed record.
+        // own fixed success text, not a sentence about the removed record.
         Ok(DeleteIdNamespaceOutput {
             message: crate::state::messages::DELETE_ID_NAMESPACE_SUCCESS.to_string(),
         })

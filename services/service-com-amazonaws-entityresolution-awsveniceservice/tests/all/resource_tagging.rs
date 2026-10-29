@@ -13,7 +13,8 @@
 //! `ListTagsForResource` reports exactly the stored map and changes nothing;
 //! `TagResource` merges the request's pairs into it (a key the resource does not
 //! carry is appended, a key it already carries takes the new value); `UntagResource`
-//! removes exactly the named keys and is idempotent for a key that is not there; a
+//! removes exactly the named keys and is idempotent for a key that is not there; the
+//! two writers model an EMPTY output, so each answers HTTP 204 with no body; a
 //! merge that would leave the resource carrying more than the modelled `TagMap`
 //! maximum of 200 tags is refused whole with HTTP 400 `ValidationException`; and
 //! an ARN that names no stored resource is refused with HTTP 404
@@ -65,7 +66,10 @@ pub(crate) async fn list_tags(emulator: &Emulator, resource_arn: &str) -> Reply 
 }
 
 /// `POST /tags/{resourceArn}` with a `tags` body — `TagResource`.
-async fn tag_resource(emulator: &Emulator, resource_arn: &str, tags: &Value) -> Reply {
+///
+/// `pub(crate)` for the same reason as [`list_tags`]: the sibling suite that pins this
+/// operation's success STATUS drives the same path instead of cloning the helper.
+pub(crate) async fn tag_resource(emulator: &Emulator, resource_arn: &str, tags: &Value) -> Reply {
     emulator
         .call(
             "POST",
@@ -77,7 +81,11 @@ async fn tag_resource(emulator: &Emulator, resource_arn: &str, tags: &Value) -> 
 
 /// `DELETE /tags/{resourceArn}?tagKeys=…` — `UntagResource`. `tagKeys` is an
 /// `@httpQuery` list, so it goes on the wire as one repeated parameter per key.
-async fn untag_resource(emulator: &Emulator, resource_arn: &str, tag_keys: &[String]) -> Reply {
+pub(crate) async fn untag_resource(
+    emulator: &Emulator,
+    resource_arn: &str,
+    tag_keys: &[String],
+) -> Reply {
     let query: Vec<String> = tag_keys
         .iter()
         .map(|key| format!("tagKeys={}", encoded_label(key)))
@@ -438,8 +446,8 @@ async fn tag_list_and_untag_round_trip_over_every_resource_type_and_tag_shape() 
             // 3. TagResource merges: new keys appended, existing keys overwritten.
             let tagged = tag_resource(&emulator, &resource_arn, &row.merged).await;
             assert_eq!(
-                tagged.status, 200,
-                "case {case:?}: TagResource must answer 200, got {tagged:?}"
+                tagged.status, 204,
+                "case {case:?}: TagResource must answer 204, got {tagged:?}"
             );
             let listed = list_tags(&emulator, &resource_arn).await;
             assert_eq!(
@@ -469,8 +477,8 @@ async fn tag_list_and_untag_round_trip_over_every_resource_type_and_tag_shape() 
             //    key the resource does not carry.
             let untagged = untag_resource(&emulator, &resource_arn, &row.removed).await;
             assert_eq!(
-                untagged.status, 200,
-                "case {case:?}: UntagResource must answer 200, got {untagged:?}"
+                untagged.status, 204,
+                "case {case:?}: UntagResource must answer 204, got {untagged:?}"
             );
             let listed = list_tags(&emulator, &resource_arn).await;
             assert_eq!(
@@ -484,8 +492,8 @@ async fn tag_list_and_untag_round_trip_over_every_resource_type_and_tag_shape() 
             // 6. Repeating the untag changes nothing (@idempotent on the model).
             let repeated = untag_resource(&emulator, &resource_arn, &row.removed).await;
             assert_eq!(
-                repeated.status, 200,
-                "case {case:?}: a repeated UntagResource must answer 200, got {repeated:?}"
+                repeated.status, 204,
+                "case {case:?}: a repeated UntagResource must answer 204, got {repeated:?}"
             );
             let after_repeat = list_tags(&emulator, &resource_arn).await;
             assert_eq!(
@@ -524,7 +532,7 @@ async fn a_tagging_call_touches_only_the_resource_its_arn_names() {
         let tag = json!({ "on": tagged_kind.label() });
         assert_eq!(
             tag_resource(&emulator, tagged_arn, &tag).await.status,
-            200,
+            204,
             "case {case:?}: tagging the {} must succeed",
             tagged_kind.label()
         );
@@ -550,7 +558,7 @@ async fn a_tagging_call_touches_only_the_resource_its_arn_names() {
             untag_resource(&emulator, tagged_arn, &["on".to_string()])
                 .await
                 .status,
-            200,
+            204,
             "case {case:?}: untagging the {} must succeed",
             tagged_kind.label()
         );
@@ -584,8 +592,8 @@ async fn an_empty_merge_or_an_untag_of_absent_keys_leaves_the_record_untouched()
         ),
     ] {
         assert_eq!(
-            reply.status, 200,
-            "case {case:?}: {label} must answer 200, got {reply:?}"
+            reply.status, 204,
+            "case {case:?}: {label} must answer 204, got {reply:?}"
         );
     }
 
@@ -624,7 +632,7 @@ async fn a_merge_past_the_tag_maximum_is_refused_whole_and_the_bound_is_self_hea
             .collect();
         let at_bound = tag_resource(&emulator, &resource_arn, &tag_object(full.clone())).await;
         assert_eq!(
-            at_bound.status, 200,
+            at_bound.status, 204,
             "case {case:?}: a merge up to the maximum of {MAX_TAGS_PER_RESOURCE} tags must \
              be accepted, got {at_bound:?}"
         );
@@ -638,7 +646,7 @@ async fn a_merge_past_the_tag_maximum_is_refused_whole_and_the_bound_is_self_hea
         let rewrite =
             tag_resource(&emulator, &resource_arn, &tag_object(overwritten.clone())).await;
         assert_eq!(
-            rewrite.status, 200,
+            rewrite.status, 204,
             "case {case:?}: overwriting existing keys at the maximum must be accepted, \
              got {rewrite:?}"
         );
@@ -673,12 +681,12 @@ async fn a_merge_past_the_tag_maximum_is_refused_whole_and_the_bound_is_self_hea
             untag_resource(&emulator, &resource_arn, std::slice::from_ref(released))
                 .await
                 .status,
-            200,
+            204,
             "case {case:?}: releasing a key must succeed"
         );
         let retried = tag_resource(&emulator, &resource_arn, &json!({ "one-too-many": "x" })).await;
         assert_eq!(
-            retried.status, 200,
+            retried.status, 204,
             "case {case:?}: with room released the same merge must be accepted, got {retried:?}"
         );
         let mut expected: Vec<(String, String)> = overwritten

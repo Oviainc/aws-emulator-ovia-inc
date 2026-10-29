@@ -501,13 +501,53 @@ pub fn statement_sid(statement: &::serde_json::Value) -> Option<&str> {
     statement.get(POLICY_SID_MEMBER)?.as_str()
 }
 
+/// The partition of an ARN — the second colon-separated field of
+/// `arn:<partition>:<service>:…` — defaulting to the commercial partition when the
+/// value carries none.
+///
+/// A principal expanded into an ARN belongs to the SAME partition as the resource
+/// whose policy names it: `VeniceGlobalArn` admits `aws`, `aws-us-gov` and `aws-cn`
+/// (`smithy_query(query="operation",operation="AddPolicyStatement")`), so the
+/// partition is read from the resource rather than hard-coded.
+fn arn_partition(arn: &str) -> &str {
+    let mut fields = arn.split(':');
+    match (fields.next(), fields.next()) {
+        (Some("arn"), Some(partition)) if !partition.is_empty() => partition,
+        _ => "aws",
+    }
+}
+
+/// One member of an IAM policy statement that is composed from a modelled LIST input.
+///
+/// A policy document admits either a single value or an array of them for these
+/// members, and a document AWS writes carries the SCALAR when there is exactly one
+/// value, so a statement composed here renders the same shape: a one-element list is
+/// the value itself, and two or more stay an array in the order the request gave them.
+/// That is what lets a client's policy parser or a document comparison see the same
+/// structure it would get from the real service.
+fn statement_member(values: &[String]) -> ::serde_json::Value {
+    match values {
+        [only] => ::serde_json::Value::String(only.clone()),
+        several => ::serde_json::json!(several),
+    }
+}
+
 /// One statement of a policy document, composed from the members `AddPolicyStatement`
 /// carries plus the ARN of the resource the policy is attached to.
 ///
-/// Every member goes through unchanged except `Principal`: the modelled
-/// `StatementPrincipal` carries BOTH principal kinds in one member, while an IAM
-/// document writes them under two keys, so they are split here (see
-/// [`is_service_principal`]) and a kind no principal belongs to is left off the block.
+/// The members composed from the request are NORMALIZED into what an IAM policy
+/// document holds, which is what the write stores and every later read serves:
+///
+/// * `Principal` — the modelled `StatementPrincipal` carries BOTH principal kinds in
+///   one member, while an IAM document writes them under two keys, so they are split
+///   here (see [`is_service_principal`]) and a kind no principal belongs to is left off
+///   the block. An ACCOUNT principal is an identity, and the identity an account id
+///   names in a policy document is that account's IAM root user, so a bare account id
+///   is expanded to its root-user ARN; a service principal is already the name a
+///   document holds and goes through as it stands.
+/// * `Principal.AWS`, `Principal.Service` and `Action` — rendered through
+///   [`statement_member`], so a single value is a scalar and several stay an array.
+///
 /// `Resource` is the policy's own resource, so a statement added through this API can
 /// never name another one, and `Condition` is absent when the request carried none,
 /// because an IAM statement without conditions carries no `Condition` block at all.
@@ -519,16 +559,23 @@ pub fn policy_statement(
     condition: Option<&::serde_json::Value>,
     resource_arn: &str,
 ) -> ::serde_json::Value {
-    let (service, aws): (Vec<&str>, Vec<&str>) = principal
+    let partition = arn_partition(resource_arn);
+    // Split on the RAW values, which is what the modelled alternation classifies, and
+    // expand the account branch afterwards.
+    let (service, accounts): (Vec<&String>, Vec<&String>) = principal
         .iter()
-        .map(String::as_str)
         .partition(|principal| is_service_principal(principal));
+    let service: Vec<String> = service.into_iter().cloned().collect();
+    let aws: Vec<String> = accounts
+        .into_iter()
+        .map(|account| format!("arn:{partition}:iam::{account}:root"))
+        .collect();
     let mut principal_block = ::serde_json::Map::new();
     if !aws.is_empty() {
-        principal_block.insert("AWS".to_string(), ::serde_json::json!(aws));
+        principal_block.insert("AWS".to_string(), statement_member(&aws));
     }
     if !service.is_empty() {
-        principal_block.insert("Service".to_string(), ::serde_json::json!(service));
+        principal_block.insert("Service".to_string(), statement_member(&service));
     }
 
     let mut statement = ::serde_json::Map::new();
@@ -541,7 +588,7 @@ pub fn policy_statement(
         "Principal".to_string(),
         ::serde_json::Value::Object(principal_block),
     );
-    statement.insert("Action".to_string(), ::serde_json::json!(action));
+    statement.insert("Action".to_string(), statement_member(action));
     statement.insert("Resource".to_string(), ::serde_json::json!(resource_arn));
     if let Some(condition) = condition {
         statement.insert("Condition".to_string(), condition.clone());
@@ -557,10 +604,13 @@ pub fn policy_statement(
 /// surface and a reader cannot disagree with the writer.
 #[derive(Debug, Clone)]
 pub struct ResourcePolicy {
-    /// `policy`: the resource-based policy document, byte for byte as the writer
-    /// supplied it. A `PolicyDocument` is an opaque string on the wire
-    /// (`smithy_query(query="shape",shape="PolicyDocument")`), so nothing here
-    /// rewrites or reformats it.
+    /// `policy`: the resource-based policy document as the WRITE that produced this
+    /// revision left it. A `PolicyDocument` is an opaque string on the wire
+    /// (`smithy_query(query="shape",shape="PolicyDocument")`), so a `PutPolicy`
+    /// caller's document is stored byte for byte and nothing reformats it on the way
+    /// out; a document `AddPolicyStatement` composed is stored exactly as that write
+    /// rendered it (see [`policy_statement`]), so every reader serves that one
+    /// rendering.
     pub policy: String,
     /// `token`: "a unique identifier for the current revision of the policy"
     /// (`smithy_query(query="doc",shape="PutPolicyOutput",member="token")`), minted
@@ -1132,12 +1182,15 @@ pub mod messages {
     /// `DeleteIdMappingWorkflow`'s `ResourceNotFoundException$message` (HTTP 404) — the
     /// refusal its own doc describes ("This operation returns a
     /// ResourceNotFoundException if a workflow with the given name does not exist").
-    /// Not itself recorded; it is this operation's own constant. The delete addresses
-    /// the SAME resource by the SAME key as `GetIdMappingWorkflow`, so it follows that
-    /// reader's constant, no-name form ([`GET_ID_MAPPING_WORKFLOW_NOT_FOUND`]) rather
-    /// than the templated [`delete_matching_workflow_not_found`], and composes nothing
-    /// from the request.
-    pub const DELETE_ID_MAPPING_WORKFLOW_NOT_FOUND: &str = "IdMappingWorkflow Not Found";
+    ///
+    /// Not itself recorded; a DELETE path names the resource it could not delete, which
+    /// is the form every recorded delete refusal in this service takes
+    /// ([`delete_matching_workflow_not_found`], [`delete_id_namespace_not_found`]), so
+    /// this one is the same template over the `workflowName` @httpLabel — and
+    /// deliberately not the reader's constant ([`GET_ID_MAPPING_WORKFLOW_NOT_FOUND`]).
+    pub fn delete_id_mapping_workflow_not_found(workflow_name: &str) -> String {
+        format!("IdMappingWorkflow {workflow_name} does not exist")
+    }
 
     /// `DeleteSchemaMapping`'s `ConflictException$message` (HTTP 400) when a matching
     /// workflow still names the schema in its `inputSourceConfig` — the refusal this
@@ -1233,21 +1286,28 @@ pub mod messages {
 
     /// `DeleteIdNamespaceOutput$message` — modelled @required, target `String`, doc "A
     /// successful operation message"
-    /// (`smithy_query(query="operation",operation="DeleteIdNamespace")`). Not itself
-    /// recorded; it is this operation's own constant, spelled with the resource type the
-    /// API uses, in the same form as the recorded [`DELETE_SCHEMA_MAPPING_SUCCESS`]. It
-    /// carries nothing of the record that was removed.
-    pub const DELETE_ID_NAMESPACE_SUCCESS: &str = "IdNamespace Deleted.";
+    /// (`smithy_query(query="operation",operation="DeleteIdNamespace")`). The whole
+    /// string is this operation's own fixed text as the recorded corpus shows AWS
+    /// wording it — `deleted` lowercase, which is NOT the casing of the recorded
+    /// [`DELETE_SCHEMA_MAPPING_SUCCESS`], so the text is reproduced per operation and
+    /// never title-cased by a shared formatter. It carries nothing of the record that
+    /// was removed.
+    pub const DELETE_ID_NAMESPACE_SUCCESS: &str = "IdNamespace deleted.";
 
     /// `DeleteIdNamespace`'s `ResourceNotFoundException$message` (HTTP 404) — the
     /// refusal its own doc describes ("This operation returns a
     /// ResourceNotFoundException if an ID namespace with the given name does not
-    /// exist"). Not itself recorded; it is this operation's own constant, in the same
-    /// constant, no-name form as the recorded [`GET_ID_NAMESPACE_NOT_FOUND`] — the
-    /// delete addresses the SAME resource by the SAME key as `GetIdNamespace` — rather
-    /// than the templated [`delete_matching_workflow_not_found`], so it composes
-    /// nothing from the request.
-    pub const DELETE_ID_NAMESPACE_NOT_FOUND: &str = "IdNamespace Not Found";
+    /// exist").
+    ///
+    /// A DELETE path names the resource it could not delete: the text is a TEMPLATE
+    /// over the request, with the `idNamespaceName` @httpLabel the caller asked for
+    /// substituted into it, exactly as [`delete_matching_workflow_not_found`] and
+    /// [`delete_schema_mapping_not_found`] do for their own resource types. The READER
+    /// of the same resource is worded differently and names nothing
+    /// ([`GET_ID_NAMESPACE_NOT_FOUND`]), so the two paths do not share a string.
+    pub fn delete_id_namespace_not_found(id_namespace_name: &str) -> String {
+        format!("IdNamespace {id_namespace_name} does not exist")
+    }
 
     /// `GenerateMatchId`'s `ResourceNotFoundException$message` (HTTP 404) when the
     /// `workflowName` @httpLabel names no matching workflow — the precondition its own

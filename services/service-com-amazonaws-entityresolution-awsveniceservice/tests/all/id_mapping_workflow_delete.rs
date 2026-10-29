@@ -46,7 +46,10 @@ use crate::schema_mapping_workflow_lifecycle::{
 /// `DELETE /idmappingworkflows/{workflowName}` — `DeleteIdMappingWorkflow`'s modelled
 /// HTTP binding
 /// (`smithy_query(query="operation",operation="DeleteIdMappingWorkflow")`).
-async fn delete_id_mapping_workflow(emulator: &Emulator, workflow_name: &str) -> Reply {
+///
+/// `pub(crate)` so the sibling suite that pins the TEXT of this delete's not-found
+/// refusal drives the same path instead of cloning the helper.
+pub(crate) async fn delete_id_mapping_workflow(emulator: &Emulator, workflow_name: &str) -> Reply {
     emulator
         .call("DELETE", &format!("/idmappingworkflows/{workflow_name}"), None)
         .await

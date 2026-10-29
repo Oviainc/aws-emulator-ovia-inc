@@ -141,7 +141,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// `TagResourceOutput` models NO members
+    /// (`smithy_query(query="shape",shape="TagResourceOutput")`), so a successful call
+    /// has nothing to serialize, and the model pins no code for it — the `@http` code
+    /// is the protocol's default rather than a stated one (`code: 200,
+    /// codeDefaulted: true`). An empty response IS the no-content status, so this
+    /// answers HTTP 204: a client that branches on the status then reads no body that
+    /// is not there.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

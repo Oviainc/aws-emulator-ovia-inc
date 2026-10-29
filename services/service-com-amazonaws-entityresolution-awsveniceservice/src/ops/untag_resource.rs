@@ -126,7 +126,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// `UntagResourceOutput` models NO members
+    /// (`smithy_query(query="shape",shape="UntagResourceOutput")`) and the `@http` code
+    /// is the protocol's default (`code: 200, codeDefaulted: true`), so the success
+    /// carries no body and is answered as HTTP 204 No Content — the same rule its
+    /// sibling `TagResource` follows.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

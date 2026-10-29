@@ -30,6 +30,12 @@
 //! (a 12-digit account id and a dotted service name) and a mix of the two,
 //! `statementId` over the character classes its pattern admits at both length bounds,
 //! and `condition` over absent, one condition key and several.
+//!
+//! The document a statement is written into holds the NORMALIZED statement: an
+//! account-id principal as that account's IAM root-user ARN, and a member composed
+//! from a one-element list as a scalar rather than a one-element array (see
+//! [`iam_root`] and [`statement_member`]). Rows span one and several actions, and one
+//! and several principals of each kind, so both shapes are covered.
 
 use serde_json::{json, Map, Value};
 
@@ -58,10 +64,25 @@ const DUPLICATE_STATEMENT_MESSAGE: &str = "Statement ID already exists in docume
 /// A second account's id, so a row can mix the two principal forms.
 const OTHER_ACCOUNT_ID: &str = "123456789012";
 
+/// The IAM identity an ACCOUNT principal names in a policy document: that account's
+/// root user, in the partition of the resource the policy is attached to.
+fn iam_root(account: &str) -> String {
+    format!("arn:aws:iam::{account}:root")
+}
+
+/// One statement member composed from a modelled LIST input, in the shape a policy
+/// document holds it: a single value as a SCALAR, several as an array in order.
+fn statement_member(values: &[String]) -> Value {
+    match values {
+        [only] => Value::String(only.clone()),
+        several => json!(several),
+    }
+}
+
 /// The resource types a `VeniceGlobalArn` can name
 /// (`smithy_query(query="operation",operation="AddPolicyStatement")`): one policy API
 /// serves all four, so the table below spans them.
-const RESOURCE_TYPES: &[&str] = &[
+pub(crate) const RESOURCE_TYPES: &[&str] = &[
     "schemamapping",
     "matchingworkflow",
     "idmappingworkflow",
@@ -78,7 +99,10 @@ fn label(value: &str) -> String {
 }
 
 /// `POST /policies/{arn}/{statementId}` — `AddPolicyStatement`'s modelled HTTP binding.
-async fn add_policy_statement(
+///
+/// `pub(crate)` so the sibling suite that pins the SHAPE of the document this write
+/// composes drives the same path instead of cloning the helper.
+pub(crate) async fn add_policy_statement(
     emulator: &Emulator,
     arn: &str,
     statement_id: &str,
@@ -125,7 +149,14 @@ async fn put_policy(emulator: &Emulator, arn: &str, document: &str) -> Reply {
 
 /// Create the resource `resource_type`/`name` through its own create operation, and
 /// answer the ARN the create minted.
-async fn create_resource(emulator: &Emulator, resource_type: &str, name: &str) -> String {
+///
+/// `pub(crate)`: one helper that creates any of the four resource types a
+/// `VeniceGlobalArn` names, which a sibling suite needs too.
+pub(crate) async fn create_resource(
+    emulator: &Emulator,
+    resource_type: &str,
+    name: &str,
+) -> String {
     let schema = format!("{name}-schema");
     let created = match resource_type {
         "schemamapping" => {
@@ -235,7 +266,8 @@ struct StatementCase {
     /// plain string on the wire), or none at all.
     condition: Option<String>,
     /// The principals that must be written under `Principal.AWS` — the 12-digit
-    /// account-id branch of the modelled alternation.
+    /// account-id branch of the modelled alternation, each as the IAM root-user ARN it
+    /// expands to.
     expected_aws: Vec<String>,
     /// The principals that must be written under `Principal.Service` — the dotted
     /// service-name branch of it.
@@ -260,17 +292,21 @@ impl StatementCase {
     fn expected_statement(&self, resource_arn: &str) -> Value {
         let mut principal = Map::new();
         if !self.expected_aws.is_empty() {
-            principal.insert("AWS".to_string(), json!(self.expected_aws));
+            principal.insert("AWS".to_string(), statement_member(&self.expected_aws));
         }
         if !self.expected_service.is_empty() {
-            principal.insert("Service".to_string(), json!(self.expected_service));
+            principal.insert(
+                "Service".to_string(),
+                statement_member(&self.expected_service),
+            );
         }
 
+        let actions: Vec<String> = self.action.iter().map(|action| action.to_string()).collect();
         let mut statement = Map::new();
         statement.insert("Sid".to_string(), json!(self.statement_id));
         statement.insert("Effect".to_string(), json!(self.effect));
         statement.insert("Principal".to_string(), Value::Object(principal));
-        statement.insert("Action".to_string(), json!(self.action));
+        statement.insert("Action".to_string(), statement_member(&actions));
         // A statement added through this API governs the policy's OWN resource, so
         // `Resource` is that ARN and never a value the request carried.
         statement.insert("Resource".to_string(), json!(resource_arn));
@@ -295,7 +331,7 @@ fn statement_cases() -> Vec<StatementCase> {
             action: vec!["entityresolution:GetMatchingJob"],
             principal: vec![account_id().to_string()],
             condition: None,
-            expected_aws: vec![account_id().to_string()],
+            expected_aws: vec![iam_root(account_id())],
             expected_service: Vec::new(),
         },
         StatementCase {
@@ -319,7 +355,7 @@ fn statement_cases() -> Vec<StatementCase> {
                 })
                 .to_string(),
             ),
-            expected_aws: vec![OTHER_ACCOUNT_ID.to_string()],
+            expected_aws: vec![iam_root(OTHER_ACCOUNT_ID)],
             expected_service: vec!["entityresolution.amazonaws.com".to_string()],
         },
         StatementCase {
@@ -352,7 +388,7 @@ fn statement_cases() -> Vec<StatementCase> {
             ],
             principal: vec![account_id().to_string(), OTHER_ACCOUNT_ID.to_string()],
             condition: None,
-            expected_aws: vec![account_id().to_string(), OTHER_ACCOUNT_ID.to_string()],
+            expected_aws: vec![iam_root(account_id()), iam_root(OTHER_ACCOUNT_ID)],
             expected_service: Vec::new(),
         },
         StatementCase {
@@ -377,7 +413,7 @@ fn statement_cases() -> Vec<StatementCase> {
                 OTHER_ACCOUNT_ID.to_string(),
             ],
             condition: None,
-            expected_aws: vec![account_id().to_string(), OTHER_ACCOUNT_ID.to_string()],
+            expected_aws: vec![iam_root(account_id()), iam_root(OTHER_ACCOUNT_ID)],
             expected_service: vec!["entityresolution.amazonaws.com".to_string()],
         },
     ]
