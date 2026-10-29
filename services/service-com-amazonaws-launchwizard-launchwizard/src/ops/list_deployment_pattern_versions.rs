@@ -177,23 +177,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        for filter in &filters {
-            // Belt and braces: the boundary refuses a name outside the modelled enum,
-            // so this loop only guards against a key this handler cannot read reaching
-            // it — which must be a refusal, never a filter that quietly selects
-            // everything.
-            let name = filter.name.as_str();
-            if !DEPLOYMENT_PATTERN_VERSION_FILTER_KEY_VALUES.contains(&name) {
-                return Err(ListDeploymentPatternVersionsErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(format!(
-                            "'{name}' is not a supported filter name; supported names are {}.",
-                            DEPLOYMENT_PATTERN_VERSION_FILTER_KEY_VALUES.join(", ")
-                        )),
-                    },
-                )
-                .into());
-            }
+        // Belt and braces: the boundary refuses a name outside the modelled enum, so
+        // this check only guards against a key this handler cannot read reaching it —
+        // which must be a refusal, never a filter that quietly selects everything. The
+        // rule and its wording are `crate::state`'s, shared with this service's other
+        // filtered list.
+        if let Some(message) = crate::state::filter_name_refusal(
+            DEPLOYMENT_PATTERN_VERSION_FILTER_KEY_VALUES,
+            filters.iter().map(|filter| filter.name.as_str()),
+        ) {
+            return Err(ListDeploymentPatternVersionsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

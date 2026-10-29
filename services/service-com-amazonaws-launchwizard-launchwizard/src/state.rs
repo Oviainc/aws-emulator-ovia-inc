@@ -2109,18 +2109,37 @@ static SPECIFICATION_KEY_SCHEMA: ::std::sync::LazyLock<::aws_smithy_schema::Sche
 /// Worded by [`validation_report`], the same renderer `src/service.rs` words a
 /// boundary refusal with, so a key refused inside a handler reads exactly like one
 /// refused at the boundary.
+///
+/// HOW MANY keys a map carries is the caller's choice (neither map shape declares a
+/// ceiling), so only the DISTINCT clauses are kept, and at most
+/// [`MAX_REFUSAL_CLAUSES`] of them: a report states one clause per failing member
+/// whatever the number of keys that failed it, so neither the work nor the response it
+/// is rendered into grows with the number of keys the request held.
 fn map_key_refusal<'a>(
     schema: &::aws_smithy_schema::Schema,
     keys: impl Iterator<Item = &'a str>,
 ) -> Option<String> {
     use ::aws_smithy_schema::serde::ShapeSerializer as _;
 
-    let mut validator = ::aws_smithy_schema_server::constraints::ValidatingSerializer::new();
+    let mut violations: Vec<Violation> = Vec::new();
+    let mut stated: BTreeSet<String> = BTreeSet::new();
     for key in keys {
+        let mut validator = ::aws_smithy_schema_server::constraints::ValidatingSerializer::new();
         // Infallible: the validator accumulates violations instead of failing.
         let _ = validator.write_string(schema, key);
+        for violation in validator.into_violations() {
+            // A clause this report already states is not a second error, so the key it
+            // came from is not kept either.
+            if stated.insert(validation_clause(&violation)) {
+                violations.push(violation);
+            }
+        }
+        // Every remaining key can only repeat a clause already stated, and the request
+        // is refused either way.
+        if stated.len() >= MAX_REFUSAL_CLAUSES {
+            break;
+        }
     }
-    let violations = validator.into_violations();
     (!violations.is_empty()).then(|| validation_report(&violations))
 }
 
@@ -2153,14 +2172,19 @@ pub fn constraint_refusal(
     (!violations.is_empty()).then(|| validation_report(&violations))
 }
 
-/// How many clauses one filter-pair refusal states at most.
+/// How many clauses ONE refusal a handler words itself states at most.
 ///
-/// `DeploymentFilterList` declares a floor and no ceiling, so HOW MANY filters a
-/// request carries is the caller's choice: the report is capped here so neither the
-/// work nor the response it is rendered into grows with that count. Ten is well past
-/// the two filter keys a request can usefully combine, so a real caller never reaches
-/// it.
-pub const MAX_FILTER_PAIR_CLAUSES: usize = 10;
+/// A collection a request carries declares no ceiling on this service's shapes, so HOW
+/// MANY entries it holds is the caller's choice: every refusal rendered from such a
+/// collection is capped here, so neither the work nor the response it is rendered into
+/// grows with that count. Ten is well past the clauses a request can usefully raise —
+/// the two filter keys it can combine, the three rules a map key is judged by — so a
+/// real caller never reaches it.
+pub const MAX_REFUSAL_CLAUSES: usize = 10;
+
+/// How many clauses one filter-pair refusal states at most: the cap every self-worded
+/// refusal shares ([`MAX_REFUSAL_CLAUSES`]), under the name the filter rule cites it by.
+pub const MAX_FILTER_PAIR_CLAUSES: usize = MAX_REFUSAL_CLAUSES;
 /// The refusal message for a filter that is not the name-and-values pair a filter is,
 /// or `None` when every filter carries both halves.
 ///
@@ -2221,6 +2245,40 @@ pub fn filter_pair_refusal<'a>(
     // Exact, where one filter contributed both of its halves on the last pass.
     violations.truncate(MAX_FILTER_PAIR_CLAUSES);
     (!violations.is_empty()).then(|| validation_report(&violations))
+}
+
+/// The refusal message for the first filter name that is not one of `supported`, or
+/// `None` when every name is one of them.
+///
+/// The other half of the rule [`filter_pair_refusal`] states: a filter narrows a result
+/// set by a named criterion, so a name no handler can read narrows nothing and is
+/// refused rather than dropped — dropping it would answer a BROADER result set than the
+/// caller asked for, with nothing on the wire to say the constraint was ignored. The
+/// refusal names the offending name and the names this list does support, so a caller
+/// can fix the request from the response alone.
+///
+/// `supported` is the modelled filter-key values of the list being read (the
+/// `*_FILTER_KEY_VALUES` constant of its `@enum` key shape), so every filter list this
+/// service pages is judged — and worded — by this one statement of the rule rather than
+/// by a copy per handler.
+///
+/// The refusal states the offending NAME, where [`validation_report`] states none of
+/// the value it refused: a filter name is a member of a published vocabulary rather
+/// than caller data (both key shapes are `@enum` and neither is `@sensitive`), and a
+/// caller cannot tell which of the filters it sent is the unusable one otherwise.
+pub fn filter_name_refusal<'a>(
+    supported: &[&str],
+    names: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    names
+        .into_iter()
+        .find(|name| !supported.contains(name))
+        .map(|name| {
+            format!(
+                "'{name}' is not a supported filter name; supported names are {}.",
+                supported.join(", ")
+            )
+        })
 }
 
 /// The validation warnings a submitted `specifications` map raises against the
@@ -2483,12 +2541,16 @@ const VALIDATION_WARNING_NOUN: &str = "warning";
 /// specification refusals are worded by; a modelled constraint is an `error`.
 pub fn validation_report(violations: &[Violation]) -> String {
     let mut clauses: Vec<String> = Vec::new();
+    // The clauses already stated, kept as a SET so recognising a repeat does not cost a
+    // walk of everything stated so far: a report over many violations is then rendered
+    // in time proportional to how many there are.
+    let mut stated: BTreeSet<String> = BTreeSet::new();
     for violation in violations {
         let clause = validation_clause(violation);
         // AWS reports one error per failing MEMBER. Two violations of the same
         // collection member render the same clause (the composed constraint set of its
         // elements), so the second is not a second error.
-        if !clauses.contains(&clause) {
+        if stated.insert(clause.clone()) {
             clauses.push(clause);
         }
     }

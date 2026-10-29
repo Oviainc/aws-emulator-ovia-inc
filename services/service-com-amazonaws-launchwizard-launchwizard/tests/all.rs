@@ -35,6 +35,8 @@ mod deployment_update_in_flight;
 mod dry_run_preflight;
 #[path = "all/empty_collection_members.rs"]
 mod empty_collection_members;
+#[path = "all/filter_name_rule_single_source.rs"]
+mod filter_name_rule_single_source;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/list_deployment_events_pagination.rs"]
