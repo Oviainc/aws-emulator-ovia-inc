@@ -160,6 +160,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `{Name}` arrives percent-decoded from the path, so a value made only of
+        // whitespace reaches here: it names no preset, so it is refused naming the member
+        // it arrived in rather than probed for a key nothing could hold — exactly as
+        // `DeleteQueue` and `DeleteJobTemplate` refuse one.
+        if crate::state::carries_no_characters(&input.name) {
+            return Err(DeletePresetErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::blank_member_message("Name")),
+            })
+            .into());
+        }
+
         // The stored key is the name exactly as `CreatePreset` persisted it, so the label
         // is read as sent rather than normalised — as `GetPreset` reads it.
         let name = input.name;

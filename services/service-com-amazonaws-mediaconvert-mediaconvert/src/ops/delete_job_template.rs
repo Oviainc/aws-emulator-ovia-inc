@@ -148,6 +148,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `{Name}` arrives percent-decoded from the path, so a value made only of
+        // whitespace reaches here: it names no job template, so it is refused naming the
+        // member it arrived in rather than probed for a key nothing could hold — exactly as
+        // `DeleteQueue` and `DeletePreset` refuse one.
+        if crate::state::carries_no_characters(&input.name) {
+            return Err(DeleteJobTemplateErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::blank_member_message("Name")),
+                },
+            )
+            .into());
+        }
+
         // The stored key is the name exactly as `CreateJobTemplate` persisted it, so the
         // label is read as sent rather than normalised.
         let name = input.name;

@@ -17,7 +17,9 @@
 //! as the top-level `Queue` does, on all three operations that accept a hop list. It holds
 //! for a reference whatever the request does with the resource it resolves to, so the
 //! share-and-tagging case covers `CreateResourceShare$JobId` and the `Arn` of the three
-//! tagging doors as well.
+//! tagging doors as well. The doors that DELETE a named resource carry the same kind of
+//! `{Name}` label, and `tests/all/blank_delete_name.rs` pins the rule there, reusing this
+//! suite's blank forms and door table.
 //!
 //! The other side of the same rule is that a value which DOES carry characters is never
 //! normalised: surrounding whitespace is part of the key, so a padded name creates its own
@@ -47,7 +49,8 @@ pub(crate) struct Blank {
     /// `value` percent-encoded for a `{Name}` path label, so a case can try to READ the
     /// resource a refused create must not have stored, and the same encoding a QUERY
     /// member's value carries (`tests/all/blank_filter_value.rs` drives the rule's
-    /// reporting half through those). Empty for the zero-length value, which is no path
+    /// reporting half through those, and `tests/all/blank_delete_name.rs` drives it through
+    /// the three delete doors' `{Name}`). Empty for the zero-length value, which is no path
     /// label at all.
     pub(crate) path: &'static str,
 }
@@ -107,23 +110,23 @@ pub(crate) fn blanks() -> Vec<Blank> {
 
 /// One door that MINTS a named resource: the collection it posts to, what a valid request
 /// carries beside `Name`, and how the resource is reported.
-struct Door {
+pub(crate) struct Door {
     /// The operation, for the case label.
-    label: &'static str,
+    pub(crate) label: &'static str,
     /// The collection URI: `POST` creates, `GET` lists, `GET <uri>/{Name}` reads one.
-    collection: &'static str,
+    pub(crate) collection: &'static str,
     /// The required members a request to this door carries BESIDE `Name`, so the only thing
     /// wrong with a refused row is the name itself.
-    extra: Value,
+    pub(crate) extra: Value,
     /// The member a single-resource reply reports the resource in.
-    view: &'static str,
+    pub(crate) view: &'static str,
     /// The member a listing reports its records in.
-    listing: &'static str,
+    pub(crate) listing: &'static str,
 }
 
 /// The three named resources this service mints, each with the smallest request that is
 /// valid apart from its `Name`.
-fn doors() -> Vec<Door> {
+pub(crate) fn doors() -> Vec<Door> {
     vec![
         Door {
             label: "CreateQueue",
@@ -151,7 +154,7 @@ fn doors() -> Vec<Door> {
 }
 
 /// A create request for `door` naming `name`.
-fn create_request(door: &Door, name: &str) -> Value {
+pub(crate) fn create_request(door: &Door, name: &str) -> Value {
     let mut body = door.extra.clone();
     body.as_object_mut()
         .expect("the fixture request is a JSON object")
@@ -167,7 +170,7 @@ pub(crate) fn refusal_message(member: &str) -> String {
 }
 
 /// Assert `reply` is the modelled bad request naming `member`.
-fn assert_blank_refusal(case: &str, member: &str, reply: &Reply) {
+pub(crate) fn assert_blank_refusal(case: &str, member: &str, reply: &Reply) {
     assert_eq!(
         reply.status, 400,
         "case {case:?}: expected HTTP 400, got {} with body {}",
@@ -189,7 +192,7 @@ fn assert_blank_refusal(case: &str, member: &str, reply: &Reply) {
 }
 
 /// The names a collection's listing reports.
-async fn listed_names(emulator: &Emulator, door: &Door) -> Vec<String> {
+pub(crate) async fn listed_names(emulator: &Emulator, door: &Door) -> Vec<String> {
     let listed = emulator.send("GET", door.collection, None).await;
     assert_eq!(
         listed.status, 200,

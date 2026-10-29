@@ -148,6 +148,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `{Name}` arrives percent-decoded from the path, so a value made only of
+        // whitespace reaches here: it names no queue, so the request is refused naming the
+        // member it arrived in rather than probed for a key nothing could hold — the
+        // delete's idempotence is over names a queue COULD have, and a value carrying no
+        // characters is not one of them.
+        if crate::state::carries_no_characters(&input.name) {
+            return Err(DeleteQueueErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::blank_member_message("Name")),
+            })
+            .into());
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         // Settle first, so the conflict guard below reads the job statuses the clock had
