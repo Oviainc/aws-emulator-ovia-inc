@@ -1619,13 +1619,24 @@ pub fn encode_cursor(kind: &str, value: &str) -> String {
 ///
 /// `None` for anything this service did not mint — the caller answers
 /// `InvalidNextTokenException`.
+///
+/// A token is accepted only when it is the EXACT output [`encode_cursor`] would have
+/// produced for the value read back out of it, so decoding is the inverse of minting
+/// rather than a prefix test on a decoded string. That rejects two shapes a prefix test
+/// lets through: a token carrying an EMPTY value, which no minting site can produce
+/// (every cursor value this service mints is a plan name, which is modelled non-empty,
+/// or a resource identity key, which always carries its separators), and a spelling of
+/// the hex that differs from the one this service hands out (`hex::decode` also accepts
+/// upper case). Either one would otherwise resume a walk from a position the service
+/// never offered.
 pub fn decode_cursor(kind: &str, token: &str) -> Option<String> {
     let bytes = hex::decode(token).ok()?;
     let decoded = String::from_utf8(bytes).ok()?;
-    decoded
-        .strip_prefix(kind)
-        .and_then(|rest| rest.strip_prefix(':'))
-        .map(ToString::to_string)
+    let value = decoded.strip_prefix(kind)?.strip_prefix(':')?;
+    if value.is_empty() || encode_cursor(kind, value) != token {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 /// The page size to use, honouring the documented 1..=50 range and the documented

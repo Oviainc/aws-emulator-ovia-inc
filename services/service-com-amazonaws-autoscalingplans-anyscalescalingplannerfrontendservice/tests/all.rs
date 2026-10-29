@@ -37,6 +37,8 @@ mod forecast_window_precision;
 mod identity_key_separators;
 #[path = "all/mutating_plan_admission.rs"]
 mod mutating_plan_admission;
+#[path = "all/next_token_authenticity.rs"]
+mod next_token_authenticity;
 #[path = "all/plan_version_member_validation.rs"]
 mod plan_version_member_validation;
 #[path = "all/policy_name_identity.rs"]
