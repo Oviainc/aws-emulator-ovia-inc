@@ -156,10 +156,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::detector_id_rejection(&input.detector_id),
             ));
         };
-        if !detector
+        let Some(set) = detector
             .threat_entity_sets
-            .contains_key(&input.threat_entity_set_id)
-        {
+            .get(&input.threat_entity_set_id)
+        else {
             // An id this detector does not hold, classified from the REQUEST like
             // every other id this service refuses: a value that cannot be an
             // entity-set id at all is a parameter failure, a well-formed one this
@@ -170,11 +170,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &input.threat_entity_set_id,
                 ),
             ));
+        };
+        // A second delete of the same id asks for the state the set is already in,
+        // so it writes nothing at all: the id still resolves, so the call is
+        // accepted, and it moves neither the record, nor the detector, nor an
+        // instant of this state's "this resource changed now" counter.
+        if set.is_deleting() {
+            return Ok(DeleteThreatEntitySetOutput {});
         }
 
-        // Past the refusals this is a MUTATION, so it advances this state's clock:
-        // the instant it hands out is when the deletion was accepted, and what the
-        // `DELETED` transition is owed from.
+        // Past the refusals and past that no-op this is a MUTATION, so it advances
+        // this state's clock: the instant it hands out is when the deletion was
+        // accepted, and what the `DELETED` transition is owed from.
         let now = state.tick_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // The detector resolved above under the same lock, so this cannot be
@@ -193,16 +200,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Status` is `@required` and its enum carries both
         // (`smithy_query(operation="GetThreatEntitySet")`), so the status after a
         // delete is something a read reports rather than a refusal. A second delete
-        // of the same id is accepted and moves nothing: the id still resolves, and
-        // deleting an already-deleted set asks for the state it is already in.
+        // of the same id is accepted and moves nothing: it returned above, before the
+        // clock was read.
         let accepted = detector
             .delete_threat_entity_set(&input.threat_entity_set_id, now)
             .unwrap_or(false);
         if accepted {
             // The detector holds one fewer LIVE sub-resource than before, which is
             // the same change `CreateThreatEntitySet` records on it in the other
-            // direction. A repeated delete changed nothing, so it moves nothing here
-            // either.
+            // direction.
             detector.updated_at_millis = now;
         }
 

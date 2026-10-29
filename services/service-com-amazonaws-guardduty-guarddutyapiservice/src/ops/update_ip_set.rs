@@ -196,19 +196,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusal (`crate::state::not_owned_message`). The delete itself stays
         // idempotent — it asks for the state the record is already in — while an
         // update would otherwise walk a DELETED record back into use.
-        if detector
+        let Some(ip_set) = detector
             .ip_sets
             .get(&input.ip_set_id)
-            .is_none_or(crate::state::IpSetRecord::is_deleting)
-        {
+            .filter(|ip_set| !ip_set.is_deleting())
+        else {
             return Err(crate::scaffolded::Scaffolded::invalid_input(
                 crate::state::ip_set_id_rejection(&input.ip_set_id),
             ));
+        };
+
+        // Whether this request changes the list at all is decided HERE, over the
+        // stored record and still before the clock moves: an update that writes
+        // back the values the list already holds changes nothing, so it must
+        // neither move `UpdatedAt` nor consume an instant of this state's "this
+        // resource changed now" counter. A member the request omits is not
+        // compared: it is not being written. `Activate` is asked of the record
+        // itself, whose answer does not depend on a transition the clock has yet to
+        // settle.
+        let changes = input
+            .name
+            .as_deref()
+            .is_some_and(|name| ip_set.name != name)
+            || input
+                .location
+                .as_deref()
+                .is_some_and(|location| ip_set.location != location)
+            || input
+                .expected_bucket_owner
+                .as_deref()
+                .is_some_and(|owner| ip_set.expected_bucket_owner.as_deref() != Some(owner))
+            || input
+                .activate
+                .is_some_and(|activate| ip_set.activation_changes(activate));
+        if !changes {
+            // Nothing is written, so nothing moves: the list keeps its `UpdatedAt`,
+            // the detector keeps its own, and the clock keeps the instant the next
+            // real change is entitled to.
+            return Ok(UpdateIPSetOutput {});
         }
 
-        // Past the refusals this is a MUTATION: the instant this hands out is the
-        // IPSet's new `UpdatedAt` and, when `Activate` moves the status, what the
-        // transition is owed from.
+        // Past the refusals and past that no-op this is a MUTATION: the instant
+        // this hands out is the IPSet's new `UpdatedAt` and, when `Activate` moves
+        // the status, what the transition is owed from.
         let now = state.tick_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // The detector resolved above under the same lock, so this cannot be
@@ -248,6 +278,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             changed |= ip_set.expected_bucket_owner.as_deref() != Some(owner.as_str());
             ip_set.expected_bucket_owner = Some(owner.clone());
         }
+        // `UpdatedAt` records the instant a value this call wrote changed; an
+        // update that changes only the status moves it through `set_activation`
+        // below, and one that would have changed nothing returned above.
         if changed {
             ip_set.updated_at_millis = now;
         }

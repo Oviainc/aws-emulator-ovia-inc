@@ -206,10 +206,14 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// The current instant in epoch milliseconds, strictly greater than every
     /// instant this state handed out before.
     ///
-    /// Call it only from a MUTATING operation: it is the "this resource changed
-    /// now" clock, and a reporting operation must not advance it. Monotonicity is
-    /// what makes `UpdatedAt > CreatedAt` observable for two changes that land in
-    /// the same wall-clock millisecond.
+    /// Call it only from a MUTATING operation, and only once that operation knows
+    /// it is going to write: it is the "this resource changed now" clock, so a
+    /// reporting operation must not advance it and neither may a call that leaves
+    /// the store exactly as it found it — an accepted request that writes nothing
+    /// would otherwise push this counter past the wall clock and make the next
+    /// real change stamp a future instant. Monotonicity is what makes
+    /// `UpdatedAt > CreatedAt` observable for two changes that land in the same
+    /// wall-clock millisecond.
     pub fn tick_millis(&mut self) -> i64 {
         let wall = now_millis();
         let next = if wall > self.last_millis {
@@ -3549,20 +3553,38 @@ impl IpSetRecord {
         true
     }
 
-    /// Start the transition the caller's `Activate` asks for, from whatever status
-    /// this IPSet currently has.
+    /// Would [`Self::set_activation`] move anything — does `activate` ask for a
+    /// status this IPSet has neither settled on nor already started towards?
     ///
-    /// Asking for the status it already has owes nothing, so a repeated request
-    /// leaves the settled status alone instead of re-opening a transition.
-    pub fn set_activation(&mut self, activate: bool, now: i64) {
+    /// Answered WITHOUT writing, so a caller can decide whether its request
+    /// changes this record at all BEFORE it reads the store's clock. The answer
+    /// does not depend on whether [`Self::settle`] has run yet: settling only ever
+    /// moves a status to the other member of the same pair.
+    pub fn activation_changes(&self, activate: bool) -> bool {
         let (settled, transitional) = if activate {
             (IP_SET_ACTIVE, IP_SET_ACTIVATING)
         } else {
             (IP_SET_INACTIVE, IP_SET_DEACTIVATING)
         };
-        if self.status == settled || self.status == transitional {
+        self.status != settled && self.status != transitional
+    }
+
+    /// Start the transition the caller's `Activate` asks for, from whatever status
+    /// this IPSet currently has.
+    ///
+    /// Asking for the status it already has owes nothing, so a repeated request
+    /// leaves the settled status alone instead of re-opening a transition — the
+    /// same question [`Self::activation_changes`] answers, asked through it so the
+    /// two cannot drift.
+    pub fn set_activation(&mut self, activate: bool, now: i64) {
+        if !self.activation_changes(activate) {
             return;
         }
+        let transitional = if activate {
+            IP_SET_ACTIVATING
+        } else {
+            IP_SET_DEACTIVATING
+        };
         self.status = transitional.to_string();
         self.status_due_millis = Some(now.saturating_add(IP_SET_TRANSITION_MILLIS));
         self.updated_at_millis = now;
@@ -4224,17 +4246,33 @@ impl EntitySetRecord {
     /// materialises it, so a caller reading straight afterwards still observes
     /// the transitional status.
     pub fn set_activation(&mut self, activate: bool, now: i64) -> bool {
+        if !self.activation_changes(activate) {
+            return false;
+        }
+        let transitional = if activate {
+            ENTITY_SET_ACTIVATING
+        } else {
+            ENTITY_SET_DEACTIVATING
+        };
+        self.status = transitional.to_string();
+        self.status_due_millis = Some(now.saturating_add(ENTITY_SET_TRANSITION_MILLIS));
+        true
+    }
+
+    /// Would [`Self::set_activation`] move anything — does `activate` ask for a
+    /// status this set has neither settled on nor already started towards?
+    ///
+    /// Answered WITHOUT writing, so a caller can decide whether its request
+    /// changes this record at all BEFORE it reads the store's clock. The answer
+    /// does not depend on whether [`Self::settle`] has run yet: settling only ever
+    /// moves a status to the other member of the same pair.
+    pub fn activation_changes(&self, activate: bool) -> bool {
         let (settled, transitional) = if activate {
             (ENTITY_SET_ACTIVE, ENTITY_SET_ACTIVATING)
         } else {
             (ENTITY_SET_INACTIVE, ENTITY_SET_DEACTIVATING)
         };
-        if self.status == settled || self.status == transitional {
-            return false;
-        }
-        self.status = transitional.to_string();
-        self.status_due_millis = Some(now.saturating_add(ENTITY_SET_TRANSITION_MILLIS));
-        true
+        self.status != settled && self.status != transitional
     }
 }
 
@@ -4424,19 +4462,35 @@ impl ThreatIntelSetRecord {
     /// [`THREAT_INTEL_SET_ACTIVATION_SPAN_MILLIS`] later, and only
     /// [`Self::settle`] materialises it.
     pub fn set_activation(&mut self, activate: bool, now: i64) {
+        if !self.activation_changes(activate) {
+            return;
+        }
         let (settled, transitional) = if activate {
             (THREAT_INTEL_SET_ACTIVE, THREAT_INTEL_SET_ACTIVATING)
         } else {
             (THREAT_INTEL_SET_INACTIVE, THREAT_INTEL_SET_DEACTIVATING)
         };
-        if self.status == settled || self.status == transitional {
-            return;
-        }
         self.status = transitional.to_string();
         self.pending_status = Some((
             settled.to_string(),
             now.saturating_add(THREAT_INTEL_SET_ACTIVATION_SPAN_MILLIS),
         ));
+    }
+
+    /// Would [`Self::set_activation`] move anything — does `activate` ask for a
+    /// status this list has neither settled on nor already started towards?
+    ///
+    /// Answered WITHOUT writing, so a caller can decide whether its request
+    /// changes this record at all BEFORE it reads the store's clock. The answer
+    /// does not depend on whether [`Self::settle`] has run yet: settling only ever
+    /// moves a status to the other member of the same pair.
+    pub fn activation_changes(&self, activate: bool) -> bool {
+        let (settled, transitional) = if activate {
+            (THREAT_INTEL_SET_ACTIVE, THREAT_INTEL_SET_ACTIVATING)
+        } else {
+            (THREAT_INTEL_SET_INACTIVE, THREAT_INTEL_SET_DEACTIVATING)
+        };
+        self.status != settled && self.status != transitional
     }
 }
 

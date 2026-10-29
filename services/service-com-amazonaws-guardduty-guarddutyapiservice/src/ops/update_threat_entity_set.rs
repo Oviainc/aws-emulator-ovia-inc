@@ -203,20 +203,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account can act on, so it is refused exactly like an id the detector
         // never held: an update would otherwise walk a record on its way out back
         // into use.
-        if detector
+        let Some(set) = detector
             .threat_entity_sets
             .get(&input.threat_entity_set_id)
-            .is_none_or(crate::state::EntitySetRecord::is_deleting)
-        {
+            .filter(|set| !set.is_deleting())
+        else {
             return Err(bad_request(crate::state::minted_id_rejection(
                 crate::state::THREAT_ENTITY_SET_ID_MEMBER,
                 &input.threat_entity_set_id,
             )));
+        };
+
+        // Whether this request changes the set at all is decided HERE, over the
+        // stored record and still before the clock moves: an update that writes
+        // back the values the set already holds changes nothing, so it must
+        // neither move `UpdatedAt` nor consume an instant of this state's "this
+        // resource changed now" counter. A member the request omits is not
+        // compared: it is not being written. `Activate` is asked of the record
+        // itself, whose answer does not depend on a transition the clock has yet
+        // to settle.
+        let changes = input.name.as_deref().is_some_and(|name| set.name != name)
+            || input
+                .location
+                .as_deref()
+                .is_some_and(|location| set.location != location)
+            || input
+                .expected_bucket_owner
+                .as_deref()
+                .is_some_and(|owner| set.expected_bucket_owner.as_deref() != Some(owner))
+            || input
+                .activate
+                .is_some_and(|activate| set.activation_changes(activate));
+        if !changes {
+            // Nothing is written, so nothing moves: the set keeps its `UpdatedAt`,
+            // the detector keeps its own, and the clock keeps the instant the next
+            // real change is entitled to.
+            return Ok(UpdateThreatEntitySetOutput {});
         }
 
-        // Past the refusals this is a MUTATION, so it advances this state's clock:
-        // the instant it hands out is what the set's `UpdatedAt` records and what a
-        // transition `Activate` starts is owed from.
+        // Past the refusals and past that no-op this is a MUTATION, so it advances
+        // this state's clock: the instant it hands out is what the set's
+        // `UpdatedAt` records and what a transition `Activate` starts is owed from.
         let now = state.tick_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // The detector resolved above under the same lock, so this cannot be
@@ -255,13 +282,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // member it omits leaves the stored one exactly where it was. `Format` is
         // not among them — the format of an existing set cannot be changed — and
         // neither is `Tags`, which `TagResource` owns.
-        let mut changed = false;
         if let Some(name) = input.name {
-            changed |= set.name != name;
             set.name = name;
         }
         if let Some(location) = input.location {
-            changed |= set.location != location;
             set.location = location;
         }
         // `ExpectedBucketOwner` is "the Amazon Web Services account ID that owns
@@ -269,7 +293,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // provides it records it, and one that does not leaves whatever the create
         // or an earlier update recorded.
         if let Some(owner) = input.expected_bucket_owner {
-            changed |= set.expected_bucket_owner.as_deref() != Some(owner.as_str());
             set.expected_bucket_owner = Some(owner);
         }
 
@@ -281,15 +304,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owes nothing, and asking for the other one opens the transitional status
         // only the clock settles.
         if let Some(activate) = input.activate {
-            changed |= set.set_activation(activate, now);
+            set.set_activation(activate, now);
         }
 
-        // `UpdatedAt` moves only when this call really changed the set, so an
-        // update that writes back the values the set already held reports what it
-        // did: nothing.
-        if changed {
-            set.updated_at_millis = now;
-        }
+        // This call really changed the set — an update that would have changed
+        // nothing returned above — so `UpdatedAt` records the instant it did.
+        set.updated_at_millis = now;
 
         // `Unit` output: success is the modelled 200 and an empty body. The
         // detector's own `UpdatedAt` does not move — the set of sub-resources it

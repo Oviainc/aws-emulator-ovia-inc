@@ -151,8 +151,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Resolve the destination and refuse an unacceptable request BEFORE anything
         // is written, so a rejected update leaves the destination exactly as it was.
         // A destination ARN is checked against the service the destination's own
-        // `DestinationType` names, which is why the stored record is read first.
-        let destination_service = {
+        // `DestinationType` names, which is why the stored record is read first. The
+        // same immutable borrow answers whether this request changes the destination
+        // at all: an update that writes back the properties the destination already
+        // holds changes nothing, so it must neither move `UpdatedAt` nor consume an
+        // instant of this state's "this resource changed now" counter. A member the
+        // request omits is not compared: it is not being written.
+        let (destination_service, changes) = {
             let Some(detector) = state.detector_in(&region, &input.detector_id) else {
                 return Err(bad_request(crate::state::detector_id_rejection(
                     &input.detector_id,
@@ -164,17 +169,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &input.destination_id,
                 )));
             };
-            crate::state::validate_destination_type(&destination.destination_type)
-                .map_err(bad_request)?
+            let destination_service =
+                crate::state::validate_destination_type(&destination.destination_type)
+                    .map_err(bad_request)?;
+            let changes = input
+                .destination_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties
+                        .destination_arn
+                        .as_deref()
+                        .is_some_and(|arn| destination.destination_arn != arn)
+                        || properties
+                            .kms_key_arn
+                            .as_deref()
+                            .is_some_and(|key_arn| destination.kms_key_arn != key_arn)
+                        || properties.expected_bucket_owner.as_deref().is_some_and(
+                            |owner| destination.expected_bucket_owner.as_deref() != Some(owner),
+                        )
+                });
+            (destination_service, changes)
         };
         if let Some(properties) = input.destination_properties.as_ref() {
             crate::state::validate_destination_property_forms(destination_service, properties)
                 .map_err(bad_request)?;
         }
+        if !changes {
+            // Nothing is written, so nothing moves: the destination keeps its
+            // `UpdatedAt` and the verification verdict it already reached, and the
+            // clock keeps the instant the next real change is entitled to.
+            return Ok(UpdatePublishingDestinationOutput {});
+        }
 
-        // A MUTATION: the instant this hands out is the destination's new `UpdatedAt`
-        // and, where the properties changed, what the verification the clock owes is
-        // counted from.
+        // Past the refusals and past that no-op this is a MUTATION: the instant this
+        // hands out is the destination's new `UpdatedAt` and what the verification the
+        // clock owes is counted from.
         let now = state.tick_millis();
         let Some(destination) = state
             .detector_in_mut(&region, &input.detector_id)
@@ -197,14 +226,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request carries replaces the stored value, a member it omits leaves the
         // stored value where it was. `DestinationType` is not among them — the type of
         // an existing destination cannot be changed.
-        let mut changed = false;
         if let Some(properties) = input.destination_properties.as_ref() {
             if let Some(destination_arn) = properties.destination_arn.as_ref() {
-                changed |= destination.destination_arn != *destination_arn;
                 destination.destination_arn = destination_arn.clone();
             }
             if let Some(kms_key_arn) = properties.kms_key_arn.as_ref() {
-                changed |= destination.kms_key_arn != *kms_key_arn;
                 destination.kms_key_arn = kms_key_arn.clone();
             }
             // `ExpectedBucketOwner` "appears in the response only if it was provided
@@ -213,19 +239,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // so an update that provides it records it and one that does not leaves
             // whatever the create or an earlier update recorded.
             if let Some(owner) = properties.expected_bucket_owner.as_ref() {
-                changed |= destination.expected_bucket_owner.as_deref() != Some(owner.as_str());
                 destination.expected_bucket_owner = Some(owner.clone());
             }
         }
-        if changed {
-            destination.updated_at_millis = now;
-            // The properties say where GuardDuty publishes and with which key, so a
-            // destination that now names different ones is one GuardDuty has not
-            // verified it can write to: the same clock-owed `PENDING_VERIFICATION` ->
-            // `PUBLISHING` span a create opens. An update asking for the values the
-            // destination already holds changes nothing and so owes nothing.
-            destination.begin_verification(now);
-        }
+        // This call really changed the destination — an update that would have
+        // changed nothing returned above — so `UpdatedAt` records the instant it
+        // did.
+        destination.updated_at_millis = now;
+        // The properties say where GuardDuty publishes and with which key, so a
+        // destination that now names different ones is one GuardDuty has not verified
+        // it can write to: the same clock-owed `PENDING_VERIFICATION` -> `PUBLISHING`
+        // span a create opens. An update asking for the values the destination already
+        // holds changes nothing and so owes nothing — it returned above.
+        destination.begin_verification(now);
 
         // `Unit` output: success is the modelled 200 and an empty body. The detector's
         // own `UpdatedAt` does not move — it holds the same destinations it did

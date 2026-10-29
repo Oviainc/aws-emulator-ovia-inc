@@ -183,20 +183,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The delete itself stays idempotent — it asks for the state the record is
         // already in — while an update would otherwise walk a `DELETED` record back
         // into use.
-        if detector
+        let Some(set) = detector
             .threat_intel_set(&input.threat_intel_set_id)
-            .is_none_or(crate::state::ThreatIntelSetRecord::is_deleting)
-        {
+            .filter(|set| !set.is_deleting())
+        else {
             return Err(crate::scaffolded::Scaffolded::invalid_input(
                 crate::state::minted_id_rejection(
                     crate::state::THREAT_INTEL_SET_ID_MEMBER,
                     &input.threat_intel_set_id,
                 ),
             ));
+        };
+
+        // Whether this request changes the list at all is decided HERE, over the
+        // stored record and still before the clock moves: an update that writes back
+        // the values the list already holds changes nothing, so it must consume no
+        // instant of this state's "this resource changed now" counter. A member the
+        // request omits is not compared: it is not being written. `Activate` is asked
+        // of the record itself, whose answer does not depend on a transition the
+        // clock has yet to settle.
+        let changes = input.name.as_deref().is_some_and(|name| set.name != name)
+            || input
+                .location
+                .as_deref()
+                .is_some_and(|location| set.location != location)
+            || input
+                .expected_bucket_owner
+                .as_deref()
+                .is_some_and(|owner| set.expected_bucket_owner.as_deref() != Some(owner))
+            || input
+                .activate
+                .is_some_and(|activate| set.activation_changes(activate));
+        if !changes {
+            // Nothing is written, so nothing moves: the list keeps every value and
+            // the status it had, and the clock keeps the instant the next real change
+            // is entitled to.
+            return Ok(UpdateThreatIntelSetOutput {});
         }
 
-        // Past the refusals this is a MUTATION, so it advances this state's clock:
-        // the instant it hands out is what a transition `Activate` starts is owed
+        // Past the refusals and past that no-op this is a MUTATION, so it advances
+        // this state's clock: the instant it hands out is what a transition
+        // `Activate` starts is owed
         // from.
         let now = state.tick_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
