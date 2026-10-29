@@ -248,8 +248,8 @@ async fn an_unpublished_token_identifies_one_record_per_jurisdiction() {
             2,
         ),
         (
-            "the same token in the same state again",
-            "Exemption certificate on file",
+            "the same token in the same state again, re-cased and padded",
+            "  EXEMPTION CERTIFICATE ON FILE  ",
             json!({ "country": "US", "state": " ohio " }),
             2,
         ),

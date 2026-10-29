@@ -3313,9 +3313,11 @@ pub fn normalized_authority(authority: &Authority) -> Authority {
 /// replaces the account's record rather than adding one beside it. `description`
 /// is the recorded type's own ([`submitted_exemption_type`]), so naming a
 /// published entry by either of its identifying members addresses one record.
-/// Case and padding make no second exemption either: they are compared the way
-/// [`normalized_authority`] stores a jurisdiction, so what the store treats as
-/// one jurisdiction it treats as one record.
+/// Case and padding make no second exemption either, in the type any more than
+/// in the jurisdiction: every member of the identity is compared the way
+/// [`find_exemption_type`] places a token and [`normalized_authority`] stores a
+/// jurisdiction — ignoring case and surrounding whitespace — so what the store
+/// treats as one type in one jurisdiction it treats as one record.
 pub fn is_same_exemption(
     stored: &StoredTaxExemption,
     description: &str,
@@ -3330,7 +3332,7 @@ pub fn is_same_exemption(
         .exemption_type
         .description
         .as_deref()
-        .is_some_and(|held| held.eq_ignore_ascii_case(description))
+        .is_some_and(|held| held.trim().eq_ignore_ascii_case(description.trim()))
         && stored
             .authority
             .country
