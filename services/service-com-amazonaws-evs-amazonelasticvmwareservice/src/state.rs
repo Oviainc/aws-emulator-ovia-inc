@@ -393,6 +393,12 @@ fn due_after_transition_delay() -> (Instant, i64) {
 /// materialised only once its due instant has passed, and the instant it stamps the
 /// record with is read from the wall clock no later than that due instant
 /// ([`due_after_transition_delay`]).
+///
+/// So every write of the PAIR's stamp goes through here: a handler dates its own change
+/// at the instant it applied it, the materialisation of their shared transition dates
+/// both of them at the instant it came due
+/// ([`StoredEnvironment::materialise_due_transition`]), and neither can pull the stamp
+/// back past the other.
 pub fn note_modified_at(modified_at_ms: &mut i64, at_ms: i64) {
     *modified_at_ms = (*modified_at_ms).max(at_ms);
 }
@@ -1609,14 +1615,16 @@ impl StoredEnvironment {
     ///
     /// The transition was owed at that instant whether or not anybody called, so a
     /// reporting operation may materialise it: it only makes a change the clock had
-    /// already made due visible.
+    /// already made due visible. The environment and every VLAN of it are dated at that
+    /// due instant through [`note_modified_at`], the one guard every write of the field
+    /// goes through, so the stamp is never pulled backwards by it either.
     pub fn materialise_due_transition(&mut self, now: Instant) {
         if let Some(pending) = self.pending.clone().filter(|pending| now >= pending.due_at) {
             self.state = pending.environment_state.to_string();
-            self.modified_at_ms = pending.due_at_ms;
+            note_modified_at(&mut self.modified_at_ms, pending.due_at_ms);
             for vlan in &mut self.vlans {
                 vlan.vlan_state = pending.vlan_state.to_string();
-                vlan.modified_at_ms = pending.due_at_ms;
+                note_modified_at(&mut vlan.modified_at_ms, pending.due_at_ms);
             }
             self.pending = None;
             if self.state == STATE_DELETED {

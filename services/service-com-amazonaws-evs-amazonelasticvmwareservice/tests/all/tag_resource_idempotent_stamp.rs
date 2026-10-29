@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use service_com_amazonaws_evs_amazonelasticvmwareservice as evs;
 
-use crate::environment_lifecycle::{call, emulator, settle, Emulator};
+use crate::environment_lifecycle::{call, emulator, settle, Emulator, PAST_THE_TRANSITION};
 
 /// The modelled bounds the rows below are built against, from
 /// `smithy_query(query="shape",shape="RequestTagMap,TagValue")`: a tag map carries at
@@ -343,6 +343,11 @@ async fn the_idempotent_replay_of_a_tag_resource_call_leaves_modified_at_where_i
     // environment, each far enough apart in wall-clock time that a stamp would show.
     let router = emulator();
     let (id, arn) = create_tagged(&router, "replay", "tag-stamp-replay", &map(&[])).await;
+    // Waited out in wall-clock time, not only settled in the store: the create transition
+    // dates the environment at the instant it came DUE, and a change is dated at the
+    // later of its own instant and the one the record already carries, so the clock has to
+    // be past that instant for a tagging below to be the later of the two.
+    tokio::time::sleep(PAST_THE_TRANSITION).await;
     settle(&router);
 
     tag(

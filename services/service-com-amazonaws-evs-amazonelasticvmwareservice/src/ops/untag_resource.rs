@@ -205,7 +205,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             removed |= environment.tags.remove(key).is_some();
         }
         if removed {
-            environment.modified_at_ms = crate::state::now_ms();
+            // Dated at the instant the keys were removed, through the guard every record
+            // of this service is re-stamped through, so the stamp cannot move backwards
+            // over a transition the materialisation above had already made due.
+            crate::state::note_modified_at(
+                &mut environment.modified_at_ms,
+                crate::state::now_ms(),
+            );
         }
 
         Ok(UntagResourceOutput {})

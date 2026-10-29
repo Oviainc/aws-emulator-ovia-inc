@@ -243,12 +243,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // every resource of it that goes away with it carry one stamp.
             let accepted_at_ms = crate::state::now_ms();
             environment.state = crate::state::STATE_DELETING.to_string();
-            environment.modified_at_ms = accepted_at_ms;
+            // Through the guard every record of this service is re-stamped through, so
+            // the stamp cannot move backwards past a transition the clock had already
+            // made due — the materialisation above dates the environment and every VLAN
+            // of it at the instant that transition came due.
+            crate::state::note_modified_at(&mut environment.modified_at_ms, accepted_at_ms);
             for vlan in &mut environment.vlans {
                 // "Environment deletion also deletes the associated Amazon EVS VLAN
                 // subnets": they go away with the environment.
                 vlan.vlan_state = crate::state::STATE_DELETING.to_string();
-                vlan.modified_at_ms = environment.modified_at_ms;
+                // The VLAN's own stamp goes through the same guard the environment's
+                // does, dated at the same instant, so neither can move backwards past a
+                // transition the clock had already made due and neither falls behind the
+                // other for the change both of them carry.
+                crate::state::note_modified_at(&mut vlan.modified_at_ms, accepted_at_ms);
                 // And with the subnet goes every Elastic IP association it carried: an
                 // association is one "with the elastic network interface in the VLAN
                 // subnet" (`EipAssociation` doc), so a VLAN whose subnet this deletion

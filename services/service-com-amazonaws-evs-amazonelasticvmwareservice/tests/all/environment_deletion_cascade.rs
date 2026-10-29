@@ -35,7 +35,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_evs_amazonelasticvmwareservice as evs;
 
 use crate::entitlement_connector::connector_in;
-use crate::environment_lifecycle::{call, create_settled, emulator, error_type, settle, Emulator};
+use crate::environment_lifecycle::{
+    call, create_settled, emulator, error_type, settle, Emulator, PAST_THE_TRANSITION,
+};
 
 /// Every `ConnectorType` the model declares, from the catalog this crate generated from
 /// the model (`smithy_query(query="shape", shape="ConnectorType")`).
@@ -232,6 +234,12 @@ async fn deleting_an_environment_deletes_its_connectors_and_stops_its_entitlemen
 
     for (case, connector_types, vm_ids, settle_first) in rows {
         let environment = create_settled(&router, None).await;
+        // The environment's own create transition dated it at the instant that transition
+        // came DUE, which the store settles to without waiting for — so the clock is let
+        // past that instant here. A change is dated at the later of its own instant and
+        // the one the record carries, and this row is about the instant the DELETION was
+        // accepted being the one every record of the environment then carries.
+        tokio::time::sleep(PAST_THE_TRANSITION).await;
         let mut vcenter: Option<String> = None;
         for connector_type in &connector_types {
             let connector_id = connector_in(&router, case, &environment, connector_type).await;

@@ -14,11 +14,14 @@
 //! reports can be dated before the transition they both carry.
 //!
 //! What the rule generalises over, and so what the tables below span: the KIND of record
-//! changed (a VLAN, an ESX host, a connector), the DIRECTION of the change (an
-//! association added, an association removed, a host removed, a connector reconfigured,
-//! a connector removed), and WHERE the stamp the record already carries sits relative to
-//! the call — behind the clock, the ordinary case, or ahead of it, which is what a
-//! transition dated at the instant it comes due leaves behind.
+//! changed (the environment itself, a VLAN, an ESX host, a connector), the DIRECTION of
+//! the change (an association added, an association removed, a host removed, a connector
+//! reconfigured, a connector removed, a tag written, a tag removed, the environment
+//! deleted), the SURFACE the change arrives on (the environmentId-addressed operations
+//! and the ARN-addressed tagging surface), and WHERE the stamp the record already carries
+//! sits relative to the call — behind the clock, the ordinary case, or ahead of it, which
+//! is what the materialisation of the transition the environment and its VLANs share
+//! leaves behind.
 //!
 //! Every test drives the service the way a client does, through the same
 //! `MultiServiceRouter` the production router mounts, and reads each record back through
@@ -28,9 +31,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_evs_amazonelasticvmwareservice as evs;
 
 use crate::environment_lifecycle::{
-    call, emulator, error_type, settle, Emulator, PAST_THE_TRANSITION,
+    call, emulator, error_type, settle, Emulator, ACCOUNT, PAST_THE_TRANSITION, REGION,
 };
-use crate::hcx_eip_associations::{create_public_hcx, register_elastic_ip};
+use crate::hcx_eip_associations::{create_public_hcx, hcx_vlan, register_elastic_ip};
 
 /// The connector type every connector here is created with
 /// (`smithy_query(query="shape",shape="ConnectorType")` declares it).
@@ -50,6 +53,10 @@ const KEY_NAME: &str = "evs-key";
 /// The `VlanState` an environment's create transition moves its VLANs to
 /// (`smithy_query(query="shape",shape="VlanState")` declares it).
 const CREATED: &str = "CREATED";
+
+/// The tag the tagging rows write and remove.
+const TAG_KEY: &str = "team";
+const TAG_VALUE: &str = "platform";
 
 /// Which record of an environment a row changes.
 #[derive(Debug, Clone)]
@@ -75,6 +82,13 @@ enum Change {
     ReconfigureConnector,
     /// `DeleteEnvironmentConnector`: remove the connector the setup added.
     RemoveConnector,
+    /// `TagResource`: write a tag the environment does not carry.
+    WriteTag,
+    /// `UntagResource`: remove a tag the setup wrote.
+    RemoveTag,
+    /// `DeleteEnvironment`: delete the environment itself, which takes the VLANs and the
+    /// connectors of it with it.
+    DeleteEnvironment,
 }
 
 /// The environment a row runs against, the record under test, and the ids its call
@@ -167,27 +181,31 @@ async fn prepare(router: &Emulator, case: &str, index: usize, change: Change) ->
                 association: None,
             }
         }
+        Change::WriteTag => Subject {
+            environment,
+            record: Record::HcxVlan,
+            allocation: None,
+            association: None,
+        },
+        Change::RemoveTag => {
+            // A tag the call under test really removes: a request that changes no stored
+            // tag changes the record not at all, and so dates nothing.
+            write_tag(router, case, &environment).await;
+            Subject {
+                environment,
+                record: Record::HcxVlan,
+                allocation: None,
+                association: None,
+            }
+        }
+        Change::DeleteEnvironment => Subject {
+            environment,
+            record: Record::HcxVlan,
+            allocation: None,
+            association: None,
+        },
         Change::ReconfigureConnector | Change::RemoveConnector => {
-            let (status, body) = call(
-                router,
-                "CreateEnvironmentConnector",
-                &json!({
-                    "environmentId": environment,
-                    "type": VCENTER,
-                    "applianceFqdn": APPLIANCE,
-                    "secretIdentifier": SECRET_IDENTIFIER,
-                }),
-            )
-            .await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: the setup connector create expected 200, got {status} ({}) {body}",
-                error_type(&body)
-            );
-            let connector = body["connector"]["connectorId"]
-                .as_str()
-                .unwrap_or_else(|| panic!("case {case:?}: no connectorId in {body}"))
-                .to_string();
+            let connector = create_connector(router, case, &environment).await;
             Subject {
                 environment,
                 record: Record::Connector(connector),
@@ -196,6 +214,56 @@ async fn prepare(router: &Emulator, case: &str, index: usize, change: Change) ->
             }
         }
     }
+}
+
+/// Add one connector to `environment_id` and answer the `connectorId` the create minted.
+async fn create_connector(router: &Emulator, case: &str, environment_id: &str) -> String {
+    let (status, body) = call(
+        router,
+        "CreateEnvironmentConnector",
+        &json!({
+            "environmentId": environment_id,
+            "type": VCENTER,
+            "applianceFqdn": APPLIANCE,
+            "secretIdentifier": SECRET_IDENTIFIER,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the setup connector create expected 200, got {status} ({}) {body}",
+        error_type(&body)
+    );
+    body["connector"]["connectorId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no connectorId in {body}"))
+        .to_string()
+}
+
+/// Write the tagging rows' tag on `environment_id`, so an untag has a stored key to
+/// remove.
+async fn write_tag(router: &Emulator, case: &str, environment_id: &str) {
+    let (status, body) = call(
+        router,
+        "TagResource",
+        &json!({
+            "resourceArn": environment_arn(environment_id),
+            "tags": { TAG_KEY: TAG_VALUE },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the setup tag write expected 200, got {status} ({}) {body}",
+        error_type(&body)
+    );
+}
+
+/// The ARN of one environment, the form the tagging surface addresses a resource by and
+/// the one `CreateEnvironment` reports (pinned by
+/// `tests/all/environment_lifecycle.rs`).
+fn environment_arn(environment_id: &str) -> String {
+    format!("arn:aws:evs:{REGION}:{ACCOUNT}:environment/{environment_id}")
 }
 
 /// Drive the row's one call under test.
@@ -267,6 +335,38 @@ async fn apply(router: &Emulator, case: &str, subject: &Subject, change: Change)
             )
             .await
         }
+        Change::WriteTag => {
+            call(
+                router,
+                "TagResource",
+                &json!({
+                    "resourceArn": environment_arn(&environment),
+                    // A key the environment does not carry, so the merge really changes
+                    // the stored tag map.
+                    "tags": { "stage": "prod" },
+                }),
+            )
+            .await
+        }
+        Change::RemoveTag => {
+            call(
+                router,
+                "UntagResource",
+                &json!({
+                    "resourceArn": environment_arn(&environment),
+                    "tagKeys": [TAG_KEY],
+                }),
+            )
+            .await
+        }
+        Change::DeleteEnvironment => {
+            call(
+                router,
+                "DeleteEnvironment",
+                &json!({ "environmentId": environment }),
+            )
+            .await
+        }
     }
 }
 
@@ -278,12 +378,17 @@ fn connector_of(case: &str, subject: &Subject) -> String {
     }
 }
 
-/// The output member the call under test reports the record under test through.
-fn reported_member(change: Change) -> &'static str {
+/// The output member the call under test reports the record under test through, or `None`
+/// for a call that reports no record at all: `TagResource` and `UntagResource` answer an
+/// empty output
+/// (`smithy_query(query="operation",operation="TagResource,UntagResource")`).
+fn reported_member(change: Change) -> Option<&'static str> {
     match change {
-        Change::AssociateEip | Change::DisassociateEip => "vlan",
-        Change::RemoveHost => "host",
-        Change::ReconfigureConnector | Change::RemoveConnector => "connector",
+        Change::AssociateEip | Change::DisassociateEip => Some("vlan"),
+        Change::RemoveHost => Some("host"),
+        Change::ReconfigureConnector | Change::RemoveConnector => Some("connector"),
+        Change::DeleteEnvironment => Some("environment"),
+        Change::WriteTag | Change::RemoveTag => None,
     }
 }
 
@@ -413,6 +518,31 @@ fn postdate_environment_and_vlans(router: &Emulator, case: &str, environment_id:
     due_at_ms
 }
 
+/// Every `modifiedAt` this service's store holds for the pair that shares one lifecycle
+/// transition — the environment itself and each of the VLANs it holds — as `(what the
+/// stamp belongs to, the stamp)`.
+fn environment_and_vlan_stamps(
+    router: &Emulator,
+    case: &str,
+    environment_id: &str,
+) -> Vec<(String, i64)> {
+    let state = evs::state::service_state(&*router.engine)
+        .expect("the in-memory engine carries this service's store");
+    let store = state.lock();
+    let environment = store
+        .environments
+        .get(environment_id)
+        .unwrap_or_else(|| panic!("case {case:?}: the store holds {environment_id}"));
+    let mut stamps = vec![("the environment".to_string(), environment.modified_at_ms)];
+    stamps.extend(
+        environment
+            .vlans
+            .iter()
+            .map(|vlan| (format!("VLAN {}", vlan.function_name), vlan.modified_at_ms)),
+    );
+    stamps
+}
+
 #[tokio::test]
 async fn a_change_dates_the_record_at_the_instant_it_was_applied() {
     // Each row is one kind of record and one direction of change, with every transition
@@ -484,7 +614,8 @@ async fn a_change_dates_the_record_at_the_instant_it_was_applied() {
         // The response reports the stamp the store now holds, and a later read of the
         // record reports one no earlier than it: only a transition the clock owes can
         // move it on from there.
-        let member = reported_member(change);
+        let member = reported_member(change)
+            .unwrap_or_else(|| panic!("case {case:?}: this row's call reports its record"));
         let reported = body[member]["modifiedAt"].clone();
         assert_eq!(
             wire_ms(case, member, &reported),
@@ -584,6 +715,102 @@ async fn a_vlan_change_is_dated_at_the_later_of_the_change_and_the_transition_it
             after_ms,
             "case {case:?}: the lister must report the stamp the store holds ({after_ms}), \
              got {listed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_change_dates_the_environment_or_its_vlans_before_the_transition_they_share() {
+    // The same ordering as the test above, over every writer of the stamp the environment
+    // and the VLANs it holds share: each row drives one call against an environment whose
+    // record and VLANs are dated AHEAD of the clock — the state the materialisation of
+    // their shared transition leaves behind — so the change the row applies is the EARLIER
+    // of the two instants and must not be the one either record is dated at.
+    //
+    // What the rows span: the DIRECTION of the change (a tag written, a tag removed, the
+    // environment deleted, a child record removed, an association added), whether the
+    // change is to the environment ITSELF or to a record it holds, the SURFACE it arrives
+    // on (the environmentId-addressed operations and the ARN-addressed tagging surface),
+    // and whether the call re-stamps the VLANs with the environment (the deletion does) or
+    // only the environment.
+    let rows: [(&str, Change); 6] = [
+        ("a tag written on the environment", Change::WriteTag),
+        ("a tag removed from the environment", Change::RemoveTag),
+        (
+            "the environment deleted, with the VLAN subnets that go away with it",
+            Change::DeleteEnvironment,
+        ),
+        ("an ESX host removed", Change::RemoveHost),
+        ("a connector removed", Change::RemoveConnector),
+        (
+            "an Elastic IP associated with the public HCX VLAN",
+            Change::AssociateEip,
+        ),
+    ];
+
+    let router = emulator();
+    for (index, (case, change)) in rows.into_iter().enumerate() {
+        let subject = prepare(&router, case, index, change).await;
+        // Past every transition the setup started, so none is left in flight and the only
+        // instant ahead of the clock is the one this row places there.
+        tokio::time::sleep(PAST_THE_TRANSITION).await;
+        settle(&router);
+        // The instant their shared transition dated the environment and its VLANs at.
+        let transition_ms = postdate_environment_and_vlans(&router, case, &subject.environment);
+        let called_at_ms = evs::state::now_ms();
+        assert!(
+            transition_ms > called_at_ms,
+            "case {case:?}: this row needs records dated ahead of the clock \
+             ({called_at_ms}), got {transition_ms}"
+        );
+
+        let (status, body) = apply(&router, case, &subject, change).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the call under test expected 200, got {status} ({}) {body}",
+            error_type(&body)
+        );
+
+        // Neither the environment nor a VLAN of it moved backwards: each is dated at the
+        // later of the change and the instant it already carried, whether the call
+        // re-stamped it or left it alone.
+        for (what, stamp) in environment_and_vlan_stamps(&router, case, &subject.environment) {
+            assert_eq!(
+                stamp, transition_ms,
+                "case {case:?}: {what} must stay dated at the later instant \
+                 {transition_ms} rather than at the call ({called_at_ms}), got {stamp}"
+            );
+        }
+
+        // Where the call reports one of the pair, it reports that same stamp: a record
+        // reported in the state their shared transition moved it to is never dated before
+        // that transition.
+        if let Some(member) = reported_member(change).filter(|member| {
+            matches!(*member, "environment" | "vlan")
+        }) {
+            let reported = body[member]["modifiedAt"].clone();
+            assert_eq!(
+                wire_ms(case, member, &reported),
+                transition_ms,
+                "case {case:?}: the {member} answered must carry the stamp the store holds \
+                 ({transition_ms}), got {reported}"
+            );
+        }
+
+        // Persisted, through each record's own reader: the environment through
+        // GetEnvironment and its HCX VLAN through ListEnvironmentVlans.
+        let environment_ms = environment_stamp(&router, case, &subject.environment).await;
+        assert_eq!(
+            environment_ms, transition_ms,
+            "case {case:?}: GetEnvironment must report the stamp the store holds \
+             ({transition_ms}), got {environment_ms}"
+        );
+        let vlan = hcx_vlan(&router, &subject.environment).await;
+        assert_eq!(
+            wire_ms(case, "the VLAN read back", &vlan["modifiedAt"]),
+            transition_ms,
+            "case {case:?}: ListEnvironmentVlans must report the stamp the store holds \
+             ({transition_ms}), got {vlan}"
         );
     }
 }

@@ -249,7 +249,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // applies to the keys it removes, on the keys this operation writes.
         if merged != environment.tags {
             environment.tags = merged;
-            environment.modified_at_ms = crate::state::now_ms();
+            // Dated at the instant the tag was written, through the guard every record of
+            // this service is re-stamped through: a transition the materialisation above
+            // had already made due dates the record at an instant this read can be
+            // earlier than, and the stamp never moves backwards over it.
+            crate::state::note_modified_at(
+                &mut environment.modified_at_ms,
+                crate::state::now_ms(),
+            );
         }
 
         Ok(TagResourceOutput {})
