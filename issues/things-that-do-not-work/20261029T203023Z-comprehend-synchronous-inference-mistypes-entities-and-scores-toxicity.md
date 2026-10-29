@@ -1,0 +1,53 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: comprehend.detect-entities-builtin-types comprehend.detect-pii-entities-ssn-offsets comprehend.detect-toxic-content-high-score
+Issue-Shape-Id: com.amazonaws.comprehend#Comprehend_20171127
+Issue-Key: comprehend.detect-entities-builtin-types|run#8|AssertionError|assert "PERSON" in types, f"expected a PERSON entity, got types {sorted(types)!r}"
+Issue-Key: comprehend.detect-pii-entities-ssn-offsets|run#9|AssertionError|assert len(ssn_entities) == 2, f"expected exactly two SSN entities, got {entities}"
+Issue-Key: comprehend.detect-toxic-content-high-score|run#8|AssertionError|assert result["Toxicity"] > 0.5, f"expected high toxicity score, got {result['Toxicity']}"
+Issue-Commit: 6bd726e14a5c3a202f9e89e1e854b8dfcc8d4492
+
+# Comprehend synchronous inference mistypes entities and scores toxicity off a three-level ladder (3 causes)
+
+> _Note: this issue was identified against the code base at commit `6bd726e14a5c3a202f9e89e1e854b8dfcc8d4492`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DetectPiiEntities
+
+## Description
+Three net-new root causes in Comprehend's real-time (single-document) inference analysers. All three answer HTTP 200 with well-formed, self-consistent shapes — offsets index back into Text and scores stay inside [0,1] — so the divergence is purely in WHICH type/score the analyser assigns. These are distinct from, and not covered by, the open wire issue `20261029T172519Z-comprehend-single-document-synchronous-inference-omits-output-members.md` (that issue's causes are about absent output members, Toxicity exactly 0.0, and dropped/merged spans on a different document; here the members are all present and the spans are correct — the TYPE and the SCORE are wrong).
+
+Cause 1 of 3: DetectEntities never types an unprefixed personal name as PERSON.
+  AWS: Smithy: DetectEntities output Entities -> Entity{Score, Type: EntityType, Text, BeginOffset, EndOffset}; EntityType enum = PERSON | LOCATION | ORGANIZATION | COMMERCIAL_ITEM | EVENT | DATE | QUANTITY | TITLE | OTHER, and Entity$Type is documented as "the standard entity types" of the pre-trained model. Recorded behavior: a plain English document naming a person by first+last name ("... was founded by Jeff Bezos and is headquartered in Seattle, Washington.") yields a PERSON entity whose Text covers that personal name, alongside the LOCATION entities.
+  Emulator: the response carries only LOCATION and OTHER; the personal-name span is typed OTHER, so no PERSON entity exists in the document at all. The recogniser only reaches PERSON when the span is preceded by an honorific/office cue or when its FIRST token is a member of a closed given-name lexicon (services/service-com-amazonaws-comprehend-comprehend-20171127/src/ops/detect_entities.rs: the `title_cue` branch and the `given_names().contains(normalised[0])` branch); any personal name outside that fixed list falls through to the OTHER bucket.
+  Why: a client that filters Entities by Type == "PERSON" (PII sweeps, redaction, people-graph extraction) sees zero people in a document that plainly names one, and a client keyed on Type reads the name under the catch-all OTHER type instead.
+  Fix: the DetectEntities handler's recogniser — PERSON typing must be driven by name-shape evidence (capitalised multi-token span in a person-bearing syntactic position), not gated on membership of a closed given-name list.
+  Traces: comprehend.detect-entities-builtin-types.
+
+Cause 2 of 3: DetectPiiEntities types a context-labelled SSN as US_INDIVIDUAL_TAX_IDENTIFICATION_NUMBER, so one of the document's two SSNs is lost.
+  AWS: Smithy: DetectPiiEntities output Entities -> PiiEntity{Score, Type: PiiEntityType, BeginOffset, EndOffset}; PiiEntityType includes both SSN and US_INDIVIDUAL_TAX_IDENTIFICATION_NUMBER. Recorded behavior: a document that introduces two nine-digit dashed numbers each with an explicit SSN cue ("primary SSN <n>", "the joint account SSN is <n>") yields TWO entities of Type SSN, in document order, each with BeginOffset/EndOffset spanning its own occurrence — AWS's contextual recogniser honours the surrounding label rather than re-deriving the type from the digits alone.
+  Emulator: the first number comes back Type SSN, but the second comes back Type US_INDIVIDUAL_TAX_IDENTIFICATION_NUMBER, so a filter on SSN finds one entity where AWS reports two. Root cause: in services/service-com-amazonaws-comprehend-comprehend-20171127/src/ops/contains_pii_entities.rs the recogniser decides the type purely from numeric issuance ranges — `is_social_security_number` rejects any area block >= 900, while the format rule `\b9\d{2}-\d{2}-\d{4}\b` plus `is_individual_tax_identification_number` accepts a group pair in 50-65/70-88/90-92/94-99 — and the format/range rule outranks the SSN rule that carries `Evidence::Context`. A number that the document itself labels as an SSN is therefore retyped from its digits.
+  Why: this is a redaction-correctness defect. A DLP/redaction client configured to redact Type == "SSN" leaves the second social-security number in the document verbatim, and a client reporting on tax identifiers is told the document contains an ITIN it does not contain.
+  Fix: the shared PII recogniser's rule arbitration (`detect_pii_spans` in contains_pii_entities.rs) — contextual evidence from the surrounding label must outrank a bare format/issuance-range match when the two disagree about the same span.
+  Traces: comprehend.detect-pii-entities-ssn-offsets.
+
+Cause 3 of 3: DetectToxicContent reports a low Toxicity for overtly threatening text, because the score comes from a three-level severity ladder and the threat/abuse categories have no detector.
+  AWS: Smithy: DetectToxicContent output ResultList -> ToxicLabels{Labels: list of ToxicContent{Name: ToxicContentType, Score}, Toxicity: Float}; ToxicLabels$Toxicity is documented as "Overall toxicity score for the string. Value range is zero to one, where one is the highest confidence"; ToxicContentType enum = GRAPHIC | HARASSMENT_OR_ABUSE | HATE_SPEECH | INSULT | PROFANITY | SEXUAL | VIOLENCE_OR_THREAT. Recorded behavior: a segment carrying an explicit threat of physical harm plus a demeaning insult is scored highly toxic overall (Toxicity well above 0.5), with the threat and abuse categories carrying the confidence.
+  Emulator: Toxicity comes back 0.1666666865348816 for exactly such a segment. The handler (services/service-com-amazonaws-comprehend-comprehend-20171127/src/ops/detect_toxic_content.rs) can only emit one of three constants per label — MILD_SCORE = 1/6, MODERATE_SCORE = 0.5, SEVERE_SCORE = 5/6 — and derives Toxicity as the complement of the product of the label complements; its DETECTABLE_CATEGORIES table covers only HATE_SPEECH, INSULT, PROFANITY and SEXUAL, so VIOLENCE_OR_THREAT, HARASSMENT_OR_ABUSE and GRAPHIC are never placed at all. An overt threat therefore contributes nothing and the whole segment lands on the single mild rung, 1/6.
+  Why: a moderation client gates on Toxicity (commonly > 0.5) and on the presence of VIOLENCE_OR_THREAT/HARASSMENT_OR_ABUSE labels; against this emulator a threatening, abusive message is passed through as clean, which is the exact failure mode the operation exists to prevent.
+  Fix: the DetectToxicContent handler — it needs detectors for the remaining ToxicContentType values (at minimum VIOLENCE_OR_THREAT and HARASSMENT_OR_ABUSE) and a continuous Toxicity confidence rather than three fixed severity midpoints.
+  Traces: comprehend.detect-toxic-content-high-score.
+
+## Evidence
+Cause 1 (comprehend.detect-entities-builtin-types): DetectEntities(Text="Amazon.com was founded by Jeff Bezos and is headquartered in Seattle, Washington.", LanguageCode="en") -> 200. Assertion `"PERSON" in types` failed: AssertionError: expected a PERSON entity, got types ['LOCATION', 'OTHER']. All offsets satisfied text[BeginOffset:EndOffset] == Entity.Text, so only Type diverges. Requirement is the convention (a personal name is typed PERSON), not this document's wording.
+
+Cause 2 (comprehend.detect-pii-entities-ssn-offsets): DetectPiiEntities(Text="Please update your records: primary SSN 123-45-6789, and the joint account SSN is 987-65-4321.", LanguageCode="en") -> 200 with Entities = [{'Score': 0.99, 'Type': 'SSN', 'BeginOffset': 40, 'EndOffset': 51}, {'Score': 0.99, 'Type': 'US_INDIVIDUAL_TAX_IDENTIFICATION_NUMBER', 'BeginOffset': 82, 'EndOffset': 93}]. Expected two entities of Type 'SSN'. AssertionError: expected exactly two SSN entities. Offsets are correct for both spans; the second entity's Type is wrong. Requirement is that a span the document labels as an SSN is typed SSN, whatever its digits; the two literal numbers here are just the request's values.
+
+Cause 3 (comprehend.detect-toxic-content-high-score): DetectToxicContent(TextSegments=[{Text: "I will find you and hurt you badly, you worthless piece of garbage, and you deserve every bit of pain coming your way."}], LanguageCode="en") -> 200 with ResultList[0].Toxicity = 0.1666666865348816 (== the handler's MILD_SCORE constant 1/6). AssertionError: expected high toxicity score, got 0.1666666865348816. Requirement: Toxicity is a confidence in [0,1] that rises with the toxicity actually present (> 0.5 for an explicit threat plus insult) and the threat/abuse ToxicContentType values are reachable labels; the 0.5 threshold is the class boundary, not a recorded literal.
+
+## Steps to Reproduce
+1. Boot the emulator from mainline and replay the behavioral suite (simparity-behavioral-aws-v1).
+2. Cause 1: call comprehend.DetectEntities with LanguageCode="en" and any plain English sentence naming a person by first+last name with no honorific (e.g. "Amazon.com was founded by Jeff Bezos and is headquartered in Seattle, Washington."). Collect {e["Type"] for e in Entities}: no PERSON is present; the name's span is typed OTHER.
+3. Cause 2: call comprehend.DetectPiiEntities with LanguageCode="en" and text that labels two nine-digit dashed numbers as SSNs, where the second has an area block >= 900 and a group pair inside the ITIN ranges (e.g. "...primary SSN 123-45-6789, and the joint account SSN is 987-65-4321."). The second entity comes back Type US_INDIVIDUAL_TAX_IDENTIFICATION_NUMBER instead of SSN.
+4. Cause 3: call comprehend.DetectToxicContent with LanguageCode="en" and one TextSegment carrying an explicit threat of physical harm plus a demeaning insult. ResultList[0].Toxicity is 1/6 and no VIOLENCE_OR_THREAT or HARASSMENT_OR_ABUSE label appears in Labels.
