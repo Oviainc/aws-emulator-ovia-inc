@@ -272,7 +272,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // state lock is held. That keeps what a refused oversized request costs
         // proportional to the cap, and grades this pair of faults in the order
         // `UpdateTable` and `CreateType` grade it, so one request shape never gets two
-        // different answers depending on which sibling served it.
+        // different answers depending on which sibling served it. Both per-column scans
+        // stay bounded by the cap wherever below they run.
         if input.schema_definition.all_columns.len() > crate::state::MAX_COLUMNS_PER_TABLE {
             return Err(CreateTableErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
@@ -369,26 +370,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A column's type may name "other user-defined types that are contained in the
-        // same keyspace" (`FieldDefinition$type`, the same rule for a column), so a name
-        // in it that is neither a native type nor a type constructor must be a type of
-        // THIS keyspace, in status ACTIVE; any other is a type "that doesn't exist. The
-        // resource might not be specified correctly, or its status might not be ACTIVE"
-        // (`ResourceNotFoundException`), and nothing is stored. Checked after the keyspace
-        // is resolved, because its own types are what a reference resolves against, and
-        // exactly as `CreateType` checks a field's type and `UpdateTable` an added column.
-        let usable_type_names = keyspace.usable_type_names();
-        for column in &input.schema_definition.all_columns {
-            if let Some(referenced) =
-                crate::state::unresolvable_type_reference(&column.r#type, &usable_type_names)
-            {
-                return Err(CreateTableErrorModeled::ResourceNotFoundException(
-                    crate::state::type_not_found(&region, &input.keyspace_name, &referenced),
-                )
-                .into());
-            }
-        }
-
         // "Within a keyspace, table names must be unique."
         if keyspace.tables.contains_key(&input.table_name) {
             return Err(CreateTableErrorModeled::ConflictException(ConflictException {
@@ -414,6 +395,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // A column's type may name "other user-defined types that are contained in the
+        // same keyspace" (`FieldDefinition$type`, the same rule for a column), so a name
+        // in it that is neither a native type nor a type constructor must be a type of
+        // THIS keyspace, in status ACTIVE; any other is a type "that doesn't exist. The
+        // resource might not be specified correctly, or its status might not be ACTIVE"
+        // (`ResourceNotFoundException`), and nothing is stored. Checked after the keyspace
+        // is resolved, because its own types are what a reference resolves against — and
+        // after the two refusals above, because whether the table this request defines can
+        // exist at all is settled before the definition it carries is resolved: a name
+        // already taken, or a keyspace already at its table cap, defines no table whose
+        // column types anything would resolve. `CreateType` grades a field's type after the
+        // same two refusals, `RestoreTable` grades the same pair in that order and
+        // `UpdateTable` resolves an added column's type only once the table it addresses is
+        // updatable, so one request shape never gets two different answers depending on
+        // which sibling served it.
+        let usable_type_names = keyspace.usable_type_names();
+        for column in &input.schema_definition.all_columns {
+            if let Some(referenced) =
+                crate::state::unresolvable_type_reference(&column.r#type, &usable_type_names)
+            {
+                return Err(CreateTableErrorModeled::ResourceNotFoundException(
+                    crate::state::type_not_found(&region, &input.keyspace_name, &referenced),
+                )
+                .into());
+            }
         }
 
         let resource_arn =

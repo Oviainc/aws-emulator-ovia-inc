@@ -47,6 +47,8 @@ mod list_keyspaces;
 mod list_types;
 #[path = "all/multi_region_table_replicas.rs"]
 mod multi_region_table_replicas;
+#[path = "all/name_conflict_precedes_type_resolution.rs"]
+mod name_conflict_precedes_type_resolution;
 #[path = "all/page_token_codec.rs"]
 mod page_token_codec;
 #[path = "all/pagination_window.rs"]
