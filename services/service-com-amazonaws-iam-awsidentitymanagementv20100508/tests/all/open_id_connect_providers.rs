@@ -132,10 +132,13 @@ pub(crate) fn expected_arn(url: &str) -> String {
 }
 
 /// The `NoSuchEntityException` message IAM refuses a request naming an ARN the account
-/// holds no OIDC provider under with: its fixed text around the ARN the request carried.
+/// holds no OIDC provider under with: its fixed text, then the ARN the request carried.
 ///
-/// ONE reader of that wording for this crate's test tree, so every suite that drives an
-/// absent provider asserts the same message.
+/// ONE reader of that wording for the suites that drive an absent provider as part of a
+/// wider rule, so they all assert the same message. The one suite that does NOT take it is
+/// `tests/all/open_id_connect_provider_absence_wording.rs`, whose subject IS the template:
+/// a suite that asks this helper what the sentence is cannot notice the sentence drifting,
+/// so that one spells it out as a literal instead.
 pub(crate) fn absence_message(arn: &str) -> String {
     format!("OpenIDConnect Provider not found for arn {arn}")
 }

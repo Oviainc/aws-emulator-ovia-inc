@@ -121,6 +121,8 @@ mod mfa_device_reads;
 mod open_id_connect_client_id_registration;
 #[path = "all/open_id_connect_client_ids.rs"]
 mod open_id_connect_client_ids;
+#[path = "all/open_id_connect_provider_absence_wording.rs"]
+mod open_id_connect_provider_absence_wording;
 #[path = "all/open_id_connect_provider_listing.rs"]
 mod open_id_connect_provider_listing;
 #[path = "all/open_id_connect_provider_tag_listing.rs"]
