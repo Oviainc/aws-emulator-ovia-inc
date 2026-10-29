@@ -397,3 +397,8 @@ mod custom_lens_deletion;
 // repeatedly refused to merge.
 #[path = "all/profile_template.rs"]
 mod profile_template;
+
+// Appended at the end of this list for the reason the notes above give: an insertion into
+// this list's sorted middle is what repeatedly refused to merge.
+#[path = "all/shared_page_size.rs"]
+mod shared_page_size;

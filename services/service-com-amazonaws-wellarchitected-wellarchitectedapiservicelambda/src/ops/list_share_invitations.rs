@@ -222,15 +222,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `MaxResults` is modelled `@range(min: 1, max: 50)`; a request that omits it asks
-        // for a full page, so the modelled maximum is the default. The clamp restates that
-        // bound in the handler, so the page size is in 1..=50 whatever reaches here.
-        let clamped = input
-            .max_results
-            .unwrap_or(MAX_RESULTS_CEILING)
-            .clamp(1, MAX_RESULTS_CEILING);
-        let page_size = usize::try_from(clamped)
-            .expect("MaxResults is clamped into 1..=50, which always fits in a usize");
+        // `MaxResults` is modelled `@range(min: 1, max: 50)`, this service's common bound,
+        // and a request that omits it asks for a full page — so the modelled maximum is
+        // both the ceiling and the default (`crate::state::page_size`).
+        let page_size = crate::state::page_size(input.max_results);
 
         // An opaque token this service did not issue is a bad request, not an empty page.
         // A token is this service's own cursor, not a value a caller composes: it cannot
@@ -314,11 +309,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The largest page `ListShareInvitations` serves, and the page size a request that omits
-/// `MaxResults` gets: the modelled `MaxResults` `@range(min: 1, max: 50)` maximum
-/// (`smithy_query(query="operation", operation="ListShareInvitations")`).
-const MAX_RESULTS_CEILING: i32 = 50;
 
 /// The four mutually exclusive name-prefix inputs, each paired with the
 /// `ShareResourceType` member whose invitations it narrows — "Use the parameter that
