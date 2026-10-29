@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkloadIdentity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkloadIdentity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkloadIdentity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists one workload identity of this account in [`crate::state`], keyed by
+//! the `name` the caller chose — which is unique within the account and is what
+//! every later read, update and delete of the identity addresses it by — and
+//! reports the ARN it was minted with.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +157,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkloadIdentity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkloadIdentityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkloadIdentity"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWorkloadIdentityErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the workload identity store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "The name must be unique within your account", and the name is the
+        // identifier every later read of the identity addresses it by, so a
+        // repeated name is refused rather than stored as a second identity those
+        // reads could not tell apart. This operation models no conflict error,
+        // so the refusal is its modelled `ValidationException`, with the reason
+        // the enum has for a request the stored state refuses.
+        if store.workload_identities.contains_key(&input.name) {
+            return Err(CreateWorkloadIdentityErrorModeled::ValidationException(
+                crate::state::resource_conflict(format!(
+                    "a workload identity named {} already exists in this account",
+                    input.name
+                )),
+            )
+            .into());
+        }
+
+        // The store this request would grow is bounded, so a caller looping on
+        // create meets this ceiling instead of this process's memory limit.
+        if store.workload_identities.len() >= crate::state::MAX_WORKLOAD_IDENTITIES {
+            return Err(CreateWorkloadIdentityErrorModeled::ValidationException(
+                crate::state::resource_conflict(format!(
+                    "this account already holds the maximum of {} workload identities",
+                    crate::state::MAX_WORKLOAD_IDENTITIES
+                )),
+            )
+            .into());
+        }
+
+        let record = crate::state::WorkloadIdentityRecord {
+            workload_identity_arn: crate::state::workload_identity_arn(&region, &input.name),
+            name: input.name,
+            allowed_resource_oauth2_return_urls: input.allowed_resource_oauth2_return_urls,
+            tags: crate::state::sorted_map(input.tags),
+            created_at: now,
+            updated_at: now,
+        };
+        let output = record.create_output();
+        store.workload_identities.insert(record.name.clone(), record);
+
+        Ok(output)
     }
 }

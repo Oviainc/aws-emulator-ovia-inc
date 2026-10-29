@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkloadIdentities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkloadIdentities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkloadIdentities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the workload identities `CreateWorkloadIdentity` persisted in
+//! [`crate::state`], one `WorkloadIdentityType` per identity, read off the same
+//! record `GetWorkloadIdentity` reports. `@readonly` and `@paginated`, so it
+//! writes nothing of its own and resumes exactly where the previous page ended.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +148,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkloadIdentities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkloadIdentitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkloadIdentities"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListWorkloadIdentitiesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the workload identity store is unavailable".to_string()),
+            })
+        })?;
+        let store = state.lock();
+
+        // The token is opaque on the wire: it carries the identity name the
+        // previous page ended on, and the next page starts strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListWorkloadIdentitiesErrorModeled::ValidationException(
+                    crate::state::field_validation_failed(
+                        NEXT_TOKEN_MEMBER,
+                        "must be a nextToken returned by a previous ListWorkloadIdentities call",
+                    ),
+                )
+            })?),
+        };
+
+        // `maxResults` carries the modelled range 1..20 and default 10, which the
+        // boundary walk resolves before this handler runs; a request whose
+        // `maxResults` never reached it at all pages at that same documented
+        // default. The page walk is `crate::state`'s, so every listing of this
+        // service pages by one rule.
+        let requested = match input.max_results {
+            0 => DEFAULT_PAGE_SIZE,
+            requested => requested,
+        };
+        let page_size = crate::state::page_size(Some(requested), MAX_PAGE_SIZE);
+        let (workload_identities, next_token) = crate::state::page_over(
+            &store.workload_identities,
+            resume_after.as_deref(),
+            page_size,
+            |record| Some(record.summary()),
+        );
+
+        Ok(ListWorkloadIdentitiesOutput {
+            workload_identities,
+            next_token,
+        })
     }
 }
+
+/// The modelled bounds of `maxResults`: the top of its range (1..20) and the
+/// default it carries (10), from `smithy_query operation=ListWorkloadIdentities`.
+const MAX_PAGE_SIZE: i32 = 20;
+const DEFAULT_PAGE_SIZE: i32 = 10;
+
+/// The request member a refused page token is reported against.
+const NEXT_TOKEN_MEMBER: &str = "nextToken";

@@ -46,8 +46,9 @@ use crate::ops::types::{
     RuntimeMetadataConfiguration, S3Location, StreamDeliveryResources, TargetConfiguration,
     TargetSummary,
     ToolDefinition, ToolSchema,
+    CreateWorkloadIdentityOutput, GetWorkloadIdentityOutput,
     UpdateGatewayOutput, ValidationException, ValidationExceptionField, WafConfiguration,
-    WorkloadIdentityDetails,
+    WorkloadIdentityDetails, WorkloadIdentityType,
 };
 
 /// The ARN namespace (and sigv4 signing name) this service stamps on its
@@ -1028,6 +1029,91 @@ pub fn harness_arn(region: &str, harness_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("harness/{harness_id}"))
 }
 
+/// How many workload identities this emulator will hold.
+///
+/// `CreateWorkloadIdentity` models no quota error, so the ceiling is reported
+/// with its modelled `ValidationException` ([`resource_conflict`]). The
+/// number is NOT a fidelity claim about any published quota: it is the
+/// emulator's own ceiling, set generously so no realistic workflow meets it, so
+/// that a caller looping on create cannot grow this process's memory without
+/// bound.
+pub const MAX_WORKLOAD_IDENTITIES: usize = 1_000;
+
+/// The resource noun [`resource_not_found`] names for a workload identity.
+pub const RESOURCE_WORKLOAD_IDENTITY: &str = "workload identity";
+
+/// One workload identity of this account, as `CreateWorkloadIdentity`
+/// persisted it.
+///
+/// The name is the identifier: `GetWorkloadIdentity`,
+/// `UpdateWorkloadIdentity` and `DeleteWorkloadIdentity` all address an
+/// identity by `name`, and it is "unique within your account"
+/// (`smithy_query doc shape=CreateWorkloadIdentityRequest member=name`), so the
+/// store is keyed by it.
+#[derive(Debug, Clone)]
+pub struct WorkloadIdentityRecord {
+    pub name: String,
+    pub workload_identity_arn: String,
+    /// The caller's `allowedResourceOauth2ReturnUrls`, optional on every
+    /// request and every response that reports an identity, so an identity
+    /// created without one reports none rather than an empty list.
+    pub allowed_resource_oauth2_return_urls: Option<Vec<String>>,
+    pub tags: BTreeMap<String, String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl WorkloadIdentityRecord {
+    /// This identity as one entry of a workload-identity listing
+    /// (`WorkloadIdentityType`), read off the same record the single-identity
+    /// read reports, so a listing cannot disagree with `GetWorkloadIdentity`.
+    pub fn summary(&self) -> WorkloadIdentityType {
+        WorkloadIdentityType {
+            name: self.name.clone(),
+            workload_identity_arn: self.workload_identity_arn.clone(),
+        }
+    }
+
+    /// This identity as `CreateWorkloadIdentity`'s response envelope.
+    pub fn create_output(&self) -> CreateWorkloadIdentityOutput {
+        CreateWorkloadIdentityOutput {
+            name: self.name.clone(),
+            workload_identity_arn: self.workload_identity_arn.clone(),
+            allowed_resource_oauth2_return_urls: self
+                .allowed_resource_oauth2_return_urls
+                .clone(),
+        }
+    }
+
+    /// This identity as `GetWorkloadIdentity`'s response envelope — the members
+    /// [`Self::create_output`] renders plus the two instants the read reports,
+    /// off the one record.
+    pub fn get_output(&self) -> GetWorkloadIdentityOutput {
+        let created = self.create_output();
+        GetWorkloadIdentityOutput {
+            name: created.name,
+            workload_identity_arn: created.workload_identity_arn,
+            allowed_resource_oauth2_return_urls: created.allowed_resource_oauth2_return_urls,
+            created_time: timestamp(self.created_at),
+            last_updated_time: timestamp(self.updated_at),
+        }
+    }
+}
+
+/// The modelled validation error for a create whose `name` is already held by a
+/// resource of this account, and for one this emulator's own ceiling refuses.
+///
+/// Nothing is wrong with the request member's own form, so `reason` is
+/// [`VALIDATION_REASON_RESOURCE_CONFLICT`] and there is no `fieldList` — the
+/// same reason a request the stored state refuses carries everywhere else here.
+pub fn resource_conflict(why: String) -> ValidationException {
+    ValidationException {
+        message: why,
+        reason: VALIDATION_REASON_RESOURCE_CONFLICT.to_string(),
+        field_list: None,
+    }
+}
+
 /// The truncation configuration to store for a request: the caller's, or the
 /// strategy that truncates nothing when the caller named none.
 pub fn effective_truncation_configuration(
@@ -1047,8 +1133,9 @@ pub fn effective_truncation_configuration(
 /// [`MAX_GATEWAYS`] caps the gateways (and with them their 1:1 name index),
 /// [`MAX_TARGETS_PER_GATEWAY`] the targets one gateway holds, [`MAX_MEMORIES`]
 /// the memories (and with them their 1:1 name index),
-/// [`MAX_STRATEGIES_PER_MEMORY`] the strategies one memory holds and
-/// [`MAX_HARNESSES`] the harnesses (and with them their 1:1 name index), and the
+/// [`MAX_STRATEGIES_PER_MEMORY`] the strategies one memory holds,
+/// [`MAX_HARNESSES`] the harnesses (and with them their 1:1 name index) and
+/// [`MAX_WORKLOAD_IDENTITIES`] the workload identities, and the
 /// idempotency records are capped at [`MAX_REMEMBERED_CLIENT_TOKENS`] with
 /// oldest-first eviction plus removal when the resource they name is deleted.
 #[derive(Debug, Default)]
@@ -1083,6 +1170,16 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// `ConflictException` rather than a second harness later reads cannot tell
     /// apart. One entry per stored harness.
     pub harness_names: BTreeMap<String, String>,
+    /// Every workload identity, keyed by `name` — the identifier every
+    /// workload-identity route addresses it by, and what the identity's own ARN
+    /// ends in. The key order is the deterministic list order
+    /// `ListWorkloadIdentities` pages over.
+    ///
+    /// The identity a runtime or a gateway mints for itself is reported on that
+    /// resource (`workloadIdentityDetails`) and is not an entry here: the
+    /// operations that create one carry no identity name of their own, and
+    /// nothing this service models reads an identity through a resource.
+    pub workload_identities: BTreeMap<String, WorkloadIdentityRecord>,
     /// `<operation>/<clientToken>` -> the (runtime, version) that token first
     /// produced, so a replayed Create/Update answers with its first result
     /// instead of minting a second runtime or a second version. The key carries
