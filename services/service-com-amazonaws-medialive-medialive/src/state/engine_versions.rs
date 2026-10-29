@@ -197,6 +197,28 @@ impl ChannelEngineVersionCatalog {
         }
     }
 
+    /// The `ChannelEngineVersionResponse` for the build identifier `version`,
+    /// as a reader that holds only the identifier (a channel's pin) reports it.
+    ///
+    /// `ExpirationDate` is "The UTC time when the version expires", so the
+    /// instant to report for an identifier is the one THIS catalogue stores for
+    /// it — the same stored instant [`Self::available_at`] reports for that
+    /// identifier, so two readers of one record cannot disagree. An identifier
+    /// the catalogue does not hold (one no release of this account's series is
+    /// named by) has no stored expiry, and then only the identifier is reported.
+    /// An entry past its expiry is still reported with that expiry: when it
+    /// expires is a fact of the record, which availability filtering does not
+    /// unmake.
+    pub fn described(&self, version: &str) -> ChannelEngineVersionResponse {
+        self.versions.get(version).map_or_else(
+            || ChannelEngineVersionResponse {
+                expiration_date: None,
+                version: Some(version.to_string()),
+            },
+            ChannelEngineVersionRecord::view,
+        )
+    }
+
     /// The engine versions available to the account at `now`, newest release first,
     /// as the modelled shape reports them.
     ///

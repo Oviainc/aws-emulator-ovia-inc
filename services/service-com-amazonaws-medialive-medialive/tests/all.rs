@@ -38,6 +38,9 @@ mod channel_class_update;
 #[path = "all/channel_configuration_validation.rs"]
 mod channel_configuration_validation;
 
+#[path = "all/channel_engine_version_expiry.rs"]
+mod channel_engine_version_expiry;
+
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
 

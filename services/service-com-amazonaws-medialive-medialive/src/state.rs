@@ -3216,7 +3216,7 @@ impl ComAmazonawsMedialiveMedialiveState {
             channel_engine_version: channel
                 .channel_engine_version
                 .as_deref()
-                .map(described_engine_version),
+                .map(|version| self.described_engine_version(version)),
             linked_channel_settings: channel
                 .linked_channel_settings
                 .as_ref()
@@ -3224,6 +3224,22 @@ impl ComAmazonawsMedialiveMedialiveState {
             channel_security_groups: Some(channel.channel_security_groups.clone()),
             inference_settings: channel.inference_settings.as_ref().map(described_inference),
         })
+    }
+
+    /// The `ChannelEngineVersionResponse` reporting the engine version a channel
+    /// is pinned to: the build identifier the channel stores, and the expiry
+    /// this account's engine version catalogue stores for that identifier.
+    ///
+    /// A channel stores only the identifier it was pinned with, so the expiry a
+    /// channel-shaped read reports is read out of the same catalogue
+    /// `ListVersions` reports from
+    /// ([`ChannelEngineVersionCatalog::described`]) — one stored instant,
+    /// however it is read.
+    fn described_engine_version(
+        &self,
+        version: &str,
+    ) -> crate::ops::types::ChannelEngineVersionResponse {
+        self.channel_engine_versions.described(version)
     }
 
     /// The `ChannelSummary` projection of one stored channel — the same stored
@@ -3252,7 +3268,7 @@ impl ComAmazonawsMedialiveMedialiveState {
             channel_engine_version: channel
                 .channel_engine_version
                 .as_deref()
-                .map(described_engine_version),
+                .map(|version| self.described_engine_version(version)),
             used_channel_engine_versions: None,
             linked_channel_settings: channel
                 .linked_channel_settings
@@ -5960,16 +5976,6 @@ fn described_inference(inference: &InferenceSettings) -> DescribeInferenceSettin
         feed_arn: inference.feed_arn.clone(),
         audio_feed_inputs: inference.audio_feed_inputs.clone(),
         enrichment_methods: inference.enrichment_methods.clone(),
-    }
-}
-
-/// `ChannelEngineVersionRequest` (just a `Version`) -> the response shape.
-/// `ExpirationDate` is "The UTC time when the version expires" — an AWS-side
-/// release fact, not something this emulator knows, so it stays absent.
-fn described_engine_version(version: &str) -> crate::ops::types::ChannelEngineVersionResponse {
-    crate::ops::types::ChannelEngineVersionResponse {
-        expiration_date: None,
-        version: Some(version.to_string()),
     }
 }
 

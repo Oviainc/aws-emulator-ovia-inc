@@ -53,7 +53,7 @@ async fn list_versions(router: &MultiServiceRouter) -> (u16, Value) {
 /// An instant `offset` seconds away from `base` — negative into the past, which is
 /// how a row dates a release, and positive into the future, which is how it dates
 /// an expiry that has not come yet.
-fn shifted(base: SystemTime, offset: i64) -> SystemTime {
+pub(crate) fn shifted(base: SystemTime, offset: i64) -> SystemTime {
     let span = Duration::from_secs(offset.unsigned_abs());
     if offset < 0 {
         base - span
@@ -63,7 +63,7 @@ fn shifted(base: SystemTime, offset: i64) -> SystemTime {
 }
 
 /// The catalogue a row installs, replacing the seeded one.
-fn install(engine: &engine::InMemoryEngine, catalogue: ChannelEngineVersionCatalog) {
+pub(crate) fn install(engine: &engine::InMemoryEngine, catalogue: ChannelEngineVersionCatalog) {
     let store = state::service_state_in(engine, DEFAULT_REGION).expect("the medialive store");
     store.lock().channel_engine_versions = catalogue;
 }
