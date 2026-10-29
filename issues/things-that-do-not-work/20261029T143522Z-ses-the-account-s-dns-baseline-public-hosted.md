@@ -1,0 +1,50 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: ses.configuration-set-sending-disabled-blocks-v2-send-email-then-restored ses.configuration-set-tracking-options-lifecycle-with-verified-domain ses.custom-verification-template-not-found-semantics ses.send-bulk-email-simulator-per-entry-message-ids
+Issue-Shape-Id: com.amazonaws.ses#SimpleEmailService
+Issue-Key: ses.configuration-set-sending-disabled-blocks-v2-send-email-then-restored|_sending_domain#3|AssertionError|raise AssertionError(
+Issue-Key: ses.configuration-set-tracking-options-lifecycle-with-verified-domain|_verified_apex#4|AssertionError|raise AssertionError(
+Issue-Key: ses.custom-verification-template-not-found-semantics|_sending_domain#3|AssertionError|raise AssertionError(
+Issue-Key: ses.send-bulk-email-simulator-per-entry-message-ids|_dns_baseline_domain#5|AssertionError|raise AssertionError(
+Issue-Commit: 5289dd65a4144c77c241afe8c5587a00323c4392
+
+# ses: the account's DNS-baseline public hosted zone is not discoverable through route53 ListHostedZones/ListTagsForResource, so four ses sending/configuration-set checks abort before any SES call is exercised
+
+> _Note: this issue was identified against the code base at commit `5289dd65a4144c77c241afe8c5587a00323c4392`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+ListHostedZones
+
+## Description
+One root cause, grounded in four failing checks of the `ses` suite directory.
+
+Cause 1 of 1: tag-based discovery of the account's public hosted zones yields nothing, so no verified sending domain can be resolved and all four checks abort in their precondition helper (`_sending_domain` / `_verified_apex` / `_dns_baseline_domain`), before any configuration set, custom verification template or send is exercised. Failing checks: ses.configuration-set-sending-disabled-blocks-v2-send-email-then-restored, ses.configuration-set-tracking-options-lifecycle-with-verified-domain, ses.custom-verification-template-not-found-semantics, ses.send-bulk-email-simulator-per-entry-message-ids.
+
+AWS: Smithy (com.amazonaws.route53) ListHostedZones — GET /2013-04-01/hostedzone, code 200, input {Marker (httpQuery marker, @length 0..64), MaxItems (httpQuery maxitems), DelegationSetId, HostedZoneType}, output ListHostedZonesResponse{HostedZones (required, list), Marker (required), IsTruncated (required, default false), NextMarker, MaxItems (required)}, paginated inputToken=Marker / outputToken=NextMarker / items=HostedZones; modeled refusals InvalidInput(400), NoSuchDelegationSet(400), DelegationSetNotReusable(400). Smithy ListTagsForResource — GET /2013-04-01/tags/{ResourceType}/{ResourceId}, code 200, input {ResourceType (httpLabel, required, enum TagResourceType), ResourceId (httpLabel, required, @length 0..64)}, output {ResourceTagSet (required)}; modeled refusals InvalidInput(400), NoSuchHostedZone(404), NoSuchHealthCheck(404), PriorRequestNotComplete(400), ThrottlingException(400). Smithy (com.amazonaws.sesv2) GetEmailIdentity — GET /v2/email/identities/{EmailIdentity} -> {IdentityType, VerifiedForSendingStatus, DkimAttributes{Status, Tokens}, ...}. Beyond those signatures this is recorded behavior only: against real AWS the ListHostedZones pagination enumerates every hosted zone that exists in the account, a public zone reports HostedZone.Config.PrivateZone false, ListTagsForResource(ResourceType='hostedzone', ResourceId=<the segment of HostedZone.Id after the last '/'>) answers 200 with a ResourceTagSet whose Tags contain exactly the tags ChangeTagsForResource wrote on that zone, and GetEmailIdentity on that zone's apex (trailing dot stripped) is 200 with VerifiedForSendingStatus true. The requirement is general and about no particular zone name: a zone that exists is enumerated, and the tags written on it are projected back for ResourceType 'hostedzone'.
+
+Emulator: neither read is refused — the discovery loop completes with 2xx responses throughout — yet not one enumerated public zone carries the tag the baseline writes, so the helper falls through to its precondition assertion and the check stops at its first statement: `AssertionError: no public hosted zone carries the DNS baseline tag, so the account has no verified domain to send from` (identical fixed text in all four checks; the tag it looks for, {'Key': 'sim2real-infra-dns-baseline', 'Value': 'true'}, and the zone apex it would have returned are values from the account's state, not part of the message template). Hypothesis: either ListHostedZones enumerates no public zone for the account (HostedZones empty, or zones reported with Config.PrivateZone true), or the hostedzone tag store is not projected by ListTagsForResource so the ResourceTagSet comes back without the written tags.
+
+Why: a client cannot tag-discover its own DNS zones — the standard way SES tooling locates the domain it sends from — and because the identity it needs is undiscoverable, the whole behavior behind these checks is masked and its fidelity is unknown: the v2 SendEmail refusal when a configuration set's sending is disabled (SendingPausedException) and its restoration, the configuration-set tracking-options lifecycle with a CustomRedirectDomain under a verified parent identity, CustomVerificationEmailTemplateDoesNotExist semantics on Get/Update of an absent template with its positive control, and per-entry MessageIds from SendBulkEmail to the mailbox simulator. None of these can even be attempted while this read is empty.
+
+Fix: route53's hosted-zone enumeration and its hostedzone tag reads — ListHostedZones' listing/pagination and the PrivateZone flag it reports, and the tag state ListTagsForResource projects for ResourceType 'hostedzone' — must agree with what CreateHostedZone/ChangeTagsForResource recorded; the sesv2 email-identity state for that apex must then report it verified for sending. Three open issues report this same route53 cause but carry only other services' check ids and so do not cover these four: 20261029T065537Z-sesv2-the-whole-ses-sending-surface-is-unreachable.md, 20261029T085623Z-sesv2-two-causes-the-dns-baseline-hosted-zone.md, 20261029T133540Z-s3-ses-sesv2-ses-inbound-mail-receiving-is-unreachable-the-account.md (the inbound/receiving half). This issue carries the `ses` sending/configuration-set half.
+
+Traces: ses.configuration-set-sending-disabled-blocks-v2-send-email-then-restored (run line 108 -> _sending_domain line 35), ses.configuration-set-tracking-options-lifecycle-with-verified-domain (run line 68 -> _verified_apex line 34), ses.custom-verification-template-not-found-semantics (_verified_sender_email line 78 -> _sending_domain line 100), ses.send-bulk-email-simulator-per-entry-message-ids (run line 134 -> _dns_baseline_domain line 40).
+
+## Evidence
+Expected (AWS, recorded): route53.list_hosted_zones() pagination enumerates at least one public zone (Config.PrivateZone false); for each such zone route53.list_tags_for_resource(ResourceType='hostedzone', ResourceId=<id segment after the last '/'>) is 200 and its ResourceTagSet.Tags contains the tag written on that zone (the baseline zone carries {'Key': 'sim2real-infra-dns-baseline', 'Value': 'true'}); sesv2.get_email_identity(EmailIdentity=<zone apex, trailing dot stripped>) is 200 with VerifiedForSendingStatus true and DkimAttributes.Status 'SUCCESS'. Each check then proceeds to its own SES assertions.
+
+Actual (emulator): every route53/sesv2 read in the discovery loop answers 2xx — nothing is refused — but no enumerated public zone reports the baseline tag, so all four checks raise their precondition assertion and never issue an SES call:
+[mismatch] ses.configuration-set-sending-disabled-blocks-v2-send-email-then-restored — run line 108 -> _sending_domain line 35: AssertionError: no public hosted zone carries the DNS baseline tag, so the account has no verified domain to send from
+[mismatch] ses.configuration-set-tracking-options-lifecycle-with-verified-domain — run line 68 -> _verified_apex line 34: identical AssertionError
+[mismatch] ses.custom-verification-template-not-found-semantics — _verified_sender_email line 78 -> _sending_domain line 100: identical AssertionError
+[mismatch] ses.send-bulk-email-simulator-per-entry-message-ids — run line 134 -> _dns_baseline_domain line 40: identical AssertionError
+
+The divergence is in what the two route53 reads enumerate/return, not in their status codes: the client sees an account that holds no tagged public hosted zone at all. Fixed text of the message: "no public hosted zone carries the DNS baseline tag, so the account has no verified domain to send from"; the variable parts in the sibling assertions of the same helpers are the zone apex and the DKIM status, both taken from the emulator's state.
+
+## Steps to Reproduce
+1. Build and boot the emulator, then run the behavioral suite.
+2. Ensure the account holds a PUBLIC hosted zone (route53 CreateHostedZone, then ChangeTagsForResource with ResourceType='hostedzone' adding {'sim2real-infra-dns-baseline': 'true'}) whose apex is a sesv2 email identity with VerifiedForSendingStatus true.
+3. Page route53.list_hosted_zones(); for each returned zone whose Config.PrivateZone is false, call route53.list_tags_for_resource(ResourceType='hostedzone', ResourceId=<the segment of HostedZone.Id after the last '/'>).
+4. Observe: no enumerated public zone reports the baseline tag (either HostedZones is empty / private-only, or the ResourceTagSet omits the written tag) while both calls still answer 200.
+5. Re-replay ses.configuration-set-sending-disabled-blocks-v2-send-email-then-restored, ses.configuration-set-tracking-options-lifecycle-with-verified-domain, ses.custom-verification-template-not-found-semantics and ses.send-bulk-email-simulator-per-entry-message-ids; each aborts in its DNS-baseline discovery helper before any SES operation is called.
