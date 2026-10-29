@@ -1073,6 +1073,178 @@ async fn paging_walks_the_inventory_once() {
     );
 }
 
+/// Keys of the OTHER page classes of this service, each in the shape its own
+/// model gives it — an `AWSAccountId` (`^[0-9]+$`), a `Base62Id`
+/// (`^[a-z0-9A-Z]{22}$`, what a resource set's `Id` is) and a `PolicyId`
+/// (`^[a-z0-9A-Z-]{36}$`), from
+/// `smithy_query(query="shape", shape="AWSAccountId,Base62Id,PolicyId")` — and
+/// therefore a key of NO page of the URI-keyed inventory.
+const FOREIGN_PAGE_KEYS: &[(&str, &str)] = &[
+    ("hex of an account-keyed page's key", "123456789012"),
+    (
+        "hex of a resource-set-keyed page's key",
+        "abcdefghij0123456789AB",
+    ),
+    (
+        "hex of a policy-keyed page's key",
+        "0f13c2a4-1111-4a26-9d0e-6b4f8d2a7c31",
+    ),
+];
+
+/// RULE: this page is ordered by the resource's URI, so a `NextToken` names a
+/// boundary in it exactly when it is the hex of a UTF-8 ARN; any other value —
+/// including a token this service minted for a page of another class, and any
+/// hex of a printable string that is no ARN — names no boundary, so the request
+/// is refused with the operation's modelled `InvalidInputException` instead of
+/// being answered with a page that starts at an arbitrary key, and the refusal
+/// reports nothing and changes nothing.
+#[tokio::test]
+async fn a_next_token_is_a_boundary_only_when_it_decodes_to_a_resource_uri() {
+    let (router, _engine) = emulator();
+    associate_admin(&router).await;
+
+    let instances = elements(
+        &ec2_ok(
+            "instances",
+            &router,
+            "RunInstances",
+            &[p("ImageId", AMI), p("MinCount", "3"), p("MaxCount", "3")],
+        )
+        .await,
+        "instanceId",
+    );
+    let whole = every_uri(&router, ACCOUNT, state::RESOURCE_TYPE_EC2_INSTANCE).await;
+    assert_eq!(
+        whole.len(),
+        instances.len(),
+        "the inventory must report every launched instance, got {whole:?} for {instances:?}"
+    );
+    assert!(
+        whole.len() >= 3 && whole.windows(2).all(|pair| pair[0] < pair[1]),
+        "this test needs at least three keys in URI order, got {whole:?}"
+    );
+
+    // ACCEPTED: the hex of an ARN is a boundary, and the page resumes at the
+    // first key at or after it. Rows differ in whether the ARN is one of this
+    // inventory's own keys, in the service, Region and account fields (API
+    // Gateway's and Amazon S3's leave some EMPTY), and in whether the ARN sorts
+    // before, inside or after the inventory.
+    let mut accepted: Vec<(String, String)> = whole
+        .iter()
+        .map(|uri| (format!("hex of its own key {uri}"), uri.clone()))
+        .collect();
+    accepted.extend([
+        (
+            "hex of an ARN sorting before every key of this type".to_string(),
+            ec2_arn("instance/"),
+        ),
+        (
+            "hex of an ARN of another account".to_string(),
+            format!("arn:aws:ec2:{REGION}:{FOREIGN_ACCOUNT}:instance/i-0"),
+        ),
+        (
+            "hex of an ARN with an empty account field".to_string(),
+            format!("arn:aws:apigateway:{REGION}::/restapis/a1b2c3/stages/prod"),
+        ),
+        (
+            "hex of a global ARN with no Region or account".to_string(),
+            "arn:aws:s3:::fms-discovery-bucket".to_string(),
+        ),
+    ]);
+    for (case, uri) in &accepted {
+        let expected: Vec<String> = whole.iter().filter(|key| *key >= uri).cloned().collect();
+        let body = list(
+            &router,
+            ACCOUNT,
+            state::RESOURCE_TYPE_EC2_INSTANCE,
+            None,
+            Some(&hex::encode(uri)),
+        )
+        .await;
+        let served: Vec<String> = items(&body).into_iter().map(|(served, ..)| served).collect();
+        assert_eq!(
+            served, expected,
+            "case {case:?}: expected the page to resume at the first key at or after that ARN, \
+             got {served:?}"
+        );
+        assert!(
+            body["NextToken"].is_null(),
+            "case {case:?}: a page holding the rest of the inventory carries no NextToken, got \
+             {body}"
+        );
+    }
+
+    // REFUSED: every value that is not the hex of a UTF-8 ARN. Rows differ in
+    // the encoding form (not hex, an odd number of digits, bytes that are not
+    // UTF-8), in the CONTENT of the decoded key (a control character, a key of
+    // another page class of this service, a printable string that is no ARN) and
+    // in WHICH condition of the ARN form the decoded key breaks.
+    let mut refused: Vec<(String, String)> = vec![
+        (
+            "not hex at all".to_string(),
+            "not-a-token-this-service-minted".to_string(),
+        ),
+        ("hex of an odd number of digits".to_string(), "abc".to_string()),
+        ("hex of bytes that are not UTF-8".to_string(), "ff".to_string()),
+        (
+            "hex of a printable string that is no ARN".to_string(),
+            hex::encode("zzz"),
+        ),
+        (
+            "hex of one of its own keys carrying a control character".to_string(),
+            hex::encode(format!("{}\u{1}", whole[0])),
+        ),
+        (
+            "hex of a value missing the arn prefix".to_string(),
+            hex::encode(format!("aws:ec2:{REGION}:{ACCOUNT}:instance/i-0")),
+        ),
+        (
+            "hex of a value with too few fields".to_string(),
+            hex::encode("arn:aws:ec2"),
+        ),
+        (
+            "hex of an ARN with an empty partition".to_string(),
+            hex::encode(format!("arn::ec2:{REGION}:{ACCOUNT}:instance/i-0")),
+        ),
+        (
+            "hex of an ARN with an empty resource".to_string(),
+            hex::encode(format!("arn:aws:ec2:{REGION}:{ACCOUNT}:")),
+        ),
+    ];
+    refused.extend(
+        FOREIGN_PAGE_KEYS
+            .iter()
+            .map(|(case, key)| ((*case).to_string(), hex::encode(key))),
+    );
+    for (case, token) in &refused {
+        let (status, body) = call(
+            &router,
+            "ListDiscoveredResources",
+            &json!({
+                "MemberAccountIds": [ACCOUNT],
+                "ResourceType": state::RESOURCE_TYPE_EC2_INSTANCE,
+                "NextToken": token,
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, crate::policy_lifecycle::error_code(&body).as_str()),
+            (400, "InvalidInputException"),
+            "case {case:?}: a token naming no boundary of this page must be refused, got {status} \
+             with {body}"
+        );
+        assert!(
+            body["Items"].is_null() && body["NextToken"].is_null(),
+            "case {case:?}: a refused call must report nothing, got {body}"
+        );
+        let after = every_uri(&router, ACCOUNT, state::RESOURCE_TYPE_EC2_INSTANCE).await;
+        assert_eq!(
+            after, whole,
+            "case {case:?}: a refused token must leave the inventory as it was, got {after:?}"
+        );
+    }
+}
+
 /// RULE: Firewall Manager keeps no copy of the inventory, so a resource deleted
 /// through its owning service stops being discovered with no propagation step.
 #[tokio::test]

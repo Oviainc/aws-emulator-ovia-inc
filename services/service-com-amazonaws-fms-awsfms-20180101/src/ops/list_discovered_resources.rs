@@ -213,9 +213,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A token this service did not mint names no page boundary.
+        // A token this service did not mint for an inventory page names no page
+        // boundary: this page is keyed by a resource URI, so a token whose
+        // decoded key is not one is refused as a bad request rather than used as
+        // an arbitrary lower bound — the modelled `InvalidInputException` is
+        // exactly "the parameters of the request were invalid".
         let start = match input.next_token.as_deref() {
-            Some(token) => match crate::state::decode_key_token(token) {
+            Some(token) => match crate::state::decode_uri_page_token(token) {
                 Some(start) => Some(start),
                 None => {
                     return Err(ListDiscoveredResourcesErrorModeled::InvalidInputException(

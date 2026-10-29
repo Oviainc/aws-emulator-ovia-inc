@@ -3024,12 +3024,15 @@ pub fn decode_base62_page_token(token: &str) -> Option<String> {
 }
 
 /// Decode a URI-keyed `PaginationToken` produced by [`encode_key_token`], for
-/// the paginated operation whose store key is a member resource's URI. `None`
-/// when the token was not produced by this service for such a page.
+/// the paginated operations whose store key is a resource's URI — a resource
+/// set's membership and the organisation's discoverable inventory
+/// ([`discovered_resources`]), which is keyed the same way. `None` when the
+/// token was not produced by this service for such a page.
 ///
 /// The decoded value must still be an ARN ([`parse_arn`]), which every resource
-/// a set holds is — an item that is not one never becomes a member
-/// ([`resource_set_item_failure_reason`] refuses it as `NOT_VALID_ARN`) — so a
+/// either page carries is — an item that is not one never becomes a member
+/// ([`resource_set_item_failure_reason`] refuses it as `NOT_VALID_ARN`), and a
+/// discovered resource is reported under the ARN it would be associated by — so a
 /// token minted for a policy, account or resource-set page, or any foreign token
 /// that happens to be valid hex, is refused rather than resumed from as an
 /// arbitrary key.
