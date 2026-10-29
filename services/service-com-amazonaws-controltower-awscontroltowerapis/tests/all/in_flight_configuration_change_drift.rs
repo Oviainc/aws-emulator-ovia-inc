@@ -397,7 +397,7 @@ async fn a_baseline_change_in_flight_reports_no_drift_assessment() {
 
 /// Which call starts deploying a configuration to an already deployed enabled control.
 #[derive(Debug, Clone)]
-enum ControlChange {
+pub(crate) enum ControlChange {
     /// `UpdateEnabledControl` with a configuration differing from the deployed one, which
     /// is what the operation requires of a control whose enablement succeeded.
     Update(serde_json::Value),
@@ -407,13 +407,13 @@ enum ControlChange {
 
 /// One row of the control table.
 #[derive(Debug, Clone)]
-struct ControlRow {
-    case: String,
-    control_identifier: String,
-    target_identifier: String,
+pub(crate) struct ControlRow {
+    pub(crate) case: String,
+    pub(crate) control_identifier: String,
+    pub(crate) target_identifier: String,
     /// The `parameters` member `EnableControl` is given; `None` omits it.
-    initial: Option<serde_json::Value>,
-    change: ControlChange,
+    pub(crate) initial: Option<serde_json::Value>,
+    pub(crate) change: ControlChange,
 }
 
 /// A `parameters` list over the first `count` keys `control` declares, each carrying the
@@ -440,7 +440,7 @@ pub(crate) fn parameters_of(
 /// The control table: each kind of call that starts deploying a configuration to a control
 /// already deployed, over a catalog control that declares parameters and the controls a
 /// reset starts an operation against.
-fn control_rows() -> Vec<ControlRow> {
+pub(crate) fn control_rows() -> Vec<ControlRow> {
     let parameterized = CONTROL_CATALOG
         .iter()
         .find(|control| control.enablable && !control.parameters.is_empty())
@@ -512,7 +512,7 @@ fn control_rows() -> Vec<ControlRow> {
 }
 
 /// Start `row`'s change against the enabled control `arn` names.
-async fn start_control_change(
+pub(crate) async fn start_control_change(
     router: &MultiServiceRouter,
     row: &ControlRow,
     arn: &str,

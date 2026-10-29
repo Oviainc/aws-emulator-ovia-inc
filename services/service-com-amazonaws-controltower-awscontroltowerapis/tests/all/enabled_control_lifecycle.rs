@@ -91,7 +91,7 @@ pub(crate) fn entries(value: &serde_json::Value) -> Vec<serde_json::Value> {
 
 /// The `arn` of every entry of a `ListEnabledControls` answer, sorted, so a case can
 /// compare SETS without depending on the minted-ARN order.
-fn listed_arns(listed: &Answer) -> Vec<String> {
+pub(crate) fn listed_arns(listed: &Answer) -> Vec<String> {
     let mut arns: Vec<String> = entries(listed.get("enabledControls"))
         .iter()
         .map(|entry| {
@@ -107,7 +107,7 @@ fn listed_arns(listed: &Answer) -> Vec<String> {
 }
 
 /// The one listed entry carrying `arn`, or `Value::Null`.
-fn listed_entry(listed: &Answer, arn: &str) -> serde_json::Value {
+pub(crate) fn listed_entry(listed: &Answer, arn: &str) -> serde_json::Value {
     entries(listed.get("enabledControls"))
         .into_iter()
         .find(|entry| entry.get("arn").and_then(|value| value.as_str()) == Some(arn))
