@@ -187,22 +187,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(|message| bad_request(&message))?;
 
         // The token is how many alerts of this filtered sequence the previous
-        // pages already reported. An alert's place in the log is when it was SET,
+        // pages already reported: an alert's place in the log is when it was SET,
         // not its id, so the position in that sequence is what a page resumes
-        // from; a token that is not a whole-number position at all is refused
-        // rather than read as the first page. A position past the end is NOT
-        // refused: the log is bounded ([`crate::state::MAX_CHANNEL_ALERTS`]), so
-        // a token handed out for a page the newest alerts have since pushed out
-        // resumes at the end of the log instead of failing a walk that was valid
-        // when it began. A continuation carries the same `StateFilter` as the
-        // request that was handed the token, which is what a paginator does: the
-        // position counts the alerts THAT filter reports.
-        let already_reported = match input.next_token.as_deref() {
-            Some(token) => token
-                .parse::<usize>()
-                .map_err(|_| bad_request(&format!("nextToken {token} is not an alert position")))?,
-            None => 0,
-        };
+        // from. That is the service's shared positional-cursor rule
+        // ([`crate::state::ListPosition`]), whose refusal this operation answers
+        // as its own modelled client error. A continuation carries the same
+        // `StateFilter` as the request that was handed the token, which is what a
+        // paginator does: the position counts the alerts THAT filter reports.
+        let cursor = crate::state::ListPosition::read(
+            input.next_token.as_deref(),
+            page_size,
+            "an alert",
+        )
+        .map_err(|message| bad_request(&message))?;
 
         let mut state = state.lock();
         // Reporting only: `settle` materialises what the clock already made due,
@@ -220,16 +217,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let reportable = channel.alerts.in_set_order(state_filter);
-        let alerts: Vec<ChannelAlert> = reportable
-            .iter()
-            .skip(already_reported)
-            .take(page_size)
-            .map(|record| crate::state::channel_alert_output(record))
-            .collect();
-        let reported = already_reported.saturating_add(alerts.len());
-        // Absent on the last page: a token is handed out only when an alert is
-        // left over after this one.
-        let next_token = (reported < reportable.len()).then(|| reported.to_string());
+        // The page the cursor reports, and the token beside it — absent on the
+        // last page, which the shared rule decides.
+        let (alerts, next_token): (Vec<ChannelAlert>, Option<String>) =
+            cursor.page(&reportable, |record| {
+                crate::state::channel_alert_output(record)
+            });
 
         Ok(ListAlertsOutput {
             alerts: Some(alerts),

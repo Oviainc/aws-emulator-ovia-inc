@@ -1203,6 +1203,85 @@ pub fn list_page_size(max_results: Option<i32>) -> Result<usize, String> {
     }))
 }
 
+/// Where a paginated request resumes in a sequence its `NextToken` walks by
+/// POSITION, and the page that cursor reports out of it.
+///
+/// ONE copy of this positional-cursor rule and of its wording, for the reason
+/// [`bounded_length`] states and beside the page-size rule [`list_page_size`]
+/// states: an operation of this service that pages over a sequence it DERIVES —
+/// a channel's alert log, a cluster's, a channel's schedule — resumes at a place
+/// in that sequence, because an entry of it carries nothing that identifies the
+/// entry on its own, so none of them can drift into its own reading of what a
+/// token means, of which token is refused or of when a token is handed out at
+/// all.
+///
+/// The caller maps the refusal message onto the modelled client error its own
+/// operation declares, exactly as the operations wrapping [`list_page_size`] do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListPosition {
+    /// How many entries of the sequence the previous pages already reported.
+    already_reported: usize,
+    /// The page size [`list_page_size`] cut this request at.
+    page_size: usize,
+}
+
+impl ListPosition {
+    /// The cursor one request walks from, out of the `NextToken` it carried and
+    /// the page size it is served at — or the message its refusal carries when
+    /// that token is not a position at all.
+    ///
+    /// `position_of` is the noun phrase, carrying its article, naming what the
+    /// positions count as the refusal reads it (`an alert`, `a schedule`).
+    ///
+    /// A request naming no token asks for the first page. A token that is not a
+    /// whole number is NOT read as the first page: it continues nothing this
+    /// service handed out, so it is refused. A position PAST the end is not
+    /// refused, because these sequences shrink on their own: a token handed out
+    /// for a page that has since been dropped resumes at the end of the sequence
+    /// instead of failing a walk that was valid when it began.
+    pub fn read(
+        next_token: Option<&str>,
+        page_size: usize,
+        position_of: &str,
+    ) -> Result<Self, String> {
+        let already_reported = match next_token {
+            Some(token) => token
+                .parse::<usize>()
+                .map_err(|_| format!("nextToken {token} is not {position_of} position"))?,
+            None => 0,
+        };
+        Ok(Self {
+            already_reported,
+            page_size,
+        })
+    }
+
+    /// The page of `sequence` this cursor reports — each entry carried into the
+    /// shape the response reports it as by `report` — and the token that resumes
+    /// after it.
+    ///
+    /// The token is the position the next page resumes at, handed out ONLY while
+    /// an entry is left over after this page, so a response carrying none is the
+    /// last page. A page is a snapshot of the sequence it was read from and never
+    /// a cursor the service holds open: an entry dropped between two pages shifts
+    /// the ones after it.
+    pub fn page<Entry, Reported>(
+        &self,
+        sequence: &[Entry],
+        report: impl FnMut(&Entry) -> Reported,
+    ) -> (Vec<Reported>, Option<String>) {
+        let page: Vec<Reported> = sequence
+            .iter()
+            .skip(self.already_reported)
+            .take(self.page_size)
+            .map(report)
+            .collect();
+        let reported = self.already_reported.saturating_add(page.len());
+        let next_token = (reported < sequence.len()).then(|| reported.to_string());
+        (page, next_token)
+    }
+}
+
 /// The BATCH slice: the per-resource outcome machinery and the id-count bound
 /// every Batch operation of this service answers by, in one module of its own so
 /// the three of them cannot drift into three readings of one rule. What stays in

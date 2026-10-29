@@ -166,22 +166,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token is how many actions of this schedule the previous pages
         // already reported. An action's place in the schedule is its start time,
         // not its name or its mint order, so the position in that sequence is what
-        // a page resumes from; a token that is not a whole-number position at all
-        // is refused rather than read as the first page. A position past the end
-        // is NOT refused: the schedule shrinks on its own (an action whose start
-        // time has long passed is cleaned up), so a token handed out for a page
-        // that has since been swept away resumes at the end of the schedule
-        // instead of failing a walk that was valid when it began. That same
-        // sweeping is what a positional cursor costs: an action removed between
-        // two pages shifts the ones after it, so a walk spanning the sweep can
-        // miss one — a page is a snapshot of the schedule it was read from, never
-        // a cursor the service holds open.
-        let already_reported = match input.next_token.as_deref() {
-            Some(token) => token.parse::<usize>().map_err(|_| {
-                bad_request(&format!("nextToken {token} is not a schedule position"))
-            })?,
-            None => 0,
-        };
+        // a page resumes from — the service's shared positional-cursor rule
+        // ([`crate::state::ListPosition`]), whose refusal this operation answers
+        // as its own modelled client error. That the schedule sweeps out an
+        // action whose start time has long passed is what a positional cursor
+        // costs: a walk spanning the sweep can miss one, because a page is a
+        // snapshot of the schedule it was read from.
+        let cursor = crate::state::ListPosition::read(
+            input.next_token.as_deref(),
+            page_size,
+            "a schedule",
+        )
+        .map_err(|message| bad_request(&message))?;
 
         let mut state = state.lock();
         // Reporting only: `settle` materialises what the clock already made due,
@@ -197,16 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let ordered = channel.schedule.in_start_order();
-        let schedule_actions: Vec<ScheduleAction> = ordered
-            .iter()
-            .skip(already_reported)
-            .take(page_size)
-            .map(|record| record.action.clone())
-            .collect();
-        let reported = already_reported.saturating_add(schedule_actions.len());
-        // Absent on the last page: a token is handed out only when an action is
-        // left over after this one.
-        let next_token = (reported < ordered.len()).then(|| reported.to_string());
+        // The page the cursor reports, and the token beside it — absent on the
+        // last page, which the shared rule decides.
+        let (schedule_actions, next_token): (Vec<ScheduleAction>, Option<String>) =
+            cursor.page(&ordered, |record| record.action.clone());
 
         Ok(DescribeScheduleOutput {
             next_token,

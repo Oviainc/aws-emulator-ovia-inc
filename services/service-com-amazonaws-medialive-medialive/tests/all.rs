@@ -365,6 +365,9 @@ mod shared_batch_outcome_rule;
 #[path = "all/shared_page_size_rule.rs"]
 mod shared_page_size_rule;
 
+#[path = "all/shared_position_cursor_rule.rs"]
+mod shared_position_cursor_rule;
+
 #[path = "all/shared_request_rules.rs"]
 mod shared_request_rules;
 
