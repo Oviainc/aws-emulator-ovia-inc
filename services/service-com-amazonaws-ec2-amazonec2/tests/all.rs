@@ -41,6 +41,12 @@ mod ipam_resource_discovery_associations;
 // inserts its lines.
 #[path = "all/send_diagnostic_interrupt.rs"]
 mod send_diagnostic_interrupt;
+// Which suppression `DisableApplicationStatusCheckSuppression` lifts, what a reader then
+// reports for that instance, and what the call refuses. Declared beside `prefix_lists` for
+// the reason the note above gives: the sorted neighbourhood and the tail of this file are
+// where every new ec2 suite inserts its lines.
+#[path = "all/disable_application_status_check_suppression.rs"]
+mod disable_application_status_check_suppression;
 // What `CreateLocalGatewayRoute` writes into one local gateway route table, what the clock
 // then owes the route, and what the create refuses. Declared beside `prefix_lists` for the
 // reason the note above gives: the sorted neighbourhood and the tail of this file are where

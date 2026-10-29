@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableApplicationStatusCheckSuppression
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableApplicationStatusCheckSuppression`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableApplicationStatusCheckSuppression::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: lifts the application status check suppression [`crate::state`] holds for
+//! each instance the request names, so health check results decide that instance's
+//! application status again, and reports each named instance in the successful or the
+//! unsuccessful set of its answer. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +138,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableApplicationStatusCheckSuppression` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableApplicationStatusCheckSuppressionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            deduplicate_ids, instance_id_is_well_formed, require_service_state,
+            system_time_to_date_time,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — a
+        // suppression is a fact of the instance rather than of the Region the request was
+        // signed for, exactly as `DescribeApplicationStatus` reads it. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the operation, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation": the question is
+        // about the CALLER's permission for this operation, which nothing the request names
+        // can change, so this operation answers it before it reads what the request names at
+        // all — and nothing is read or written for a request that gets this answer.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableApplicationStatusCheckSuppression"))
+        // WHERE a dry run sits relative to an operation's own validation is a fact of that
+        // operation, recorded by its caller, the way the wording of its unresolvable-id
+        // refusal is (`crate::scaffolded::Scaffolded::instance_id_is_malformed`): this one's
+        // recorded dry run answers `DryRunOperation` for a request whose instance id it
+        // refuses without the flag.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "The IDs of the instances for which to disable application status check
+        // suppression" is the only thing this call acts on, and the model marks it neither
+        // `@required` nor `@length`, so a request that names NO instance reaches here: it
+        // asks for nothing and is refused rather than answered with two empty sets. The
+        // parameter is named the way an ec2Query request spells it (the member's `xmlName`,
+        // `InstanceId`), the way the rest of this crate words a missing one.
+        let requested_ids = input.instance_ids.clone().unwrap_or_default();
+        if requested_ids.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter InstanceId",
+            ));
+        }
+        // "You can specify a maximum of 100 instance IDs for each request" — this
+        // operation's own documented ceiling, charged before any per-id work is done.
+        if requested_ids.len() > MAX_INSTANCE_IDS_PER_REQUEST {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "InstanceId carries {} ids, above the maximum of \
+                 {MAX_INSTANCE_IDS_PER_REQUEST}",
+                requested_ids.len()
+            )));
+        }
+
+        // One instance gets one answer however many times the batch names it: a repeat is
+        // the same instruction, not a second suppression to lift.
+        let instance_ids = deduplicate_ids(&requested_ids);
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The whole batch is resolved before the first suppression is lifted, so a request
+        // naming one id this service cannot resolve lifts nothing at all — which is also
+        // what makes this loop the last thing that can refuse the call. Malformed before
+        // unknown, the order this service asks the two questions in; the malformed half is
+        // worded the way THIS operation's validator words it — "The instance ID '<id>' is
+        // malformed", which is what its recorded refusal carries — rather than the bare
+        // "Invalid id" of the operations that answer `require_known_instance`.
+        for instance_id in &instance_ids {
+            if !instance_id_is_well_formed(instance_id) {
+                return Err(Scaffolded::instance_id_is_malformed(instance_id));
+            }
+            if !store.instances.contains_key(instance_id) {
+                return Err(Scaffolded::invalid_instance_id_not_found(instance_id));
+            }
+        }
+
+        // "After suppression is disabled, health check results resume affecting the
+        // instance-level application status": reporting resumes at the instant this call is
+        // served — the clock owes nothing later — so that instant is both what the stored
+        // suppression ends at and the `ResumeAt` the answer carries.
+        let now = ::std::time::SystemTime::now();
+        let resumed_at = system_time_to_date_time(now);
+
+        // Each instance is judged on its own and reported in one of the two sets the output
+        // declares, so an instance nothing is suppressing does not refuse the instances
+        // beside it. The suppression RECORD is kept and what changes is its end: a
+        // suppression that has ended is already no longer in force wherever one is read
+        // (`crate::state::ApplicationStatusSuppression::in_force_at`), and keeping it is
+        // what lets this call tell a caller when the suppression it lifted had started.
+        //
+        // Keeping it is also what makes a repeated call leave the store exactly as the
+        // first one left it: the second finds nothing in force, so it writes nothing and
+        // answers no error. This operation keeps no per-`ClientToken` memory of the answer
+        // it gave, so a repeat is answered from the state the first call left — it reports
+        // that nothing was in force rather than replaying the first answer — and nothing of
+        // the token is stored, so no caller-chosen bytes are retained for it.
+        let mut successful: Vec<SuccessfulSuppressionResponseObject> = Vec::new();
+        let mut unsuccessful: Vec<UnsuccessfulSuppressionResponseObject> = Vec::new();
+        for instance_id in &instance_ids {
+            let suppression = store
+                .application_status
+                .get_mut(instance_id)
+                .and_then(|record| record.suppression.as_mut());
+            match suppression {
+                // A suppression in force is what there is to disable: it ends here, and
+                // the instance is reported with the instant it started ("The date and time
+                // when suppression started") and the instant reporting resumed ("The date
+                // and time when suppression ends and health checks resume").
+                Some(suppression) if suppression.in_force_at(now) => {
+                    let suppressed_at = system_time_to_date_time(suppression.since);
+                    suppression.resume_at = Some(now);
+                    successful.push(SuccessfulSuppressionResponseObject {
+                        instance_id: Some(instance_id.clone()),
+                        suppress_at: Some(suppressed_at),
+                        resume_at: Some(resumed_at),
+                    });
+                }
+                // An instance whose reporting is NOT suppressed as of this instant has no
+                // suppression for this call to disable — whether one has already ended, on
+                // its own duration or on an earlier call, or none was ever put in force —
+                // so it is reported as unsuccessful with the reason. The instants are the
+                // ones a reader of that instance would see, and are absent when no
+                // suppression of it was ever recorded.
+                Some(suppression) => {
+                    let suppressed_at = system_time_to_date_time(suppression.since);
+                    let ended_at = suppression.resume_at.map(system_time_to_date_time);
+                    unsuccessful.push(UnsuccessfulSuppressionResponseObject {
+                        instance_id: Some(instance_id.clone()),
+                        suppress_at: Some(suppressed_at),
+                        resume_at: ended_at,
+                        reason: Some(NOT_SUPPRESSED_REASON.to_string()),
+                    });
+                }
+                None => unsuccessful.push(UnsuccessfulSuppressionResponseObject {
+                    instance_id: Some(instance_id.clone()),
+                    suppress_at: None,
+                    resume_at: None,
+                    reason: Some(NOT_SUPPRESSED_REASON.to_string()),
+                }),
+            }
+        }
+
+        Ok(DisableApplicationStatusCheckSuppressionOutput {
+            successful_results: Some(successful),
+            unsuccessful_results: Some(unsuccessful),
+        })
     }
 }
+
+/// The most instances one call may name: "You can specify a maximum of 100 instance IDs
+/// for each request", this operation's own documented ceiling
+/// (`smithy_query(query="doc",shape="DisableApplicationStatusCheckSuppression")`). The
+/// model declares no `@length` on `InstanceIdList`, so the handler is the only place the
+/// bound can exist.
+const MAX_INSTANCE_IDS_PER_REQUEST: usize = 100;
+
+/// "The reason the suppression failed" (`UnsuccessfulSuppressionResponseObject$Reason`) for
+/// the one cause this operation has: the instance's application status reporting was not
+/// suppressed as of the call, so there was no suppression of it to disable.
+const NOT_SUPPRESSED_REASON: &str =
+    "Application status check suppression is not in effect for this instance";
