@@ -151,8 +151,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The attach points are listed FOR an Environment, so an `environmentId` the
-        // catalog does not hold has nothing to list them for. An unresolvable
+        // The attach points are listed FOR an Environment, so the catalog record the
+        // `environmentId` names is what the listing is scoped by — and an id the catalog
+        // does not hold has no Environment to list anything for. An unresolvable
         // environment is this service's own client fault — the caller named an
         // environment model that does not exist — so it is the 400
         // `InterconnectClientException` every environment-resolving operation gives,
@@ -162,15 +163,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // binds no CreateEnvironment), so there is nothing the clock owes either. The
         // guard is dropped before the cross-service read below, so no lock is held
         // across an await.
-        let environment_is_known = state.lock().environments.contains_key(&input.environment_id);
-        if !environment_is_known {
+        let environment = state.lock().environments.get(&input.environment_id).cloned();
+        let Some(environment) = environment else {
             return Err(ListAttachPointsErrorModeled::InterconnectClientException(
                 InterconnectClientException {
                     message: crate::state::environment_not_found_message(&input.environment_id),
                 },
             )
             .into());
-        }
+        };
 
         // A cursor this operation did not issue is refused, rather than answered
         // with an empty page the caller cannot tell from "no more results".
@@ -193,13 +194,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // "Lists all Attach Points the caller has access to": `AttachPointType`'s only
-        // modelled value is `DirectConnectGateway` and `AttachPoint$directConnectGateway`
-        // names a gateway by its own id, so the listing IS the account's Direct Connect
-        // gateways — state of the service that owns them, resolved against it rather than
-        // held here. An account that owns none has no attach point, which is an empty
-        // page: a descriptor is never synthesised for a gateway that does not exist.
-        let descriptors = crate::state::direct_connect::attach_points(ctx, &region).await;
+        // "Lists all Attach Points the caller has access to THAT ARE VALID FOR the
+        // specified Environment": `AttachPointType`'s only modelled value is
+        // `DirectConnectGateway` and `AttachPoint$directConnectGateway` names a gateway
+        // by its own id, so the candidates are the account's Direct Connect gateways —
+        // state of the service that owns them, resolved against it rather than held
+        // here — and the Environment this listing is for is what decides which of them
+        // are valid: an Environment no Connection can be placed upon has no attach
+        // point to offer, because an attach point is where a Connection on THAT
+        // Environment would logically connect. The same predicate judges the attach
+        // point a create or an acceptance names, so the listing and those refusals
+        // cannot disagree. An account that owns no gateway has no attach point either,
+        // which is an empty page: a descriptor is never synthesised for a gateway that
+        // does not exist.
+        let descriptors =
+            crate::state::direct_connect::attach_points(ctx, &region, Some(&environment)).await;
 
         // Keyed by `identifier`, which is what identifies an attach point within an
         // environment, and ordered by it so paging walks one stable sequence: a page

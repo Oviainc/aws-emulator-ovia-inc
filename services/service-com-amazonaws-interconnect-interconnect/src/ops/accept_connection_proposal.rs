@@ -347,7 +347,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lock is held across an await. The same judgement is made again where the
         // acceptance is applied, so what lands is judged against the store as it is
         // THEN.
-        let environment_id = {
+        let (environment_id, environment) = {
             let mut store = state.lock();
             store.materialise_due_transitions(::std::time::Instant::now());
             match judge_against_store(&store, &input, &region)? {
@@ -356,21 +356,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         connection: Some(*connection),
                     })
                 }
-                StoreVerdict::Accept { environment_id, .. } => environment_id,
+                // The Environment the proposal's connection is placed upon is read
+                // under the SAME lock the verdict was made under: it is what scopes
+                // the attach-point judgement below, which runs off the lock.
+                StoreVerdict::Accept { environment_id, .. } => {
+                    let environment = store.environments.get(&environment_id).cloned();
+                    (environment_id, environment)
+                }
             }
         };
 
         // The attach point the acceptance selected, judged by the one rule both writers
         // of a connection's attach point are held to
         // (`crate::state::direct_connect::judge_attach_point`): a gateway the account
-        // does not hold, or one not ready for use, is not among the attach points valid
-        // for the Environment, and no Connection is made onto one; an account whose
-        // gateways could not be read at all is a different answer again, because then
-        // nothing is known about the identifier either way.
+        // does not hold, one not ready for use, and any gateway at all on an Environment
+        // that carries no Connection are none of them among the attach points valid for
+        // the Environment, and no Connection is made onto one; an account whose gateways
+        // could not be read at all is a different answer again, because then nothing is
+        // known about the identifier either way.
         crate::state::direct_connect::judge_attach_point::<AcceptConnectionProposalError>(
             ctx,
             &region,
             &input.attach_point,
+            environment.as_ref(),
             &environment_id,
         )
         .await?;

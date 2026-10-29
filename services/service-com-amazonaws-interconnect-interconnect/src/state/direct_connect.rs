@@ -4,18 +4,22 @@
 //!
 //! `AttachPointType`'s only modelled value is `DirectConnectGateway`, and
 //! `AttachPoint$directConnectGateway` identifies an attach point "by
-//! DirectConnectGatewayID" — so the attach points `ListAttachPoints` reports ("all Attach
-//! Points the caller has access to") are the Direct Connect gateways the ACCOUNT holds.
-//! Those are resources of Direct Connect, not of this service, so they are read the way
-//! any emulated service reaches another: the AWS SDK driven over the in-process callback
-//! ([`smithy_server_runtime::OperationContext::callback`]), so this crate names no other
-//! service's crate.
+//! DirectConnectGatewayID" — so the candidate attach points of an account are the Direct
+//! Connect gateways it holds. Those are resources of Direct Connect, not of this service,
+//! so they are read the way any emulated service reaches another: the AWS SDK driven over
+//! the in-process callback ([`smithy_server_runtime::OperationContext::callback`]), so
+//! this crate names no other service's crate.
+//!
+//! A candidate is only an attach point `ListAttachPoints` reports once it is one "that
+//! [is] valid for the specified Environment", so every reader here is scoped by the
+//! Environment the request named ([`crate::state::environment_offers_attach_points`]) and
+//! not by the account alone.
 //!
 //! Nothing is assumed from silence and nothing is invented: an account that holds no
 //! gateway — and an emulator with no Direct Connect mounted, which knows of none — has no
 //! attach point, which is an EMPTY listing rather than a fabricated descriptor.
 
-use crate::ops::types::{AttachPoint, AttachPointDescriptor};
+use crate::ops::types::{AttachPoint, AttachPointDescriptor, Environment};
 
 /// The one `DirectConnectGatewayState` a Connection can be attached to.
 ///
@@ -110,19 +114,25 @@ pub enum AttachPointResolution {
     Unresolvable,
 }
 
-/// Resolve `identifier` against the attach points of the account.
+/// Resolve `identifier` against the attach points valid for `environment`.
 ///
-/// Answered from the same walk [`attach_points`] reports, so what a Connection may be
-/// attached to is exactly what `ListAttachPoints` offers for the Environment — the two
-/// cannot drift apart. A gateway the account does not hold and one that is not ready
-/// for use are both [`AttachPointResolution::NotAnAttachPoint`]; a walk that could not
-/// be completed is [`AttachPointResolution::Unresolvable`], unless the pages it did
-/// read already hold the identifier, which settles the question on its own.
+/// Answered from the same reader [`attach_points`] reports, so what a Connection may be
+/// attached to is exactly what `ListAttachPoints` offers for that Environment — the two
+/// cannot drift apart. A gateway the account does not hold, one that is not ready for
+/// use, and any identifier at all on an Environment that carries no Connection
+/// ([`crate::state::environment_offers_attach_points`]) are all
+/// [`AttachPointResolution::NotAnAttachPoint`]; a walk that could not be completed is
+/// [`AttachPointResolution::Unresolvable`], unless the pages it did read already hold
+/// the identifier, which settles the question on its own.
 pub async fn resolve_attach_point(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
+    environment: Option<&Environment>,
     identifier: &str,
 ) -> AttachPointResolution {
+    if !crate::state::environment_offers_attach_points(environment) {
+        return AttachPointResolution::NotAnAttachPoint;
+    }
     let (descriptors, complete) = walk_attach_points(ctx, region).await;
     if descriptors
         .iter()
@@ -172,9 +182,10 @@ pub trait AttachPointRefusal: Sized {
 ///
 /// * [`AttachPointResolution::Valid`] — the identifier names an attach point of the
 ///   account, and the request continues;
-/// * [`AttachPointResolution::NotAnAttachPoint`] — it names none, which is the
-///   not-found refusal worded by [`crate::state::attach_point_not_valid_message`] from
-///   the identifier the request carried and the Environment it was offered for;
+/// * [`AttachPointResolution::NotAnAttachPoint`] — it names none of the attach points
+///   valid for that Environment, which is the not-found refusal worded by
+///   [`crate::state::attach_point_not_valid_message`] from the identifier the request
+///   carried and the Environment it was offered for;
 /// * [`AttachPointResolution::Unresolvable`] — the account's attach points could not be
 ///   read, which is the server refusal carrying the sentence above, a DIFFERENT answer
 ///   because nothing is known about the identifier either way.
@@ -183,16 +194,21 @@ pub trait AttachPointRefusal: Sized {
 /// DirectConnect Gateway attach point by DirectConnectGatewayID", a resource of the
 /// service that OWNS those gateways, while `AttachPoint$arn` names a Connection of the
 /// account, which this service's own store resolves under its own lock.
+/// `environment` is the catalog record the request resolved, and `environment_id` the
+/// identifier it resolved it by — taken separately, the way
+/// [`crate::state::bandwidth_availability_violation`] takes them, so the refusal names
+/// the Environment the request was for whether or not the catalog still holds it.
 pub async fn judge_attach_point<E: AttachPointRefusal>(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     attach_point: &AttachPoint,
+    environment: Option<&Environment>,
     environment_id: &str,
 ) -> Result<(), E> {
     let AttachPoint::directConnectGateway(gateway) = attach_point else {
         return Ok(());
     };
-    match resolve_attach_point(ctx, region, gateway).await {
+    match resolve_attach_point(ctx, region, environment, gateway).await {
         AttachPointResolution::Valid => Ok(()),
         AttachPointResolution::NotAnAttachPoint => Err(E::not_an_attach_point(
             crate::state::attach_point_not_valid_message(gateway, environment_id),
@@ -203,18 +219,27 @@ pub async fn judge_attach_point<E: AttachPointRefusal>(
     }
 }
 
-/// Every Direct Connect gateway of the account that is a valid attach point, as the
-/// descriptors `ListAttachPoints` reports.
+/// The attach points valid for `environment`: every Direct Connect gateway of the
+/// account that is ready for use, as the descriptors `ListAttachPoints` reports — and
+/// NONE at all for an Environment that carries no Connection
+/// ([`crate::state::environment_offers_attach_points`]), because an attach point is
+/// where a Connection on that Environment would logically connect, so an Environment
+/// nothing can be placed upon has nothing valid to offer. The account's gateways are
+/// not read at all in that case: no answer about them could change it.
 ///
-/// Empty when the account holds none, and empty when Direct Connect cannot be asked at
-/// all — in both cases nothing is known to attach to, and a descriptor is never
-/// synthesised to fill the gap. The second case is not silent: it is logged at `warn`,
-/// so an empty listing is not read as a positive answer when the peer simply did not
-/// answer.
+/// Empty, too, when the account holds no gateway, and when Direct Connect cannot be
+/// asked at all — in both cases nothing is known to attach to, and a descriptor is
+/// never synthesised to fill the gap. The last case is not silent: it is logged at
+/// `warn`, so an empty listing is not read as a positive answer when the peer simply
+/// did not answer.
 pub async fn attach_points(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
+    environment: Option<&Environment>,
 ) -> Vec<AttachPointDescriptor> {
+    if !crate::state::environment_offers_attach_points(environment) {
+        return Vec::new();
+    }
     walk_attach_points(ctx, region).await.0
 }
 

@@ -4,19 +4,21 @@
 //!
 //! An attach point is not a catalog this service publishes: `AttachPointType`'s only
 //! modelled value is `DirectConnectGateway` and `AttachPoint$directConnectGateway`
-//! identifies one "by DirectConnectGatewayID", so the listing is the account's own Direct
-//! Connect gateways — state of the service that owns them. These suites drive both
-//! services on one engine (the `crate::emulator` harness) and assert the rule over
+//! identifies one "by DirectConnectGatewayID", so the candidates are the account's own
+//! Direct Connect gateways — state of the service that owns them — and the Environment
+//! the listing is asked for decides which of them are valid for it. These suites drive
+//! both services on one engine (the `crate::emulator` harness) and assert the rule over
 //! tables whose rows differ in how many gateways the account holds, in each gateway's
 //! name and `amazonSideAsn`, in the environment the listing is asked for, and in the
 //! gateway's own lifecycle state.
 
 use std::collections::BTreeSet;
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::emulator::{
-    available_bandwidths, creatable_environments, text, Emulator, ATTACH_POINT_TYPE,
+    available_bandwidths, carries_connections, creatable_environments, identifiers, text, Emulator,
+    ATTACH_POINT_TYPE,
 };
 
 /// A well-formed `DirectConnectGatewayAttachPoint` (36 characters in the UUID groups the
@@ -24,29 +26,17 @@ use crate::emulator::{
 /// reported as an attach point.
 const UNOWNED_GATEWAY_UUID: &str = "00000000-0000-4000-8000-000000000000";
 
-/// The `identifier`s of a listing, as a set.
-fn identifiers(listed: &[Value]) -> BTreeSet<String> {
-    listed
-        .iter()
-        .map(|descriptor| text(descriptor, "identifier"))
-        .collect()
-}
-
-/// RULE: the attach points an Environment offers are exactly the Direct Connect gateways
-/// the account holds — so creating one makes it listable, and the listing grows with the
+/// RULE: the attach points an Environment offers are the Direct Connect gateways the
+/// account holds that are valid for that Environment — so creating one makes it listable
+/// on every Environment that can carry a Connection, and the listing grows with the
 /// account rather than with the environment id.
 #[tokio::test]
 async fn a_created_gateway_becomes_a_listed_attach_point() {
     let emulator = Emulator::new();
-    let environments: Vec<String> = emulator
-        .environments()
-        .await
-        .iter()
-        .map(|environment| text(environment, "environmentId"))
-        .collect();
+    let catalog = emulator.environments().await;
     assert!(
-        !environments.is_empty(),
-        "case \"catalog\": expected the seeded Environment catalog to be non-empty, got {environments:?}"
+        !catalog.is_empty(),
+        "case \"catalog\": expected the seeded Environment catalog to be non-empty, got {catalog:?}"
     );
 
     // Rows differ in how many gateways the account holds (none, one, then one more each
@@ -68,15 +58,22 @@ async fn a_created_gateway_becomes_a_listed_attach_point() {
             let ids = emulator.ready_gateways(&[(name, asn)]).await;
             owned.extend(ids);
         }
-        // EVERY environment of the catalog reports the same account-owned set: the
-        // gateways are account state, so the environment the caller names does not
-        // change which ones exist.
-        for environment_id in &environments {
-            let listed = emulator.attach_points(environment_id).await;
+        // EVERY environment that can carry a Connection reports the same account-owned
+        // set: the gateways are account state, so which ones EXIST does not depend on
+        // the environment the caller names — while an environment that can carry none
+        // has no valid attach point to report at all.
+        for environment in &catalog {
+            let environment_id = text(environment, "environmentId");
+            let expected = if carries_connections(environment) {
+                owned.clone()
+            } else {
+                BTreeSet::new()
+            };
+            let listed = emulator.attach_points(&environment_id).await;
             assert_eq!(
                 identifiers(&listed),
-                owned,
-                "case {case:?} ({} owned) / {environment_id:?}: expected the account's gateways, got {listed:?}",
+                expected,
+                "case {case:?} ({} owned) / {environment_id:?}: expected the gateways valid for this environment, got {listed:?}",
                 owned.len()
             );
             for descriptor in &listed {
@@ -105,7 +102,13 @@ async fn a_created_gateway_becomes_a_listed_attach_point() {
 #[tokio::test]
 async fn a_gateway_is_an_attach_point_once_direct_connect_reports_it_available() {
     let emulator = Emulator::new();
-    let environment_id = text(&emulator.environments().await[0], "environmentId");
+    // An environment that can carry a Connection, so what the listing turns on below is
+    // the gateway's own lifecycle state and nothing else.
+    let catalog = emulator.environments().await;
+    let environment_id = text(
+        &creatable_environments(&catalog)[0],
+        "environmentId",
+    );
 
     // Rows differ in the gateway's name and ASN; each is read straight back (the
     // transient state the clock owes is never zero-length) and then after it settles.

@@ -234,7 +234,7 @@ fn judge_against_store(
     // new connections ("available: the environment is available and new
     // Connection objects can be requested" / "unavailable: the environment is
     // currently unavailable").
-    if environment.state == "unavailable" {
+    if environment.state == crate::state::UNAVAILABLE_ENVIRONMENT_STATE {
         return Err(CreateConnectionErrorModeled::InterconnectClientException(
             InterconnectClientException {
                 message: format!(
@@ -368,14 +368,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The attach point the request selected, judged by the one rule both writers of
         // a connection's attach point are held to
         // (`crate::state::direct_connect::judge_attach_point`): a gateway the account
-        // does not hold, or one not ready for use, is not among the attach points valid
-        // for the Environment, and a Connection is never provisioned onto one; an
-        // account whose gateways could not be read at all is a different answer again,
-        // because then nothing is known about the identifier either way.
+        // does not hold, one not ready for use, and any gateway at all on an Environment
+        // that carries no Connection are none of them among the attach points valid for
+        // the Environment, and a Connection is never provisioned onto one; an account
+        // whose gateways could not be read at all is a different answer again, because
+        // then nothing is known about the identifier either way.
         crate::state::direct_connect::judge_attach_point::<CreateConnectionError>(
             ctx,
             &region,
             &input.attach_point,
+            Some(&environment),
             &environment.environment_id,
         )
         .await?;

@@ -496,6 +496,15 @@ pub(crate) fn without_tags(connection: &Value) -> Value {
     copy
 }
 
+/// The `identifier`s of an attach-point listing, as a set — the ONE reader every
+/// attach-point suite compares a listing by, so none of them keeps its own copy.
+pub(crate) fn identifiers(listed: &[Value]) -> std::collections::BTreeSet<String> {
+    listed
+        .iter()
+        .map(|descriptor| text(descriptor, "identifier"))
+        .collect()
+}
+
 /// A string member, or `""` when absent — so a missing member fails an assertion
 /// rather than panicking the harness.
 pub(crate) fn text(value: &Value, member: &str) -> String {
@@ -527,12 +536,30 @@ pub(crate) fn available_bandwidths(environment: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The environments a connection can be created on: one offering no available
-/// bandwidth (the `unavailable` state) takes none.
+/// The `EnvironmentState` the model documents as "the environment is currently
+/// unavailable", as against `available` ("new Connection objects can be requested") and
+/// `limited` ("available, but overall capacity is limited").
+pub(crate) const UNAVAILABLE_ENVIRONMENT_STATE: &str = "unavailable";
+
+/// Whether a Connection can be placed on this Environment at all — which is also
+/// whether any attach point is valid FOR it, since an attach point is where a
+/// Connection on that Environment "will logically connect"
+/// (`CreateConnection$attachPoint`).
+///
+/// Two members of the record say it carries none: the `unavailable` state, and a
+/// `bandwidths.available` ("the list of currently available bandwidths") offering
+/// nothing, which leaves no value the required `CreateConnection$bandwidth` could carry.
+pub(crate) fn carries_connections(environment: &Value) -> bool {
+    text(environment, "state") != UNAVAILABLE_ENVIRONMENT_STATE
+        && !available_bandwidths(environment).is_empty()
+}
+
+/// The environments a connection can be created on: one that carries none
+/// ([`carries_connections`]) takes no create.
 pub(crate) fn creatable_environments(catalog: &[Value]) -> Vec<Value> {
     catalog
         .iter()
-        .filter(|environment| !available_bandwidths(environment).is_empty())
+        .filter(|environment| carries_connections(environment))
         .cloned()
         .collect()
 }

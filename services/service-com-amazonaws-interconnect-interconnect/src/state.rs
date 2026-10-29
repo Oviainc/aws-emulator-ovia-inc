@@ -627,6 +627,44 @@ pub fn attach_point_not_valid_message(identifier: &str, environment_id: &str) ->
     )
 }
 
+/// The `EnvironmentState` on which an Environment takes no new Connection at all.
+///
+/// The state's own documentation draws the line: `available` is "the environment is
+/// available and new `Connection` objects can be requested" and `limited` is "the
+/// environment is available, but overall capacity is limited", while this one is "the
+/// environment is currently unavailable".
+pub const UNAVAILABLE_ENVIRONMENT_STATE: &str = "unavailable";
+
+/// Whether ANY attach point is valid for the Environment — which is whether a
+/// Connection can be placed on it at all.
+///
+/// `ListAttachPoints` reports "all Attach Points the caller has access to that are
+/// valid for the specified Environment", and an attach point is where a Connection on
+/// that Environment "will logically connect" (`CreateConnection$attachPoint`): an
+/// Environment that can carry no Connection therefore has no valid attach point,
+/// whatever the account holds. Two members of the Environment record say it carries
+/// none — its `state` ([`UNAVAILABLE_ENVIRONMENT_STATE`]), and a `bandwidths.available`
+/// offering nothing, which leaves no value the required `CreateConnection$bandwidth`
+/// could carry ([`bandwidth_availability_violation`]) — so this is the ONE predicate
+/// both the listing and the per-request attach-point judgement scope themselves by, and
+/// what the listing offers for an Environment cannot drift from what a create onto it
+/// accepts.
+///
+/// `environment` is an `Option` for the same reason
+/// [`bandwidth_availability_violation`]'s is: a caller that reaches the catalog by id
+/// may find no record there, and an Environment the catalog does not hold carries no
+/// Connection either.
+pub fn environment_offers_attach_points(environment: Option<&Environment>) -> bool {
+    environment.is_some_and(|environment| {
+        environment.state != UNAVAILABLE_ENVIRONMENT_STATE
+            && environment
+                .bandwidths
+                .available
+                .as_deref()
+                .is_some_and(|available| !available.is_empty())
+    })
+}
+
 /// Judge the `arn` member of the `attach_point` a request selected for a connection on
 /// `environment_id`, answering `Ok(())` when the connection may be provisioned onto it.
 ///
@@ -644,7 +682,9 @@ pub fn attach_point_not_valid_message(identifier: &str, environment_id: &str) ->
 /// the `arn` member against the store under the caller's lock, and
 /// [`direct_connect::judge_attach_point`] answers `directConnectGateway` — a resource of
 /// the service that owns those gateways — off that lock, under the same readiness rule.
-/// Each answers `Ok(())` for the member the other owns.
+/// Each answers `Ok(())` for the member the other owns, and each scopes itself to the
+/// Environment by the same predicate ([`environment_offers_attach_points`]), so neither
+/// member names an attach point valid for an Environment the other would refuse.
 pub fn judge_attach_point_arn<E: direct_connect::AttachPointRefusal>(
     store: &ComAmazonawsInterconnectInterconnectState,
     region: &str,
@@ -654,7 +694,9 @@ pub fn judge_attach_point_arn<E: direct_connect::AttachPointRefusal>(
     let AttachPoint::Arn(arn) = attach_point else {
         return Ok(());
     };
-    if store.attach_point_connection_in(region, arn).is_some() {
+    if environment_offers_attach_points(store.environments.get(environment_id))
+        && store.attach_point_connection_in(region, arn).is_some()
+    {
         return Ok(());
     }
     Err(E::not_an_attach_point(attach_point_not_valid_message(
@@ -1443,7 +1485,7 @@ fn seed_environments() -> BTreeMap<String, Environment> {
             provider: Provider::lastMileProvider("Megaport".to_string()),
             location: "Sydney, NSW".to_string(),
             environment_id: "env-lmp-megaport-sydney".to_string(),
-            state: "unavailable".to_string(),
+            state: UNAVAILABLE_ENVIRONMENT_STATE.to_string(),
             bandwidths: Bandwidths {
                 available: Some(Vec::new()),
                 supported: Some(vec!["1Gbps".to_string(), "10Gbps".to_string()]),

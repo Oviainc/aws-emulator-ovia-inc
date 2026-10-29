@@ -16,7 +16,9 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Map, Value};
 
-use crate::emulator::{remote_account_for, text, Emulator, ATTACH_POINT_TYPE};
+use crate::emulator::{
+    carries_connections, identifiers, remote_account_for, text, Emulator, ATTACH_POINT_TYPE,
+};
 
 /// `MaxResults` is modelled `@range(min: 1, max: 100)`, so these are the published
 /// bounds a page size may take, and 0 / 101 are the first values past them.
@@ -48,23 +50,16 @@ fn is_dxgw_identifier(value: &str) -> bool {
             .all(|group| group.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// The `identifier`s of a listing, as a set.
-fn identifiers(listed: &[Value]) -> BTreeSet<String> {
-    listed
-        .iter()
-        .map(|descriptor| text(descriptor, "identifier"))
-        .collect()
-}
-
 // ---------------------------------------------------------------------------
 // The attach points an Environment offers
 // ---------------------------------------------------------------------------
 
-/// RULE: `ListAttachPoints` reports the Direct Connect gateways the ACCOUNT holds —
-/// nothing while it holds none — each with every member `AttachPointDescriptor`
-/// requires, and reading it changes nothing a later caller sees.
+/// RULE: `ListAttachPoints` reports the Direct Connect gateways the ACCOUNT holds that
+/// are valid for the Environment asked about — nothing while it holds none, and nothing
+/// at all for an Environment that can carry no Connection — each with every member
+/// `AttachPointDescriptor` requires, and reading it changes nothing a later caller sees.
 #[tokio::test]
-async fn every_environment_reports_the_accounts_gateways_as_attach_points() {
+async fn an_environment_reports_the_accounts_gateways_it_can_carry_a_connection_on() {
     let emulator = Emulator::new();
     let catalog = emulator.environments().await;
     assert!(
@@ -88,15 +83,21 @@ async fn every_environment_reports_the_accounts_gateways_as_attach_points() {
     let owned: BTreeSet<String> = gateways.iter().cloned().collect();
 
     // One row per environment: they differ in the provider kind, the location and the
-    // state. Every one of them reports the SAME account-owned gateways — the set is
-    // account state, not a per-environment catalog.
+    // state. An environment that can carry a Connection reports the account-owned
+    // gateways; one that can carry none reports no attach point, because an attach point
+    // is where a Connection on THAT environment would logically connect.
     for environment in &catalog {
         let id = text(environment, "environmentId");
+        let expected = if carries_connections(environment) {
+            owned.clone()
+        } else {
+            BTreeSet::new()
+        };
         let listed = emulator.attach_points(&id).await;
         assert_eq!(
             identifiers(&listed),
-            owned,
-            "case {id:?}: expected the account's own gateways as attach points, got {listed:?}"
+            expected,
+            "case {id:?}: expected the attach points valid for this environment, got {listed:?}"
         );
 
         // The largest page a caller may ask for is the last one: `nextToken` comes back
@@ -169,7 +170,11 @@ async fn every_environment_reports_the_accounts_gateways_as_attach_points() {
             )
         })
         .collect();
-    let first_environment = text(&catalog[0], "environmentId");
+    let first_environment = catalog
+        .iter()
+        .find(|environment| carries_connections(environment))
+        .map(|environment| text(environment, "environmentId"))
+        .expect("the seeded catalog offers an environment that carries connections");
     for descriptor in emulator.attach_points(&first_environment).await {
         let identifier = text(&descriptor, "identifier");
         let expected = names
@@ -198,10 +203,15 @@ async fn attach_point_pages_walk_each_environment_without_repeats_or_gaps() {
     for environment in emulator.environments().await {
         let id = text(&environment, "environmentId");
         let all = emulator.attach_points(&id).await;
+        let expected_len = if carries_connections(&environment) {
+            GATEWAY_ROWS.len()
+        } else {
+            0
+        };
         assert_eq!(
             all.len(),
-            GATEWAY_ROWS.len(),
-            "case {id:?}: expected one attach point per gateway the account holds, got {all:?}"
+            expected_len,
+            "case {id:?}: expected {expected_len} attach points valid for this environment, got {all:?}"
         );
 
         // Rows differ in page size: every size from one item to one past the whole
@@ -248,7 +258,9 @@ async fn attach_point_pages_walk_each_environment_without_repeats_or_gaps() {
         }
 
         // Each published `MaxResults` bound is accepted; the first value past either
-        // bound is refused by the modelled range rather than silently clamped.
+        // bound is refused by the modelled range rather than silently clamped. A page is
+        // as long as the listing allows, which is nothing at all on an environment that
+        // carries no Connection.
         for max_results in MAX_RESULTS_BOUNDS {
             let listed = emulator
                 .ic_ok(
@@ -261,8 +273,9 @@ async fn attach_point_pages_walk_each_environment_without_repeats_or_gaps() {
                 .cloned()
                 .unwrap_or_default();
             assert!(
-                !page.is_empty() && page.len() as i64 <= max_results,
-                "case {id:?}/maxResults {max_results}: expected a page of 1..={max_results}, got {}",
+                page.len() == all.len().min(max_results as usize),
+                "case {id:?}/maxResults {max_results}: expected a page of {}, got {}",
+                all.len().min(max_results as usize),
                 page.len()
             );
         }

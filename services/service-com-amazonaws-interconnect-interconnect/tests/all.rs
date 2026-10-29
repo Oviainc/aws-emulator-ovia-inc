@@ -27,6 +27,8 @@ mod attach_point_arn_stops_at_the_delete;
 mod attach_point_judgement_is_shared;
 #[path = "all/attach_points.rs"]
 mod attach_points;
+#[path = "all/attach_points_are_scoped_to_the_environment.rs"]
+mod attach_points_are_scoped_to_the_environment;
 #[path = "all/bandwidth_availability.rs"]
 mod bandwidth_availability;
 #[path = "all/billing_tier.rs"]
