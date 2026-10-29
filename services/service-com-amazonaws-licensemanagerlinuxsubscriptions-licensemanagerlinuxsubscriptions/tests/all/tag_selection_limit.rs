@@ -269,7 +269,8 @@ async fn a_tag_selection_within_the_modelled_maximum_is_accepted() {
 
     // A removal names between one key and the maximum, and empties a resource carrying
     // exactly those keys. (`tagKeys` is `@required`, so a request naming none of them is
-    // a different refusal and not a row of this rule.)
+    // a different refusal and not a row of this rule — `tag_api_refusal_code.rs` pins
+    // what that refusal is.)
     for count in [1_usize, 2, MAX_TAG_SELECTION - 1, MAX_TAG_SELECTION] {
         let case = format!("UntagResource naming {count} key(s)");
         let label = format!("removal-{count}");

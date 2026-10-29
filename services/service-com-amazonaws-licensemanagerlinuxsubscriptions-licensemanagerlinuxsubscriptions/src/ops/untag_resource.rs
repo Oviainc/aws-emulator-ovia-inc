@@ -16,7 +16,11 @@
 //!    operation does not even model. A `tagKeys` selection past its modelled maximum is
 //!    refused at that same boundary with that same code and the sentence stating the
 //!    limit: the limit is the size of the tag set a resource may carry, and this list
-//!    selects out of that one set exactly as a write's tag map does.
+//!    selects out of that one set exactly as a write's tag map does. `tagKeys` is also
+//!    `@required` and bound to the query string, so a request carrying no `tagKeys`
+//!    parameter is refused at that boundary with that same code and the sentence naming
+//!    the parameter it has to add — every refusal of this surface is the surface's own,
+//!    whatever the violated constraint.
 //! 2. EXISTENCE — an ARN addressing no resource of this account is refused with HTTP 404
 //!    `NotFoundException` ([`crate::scaffolded::NOT_FOUND_CODE`] /
 //!    [`crate::scaffolded::NOT_FOUND_STATUS`]), the same status, code and text as the

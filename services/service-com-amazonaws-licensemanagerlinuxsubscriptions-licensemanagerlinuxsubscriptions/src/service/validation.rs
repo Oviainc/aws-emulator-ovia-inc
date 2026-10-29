@@ -20,7 +20,12 @@
 //!    whether it travels as the tag MAP of a write (`RegisterSubscriptionProvider`'s
 //!    `Tags` as much as `TagResource`'s `tags`) or as the tag-KEY LIST of a removal
 //!    (`UntagResource`'s `tagKeys`), since both select from the one tag set whose size
-//!    the limit is about. Both are the refusals `crate::scaffolded` states, so the
+//!    the limit is about. And so is a required REQUEST PARAMETER the request does not
+//!    carry — a member the model binds to the query string, which the request therefore
+//!    has to name for the operation to be addressed at all: that refusal states the
+//!    parameters to add (see [`absent_request_parameters`]), and it is the surface's
+//!    because the operation whose parameter it is models no generic constraint error to
+//!    state it with. All three are the refusals `crate::scaffolded` states, so the
 //!    EXISTENCE stage a handler answers (`NotFoundException`) sits behind the same
 //!    taxonomy.
 //! 2. **Every other refusal is the AWS constraint envelope** under this service's
@@ -66,7 +71,7 @@ use std::collections::{HashMap, HashSet};
 
 use smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
 
-use crate::scaffolded::UnmodeledRefusal;
+use crate::scaffolded::{UnmodeledRefusal, BAD_REQUEST_CODE};
 
 /// The error code this service answers an input-constraint violation with: its own
 /// modelled `ValidationException`, which carries `@httpError 400`
@@ -355,37 +360,103 @@ pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
     }
 }
 
-/// The tagging surface's own refusal for `violations`, or `None` when none of them is on
-/// that surface.
+/// The tagging surface's own refusal for `violations`, or `None` when none of them is a
+/// refusal that surface states itself.
 ///
 /// The FIRST violation decides, because it is the first thing the walk found wrong and
-/// the tag APIs state one refusal rather than an envelope of clauses. Both refusals are
-/// the constants `crate::scaffolded` states them with, so a handler reaching the same
-/// refusal from inside the operation answers identically.
-fn tag_api_refusal(violations: &[Violation]) -> Option<&'static UnmodeledRefusal> {
+/// the tag APIs state one refusal rather than an envelope of clauses. THREE classes are
+/// the surface's own, each with the sentence `crate::scaffolded` states it with (so a
+/// handler reaching the same refusal from inside the operation answers identically) or,
+/// for the third, with the parameters the request has to add: a value outside the
+/// `resourceArn` label's grammar, a tag selection past its size limit, and a required
+/// REQUEST PARAMETER the request does not carry. Every other class is the service's
+/// modelled constraint envelope ([`refused`]), which is what this service's models
+/// declare for a value they refuse.
+fn tag_api_refusal(violations: &[Violation]) -> Option<Refused> {
     const INVALID_ARN: UnmodeledRefusal = UnmodeledRefusal::invalid_resource_arn();
     const TAG_LIMIT: UnmodeledRefusal = UnmodeledRefusal::tag_limit_exceeded();
 
     let first = violations.first()?;
     let (path, depth) = collapsed(&first.path);
-    // Both refusals are about the MEMBER itself — the label's own grammar, and the SIZE
-    // of the tag selection — so a violation reached THROUGH a collection step is not one
-    // of them, whatever member it sits under. That is also what keeps a numeric tag KEY
-    // from being read as a tag-count violation: the framework spells a map entry
-    // `<key>.member`, exactly as it spells a list element, so a key of digits only is
-    // indistinguishable from an index by the path alone — but a per-key, per-value or
-    // per-element `@length` on such an entry is not the collection's own `@length`, and
-    // this check is what separates them.
+    // Both of the surface's VALUE refusals are about the MEMBER itself — the label's own
+    // grammar, and the SIZE of the tag selection — so a violation reached THROUGH a
+    // collection step is not one of them, whatever member it sits under. That is also
+    // what keeps a numeric tag KEY from being read as a tag-count violation: the
+    // framework spells a map entry `<key>.member`, exactly as it spells a list element,
+    // so a key of digits only is indistinguishable from an index by the path alone — but
+    // a per-key, per-value or per-element `@length` on such an entry is not the
+    // collection's own `@length`, and this check is what separates them.
     if depth != 0 {
         return None;
     }
     if path == RESOURCE_ARN_MEMBER {
-        return Some(&INVALID_ARN);
+        return Some(stated(&INVALID_ARN));
     }
-    if TAG_SELECTION_MEMBERS.contains(&path) && matches!(first.kind, ViolationKind::MaxLength(_)) {
-        return Some(&TAG_LIMIT);
+    if !TAG_SELECTION_MEMBERS.contains(&path) {
+        return None;
     }
-    None
+    match first.kind {
+        // The selection is past the size a resource's tag set may reach.
+        ViolationKind::MaxLength(_) => Some(stated(&TAG_LIMIT)),
+        // A required REQUEST PARAMETER is absent, so the request does not name what to
+        // remove at all. `None` when the absent member travels in the BODY instead: a
+        // payload that omits a required member is not a missing request parameter, and
+        // the operations that carry a tag selection in their body do declare the
+        // service's modelled constraint error for it.
+        ViolationKind::MissingRequiredMember => {
+            absent_request_parameters(violations).map(|message| Refused {
+                code: BAD_REQUEST_CODE.to_string(),
+                message,
+            })
+        }
+        // Every other class is the service's modelled constraint envelope.
+        _ => None,
+    }
+}
+
+/// `refusal` as the answer the framework renders.
+fn stated(refusal: &UnmodeledRefusal) -> Refused {
+    Refused {
+        code: refusal.code.to_string(),
+        message: refusal.message.to_string(),
+    }
+}
+
+/// The sentence stating the required REQUEST PARAMETERS `violations` reports absent, or
+/// `None` when it reports none.
+///
+/// The fixed half states the condition; the variable half is the list of parameter NAMES
+/// the request left out — in walk order, without repeats — because that is what tells the
+/// caller what to add. Only a member that travels AS a request parameter is named, and
+/// which members those are is read off the model by [`super::tag_request_parameters`]
+/// rather than written out here: a body member absent from a payload is not a missing
+/// request parameter.
+fn absent_request_parameters(violations: &[Violation]) -> Option<String> {
+    let mut named: Vec<&str> = Vec::new();
+    for violation in violations {
+        if !matches!(violation.kind, ViolationKind::MissingRequiredMember) {
+            continue;
+        }
+        let (path, depth) = collapsed(&violation.path);
+        if depth != 0 {
+            continue;
+        }
+        let parameter = super::tag_request_parameters()
+            .find(|(member, _)| member == path)
+            .map(|(_, parameter)| parameter);
+        if let Some(parameter) = parameter {
+            if !named.contains(&parameter) {
+                named.push(parameter);
+            }
+        }
+    }
+    if named.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Missing required request parameters: [{}]",
+        named.join(", ")
+    ))
 }
 
 /// How this service states `refusal`, or `None` to keep the framework's wording.
@@ -396,10 +467,7 @@ fn tag_api_refusal(violations: &[Violation]) -> Option<&'static UnmodeledRefusal
 pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
     match refusal {
         Refusal::Invalid(violations) => match tag_api_refusal(violations) {
-            Some(tag_refusal) => Some(Refused {
-                code: tag_refusal.code.to_string(),
-                message: tag_refusal.message.to_string(),
-            }),
+            Some(tag_refusal) => Some(tag_refusal),
             None => Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),
                 message: envelope(violations)?,
@@ -519,6 +587,99 @@ mod tests {
                 refusal.is_some(),
                 expects_tag_limit,
                 "case {path:?}: expected a tag-API refusal: {expects_tag_limit}, got {refusal:?}"
+            );
+        }
+    }
+
+    /// Which classes of refusal on a member of the tagging surface take that surface's
+    /// own code, and which keep the service's modelled constraint envelope: a value
+    /// outside the label's grammar, a selection past its size, and a required REQUEST
+    /// PARAMETER the request does not carry are the surface's; a required member of a
+    /// request BODY, and every other class, are the modelled envelope's.
+    #[test]
+    fn only_the_surfaces_own_classes_take_the_surfaces_code() {
+        // (member, class, the code the refusal names)
+        let cases: &[(&str, ViolationKind, &str)] = &[
+            (
+                RESOURCE_ARN_MEMBER,
+                ViolationKind::Pattern("^arn:.*$".to_string()),
+                BAD_REQUEST_CODE,
+            ),
+            ("tagKeys", ViolationKind::MaxLength(50), BAD_REQUEST_CODE),
+            ("tags", ViolationKind::MaxLength(50), BAD_REQUEST_CODE),
+            // The `@httpQuery` parameter of the removal: the surface's.
+            (
+                "tagKeys",
+                ViolationKind::MissingRequiredMember,
+                BAD_REQUEST_CODE,
+            ),
+            // The required BODY member of the write: the modelled envelope's.
+            (
+                "tags",
+                ViolationKind::MissingRequiredMember,
+                VALIDATION_EXCEPTION,
+            ),
+            // A class no model of this surface reaches, had it one: the envelope's.
+            ("tagKeys", ViolationKind::UniqueItems, VALIDATION_EXCEPTION),
+            // And a member of another surface entirely.
+            (
+                "subscriptionProviderSources",
+                ViolationKind::EnumValue(vec!["RedHat".to_string()]),
+                VALIDATION_EXCEPTION,
+            ),
+        ];
+        for (member, kind, expected) in cases {
+            let violation = Violation {
+                path: (*member).to_string(),
+                kind: kind.clone(),
+                value: None,
+            };
+            let refused = refused(&Refusal::Invalid(vec![violation]))
+                .unwrap_or_else(|| panic!("case {member} {kind:?}: nothing was stated"));
+            assert_eq!(
+                refused.code, *expected,
+                "case {member} {kind:?}: expected the code {expected}, got {:?}",
+                refused.code
+            );
+            assert!(
+                !refused.message.is_empty(),
+                "case {member} {kind:?}: the refusal must state what was wrong"
+            );
+        }
+    }
+
+    /// The parameters a request has to add are named from the members the walk reports
+    /// absent — the parameter's wire name, in walk order, without repeats — and a member
+    /// that travels in the BODY is not one of them.
+    #[test]
+    fn only_absent_request_parameters_are_named() {
+        let absent = |path: &str| Violation {
+            path: path.to_string(),
+            kind: ViolationKind::MissingRequiredMember,
+            value: None,
+        };
+        let cases: &[(&[&str], Option<&str>)] = &[
+            (
+                &["tagKeys"],
+                Some("Missing required request parameters: [tagKeys]"),
+            ),
+            (
+                &["tagKeys", "tagKeys"],
+                Some("Missing required request parameters: [tagKeys]"),
+            ),
+            // A required member of a request BODY is absent from a payload, not from the
+            // request parameters.
+            (&["tags"], None),
+            (&["secretArn"], None),
+            (&[], None),
+        ];
+        for (paths, expected) in cases {
+            let violations: Vec<Violation> = paths.iter().map(|path| absent(path)).collect();
+            let actual = absent_request_parameters(&violations);
+            assert_eq!(
+                actual.as_deref(),
+                *expected,
+                "case {paths:?}: expected {expected:?}, got {actual:?}"
             );
         }
     }

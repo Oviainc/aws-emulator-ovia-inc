@@ -41,6 +41,8 @@ mod state_roundtrip;
 mod subscription_provider_registration;
 #[path = "all/subscription_providers.rs"]
 mod subscription_providers;
+#[path = "all/tag_api_refusal_code.rs"]
+mod tag_api_refusal_code;
 #[path = "all/tag_not_found_status.rs"]
 mod tag_not_found_status;
 #[path = "all/tag_removal.rs"]
