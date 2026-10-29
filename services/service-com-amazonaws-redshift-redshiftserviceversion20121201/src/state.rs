@@ -17,7 +17,8 @@
 //! with, the Redshift-managed VPC endpoints the account created on its clusters
 //! and the endpoint authorizations that say which account may create one,
 //! and the resource policies attached to the resources whose ARNs a
-//! `PutResourcePolicy` named. Every collection keeps
+//! `PutResourcePolicy` named, and the Amazon Redshift Advisor recommendations
+//! recorded against the account's clusters. Every collection keeps
 //! INSERTION ORDER, so the `Marker`
 //! cursor the paginated `Describe*` operations hand out is a stable, resumable
 //! offset into the same sequence a later page walks.
@@ -54,6 +55,7 @@ use crate::ops::types::{
     NamespaceIdentifierUnion,
     NetworkInterface, Parameter, PartnerIntegrationInfo, PendingModifiedValues, Qev2IdcApplication,
     RecurringCharge,
+    Recommendation,
     RedshiftIdcApplication, ReservedNode, ReservedNodeConfigurationOption,
     ReservedNodeExchangeStatus, ReservedNodeOffering, Snapshot, SnapshotCopyGrant, Subnet,
     SupportedOperation,
@@ -3506,6 +3508,22 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// Every endpoint authorization, keyed by the cluster and the grantee account
     /// it was granted for, in creation order.
     pub endpoint_authorizations: Vec<StoredEndpointAuthorization>,
+    /// Every Amazon Redshift Advisor recommendation recorded against a cluster of
+    /// this account, keyed by `Id`, in the order they were recorded.
+    ///
+    /// Unlike the published catalogs above, this collection is neither seeded nor
+    /// grown by any operation: an Advisor finding comes from ANALYSING a
+    /// cluster's workload — its query and table history — which this control
+    /// plane holds none of, and the service publishes no API that records one. So
+    /// a cluster no analysis has observed carries no recommendation, and a read
+    /// reports for it the empty page the real service reports.
+    ///
+    /// The modelled `Recommendation` shape IS the whole record — a recommendation
+    /// is an observation already made, and carries no status the clock moves — so,
+    /// like
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::snapshot_copy_grants`],
+    /// this collection needs no `Stored*` wrapper.
+    pub recommendations: Vec<Recommendation>,
 }
 
 /// Where in the store one resource an ARN names sits: its collection and its
@@ -3561,6 +3579,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             integrations: Vec::new(),
             endpoint_accesses: Vec::new(),
             endpoint_authorizations: Vec::new(),
+            recommendations: Vec::new(),
         }
     }
 }
@@ -4312,6 +4331,31 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         self.clusters
             .iter()
             .find(|stored| stored.cluster.cluster_namespace_arn.as_deref() == Some(namespace_arn))
+    }
+
+    /// The cluster one Advisor recommendation is ABOUT, if this account still
+    /// holds it.
+    ///
+    /// A recommendation is an observation of ONE cluster, which the record
+    /// identifies the two ways it carries: by the cluster's identifier, and by
+    /// the ARN of the namespace holding that cluster's data. Resolving both here
+    /// is what keeps a recommendation read scoped to the clusters "in an Amazon
+    /// Web Services account": a record naming a cluster this account no longer
+    /// holds is about no cluster of it, and so is one naming none at all.
+    pub fn recommendation_cluster(
+        &self,
+        recommendation: &Recommendation,
+    ) -> Option<&StoredCluster> {
+        recommendation
+            .cluster_identifier
+            .as_deref()
+            .and_then(|identifier| self.cluster(identifier))
+            .or_else(|| {
+                recommendation
+                    .namespace_arn
+                    .as_deref()
+                    .and_then(|arn| self.cluster_with_namespace_arn(arn))
+            })
     }
 
     /// The cluster this custom domain name is associated with, if any — a custom

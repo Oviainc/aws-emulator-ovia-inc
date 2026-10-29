@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Amazon Redshift Advisor recommendations the store holds for the
+//! clusters this request scopes the read to — the one cluster a
+//! `ClusterIdentifier` or a `NamespaceArn` names, or every cluster of the
+//! account when it names neither — paged with this service's shared `Marker` /
+//! `MaxRecords` cursor. A report: the only write it makes is the clock-owed
+//! cluster transitions `settle` materialises.
+//!
+//! An Advisor recommendation is an observation ALREADY MADE of a cluster: it
+//! comes from analysing that cluster's workload — its query and table history —
+//! which this control plane holds none of, and the service publishes no API that
+//! records one. So the collection this read reports
+//! ([`crate::state::ComAmazonawsRedshiftRedshiftserviceversion20121201State::recommendations`])
+//! holds only what an analysis recorded, and a cluster none has observed is
+//! answered with the empty page the real service answers for it — never with a
+//! finding derived from the cluster's configuration, which would be an
+//! observation nothing made.
 //!
 //! ## Shape of an operation
 //!
@@ -102,11 +110,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `ListRecommendationsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#ListRecommendations")]
+// `DependentServiceUnavailableFault` is widened in, as on the sibling read
+// operations: the model does not list it for this operation, but the service
+// declares the shape, and it is the only modelled way to say "the control-plane
+// store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#ListRecommendations",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum ListRecommendationsErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -158,20 +174,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRecommendations"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                ListRecommendationsErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // The clock already owed these transitions at this instant — a cluster
+        // whose delete has fallen due has left the store — so applying them here
+        // shows nothing a later caller could not already have seen, and the scope
+        // below is resolved against the clusters the account holds NOW.
+        store.settle(::std::time::Instant::now());
+        let store = &*store;
+
+        // Each scope member names the ONE cluster the recommendations are
+        // reported for — `ClusterIdentifier` the identifier the cluster is named
+        // by, `NamespaceArn` the ARN of the namespace holding its data — so a
+        // value naming no cluster this account holds is refused as a cluster
+        // that is not there rather than reported as an empty page. Decided
+        // before any record is walked, and each member is RESOLVED to the
+        // cluster it names, so the two agree on the same CLUSTER rather than on
+        // the same member. One message, the crate's own `ClusterNotFoundFault`
+        // wording, with the value the request carried interpolated into it.
+        let not_found = |wanted: &str| -> Self::Error {
+            ListRecommendationsErrorModeled::ClusterNotFoundFault(ClusterNotFoundFault {
+                message: Some(format!("Cluster {wanted} not found.")),
+            })
+            .into()
+        };
+        let mut scopes: Vec<String> = Vec::new();
+        if let Some(wanted) = input.cluster_identifier.as_deref() {
+            let Some(stored) = store.cluster(wanted) else {
+                return Err(not_found(wanted));
+            };
+            scopes.push(stored.cluster.cluster_identifier.clone().unwrap_or_default());
+        }
+        if let Some(wanted) = input.namespace_arn.as_deref() {
+            let Some(stored) = store.cluster_with_namespace_arn(wanted) else {
+                return Err(not_found(wanted));
+            };
+            scopes.push(stored.cluster.cluster_identifier.clone().unwrap_or_default());
+        }
+
+        // Selected by REFERENCE, so only the page is cloned: the work done under
+        // the state lock is proportional to the page, not to every recommendation
+        // the account has been given. The collection is appended to as each
+        // observation is recorded, so its order is the order they were recorded
+        // in — the insertion order every paginated read of this service pages
+        // over, which is what makes the `Marker` a stable offset into one
+        // sequence.
+        let matched: Vec<&Recommendation> = store
+            .recommendations
+            .iter()
+            .filter(|recommendation| {
+                // "for one or multiple Amazon Redshift clusters in an Amazon Web
+                // Services account": a record is reported only while the account
+                // still holds the cluster it is an observation of — and which
+                // cluster that is decides every scope, so a record naming its
+                // cluster only by namespace is in that cluster's identifier
+                // scope too.
+                let Some(cluster) = store.recommendation_cluster(recommendation) else {
+                    return false;
+                };
+                let observed = cluster.cluster.cluster_identifier.as_deref();
+                // Each scope member the request carries narrows the set, and one
+                // it omits constrains nothing — so a request naming neither
+                // reports every cluster's recommendations, and a pair naming two
+                // different clusters selects what belongs to both.
+                scopes
+                    .iter()
+                    .all(|scoped| observed == Some(scoped.as_str()))
+            })
+            .collect();
+
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(ListRecommendationsOutput {
+            recommendations: Some(
+                matched[start..end]
+                    .iter()
+                    .map(|recommendation| (*recommendation).clone())
+                    .collect(),
+            ),
+            marker: next_marker,
+        })
     }
 }
