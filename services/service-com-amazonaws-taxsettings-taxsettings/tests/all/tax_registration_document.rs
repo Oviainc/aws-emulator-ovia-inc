@@ -66,7 +66,7 @@ const TOKEN_REFUSED_MESSAGE: &str = "The specified token in the request is eithe
 /// A plain German VAT entry, because the rule under test is about the DOCUMENTS
 /// a registration carries and not about the jurisdiction it is held in; the
 /// per-country requirements have their own suites.
-async fn store_documents(
+pub(crate) async fn store_documents(
     router: &MultiServiceRouter,
     account_id: &str,
     documents: &Value,
@@ -96,7 +96,7 @@ async fn store_documents(
 /// The `taxDocumentMetadatas` a read of `account_id`'s registration reports —
 /// where a caller gets the metadata it submits here, as the model's note on
 /// `taxDocumentAccessToken` says.
-async fn reported_metadatas(router: &MultiServiceRouter, account_id: &str) -> Vec<Value> {
+pub(crate) async fn reported_metadatas(router: &MultiServiceRouter, account_id: &str) -> Vec<Value> {
     let got = call(
         router,
         "GetTaxRegistration",
@@ -112,7 +112,7 @@ async fn reported_metadatas(router: &MultiServiceRouter, account_id: &str) -> Ve
 }
 
 /// Ask for one document's download location.
-async fn get_document(
+pub(crate) async fn get_document(
     router: &MultiServiceRouter,
     metadata: &Value,
     destination: Option<&Value>,
@@ -348,7 +348,7 @@ async fn a_held_documents_metadata_resolves_to_its_download_location() {
 /// expected one), and a `fieldList` naming the access-token parameter. Answers
 /// the message, which the caller checks does not vary with the token asked
 /// about.
-fn assert_refused(case: &str, answer: &Answer, expected_code: &str) -> String {
+pub(crate) fn assert_refused(case: &str, answer: &Answer, expected_code: &str) -> String {
     assert_eq!(
         (answer.status, answer.error_code.as_str()),
         (400, "ValidationException"),

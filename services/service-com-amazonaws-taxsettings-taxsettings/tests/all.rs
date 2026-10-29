@@ -53,6 +53,8 @@ mod put_tax_exemption_state;
 mod registration_type_refusals;
 #[path = "all/repeated_account_ids.rs"]
 mod repeated_account_ids;
+#[path = "all/retired_document_tokens.rs"]
+mod retired_document_tokens;
 #[path = "all/sector_registration_types.rs"]
 mod sector_registration_types;
 #[path = "all/shared_distinct_account_ids.rs"]

@@ -644,6 +644,22 @@ pub struct ComAmazonawsTaxsettingsTaxsettingsState {
     /// How many support cases `PutTaxExemption` has opened. The next `caseId` is
     /// derived from it, so every submission gets its own.
     pub minted_exemption_cases: u64,
+    /// The highest registration revision this service has already minted
+    /// document access tokens under for a registration it no longer holds.
+    ///
+    /// A revision is the coordinate a `taxDocumentAccessToken` locates ONE write
+    /// of ONE account's registration by, so no revision may be handed out twice:
+    /// a token the service stopped honouring must never start naming a document
+    /// again. A record carries its own revision while the store holds it, but
+    /// removing the record would take that count with it, so
+    /// [`Self::delete_registration`] keeps its high-water mark here and the next
+    /// write for an account the store holds no record for starts past it.
+    ///
+    /// One number for the whole store rather than a tally per account, so
+    /// remembering what was retired costs nothing per account removed — a
+    /// revision past every retired one is past the retired ones of the account
+    /// being written, which is what the rule needs.
+    pub retired_registration_revision: u64,
 }
 
 impl ComAmazonawsTaxsettingsTaxsettingsState {
@@ -685,8 +701,10 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     /// The one place a `TaxRegistrationEntry` becomes a stored record, so
     /// `PutTaxRegistration` and the per-account loop of
     /// `BatchPutTaxRegistration` cannot write one entry two different ways: the
-    /// write replaces the account's record and bumps its revision, which the
-    /// document access tokens carry.
+    /// write replaces the account's record and moves its revision on, past every
+    /// revision this account's documents have already been minted under — the
+    /// record's own, or, when the store holds none, the retired high-water mark
+    /// [`Self::delete_registration`] keeps.
     ///
     /// Two refusals, both `ConflictException`s — each caller renders one on its
     /// own channel, a `ConflictException` response or a per-account row of the
@@ -727,7 +745,14 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
         if previous_revision.is_none() && self.registrations.len() >= MAX_STORED_REGISTRATIONS {
             return Err(registration_store_full());
         }
-        let revision = previous_revision.map_or(1, |revision| revision.saturating_add(1));
+        // Every write gets a revision past every one this account's documents
+        // have already been minted under — the record's own while the store
+        // holds it, and the retired high-water mark once it does not, because a
+        // removed record's revisions are gone from the store but their tokens
+        // are not gone from the callers that hold them.
+        let revision = previous_revision
+            .unwrap_or(self.retired_registration_revision)
+            .saturating_add(1);
         let stored = StoredTaxRegistration::from_entry(entry, account_id, revision, written_at);
         let status = stored.status.clone();
         self.registrations.insert(account_id.to_string(), stored);
@@ -756,6 +781,10 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     ///
     /// A refused record is left exactly as it was, so every later read still
     /// reports it.
+    ///
+    /// A removed record's revision is retired into
+    /// [`Self::retired_registration_revision`] rather than discarded with it, so
+    /// the document access tokens its documents had are never minted again.
     pub fn delete_registration(
         &mut self,
         account_id: &str,
@@ -764,7 +793,10 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
             return Err(RegistrationDeleteRefusal::NotFound(no_tax_registration()));
         };
         check_registration_deletable(stored).map_err(RegistrationDeleteRefusal::NotDeletable)?;
-        self.registrations.remove(account_id);
+        if let Some(removed) = self.registrations.remove(account_id) {
+            self.retired_registration_revision =
+                self.retired_registration_revision.max(removed.revision);
+        }
         Ok(())
     }
 
@@ -1165,9 +1197,13 @@ pub struct StoredTaxRegistration {
     /// settled, so settling is idempotent and a settled record never moves
     /// again.
     pub validation_due_at: Option<Instant>,
-    /// How many times `PutTaxRegistration` has written this account's TRN. The
-    /// document access tokens below are derived from it, because the model
-    /// documents that updating a registration invalidates the previous tokens.
+    /// Which write of this account's TRN stored this record, counted past every
+    /// revision the store retired when a registration was removed
+    /// ([`ComAmazonawsTaxsettingsTaxsettingsState::retired_registration_revision`]).
+    /// The document access tokens below are derived from it, because the model
+    /// documents that updating a registration invalidates the previous tokens —
+    /// and so does removing it, which is why a deleted record's count is not
+    /// handed out again.
     pub revision: u64,
     /// The metadata of the documents submitted with this registration, derived
     /// from `VerificationDetails$taxRegistrationDocuments` when it was stored.
@@ -1178,8 +1214,9 @@ pub struct StoredTaxRegistration {
 impl StoredTaxRegistration {
     /// The record `PutTaxRegistration` stores for `entry`.
     ///
-    /// `revision` is the account's new revision number (its previous one plus
-    /// one), which the derived document access tokens carry.
+    /// `revision` is the account's new revision number (the one
+    /// [`ComAmazonawsTaxsettingsTaxsettingsState::store_registration`] moved it
+    /// on to), which the derived document access tokens carry.
     ///
     /// `legalName` and `legalAddress` are optional on `TaxRegistrationEntry` and
     /// `@required` on every shape that reports a registration: where the entry

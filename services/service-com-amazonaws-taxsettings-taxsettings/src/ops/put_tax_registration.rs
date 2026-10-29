@@ -4,8 +4,10 @@
 //!
 //! Stores the submitted TRN as this account's tax registration and reports the
 //! status it was stored with. Writing again replaces the account's record and
-//! bumps its revision, so the document access tokens the previous write minted
-//! no longer name anything.
+//! moves its revision on — past every revision this account's documents have
+//! already been minted under, including those of a registration that was
+//! deleted — so the document access tokens an earlier write minted no longer
+//! name anything.
 //!
 //! The status is the outcome of validating the submitted TRN, which the model
 //! documents as `Verified`, `Pending` or `Rejected`. Validating takes time, so a
