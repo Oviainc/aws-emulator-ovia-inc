@@ -3055,6 +3055,21 @@ pub fn private_graph_endpoint_state_conflict(
     )
 }
 
+/// The modelled `ConflictException` for a `CreatePrivateGraphEndpoint` whose graph and
+/// VPC already hold an endpoint.
+///
+/// `(graphIdentifier, vpcId)` is the identity `GetPrivateGraphEndpoint` and
+/// `DeletePrivateGraphEndpoint` address an endpoint by, so a second create of that pair
+/// asks for a record the store already holds. Worded by the one template
+/// [`precondition_conflict`] this service refuses a precondition with, and for the same
+/// reasons: the endpoint was addressed by the graph identifier and VPC id the caller
+/// sent, so the refusal fronts neither of them, and the `vpcEndpointId` this service
+/// minted for the stored endpoint is a value the request never named, so it is not
+/// reported either.
+pub fn private_graph_endpoint_exists_conflict() -> ConflictException {
+    precondition_conflict("create the private graph endpoint", "it", "already exists")
+}
+
 /// Refuse more tag entries on one resource than it may hold ([`MAX_TAGS`]).
 ///
 /// `total` is the number of entries the record would hold AFTER the call, so

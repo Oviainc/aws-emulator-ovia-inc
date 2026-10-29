@@ -212,17 +212,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `GetPrivateGraphEndpoint` and `DeletePrivateGraphEndpoint` address an endpoint
         // by, so a second endpoint in a VPC that already has one conflicts with the
         // stored record. Checked before the graph's status so a duplicate is reported as
-        // the conflict it is, whatever the graph is doing.
-        if let Some(existing) = store.settled_private_endpoint(&graph_id, &vpc_id, now) {
+        // the conflict it is, whatever the graph is doing. The wording is the service's
+        // one conflict refusal for it
+        // (`crate::state::private_graph_endpoint_exists_conflict`), which fronts no
+        // identifier: the endpoint was addressed by the graph identifier and VPC id the
+        // caller sent, and the stored record's minted `vpcEndpointId` is a value this
+        // request never named.
+        if store
+            .settled_private_endpoint(&graph_id, &vpc_id, now)
+            .is_some()
+        {
             return Err(CreatePrivateGraphEndpointErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "graph {graph_id} already has a private graph endpoint in vpc \
-                         {vpc_id} with vpc endpoint id {}",
-                        existing.vpc_endpoint_id
-                    ),
-                    reason: None,
-                },
+                crate::state::private_graph_endpoint_exists_conflict(),
             )
             .into());
         }
