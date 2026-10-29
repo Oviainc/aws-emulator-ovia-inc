@@ -178,9 +178,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PutEmailIdentityConfigurationSetAttributesErrorModeled::NotFoundException(
                     NotFoundException {
-                        message: Some(format!(
-                            "Email identity {} does not exist.",
-                            input.email_identity
+                        message: Some(crate::state::email_identity_not_found_unquoted(
+                            &input.email_identity,
                         )),
                     },
                 )

@@ -151,7 +151,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = crate::state::identity_key(&input.email_identity);
         let Some(record) = store.identities.get(&key) else {
             return Err(DeleteEmailIdentityErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::email_identity_not_found(&input.email_identity)),
+                // The delete names the identity it does not hold UNQUOTED, which is
+                // the form this operation is recorded answering; the identity reads
+                // quote it.
+                message: Some(crate::state::email_identity_not_found_unquoted(
+                    &input.email_identity,
+                )),
             })
             .into());
         };

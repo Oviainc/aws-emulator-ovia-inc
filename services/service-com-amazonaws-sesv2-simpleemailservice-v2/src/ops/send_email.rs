@@ -313,13 +313,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 };
                 if let Some(topic_name) = options.topic_name.as_deref() {
                     if !list.publishes_topic(topic_name) {
-                        return Err(bad_request(crate::state::contact_list_topic_not_found(
-                            &options.contact_list_name,
-                            topic_name,
-                        )));
+                        // Each member of the options NAMES a resource — a contact
+                        // list of this account, and a topic of that list — so a
+                        // value that resolves to no such resource is a resource
+                        // that is not there: the modelled 404 `NotFoundException`
+                        // the unknown-list branch above answers too, rather than a
+                        // malformed request.
+                        return Err(SendEmailErrorModeled::NotFoundException(NotFoundException {
+                            message: Some(crate::state::contact_list_topic_not_found(
+                                &options.contact_list_name,
+                                topic_name,
+                            )),
+                        })
+                        .into());
                     }
                 }
-                Some(options.contact_list_name.clone())
+                Some((
+                    options.contact_list_name.clone(),
+                    options.topic_name.clone(),
+                ))
             }
         };
 
@@ -430,11 +442,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A message that belongs to a contact list makes its recipients contacts of
         // that list: the unsubscribe link list management stamps into the message
         // unsubscribes a CONTACT of the list, so a recipient the list did not hold
-        // becomes one, with no preference of its own stated. One that is already on
-        // the list is left exactly as it is — the send states nothing about its
-        // preferences. The list's own ceiling still applies, so a send cannot grow a
-        // list past what `CreateContact` would admit.
-        if let Some(list_name) = list_management {
+        // becomes one — subscribed to the topic the message belongs to, when it named
+        // one, since that is the subscription the link reverses, and with no
+        // preference stated at all when the message belongs to the list and to no
+        // topic of it. One that is already on the list is left exactly as it is — the
+        // send states nothing about its preferences. The list's own ceiling still
+        // applies, so a send cannot grow a list past what `CreateContact` would admit.
+        if let Some((list_name, topic_name)) = list_management {
             if let Some(list) = store.contact_lists.get_mut(&list_name) {
                 for address in &addressed {
                     let key = crate::state::identity_key(address);
@@ -443,8 +457,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     {
                         continue;
                     }
-                    list.contacts
-                        .insert(key, crate::state::ContactRecord::new(address, now));
+                    let mut contact = crate::state::ContactRecord::new(address, now);
+                    if let Some(topic_name) = topic_name.as_deref() {
+                        contact.subscribe_to_topic(topic_name);
+                    }
+                    list.contacts.insert(key, contact);
                     // The list now holds one more contact, which is a change to the
                     // list itself.
                     list.last_updated_at = now;

@@ -9,11 +9,13 @@
 //! The rule these cases pin: "an object used to specify a list or topic to which an
 //! email belongs, which will be used when a contact chooses to unsubscribe" names a
 //! contact list this account holds and a topic that list publishes, so a send resolves
-//! both against the contact-list table before it checks anything about the message —
-//! a list the account does not hold is a terminal 404 `NotFoundException`, a topic the
-//! list does not publish a terminal 400 — and an accepted send makes each of its
-//! recipients a contact of that list, since the unsubscribe link list management
-//! stamps into the message unsubscribes a contact of it.
+//! both against the contact-list table before it checks anything about the message, and
+//! a value either member resolves to no resource for is a terminal 404
+//! `NotFoundException` — whichever of the two it was. An accepted send makes each of its
+//! recipients a contact of that list, since the unsubscribe link list management stamps
+//! into the message unsubscribes a contact of it, and a recipient the send puts on the
+//! list is subscribed to the topic the message belongs to — the subscription that link
+//! reverses — while a send that names no topic states no preference at all.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -146,18 +148,27 @@ impl Ses {
 
     /// `CreateContactList` with one topic.
     async fn create_list(&self, name: &str) -> Reply {
+        self.create_list_with_topics(name, &[(TOPIC, "OPT_IN")]).await
+    }
+
+    /// `CreateContactList` publishing each `(TopicName, DefaultSubscriptionStatus)`
+    /// supplied, in that order.
+    async fn create_list_with_topics(&self, name: &str, topics: &[(&str, &str)]) -> Reply {
+        let topics: Vec<Value> = topics
+            .iter()
+            .map(|(topic, default_status)| {
+                json!({
+                    "TopicName": topic,
+                    "DisplayName": format!("{topic} news"),
+                    "DefaultSubscriptionStatus": default_status,
+                })
+            })
+            .collect();
         self.call(
             HOME,
             "POST",
             "/v2/email/contact-lists",
-            Some(json!({
-                "ContactListName": name,
-                "Topics": [{
-                    "TopicName": TOPIC,
-                    "DisplayName": "Weekly news",
-                    "DefaultSubscriptionStatus": "OPT_IN",
-                }],
-            })),
+            Some(json!({ "ContactListName": name, "Topics": topics })),
         )
         .await
     }
@@ -310,8 +321,8 @@ async fn a_topic_the_list_does_not_publish_is_refused() {
             .await;
         assert_eq!(
             (reply.status, reply.error_code().as_str()),
-            (400, "BadRequestException"),
-            "case {topic:?}: expected 400 BadRequestException, got {} {:?}",
+            (404, "NotFoundException"),
+            "case {topic:?}: expected 404 NotFoundException, got {} {:?}",
             reply.status,
             reply.body
         );
@@ -385,9 +396,15 @@ async fn an_accepted_send_makes_its_recipients_contacts_of_the_list() {
     ];
 
     for (case, recipients) in cases {
-        for options in [
-            json!({"ContactListName": LIST}),
-            json!({"ContactListName": LIST, "TopicName": TOPIC}),
+        // What the send states about the contact it creates: a send that names a topic
+        // subscribes the contact to that topic, one that names none states nothing (and
+        // `GetContact` omits the member entirely rather than answering an empty list).
+        for (options, expected_preferences) in [
+            (json!({"ContactListName": LIST}), None),
+            (
+                json!({"ContactListName": LIST, "TopicName": TOPIC}),
+                Some(json!([{"TopicName": TOPIC, "SubscriptionStatus": "OPT_IN"}])),
+            ),
         ] {
             let ses = seeded().await;
             let reply = ses
@@ -424,21 +441,97 @@ async fn an_accepted_send_makes_its_recipients_contacts_of_the_list() {
                 "case ({case:?}, {options}): expected every recipient to be a contact of the list, got {:?}",
                 listed.contacts()
             );
-            // A contact a send created states no preference of its own, so it is
-            // answered from the list's own defaults.
-            let contact = ses.get_contact(LIST, recipients[0]).await;
-            assert_eq!(
-                contact.status, 200,
-                "case ({case:?}, {options}): expected the new contact to be readable, got {} {:?}",
-                contact.status, contact.body
-            );
-            assert_eq!(
-                contact.body.get("TopicPreferences"),
-                None,
-                "case ({case:?}, {options}): expected the new contact to state no preference, got {:?}",
-                contact.body
-            );
+            // EVERY recipient the send put on the list carries what the send stated,
+            // not just the first one.
+            for recipient in recipients {
+                let contact = ses.get_contact(LIST, recipient).await;
+                assert_eq!(
+                    contact.status, 200,
+                    "case ({case:?}, {options}, {recipient}): expected the new contact to be readable, got {} {:?}",
+                    contact.status, contact.body
+                );
+                assert_eq!(
+                    contact.body.get("TopicPreferences"),
+                    expected_preferences.as_ref(),
+                    "case ({case:?}, {options}, {recipient}): expected TopicPreferences {expected_preferences:?}, got {:?}",
+                    contact.body.get("TopicPreferences")
+                );
+            }
         }
+    }
+}
+
+#[tokio::test]
+async fn the_topic_a_send_names_is_the_one_the_new_contact_is_subscribed_to() {
+    // A list publishing several topics, each with its own default: the subscription the
+    // send states is for the topic the MESSAGE named, whatever the list's defaults say
+    // and whatever other topics the list publishes. The topic names and the default
+    // statuses span the two values `SubscriptionStatus` carries (the enum is
+    // ["OPT_IN", "OPT_OUT"]).
+    let topics: &[(&str, &str)] = &[
+        ("weekly", "OPT_IN"),
+        ("monthly", "OPT_OUT"),
+        ("Breaking.News_1", "OPT_IN"),
+    ];
+    let list = "many-topics";
+
+    for (topic, _default_status) in topics {
+        let ses = Ses::new();
+        let created = ses.create_list_with_topics(list, topics).await;
+        assert_eq!(
+            created.status, 200,
+            "case {topic:?}: expected the contact list to be created, got {} {:?}",
+            created.status, created.body
+        );
+        let identity = ses.create_identity(SENDER_DOMAIN).await;
+        assert_eq!(
+            identity.status, 200,
+            "case {topic:?}: expected the sending domain to be created, got {} {:?}",
+            identity.status, identity.body
+        );
+        ses.settle_identities();
+
+        let recipient = "reader@example.net";
+        let reply = ses
+            .send(
+                HOME,
+                SENDER,
+                &[recipient],
+                Some(json!({"ContactListName": list, "TopicName": topic})),
+            )
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {topic:?}: expected the send to be accepted, got {} {:?}",
+            reply.status, reply.body
+        );
+
+        let contact = ses.get_contact(list, recipient).await;
+        assert_eq!(
+            contact.status, 200,
+            "case {topic:?}: expected the new contact to be readable, got {} {:?}",
+            contact.status, contact.body
+        );
+        assert_eq!(
+            contact.body.get("TopicPreferences"),
+            Some(&json!([{"TopicName": topic, "SubscriptionStatus": "OPT_IN"}])),
+            "case {topic:?}: expected the contact to be subscribed to the topic the message named, got {:?}",
+            contact.body.get("TopicPreferences")
+        );
+        // The list's own defaults are unchanged by the send: they are the list's, not
+        // the contact's.
+        let defaults: Vec<Value> = topics
+            .iter()
+            .map(|(topic, default_status)| {
+                json!({"TopicName": topic, "SubscriptionStatus": default_status})
+            })
+            .collect();
+        assert_eq!(
+            contact.body.get("TopicDefaultPreferences"),
+            Some(&Value::Array(defaults)),
+            "case {topic:?}: expected the list's own defaults to be reported unchanged, got {:?}",
+            contact.body.get("TopicDefaultPreferences")
+        );
     }
 }
 

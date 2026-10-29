@@ -85,6 +85,8 @@ mod email_identity_lifecycle;
 mod email_identity_listing_route;
 #[path = "all/email_identity_mail_from_attributes.rs"]
 mod email_identity_mail_from_attributes;
+#[path = "all/email_identity_not_found_message.rs"]
+mod email_identity_not_found_message;
 #[path = "all/email_identity_policies.rs"]
 mod email_identity_policies;
 #[path = "all/email_identity_policies_read.rs"]

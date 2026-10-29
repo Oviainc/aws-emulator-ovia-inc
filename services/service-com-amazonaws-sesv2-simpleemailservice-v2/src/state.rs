@@ -2546,6 +2546,12 @@ pub struct ContactRecord {
     pub last_updated_at: SystemTime,
 }
 
+/// The `SubscriptionStatus` a contact holds for a topic it is subscribed to, as the
+/// model's own enum spells it (`SUBSCRIPTION_STATUS_VALUES` is `["OPT_IN",
+/// "OPT_OUT"]`): "the contact's subscription status to a topic which is either
+/// `OPT_IN` or `OPT_OUT`".
+pub const SUBSCRIBED: &str = "OPT_IN";
+
 impl ContactRecord {
     /// A contact as `CreateContact` stores it.
     pub fn new(email_address: &str, now: SystemTime) -> Self {
@@ -2557,6 +2563,21 @@ impl ContactRecord {
             created_at: now,
             last_updated_at: now,
         }
+    }
+
+    /// Record that this contact is subscribed to `topic_name`.
+    ///
+    /// A message sent with list management "belongs to" the list and the topic it
+    /// names, and the unsubscribe link it carries is what lets the contact opt OUT of
+    /// that topic, so a contact of the list is subscribed to the topic a message it
+    /// was sent belongs to: the preference stated for that topic is [`SUBSCRIBED`].
+    /// Stating it goes through [`ContactRecord::merge_topic_preferences`], so it is
+    /// one preference per topic here as everywhere else.
+    pub fn subscribe_to_topic(&mut self, topic_name: &str) {
+        self.merge_topic_preferences(vec![crate::ops::types::TopicPreference {
+            topic_name: topic_name.to_string(),
+            subscription_status: SUBSCRIBED.to_string(),
+        }]);
     }
 
     /// The contact's preference for `topic_name`, when it has stated one.
@@ -4562,18 +4583,35 @@ pub fn addr_spec(address: &str) -> &str {
 }
 
 /// How this service words `NotFoundException` for an email identity it does not
-/// hold.
+/// hold, on the operations that QUOTE the identity in angle brackets.
 ///
-/// SES quotes the value it refuses in angle brackets here, and this is the sentence
-/// shared by the identity readers, the delete and the certificate operations, so a
-/// client sees the same wording whichever of them first tells it the identity is
-/// gone. Two operations are deliberately NOT routed through it:
-/// `PutEmailIdentityFeedbackAttributes` and
-/// `PutEmailIdentityConfigurationSetAttributes` answer an unbracketed sentence,
-/// which is what their own recorded responses carry, so each words it in its own
-/// handler.
+/// One sentence — the fixed text `Email identity <` + `> does not exist.`, with the
+/// `EmailIdentity` the request spelled as its only variable part — shared by the
+/// identity reads (`GetEmailIdentity`, `GetEmailIdentityPolicies`) and the
+/// certificate operations, which are the operations recorded answering the quoted
+/// form, so a client sees the same wording whichever of them first tells it the
+/// identity is gone.
+///
+/// The identity WRITES, and the delete, are recorded answering the same sentence
+/// with the identity unquoted: that form is [`email_identity_not_found_unquoted`],
+/// and the two must not be swapped — a client that strips the brackets off one
+/// operation's sentence would read the wrong resource name out of the other's.
 pub fn email_identity_not_found(identity: &str) -> String {
     format!("Email identity <{identity}> does not exist.")
+}
+
+/// How this service words `NotFoundException` for an email identity it does not
+/// hold, on the operations that name the identity UNQUOTED.
+///
+/// The same sentence as [`email_identity_not_found`] without the angle brackets
+/// around the value: the fixed text `Email identity ` + ` does not exist.`, with the
+/// `EmailIdentity` the request spelled as its only variable part. `DeleteEmailIdentity`
+/// and the writes that hang attributes or a policy off an identity
+/// (`PutEmailIdentity*`, `CreateEmailIdentityPolicy`) are the operations recorded
+/// answering this form, stated once here so no two of them word the one condition
+/// differently.
+pub fn email_identity_not_found_unquoted(identity: &str) -> String {
+    format!("Email identity {identity} does not exist.")
 }
 
 /// The key an identity is stored and looked up under.
