@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `ModifyCapacityReservationFleet` changes about a stored Capacity Reservation Fleet,
+// what a describe then reports of it, and what the modification refuses. Declared beside
+// `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail
+// of this file are where every new ec2 suite inserts its lines.
+#[path = "all/modify_capacity_reservation_fleet.rs"]
+mod modify_capacity_reservation_fleet;
 // What `RevokeSecurityGroupEgress` removes from a group, which requests it admits and
 // refuses. Declared beside `prefix_lists` for the reason the note above gives: the sorted
 // neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyCapacityReservationFleet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyCapacityReservationFleet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyCapacityReservationFleet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modifies a stored Capacity Reservation Fleet: the capacity its Capacity Reservations
+//! reserve, and when it expires. The Fleet is answered in the non-terminal `modifying` state
+//! the clock owes `active`. The ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +150,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyCapacityReservationFleet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyCapacityReservationFleetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyCapacityReservationFleet"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            capacity_reservation_fleet_id_is_well_formed, incorrect_state_of,
+            invalid_capacity_reservation_fleet_id_malformed,
+            invalid_capacity_reservation_fleet_id_not_found, require_service_state,
+            system_time_to_date_time, CapacityReservationFleetEndDate,
+            CapacityReservationFleetModification,
+        };
+
+        /// How this operation names the resource it refuses for, as EC2's `IncorrectState`
+        /// wording spells it.
+        const FLEET: &str = "Capacity Reservation Fleet";
+
+        // `ctx` carries request metadata only; this operation reads none of it — a Fleet is
+        // modified by its id, and the store holds Fleets per account. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+
+        // "The ID of the Capacity Reservation Fleet to modify"
+        // (`$CapacityReservationFleetId`), a `@required` member the boundary validator has
+        // already refused an absent one for. Something that is not a Fleet id AT ALL is
+        // refused before the store is read: there is nothing to look up, so it is a request
+        // that cannot be read rather than a Fleet the account does not hold.
+        let fleet_id = input.capacity_reservation_fleet_id.clone();
+        if !capacity_reservation_fleet_id_is_well_formed(&fleet_id) {
+            return Err(invalid_capacity_reservation_fleet_id_malformed(&fleet_id));
+        }
+
+        // "You can't specify EndDate and RemoveEndDate in the same request" (`$EndDate` /
+        // `$RemoveEndDate`): the two ask for opposite things, so a request carrying both says
+        // nothing the service can act on — whatever value `RemoveEndDate` carries.
+        if input.end_date.is_some() && input.remove_end_date.is_some() {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "You can't specify EndDate and RemoveEndDate in the same request",
+            ));
+        }
+
+        // "The date and time at which the Capacity Reservation Fleet expires. When the
+        // Capacity Reservation Fleet expires, its state changes to `expired`" (`$EndDate`):
+        // an end date already behind us names a Fleet that is over before the modification
+        // lands.
+        let now = ::std::time::SystemTime::now();
+        if let Some(end_date) = input.end_date {
+            if end_date.as_secs_f64() <= system_time_to_date_time(now).as_secs_f64() {
+                return Err(Scaffolded::invalid_parameter_value(
+                    "Invalid value for endDate. It must be a time in the future",
+                ));
+            }
+        }
+
+        // "The total number of capacity units to be reserved by the Capacity Reservation
+        // Fleet" (`$TotalTargetCapacity`), the same floor the create holds the member to: a
+        // Fleet that reserves no capacity units reserves nothing, which is not something to
+        // answer with a success.
+        if let Some(total_target_capacity) = input.total_target_capacity {
+            if total_target_capacity < 1 {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{total_target_capacity}' for totalTargetCapacity. \
+                     It must be at least 1"
+                )));
+            }
+        }
+
+        // What the request asks to change. `RemoveEndDate: false` asks for nothing — it is
+        // the absence of a removal, not a removal of nothing — so it leaves the Fleet's end
+        // date as stored.
+        let end_date = match (input.end_date, input.remove_end_date) {
+            (Some(end_date), _) => CapacityReservationFleetEndDate::MovedTo(end_date),
+            (None, Some(true)) => CapacityReservationFleetEndDate::Removed,
+            (None, _) => CapacityReservationFleetEndDate::AsStored,
+        };
+        let change = CapacityReservationFleetModification {
+            total_target_capacity: input.total_target_capacity,
+            end_date,
+        };
+        // A request that changes nothing about the Fleet is not a modification: this
+        // operation modifies "the total target capacity" or "the end date for the Fleet"
+        // (`ModifyCapacityReservationFleet`), so one that names neither has nothing to apply.
+        if change.total_target_capacity.is_none()
+            && change.end_date == CapacityReservationFleetEndDate::AsStored
+        {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter totalTargetCapacity, endDate or \
+                 removeEndDate",
+            ));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The moves the CLOCK already owed are materialised before any state is read, so the
+        // Fleet is modified from the state it is actually in: a `submitted` Fleet whose
+        // `active` fell due is modified from `active`, and one whose cancellation has already
+        // completed is seen as `cancelled` rather than modified after the fact.
+        store.materialize_due_transitions();
+
+        // The Fleet the modification applies to, resolved BEFORE the dry run: an id the
+        // account holds no Fleet under, and a Fleet in a state a modification does not run
+        // from, are both reasons the request would NOT have succeeded, and `DryRun` asks
+        // exactly that question.
+        let Some(record) = store.capacity_reservation_fleets.get(&fleet_id) else {
+            return Err(invalid_capacity_reservation_fleet_id_not_found(&fleet_id));
+        };
+        // A Fleet that is being cancelled, is cancelled, has expired or has failed is not one
+        // a modification runs from, so the request is refused rather than answered a success
+        // that changed nothing.
+        if !record.is_modifiable() {
+            return Err(incorrect_state_of(FLEET, &fleet_id, record.state()));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and the Fleet resolved, and
+        // BEFORE anything is changed: the flag asks whether the request WOULD have succeeded,
+        // so one that would have been refused is refused with that reason instead, and
+        // nothing is modified.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The modification itself, applied to the Fleet just resolved under this same lock.
+        if !store.modify_capacity_reservation_fleet(&fleet_id, &change) {
+            return Err(Scaffolded::internal_error(format!(
+                "the Capacity Reservation Fleet '{fleet_id}' could not be modified after it \
+                 was resolved"
+            )));
+        }
+        // "Returns `true` if the request succeeds; otherwise, it returns an error"
+        // (`$Return`) — the modification was applied to the stored Fleet, which a
+        // `DescribeCapacityReservationFleets` now reports.
+        Ok(ModifyCapacityReservationFleetOutput {
+            r#return: Some(true),
+        })
     }
 }

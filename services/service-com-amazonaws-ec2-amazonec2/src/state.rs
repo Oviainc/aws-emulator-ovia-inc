@@ -35808,6 +35808,23 @@ pub const CAPACITY_RESERVATION_FLEET_CANCELLABLE_STATES: [&str; 5] = [
     CAPACITY_RESERVATION_FLEET_STATE_EXPIRING,
 ];
 
+/// The states a Capacity Reservation Fleet can be MODIFIED from.
+///
+/// A modification "creates new Capacity Reservations, or modifies or cancels existing
+/// Capacity Reservations in the Fleet to meet the new total target capacity"
+/// (`ModifyCapacityReservationFleet`), so it runs only from a state in which the Fleet still
+/// creates Capacity Reservations: one preparing them, one already being modified, and one
+/// holding capacity in full or in part. The states left out are the ones in which "The Fleet
+/// can't create new Capacity Reservations" (`CapacityReservationFleet$State`) — `expiring`
+/// and `expired`, where the Fleet has reached its end date, `cancelling` and `cancelled`,
+/// where it is being or has been cancelled, and `failed`.
+pub const CAPACITY_RESERVATION_FLEET_MODIFIABLE_STATES: [&str; 4] = [
+    CAPACITY_RESERVATION_FLEET_STATE_SUBMITTED,
+    CAPACITY_RESERVATION_FLEET_STATE_MODIFYING,
+    CAPACITY_RESERVATION_FLEET_STATE_ACTIVE,
+    CAPACITY_RESERVATION_FLEET_STATE_PARTIALLY_FULFILLED,
+];
+
 /// "Currently, only the `prioritized` allocation strategy is supported […] Valid values:
 /// `prioritized`" (`CreateCapacityReservationFleetRequest$AllocationStrategy`), so it is
 /// both the only value a request may name and the strategy a request that names none gets.
@@ -35973,6 +35990,90 @@ impl CapacityReservationFleetRecord {
         Some(previous)
     }
 
+    /// Whether this Fleet's current state is one a modification runs from
+    /// ([`CAPACITY_RESERVATION_FLEET_MODIFIABLE_STATES`]).
+    pub fn is_modifiable(&self) -> bool {
+        CAPACITY_RESERVATION_FLEET_MODIFIABLE_STATES.contains(&self.state())
+    }
+
+    /// Start modifying this Fleet.
+    ///
+    /// "`modifying` - The Capacity Reservation Fleet is being modified"
+    /// (`CapacityReservationFleet$State`) is a NON-terminal state, so the caller is answered
+    /// the transient state and the clock owes the Fleet `active`, where it "has fulfilled its
+    /// total target capacity and it is attempting to maintain this capacity". Any move that
+    /// was owed before (a `submitted` Fleet's `active`, or the `active` an earlier
+    /// modification owed) is REPLACED, so the Fleet reaches `active` one span after the LAST
+    /// call that changed it.
+    ///
+    /// Callers ask [`Self::is_modifiable`] first: this is the move itself, not the check.
+    fn begin_modification(&mut self) {
+        self.view.state = Some(CAPACITY_RESERVATION_FLEET_STATE_MODIFYING.to_string());
+        self.pending = Some(CapacityReservationFleetTransition::starting_now(
+            CAPACITY_RESERVATION_FLEET_STATE_ACTIVE,
+        ));
+    }
+
+    /// Reserve `total_target_capacity` capacity units through this Fleet's Capacity
+    /// Reservations, the Fleet's `prioritized` allocation strategy having chosen `chosen`.
+    ///
+    /// "When you modify the total target capacity of a Capacity Reservation Fleet, the Fleet
+    /// automatically creates new Capacity Reservations, or modifies or cancels existing
+    /// Capacity Reservations in the Fleet to meet the new total target capacity"
+    /// (`ModifyCapacityReservationFleet`): the chosen specification's Capacity Reservation is
+    /// MODIFIED in place — it keeps the id and the create date it was reserved under, so a
+    /// caller holding that id still names the same reservation — and a specification the
+    /// strategy no longer reserves on holds no Capacity Reservation at all. The instance
+    /// count covering the new target, and the capacity it fulfils, are derived exactly as a
+    /// create derives them ([`fleet_instance_count`], [`fleet_fulfilled_capacity`]), so one
+    /// Fleet cannot report its capacity two ways.
+    ///
+    /// `minted_reservation_id` is the id for a Capacity Reservation this call CREATES (the
+    /// chosen specification held none), minted by the caller because only the store mints
+    /// ids; `now` dates that reservation.
+    fn reserve_target_capacity(
+        &mut self,
+        total_target_capacity: i32,
+        chosen: Option<usize>,
+        minted_reservation_id: Option<String>,
+        now: SystemTime,
+    ) {
+        self.view.total_target_capacity = Some(total_target_capacity);
+        let mut reservations = self
+            .view
+            .instance_type_specifications
+            .take()
+            .unwrap_or_default();
+        for (index, reservation) in reservations.iter_mut().enumerate() {
+            let weight = reservation
+                .weight
+                .filter(|weight| *weight > 0.0)
+                .unwrap_or(DEFAULT_FLEET_INSTANCE_WEIGHT);
+            let reserved_here = chosen == Some(index);
+            let instance_count = if reserved_here {
+                fleet_instance_count(total_target_capacity, weight)
+            } else {
+                0
+            };
+            reservation.weight = Some(weight);
+            reservation.total_instance_count = Some(instance_count);
+            reservation.fulfilled_capacity = Some(f64::from(instance_count) * weight);
+            if reserved_here {
+                if reservation.capacity_reservation_id.is_none() {
+                    reservation.capacity_reservation_id = minted_reservation_id.clone();
+                    reservation.create_date = Some(system_time_to_date_time(now));
+                }
+            } else {
+                // The Capacity Reservation this specification held is CANCELLED, so there is
+                // no reservation left to name or to date.
+                reservation.capacity_reservation_id = None;
+                reservation.create_date = None;
+            }
+        }
+        self.view.total_fulfilled_capacity = Some(fleet_fulfilled_capacity(&reservations));
+        self.view.instance_type_specifications = Some(reservations);
+    }
+
     /// Apply the move the clock owed this Fleet.
     ///
     /// `active` is where the Fleet "has fulfilled its total target capacity and it is
@@ -36022,6 +36123,31 @@ pub fn fleet_fulfilled_capacity(reservations: &[FleetCapacityReservation]) -> f6
         .iter()
         .filter_map(|reservation| reservation.fulfilled_capacity)
         .sum()
+}
+
+/// Which of a Capacity Reservation Fleet's instance type specifications the Fleet reserves
+/// its capacity on.
+///
+/// The `prioritized` allocation strategy "uses the priority that you assigned to each
+/// instance type to determine which of the specified instance types to use" first, moving on
+/// only when the capacity it asked for is not available
+/// (`CreateCapacityReservationFleetRequest$AllocationStrategy`), and "A lower value indicates
+/// a high priority" (`ReservationFleetInstanceSpecification$Priority`) — a specification that
+/// assigned none coming after every one that did, and the earliest winning a tie
+/// (`min_by_key` keeps the first). The capacity this emulator reserves is always available,
+/// so the chosen specification covers the whole target and the others reserve nothing.
+///
+/// Generic over the carrier, so the create (which reads a validated request) and a later
+/// modification (which reads the Fleet as stored) resolve the strategy through ONE rule.
+fn prioritized_fleet_specification<T>(
+    specifications: &[T],
+    priority_of: impl Fn(&T) -> Option<i32>,
+) -> Option<usize> {
+    specifications
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, specification)| priority_of(specification).unwrap_or(i32::MAX))
+        .map(|(index, _)| index)
 }
 
 /// One instance type a Capacity Reservation Fleet reserves capacity for, as a writer has
@@ -36106,14 +36232,7 @@ impl ComAmazonawsEc2Amazonec2State {
     /// "Information about the instance types for which to reserve the capacity"
     /// (`CapacityReservationFleet$InstanceTypeSpecifications`) — every specification is
     /// reported, carrying what the Fleet reserved on it. WHICH of them that is follows the
-    /// allocation strategy: `prioritized` "uses the priority that you assigned to each
-    /// instance type to determine which of the specified instance types to use" first,
-    /// moving on only when the capacity it asked for is not available
-    /// (`CreateCapacityReservationFleetRequest$AllocationStrategy`), and "A lower value
-    /// indicates a high priority" (`ReservationFleetInstanceSpecification$Priority`), a
-    /// specification that assigned none coming after every one that did. The capacity this
-    /// emulator reserves is always available, so the highest-priority specification covers
-    /// the whole target and the others reserve nothing.
+    /// allocation strategy, resolved by [`prioritized_fleet_specification`].
     ///
     /// How many instances covering the target takes is the target capacity divided by what
     /// one instance of that type provides, rounded UP: "This value, together with the total
@@ -36128,14 +36247,11 @@ impl ComAmazonawsEc2Amazonec2State {
         spec: &CapacityReservationFleetSpec,
         created_at: SystemTime,
     ) -> Vec<FleetCapacityReservation> {
-        // The specification the strategy reserves on: the lowest `Priority` value, the
-        // earliest of them when several share it (`min_by_key` keeps the first).
-        let chosen = spec
-            .instance_specs
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, instance_spec)| instance_spec.priority.unwrap_or(i32::MAX))
-            .map(|(index, _)| index);
+        // The specification the strategy reserves on, by the one rule both the create and a
+        // later modification resolve it through.
+        let chosen = prioritized_fleet_specification(&spec.instance_specs, |instance_spec| {
+            instance_spec.priority
+        });
         let mut reservations: Vec<FleetCapacityReservation> =
             Vec::with_capacity(spec.instance_specs.len());
         for (index, instance_spec) in spec.instance_specs.iter().enumerate() {
@@ -36231,6 +36347,84 @@ impl ComAmazonawsEc2Amazonec2State {
         stored
     }
 
+    /// Apply a `ModifyCapacityReservationFleet` to the Fleet stored under `fleet_id`.
+    ///
+    /// The one way a stored Fleet is modified, so what a modification changes about it — the
+    /// capacity its Capacity Reservations reserve, when it expires, the state it reports and
+    /// the move the clock then owes it — cannot be applied two ways.
+    ///
+    /// The CALL reserves the new capacity: "the Fleet automatically creates new Capacity
+    /// Reservations, or modifies or cancels existing Capacity Reservations in the Fleet to
+    /// meet the new total target capacity" (`ModifyCapacityReservationFleet`), so the
+    /// reservations are facts of this call rather than of a later instant. What the Fleet
+    /// still owes the clock is its own STATE word: it is answered in the non-terminal
+    /// `modifying` and reaches `active` one [`TRANSITION_DELAY`] later.
+    ///
+    /// Answers whether the Fleet was modified: `false` when the id names no Fleet of the
+    /// account, or names one in a state a modification does not run from
+    /// ([`CAPACITY_RESERVATION_FLEET_MODIFIABLE_STATES`]). A caller resolves the Fleet and its
+    /// state first — through the record's own [`CapacityReservationFleetRecord::is_modifiable`]
+    /// — and words those two refusals itself; this guard is what keeps the store from being
+    /// written behind them.
+    pub fn modify_capacity_reservation_fleet(
+        &mut self,
+        fleet_id: &str,
+        change: &CapacityReservationFleetModification,
+    ) -> bool {
+        let Some(record) = self.capacity_reservation_fleets.get(fleet_id) else {
+            return false;
+        };
+        if !record.is_modifiable() {
+            return false;
+        }
+        // Which specification the Fleet reserves on, and the id for a Capacity Reservation
+        // this call has to CREATE there — minted before the record is borrowed mutably,
+        // because only the store mints ids.
+        let reservations = record
+            .view
+            .instance_type_specifications
+            .as_deref()
+            .unwrap_or_default();
+        let chosen =
+            prioritized_fleet_specification(reservations, |reservation| reservation.priority);
+        let needs_reservation_id = chosen.is_some_and(|index| {
+            reservations
+                .get(index)
+                .is_some_and(|reservation| reservation.capacity_reservation_id.is_none())
+        });
+        let minted_reservation_id = (change.total_target_capacity.is_some()
+            && needs_reservation_id)
+            .then(|| self.next_id(CAPACITY_RESERVATION_ID_PREFIX));
+
+        let now = SystemTime::now();
+        let Some(record) = self.capacity_reservation_fleets.get_mut(fleet_id) else {
+            return false;
+        };
+        if let Some(total_target_capacity) = change.total_target_capacity {
+            record.reserve_target_capacity(
+                total_target_capacity,
+                chosen,
+                minted_reservation_id,
+                now,
+            );
+        }
+        match change.end_date {
+            CapacityReservationFleetEndDate::AsStored => {}
+            // "The date and time at which the Capacity Reservation Fleet expires. When the
+            // Capacity Reservation Fleet expires, its state changes to `expired`"
+            // (`ModifyCapacityReservationFleetRequest$EndDate`).
+            CapacityReservationFleetEndDate::MovedTo(end_date) => {
+                record.view.end_date = Some(end_date);
+            }
+            // "If you remove the end date, the Capacity Reservation Fleet does not expire and
+            // it remains active until you explicitly cancel it"
+            // (`$RemoveEndDate`), so the Fleet then reports no end date at all.
+            CapacityReservationFleetEndDate::Removed => record.view.end_date = None,
+        }
+        record.begin_modification();
+        true
+    }
+
     /// Apply every Capacity Reservation Fleet move the clock owes, as of `now`.
     ///
     /// Called by [`Self::materialize_due_transitions`], which is the one place every owed
@@ -36247,6 +36441,38 @@ impl ComAmazonawsEc2Amazonec2State {
             }
         }
     }
+}
+
+/// What a `ModifyCapacityReservationFleet` does to a Fleet's end date.
+///
+/// Three outcomes rather than an `Option`, because "Indicates whether to remove the end date
+/// from the Capacity Reservation Fleet"
+/// (`ModifyCapacityReservationFleetRequest$RemoveEndDate`) and a request that names neither
+/// member ask for different things: taking the end date away, and leaving it as stored.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CapacityReservationFleetEndDate {
+    /// The request named neither `EndDate` nor `RemoveEndDate`, so the Fleet keeps the end
+    /// date it holds.
+    AsStored,
+    /// "The date and time at which the Capacity Reservation Fleet expires"
+    /// (`ModifyCapacityReservationFleetRequest$EndDate`).
+    MovedTo(::aws_smithy_types::DateTime),
+    /// "Indicates whether to remove the end date from the Capacity Reservation Fleet"
+    /// (`$RemoveEndDate`): the Fleet then "does not expire and it remains active until you
+    /// explicitly cancel it".
+    Removed,
+}
+
+/// What a `ModifyCapacityReservationFleet` changes about a stored Fleet, as its handler has
+/// already validated it.
+#[derive(Debug, Clone, Copy)]
+pub struct CapacityReservationFleetModification {
+    /// "The total number of capacity units to be reserved by the Capacity Reservation Fleet"
+    /// (`ModifyCapacityReservationFleetRequest$TotalTargetCapacity`), or `None` for a request
+    /// that leaves the Fleet's capacity where it is.
+    pub total_target_capacity: Option<i32>,
+    /// What the request does to the Fleet's end date.
+    pub end_date: CapacityReservationFleetEndDate,
 }
 
 // =============================================================================
