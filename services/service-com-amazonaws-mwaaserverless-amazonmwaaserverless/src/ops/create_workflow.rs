@@ -473,7 +473,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `crate::state` re-declares, so the clause, the elision of a long value, the
 /// violation cap and the path are the framework's, not this crate's.
 fn validate_input(input: &CreateWorkflowInput) -> Result<(), ValidationException> {
-    use crate::state::ConstrainedValue::{Entries, Nested, Text};
+    use crate::state::ConstrainedValue::{Nested, Text};
 
     let code = crate::state::constrained_code(input.code.as_ref());
     let encryption =
@@ -495,8 +495,12 @@ fn validate_input(input: &CreateWorkflowInput) -> Result<(), ValidationException
     if let Some(trigger_mode) = input.trigger_mode.as_deref() {
         members.push((&crate::state::M_TRIGGER_MODE, Text(trigger_mode)));
     }
+    // `Tags` is handed over through `constrained_tags`, so every tag KEY is
+    // checked against the key shape's own constraints beside the map's entry
+    // count and each value's — a workflow is never created holding one outside
+    // them.
     if let Some(tags) = input.tags.as_ref() {
-        members.push((&crate::state::M_TAGS, Entries(tags)));
+        members.extend(crate::state::constrained_tags(tags));
     }
     if let Some(code) = code.as_ref() {
         members.push((&crate::state::M_CODE, Nested(code)));

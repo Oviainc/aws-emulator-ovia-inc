@@ -28,8 +28,9 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
-    Workflow, RUN_STATUS_QUEUED, RUN_STATUS_RUNNING, RUN_STATUS_STARTING, RUN_STATUS_SUCCESS,
-    RUN_TYPE_SCHEDULED, SCHEDULED_RUN_EVERY,
+    Workflow, MAX_CATCHUP_FIRINGS_PER_CALL, MAX_CATCHUP_FIRINGS_PER_WORKFLOW, RUN_STATUS_QUEUED,
+    RUN_STATUS_RUNNING, RUN_STATUS_STARTING, RUN_STATUS_SUCCESS, RUN_TYPE_SCHEDULED,
+    SCHEDULED_RUN_EVERY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -313,4 +314,187 @@ async fn the_trigger_in_force_is_the_active_version_s_and_a_delete_removes_it() 
         during_teardown.is_empty(),
         "case deleted: a workflow tearing down produces no new run, got {during_teardown:?}"
     );
+}
+
+/// Every run of a workflow in one page, so a ceiling rather than the default page size
+/// is what bounds what a test sees.
+async fn whole_history(scheduled: &Scheduled, arn: &str, case: &str) -> Vec<Value> {
+    let (status, listed) = call(
+        &scheduled.router,
+        "ListWorkflowRuns",
+        json!({"WorkflowArn": arn, "MaxResults": 100}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected ListWorkflowRuns to succeed, got {status} {listed:?}"
+    );
+    listed["WorkflowRuns"].as_array().cloned().unwrap_or_default()
+}
+
+/// The `RunId` of each run, in the order the listing reported them.
+fn run_ids(runs: &[Value]) -> Vec<String> {
+    runs.iter()
+        .map(|run| run["RunId"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// The work ONE request performs catching a trigger up is bounded: a call materialises
+/// at most [`MAX_CATCHUP_FIRINGS_PER_WORKFLOW`] firings for a workflow, parks the
+/// trigger AT the oldest firing it did not materialise rather than skipping it, and the
+/// next call continues from there — so a gap costs one caller a bounded amount of work
+/// and still produces exactly one run per firing.
+#[tokio::test]
+async fn one_call_catches_a_trigger_up_by_at_most_the_per_call_ceiling() {
+    let scheduled = Scheduled::new().await;
+    let arn = scheduled
+        .create("cappedCatchUp", "dags/capped.yaml", DECLARES_A_SCHEDULE)
+        .await;
+
+    // More owed firings than one call will materialise.
+    let owed = MAX_CATCHUP_FIRINGS_PER_WORKFLOW + 4;
+    let case =
+        format!("{owed} owed firings against a ceiling of {MAX_CATCHUP_FIRINGS_PER_WORKFLOW}");
+    let oldest = owe_firings(&scheduled, &arn, u32::try_from(owed).unwrap_or_default());
+
+    let first = whole_history(&scheduled, &arn, &case).await;
+    assert_eq!(
+        first.len(),
+        MAX_CATCHUP_FIRINGS_PER_WORKFLOW,
+        "case {case:?}: one call must materialise at most the per-workflow ceiling, got {} \
+         runs",
+        first.len()
+    );
+
+    // Nothing was skipped: the trigger stands at the firing after the last one this call
+    // recorded, which is still in the past.
+    let stopped_at = oldest
+        + SCHEDULED_RUN_EVERY
+            * u32::try_from(MAX_CATCHUP_FIRINGS_PER_WORKFLOW).unwrap_or_default();
+    assert_eq!(
+        trigger(&scheduled, &arn),
+        Some(stopped_at),
+        "case {case:?}: a capped call must leave the trigger at the firing it stopped at"
+    );
+
+    // The next call continues the catch-up, so every firing the first call owed has by
+    // now produced its own run, and the runs the first call recorded are still there.
+    let second = whole_history(&scheduled, &arn, &case).await;
+    assert!(
+        second.len() >= owed,
+        "case {case:?}: the next call must continue the catch-up to at least {owed} runs, got \
+         {}",
+        second.len()
+    );
+    let ids = run_ids(&second);
+    let (carried, added) = ids.split_at(first.len());
+    assert_eq!(
+        carried,
+        run_ids(&first).as_slice(),
+        "case {case:?}: the runs the first call recorded must still be the oldest ones"
+    );
+    for id in added {
+        assert!(
+            !carried.contains(id),
+            "case {case:?}: every firing mints its own RunId, got {id:?} twice"
+        );
+    }
+}
+
+/// The per-call ceiling bounds the work, it does not drop a trigger: the triggers are
+/// served oldest owed firing first, so a workflow one call's budget did not reach holds
+/// the oldest firing in the store and is the first the next call serves.
+#[tokio::test]
+async fn the_per_call_budget_cannot_starve_a_trigger() {
+    let scheduled = Scheduled::new().await;
+
+    // One workflow more than the whole-store budget covers at the per-workflow ceiling,
+    // each owing more firings than that ceiling, so the budget really is spent before
+    // the last of them is reached.
+    let workflows = MAX_CATCHUP_FIRINGS_PER_CALL / MAX_CATCHUP_FIRINGS_PER_WORKFLOW + 1;
+    let owed = MAX_CATCHUP_FIRINGS_PER_WORKFLOW + 2;
+    let case = format!("{workflows} triggers owing {owed} firings each");
+    let mut arns: Vec<String> = Vec::with_capacity(workflows);
+    for index in 0..workflows {
+        let arn = scheduled
+            .create(
+                &format!("starved{index}"),
+                &format!("dags/starved-{index}.yaml"),
+                DECLARES_A_SCHEDULE,
+            )
+            .await;
+        arns.push(arn);
+    }
+    // Owed only once every workflow exists: a create is itself a request, and a request
+    // materialises what the clock owes, so owing inside the creation loop would let the
+    // later creates catch the earlier triggers up before the budget is ever tested.
+    for arn in &arns {
+        owe_firings(&scheduled, arn, u32::try_from(owed).unwrap_or_default());
+    }
+
+    /// How many runs each workflow holds AS THE STORE HOLDS IT, in creation order.
+    ///
+    /// Read from the store rather than over the wire: every request materialises what
+    /// the clock owes before it answers, so a listing call would itself move the
+    /// catch-up along and could not show where one call stopped.
+    fn histories(scheduled: &Scheduled, arns: &[String]) -> Vec<usize> {
+        arns.iter()
+            .map(|arn| {
+                with_stored_workflow(&scheduled.engine, arn, |workflow: &mut Workflow| {
+                    workflow.runs.len()
+                })
+            })
+            .collect()
+    }
+
+    // The first call spends the budget, so at least one trigger is left untouched: the
+    // bound is doing something here.
+    let (status, listed) =
+        call(&scheduled.router, "ListWorkflows", json!({"MaxResults": 100})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected ListWorkflows to succeed, got {status} {listed:?}"
+    );
+    let after_one = histories(&scheduled, &arns);
+    assert!(
+        after_one.contains(&0),
+        "case {case:?}: the whole-store budget must stop one call short of every trigger, \
+         got {after_one:?}"
+    );
+
+    // And no trigger stays behind: within a few further calls every one of them has
+    // caught up to the firings it owed.
+    let mut counts = after_one;
+    for _ in 0..workflows {
+        if counts.iter().all(|held| *held >= owed) {
+            break;
+        }
+        let (status, listed) =
+            call(&scheduled.router, "ListWorkflows", json!({"MaxResults": 100})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected ListWorkflows to succeed, got {status} {listed:?}"
+        );
+        counts = histories(&scheduled, &arns);
+    }
+    assert!(
+        counts.iter().all(|held| *held >= owed),
+        "case {case:?}: every trigger must catch up to the {owed} firings it owed, got \
+         {counts:?}"
+    );
+
+    // Every caught-up trigger's history is one run per firing, readable back over the
+    // wire: the bound changed how much one call does, not what a firing produces.
+    for arn in &arns {
+        let runs = whole_history(&scheduled, arn, &case).await;
+        let ids = run_ids(&runs);
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "case {case:?}: every firing mints its own RunId, got {ids:?}"
+        );
+    }
 }

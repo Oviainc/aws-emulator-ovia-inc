@@ -205,6 +205,24 @@ pub const MAX_WORKFLOWS: usize = 1_000;
 /// `OverrideParameters` each run holds.
 pub const MAX_RUNS_PER_WORKFLOW: usize = 1_000;
 
+/// How many owed firings ONE call materialises for a single workflow, and how many
+/// across the whole store, before it stops and leaves the rest to the next call.
+///
+/// A trigger left behind owes one firing per [`SCHEDULED_RUN_EVERY`] of the gap, and
+/// every handler materialises what the clock already owed before it answers
+/// ([`ComAmazonawsMwaaserverlessAmazonmwaaserverlessState::advance_clock`]). Without a
+/// per-call ceiling the work ONE request performs grows with the idle time before it
+/// and with the number of triggers in the store — up to a whole store of runs built
+/// under the lock every other request waits on. These ceilings bound that work per
+/// call without skipping a firing: the trigger is left AT the firing a capped call
+/// stopped at, so the next call continues the catch-up from there and every owed
+/// firing still produces exactly one run. They are the emulator's own choice, set well
+/// above the handful of firings a test or a caller that waited can owe.
+pub const MAX_CATCHUP_FIRINGS_PER_WORKFLOW: usize = 16;
+
+/// The whole-store companion of [`MAX_CATCHUP_FIRINGS_PER_WORKFLOW`].
+pub const MAX_CATCHUP_FIRINGS_PER_CALL: usize = 128;
+
 /// How many immutable versions this emulator will hold for ONE workflow.
 ///
 /// `UpdateWorkflow` appends a version per call ("automatically creates a new version with
@@ -1130,25 +1148,53 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
     /// A workflow already holding [`MAX_RUNS_PER_WORKFLOW`] runs records no further
     /// one: its trigger skips to the next firing after `now`, so a schedule left
     /// running cannot grow this store without bound.
+    ///
+    /// One call materialises at most [`MAX_CATCHUP_FIRINGS_PER_WORKFLOW`] firings for a
+    /// workflow and [`MAX_CATCHUP_FIRINGS_PER_CALL`] in all, so the work one request
+    /// performs does not grow with the gap it found. A trigger a capped call stopped at
+    /// is left THERE rather than moved on, so nothing is skipped and the next call
+    /// continues the catch-up — and the triggers are served OLDEST OWED FIRING FIRST,
+    /// so the trigger a capped call did not reach holds the oldest firing in the store
+    /// and is the first the next call serves. No trigger can therefore be starved by
+    /// one that keeps falling due.
     pub fn fire_due_scheduled_runs(&mut self, now: SystemTime) -> usize {
-        let due: Vec<String> = self
+        let mut due: Vec<(SystemTime, String)> = self
             .workflows
             .values()
-            .filter(|workflow| workflow.next_scheduled_run_at.is_some_and(|at| now >= at))
-            .map(|workflow| workflow.arn.clone())
+            .filter_map(|workflow| {
+                workflow
+                    .next_scheduled_run_at
+                    .filter(|at| now >= *at)
+                    .map(|at| (at, workflow.arn.clone()))
+            })
             .collect();
+        due.sort();
         let mut fired = 0;
-        for arn in due {
+        for (_, arn) in due {
+            if fired >= MAX_CATCHUP_FIRINGS_PER_CALL {
+                break;
+            }
+            // The version in force and the plan a run of it follows are resolved ONCE
+            // for this workflow's whole catch-up: every firing of it executes the same
+            // frozen definition, so the definition content is neither cloned nor read
+            // again per firing.
+            let Some((version, execution)) = self.active_execution(&arn) else {
+                continue;
+            };
+            let mut caught_up = 0;
             // Every firing the clock owes, oldest first, so a trigger left behind
             // reports one run per firing rather than one run for the whole gap.
-            while let Some((due_at, version, definition, at_capacity)) =
-                self.next_owed_firing(&arn, now)
-            {
+            while let Some((due_at, at_capacity)) = self.next_owed_firing(&arn, now) {
                 if at_capacity {
                     let skipped = firing_after(due_at, now, SCHEDULED_RUN_EVERY);
                     if let Some(workflow) = self.workflows.get_mut(&arn) {
                         workflow.next_scheduled_run_at = Some(skipped);
                     }
+                    break;
+                }
+                if caught_up >= MAX_CATCHUP_FIRINGS_PER_WORKFLOW
+                    || fired >= MAX_CATCHUP_FIRINGS_PER_CALL
+                {
                     break;
                 }
 
@@ -1158,7 +1204,7 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
                 let run = WorkflowRun {
                     run_id: run_id.clone(),
                     workflow_arn: arn.clone(),
-                    workflow_version: version,
+                    workflow_version: version.clone(),
                     // Nobody asked for this run: the workflow's own trigger did.
                     run_type: RUN_TYPE_SCHEDULED.to_string(),
                     status: RUN_STATUS_STARTING.to_string(),
@@ -1176,7 +1222,7 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
                     // The instances of the tasks this run's definition declares are
                     // recorded when it starts executing them ([`WorkflowRun::settle`]).
                     task_instances: BTreeMap::new(),
-                    execution: workflow_execution::ExecutionPlan::of(definition.as_deref()),
+                    execution: execution.clone(),
                     next_status_at: due_at + RUN_ADMITTED_AFTER,
                     sequence,
                 };
@@ -1186,33 +1232,38 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
                 };
                 workflow.runs.insert(run_id, run);
                 workflow.next_scheduled_run_at = Some(due_at + SCHEDULED_RUN_EVERY);
+                caught_up += 1;
                 fired += 1;
             }
         }
         fired
     }
 
+    /// The version in force for `arn` and the execution plan a run of that version
+    /// follows, built once from the definition content the version froze.
+    fn active_execution(&self, arn: &str) -> Option<(String, workflow_execution::ExecutionPlan)> {
+        let workflow = self.workflows.get(arn)?;
+        let version = workflow.version(None)?;
+        Some((
+            version.version.clone(),
+            workflow_execution::ExecutionPlan::of(
+                version.snapshot.workflow_definition.as_deref(),
+            ),
+        ))
+    }
+
     /// The next firing of `arn`'s trigger that `now` has already made due: the instant
-    /// it fell due, the version in force at that instant — the one its run executes —
-    /// with the definition content that version froze, and whether the workflow already
-    /// holds every run this store keeps for it.
+    /// it fell due, and whether the workflow already holds every run this store keeps
+    /// for it.
     ///
     /// `None` when the trigger owes nothing: the workflow is gone, it has no trigger,
     /// its next firing is still ahead, or it holds no version to run.
-    fn next_owed_firing(
-        &self,
-        arn: &str,
-        now: SystemTime,
-    ) -> Option<(SystemTime, String, Option<String>, bool)> {
+    fn next_owed_firing(&self, arn: &str, now: SystemTime) -> Option<(SystemTime, bool)> {
         let workflow = self.workflows.get(arn)?;
         let due_at = workflow.next_scheduled_run_at.filter(|at| now >= *at)?;
-        let version = workflow.version(None)?;
-        Some((
-            due_at,
-            version.version.clone(),
-            version.snapshot.workflow_definition.clone(),
-            workflow.runs.len() >= MAX_RUNS_PER_WORKFLOW,
-        ))
+        // A workflow holding no version has nothing for a firing to execute.
+        workflow.version(None)?;
+        Some((due_at, workflow.runs.len() >= MAX_RUNS_PER_WORKFLOW))
     }
 
     /// Apply EVERY change the clock already owed this store — the workflow teardowns
@@ -2077,8 +2128,13 @@ static ENCRYPTION_TYPE_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
 
 /// `Tags`: `@length(0..50)` ENTRIES, with `TagValue`'s own constraints carried
 /// for each value exactly as codegen carries them
-/// (`smithy_query(query="shape", shape="Tags")`). A map KEY is not walked, which
-/// is the framework's own rule, not a choice made here.
+/// (`smithy_query(query="shape", shape="Tags")`).
+///
+/// The walk does not run a constraint on a map KEY: a key is written against the
+/// map member's own schema, whose trait map describes the MAP (its entry count)
+/// and its VALUES. The key shape's constraints are therefore carried separately,
+/// by [`M_TAGS_KEY`], and handed to the same walk beside the map itself by
+/// [`constrained_tags`].
 static TAGS_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
     let mut traits = TraitMap::new();
     traits.insert(Box::new(LengthTrait::new(Some(0), Some(50))));
@@ -2279,6 +2335,29 @@ pub static M_TAGS: Schema = Schema::new_member(
     11,
 )
 .with_traits(&TAGS_TRAITS);
+
+/// The KEY position of a `Tags` map, which targets `TagKey` exactly as
+/// `TagKeys`' element does (`smithy_query(query="shape", shape="Tags")`).
+///
+/// Named for the member that CARRIES the map, because that is the member a
+/// request supplied the key in and the one a refusal must name; a key outside
+/// `TagKey` is reported at that member's own path, the position the map's entry
+/// count is reported at too.
+///
+/// Declared beside the map it belongs to, with the next free index of this
+/// shadow family (the root struct's member list is empty, so the index only has
+/// to be unique).
+pub static M_TAGS_KEY: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$TagsKey",
+        NAMESPACE,
+        "Tags",
+    ),
+    ShapeType::String,
+    "Tags",
+    16,
+)
+.with_traits(&TAG_KEY_TRAITS);
 
 /// `TagKeys`, the `TagKeys` list.
 pub static M_TAG_KEYS: Schema = Schema::new_member(
@@ -2495,6 +2574,30 @@ pub fn validate_members(
     members: &[(&'static Schema, ConstrainedValue<'_>)],
 ) -> Vec<Violation> {
     validate(&ConstrainedMembers { members }, &CONSTRAINED_INPUT_SCHEMA)
+}
+
+/// A request's `Tags` map, ready for the walk: the map itself — its entry count
+/// and each VALUE's own constraints — plus every KEY it carries.
+///
+/// A map's key shape is constrained just like its value shape, so both sides of
+/// an entry are checked before anything is stored. The walk reaches a value
+/// through the map member's element constraints but never a key (see
+/// [`M_TAGS`]), so each key is handed over as its own leaf, carrying
+/// `TagKey`'s constraints through [`M_TAGS_KEY`]. Every operation that accepts
+/// `Tags` hands the member over this way, so a key one operation refuses is
+/// refused by all of them — and no key a later `UntagResource` could not name is
+/// ever written.
+pub fn constrained_tags(
+    tags: &HashMap<String, String>,
+) -> Vec<(&'static Schema, ConstrainedValue<'_>)> {
+    let mut members: Vec<(&'static Schema, ConstrainedValue<'_>)> =
+        Vec::with_capacity(tags.len() + 1);
+    members.push((&M_TAGS, ConstrainedValue::Entries(tags)));
+    members.extend(
+        tags.keys()
+            .map(|key| (&M_TAGS_KEY, ConstrainedValue::Text(key.as_str()))),
+    );
+    members
 }
 
 /// `Code`'s `S3Location` variant, for the walk.

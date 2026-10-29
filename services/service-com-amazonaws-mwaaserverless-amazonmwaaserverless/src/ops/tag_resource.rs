@@ -267,12 +267,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// violation cap, the entry-count bound and the path are the framework's, not
 /// this crate's.
 fn validate_input(input: &TagResourceInput) -> Result<(), ValidationException> {
-    use crate::state::ConstrainedValue::{Entries, Text};
+    use crate::state::ConstrainedValue::Text;
 
-    let violations = crate::state::validate_members(&[
-        (&crate::state::M_RESOURCE_ARN, Text(&input.resource_arn)),
-        (&crate::state::M_TAGS, Entries(&input.tags)),
-    ]);
+    // `Tags` is handed over through `constrained_tags`, so every tag KEY is
+    // checked against the key shape's own constraints beside the map's entry
+    // count and each value's — a key outside them never reaches the store.
+    let mut members: Vec<(&'static ::aws_smithy_schema::Schema, crate::state::ConstrainedValue)> =
+        vec![(&crate::state::M_RESOURCE_ARN, Text(&input.resource_arn))];
+    members.extend(crate::state::constrained_tags(&input.tags));
+
+    let violations = crate::state::validate_members(&members);
     if violations.is_empty() {
         return Ok(());
     }

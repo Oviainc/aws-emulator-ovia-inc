@@ -57,6 +57,8 @@ mod run_version_task_graph;
 mod scheduled_workflow_runs;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_key_constraints.rs"]
+mod tag_key_constraints;
 #[path = "all/tag_writes_while_deleting.rs"]
 mod tag_writes_while_deleting;
 #[path = "all/task_instance_listing.rs"]
