@@ -30,6 +30,14 @@
 //! channel into the modelled `UPDATING` state and owes the `IDLE` it started
 //! from, so a caller polling straight afterwards sees that transient state.
 //!
+//! The pipelines the new class gives the channel are also what the channel's
+//! SCHEDULE resolves a pause action's `PipelineId` against, so the stored actions
+//! are resolved against the class this request would leave before anything is
+//! written: a class under which an action the schedule holds is one
+//! `BatchUpdateSchedule` would refuse to create is refused with this operation's
+//! modelled `UnprocessableEntityException` (422), exactly as `UpdateChannel`
+//! refuses a configuration that would strand one.
+//!
 //! The id is resolved through the shared channel-mutation guard
 //! (`state::mutable_channel`), so a channel whose delete this service has
 //! accepted — readable in `DELETING` and then in the terminal `DELETED` — names
@@ -237,6 +245,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The pipelines the new class gives the channel are what a stored pause
+        // action's `PipelineId` resolves against, so the schedule is resolved
+        // against the class this request would leave: an action the channel
+        // could then not execute is one `BatchUpdateSchedule` refuses to create,
+        // so a class that would strand it is refused here too and the channel
+        // keeps the class its schedule was built against.
+        let problems = channel.schedule.unexecutable_action_problems(
+            &crate::state::ChannelScheduleScope::of_configuration(
+                channel.encoder_settings.as_ref(),
+                &channel.input_attachments,
+                crate::state::class_pipelines(&input.channel_class),
+            ),
+        );
+        if !problems.is_empty() {
+            return Err(unprocessable(problems));
+        }
+
         // The class is what this operation exists to write; the destinations are
         // replaced only when the request names them.
         channel.channel_class = input.channel_class;
@@ -271,6 +296,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn not_found(message: &str) -> UpdateChannelClassError {
     UpdateChannelClassErrorModeled::NotFoundException(NotFoundException {
         message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The refusal a class that would leave the channel unable to execute an action
+/// its schedule holds earns: the operation's modelled
+/// `UnprocessableEntityException` (422), carrying one `ValidationErrors` entry
+/// per problem — "A collection of validation error responses", each naming the
+/// element path the problem was found at — beside the message `UpdateChannel`
+/// reports the same class of refusal with. Nothing is written for it, so the
+/// channel keeps the class it had.
+fn unprocessable(problems: Vec<ValidationError>) -> UpdateChannelClassError {
+    UpdateChannelClassErrorModeled::UnprocessableEntityException(UnprocessableEntityException {
+        message: Some(crate::state::CHANNEL_CONTAINS_ERRORS_MESSAGE.to_string()),
+        validation_errors: Some(problems),
     })
     .into()
 }

@@ -59,11 +59,23 @@
 //! * `PipelinePauseStateSettings$PipelineId`: "Pipeline ID to pause ("PIPELINE_0"
 //!   or "PIPELINE_1")" — of the channel, which has two pipelines only in the
 //!   `STANDARD` class ("a single pipeline channel only has one").
+//!
+//! Those references are resolved against the channel configuration at ALL times,
+//! not only when an action is created: the members they are resolved against are
+//! the channel's own, and a write that replaces one of them would otherwise leave
+//! the schedule holding an action naming something the channel no longer
+//! declares. [`ChannelSchedule::unexecutable_action_problems`] is the question a
+//! write asks before it stores a configuration —
+//! [`ChannelScheduleScope::of_configuration`] is that prospective configuration's
+//! side of it — so the same rule that refuses such an action on the way in keeps
+//! it from being stranded afterwards.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{ScheduleAction, ScheduleActionSettings, ValidationError};
+use crate::ops::types::{
+    EncoderSettings, InputAttachment, ScheduleAction, ScheduleActionSettings, ValidationError,
+};
 
 /// How long an action stays in the schedule once its start time has passed.
 ///
@@ -81,6 +93,16 @@ pub const SCHEDULE_ACTION_RETENTION: Duration = Duration::from_secs(60 * 60);
 /// names the limit rather than a per-account quota. `BatchUpdateSchedule` models
 /// `TooManyRequestsException`, which is that refusal once the schedule is full.
 pub const MAX_SCHEDULE_ACTIONS: usize = 500;
+
+/// Where a problem with an action the schedule ALREADY holds is reported: the
+/// stored schedule of the channel being written, under the action's own name.
+///
+/// A created action's problem is reported at the request member it arrived in
+/// (`creates/scheduleActions/<index>`), but an action that is already stored
+/// arrived in no member of the write being refused, so the path names the place
+/// it is held — `ValidationError$ElementPath` is "Path to the source of the
+/// error", and the source is that stored action.
+const STORED_ACTIONS_PATH: &str = "schedule/scheduleActions";
 
 /// The value a channel-configuration flag carries when the feature is on.
 /// `FeatureActivationsInputPrepareScheduleActions`,
@@ -130,15 +152,35 @@ impl ChannelScheduleScope {
     /// The channel configuration a request's created actions are resolved
     /// against, read off the channel record that owns the schedule.
     pub fn of(channel: &super::ChannelRecord) -> Self {
-        let encoder = channel.encoder_settings.as_ref();
-        let features = encoder.and_then(|settings| settings.feature_activations.as_ref());
+        Self::of_configuration(
+            channel.encoder_settings.as_ref(),
+            &channel.input_attachments,
+            channel.pipelines(),
+        )
+    }
+
+    /// The same scope, read off the three things a channel configuration
+    /// DECLARES rather than off the record that holds them: its
+    /// `EncoderSettings`, its `InputAttachments` and the pipelines its
+    /// `ChannelClass` gives it.
+    ///
+    /// What [`Self::of`] is for the configuration a channel HAS, this is for one
+    /// a write WOULD leave on it — the members its request names over the ones
+    /// the channel already had — so the schedule can be resolved against that
+    /// configuration before anything is stored.
+    pub fn of_configuration(
+        encoder_settings: Option<&EncoderSettings>,
+        input_attachments: &[InputAttachment],
+        pipelines: impl IntoIterator<Item = i32>,
+    ) -> Self {
+        let features =
+            encoder_settings.and_then(|settings| settings.feature_activations.as_ref());
         Self {
-            attachment_names: channel
-                .input_attachments
+            attachment_names: input_attachments
                 .iter()
                 .filter_map(|attachment| attachment.input_attachment_name.clone())
                 .collect(),
-            output_names: encoder
+            output_names: encoder_settings
                 .map(|settings| settings.output_groups.as_slice())
                 .unwrap_or_default()
                 .iter()
@@ -147,7 +189,7 @@ impl ChannelScheduleScope {
                 .collect(),
             // The channel's own pipelines, so `PIPELINE_1` names one of them
             // only in the two-pipeline class.
-            pipelines: channel.pipelines().collect(),
+            pipelines: pipelines.into_iter().collect(),
             input_prepare_actions: features
                 .and_then(|features| features.input_prepare_schedule_actions.as_deref())
                 == Some(FEATURE_ENABLED),
@@ -159,7 +201,7 @@ impl ChannelScheduleScope {
             // A configuration that is there and not turned off: the member is
             // what declares the feature on the channel, and its own flag can
             // turn it back off.
-            motion_graphics: encoder
+            motion_graphics: encoder_settings
                 .and_then(|settings| settings.motion_graphics_configuration.as_ref())
                 .is_some_and(|configuration| {
                     configuration.motion_graphics_insertion.as_deref() != Some(FEATURE_DISABLED)
@@ -432,6 +474,44 @@ impl ChannelSchedule {
             (at, hops, record.sequence)
         });
         ordered
+    }
+
+    /// Every problem the actions this schedule ALREADY holds have with
+    /// `scope` — each stored action's channel-scoped references resolved against
+    /// a channel configuration exactly as [`Self::apply`] resolves a created
+    /// action's, so one rule decides both.
+    ///
+    /// Empty for a schedule whose every action the configuration can execute,
+    /// which is the only schedule a channel holds: a write that replaces a
+    /// member the references resolve against asks this of the configuration it
+    /// WOULD leave ([`ChannelScheduleScope::of_configuration`]) before it stores
+    /// anything, so a configuration that would strand a stored action is refused
+    /// instead of being written.
+    ///
+    /// Each entry is reported at the stored action it was found at, named by the
+    /// `ActionName` that is "the main reference to an action once it is added to
+    /// the schedule", so the caller is told which action blocks the write and
+    /// which of its members does. The actions are walked in the store's own
+    /// (name) order rather than in start order: the names are what identify them
+    /// here, which keeps the reported order total and stable without placing
+    /// every action on the timeline first.
+    pub fn unexecutable_action_problems(
+        &self,
+        scope: &ChannelScheduleScope,
+    ) -> Vec<ValidationError> {
+        self.actions
+            .values()
+            .flat_map(|record| {
+                channel_problems(
+                    &format!(
+                        "{STORED_ACTIONS_PATH}/{}/scheduleActionSettings",
+                        record.action.action_name
+                    ),
+                    &record.action.schedule_action_settings,
+                    scope,
+                )
+            })
+            .collect()
     }
 
     /// Where `record` starts in the channel: the instant, and how many follow

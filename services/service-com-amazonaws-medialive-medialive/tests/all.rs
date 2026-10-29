@@ -35,6 +35,9 @@ mod channel_anywhere_placement_resolution;
 #[path = "all/channel_class_update.rs"]
 mod channel_class_update;
 
+#[path = "all/channel_configuration_schedule_consistency.rs"]
+mod channel_configuration_schedule_consistency;
+
 #[path = "all/channel_configuration_validation.rs"]
 mod channel_configuration_validation;
 

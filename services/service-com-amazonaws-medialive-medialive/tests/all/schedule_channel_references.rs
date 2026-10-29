@@ -18,6 +18,12 @@
 //! referenced shapes `InputAttachment`, `Output`, `FeatureActivations`,
 //! `MotionGraphicsConfiguration`, `PipelineId`), the two channel classes and both
 //! sides of every rule; the issue's input-switch case is ONE row.
+//!
+//! The channel setup, the action builder and the two response readers below are
+//! `pub(crate)` because `crate::channel_configuration_schedule_consistency` — the
+//! suite about the SAME references surviving a write to the channel's
+//! configuration — drives the same requests, so the two suites share one harness
+//! rather than keeping two copies of it.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -47,7 +53,7 @@ async fn input(router: &MultiServiceRouter) -> String {
 
 /// A channel carrying `attachments` (each entry is an attachment name), the
 /// `encoder_settings` the case needs and `class` as its `ChannelClass`.
-async fn channel(
+pub(crate) async fn channel(
     router: &MultiServiceRouter,
     class: &str,
     attachments: &[&str],
@@ -80,7 +86,7 @@ async fn channel(
 /// OutputGroups, TimecodeConfig, VideoDescriptions), the outputs named by
 /// `outputs`, and whatever `extra` members the case adds (feature activations,
 /// motion graphics).
-fn encoder_settings(outputs: &[&str], extra: Value) -> Value {
+pub(crate) fn encoder_settings(outputs: &[&str], extra: Value) -> Value {
     let outputs: Vec<Value> = outputs
         .iter()
         .map(|name| json!({ "outputName": name, "outputSettings": {} }))
@@ -105,7 +111,7 @@ fn encoder_settings(outputs: &[&str], extra: Value) -> Value {
 
 /// `FeatureActivations` with both schedule-action features turned on or off
 /// (`smithy_query(query="shape", shape="FeatureActivations")`).
-fn features(input_prepare: &str, output_static_image_overlay: &str) -> Value {
+pub(crate) fn features(input_prepare: &str, output_static_image_overlay: &str) -> Value {
     json!({
         "featureActivations": {
             "inputPrepareScheduleActions": input_prepare,
@@ -114,12 +120,12 @@ fn features(input_prepare: &str, output_static_image_overlay: &str) -> Value {
     })
 }
 
-fn schedule_uri(channel_id: &str) -> String {
+pub(crate) fn schedule_uri(channel_id: &str) -> String {
     format!("/prod/channels/{channel_id}/schedule")
 }
 
 /// One immediate-mode `ScheduleAction` carrying `settings`.
-fn action(name: &str, settings: Value) -> Value {
+pub(crate) fn action(name: &str, settings: Value) -> Value {
     json!({
         "actionName": name,
         "scheduleActionSettings": settings,
@@ -127,7 +133,11 @@ fn action(name: &str, settings: Value) -> Value {
     })
 }
 
-async fn update(router: &MultiServiceRouter, channel_id: &str, actions: Vec<Value>) -> (u16, Value) {
+pub(crate) async fn update(
+    router: &MultiServiceRouter,
+    channel_id: &str,
+    actions: Vec<Value>,
+) -> (u16, Value) {
     call(
         router,
         "PUT",
@@ -137,13 +147,13 @@ async fn update(router: &MultiServiceRouter, channel_id: &str, actions: Vec<Valu
     .await
 }
 
-async fn describe(router: &MultiServiceRouter, channel_id: &str) -> (u16, Value) {
+pub(crate) async fn describe(router: &MultiServiceRouter, channel_id: &str) -> (u16, Value) {
     call(router, "GET", &schedule_uri(channel_id), None).await
 }
 
 /// The `elementPath`s a refusal's `validationErrors` named ("Path to the source of
 /// the error").
-fn element_paths(body: &Value) -> Vec<String> {
+pub(crate) fn element_paths(body: &Value) -> Vec<String> {
     body["validationErrors"]
         .as_array()
         .map(|errors| {
@@ -156,7 +166,7 @@ fn element_paths(body: &Value) -> Vec<String> {
 }
 
 /// The action names a `DescribeSchedule` read reported.
-fn reported_names(body: &Value) -> Vec<String> {
+pub(crate) fn reported_names(body: &Value) -> Vec<String> {
     body["scheduleActions"]
         .as_array()
         .map(|actions| {

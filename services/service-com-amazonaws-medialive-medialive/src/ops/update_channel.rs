@@ -27,6 +27,14 @@
 //! modelled `UPDATING` state and owes the `IDLE` it started from, so a caller
 //! polling straight afterwards sees that transient state.
 //!
+//! The configuration an update would leave is also what the channel's SCHEDULE
+//! resolves its channel-scoped references against ("The name is specified in the
+//! channel configuration"), so the stored actions are resolved against it before
+//! anything is written: a configuration under which an action the schedule holds
+//! is one `BatchUpdateSchedule` would refuse to create is refused with the same
+//! modelled `UnprocessableEntityException` (422) the merged-configuration rule
+//! answers through.
+//!
 //! The id is resolved through the shared channel-mutation guard
 //! (`state::mutable_channel`), so a channel whose delete this service has
 //! accepted — readable in `DELETING` and then in the terminal `DELETED` — names
@@ -283,15 +291,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled 422, one `ValidationErrors` entry per problem, and the channel
         // keeps exactly the configuration it had.
         let stored = state.channels.get(&input.channel_id).ok_or_else(unavailable)?;
-        let problems = state.channel_configuration_problems(&crate::state::ChannelConfiguration {
-            encoder_settings: input
-                .encoder_settings
-                .as_ref()
-                .or(stored.encoder_settings.as_ref()),
-            input_attachments: input
-                .input_attachments
-                .as_deref()
-                .unwrap_or(&stored.input_attachments),
+        // The two members the channel's own SCHEDULE resolves its references
+        // against, as this update would leave them.
+        let encoder_settings = input
+            .encoder_settings
+            .as_ref()
+            .or(stored.encoder_settings.as_ref());
+        let input_attachments = input
+            .input_attachments
+            .as_deref()
+            .unwrap_or(&stored.input_attachments);
+        let mut problems = state.channel_configuration_problems(&crate::state::ChannelConfiguration {
+            encoder_settings,
+            input_attachments,
             channel_security_groups: input
                 .channel_security_groups
                 .as_deref()
@@ -309,6 +321,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // refusal for a member the request never supplied.
             held: Some(stored),
         });
+        // The channel's schedule resolves its channel-scoped references —
+        // an input attachment by name, an output by name, the features a kind of
+        // action needs — against exactly the members this update replaces, so
+        // the actions it ALREADY holds are resolved against the configuration
+        // this update would leave: an action the channel could then not execute
+        // is one `BatchUpdateSchedule` refuses to create, so a configuration
+        // that would strand it is refused here too, in the same 422, and the
+        // channel keeps the configuration its schedule was built against.
+        problems.extend(stored.schedule.unexecutable_action_problems(
+            &crate::state::ChannelScheduleScope::of_configuration(
+                encoder_settings,
+                input_attachments,
+                // The class, and so the pipelines a pause action may name, is
+                // not a member this operation writes (`UpdateChannelClass` is),
+                // so the channel keeps the ones it has.
+                stored.pipelines(),
+            ),
+        ));
         if !problems.is_empty() {
             return Err(unprocessable(problems));
         }

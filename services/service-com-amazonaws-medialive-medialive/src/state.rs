@@ -548,6 +548,23 @@ pub mod channel_class {
     pub const SINGLE_PIPELINE: &str = "SINGLE_PIPELINE";
 }
 
+/// The pipelines a channel of `channel_class` has, numbered as
+/// [`PipelineDetail`]`$PipelineId` numbers them.
+///
+/// The ONE place the class-to-pipeline rule lives (the `ChannelClass` doc: "A
+/// standard channel has two encoding pipelines and a single pipeline channel
+/// only has one"): [`ChannelRecord::pipelines`] is this for the class a channel
+/// HAS, and a write that would give it another class asks this for the class it
+/// WOULD have.
+pub fn class_pipelines(channel_class: &str) -> ::std::ops::Range<i32> {
+    let count = if channel_class == channel_class::SINGLE_PIPELINE {
+        1
+    } else {
+        2
+    };
+    0..count
+}
+
 /// The pipeline a `PipelineId` / `ChannelPipelineIdToRestart` value names, as
 /// [`PipelineDetail`]`$PipelineId` numbers it.
 ///
@@ -1347,22 +1364,19 @@ impl ChannelRecord {
     /// channel has two encoding pipelines and a single pipeline channel only has
     /// one").
     pub fn pipeline_count(&self) -> i32 {
-        if self.channel_class == channel_class::SINGLE_PIPELINE {
-            1
-        } else {
-            2
-        }
+        self.pipelines().end
     }
 
     /// The pipelines this channel's class gives it, numbered as
     /// `PipelineDetail$PipelineId` numbers them (the `ChannelClass` doc: a
     /// `STANDARD` channel has two, a `SINGLE_PIPELINE` channel one).
     ///
-    /// The one place the class-to-pipeline rule lives: every other reading of it
-    /// — whether a request may name a pipeline, which of them are up, how a
-    /// schedule action's pause target is resolved — derives from here.
+    /// Every other reading of the class-to-pipeline rule — whether a request may
+    /// name a pipeline, which of them are up, how a schedule action's pause
+    /// target is resolved — derives from here, which derives from the one place
+    /// that rule lives ([`class_pipelines`]).
     pub fn pipelines(&self) -> ::std::ops::Range<i32> {
-        0..self.pipeline_count()
+        class_pipelines(&self.channel_class)
     }
 
     /// The pipelines of this channel that are up right now, numbered as
