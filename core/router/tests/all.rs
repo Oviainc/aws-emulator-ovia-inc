@@ -41,6 +41,9 @@ mod cloudformation_opensearch_domain_access_policies;
 // Declared in this same head region, for the reason the entries above record.
 #[path = "all/cloudformation_opensearch_domain_deployments.rs"]
 mod cloudformation_opensearch_domain_deployments;
+// Declared in this same head region, for the reason the entries above record.
+#[path = "all/cloudformation_opensearch_vpc_endpoint_access.rs"]
+mod cloudformation_opensearch_vpc_endpoint_access;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `c…` span (where every cloudformation suite lands) are both regions
 // concurrently landing suites add their line to.

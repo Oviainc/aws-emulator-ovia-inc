@@ -169,6 +169,8 @@ mod version_catalog;
 mod vpc_access_endpoints;
 #[path = "all/vpc_endpoint_access.rs"]
 mod vpc_endpoint_access;
+#[path = "all/vpc_endpoint_access_revocation.rs"]
+mod vpc_endpoint_access_revocation;
 #[path = "all/vpc_endpoint_updates.rs"]
 mod vpc_endpoint_updates;
 #[path = "all/vpc_endpoints.rs"]

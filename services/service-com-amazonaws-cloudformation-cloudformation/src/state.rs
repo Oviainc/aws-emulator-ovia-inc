@@ -3018,11 +3018,19 @@ impl StoredStack {
     /// Record that the service owning `logical_id` reports the resource ready, and make the
     /// operation's terminal status due where that was the last resource it was waiting for.
     ///
-    /// The operation is owed its terminal status from the instant the resource became ready
-    /// rather than from the call that started it, exactly as a wait condition's signals do
-    /// it ([`Self::release_wait_conditions`]) — so a caller reading straight after still
-    /// sees the operation in progress, and the barriers stay on the stack until
-    /// [`Self::settle`] completes it.
+    /// The barrier HELD a conclusion the operation's own clock had already made due
+    /// ([`STATUS_TRANSITION_DELAY`], stamped when the operation began): it never postponed
+    /// it. So releasing the last barrier restores that instant rather than starting a fresh
+    /// span — the conclusion stands at the LATER of the instant the operation's own span
+    /// elapsed and the instant the resource was ready, which is the first instant at which
+    /// every part of it had happened. `now` is when the owning service was seen to report the
+    /// resource ready, and a release is only ever recorded from a call that asked it
+    /// ([`provisioning::advance_stabilisations`]), which is the one thing a read of this
+    /// store cannot do — so a read that asks and learns the resource came up long ago
+    /// reports the conclusion the clock owed from then, instead of charging the caller
+    /// another span for having been the one to notice. The barriers stay on the stack until
+    /// [`Self::settle`] completes it, so the resources the operation created go on being
+    /// reported while it finishes.
     pub fn release_stabilisation(&mut self, logical_id: &str, now: SystemTime) {
         let Some(barrier) = self
             .stabilisations
@@ -3036,7 +3044,7 @@ impl StoredStack {
             return;
         }
         if let Some(pending) = &mut self.pending {
-            pending.due_at = now + STATUS_TRANSITION_DELAY;
+            pending.due_at = pending.due_at.max(now);
         }
     }
 

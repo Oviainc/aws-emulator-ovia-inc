@@ -84,9 +84,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{
-    PRINCIPAL_TYPE_AWS_ACCOUNT, PRINCIPAL_TYPE_AWS_SERVICE, VPC_ENDPOINT_ACCESS_QUOTA,
-};
+use crate::state::VPC_ENDPOINT_ACCESS_QUOTA;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -167,8 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Which principal is being authorized is decided from the request alone, before
         // the store is touched, so a request that names no principal — or two — changes
-        // nothing.
-        let principal = requested_principal(input.account, input.service)?;
+        // nothing. The rule is `crate::state`'s, shared with the revoke that addresses the
+        // same set.
+        let principal = crate::state::requested_principal(input.account, input.service)
+            .map_err(AuthorizeVpcEndpointAccessErrorModeled::ValidationException)?;
 
         let mut store = state.lock();
         // Access is access TO a domain, so a name the registry does not resolve names
@@ -218,56 +218,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The principal a request names: what kind of principal it is, and the identity that
-/// names it.
-struct RequestedPrincipal {
-    /// One of `PrincipalType`'s values.
-    principal_type: &'static str,
-    /// `AuthorizedPrincipal$Principal`, and the key the domain's set holds it under.
-    id: String,
-}
-
-/// The principal `Account` and `Service` name, or the refusal for a request that names
-/// no principal or more than one.
-///
-/// An authorization is one principal's access to the domain and the answer carries
-/// exactly one `AuthorizedPrincipal`, whose `PrincipalType` says which of the two kinds
-/// it is — so a request names EXACTLY one of them. Both members are optional in the
-/// model and nothing in it relates them, so neither combination is refused at the
-/// request boundary: it is this operation's own modelled `ValidationException` that
-/// refuses them, with 400.
-fn requested_principal(
-    account: Option<String>,
-    service: Option<String>,
-) -> Result<RequestedPrincipal, AuthorizeVpcEndpointAccessError> {
-    match (account, service) {
-        (Some(account), None) => Ok(RequestedPrincipal {
-            principal_type: PRINCIPAL_TYPE_AWS_ACCOUNT,
-            id: account,
-        }),
-        (None, Some(service)) => Ok(RequestedPrincipal {
-            principal_type: PRINCIPAL_TYPE_AWS_SERVICE,
-            id: service,
-        }),
-        (None, None) => Err(AuthorizeVpcEndpointAccessErrorModeled::ValidationException(
-            ValidationException {
-                message: Some(
-                    "either Account or Service is required: it names the principal being \
-                     granted access to the domain"
-                        .to_string(),
-                ),
-            },
-        )
-        .into()),
-        (Some(_), Some(_)) => Err(AuthorizeVpcEndpointAccessErrorModeled::ValidationException(
-            ValidationException {
-                message: Some(
-                    "Account and Service are mutually exclusive: one call grants access \
-                     to one principal"
-                        .to_string(),
-                ),
-            },
-        )
-        .into()),
-    }
-}

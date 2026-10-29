@@ -850,12 +850,67 @@ pub const PRINCIPAL_TYPE_AWS_SERVICE: &str = "AWS_SERVICE";
 /// Like [`DATA_SOURCE_QUOTA`] this is the emulator's OWN bound on the store — it
 /// models neither Service Quotas nor an account's adjustments — and it is what stops
 /// a caller looping with fresh principals from growing the state without end: every
-/// record it counts is released when `DeleteDomain` releases the domain that holds it
-/// (`RevokeVpcEndpointAccess`, which releases one on its own, is still a stub).
+/// record it counts is released when `RevokeVpcEndpointAccess` releases the one
+/// principal's access, or when `DeleteDomain` releases the domain that holds the set.
 /// Because the per-domain set IS what `ListVpcEndpointAccess` answers with, and that
 /// set is held on the domain, with [`DOMAIN_QUOTA`] it also bounds the whole
 /// authorization store.
 pub const VPC_ENDPOINT_ACCESS_QUOTA: usize = 50;
+
+/// The principal a VPC endpoint access call names: what kind of principal it is, and the
+/// identity that names it.
+#[derive(Debug, Clone)]
+pub struct RequestedPrincipal {
+    /// One of `PrincipalType`'s values — [`PRINCIPAL_TYPE_AWS_ACCOUNT`] or
+    /// [`PRINCIPAL_TYPE_AWS_SERVICE`].
+    pub principal_type: &'static str,
+    /// `AuthorizedPrincipal$Principal`, and the key a domain's set holds the record
+    /// under.
+    pub id: String,
+}
+
+/// The principal an `Account`/`Service` pair names, or the refusal for a request that
+/// names no principal or more than one.
+///
+/// An authorization is ONE principal's access to the domain and the grant's answer
+/// carries exactly one `AuthorizedPrincipal`, whose `PrincipalType` says which of the two
+/// kinds it is — so a request names EXACTLY one of them. Both members are optional in the
+/// model and nothing in it relates them, so neither combination is refused at the request
+/// boundary: it is the operation's own modelled `ValidationException` that refuses them,
+/// with 400.
+///
+/// `AuthorizeVpcEndpointAccess` and `RevokeVpcEndpointAccess` take that same pair and
+/// address the same per-domain set with it, so the rule reading it lives here once and
+/// the two cannot disagree about which principal a request named.
+pub fn requested_principal(
+    account: Option<String>,
+    service: Option<String>,
+) -> Result<RequestedPrincipal, ValidationException> {
+    match (account, service) {
+        (Some(account), None) => Ok(RequestedPrincipal {
+            principal_type: PRINCIPAL_TYPE_AWS_ACCOUNT,
+            id: account,
+        }),
+        (None, Some(service)) => Ok(RequestedPrincipal {
+            principal_type: PRINCIPAL_TYPE_AWS_SERVICE,
+            id: service,
+        }),
+        (None, None) => Err(ValidationException {
+            message: Some(
+                "either Account or Service is required: it names the principal whose \
+                 access to the domain through an interface VPC endpoint this call changes"
+                    .to_string(),
+            ),
+        }),
+        (Some(_), Some(_)) => Err(ValidationException {
+            message: Some(
+                "Account and Service are mutually exclusive: one call changes the access \
+                 of one principal"
+                    .to_string(),
+            ),
+        }),
+    }
+}
 
 /// How many authorized principals ONE page of `ListVpcEndpointAccess` carries.
 ///

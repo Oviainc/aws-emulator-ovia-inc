@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeVpcEndpointAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeVpcEndpointAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeVpcEndpointAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Revokes ONE principal's access to a domain through an interface VPC endpoint by
+//! taking its record out of that domain's
+//! [`crate::state::Domain::vpc_endpoint_access`] set: the same record
+//! `AuthorizeVpcEndpointAccess` put there and `ListVpcEndpointAccess` reports.
+//!
+//! The principal IS the identity of the authorization, so a revoke names the principal
+//! whose access goes and removes AT MOST that one record. Revoking is idempotent: a
+//! principal the domain does not allow has no access left to take away, so the call
+//! succeeds with its empty body and the set is left exactly as it was — it never grants
+//! anything, and it never removes anybody else's grant.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +151,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeVpcEndpointAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeVpcEndpointAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeVpcEndpointAccess"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // Which principal loses its access is decided from the request alone, before the
+        // store is touched, so a request that names no principal — or two — changes
+        // nothing. The rule is `crate::state`'s, shared with the grant that fills the same
+        // set.
+        let principal = crate::state::requested_principal(input.account, input.service)
+            .map_err(RevokeVpcEndpointAccessErrorModeled::ValidationException)?;
+
+        let mut store = state.lock();
+        // Access is access TO a domain, so a name the registry does not resolve names
+        // nothing whose access could be revoked: the modelled missing-resource refusal,
+        // the same one a grant answers such a name with.
+        let domain = store.domains.get_mut(&input.domain_name).ok_or_else(|| {
+            RevokeVpcEndpointAccessErrorModeled::ResourceNotFoundException(
+                crate::state::domain_not_found(&input.domain_name),
+            )
+        })?;
+
+        // The principal keys the set, so this takes out exactly the record that principal
+        // holds and leaves every other one in place. A principal the domain does not allow
+        // keys nothing, so nothing is removed — and nothing is added either.
+        domain.vpc_endpoint_access.remove(&principal.id);
+
+        // The model gives this operation no output members at all, so what a success
+        // carries is the empty body.
+        Ok(RevokeVpcEndpointAccessOutput {})
     }
 }

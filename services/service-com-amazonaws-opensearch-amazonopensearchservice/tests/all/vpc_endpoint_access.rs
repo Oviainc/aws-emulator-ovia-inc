@@ -45,7 +45,7 @@ use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX};
 
 /// `AuthorizeVpcEndpointAccess`:
 /// `POST /opensearch/domain/{DomainName}/authorizeVpcEndpointAccess`.
-async fn authorize(emulator: &Emulator, domain: &str, body: Value) -> Answer {
+pub(crate) async fn authorize(emulator: &Emulator, domain: &str, body: Value) -> Answer {
     emulator
         .call(
             "POST",
@@ -57,7 +57,7 @@ async fn authorize(emulator: &Emulator, domain: &str, body: Value) -> Answer {
 
 /// `ListVpcEndpointAccess`: `GET /opensearch/domain/{DomainName}/listVpcEndpointAccess`,
 /// optionally resumed from a page token.
-async fn list(emulator: &Emulator, domain: &str, token: Option<&str>) -> Answer {
+pub(crate) async fn list(emulator: &Emulator, domain: &str, token: Option<&str>) -> Answer {
     let uri = match token {
         None => format!("{PREFIX}/opensearch/domain/{domain}/listVpcEndpointAccess"),
         Some(token) => {
@@ -69,7 +69,7 @@ async fn list(emulator: &Emulator, domain: &str, token: Option<&str>) -> Answer 
 
 /// A domain to grant access to, created through `CreateDomain` so the grants are made
 /// against a domain that exists.
-async fn created_domain(emulator: &Emulator, name: &str) {
+pub(crate) async fn created_domain(emulator: &Emulator, name: &str) {
     let created = emulator.create(json!({ "DomainName": name })).await;
     assert_eq!(
         created.status, 200,
@@ -79,7 +79,7 @@ async fn created_domain(emulator: &Emulator, name: &str) {
 }
 
 /// The `AuthorizedPrincipalList` of a listing answer, with the case named on failure.
-fn principal_list(answer: &Answer, case: &str) -> Vec<Value> {
+pub(crate) fn principal_list(answer: &Answer, case: &str) -> Vec<Value> {
     answer.body["AuthorizedPrincipalList"]
         .as_array()
         .unwrap_or_else(|| {
@@ -171,7 +171,7 @@ struct Grant {
 /// (`smithy_query(query="shape",shape="AWSServicePrincipal")`, which the generated
 /// `A_W_S_SERVICE_PRINCIPAL_VALUES` carries): a request naming any other service is
 /// refused at the request boundary, so this is the one service a grant can name.
-fn service_principal() -> &'static str {
+pub(crate) fn service_principal() -> &'static str {
     A_W_S_SERVICE_PRINCIPAL_VALUES[0]
 }
 
