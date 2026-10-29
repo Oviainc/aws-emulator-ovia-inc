@@ -17,6 +17,8 @@ mod account_customizations;
 mod body_boundary_refusal;
 #[path = "all/body_validation_refusals.rs"]
 mod body_validation_refusals;
+#[path = "all/console_identifier_namespace.rs"]
+mod console_identifier_namespace;
 #[path = "all/list_setting_order.rs"]
 mod list_setting_order;
 #[path = "all/list_setting_reset.rs"]

@@ -139,11 +139,20 @@ pub const ACCOUNT_COLOR_NONE: &str = "none";
 /// `lambda` — the three the model's own `@examples` output lists) but they are not
 /// the same set: the console names Amazon Cognito `cognito` where the API endpoint
 /// prefix is `cognito-idp`, names CloudWatch Logs under `cloudwatch` where the
-/// prefix is `logs`, and publishes console-only entries (`activate`, `artifact`,
+/// prefix is `logs`, names AWS Systems Manager `systems-manager` where the prefix
+/// is `ssm`, Amazon MSK `msk` where the prefix is `kafka`, Amazon MWAA `mwaa`
+/// where the prefix is `airflow` and IAM Identity Center `singlesignon` where the
+/// prefix is `sso`, and publishes console-only entries (`activate`, `artifact`,
 /// `aws-marketplace`, `ce`) for services with no endpoint prefix of that name at
 /// all. A catalog keyed on endpoint prefixes answers a discovery call in the wrong
 /// namespace, so an identifier a console client may legitimately set looks
 /// nonexistent.
+///
+/// Where the two namespaces differ for one service, the console identifier is the
+/// entry and its signing name / endpoint prefix is NOT also an entry: a service is
+/// named here once, by the identifier its console home is addressed by. Where a
+/// service has no console home of its own because the console files it under
+/// another service's home, neither spelling is an entry and the HOME is.
 ///
 /// # Where these entries come from
 ///
@@ -164,8 +173,10 @@ pub const ACCOUNT_COLOR_NONE: &str = "none";
 /// pages at the page sizes a client asks for) rather than a single short page.
 /// Entries no console service home is published under are deliberately absent —
 /// `access-analyzer` (IAM Access Analyzer lives under `iam`), `account`,
-/// `appconfig` (under `systems-manager`), `cognito-idp`, `logs` and `sts` — so the
-/// catalog is one namespace throughout.
+/// `appconfig` (under `systems-manager`), `cognito-idp`, `kafkaconnect` (MSK
+/// Connect lives under `msk`), `logs` and `sts` — so the catalog is one namespace
+/// throughout, and every console home an omission above redirects to is itself an
+/// entry a caller can discover and set.
 ///
 /// It is the ADMISSION list as well as the discovery list: `ListServices`
 /// "returns a paginated list of ... service identifiers that you can use as
@@ -181,7 +192,6 @@ const SEED_SERVICE_CATALOG: &[&str] = &[
     "acm-pca",
     "activate",
     "aidevops",
-    "airflow",
     "amazon-mq",
     "amplify",
     "apigateway",
@@ -296,8 +306,6 @@ const SEED_SERVICE_CATALOG: &[&str] = &[
     "iottwinmaker",
     "iotwireless",
     "ivs",
-    "kafka",
-    "kafkaconnect",
     "kendra",
     "keyspaces",
     "kinesis",
@@ -328,6 +336,8 @@ const SEED_SERVICE_CATALOG: &[&str] = &[
     "mgn",
     "migrationhub",
     "monitron",
+    "msk",
+    "mwaa",
     "neptune",
     "network-firewall",
     "networkmanager",
@@ -375,15 +385,15 @@ const SEED_SERVICE_CATALOG: &[&str] = &[
     "shield",
     "signer",
     "simspaceweaver",
+    "singlesignon",
     "sns",
     "sqs",
-    "ssm",
-    "sso",
     "states",
     "storagegateway",
     "supplychain",
     "support",
     "swf",
+    "systems-manager",
     "textract",
     "timestream",
     "transcribe",
