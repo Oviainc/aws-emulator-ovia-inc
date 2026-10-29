@@ -105,6 +105,8 @@ mod slo_goal_retention;
 mod slo_indicator_required;
 #[path = "all/slo_lifecycle.rs"]
 mod slo_lifecycle;
+#[path = "all/slo_list_selection_binding.rs"]
+mod slo_list_selection_binding;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stated_instant_rendering.rs"]

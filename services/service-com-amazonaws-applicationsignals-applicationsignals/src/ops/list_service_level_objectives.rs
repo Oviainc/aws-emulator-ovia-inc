@@ -161,7 +161,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// A read: it only projects stored records. The store is ordered by SLO name, so the
     /// page boundary is a cursor on that order and paging over more SLOs than `MaxResults`
     /// terminates having visited each matching SLO exactly once. `NextToken` is returned
-    /// only while matching SLOs remain after the page.
+    /// only while matching SLOs remain after the page, and carries the selection it was
+    /// counted in, so it resumes that listing and no other.
     async fn handle(
         &self,
         input: Self::Input,
@@ -186,9 +187,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size =
             crate::state::optional_page_bound(input.max_results, crate::state::MAX_SLO_PAGE);
 
+        // The cursor is a boundary within the ordered set THIS request selects
+        // (`matches_filters`), so every selector that picks that set out is bound into the tag
+        // its token is issued and resolved under: a token handed back by one filtered listing
+        // is refused here rather than honoured as a boundary into another, which would report
+        // only the matching objectives sorting after it and tell the caller the listing had
+        // ended ([`crate::state::slo_selection_token_tag`]).
+        let token_tag = crate::state::slo_selection_token_tag(
+            input.key_attributes.as_ref(),
+            input.operation_name.as_deref(),
+            input.dependency_config.as_ref(),
+            input.metric_source.as_ref(),
+            input.metric_source_types.as_deref(),
+        );
         let cursor = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::decode_next_token(token) {
+            Some(token) => match crate::state::decode_cursor(&token_tag, token) {
                 Some(cursor) => Some(cursor),
                 None => {
                     return Err(crate::scaffolded::Scaffolded::validation(
@@ -210,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (slo_summaries, next_token) = if other_account {
             (Vec::new(), None)
         } else {
-            store.page(cursor.as_deref(), page_size, |slo| {
+            store.page(&token_tag, cursor.as_deref(), page_size, |slo| {
                 matches_filters(slo, &input)
             })
         };
@@ -227,6 +241,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Each selector names part of the entity an SLO's SLI identifies, so it is matched against
 /// the entity read out of the stored record — never against the request that created it.
 /// An absent selector filters nothing.
+///
+/// The selectors read here are the ones the page token's tag is a function of
+/// ([`crate::state::slo_selection_token_tag`]): they pick out the ordered set a cursor is a
+/// boundary within, so a selector added to one belongs in the other.
 fn matches_filters(
     slo: &ServiceLevelObjective,
     input: &ListServiceLevelObjectivesInput,

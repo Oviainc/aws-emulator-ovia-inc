@@ -172,10 +172,13 @@ const MATERIALISED_SLI_QUERY_ID: &str = "m1";
 /// ("a period can be as short as one minute (60 seconds) and must be a multiple of 60").
 const MIN_SLI_PERIOD_SECONDS: i32 = 60;
 
-/// The marker every `NextToken` this service issues carries, so a well-formed token this
-/// service did not issue is refused instead of being read as a cursor. The `/` cannot occur
-/// in an SLO name (the modelled `ServiceLevelObjectiveName` pattern admits only
+/// The marker every `NextToken` the objective listing issues carries, so a well-formed token
+/// this service did not issue is refused instead of being read as a cursor. The `/` cannot
+/// occur in an SLO name (the modelled `ServiceLevelObjectiveName` pattern admits only
 /// `[-._0-9A-Za-z ]`), so the prefix can never be mistaken for part of the cursor.
+///
+/// The listing reports the stored objectives the REQUEST selects, so its tokens are issued
+/// under this marker plus the fingerprint of that selection ([`slo_selection_token_tag`]).
 const NEXT_TOKEN_TAG: &str = "slos/1/";
 
 /// The [`NEXT_TOKEN_TAG`] of each time-ranged topology read. One tag per operation, so a
@@ -467,12 +470,17 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// `cursor`, together with the cursor for the next page (`None` once the page is the
     /// last one).
     ///
+    /// The next page's token is issued under `token_tag`, the tag of the very selection
+    /// `matches` picks out ([`slo_selection_token_tag`]), so the key it carries is resolved
+    /// only against the ordered set it was taken from.
+    ///
     /// At most `page_size + 1` records are COLLECTED, so the memory the page holds and the
     /// response it produces are bounded by the page rather than by the number of stored
     /// records. The range scan itself still steps over any record the filter rejects, so a
     /// selector that matches few SLOs walks the stored set once.
     pub fn page<F>(
         &self,
+        token_tag: &str,
         cursor: Option<&str>,
         page_size: usize,
         matches: F,
@@ -494,7 +502,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
 
         let next_cursor = if window.len() > page_size {
             window.truncate(page_size);
-            window.last().map(|slo| encode_next_token(&slo.name))
+            window.last().map(|slo| encode_cursor(token_tag, &slo.name))
         } else {
             None
         };
@@ -1365,21 +1373,6 @@ pub fn summary_of(slo: &ServiceLevelObjective) -> ServiceLevelObjectiveSummary {
 /// mislead the caller about its own request.
 pub const STATE_UNAVAILABLE: &str = "Application Signals state is unavailable";
 
-/// `NextToken` is opaque to the caller: the hex encoding of [`NEXT_TOKEN_TAG`] followed by
-/// the last SLO name the previous page returned, which the next call resolves against the
-/// ordered store as an exclusive cursor.
-pub fn encode_next_token(last_name: &str) -> String {
-    encode_cursor(NEXT_TOKEN_TAG, last_name)
-}
-
-/// The cursor a `NextToken` carries, or `None` when the token is not one this service
-/// issued — which covers a token that is not hex, is not UTF-8, or is well-formed but
-/// carries no [`NEXT_TOKEN_TAG`], so a forged token is refused rather than honoured as a
-/// page boundary.
-pub fn decode_next_token(token: &str) -> Option<String> {
-    decode_cursor(NEXT_TOKEN_TAG, token)
-}
-
 /// A `NextToken` carrying `cursor` under `tag`: hex, so the caller reads it as the opaque
 /// value the model documents rather than as a store key it could edit.
 pub fn encode_cursor(tag: &str, cursor: &str) -> String {
@@ -1599,21 +1592,37 @@ pub fn entity_token_tag(
     window_start: &DateTime,
     window_end: &DateTime,
 ) -> String {
+    let mut fields = attribute_fields(attributes);
+    fields.extend(window_fields(window_start, window_end).into_iter().map(Some));
+    subject_token_tag(tag, &borrowed_fields(&fields))
+}
+
+/// The fields one `Attributes` map contributes to the tag of a cursor paged over the set it
+/// selects: how many entries it holds, then those entries in key order.
+///
+/// The entries are fingerprinted in KEY ORDER, since a map carries no order of its own while
+/// one selection must yield the same tag on every call, and the count comes first so that
+/// where the map's entries end and the fields after them begin is readable off the field list
+/// itself rather than being a property of the values in it ([`subject_token_tag`]).
+fn attribute_fields(attributes: &HashMap<String, String>) -> Vec<Option<String>> {
     let mut entries: Vec<(&str, &str)> = attributes
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
     entries.sort_unstable();
-    let count = entries.len().to_string();
-    let window = window_fields(window_start, window_end);
-    let mut fields: Vec<Option<&str>> = vec![Some(count.as_str())];
-    fields.extend(
-        entries
-            .into_iter()
-            .flat_map(|(key, value)| [Some(key), Some(value)]),
-    );
-    fields.extend(window.iter().map(|field| Some(field.as_str())));
-    subject_token_tag(tag, &fields)
+    let mut fields: Vec<Option<String>> = vec![Some(entries.len().to_string())];
+    for (key, value) in entries {
+        fields.push(Some(key.to_string()));
+        fields.push(Some(value.to_string()));
+    }
+    fields
+}
+
+/// [`attribute_fields`] for a selector the request may leave out: ONE absent field where no
+/// map is stated, so a selection that states no map renders a different field list from one
+/// that states any map at all.
+fn optional_attribute_fields(attributes: Option<&HashMap<String, String>>) -> Vec<Option<String>> {
+    attributes.map_or_else(|| vec![None], attribute_fields)
 }
 
 /// [`subject_token_tag`] for a read whose selection is a period plus the attribute filters that
@@ -1659,6 +1668,59 @@ pub fn filtered_window_token_tag(
             .map(Some),
     );
     subject_token_tag(tag, &borrowed_fields(&fields))
+}
+
+/// [`subject_token_tag`] for the objective listing, whose ordered set is every stored
+/// objective that passes the selectors the request supplied.
+///
+/// Each selector is a further condition a reported objective meets, so two requests stating
+/// different selectors page different sets and a cursor counted in one of them is not a
+/// boundary in the other — the rule [`subject_token_tag`] states, which here binds the whole
+/// selection rather than a period. A selector LEFT OUT narrows nothing, which is a selection
+/// of its own and renders an absent field ([`optional_attribute_fields`]) rather than the
+/// fields of an empty one.
+///
+/// Each selector is fingerprinted on the identity the matcher resolves it to: the entries of
+/// an `Attributes` map in key order, a dependency on both of its members, a metric source on
+/// the key attributes alone (the additional attributes of that shape select nothing, so a
+/// request carrying them resumes a token issued without them), and the metric source types
+/// sorted and deduplicated, since an objective is reported when its own type is ANY of them
+/// and so neither their order nor a type named twice picks out another set.
+///
+/// The account the request names is NOT part of the tag: an id naming another account selects
+/// no stored objective at all ([`names_other_account`]), so that listing reports an empty set
+/// in full and holds no entry a resumed cursor could skip — and an id naming THIS account
+/// selects the same set as no id at all, as the sibling account-scoped reads also resolve it.
+pub fn slo_selection_token_tag(
+    key_attributes: Option<&HashMap<String, String>>,
+    operation_name: Option<&str>,
+    dependency: Option<&DependencyConfig>,
+    metric_source: Option<&MetricSource>,
+    metric_source_types: Option<&[String]>,
+) -> String {
+    let mut fields = optional_attribute_fields(key_attributes);
+    fields.push(operation_name.map(ToString::to_string));
+    match dependency {
+        None => fields.push(None),
+        Some(dependency) => {
+            fields.extend(attribute_fields(&dependency.dependency_key_attributes));
+            fields.push(Some(dependency.dependency_operation_name.clone()));
+        }
+    }
+    fields.extend(optional_attribute_fields(
+        metric_source.map(|source| &source.metric_source_key_attributes),
+    ));
+    match metric_source_types {
+        None => fields.push(None),
+        Some(kinds) => {
+            let mut kinds: Vec<&str> = kinds.iter().map(String::as_str).collect();
+            kinds.sort_unstable();
+            kinds.dedup();
+            fields.push(Some(kinds.len().to_string()));
+            fields.extend(kinds.into_iter().map(|kind| Some(kind.to_string())));
+        }
+    }
+    subject_token_tag(NEXT_TOKEN_TAG, &borrowed_fields(&fields))
 }
 
 /// Whether `candidate` holds every entry of `filter` with the same value.
