@@ -86,11 +86,10 @@ use super::types::*;
 /// each element's length (1..255) but says nothing about how many elements the list may
 /// hold, while the answer carries one whole job projection per name the request lists,
 /// repeats included. So what one request can make this operation look up and allocate is
-/// bounded here, at the figure this service's paginated readers already serve in one
-/// answer (`GetTables`' page ceiling, 100 records), so a batch cannot ask for a larger
-/// answer than a page. A batch past it is refused with this operation's own modelled
-/// `InvalidInputException` rather than served.
-pub const MAX_BATCH_JOB_NAMES: usize = 100;
+/// bounded by the one figure every batch reader of this service shares
+/// ([`crate::state::MAX_BATCH_NAMES`]). A batch past it is refused with this operation's
+/// own modelled `InvalidInputException` rather than served.
+pub const MAX_BATCH_JOB_NAMES: usize = crate::state::MAX_BATCH_NAMES;
 
 /// The message that refusal carries: the request-size bound a batch has to fit in, built
 /// from [`MAX_BATCH_JOB_NAMES`] so the figure a caller reads back is the one enforced.

@@ -386,6 +386,21 @@ pub const COMPUTE_ENVIRONMENT_ATHENA: &str = "ATHENA";
 /// See [`COMPUTE_ENVIRONMENT_SPARK`].
 pub const COMPUTE_ENVIRONMENT_PYTHON: &str = "PYTHON";
 
+/// How many names ONE request may give a batch reader of this service to look up.
+///
+/// This emulator's own REQUEST-SIZE bound, with no modelled counterpart: a batch reader's
+/// name list bounds each element's length but says nothing about how many elements it may
+/// hold, while the answer carries one whole resource projection per name the request
+/// lists, repeats included. So what one request can make such an operation look up and
+/// allocate is bounded here, at the figure this service's paginated readers already serve
+/// in one answer (`GetTables`' page ceiling, 100 records), so a batch cannot ask for a
+/// larger answer than a page. ONE figure, shared by every batch reader that needs it, so
+/// two operations never enforce two different ceilings.
+///
+/// A batch past it is refused with the asking operation's own modelled
+/// `InvalidInputException`, in a message that reports this figure.
+pub const MAX_BATCH_NAMES: usize = 100;
+
 /// Ceiling on the crawlers this emulator will hold, for the same reason as
 /// [`MAX_DATABASES_PER_CATALOG`]: resident memory bounded against a create any caller
 /// can reach. A create past it is refused with `CreateCrawler`'s own modelled

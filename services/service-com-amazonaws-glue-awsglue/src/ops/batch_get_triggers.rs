@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetTriggers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetTriggers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports, for EACH name the request lists and in the order it listed them,
+//! either the trigger definition this Region's store holds under that name — the same
+//! projection `GetTrigger` reports — or that name in `TriggersNotFound`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetTriggers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A name no trigger holds is not a failure of the call: this is a BATCH addressing mode
+//! over the records `CreateTrigger` wrote and `UpdateTrigger` overwrote, so it answers 200
+//! and splits the requested names across the two lists. Only this Region's triggers are
+//! reachable, because a trigger is served only through the endpoint that created it. The
+//! read changes nothing a later caller sees.
+//!
+//! A batch carrying more names than [`MAX_BATCH_TRIGGER_NAMES`] is refused with the
+//! modelled `InvalidInputException` instead of served. That ceiling is this emulator's own
+//! resource bound with no modelled counterpart — nothing in the model or in this
+//! operation's documentation limits how many names the list may hold — so it is stated on
+//! the constant rather than presented as an AWS quota.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +78,28 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// How many names one `BatchGetTriggers` request may carry.
+///
+/// This emulator's own REQUEST-SIZE bound, with NO modelled counterpart — neither the
+/// model nor this operation's documentation states a limit on the list's element count,
+/// so this is a deliberate resource bound and not an AWS quota being reproduced:
+/// `TriggerNameList` bounds each element's length (1..255) but says nothing about how
+/// many elements the list may hold, while the answer carries one whole trigger projection
+/// per name the request lists, repeats included. So what one request can make this
+/// operation look up and allocate is bounded by the one figure every batch reader of this
+/// service shares ([`crate::state::MAX_BATCH_NAMES`]), so a batch cannot ask for a larger
+/// answer than a page and no two batch readers enforce two different ceilings.
+///
+/// A batch past it is refused with this operation's own modelled `InvalidInputException`
+/// rather than served, in a message built from this constant.
+pub const MAX_BATCH_TRIGGER_NAMES: usize = crate::state::MAX_BATCH_NAMES;
+
+/// The message that refusal carries: the request-size bound a batch has to fit in, built
+/// from [`MAX_BATCH_TRIGGER_NAMES`] so the figure a caller reads back is the one enforced.
+fn batch_limit_message() -> String {
+    format!("TriggerNames may carry at most {MAX_BATCH_TRIGGER_NAMES} names")
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,18 +171,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetTriggers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetTriggersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetTriggers"))
+        // The batch bound is a property of the REQUEST as a whole, so it is answered
+        // before any name in it is looked up and before the answer allocates anything: a
+        // caller that sent too many names learns that, rather than learning that one of
+        // them is unknown. `TriggerNameList` bounds each element's length but not the
+        // list's, and the answer carries one whole trigger projection per listed name
+        // (repeats included), so the bound is this operation's own
+        // ([`MAX_BATCH_TRIGGER_NAMES`]).
+        if input.trigger_names.len() > MAX_BATCH_TRIGGER_NAMES {
+            return Err(BatchGetTriggersErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(batch_limit_message()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // An unreachable store is an internal mounting fault, reported through this
+            // operation's own server error.
+            return Err(BatchGetTriggersErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue trigger store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // Each element of `TriggerNameList` is bounded `length 1..255` with a pattern, so
+        // a name too long or too short to address a trigger is refused at the request
+        // boundary: reaching here, the only question per name is whether this Region holds
+        // a trigger of that name. The walk keeps the request's order and its repeats — one
+        // answer per REQUESTED name, not per distinct name — and runs in a critical
+        // section scoped to the lookups alone, bounded above by the batch bound, with the
+        // guard dropped before the answer is built.
+        let (triggers, triggers_not_found) = {
+            let region = crate::state::request_region(ctx.parts());
+            let store = state.lock();
+            let mut triggers = Vec::new();
+            let mut triggers_not_found = Vec::new();
+            for name in &input.trigger_names {
+                match store.trigger(&region, name) {
+                    Some(entry) => triggers.push(entry.to_trigger()),
+                    None => triggers_not_found.push(name.clone()),
+                }
+            }
+            (triggers, triggers_not_found)
+        };
+
+        ::tracing::info!(
+            operation = "BatchGetTriggers",
+            requested = input.trigger_names.len(),
+            found = triggers.len(),
+            not_found = triggers_not_found.len(),
+            "read Glue triggers in a batch"
+        );
+
+        // Both lists are reported, empty included: a caller reads `TriggersNotFound` to
+        // learn which of its names missed, so an omitted list would make "none missed"
+        // indistinguishable from "not answered".
+        Ok(BatchGetTriggersOutput {
+            triggers: Some(triggers),
+            triggers_not_found: Some(triggers_not_found),
+        })
     }
 }

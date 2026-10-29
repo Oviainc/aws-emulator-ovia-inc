@@ -145,6 +145,44 @@ pub fn table_names(page: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The strings of a top-level list member of a response body, which must be present even
+/// when it is empty.
+///
+/// One copy, shared: every suite that reads a flat list of names off an answer — the
+/// `*NotFound` list of a batch reader, say — reads it the same way.
+pub fn string_list(body: &Value, member: &str) -> Vec<String> {
+    body.get(member)
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("the answer must report {member}, got {body}"))
+        .iter()
+        .map(|name| {
+            name.as_str()
+                .unwrap_or_else(|| panic!("{member} holds strings, got {name}"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// The `Name` of every element of a top-level list member, in the order the service
+/// returned them.
+///
+/// One copy, shared: every suite that reads the names off a list of resource projections
+/// (`Triggers`, `Jobs`, `Crawlers`) reads them the same way.
+pub fn names_in(body: &Value, member: &str) -> Vec<String> {
+    body.get(member)
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("the answer must report a {member} list, got {body}"))
+        .iter()
+        .map(|element| {
+            element
+                .get("Name")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("every element of {member} carries a Name, got {element}"))
+                .to_string()
+        })
+        .collect()
+}
+
 /// Assert that every member of `sent` reappears, unchanged, on `got`. Recurses into
 /// nested structures AND into the elements of a nested list, so a member the server
 /// fills with its own default (an absent `Compressed`, say) or ADDS to a nested

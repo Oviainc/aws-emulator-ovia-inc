@@ -42,33 +42,15 @@ async fn batch_get(router: &MultiServiceRouter, names: &[&str]) -> (Vec<String>,
     (job_names(&body), string_list(&body, "JobsNotFound"))
 }
 
-/// The `Name` of every element of the response's `Jobs` list, in order.
+/// The `Name` of every element of the response's `Jobs` list, in order — read through the
+/// shared harness helper, so this suite holds no copy of it.
 fn job_names(body: &Value) -> Vec<String> {
-    body.get("Jobs")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("BatchGetJobs must report a Jobs list, got {body}"))
-        .iter()
-        .map(|job| {
-            job.get("Name")
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| panic!("every reported Job carries a Name, got {job}"))
-                .to_string()
-        })
-        .collect()
+    crate::wire::names_in(body, "Jobs")
 }
 
 /// The strings of a top-level list member, which must be present even when empty.
 fn string_list(body: &Value, member: &str) -> Vec<String> {
-    body.get(member)
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("BatchGetJobs must report {member}, got {body}"))
-        .iter()
-        .map(|name| {
-            name.as_str()
-                .unwrap_or_else(|| panic!("{member} holds strings, got {name}"))
-                .to_string()
-        })
-        .collect()
+    crate::wire::string_list(body, member)
 }
 
 // ---------------------------------------------------------------------------

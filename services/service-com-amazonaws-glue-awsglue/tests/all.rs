@@ -29,6 +29,8 @@ mod batch_get_custom_entity_types;
 mod batch_get_jobs;
 #[path = "all/batch_get_partition.rs"]
 mod batch_get_partition;
+#[path = "all/batch_get_triggers.rs"]
+mod batch_get_triggers;
 #[path = "all/batch_stop_job_run.rs"]
 mod batch_stop_job_run;
 #[path = "all/batch_table_version_deletion.rs"]

@@ -53,32 +53,12 @@ async fn batch_get(router: &MultiServiceRouter, names: &[&str]) -> (Vec<String>,
 
 /// The `Name` of every element of the response's `Crawlers` list, in order.
 fn crawler_names(body: &Value) -> Vec<String> {
-    body.get("Crawlers")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("BatchGetCrawlers must report a Crawlers list, got {body}"))
-        .iter()
-        .map(|crawler| {
-            crawler
-                .get("Name")
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| panic!("every reported Crawler carries a Name, got {crawler}"))
-                .to_string()
-        })
-        .collect()
+    crate::wire::names_in(body, "Crawlers")
 }
 
 /// The strings of a top-level list member, which must be present even when empty.
 fn string_list(body: &Value, member: &str) -> Vec<String> {
-    body.get(member)
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("BatchGetCrawlers must report {member}, got {body}"))
-        .iter()
-        .map(|name| {
-            name.as_str()
-                .unwrap_or_else(|| panic!("{member} holds strings, got {name}"))
-                .to_string()
-        })
-        .collect()
+    crate::wire::string_list(body, member)
 }
 
 // ---------------------------------------------------------------------------
