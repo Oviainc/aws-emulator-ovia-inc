@@ -8,10 +8,11 @@
 //! name keeps the value it had. Every later `ListTagsForResource` answers from
 //! that same map.
 //!
-//! A caller-supplied tag has to be one AWS would accept: no key may claim the
-//! `aws:` namespace AWS reserves for its own tags, and a key or value may carry
-//! only the published tag character set. A request naming one that does not is a
-//! `BadRequestException` (HTTP 400) with nothing written.
+//! A caller-supplied tag has to be one AWS would accept: a key has to hold a
+//! number of characters `TagKey`'s modelled `@length` allows, no key may claim
+//! the `aws:` namespace AWS reserves for its own tags, and a key or value may
+//! carry only the published tag character set. A request naming one that does
+//! not is a `BadRequestException` (HTTP 400) with nothing written.
 //!
 //! ## Shape of an operation
 //!
@@ -176,6 +177,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.settle_due();
 
+        // A modelled constraint is decided from the request alone, so it is
+        // read before any rule of this service's own: a key outside `TagKey`'s
+        // `@length` is refused in the same words the request boundary refuses
+        // the modelled length of a tag VALUE in, which the boundary walk cannot
+        // do for a map's key (`crate::state::tag_key_length_refusal`).
+        if let Some(message) =
+            crate::state::tag_key_length_refusal(input.tags.keys().map(String::as_str))
+        {
+            return Err(TagResourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into());
+        }
+
         // A value that is not a kafkaconnect ARN at all names none of this
         // service's taggable resources, so it is incorrect input rather than a
         // resource that is absent: the modelled 400, blaming the member that
@@ -202,9 +217,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // hold more tags than a resource may, in which case nothing is written.
         match state.attach_tags(&region, &input.resource_arn, input.tags) {
             Ok(()) => Ok(TagResourceOutput {}),
-            // A tag rule the model cannot express (`TagKey`/`TagValue` carry
-            // lengths and no pattern), so the handler is where it is refused:
-            // the modelled 400, blaming the member that carried the tags.
+            // The two rules the model cannot state at all — the namespace AWS
+            // reserves and the tag character set (`TagKey`/`TagValue` carry no
+            // `@pattern`) — are refused here: the modelled 400, blaming the
+            // member that carried the tags.
             Err(crate::state::TagWriteRefusal::IllegalTag(breach)) => {
                 Err(TagResourceErrorModeled::BadRequestException(BadRequestException {
                     message: Some(crate::state::invalid_parameter_because(

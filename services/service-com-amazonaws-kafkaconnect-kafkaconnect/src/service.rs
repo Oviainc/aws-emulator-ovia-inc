@@ -110,19 +110,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // renders for this refusal is already 400, so only the code and the
         // message change.
         match refusal {
-            Refusal::Invalid(violations) => {
-                let clauses: Vec<String> = violations
-                    .iter()
-                    .map(smithy_server_runtime::Violation::message)
-                    .collect();
-                Some(Refused {
-                    code: "BadRequestException".to_string(),
-                    message: format!(
-                        "Bad request due to incorrect input: {}. Correct your request and then retry it.",
-                        clauses.join("; ")
-                    ),
-                })
-            }
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "BadRequestException".to_string(),
+                // The one place this service words a modelled-constraint
+                // refusal, shared with the one rule the boundary walk cannot
+                // reach (a tag map's KEY, `crate::state::tag_key_length_refusal`),
+                // so a caller cannot tell where the refusal was made.
+                message: crate::state::incorrect_input_message(violations).unwrap_or_default(),
+            }),
             // The framework renders an authentication refusal as 403, which is
             // this service's `ForbiddenException` ("Access forbidden. Correct
             // your credentials and then retry your request."), not its 401

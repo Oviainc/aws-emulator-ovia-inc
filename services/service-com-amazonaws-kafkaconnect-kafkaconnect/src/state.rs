@@ -354,6 +354,15 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 /// validator cannot refuse such a key and this service has to.
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
+/// The fewest characters a tag key may carry: `TagKey` is modelled
+/// `length 1..128` (`smithy_query(query="shape", shape="Tags,TagKey,TagValue")`
+/// reports the same bound on the `Tags` map's key), so a key of nothing names no
+/// tag.
+pub const MIN_TAG_KEY_LENGTH: usize = 1;
+
+/// The most characters a tag key may carry, from that same `TagKey` bound.
+pub const MAX_TAG_KEY_LENGTH: usize = 128;
+
 /// The characters a tag key or value may carry besides letters, numbers and
 /// spaces, as AWS publishes the tag character set (letters, numbers, spaces,
 /// and `+ - = . _ : / @`). Letters and numbers are read as the Unicode
@@ -456,6 +465,136 @@ pub fn tag_map_breach(tags: &HashMap<String, String>) -> Option<TagRuleBreach> {
 /// a key AWS reserves is not a caller's to strip.
 pub fn tag_key_breach(keys: &[String]) -> Option<TagRuleBreach> {
     tag_breach(keys.iter().map(|key| (key.as_str(), None)))
+}
+
+/// The member every operation of this service binds a `Tags` map to — the
+/// `tags` of `TagResource` and of each create — which is the path a violation
+/// of one of its KEYS is reported at: a map key is a value the caller chose
+/// rather than a member of its own, so the clause names the member that carried
+/// the map and echoes the key.
+const TAG_MAP_MEMBER: &str = "tags";
+
+/// `TagKey`'s modelled `@length`, in the framework's own form, so the keys of a
+/// map are judged by the same trait every other length-bearing member of this
+/// service is judged by.
+static TAG_KEY_LENGTH_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| {
+        let mut traits = ::aws_smithy_schema::TraitMap::new();
+        traits.insert(Box::new(::aws_smithy_schema_server::LengthTrait::new(
+            Some(MIN_TAG_KEY_LENGTH as i64),
+            Some(MAX_TAG_KEY_LENGTH as i64),
+        )));
+        traits
+    });
+
+/// The schema a tag key is walked against: named after the member the map was
+/// bound to, so the clause reports the position a boundary refusal of that
+/// member would, and carrying `TagKey`'s bound.
+static M_TAG_KEY: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+    ::aws_smithy_schema::ShapeId::from_static(
+        "com.amazonaws.kafkaconnect#CheckedTagKeys$tags",
+        "com.amazonaws.kafkaconnect",
+        TAG_MAP_MEMBER,
+    ),
+    ::aws_smithy_schema::ShapeType::String,
+    TAG_MAP_MEMBER,
+    0,
+)
+.with_traits(&TAG_KEY_LENGTH_TRAITS);
+
+/// The root of the shadow input the walk is driven over. Its member list is
+/// empty on purpose: the walk visits what [`CheckedTagKeys`] WRITES, and a root
+/// struct schema contributes no path segment of its own. The shape id is one
+/// the model does not declare, so it cannot collide with a modelled shape.
+static CHECKED_TAG_KEYS_SCHEMA: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.kafkaconnect#CheckedTagKeys",
+            "com.amazonaws.kafkaconnect",
+            "CheckedTagKeys",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[],
+    );
+
+/// The keys of one request's tag map, written for the validating walk the way a
+/// codec writes a string member. Every key goes into ONE walk, so how many
+/// clauses a refusal may state is the framework's own bound rather than a
+/// second one invented here.
+struct CheckedTagKeys<'a>(Vec<&'a str>);
+
+impl ::aws_smithy_schema::serde::SerializableStruct for CheckedTagKeys<'_> {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        for key in &self.0 {
+            s.write_string(&M_TAG_KEY, key)?;
+        }
+        Ok(())
+    }
+}
+
+/// The message a request whose tag map carries a key outside `TagKey`'s
+/// modelled `@length` is refused with, or `None` when every key is inside it.
+///
+/// WHY A HANDLER APPLIES THIS. The framework's boundary walk enforces the
+/// `@length` of a map's VALUE and of a list's elements — which is what refuses
+/// an over-long `TagValue` and an over-long `UntagResource` key already — but
+/// not of a map's KEY: the codec writes an entry's key against the map member's
+/// own schema before its value, and the walk captures it as that value's path
+/// segment instead of checking it
+/// (`vendor/smithy-schema-server/src/constraints.rs`, `write_leaf`). So the
+/// handler that accepts a `Tags` map is the only place a rule on its keys can be
+/// applied, and every operation that accepts one applies it here, so none of
+/// them can store a key another would refuse.
+///
+/// NOTHING about constraint checking or its wording is reimplemented: the bound
+/// is re-declared in the framework's own form, the check is
+/// [`::aws_smithy_schema_server::validate`] — the same walk the boundary runs,
+/// so the length is counted in characters and an over-long key is elided in the
+/// clause exactly as it would be there — and the sentence is
+/// [`incorrect_input_message`], the one this service words a modelled-constraint
+/// refusal with. A refusal made here therefore reads exactly like one made at
+/// the boundary.
+///
+/// The keys are walked in order of the KEY, because a `Tags` map reaches a
+/// handler unordered: that is the one order the entries themselves fix, so one
+/// request has exactly one refusal text however its map was built.
+pub fn tag_key_length_refusal<'k>(keys: impl IntoIterator<Item = &'k str>) -> Option<String> {
+    let mut keys: Vec<&str> = keys.into_iter().collect();
+    keys.sort_unstable();
+    let violations = ::aws_smithy_schema_server::validate(
+        &CheckedTagKeys(keys),
+        &CHECKED_TAG_KEYS_SCHEMA,
+    );
+    incorrect_input_message(&violations)
+}
+
+/// The message a request that broke a MODELLED constraint is refused with, or
+/// `None` when it broke none.
+///
+/// The ONE place this service words that class of refusal: the clauses are the
+/// framework's own ([`::aws_smithy_schema_server::Violation::message`]), and the
+/// sentence around them is the one `BadRequestException` documents ("HTTP Status
+/// Code 400: Bad request due to incorrect input. Correct your request and then
+/// retry it."). `crate::service` renders a refusal the boundary made through
+/// here, and [`tag_key_length_refusal`] the one rule the boundary cannot reach,
+/// so a caller cannot tell the two apart.
+pub fn incorrect_input_message(
+    violations: &[::aws_smithy_schema_server::Violation],
+) -> Option<String> {
+    if violations.is_empty() {
+        return None;
+    }
+    let clauses: Vec<String> = violations
+        .iter()
+        .map(::aws_smithy_schema_server::Violation::message)
+        .collect();
+    Some(format!(
+        "Bad request due to incorrect input: {}. Correct your request and then retry it.",
+        clauses.join("; ")
+    ))
 }
 
 /// Why a tag write was refused, with nothing written.

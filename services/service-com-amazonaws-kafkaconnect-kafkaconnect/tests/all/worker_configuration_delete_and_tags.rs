@@ -24,7 +24,8 @@
 //! removes one of several keys, removes a key that was never there, and empties
 //! the set — rather than the single recorded case the issue cited. The modelled
 //! bounds on `TagKey` (len 1..128) and `TagValue` (len 0..256) are exercised at
-//! each published bound and one past it.
+//! each published bound here; a length PAST one of them belongs to
+//! `tag_length_bounds.rs`, which asserts the refusal.
 //!
 //! The sibling suites' request helpers are private to their own modules, so this
 //! one carries its own copies of the few it needs.
@@ -605,10 +606,9 @@ async fn a_tag_key_or_value_at_a_modelled_bound_round_trips_and_is_removed_by_it
     // 1..128 and `TagValue` is len 0..256 (smithy: Tags -> TagKey / TagValue),
     // so each of those lengths is a legal key or value the store must hold and
     // hand back unchanged, and must remove when — and only when — it is named.
-    // (Refusing a length PAST a bound on a map key or value is the shared
-    // schema-validation layer's job, not this handler's, and this emulator's
-    // generated `Tags` schema does not carry those member constraints yet; that
-    // gap is its own issue and is not asserted here.)
+    // (A key or value PAST one of those bounds is refused, which
+    // `tag_length_bounds.rs` is about; this case is about the lengths the
+    // bounds admit.)
     let emulator = emulator();
     let arn = create(&emulator, "wc-tag-bounds", &[]).await;
 

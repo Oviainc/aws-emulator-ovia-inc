@@ -51,6 +51,8 @@ mod region_scoping;
 mod restart_connector_scope;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_length_bounds.rs"]
+mod tag_length_bounds;
 #[path = "all/tag_rules.rs"]
 mod tag_rules;
 #[path = "all/validation_messages.rs"]

@@ -9,9 +9,10 @@
 //! `ListTagsForResource` answers with exactly the keys that survived.
 //!
 //! The keys a caller may name are the ones a caller could have written: a key
-//! claiming the `aws:` namespace AWS reserves for its own tags, or one outside
-//! the published tag character set, is a `BadRequestException` (HTTP 400) with
-//! nothing removed.
+//! outside `TagKey`'s modelled `@length` is refused by the request boundary,
+//! and one claiming the `aws:` namespace AWS reserves for its own tags, or one
+//! outside the published tag character set, is a `BadRequestException`
+//! (HTTP 400) with nothing removed.
 //!
 //! ## Shape of an operation
 //!
@@ -198,8 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A key AWS reserves is not a caller's to strip, and a key outside
             // the tag character set is not a tag at all: the modelled 400,
             // blaming the member that carried the keys. The model gives
-            // `TagKey` a length and no pattern, so the handler is where this is
-            // refused.
+            // `TagKey` a length — which the boundary walk enforces on each
+            // element of this list — and no pattern, so these two are what the
+            // handler is left to refuse.
             Err(crate::state::TagWriteRefusal::IllegalTag(breach)) => {
                 Err(UntagResourceErrorModeled::BadRequestException(BadRequestException {
                     message: Some(crate::state::invalid_parameter_because(

@@ -180,11 +180,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
 
-        // The `tags` a create carries are held to the same AWS tag rules as a
-        // later `TagResource` write (`crate::state::tag_map_breach`), so a
-        // create cannot store a tag the tagging path would refuse. `TagKey` and
-        // `TagValue` carry lengths and no pattern, so the handler is where the
-        // rules are applied.
+        // The `tags` a create carries are held to the same rules as a later
+        // `TagResource` write, so a create cannot store a tag the tagging path
+        // would refuse. A key outside `TagKey`'s modelled `@length` first,
+        // because a modelled constraint is decided from the request alone and
+        // the framework's boundary walk cannot reach a map's KEY
+        // (`crate::state::tag_key_length_refusal`)...
+        if let Some(message) = input
+            .tags
+            .as_ref()
+            .and_then(|tags| crate::state::tag_key_length_refusal(tags.keys().map(String::as_str)))
+        {
+            return Err(CreateCustomPluginErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into());
+        }
+
+        // ...then the two rules the model cannot state at all, the namespace
+        // AWS reserves and the tag character set
+        // (`crate::state::tag_map_breach`).
         if let Some(breach) = input.tags.as_ref().and_then(crate::state::tag_map_breach) {
             return Err(CreateCustomPluginErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::invalid_parameter_because(
