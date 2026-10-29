@@ -734,6 +734,40 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
         Ok(status)
     }
 
+    /// Remove `account_id`'s tax registration, or answer the refusal a delete of
+    /// that one account is refused with.
+    ///
+    /// The one place a stored record STOPS being one, so
+    /// `DeleteTaxRegistration` and the per-account loop of
+    /// `BatchDeleteTaxRegistration` cannot decide one record's deletion two
+    /// different ways — the delete-side counterpart of
+    /// [`Self::store_registration`]. The whole decision lives here: which
+    /// refusal applies, and the removal itself.
+    ///
+    /// Two refusals, each caller rendering one on its own channel — a modelled
+    /// error response, or a per-account row of the batch's `errors` list (see
+    /// [`RegistrationDeleteRefusal`]):
+    ///
+    /// * the account holds no record at all, so there is nothing to delete
+    ///   whatever jurisdiction the carve-out is about
+    ///   ([`no_tax_registration`], the 404 class);
+    /// * the record is held in a jurisdiction this API cannot remove one from
+    ///   ([`check_registration_deletable`], the 400 class).
+    ///
+    /// A refused record is left exactly as it was, so every later read still
+    /// reports it.
+    pub fn delete_registration(
+        &mut self,
+        account_id: &str,
+    ) -> Result<(), RegistrationDeleteRefusal> {
+        let Some(stored) = self.registrations.get(account_id) else {
+            return Err(RegistrationDeleteRefusal::NotFound(no_tax_registration()));
+        };
+        check_registration_deletable(stored).map_err(RegistrationDeleteRefusal::NotDeletable)?;
+        self.registrations.remove(account_id);
+        Ok(())
+    }
+
     /// The tax document the submitted `TaxDocumentMetadata` names, or the
     /// `ValidationException` that metadata is refused with.
     ///
@@ -3181,12 +3215,13 @@ pub fn non_api_delete_country(country_code: &str) -> Option<&'static str> {
 /// Refuse the deletion of a stored registration held in a jurisdiction this API
 /// cannot remove one from ([`COUNTRIES_WITH_NON_API_REGISTRATION_DELETE`]).
 ///
-/// The one place both delete paths — `DeleteTaxRegistration` and the per-account
-/// loop of `BatchDeleteTaxRegistration` — decide whether a record is removable
-/// through the API, so the two operations cannot disagree about one record. The
-/// 400 class and the `ValidationException` shape are the contract both declare;
-/// the wording states the documented carve-out, naming the jurisdiction of the
-/// record the call addressed, and `accountId` is the parameter that selected it.
+/// The jurisdiction step of the one delete decision
+/// ([`ComAmazonawsTaxsettingsTaxsettingsState::delete_registration`]), which
+/// both delete paths take, so the two operations cannot disagree about one
+/// record. The 400 class and the `ValidationException` shape are the contract
+/// both declare; the wording states the documented carve-out, naming the
+/// jurisdiction of the record the call addressed, and `accountId` is the
+/// parameter that selected it.
 pub fn check_registration_deletable(
     stored: &StoredTaxRegistration,
 ) -> Result<(), ValidationException> {
@@ -3201,6 +3236,48 @@ pub fn check_registration_deletable(
             ),
         )),
         None => Ok(()),
+    }
+}
+
+/// Why a delete of ONE account's tax registration was refused, as the one delete
+/// decision ([`ComAmazonawsTaxsettingsTaxsettingsState::delete_registration`])
+/// answers it.
+///
+/// It names the modelled error `DeleteTaxRegistration` raises, which is what each
+/// caller renders on its own channel: the single-account delete returns that
+/// error, and the batch reports a per-account row of its `errors` list carrying
+/// the same code and message. So a refusal added to the decision reaches both
+/// paths, and neither path decides on its own what a delete of one record
+/// answers.
+#[derive(Debug)]
+pub enum RegistrationDeleteRefusal {
+    /// The account holds no tax registration — [`no_tax_registration`].
+    NotFound(ResourceNotFoundException),
+    /// The record is held in a jurisdiction this API cannot remove one from —
+    /// [`check_registration_deletable`].
+    NotDeletable(ValidationException),
+}
+
+impl RegistrationDeleteRefusal {
+    /// The name of the modelled error `DeleteTaxRegistration` answers this
+    /// refusal with — the `code` the batch's per-account row carries, because a
+    /// row reports what that account's own single-account delete would have
+    /// failed with. Neither exception publishes a service-defined `errorCode`
+    /// for this refusal, so the exception's name is the only code there is.
+    pub const fn error_name(&self) -> &'static str {
+        match self {
+            Self::NotFound(_) => "ResourceNotFoundException",
+            Self::NotDeletable(_) => "ValidationException",
+        }
+    }
+
+    /// The refusal's message, as the modelled exception carries it: one wording
+    /// per refusal, whichever path renders it.
+    pub fn into_message(self) -> String {
+        match self {
+            Self::NotFound(error) => error.message,
+            Self::NotDeletable(error) => error.message,
+        }
     }
 }
 

@@ -168,28 +168,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // [`crate::state::distinct_account_ids`], which is where what a repeated
         // id means is stated for this whole service.
         for account_id in crate::state::distinct_account_ids(&input.account_ids) {
-            // Exactly what this account's own single-account delete would have
-            // answered, so the two delete paths cannot disagree about one
-            // record: the code is the modelled error that delete raises and the
-            // record is left in place whenever one is raised.
-            let refused: Option<(&str, String)> = match store.registrations.get(account_id) {
-                None => Some((
-                    "ResourceNotFoundException",
-                    crate::state::no_tax_registration().message,
-                )),
-                Some(stored) => crate::state::check_registration_deletable(stored)
-                    .err()
-                    .map(|refusal| ("ValidationException", refusal.message)),
-            };
-            match refused {
-                Some((code, message)) => errors.push(BatchDeleteTaxRegistrationError2 {
+            // The same delete `DeleteTaxRegistration` performs, so one record's
+            // deletion cannot be decided two different ways: the one decision in
+            // `state` answers whether this account's record is removed, and this
+            // handler only renders a refusal on its own channel — a row naming
+            // the account with the code that single-account delete would have
+            // failed with, the record left in place, and the rest of the batch
+            // still deleted.
+            if let Err(refusal) = store.delete_registration(account_id) {
+                let code = refusal.error_name().to_string();
+                errors.push(BatchDeleteTaxRegistrationError2 {
                     account_id: account_id.to_string(),
-                    message,
-                    code: Some(code.to_string()),
-                }),
-                None => {
-                    store.registrations.remove(account_id);
-                }
+                    message: refusal.into_message(),
+                    code: Some(code),
+                });
             }
         }
         drop(store);

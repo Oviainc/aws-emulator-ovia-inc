@@ -10,8 +10,13 @@
 //! ([`crate::state::COUNTRIES_WITH_NON_API_REGISTRATION_DELETE`]) is NOT
 //! removed: the call is refused with the modelled `ValidationException` and the
 //! record stays readable, because the operation's own documentation carves that
-//! jurisdiction out. The carve-out is applied by
-//! [`crate::state::check_registration_deletable`], which the batch delete shares.
+//! jurisdiction out.
+//!
+//! What a delete of ONE account answers — the 404 for an account holding
+//! nothing, the carve-out refusal, or the removal — is decided in ONE place,
+//! [`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::delete_registration`],
+//! which the batch delete drives per account; this handler only renders its
+//! refusal as this operation's modelled error.
 //!
 //! ## Shape of an operation
 //!
@@ -155,21 +160,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let account_id = crate::state::resolve_account_id(input.account_id);
         let mut store = state.lock();
 
-        // An account holding nothing has nothing to delete, whatever jurisdiction
-        // the carve-out is about: that is this operation's 404.
-        let Some(stored) = store.registrations.get(&account_id) else {
-            return Err(DeleteTaxRegistrationErrorModeled::ResourceNotFoundException(
-                crate::state::no_tax_registration(),
-            )
-            .into());
-        };
-
-        // A record this API cannot remove is left exactly as it was, so every
-        // later read still reports it.
-        crate::state::check_registration_deletable(stored)
-            .map_err(DeleteTaxRegistrationErrorModeled::ValidationException)?;
-
-        store.registrations.remove(&account_id);
+        // The one delete decision, rendered on this operation's own channel: a
+        // refusal is this operation's modelled error and leaves the record
+        // exactly as it was, so every later read still reports it.
+        store
+            .delete_registration(&account_id)
+            .map_err(|refusal| match refusal {
+                crate::state::RegistrationDeleteRefusal::NotFound(error) => {
+                    DeleteTaxRegistrationErrorModeled::ResourceNotFoundException(error)
+                }
+                crate::state::RegistrationDeleteRefusal::NotDeletable(error) => {
+                    DeleteTaxRegistrationErrorModeled::ValidationException(error)
+                }
+            })?;
         drop(store);
         Ok(DeleteTaxRegistrationOutput {})
     }
