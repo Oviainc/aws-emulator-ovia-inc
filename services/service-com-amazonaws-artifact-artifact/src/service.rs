@@ -72,6 +72,14 @@
 //! report handler makes it, through `crate::scaffolded::Scaffolded::unauthorized`, and
 //! answers the same 401.
 //!
+//! All three are judgements about ONE operation's input, so each needs the operation the
+//! request addresses. The protocol names it for every request that carries what its route
+//! needs; a request that leaves a `@required` `@httpQuery` member out matches no route at
+//! all, and it still addressed the operation its method and path address, so
+//! [`addresses`] reads the name off the input schema's own `@http` binding for that one.
+//! Without it such a request would never be judged and would be answered as an operation
+//! this emulator does not serve — which is not what it was, whatever it then deserves.
+//!
 //! ## The document plane
 //!
 //! `ExportComplianceInquiry` hands out a PRESIGNED URL, and a presigned URL is a promise
@@ -149,35 +157,66 @@ enum PreDispatchRefusal {
     InvalidInput(Vec<Violation>),
 }
 
-/// The resource one request targets, as the gateway reads it: the kind of identifier
-/// the operation's input carries, and the value the caller sent.
+/// The kind of resource one request targets, as the gateway reads it.
 ///
-/// The gateway authorizes the resource ARN it builds from that identifier, so a value
-/// that is not a well-formed identifier of its type names no resource to authorize at
-/// all — which is why this judgement precedes the modelled constraint validation that
-/// would otherwise refuse the same value as a `ValidationException`.
+/// The gateway authorizes the resource ARN it builds from the identifier the request
+/// carried, so a value that is not a well-formed identifier of its kind names no
+/// resource to authorize at all — which is why this judgement precedes the modelled
+/// constraint validation that would otherwise refuse the same value as a
+/// `ValidationException`.
 #[derive(Debug, Clone, Copy)]
-enum Target<'a> {
+enum Target {
     /// A `reportId` (`ReportId`), as every report operation carries.
-    Report(&'a str),
+    Report,
     /// A `complianceInquiryId` (`InquiryId`), as every compliance-inquiry operation
     /// carries.
-    ComplianceInquiry(&'a str),
+    ComplianceInquiry,
 }
 
-impl Target<'_> {
-    /// Whether this identifier can name a resource of its type at all.
+impl Target {
+    /// Whether `identifier` can name a resource of this kind at all.
     ///
     /// The syntax of each id lives in `crate::state` beside the catalog it keys, and
     /// is the model's: `ReportId`'s `^report-[a-zA-Z0-9]{16}$` and `InquiryId`'s
     /// `^compliance-inquiry-[a-zA-Z0-9]{16}$`.
-    fn names_a_resource(&self) -> bool {
+    fn names_a_resource(self, identifier: &str) -> bool {
         match self {
-            Self::Report(id) => crate::state::is_report_id(id),
-            Self::ComplianceInquiry(id) => crate::state::is_inquiry_id(id),
+            Self::Report => crate::state::is_report_id(identifier),
+            Self::ComplianceInquiry => crate::state::is_inquiry_id(identifier),
         }
     }
 }
+
+/// Which member of one operation's input carries the identifier of the resource the
+/// request targets, and which kind of resource that identifier names.
+///
+/// The member is named as the MODEL declares it, rather than reached through a field of
+/// the bound input, because the target is authorized ahead of everything else the
+/// request carried — including whether the input binds at all, which it does not when a
+/// member the shape requires is absent. Naming the member is what lets the identifier be
+/// read off such a request too, by [`bound_member`], which matches the name against the
+/// operation's own input schema.
+#[derive(Debug, Clone, Copy)]
+struct TargetMember {
+    /// The input member the identifier travels in, as the model names it.
+    member: &'static str,
+    /// What an identifier that member carried names.
+    kind: Target,
+}
+
+/// The target of every operation that names a report: the model gives each of them the
+/// same `reportId` member, so the pair is stated once rather than per operation.
+const REPORT_TARGET: Option<TargetMember> = Some(TargetMember {
+    member: "reportId",
+    kind: Target::Report,
+});
+
+/// The target of every operation that names a compliance inquiry — `complianceInquiryId`
+/// on each of them, whether the model binds it to the query string or to the body.
+const INQUIRY_TARGET: Option<TargetMember> = Some(TargetMember {
+    member: "complianceInquiryId",
+    kind: Target::ComplianceInquiry,
+});
 
 /// One refusal the front door answers with, as a pre-dispatch operation.
 ///
@@ -225,23 +264,121 @@ impl ErasedOperation for FrontDoorAnswer {
 /// member is what the request carries the value in.
 fn body_bound(schema: &Schema, violated: &str) -> bool {
     let member = violated.split('.').next().unwrap_or(violated);
-    schema.members().iter().any(|candidate| {
-        candidate
-            .member_name()
-            .is_some_and(|name| path::member(name) == member)
-            && candidate.http_label().is_none()
-            && candidate.http_query().is_none()
-            && candidate.http_query_params().is_none()
-            && candidate.http_header().is_none()
-            && candidate.http_prefix_headers().is_none()
+    schema
+        .members()
+        .iter()
+        .any(|candidate| named(candidate).as_deref() == Some(member) && !carried_in_uri(candidate))
+}
+
+/// Whether this member schema binds its value somewhere in the request URI rather than
+/// in the body: the five HTTP locations a member can occupy outside the payload.
+fn carried_in_uri(member: &Schema) -> bool {
+    member.http_label().is_some()
+        || member.http_query().is_some()
+        || member.http_query_params().is_some()
+        || member.http_header().is_some()
+        || member.http_prefix_headers().is_some()
+}
+
+/// The member's name as this service names a member everywhere it states one: the
+/// model's member name, in the lowerCamel form a violation path and a `fieldList` entry
+/// carry.
+fn named(member: &Schema) -> Option<String> {
+    member.member_name().map(path::member)
+}
+
+/// The value one named member of an operation's input carries in this request, read
+/// through the PROTOCOL's own binding — `None` when the request carries no such value,
+/// when the shape declares no such member, or when the value is not a string.
+///
+/// Reads that ONE member and nothing else, which is what lets it answer for a request
+/// the operation's own input reader cannot complete: a shape whose required member is
+/// absent yields no bound input to read a field off, while the members the request DID
+/// carry are bound exactly as dispatch would bind them — the same query, path and body
+/// binding, with the same decoding.
+fn bound_member(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+    schema: &'static Schema,
+    member: &str,
+) -> Option<String> {
+    let mut deserializer = protocol.deserialize_input(req, schema).ok()?;
+    let mut found = None;
+    // The result is deliberately dropped: a walk that reads the wanted member and then
+    // stops short of the end of the request still read it, and a walk that cannot read
+    // the request at all answers `None` like one that found no such member.
+    let _ = deserializer.read_struct(schema, &mut |candidate, d| {
+        if found.is_some() {
+            return Ok(());
+        }
+        if named(candidate).as_deref() == Some(member) {
+            found = Some(d.read_string(candidate)?);
+            return Ok(());
+        }
+        // A member the walk passes over still has its value in the body's document, and
+        // only the codec that reads values can step over one, so a body member's value is
+        // read and discarded to keep that codec in step with its own input. A URI-bound
+        // member carries its value outside the body, where there is nothing to step over.
+        if !carried_in_uri(candidate) {
+            d.read_document(candidate)?;
+        }
+        Ok(())
+    });
+    found
+}
+
+/// Whether `req` is a call to the operation `name`, whose input `schema` carries the
+/// method and URI the model binds that operation to.
+///
+/// `key` is the name the PROTOCOL resolved, which names the operation for every request
+/// that carries what its route needs. A request that leaves a `@required` `@httpQuery`
+/// member out matches NO route — the framework's lookup refuses a route the request
+/// could not invoke — and yet such a request still addresses the operation its method
+/// and path address, so with no key the name is read off the input schema's own `@http`
+/// binding instead. Without that the pre-dispatch judgements never see the request and
+/// it is answered as an operation this emulator does not serve, which is not what it was.
+fn addresses(key: Option<&str>, req: &RtRequest, schema: &Schema, name: &str) -> bool {
+    if let Some(key) = key {
+        return key == name;
+    }
+    schema.http().is_some_and(|binding| {
+        binding.method().eq_ignore_ascii_case(req.method())
+            && path_matches(binding.uri(), &split_uri(req.uri()).0)
     })
+}
+
+/// Whether `path` is the `@http` URI `pattern` with its `@httpLabel` placeholders filled:
+/// one path segment per `{label}`, and the whole remaining path for a greedy `{label+}`.
+///
+/// Only the pattern's PATH is matched; a query literal in the pattern selects between
+/// routes, and selecting is what the protocol's own lookup does whenever it can.
+fn path_matches(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.split('?').next().unwrap_or(pattern);
+    let expected: Vec<&str> = pattern.trim_matches('/').split('/').collect();
+    let actual: Vec<&str> = path.trim_matches('/').split('/').collect();
+    for (index, segment) in expected.iter().enumerate() {
+        let greedy = segment.starts_with('{') && segment.ends_with("+}");
+        let label = segment.starts_with('{') && segment.ends_with('}');
+        match actual.get(index) {
+            // A greedy label takes every segment that is left, and there must be one.
+            Some(_) if greedy => return true,
+            Some(carried) if label => {
+                if carried.is_empty() {
+                    return false;
+                }
+            }
+            Some(carried) if carried == segment => {}
+            _ => return false,
+        }
+    }
+    actual.len() == expected.len()
 }
 
 /// Run the pre-dispatch checks over one operation's request: the front door's two, and
 /// this service's own refusal of a URI-bound value the model's constraints reject.
 ///
-/// `target` names the resource the input targets, for an operation whose input carries
-/// an identifier, and `None` for one that does not.
+/// `target` names the member the resource the input targets travels in, for an operation
+/// whose input carries an identifier, and `None` for one that does not.
 ///
 /// The input is read through the PROTOCOL's own binding against the operation's own
 /// input schema, so the value judged is the value dispatch would hand the handler —
@@ -252,26 +389,47 @@ fn body_bound(schema: &Schema, violated: &str) -> bool {
 ///
 /// The layering decides the order: the gateway answers ahead of this service, so an
 /// unauthorizable target comes first and a body it cannot bind second, and only a request
-/// both of them pass is refused for a value its URI carried.
+/// both of them pass is refused for a value its URI carried. The order holds whatever the
+/// request LEFT OUT — a member the shape requires and the request omits is one more thing
+/// the request carried, at one more member, judged after the target like any value it did
+/// carry — which is why the identifier is read off the request rather than off the bound
+/// input, there being no bound input for such a request to read it off.
 fn judge<I>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
     schema: &'static Schema,
-    target: fn(&I) -> Option<Target<'_>>,
+    target: Option<TargetMember>,
 ) -> Option<PreDispatchRefusal>
 where
     I: DeserializableStruct + SerializableStruct,
 {
+    // 1. Authorize the target, ahead of every constraint the model declares — and so
+    // ahead of whether the input's own reader can complete at all, which it cannot when
+    // a member the shape requires is absent. A request that leaves such a member out
+    // still names the target it names, so the identifier is read off the request itself
+    // rather than off a bound input. An identifier the request carries no value for
+    // names nothing to authorize, and is left to the judgements below.
+    if let Some(target) = target {
+        let identifier = bound_member(protocol, req, schema, target.member);
+        if identifier
+            .as_deref()
+            .is_some_and(|identifier| !target.kind.names_a_resource(identifier))
+        {
+            return Some(PreDispatchRefusal::FrontDoor(FrontDoorVerdict::Unauthorized));
+        }
+    }
+
     let mut deserializer = protocol.deserialize_input(req, schema).ok()?;
     let input = match I::deserialize(&mut *deserializer) {
         Ok(input) => input,
         // A member the shape requires, absent from the body, is a body the gateway
         // cannot bind. A URI-bound one is this service's own refusal, stated against the
         // member the request did not carry — absence is a constraint violation like any
-        // other, found while reading the request rather than while walking it. Anything
-        // else the codec could not read (a body that is not the protocol's format at all)
-        // is left to the framework's own refusal: the gateway's answer to it is not
-        // recorded.
+        // other, found while reading the request rather than while walking it, and so
+        // judged after the target above exactly as a present-but-refused value is.
+        // Anything else the codec could not read (a body that is not the protocol's
+        // format at all) is left to the framework's own refusal: the gateway's answer to
+        // it is not recorded.
         Err(aws_smithy_schema::serde::SerdeError::MissingMember { member_name }) => {
             return Some(if body_bound(schema, &member_name) {
                 PreDispatchRefusal::FrontDoor(FrontDoorVerdict::InvalidRequestBody)
@@ -285,11 +443,6 @@ where
         }
         Err(_) => return None,
     };
-
-    // 1. Authorize the target, ahead of every constraint the model declares.
-    if target(&input).is_some_and(|target| !target.names_a_resource()) {
-        return Some(PreDispatchRefusal::FrontDoor(FrontDoorVerdict::Unauthorized));
-    }
 
     // 2. Validate the body. A violation on a URI-bound member is NOT the gateway's:
     // the service refuses that one itself, as its modelled `ValidationException`.
@@ -778,106 +931,137 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     fn examine(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Option<PreDispatchRefusal> {
         use crate::ops;
 
-        let key = protocol.routing_key(req).ok()?;
+        // The name the protocol resolved for this request, where it resolved one; see
+        // [`addresses`], which decides each arm below, for the request that has none.
+        let key = protocol.routing_key(req).ok();
+        let addressed =
+            |schema: &'static Schema, name: &'static str| addresses(key, req, schema, name);
 
         // Reports: the `reportId` every report operation targets.
-        if key == <ops::get_report_metadata::GetReportMetadata<Eng> as Operation>::NAME {
+        if addressed(
+            types::GET_REPORT_METADATA_INPUT_SCHEMA,
+            <ops::get_report_metadata::GetReportMetadata<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::GetReportMetadataInput>(
                 protocol,
                 req,
                 types::GET_REPORT_METADATA_INPUT_SCHEMA,
-                |input| Some(Target::Report(&input.report_id)),
+                REPORT_TARGET,
             );
         }
-        if key == <ops::list_report_versions::ListReportVersions<Eng> as Operation>::NAME {
+        if addressed(
+            types::LIST_REPORT_VERSIONS_INPUT_SCHEMA,
+            <ops::list_report_versions::ListReportVersions<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::ListReportVersionsInput>(
                 protocol,
                 req,
                 types::LIST_REPORT_VERSIONS_INPUT_SCHEMA,
-                |input| Some(Target::Report(&input.report_id)),
+                REPORT_TARGET,
             );
         }
-        if key == <ops::get_term_for_report::GetTermForReport<Eng> as Operation>::NAME {
+        if addressed(
+            types::GET_TERM_FOR_REPORT_INPUT_SCHEMA,
+            <ops::get_term_for_report::GetTermForReport<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::GetTermForReportInput>(
                 protocol,
                 req,
                 types::GET_TERM_FOR_REPORT_INPUT_SCHEMA,
-                |input| Some(Target::Report(&input.report_id)),
+                REPORT_TARGET,
             );
         }
-        if key == <ops::get_report::GetReport<Eng> as Operation>::NAME {
+        if addressed(
+            types::GET_REPORT_INPUT_SCHEMA,
+            <ops::get_report::GetReport<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::GetReportInput>(
                 protocol,
                 req,
                 types::GET_REPORT_INPUT_SCHEMA,
-                |input| Some(Target::Report(&input.report_id)),
+                REPORT_TARGET,
             );
         }
 
         // Compliance inquiries: the `complianceInquiryId` each one targets, whether the
         // model binds it to the query string or to the body.
-        if key
-            == <ops::get_compliance_inquiry_metadata::GetComplianceInquiryMetadata<Eng> as Operation>::NAME
-        {
+        if addressed(
+            types::GET_COMPLIANCE_INQUIRY_METADATA_INPUT_SCHEMA,
+            <ops::get_compliance_inquiry_metadata::GetComplianceInquiryMetadata<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::GetComplianceInquiryMetadataInput>(
                 protocol,
                 req,
                 types::GET_COMPLIANCE_INQUIRY_METADATA_INPUT_SCHEMA,
-                |input| Some(Target::ComplianceInquiry(&input.compliance_inquiry_id)),
+                INQUIRY_TARGET,
             );
         }
-        if key
-            == <ops::list_compliance_inquiry_queries::ListComplianceInquiryQueries<Eng> as Operation>::NAME
-        {
+        if addressed(
+            types::LIST_COMPLIANCE_INQUIRY_QUERIES_INPUT_SCHEMA,
+            <ops::list_compliance_inquiry_queries::ListComplianceInquiryQueries<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::ListComplianceInquiryQueriesInput>(
                 protocol,
                 req,
                 types::LIST_COMPLIANCE_INQUIRY_QUERIES_INPUT_SCHEMA,
-                |input| Some(Target::ComplianceInquiry(&input.compliance_inquiry_id)),
+                INQUIRY_TARGET,
             );
         }
-        if key == <ops::export_compliance_inquiry::ExportComplianceInquiry<Eng> as Operation>::NAME {
+        if addressed(
+            types::EXPORT_COMPLIANCE_INQUIRY_INPUT_SCHEMA,
+            <ops::export_compliance_inquiry::ExportComplianceInquiry<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::ExportComplianceInquiryInput>(
                 protocol,
                 req,
                 types::EXPORT_COMPLIANCE_INQUIRY_INPUT_SCHEMA,
-                |input| Some(Target::ComplianceInquiry(&input.compliance_inquiry_id)),
+                INQUIRY_TARGET,
             );
         }
-        if key
-            == <ops::put_compliance_inquiry_feedback::PutComplianceInquiryFeedback<Eng> as Operation>::NAME
-        {
+        if addressed(
+            types::PUT_COMPLIANCE_INQUIRY_FEEDBACK_INPUT_SCHEMA,
+            <ops::put_compliance_inquiry_feedback::PutComplianceInquiryFeedback<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::PutComplianceInquiryFeedbackInput>(
                 protocol,
                 req,
                 types::PUT_COMPLIANCE_INQUIRY_FEEDBACK_INPUT_SCHEMA,
-                |input| Some(Target::ComplianceInquiry(&input.compliance_inquiry_id)),
+                INQUIRY_TARGET,
             );
         }
 
         // Bodies without a target of their own.
-        if key == <ops::create_compliance_inquiry::CreateComplianceInquiry<Eng> as Operation>::NAME {
+        if addressed(
+            types::CREATE_COMPLIANCE_INQUIRY_INPUT_SCHEMA,
+            <ops::create_compliance_inquiry::CreateComplianceInquiry<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::CreateComplianceInquiryInput>(
                 protocol,
                 req,
                 types::CREATE_COMPLIANCE_INQUIRY_INPUT_SCHEMA,
-                |_| None,
+                None,
             );
         }
-        if key == <ops::put_account_settings::PutAccountSettings<Eng> as Operation>::NAME {
+        if addressed(
+            types::PUT_ACCOUNT_SETTINGS_INPUT_SCHEMA,
+            <ops::put_account_settings::PutAccountSettings<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::PutAccountSettingsInput>(
                 protocol,
                 req,
                 types::PUT_ACCOUNT_SETTINGS_INPUT_SCHEMA,
-                |_| None,
+                None,
             );
         }
-        if key == <ops::tag_resource::TagResource<Eng> as Operation>::NAME {
+        if addressed(
+            types::TAG_RESOURCE_INPUT_SCHEMA,
+            <ops::tag_resource::TagResource<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::TagResourceInput>(
                 protocol,
                 req,
                 types::TAG_RESOURCE_INPUT_SCHEMA,
-                |_| None,
+                None,
             );
         }
 
@@ -886,52 +1070,70 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         // what their URI carried, against the model's own constraints. They are listed
         // for exactly that: the refusal of a `@httpQuery` or `@httpLabel` value is this
         // service's, and it is the same refusal on every operation that has one.
-        if key == <ops::list_reports::ListReports<Eng> as Operation>::NAME {
+        if addressed(
+            types::LIST_REPORTS_INPUT_SCHEMA,
+            <ops::list_reports::ListReports<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::ListReportsInput>(
                 protocol,
                 req,
                 types::LIST_REPORTS_INPUT_SCHEMA,
-                |_| None,
+                None,
             );
         }
-        if key == <ops::list_customer_agreements::ListCustomerAgreements<Eng> as Operation>::NAME {
+        if addressed(
+            types::LIST_CUSTOMER_AGREEMENTS_INPUT_SCHEMA,
+            <ops::list_customer_agreements::ListCustomerAgreements<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::ListCustomerAgreementsInput>(
                 protocol,
                 req,
                 types::LIST_CUSTOMER_AGREEMENTS_INPUT_SCHEMA,
-                |_| None,
+                None,
             );
         }
-        if key == <ops::list_compliance_inquiries::ListComplianceInquiries<Eng> as Operation>::NAME {
+        if addressed(
+            types::LIST_COMPLIANCE_INQUIRIES_INPUT_SCHEMA,
+            <ops::list_compliance_inquiries::ListComplianceInquiries<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::ListComplianceInquiriesInput>(
                 protocol,
                 req,
                 types::LIST_COMPLIANCE_INQUIRIES_INPUT_SCHEMA,
-                |_| None,
+                None,
             );
         }
-        if key == <ops::get_account_settings::GetAccountSettings<Eng> as Operation>::NAME {
+        if addressed(
+            types::GET_ACCOUNT_SETTINGS_INPUT_SCHEMA,
+            <ops::get_account_settings::GetAccountSettings<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::GetAccountSettingsInput>(
                 protocol,
                 req,
                 types::GET_ACCOUNT_SETTINGS_INPUT_SCHEMA,
-                |_| None,
+                None,
             );
         }
-        if key == <ops::list_tags_for_resource::ListTagsForResource<Eng> as Operation>::NAME {
+        if addressed(
+            types::LIST_TAGS_FOR_RESOURCE_INPUT_SCHEMA,
+            <ops::list_tags_for_resource::ListTagsForResource<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::ListTagsForResourceInput>(
                 protocol,
                 req,
                 types::LIST_TAGS_FOR_RESOURCE_INPUT_SCHEMA,
-                |_| None,
+                None,
             );
         }
-        if key == <ops::untag_resource::UntagResource<Eng> as Operation>::NAME {
+        if addressed(
+            types::UNTAG_RESOURCE_INPUT_SCHEMA,
+            <ops::untag_resource::UntagResource<Eng> as Operation>::NAME,
+        ) {
             return judge::<types::UntagResourceInput>(
                 protocol,
                 req,
                 types::UNTAG_RESOURCE_INPUT_SCHEMA,
-                |_| None,
+                None,
             );
         }
 

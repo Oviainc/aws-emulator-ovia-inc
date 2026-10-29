@@ -79,6 +79,8 @@ mod resource_tags;
 mod service_stated_validation_envelope;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/target_authorized_before_absent_members.rs"]
+mod target_authorized_before_absent_members;
 #[path = "all/timestamp_wire_form.rs"]
 mod timestamp_wire_form;
 #[path = "all/validation_exception_shape.rs"]
