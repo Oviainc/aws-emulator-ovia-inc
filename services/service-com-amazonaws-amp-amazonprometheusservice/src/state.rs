@@ -608,7 +608,23 @@ pub struct Workspace {
     pub arn: String,
     /// `None` when the workspace carries no alias (none given, or one that was all
     /// blank space — see [`normalize_alias`]).
+    ///
+    /// This is the PUBLISHED alias: what every reader reports. A rename that has been
+    /// accepted but has not settled yet is held in [`Workspace::pending_alias`] and
+    /// lands here only when the workspace is settled again.
     pub alias: Option<String>,
+    /// The alias an accepted-but-unsettled rename will publish, or `None` when no
+    /// rename is in flight. The inner `Option` is the alias itself, so a rename that
+    /// leaves the workspace with none is held here the same way one that sets a value
+    /// is.
+    ///
+    /// A rename is accepted with no status to report (modelled 204, `Unit` output), so
+    /// a reader has no signal that an alias it can see is not in effect yet: the new
+    /// alias and the settled status therefore become visible in the SAME step, applied
+    /// by [`ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`] when the
+    /// owed settling comes due. Until then every reader reports the alias the
+    /// workspace had before the rename.
+    pub pending_alias: Option<Option<String>>,
     /// One of [`STATUS_CREATING`], [`STATUS_ACTIVE`], [`STATUS_UPDATING`],
     /// [`STATUS_DELETING`].
     pub status_code: String,
@@ -1092,6 +1108,13 @@ impl RegionalState {
                 deleted.push(workspace.workspace_id.clone());
             } else {
                 workspace.status_code = STATUS_ACTIVE.to_string();
+                // The settling is the one step that publishes what the update changed:
+                // the alias an accepted rename is holding becomes visible here,
+                // together with the status it settles to, so no reader ever sees the
+                // new alias on a workspace that is not yet settled.
+                if let Some(pending) = workspace.pending_alias.take() {
+                    workspace.alias = pending;
+                }
                 // The token identified the update that just settled, so it stops
                 // standing for one: a later call carrying it is a new request.
                 workspace.update_token = None;

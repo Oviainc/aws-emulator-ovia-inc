@@ -10,6 +10,11 @@
 //! except a replay of the very call that started the update, which its
 //! `@idempotencyToken` makes the same request.
 //!
+//! The new alias is published by that settling and not before it, which
+//! `workspace_alias_publication` pins over the readers and the forms the alias takes:
+//! here it is asserted only as the value each read reports while the rename is in
+//! flight (the one the workspace had before the call) and once it has settled.
+//!
 //! Each suite spans what that rule generalises over — the form of the new alias (a
 //! value, blank-padded, at each modelled length bound, omitted), whether the request
 //! carries a `clientToken`, which status-gated operation the second caller attempts, how
@@ -124,9 +129,10 @@ async fn workspace_rename_is_accepted_asynchronously() {
         );
         let in_flight_alias = described_alias(&amp, case.region, &workspace_id).await;
         assert_eq!(
-            in_flight_alias, case.stored_alias,
-            "case {name:?}: the in-flight workspace must report the new alias, got \
-             {in_flight_alias:?}"
+            in_flight_alias,
+            Some("before".to_string()),
+            "case {name:?}: while the rename is in flight the workspace must still report \
+             the alias it had, got {in_flight_alias:?}"
         );
 
         wait_for_due_transition();
@@ -140,7 +146,7 @@ async fn workspace_rename_is_accepted_asynchronously() {
         let settled_alias = described_alias(&amp, case.region, &workspace_id).await;
         assert_eq!(
             settled_alias, case.stored_alias,
-            "case {name:?}: the settling must not move the alias, got {settled_alias:?}"
+            "case {name:?}: the settling must publish the new alias, got {settled_alias:?}"
         );
 
         // A listing reads the same record a describe does, so it reports the same pair.
@@ -231,15 +237,25 @@ async fn an_updating_workspace_refuses_the_operations_that_need_it_active() {
             "ConflictException",
             "case {name:?}: unexpected error code, got {refused:?}"
         );
-        // The refusal changed nothing: the first rename's alias is still the stored one.
+        // The refusal changed nothing, and the first rename has not settled yet, so the
+        // alias every reader reports is still the one the workspace was created with.
         let alias = described_alias(&amp, region, &workspace_id).await;
         assert_eq!(
             alias,
-            Some("first".to_string()),
-            "case {name:?}: a refused call must leave the stored alias alone, got {alias:?}"
+            Some("contended".to_string()),
+            "case {name:?}: a refused call must leave the published alias alone, got {alias:?}"
         );
 
         wait_for_due_transition();
+
+        // The settling published the first rename's alias, and only then.
+        let published = described_alias(&amp, region, &workspace_id).await;
+        assert_eq!(
+            published,
+            Some("first".to_string()),
+            "case {name:?}: the settling must publish the first rename's alias, got \
+             {published:?}"
+        );
 
         let accepted = amp.call(case.method, &uri, region, &(case.body)()).await;
         assert!(
@@ -281,6 +297,15 @@ async fn replaying_the_in_flight_rename_token_is_accepted() {
             "case \"replay {attempt}\": the workspace must still be {STATUS_UPDATING}, \
              got {status:?}"
         );
+        // A replay applies nothing of its own, and the rename it replays has not
+        // settled, so the published alias is still the pre-rename one.
+        let alias = described_alias(&amp, region, &workspace_id).await;
+        assert_eq!(
+            alias,
+            Some("idempotent".to_string()),
+            "case \"replay {attempt}\": the published alias must still be the pre-rename \
+             one, got {alias:?}"
+        );
     }
 
     wait_for_due_transition();
@@ -289,6 +314,13 @@ async fn replaying_the_in_flight_rename_token_is_accepted() {
         settled, STATUS_ACTIVE,
         "case \"after the owed settling\": the workspace must report {STATUS_ACTIVE}, \
          got {settled:?}"
+    );
+    let settled_alias = described_alias(&amp, region, &workspace_id).await;
+    assert_eq!(
+        settled_alias,
+        Some("settled-name".to_string()),
+        "case \"after the owed settling\": the rename must be published exactly once, \
+         got {settled_alias:?}"
     );
 
     // The token no longer names an update in flight, so the SAME request is a new rename:
@@ -310,12 +342,21 @@ async fn replaying_the_in_flight_rename_token_is_accepted() {
         "case \"the token reused after the update settled\": the workspace must be \
          {STATUS_UPDATING} again, got {status:?}"
     );
+    let in_flight_alias = described_alias(&amp, region, &workspace_id).await;
+    assert_eq!(
+        in_flight_alias,
+        Some("settled-name".to_string()),
+        "case \"the token reused after the update settled\": the new rename is in flight, \
+         so the previous alias must still be the published one, got {in_flight_alias:?}"
+    );
+
+    wait_for_due_transition();
     let alias = described_alias(&amp, region, &workspace_id).await;
     assert_eq!(
         alias,
         Some("reused-token".to_string()),
-        "case \"the token reused after the update settled\": the new alias must be \
-         stored, got {alias:?}"
+        "case \"the token reused after the update settled\": the settling must publish \
+         the new alias, got {alias:?}"
     );
 }
 
@@ -328,6 +369,7 @@ async fn successive_renames_each_settle_before_the_next() {
     let workspace_id = amp.active_workspace(region, "serial-0").await;
 
     for round in 1..=4 {
+        let previous = format!("serial-{}", round - 1);
         let alias = format!("serial-{round}");
         let renamed = amp
             .rename(region, &workspace_id, &serde_json::json!({ "alias": alias }))
@@ -341,6 +383,13 @@ async fn successive_renames_each_settle_before_the_next() {
             in_flight, STATUS_UPDATING,
             "case \"rename {round}\": the workspace must report {STATUS_UPDATING}, got \
              {in_flight:?}"
+        );
+        let in_flight_alias = described_alias(&amp, region, &workspace_id).await;
+        assert_eq!(
+            in_flight_alias,
+            Some(previous.clone()),
+            "case \"rename {round}\": the in-flight workspace must still report \
+             {previous:?}, got {in_flight_alias:?}"
         );
         wait_for_due_transition();
         let settled = described_status(&amp, region, &workspace_id).await;

@@ -336,6 +336,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: crate::state::workspace_arn(&region, &workspace_id),
             prometheus_endpoint: crate::state::prometheus_endpoint(&region, &workspace_id),
             alias: crate::state::normalize_alias(input.alias.as_deref()),
+            // A workspace is created with the alias the request carried; only an
+            // accepted-but-unsettled `UpdateWorkspaceAlias` holds a pending one.
+            pending_alias: None,
             // "Immediately after you create the workspace, the status is usually
             // CREATING" — and the clock owes the move to ACTIVE at `transition_due`.
             status_code: crate::state::STATUS_CREATING.to_string(),

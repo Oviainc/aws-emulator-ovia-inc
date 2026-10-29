@@ -52,6 +52,7 @@ fn workspace_record(region: &str, workspace_id: &str, alias: &str) -> Workspace 
         workspace_id: workspace_id.to_string(),
         arn: workspace_arn(region, workspace_id),
         alias: Some(alias.to_string()),
+        pending_alias: None,
         status_code: STATUS_ACTIVE.to_string(),
         prometheus_endpoint: prometheus_endpoint(region, workspace_id),
         created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),

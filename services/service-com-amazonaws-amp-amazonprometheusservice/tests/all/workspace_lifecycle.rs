@@ -814,11 +814,12 @@ async fn list_workspaces_pages_with_max_results_and_next_token() {
     }
 }
 
-/// `UpdateWorkspaceAlias` replaces the stored alias, so every later read reports the
-/// new value — one row per form the new alias takes. Each rename is accepted
-/// asynchronously, so the row waits for the owed settling before the next one renames
-/// the same workspace again (the status rule itself is pinned by
-/// `workspace_rename_is_accepted_asynchronously`).
+/// `UpdateWorkspaceAlias` replaces the stored alias, so every read taken once the rename
+/// has settled reports the new value — one row per form the new alias takes. Each rename
+/// is accepted asynchronously and the new alias is published by the owed settling, so the
+/// row waits for it before reading the record back and renaming the same workspace again
+/// (the status rule itself is pinned by `workspace_rename_is_accepted_asynchronously`,
+/// and the publication rule by `workspace_alias_publication`).
 #[tokio::test]
 async fn update_workspace_alias_changes_what_later_reads_report() {
     let amp = Amp::new();
@@ -864,6 +865,10 @@ async fn update_workspace_alias_changes_what_later_reads_report() {
             "case {case:?}: UpdateWorkspaceAlias must answer 204, got {renamed:?}"
         );
 
+        // The rename publishes its alias when the owed settling comes due, so the reads
+        // below are taken after it.
+        wait_for_due_transition();
+
         let described = amp.describe("us-west-2", &workspace_id).await;
         assert_eq!(
             described.body["workspace"]["alias"].as_str().map(str::to_string),
@@ -876,7 +881,6 @@ async fn update_workspace_alias_changes_what_later_reads_report() {
             expected,
             "case {case:?}: a listing must report the new alias, got {listed:?}"
         );
-        wait_for_due_transition();
     }
 
     let unknown = amp

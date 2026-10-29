@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWorkspaceAlias
-//! IMPLEMENTED: replaces the stored `alias` of one workspace and accepts the rename
-//! asynchronously — the workspace reports `UPDATING` until the clock settles it back to
-//! `ACTIVE`, and every later DescribeWorkspace/ListWorkspaces reports the new value.
+//! IMPLEMENTED: renames one workspace and accepts the rename asynchronously — the
+//! workspace reports `UPDATING` until the clock settles it back to `ACTIVE`, and the new
+//! alias is published in that same step, so DescribeWorkspace/ListWorkspaces report the
+//! new alias only on a workspace that is `ACTIVE` again.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -239,17 +240,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if !replays_pending_update {
+            // The rename is accepted asynchronously (the workspace moves to `UPDATING`
+            // here and the clock owes its move back to `ACTIVE`, which
+            // `ComAmazonawsAmpAmazonprometheusserviceState::materialize_due` applies), and
+            // this operation reports NO status for it: its modelled success is 204 with a
+            // `Unit` output, so a reader has nothing to tell it that an alias it can see
+            // is not in effect yet. The new alias is therefore held as the pending one and
+            // published by the settling, in the same step the status becomes `ACTIVE`
+            // again — until then every reader reports the alias the workspace had before
+            // this call, and the pair (new alias, non-`ACTIVE` workspace) is never
+            // observable.
+            //
             // The alias is metadata the service replaces outright: an omitted `alias`
             // leaves the workspace with none, which is why `WorkspaceDescription$alias`
-            // is an optional member.
-            workspace.alias = crate::state::normalize_alias(input.alias.as_deref());
-
-            // The rename is accepted asynchronously (modelled 204 on an
-            // eventually-consistent resource): the workspace moves to `UPDATING` here and
-            // the clock owes its move back to `ACTIVE`, which
-            // `ComAmazonawsAmpAmazonprometheusserviceState::materialize_due` applies — so
-            // a caller reading straight after this call still sees `UPDATING`, with the
-            // status-gated refusals that go with it, and one reading later sees `ACTIVE`.
+            // is an optional member — so the pending value carries that absence too.
+            workspace.pending_alias =
+                Some(crate::state::normalize_alias(input.alias.as_deref()));
             workspace.status_code = crate::state::STATUS_UPDATING.to_string();
             workspace.transition_due = Some(now + crate::state::TRANSITION_DELAY);
             workspace.update_token = input.client_token;

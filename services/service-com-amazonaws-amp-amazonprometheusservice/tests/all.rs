@@ -89,6 +89,8 @@ mod taggable_resource_kinds;
 mod tagging_api_arn_resolution;
 #[path = "all/wire_fidelity.rs"]
 mod wire_fidelity;
+#[path = "all/workspace_alias_publication.rs"]
+mod workspace_alias_publication;
 #[path = "all/workspace_configuration.rs"]
 mod workspace_configuration;
 #[path = "all/workspace_lifecycle.rs"]
