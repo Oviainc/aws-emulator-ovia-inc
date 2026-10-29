@@ -800,6 +800,9 @@ pub fn probe_subnet_key(source_arn: &str) -> &str {
 /// `CreateMonitor`'s inline `probes` list), so the limit cannot be enforced on
 /// one path and not the other. `Err` carries
 /// [`PROBES_PER_SUBNET_MESSAGE`].
+///
+/// Applied only once each requested probe has satisfied the probe rules on its
+/// own, for the reason given on [`check_probes_per_monitor`].
 pub fn check_probes_per_subnet<'a>(
     existing: Option<&'a Monitor>,
     requested: impl IntoIterator<Item = &'a str>,
@@ -839,6 +842,13 @@ pub fn check_probes_per_subnet<'a>(
 /// `CreateMonitor`'s inline `probes` list), so the limit cannot be enforced on
 /// one path and not the other. `Err` carries
 /// [`PROBES_PER_MONITOR_MESSAGE`].
+///
+/// A count is what a request asks for, so every caller applies it only once
+/// each requested probe has satisfied the probe rules on its own
+/// ([`validate_probe_spec`]): a malformed probe is refused by the clause naming
+/// the member it got wrong, never by a count sentence that names none. The
+/// sibling [`check_probes_per_subnet`] sits at the same point, so the two
+/// ceilings of one family resolve the same way.
 pub fn check_probes_per_monitor(
     existing: Option<&Monitor>,
     requested: usize,

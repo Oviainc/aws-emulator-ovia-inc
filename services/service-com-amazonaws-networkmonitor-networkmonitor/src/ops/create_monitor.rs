@@ -6,9 +6,14 @@
 //! has nothing to aggregate, so it is stored (and reported) `INACTIVE`; one
 //! created with probes is `PENDING` until the clock makes its activation due.
 //! The probes created inline are probes of the monitor, so they are bounded per
-//! source subnet like any other
-//! ([`crate::state::check_probes_per_subnet`]): a request asking for more probes
-//! than one subnet of a monitor may hold is refused and stores nothing.
+//! source subnet, and as a whole, like any other
+//! ([`crate::state::check_probes_per_subnet`],
+//! [`crate::state::check_probes_per_monitor`]): a request asking for more probes
+//! than one subnet of a monitor, or than the monitor itself, may hold is refused
+//! and stores nothing. Both counts are judged only after every requested probe
+//! has satisfied the probe rules on its own
+//! ([`crate::state::validate_probe_spec`]), so a request that is both malformed
+//! and too long is refused by the clause naming the member it got wrong.
 //! A second create naming a monitor that already exists is a RETRY only when it
 //! repeats the idempotency token recorded for that create
 //! ([`crate::state::ComAmazonawsNetworkmonitorNetworkmonitorState::monitor_minted_by_token`],
@@ -321,10 +326,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // The probes this request creates inline are probes of this monitor, so
-        // they are bounded as a whole exactly as `CreateProbe`'s are — here
-        // against each other, since the monitor being created holds none yet.
-        crate::state::check_probes_per_monitor(None, specs.len()).map_err(validation)?;
         // Each requested probe has to satisfy the probe rules on its own before
         // the request is judged on how many probes it asks for, so a malformed
         // probe is refused for what it says rather than for the company it
@@ -337,11 +338,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(validation)?;
         }
+        // Only once every requested probe stands on its own is the request
+        // judged on HOW MANY probes it asks for. Both count ceilings are of one
+        // family and so resolve in one place, after the per-probe rules and
+        // before any probe id is minted: a refused create leaves the store as
+        // it found it.
+        //
         // The probes this request creates inline are probes of this monitor, so
-        // they are bounded per source subnet exactly as `CreateProbe`'s are —
-        // here against each other, since the monitor being created holds none
-        // yet. Checked before any probe id is minted, so a refused create
-        // leaves the store as it found it.
+        // they are bounded as a whole, and per source subnet, exactly as
+        // `CreateProbe`'s are — here against each other, since the monitor
+        // being created holds none yet.
+        crate::state::check_probes_per_monitor(None, specs.len()).map_err(validation)?;
         crate::state::check_probes_per_subnet(
             None,
             specs.iter().map(|spec| spec.source_arn.as_str()),

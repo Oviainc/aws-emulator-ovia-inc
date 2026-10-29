@@ -6,8 +6,12 @@
 //! [`crate::state`], and answers from the record it stored. A repeat carrying
 //! the same `clientToken` replays the first probe rather than minting a second.
 //! A monitor holds only so many probes in one source subnet
-//! ([`crate::state::check_probes_per_subnet`]), so a request past that bound is
-//! refused and mints nothing.
+//! ([`crate::state::check_probes_per_subnet`]), and only so many in all
+//! ([`crate::state::check_probes_per_monitor`]), so a request past either bound
+//! is refused and mints nothing. Both counts are judged only after the probe
+//! has satisfied the probe rules on its own
+//! ([`crate::state::validate_probe_spec`]), so a malformed probe is refused by
+//! the clause naming the member it got wrong.
 //!
 //! The tags the request assigns the probe (`tags` and `probe.tags`) are a
 //! caller's own, so a key in the namespace AWS reserves for its tags
@@ -289,21 +293,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // A probe occupies a slot in its monitor, and a monitor holds only so
-        // many probes. Counted off the probes the monitor already holds, by the
-        // one rule both create paths apply.
-        crate::state::check_probes_per_monitor(store.monitor(&region, &input.monitor_name), 1)
-            .map_err(validation)?;
         // The probe has to satisfy the probe rules on its own before the request
-        // is judged on how many probes its subnet already holds, so a malformed
-        // probe is refused for what it says.
+        // is judged on how many probes its monitor or its subnet already holds,
+        // so a malformed probe is refused for what it says.
         // `crate::state::build_probe` below applies the same rules when it
         // writes the record.
         crate::state::validate_probe_spec(&spec, &crate::state::member_path("probe"))
             .map_err(validation)?;
-        // A probe occupies a slot in the subnet its `sourceArn` names, and a
-        // monitor holds only so many probes per subnet. Checked before a probe
-        // id is minted, so a refused create mints nothing.
+        // Only once the probe stands on its own is the request judged on the
+        // COUNT ceilings: a probe occupies a slot in its monitor and a slot in
+        // the subnet its `sourceArn` names, and a monitor holds only so many of
+        // each. Counted off the probes the monitor already holds, by the one
+        // rule both create paths apply, before a probe id is minted, so a
+        // refused create mints nothing.
+        crate::state::check_probes_per_monitor(store.monitor(&region, &input.monitor_name), 1)
+            .map_err(validation)?;
         crate::state::check_probes_per_subnet(
             store.monitor(&region, &input.monitor_name),
             ::std::iter::once(spec.source_arn.as_str()),
