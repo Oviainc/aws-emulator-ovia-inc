@@ -485,6 +485,19 @@ impl ComAmazonawsPcaconnectorscepPcaconnectorscepState {
             .is_some_and(|connector| connector.challenges.remove(challenge_arn).is_some())
     }
 
+    /// The connector a `ResourceArn` of either kind hangs off: the connector itself for a
+    /// connector ARN, and the owning connector for a challenge ARN — the record whose
+    /// lifecycle governs both, because a connector owns its challenges and takes them with
+    /// it ([`Self::connectors`]).
+    ///
+    /// `Some` as soon as that connector exists in `region`, even when the challenge segment
+    /// names no stored challenge, so a caller that needs the resource itself to exist asks
+    /// for it ([`Self::tags_of`], [`Self::challenge`]) rather than inferring it from here.
+    pub fn owning_connector(&self, region: &str, resource_arn: &str) -> Option<&StoredConnector> {
+        let connector_arn = connector_arn_of_challenge(resource_arn).unwrap_or(resource_arn);
+        self.connector(region, connector_arn)
+    }
+
     /// The tags of the connector or challenge `resource_arn` names, or `None` when this
     /// service holds no resource under that ARN.
     ///

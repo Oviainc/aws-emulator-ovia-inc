@@ -53,3 +53,5 @@ mod tag_resource;
 mod tag_updated_at;
 #[path = "all/tag_validation.rs"]
 mod tag_validation;
+#[path = "all/tag_write_under_teardown.rs"]
+mod tag_write_under_teardown;

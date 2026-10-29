@@ -10,6 +10,11 @@
 //! also moves the `UpdatedAt` the connector or challenge reports — unless every entry it
 //! writes is one the record already carried, which leaves the record as it was.
 //!
+//! A connector whose `DeleteConnector` has been accepted is reported until its teardown
+//! completes but can no longer be changed, so a write naming it — or a challenge hanging off
+//! it — is refused 400 `ValidationException` with `Reason` `INVALID_STATE` rather than
+//! answered 204 for a tag the teardown would discard.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -204,10 +209,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let resource_arn = input.resource_arn.clone();
-        // ONE lookup, taken mutably: the ceiling below is computed from the very map the
-        // write then lands on, so there is no second lookup that could miss. The borrow
-        // carries the record's own change timestamp beside that map, because a tag write
-        // changes the record.
+
+        // A connector whose deletion has already been accepted is a record this service only
+        // REPORTS until it disappears: a tag written onto it — or onto a challenge hanging off
+        // it, which goes with it — would be dropped with the record, so the write is refused
+        // for the status it is in instead of being answered as a success that is discarded.
+        // A status refusal is for a resource that EXISTS: an ARN this service holds no record
+        // under is the 404 below, so the owning connector's status is consulted only once the
+        // tag map is known to be there. The connector's own strings are cloned out, so the
+        // write below takes the store mutably with nothing borrowed from this lookup.
+        let under_teardown = if store.tags_of(&region, &resource_arn).is_some() {
+            store
+                .owning_connector(&region, &resource_arn)
+                .filter(|connector| connector.is_deleting())
+                .map(|connector| (connector.arn.clone(), connector.status.clone()))
+        } else {
+            None
+        };
+        if let Some((connector_arn, status)) = under_teardown {
+            return Err(invalid_state(&resource_arn, &connector_arn, &status));
+        }
+
+        // The write's own lookup, taken mutably: the ceiling below is computed from the very
+        // map the write then lands on, so there is no second lookup that could miss. The
+        // borrow carries the record's own change timestamp beside that map, because a tag
+        // write changes the record. It is also what answers a `ResourceArn` this service
+        // holds no record under.
         let Some(mut target) = store.taggable_mut(&region, &resource_arn) else {
             return Err(not_found(&resource_arn));
         };
@@ -256,6 +283,27 @@ fn validation(message: String) -> TagResourceError {
         // own doc), and `ValidationExceptionReason` carries no value for a malformed member
         // or for a tag a caller may not set.
         reason: None,
+    })
+    .into()
+}
+
+/// The resource exists, but the connector it hangs off has been accepted for teardown, so
+/// nothing may be written onto it — HTTP 400 `ValidationException` carrying the modelled
+/// `Reason` for a call a connector's status does not allow. The record is still READ through
+/// `ListTagsForResource` and `GetConnector`; only the write is refused.
+fn invalid_state(resource_arn: &str, connector_arn: &str, status: &str) -> TagResourceError {
+    let message = if resource_arn == connector_arn {
+        format!("Connector {connector_arn} has status {status}; its tags cannot be changed")
+    } else {
+        format!(
+            "{} {resource_arn} belongs to connector {connector_arn}, which has status {status}; \
+             its tags cannot be changed",
+            crate::state::resource_type_of(resource_arn)
+        )
+    };
+    TagResourceErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some(crate::state::REASON_INVALID_STATE.to_string()),
     })
     .into()
 }
