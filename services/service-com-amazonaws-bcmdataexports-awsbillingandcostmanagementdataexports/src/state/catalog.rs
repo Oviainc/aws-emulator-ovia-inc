@@ -371,6 +371,16 @@ impl TableSpec {
     /// detected" (smithy_query shape `ValidationExceptionField`) and the operations that
     /// reach this one carry a requested property map at different members of their
     /// different inputs.
+    ///
+    /// The requested entries are judged BY KEY IN SORTED ORDER, so a request carrying more
+    /// than one invalid entry is refused for the same one of them every time and two
+    /// identical requests get the identical refusal. `requested` is the caller's own
+    /// modelled map, a `HashMap` whose iteration order is neither the request's nor stable
+    /// between two maps carrying the same entries, so walking it directly would let the
+    /// offender a caller is told to act on — and which of the two sentences states it —
+    /// depend on nothing the caller sent. This is the rule the rest of this service already
+    /// applies to a refusal built from a caller-supplied collection (see
+    /// [`super::check_tag_keys_not_reserved`]).
     pub fn effective_properties(
         &self,
         requested: Option<&HashMap<String, String>>,
@@ -385,14 +395,19 @@ impl TableSpec {
                     .map(|default| (property.name.to_string(), default.to_string()))
             })
             .collect();
-        for (name, value) in requested.into_iter().flatten() {
+        let submitted: BTreeMap<&str, &str> = requested
+            .into_iter()
+            .flatten()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        for (name, value) in submitted {
             let property = self
                 .property(name)
                 .ok_or_else(|| unknown_table_property(field, self, name))?;
             if !property.accepts(value) {
                 return Err(invalid_table_property_value(field, property, value));
             }
-            effective.insert(name.clone(), value.clone());
+            effective.insert(name.to_string(), value.to_string());
         }
         Ok(effective)
     }

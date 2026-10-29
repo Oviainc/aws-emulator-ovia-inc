@@ -70,7 +70,12 @@ struct Row {
 /// The properties of `table` that publish a closed list of values, so a value outside the
 /// list is refused. A free-form property publishes the wildcard or no list at all
 /// (`TablePropertySpec::accepts`), and accepts anything.
-fn enumerated_properties(table: &'static TableSpec) -> Vec<&'static TablePropertySpec> {
+///
+/// `pub(crate)` so a suite that has to build an invalid value for a published property
+/// reads the closed lists out of the catalog the same way this one does.
+pub(crate) fn enumerated_properties(
+    table: &'static TableSpec,
+) -> Vec<&'static TablePropertySpec> {
     table
         .properties
         .iter()
