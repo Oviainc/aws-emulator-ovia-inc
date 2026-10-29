@@ -1074,6 +1074,15 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .filter(|record| !deregistration_started(&record.status))
     }
 
+    /// [`live_identity_provider`](Self::live_identity_provider) for a caller that WRITES the
+    /// registration it resolves: the same rule, by the same predicate, so a write cannot
+    /// reach a registration a read would not.
+    fn live_identity_provider_mut(&mut self, arn: &str) -> Option<&mut IdentityProviderRecord> {
+        self.identity_providers
+            .get_mut(arn)
+            .filter(|record| !deregistration_started(&record.status))
+    }
+
     /// The product user `arn` names, when it names a subscription this account can still
     /// act on: one whose end was accepted resolves for nothing, exactly as one that is
     /// gone, even though it is still reported while its teardown runs.
@@ -1934,6 +1943,56 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .ok_or(StateError::ProviderNotRegistered)?;
         self.live_identity_provider(arn)
             .ok_or(StateError::ProviderNotRegistered)
+    }
+
+    /// Fold an `UpdateSettings` payload onto the settings the registration `arn` holds AT
+    /// THIS MOMENT, store the result, and answer the summary of the record as the write
+    /// left it.
+    ///
+    /// The WRITE half of `UpdateIdentityProviderSettings`, which runs after that operation
+    /// has resolved the network its payload would store against the account's own Amazon
+    /// EC2 — a hop, so the lock the write takes is not the lock the read before it was
+    /// taken under, and the store can have moved in between. BOTH decisions a write makes
+    /// therefore happen here, under the one lock that writes:
+    ///
+    /// * the registration is resolved by this store's single liveness rule
+    ///   ([`live_identity_provider_mut`](Self::live_identity_provider_mut), the writing form
+    ///   of [`live_identity_provider`](Self::live_identity_provider)), so no update is
+    ///   applied to a registration whose deregistration was accepted while the resolution
+    ///   was in flight — a reference that stopped resolving is refused exactly as one that
+    ///   never resolved, which is what every operation acting on a registration does;
+    /// * the payload is folded onto the settings the record carries NOW rather than onto a
+    ///   snapshot read earlier ([`apply_update_settings`]), so an update accepted in between
+    ///   is something this one adds to instead of something it overwrites.
+    ///
+    /// The fold is of the PAYLOAD's own ids, which the resolution covered; what it folds
+    /// them onto is settings some accepted write already resolved, so the configuration
+    /// stored here is one the account's network carries.
+    ///
+    /// `Err(StateError::ProviderNotRegistered)` when `arn` names no live registration, and
+    /// the payload's own refusals when the fold against the current settings has no result
+    /// ([`apply_update_settings`]); nothing is stored in either case.
+    pub fn update_live_settings(
+        &mut self,
+        arn: &str,
+        add_subnets: &[String],
+        remove_subnets: &[String],
+        security_group_id: Option<&str>,
+    ) -> Result<IdentityProviderSummary, StateError> {
+        let record = self
+            .live_identity_provider_mut(arn)
+            .ok_or(StateError::ProviderNotRegistered)?;
+        // The fold reads the settings the record carries and yields the whole value to
+        // store, so the registration resolved above is the one written: there is no second
+        // lookup to disagree with it.
+        let updated = apply_update_settings(
+            &record.settings,
+            add_subnets,
+            remove_subnets,
+            security_group_id,
+        )?;
+        record.settings = updated;
+        Ok(identity_provider_summary(record))
     }
 
     /// The `ProductUserArn` of the subscription a request addresses by the members that

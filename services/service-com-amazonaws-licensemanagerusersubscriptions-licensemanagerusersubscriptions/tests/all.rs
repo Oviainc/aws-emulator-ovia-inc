@@ -63,6 +63,8 @@ mod registration_pair_resolution_is_shared;
 mod resource_resolution_refusals;
 #[path = "all/settings_network_resolution.rs"]
 mod settings_network_resolution;
+#[path = "all/settings_update_writes_at_write_time.rs"]
+mod settings_update_writes_at_write_time;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/subscription_product_names_the_subscription.rs"]
