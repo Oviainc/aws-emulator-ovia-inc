@@ -158,33 +158,158 @@ fn with_stated_length(mut resp: RtResponse) -> RtResponse {
     resp
 }
 
-/// The operation `GET /revocations` addresses, as the generated routing table keys
-/// it (the operation's own name).
-const GET_REVOCATION_STATUS: &str = "GetRevocationStatus";
-
-/// The method that route is bound to.
-const REVOCATIONS_METHOD: &str = "GET";
-
-/// Its path, as the single path segment it consists of. Compared the way the router
-/// compares it: `route_lookup` trims the path's leading and trailing `/` and splits
-/// the rest into segments, so `/revocations`, `/revocations/` and `//revocations//`
-/// are all that one segment and anything else is another route.
-const REVOCATIONS_PATH_SEGMENT: &str = "revocations";
-
-/// Whether `req` addresses the `GET /revocations` route, whatever query parameters
-/// it carries.
+/// Every operation of this service, each paired with the input schema that carries its
+/// `@httpQuery` bindings.
 ///
-/// Parsed with `http::Uri` rather than by hand, so an absolute-form URI, an
-/// origin-form one, and the userinfo/port/fragment variants all yield the same path
-/// the router reads. A URI that does not parse addresses no route.
-fn addresses_revocation_status(req: &aws_smithy_runtime_api::http::Request) -> bool {
-    if req.method() != REVOCATIONS_METHOD {
-        return false;
+/// Source: the operations this model binds (`smithy_query(query="digest",
+/// model_path="services/service-com-amazonaws-signer-wallabyservice/smithy-model/\
+/// com-amazonaws-signer-wallabyservice.json")`). Only the operation NAME — the key the
+/// generated routing table holds it under — is written out here: not a method, not a
+/// path, not one parameter name. The parameters come off that operation's own input
+/// schema ([`aws_smithy_schema::Schema::members`]) and the route itself stays the
+/// router's, so the model is the one source of what a route is and which parameters it
+/// binds.
+const OPERATION_INPUTS: &[(&str, &::aws_smithy_schema::Schema)] = &[
+    (
+        "AddProfilePermission",
+        crate::ops::types::ADD_PROFILE_PERMISSION_INPUT_SCHEMA,
+    ),
+    (
+        "CancelSigningProfile",
+        crate::ops::types::CANCEL_SIGNING_PROFILE_INPUT_SCHEMA,
+    ),
+    (
+        "DescribeSigningJob",
+        crate::ops::types::DESCRIBE_SIGNING_JOB_INPUT_SCHEMA,
+    ),
+    (
+        "GetRevocationStatus",
+        crate::ops::types::GET_REVOCATION_STATUS_INPUT_SCHEMA,
+    ),
+    (
+        "GetSigningPlatform",
+        crate::ops::types::GET_SIGNING_PLATFORM_INPUT_SCHEMA,
+    ),
+    (
+        "GetSigningProfile",
+        crate::ops::types::GET_SIGNING_PROFILE_INPUT_SCHEMA,
+    ),
+    (
+        "ListProfilePermissions",
+        crate::ops::types::LIST_PROFILE_PERMISSIONS_INPUT_SCHEMA,
+    ),
+    (
+        "ListSigningJobs",
+        crate::ops::types::LIST_SIGNING_JOBS_INPUT_SCHEMA,
+    ),
+    (
+        "ListSigningPlatforms",
+        crate::ops::types::LIST_SIGNING_PLATFORMS_INPUT_SCHEMA,
+    ),
+    (
+        "ListSigningProfiles",
+        crate::ops::types::LIST_SIGNING_PROFILES_INPUT_SCHEMA,
+    ),
+    (
+        "ListTagsForResource",
+        crate::ops::types::LIST_TAGS_FOR_RESOURCE_INPUT_SCHEMA,
+    ),
+    (
+        "PutSigningProfile",
+        crate::ops::types::PUT_SIGNING_PROFILE_INPUT_SCHEMA,
+    ),
+    (
+        "RemoveProfilePermission",
+        crate::ops::types::REMOVE_PROFILE_PERMISSION_INPUT_SCHEMA,
+    ),
+    (
+        "RevokeSignature",
+        crate::ops::types::REVOKE_SIGNATURE_INPUT_SCHEMA,
+    ),
+    (
+        "RevokeSigningProfile",
+        crate::ops::types::REVOKE_SIGNING_PROFILE_INPUT_SCHEMA,
+    ),
+    ("SignPayload", crate::ops::types::SIGN_PAYLOAD_INPUT_SCHEMA),
+    (
+        "StartSigningJob",
+        crate::ops::types::START_SIGNING_JOB_INPUT_SCHEMA,
+    ),
+    ("TagResource", crate::ops::types::TAG_RESOURCE_INPUT_SCHEMA),
+    (
+        "UntagResource",
+        crate::ops::types::UNTAG_RESOURCE_INPUT_SCHEMA,
+    ),
+];
+
+/// `req` with every `@httpQuery` parameter `input` binds that `req` does not already
+/// carry ADDED to its query string — or `None` when it carries them all, so there is
+/// nothing to add, and when its target cannot be read as a URI.
+///
+/// The added parameters carry no value, because the router's required-binding check asks
+/// only whether the parameter's NAME occurs on the query string
+/// (`required_binding_score`, `vendor/smithy-schema-server/src/rest_xml.rs`, which reads
+/// raw `key[=value]` pairs and compares names): a bare name is exactly "supplied" to it.
+/// Everything else about the request — its method, its path, its headers — is carried
+/// over unchanged, so the route this answers for is the route the request addressed.
+///
+/// The result is a PROBE, asked of the router and then dropped: it is never deserialized
+/// and never served, so the values the added names do not carry are never read. The
+/// request the operation is then run against is the caller's own, which still leaves its
+/// required parameter out — and is refused for exactly that.
+///
+/// Parsed with `http::Uri` rather than by hand, so an absolute-form target, an
+/// origin-form one, and the userinfo/port/fragment variants all yield the path and query
+/// the router itself reads.
+fn with_query_parameters_supplied(
+    req: &RtRequest,
+    input: &::aws_smithy_schema::Schema,
+) -> Option<RtRequest> {
+    let uri = req.uri().parse::<http::Uri>().ok()?;
+    let path_and_query = uri.path_and_query()?;
+    let carried = path_and_query.query().unwrap_or_default();
+    // Split the way the router splits it: raw pairs, the name being everything before
+    // the first `=`, so the two cannot disagree about what a request supplied.
+    let supplied: Vec<&str> = carried
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| pair.split_once('=').map_or(pair, |(name, _)| name))
+        .collect();
+
+    let mut query = carried.to_string();
+    let mut added = false;
+    for member in input.members() {
+        let Some(parameter) = member.http_query().map(|binding| binding.value()) else {
+            continue;
+        };
+        if supplied.contains(&parameter) {
+            continue;
+        }
+        if !query.is_empty() {
+            query.push('&');
+        }
+        query.push_str(parameter);
+        added = true;
     }
-    let Ok(uri) = req.uri().parse::<http::Uri>() else {
-        return false;
-    };
-    uri.path().trim_matches('/') == REVOCATIONS_PATH_SEGMENT
+    if !added {
+        return None;
+    }
+
+    let mut probe = RtRequest::new(::aws_smithy_types::body::SdkBody::empty());
+    probe
+        .set_uri(format!("{}?{query}", path_and_query.path()).as_str())
+        .ok()?;
+    probe.set_method(req.method()).ok()?;
+    for (name, value) in req.headers().iter() {
+        // `append`, not `insert`: a repeated or multi-valued header keeps every value, so
+        // a route discriminated by a header reads the same on the probe as on `req`. The
+        // append is FALLIBLE: a header the HTTP layer cannot represent is dropped rather
+        // than turned into a panic on a request path.
+        let _ = probe
+            .headers_mut()
+            .try_append(name.to_string(), value.to_string());
+    }
+    Some(probe)
 }
 
 /// The error code every refusal of a request's own values carries on this
@@ -295,6 +420,40 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             empty_answers,
         }
     }
+
+    /// The operation a request that named NO modelled operation nevertheless ADDRESSED,
+    /// when the only thing between it and that operation is a `@required` query
+    /// parameter it left out — or `None` when it addressed no route of this service.
+    ///
+    /// The REST router matches a route only for a request carrying every `@required`
+    /// header/query binding the operation declares, because that is how REST services
+    /// tell apart operations overloaded on ONE method + URI template. That
+    /// discrimination picks BETWEEN operations; it cannot un-name the operation a route
+    /// has. So a request that leaves such a parameter out resolves to NO operation, and
+    /// the protocol default for that is 501 `NotImplemented` — which says nobody
+    /// implemented the operation, when what actually happened is that the request left a
+    /// required parameter out.
+    ///
+    /// Naming the operation here hands such a request to the operation it addressed, so
+    /// the centralized walk's own boundary validator refuses it with the modelled 400
+    /// naming each absent member.
+    ///
+    /// Which route a request addressed is answered by the ROUTER rather than by matching
+    /// paths here: each candidate is asked of `routing_key` with that candidate's own
+    /// query parameters supplied ([`with_query_parameters_supplied`]), and a candidate
+    /// counts only when the router then resolves the candidate itself — so the method,
+    /// the path labels and the route precedence are all the router's own, and a request
+    /// addressing nothing this service routes keeps the framework's answer.
+    fn operation_addressed_without_a_required_parameter(
+        &self,
+        req: &RtRequest,
+    ) -> Option<&'static str> {
+        OPERATION_INPUTS.iter().find_map(|(operation, input)| {
+            let probe = with_query_parameters_supplied(req, input)?;
+            let resolved = self.entry.protocol().routing_key(&probe).ok()?;
+            (resolved == *operation).then_some(*operation)
+        })
+    }
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -334,31 +493,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // `GetRevocationStatus` binds `GET /revocations` with ALL FIVE of its input
-        // members `@required` + `@httpQuery`
-        // (`smithy_query(query="operation",operation="GetRevocationStatus")`), so the
-        // REST router's required-binding check matches that route only for a request
-        // that carries every one of those query parameters. A request leaving one out
-        // resolves to NO operation, and the protocol default for that is 501
-        // `NotImplemented` — which says nobody implemented the operation, when what
-        // actually happened is that the request left a required parameter out.
-        //
-        // Naming the operation here hands such a request to the operation it
-        // addressed, so the centralized walk's own boundary validator refuses it with
-        // the modelled 400 naming each absent member. A request that carries them all
-        // resolves to this same operation through the routing table, so nothing else
-        // changes.
-        if addresses_revocation_status(req) {
-            return self.entry.routing_table().get(GET_REVOCATION_STATUS);
+        match self.entry.protocol().routing_key(req) {
+            // NOT a re-route: the key is the one the generated table's own protocol
+            // resolves, and the operation it names is the one served — wrapped in
+            // `StatedEmptyLength` so an answer with no body states its length. A key
+            // no wrapped operation holds resolves to `None` here, so every other
+            // request is served by the generated table unchanged.
+            Ok(key) => self.empty_answers.get(key),
+            // The request named no operation. One class of such request addresses an
+            // operation this service serves: see
+            // [`EmulatedService::operation_addressed_without_a_required_parameter`].
+            Err(_) => {
+                let operation = self.operation_addressed_without_a_required_parameter(req)?;
+                // The generated table, not `empty_answers`: the request this names an
+                // operation for leaves a `@required` member out, so the walk refuses it
+                // before the handler and the answer carries an error document, whose
+                // length its own renderer states.
+                self.entry.routing_table().get(operation)
+            }
         }
-
-        // NOT a re-route: the key is the one the generated table's own protocol
-        // resolves, and the operation it names is the one served — wrapped in
-        // `StatedEmptyLength` so an answer with no body states its length. A key
-        // no wrapped operation holds resolves to `None` here, so every other
-        // request is served by the generated table unchanged.
-        let key = self.entry.protocol().routing_key(req).ok()?;
-        self.empty_answers.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -417,8 +570,97 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 mod tests {
     use super::{
         is_query_bound_list_member, missing_list_member_constraint, missing_list_member_refusal,
-        Violation, ViolationKind, VALIDATION_EXCEPTION_CODE,
+        with_query_parameters_supplied, RtRequest, Violation, ViolationKind,
+        VALIDATION_EXCEPTION_CODE,
     };
+
+    /// One request, by method and target, with no body — enough for a route lookup.
+    fn request(method: &str, target: &str) -> RtRequest {
+        let mut req = RtRequest::new(::aws_smithy_types::body::SdkBody::empty());
+        req.set_uri(target).expect("the target is well formed");
+        req.set_method(method).expect("the method is well formed");
+        req
+    }
+
+    /// The probe supplies exactly the query parameters the request left out, as bare
+    /// names, keeps the ones it carried, and is `None` when nothing is left to supply.
+    ///
+    /// The rows span what the rule generalises over: a route binding ONE query parameter
+    /// and a route binding five, the parameter absent, present, present with no value,
+    /// and present beside a parameter the model does not bind.
+    #[test]
+    fn a_probe_supplies_only_the_parameters_the_request_left_out() {
+        let removal = crate::ops::types::REMOVE_PROFILE_PERMISSION_INPUT_SCHEMA;
+        let revocation = crate::ops::types::GET_REVOCATION_STATUS_INPUT_SCHEMA;
+        let cases: &[(&str, &str, &str, &::aws_smithy_schema::Schema, Option<&str>)] = &[
+            (
+                "the one required parameter absent",
+                "DELETE",
+                "/signing-profiles/P/permissions/s1",
+                removal,
+                Some("/signing-profiles/P/permissions/s1?revisionId"),
+            ),
+            (
+                "the one required parameter present",
+                "DELETE",
+                "/signing-profiles/P/permissions/s1?revisionId=abcdefghij",
+                removal,
+                None,
+            ),
+            (
+                "the one required parameter present carrying no value",
+                "DELETE",
+                "/signing-profiles/P/permissions/s1?revisionId=",
+                removal,
+                None,
+            ),
+            (
+                "another parameter present, the required one absent",
+                "DELETE",
+                "/signing-profiles/P/permissions/s1?nextToken=x",
+                removal,
+                Some("/signing-profiles/P/permissions/s1?nextToken=x&revisionId"),
+            ),
+            (
+                "a route binding five parameters, none of them supplied",
+                "GET",
+                "/revocations",
+                revocation,
+                Some(
+                    "/revocations?signatureTimestamp&platformId&profileVersionArn&jobArn\
+                     &certificateHashes",
+                ),
+            ),
+            (
+                "a route binding five parameters, one of them supplied",
+                "GET",
+                "/revocations?platformId=AWSLambda-SHA384-ECDSA",
+                revocation,
+                Some(
+                    "/revocations?platformId=AWSLambda-SHA384-ECDSA&signatureTimestamp\
+                     &profileVersionArn&jobArn&certificateHashes",
+                ),
+            ),
+        ];
+
+        for (case, method, target, input, expected) in cases {
+            let probe = with_query_parameters_supplied(&request(method, target), input);
+            let actual = probe.as_ref().map(|probe| probe.uri().to_string());
+            assert_eq!(
+                actual.as_deref(),
+                *expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+            if let Some(probe) = probe {
+                assert_eq!(
+                    probe.method(),
+                    *method,
+                    "case {case:?}: expected the method carried over, got {:?}",
+                    probe.method()
+                );
+            }
+        }
+    }
 
     /// One violation of `kind` against `path`, carrying `value`.
     fn violation(path: &str, kind: ViolationKind, value: Option<&str>) -> Violation {
