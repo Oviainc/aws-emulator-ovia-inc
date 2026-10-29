@@ -59,12 +59,13 @@ use crate::ops::types::{
 pub const COMPONENT_PAGE_LIMIT: i32 = 100;
 
 /// How many records one export page carries, for every export this service
-/// serves (`ExportComponents`, `ExportThemes`).
+/// serves (`ExportComponents`, `ExportForms`, `ExportThemes`).
 ///
 /// An export request models no page-size member (only `nextToken`), so the
 /// length of an export page is the service's own choice rather than something a
 /// caller asks for. This emulator serves the same largest page its component
-/// list does, so a caller walking either operation walks pages of one bound.
+/// list does, so a caller walking any of those operations walks pages of one
+/// bound.
 pub const EXPORT_PAGE_LIMIT: usize = COMPONENT_PAGE_LIMIT as usize;
 
 /// How many components the store holds before `CreateComponent` refuses with the
@@ -397,6 +398,13 @@ pub struct StoredForm {
     pub tags: Option<HashMap<String, String>>,
     pub cta: Option<FormCTA>,
     pub label_decorator: Option<String>,
+    /// The position this form holds in its environment's creation order.
+    ///
+    /// It is what an `ExportForms` page token indexes into: drawn from the same
+    /// counter [`StoredComponent::cursor`] is drawn from, it never changes and
+    /// never repeats, so a page resumes at the same place whether or not forms
+    /// were created or deleted since the previous page.
+    pub cursor: u64,
 }
 
 impl StoredForm {
@@ -1066,7 +1074,7 @@ pub fn carries_reserved_name<V>(map: &HashMap<String, V>) -> bool {
     map.contains_key(RESERVED_PROPERTY_NAME)
 }
 
-/// The `nextToken` a page of `key`'s components that ends before `cursor`
+/// The `nextToken` a page of `key`'s entities that ends before `cursor`
 /// reports.
 ///
 /// The token carries the app environment it was issued for as well as the
@@ -1083,7 +1091,7 @@ pub fn page_token(key: &EnvironmentKey, cursor: u64) -> String {
 }
 
 /// The cursor `token` resumes `key`'s list at, or `None` when it is not a token
-/// `ListComponents` issued for that app environment.
+/// this service issued for that app environment.
 ///
 /// A cursor beyond `issued` — the highest cursor the service has handed out — is
 /// refused too, so a well-formed token nobody was ever given names no page.

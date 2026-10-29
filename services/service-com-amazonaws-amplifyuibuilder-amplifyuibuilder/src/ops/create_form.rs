@@ -192,6 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_form_id(&key);
+        // The position in the service's one creation order an `ExportForms` page
+        // token indexes into, drawn from the counter a component's cursor also
+        // comes from.
+        let cursor = store.next_cursor();
         let form = crate::state::StoredForm {
             app_id: input.app_id,
             environment_name: input.environment_name,
@@ -206,6 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: data.tags,
             cta: data.cta,
             label_decorator: data.label_decorator,
+            cursor,
         };
 
         let entity = form.to_form();

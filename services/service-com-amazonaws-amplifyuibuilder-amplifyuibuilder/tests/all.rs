@@ -26,6 +26,9 @@ mod component_wire_fidelity;
 #[path = "all/export_components.rs"]
 mod export_components;
 
+#[path = "all/export_forms.rs"]
+mod export_forms;
+
 #[path = "all/export_themes.rs"]
 mod export_themes;
 
