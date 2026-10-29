@@ -14,97 +14,21 @@
 //! behind it is a `ResourceNotFoundException`.
 //!
 //! The role is resolved against the account's IAM records, the very records
-//! `CreateRole` wrote in the same engine, so the rows run over every form of the
-//! question: the trust forms IAM admits (the action and the principal as strings
-//! or lists, the wildcards, the casing), the forms that withhold the grant
-//! (another principal, an explicit deny, another action, a statement list
-//! granting nothing) and the case that is no evidence either way — an ARN the
-//! IAM records hold no role for, which is accepted.
+//! `CreateRole` wrote in the same engine, and the rows are the shared table of
+//! trust forms every suite about this rule drives
+//! (`harness::trust_policy_rows`), because ONE rule decides every member of
+//! this service that names a role (`tests/all/workspace_role_trust.rs` drives
+//! the same table through the workspace's `role`).
 
 use serde_json::json;
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::ops::types::SYNC_JOB_STATE_VALUES;
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
-    sync_job_not_found_message, SERVICE_PRINCIPAL, SYNC_SOURCE_SITEWISE,
+    sync_job_not_found_message, SERVICE_PRINCIPAL, SYNC_ROLE_MEMBER, SYNC_SOURCE_SITEWISE,
 };
 
-use crate::harness::Emulator;
-
-/// A trust policy with one statement, written as a client would send it.
-fn policy(effect: &str, action: &str, service: &str) -> String {
-    format!(
-        "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"{effect}\",\
-         \"Principal\":{{\"Service\":{service}}},\"Action\":{action}}}]}}"
-    )
-}
-
-/// The trust documents the rule generalises over, and whether a role carrying
-/// one may be used: `(case, document, admitted)`.
-///
-/// `None` for the document is the row whose ARN names no role of this account at
-/// all — not evidence of a missing trust, so the create goes ahead.
-fn rows() -> Vec<(&'static str, Option<String>, bool)> {
-    let principal = format!("\"{SERVICE_PRINCIPAL}\"");
-    vec![
-        (
-            "the action and the principal as strings",
-            Some(policy("Allow", "\"sts:AssumeRole\"", &principal)),
-            true,
-        ),
-        (
-            "both as lists",
-            Some(policy(
-                "Allow",
-                "[\"sts:TagSession\",\"sts:AssumeRole\"]",
-                &format!("[\"ec2.amazonaws.com\",\"{SERVICE_PRINCIPAL}\"]"),
-            )),
-            true,
-        ),
-        (
-            "a service wildcard in the action",
-            Some(policy("Allow", "\"sts:*\"", &principal)),
-            true,
-        ),
-        (
-            "every action",
-            Some(policy("Allow", "\"*\"", &principal)),
-            true,
-        ),
-        (
-            "the principal in another casing",
-            Some(policy(
-                "Allow",
-                "\"STS:ASSUMEROLE\"",
-                "\"IoTTwinMaker.amazonaws.com\"",
-            )),
-            true,
-        ),
-        (
-            "another service's principal only",
-            Some(policy("Allow", "\"sts:AssumeRole\"", "\"ec2.amazonaws.com\"")),
-            false,
-        ),
-        (
-            "an explicit deny",
-            Some(policy("Deny", "\"sts:AssumeRole\"", &principal)),
-            false,
-        ),
-        (
-            "an action that is not assuming the role",
-            Some(policy("Allow", "\"s3:GetObject\"", &principal)),
-            false,
-        ),
-        (
-            "a statement list granting nothing",
-            Some("{\"Version\":\"2012-10-17\",\"Statement\":[]}".to_string()),
-            false,
-        ),
-        // There is no row for a trust document that is not a policy at all: IAM
-        // itself refuses `CreateRole` for one ("AssumeRolePolicyDocument must be
-        // a JSON object carrying a Statement element"), so no role of this
-        // account can carry such a document.
-        ("a role this account does not hold", None, true),
-    ]
-}
+use crate::harness::{
+    admitting_trust_policy, trust_policy, trust_policy_rows, trusted_role_arn, Emulator,
+};
 
 /// RULE: a create whose `syncRole` names a role of this account that cannot be
 /// assumed by this service is refused 400 `ValidationException` and stores
@@ -114,7 +38,7 @@ fn rows() -> Vec<(&'static str, Option<String>, bool)> {
 async fn a_sync_role_this_service_cannot_assume_is_refused_and_persists_nothing() {
     let emulator = Emulator::with_iam();
 
-    for (index, (case, document, admitted)) in rows().into_iter().enumerate() {
+    for (index, (case, document, admitted)) in trust_policy_rows().into_iter().enumerate() {
         // One workspace per row: a sync source identifies at most one job inside
         // a workspace, and the recorded refusal is about the create, so each row
         // needs a workspace of its own to create into.
@@ -124,16 +48,12 @@ async fn a_sync_role_this_service_cannot_assume_is_refused_and_persists_nothing(
             200,
             "case {case:?}: the workspace the row creates into must exist"
         );
-        let role_arn = match &document {
-            Some(document) => {
-                emulator
-                    .create_iam_role(&format!("twinmaker-sync-{index}"), document)
-                    .await
-            }
-            // The modelled `RoleArn` form, naming a role the IAM store holds no
-            // record of.
-            None => format!("arn:aws:iam::000000000000:role/unknown-to-iam-{index}"),
-        };
+        let role_arn = trusted_role_arn(
+            &emulator,
+            &format!("twinmaker-sync-{index}"),
+            document.as_ref(),
+        )
+        .await;
 
         let created = emulator
             .create_sync_job(
@@ -172,12 +92,18 @@ async fn a_sync_role_this_service_cannot_assume_is_refused_and_persists_nothing(
                 "case {case:?}: expected a 400 ValidationException, got {created:?}"
             );
             let message = created.member("message").as_str().unwrap_or_default();
-            for expected in ["syncRole", role_arn.as_str(), SERVICE_PRINCIPAL] {
-                assert!(
-                    message.contains(expected),
-                    "case {case:?}: the refusal must name {expected:?}, got {message:?}"
-                );
-            }
+            // The MEMBER the caller has to fix opens the message — asserted as a
+            // prefix rather than by `contains`, since "role" is a substring of
+            // every role ARN the message quotes.
+            assert!(
+                message.starts_with(&format!("{SYNC_ROLE_MEMBER} {role_arn}")),
+                "case {case:?}: the refusal must open by naming the member and the role, got \
+                 {message:?}"
+            );
+            assert!(
+                message.contains(SERVICE_PRINCIPAL),
+                "case {case:?}: the refusal must name {SERVICE_PRINCIPAL:?}, got {message:?}"
+            );
             // Nothing was persisted: the read behind the refused create is the
             // service's own not-found refusal for a sync job, and the workspace
             // reports no linked service either.
@@ -210,14 +136,11 @@ async fn the_verdict_follows_the_stored_trust_policy_not_the_arn() {
     let refused_role = emulator
         .create_iam_role(
             "twinmaker-ec2-only",
-            &policy("Allow", "\"sts:AssumeRole\"", "\"ec2.amazonaws.com\""),
+            &trust_policy("Allow", "\"sts:AssumeRole\"", "\"ec2.amazonaws.com\""),
         )
         .await;
     let accepted_role = emulator
-        .create_iam_role(
-            "twinmaker-sync",
-            &policy("Allow", "\"sts:AssumeRole\"", &format!("\"{SERVICE_PRINCIPAL}\"")),
-        )
+        .create_iam_role("twinmaker-sync", &admitting_trust_policy())
         .await;
     assert_eq!(
         emulator.create_workspace("syncTrustWs").await.status,

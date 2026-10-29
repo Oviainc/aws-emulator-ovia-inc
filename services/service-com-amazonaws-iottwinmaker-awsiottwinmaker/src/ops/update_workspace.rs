@@ -13,6 +13,15 @@
 //! ([`crate::state::workspace_does_not_exist_message`]) rather than the one a
 //! look-up path reports. The update is SYNCHRONOUS: the next read sees it.
 //!
+//! The `role` a patch names is the workspace's EXECUTION role, the same kind of
+//! value the create accepts, so it is decided by the same rule: a role of this
+//! account whose trust policy withholds `sts:AssumeRole` from
+//! [`crate::state::SERVICE_PRINCIPAL`] is refused with `ValidationException`
+//! (HTTP 400) and the workspace is left as it stood
+//! ([`crate::state::assume_role_refusal`]). The role is validated BEFORE the
+//! workspace is looked up, as it is on the sync-job create, so a request
+//! carrying such a role is refused whether or not the workspace exists.
+//!
 //! Authorization is not emulated, so the modelled `AccessDeniedException` is
 //! never returned, and nothing here can exceed a quota the create did not.
 //!
@@ -164,6 +173,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workspace_id = %input.workspace_id,
             "serving a request"
         );
+        // The role a patch names is the execution role the service acts AS, so
+        // it is checked against the account's IAM records before the workspace
+        // is touched: a role this service could not assume is refused and the
+        // stored workspace keeps the role it had. The IAM guard is taken and
+        // released BEFORE this service's, so no two orders of the same two locks
+        // exist.
+        if let Some(role) = input.role.as_deref() {
+            let iam = crate::state::iam_state(&*self.engine).ok_or_else(|| {
+                UpdateWorkspaceErrorModeled::InternalServerException(InternalServerException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                })
+            })?;
+            let role_refusal = crate::state::assume_role_refusal(
+                crate::state::WORKSPACE_ROLE_MEMBER,
+                role,
+                &iam.lock(),
+            );
+            if let Some(message) = role_refusal {
+                return Err(UpdateWorkspaceErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
         // The Region this request is signed for picks the store it acts on: a
         // workspace created through another Region's endpoint is not in it, so
         // this call cannot update it.

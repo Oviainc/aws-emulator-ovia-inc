@@ -188,6 +188,9 @@ mod workspace_entity_lifecycle;
 #[path = "all/workspace_listing.rs"]
 mod workspace_listing;
 
+#[path = "all/workspace_role_trust.rs"]
+mod workspace_role_trust;
+
 #[path = "all/workspace_update.rs"]
 mod workspace_update;
 

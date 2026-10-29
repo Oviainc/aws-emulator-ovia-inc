@@ -18,11 +18,20 @@
 //! `GetComponentType`, `ListComponentTypes` and every `extendsFrom` or
 //! `componentTypeId` reference — from the instant this call returns.
 //!
-//! Authorization is NOT emulated here (nor anywhere in this service), so the
-//! modelled `AccessDeniedException` is never returned: the emulator verifies
-//! request signatures centrally and carries no IAM policy or `iam:PassRole`
-//! evaluation for the `role` this operation accepts. A 200 from here is not an
-//! authorization decision.
+//! The `role` this call stores is the workspace's EXECUTION role, so the service
+//! acts as it: a request naming a role of this account whose trust policy
+//! withholds `sts:AssumeRole` from [`crate::state::SERVICE_PRINCIPAL`] is
+//! refused with `ValidationException` (HTTP 400) before the workspace is
+//! stored, by the one rule every member of this service naming such a role is
+//! decided by ([`crate::state::assume_role_refusal`], which `CreateSyncJob`
+//! applies to its `syncRole` and `UpdateWorkspace` to the same `role`).
+//!
+//! That is a check on whether the service CAN assume the role, not on whether
+//! the caller may pass it: authorization is NOT emulated here (nor anywhere in
+//! this service), so the modelled `AccessDeniedException` is never returned —
+//! the emulator verifies request signatures centrally and carries no IAM policy
+//! or `iam:PassRole` evaluation for the `role` this operation accepts. A 200
+//! from here is not an authorization decision.
 //!
 //! ## Shape of an operation
 //!
@@ -191,6 +200,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(message),
             })
             .into());
+        }
+
+        // A workspace's `role` is the execution role the service acts AS to
+        // reach what the workspace holds, so a role whose trust policy does not
+        // let this service assume it can serve no part of the workspace: the
+        // request is refused SYNCHRONOUSLY, before anything is stored, by the
+        // same rule the sync-job create applies to its own role member. The IAM
+        // store is a different store in the same engine, and no IAM handler
+        // reads this one; its guard is taken and released BEFORE this service's,
+        // so no two orders of the same two locks exist.
+        if let Some(role) = input.role.as_deref() {
+            let iam = crate::state::iam_state(&*self.engine).ok_or_else(|| {
+                CreateWorkspaceErrorModeled::InternalServerException(InternalServerException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                })
+            })?;
+            let role_refusal = crate::state::assume_role_refusal(
+                crate::state::WORKSPACE_ROLE_MEMBER,
+                role,
+                &iam.lock(),
+            );
+            if let Some(message) = role_refusal {
+                return Err(CreateWorkspaceErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
         }
 
         // The Region this request is signed for picks the store the workspace

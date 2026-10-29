@@ -14,7 +14,7 @@ use std::time::SystemTime;
 use serde_json::{json, Value};
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
     Entity, ResourceRef, SyncJob, DEFAULT_REGION, MAX_ENTITIES_PER_WORKSPACE,
-    ROOT_PARENT_ENTITY_ID, STATE_ACTIVE,
+    ROOT_PARENT_ENTITY_ID, SERVICE_PRINCIPAL, STATE_ACTIVE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -876,6 +876,121 @@ pub(crate) fn metadata_transfer_job_arn(metadata_transfer_job_id: &str) -> Strin
     format!(
         "arn:aws:iottwinmaker:{REGION}:{ACCOUNT}:metadata-transfer-job/{metadata_transfer_job_id}"
     )
+}
+
+/// A trust policy with one statement, written as a client would send it.
+pub(crate) fn trust_policy(effect: &str, action: &str, service: &str) -> String {
+    format!(
+        "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"{effect}\",\
+         \"Principal\":{{\"Service\":{service}}},\"Action\":{action}}}]}}"
+    )
+}
+
+/// A trust policy granting THIS service `sts:AssumeRole` in the plainest form,
+/// which is the document a role every rule below admits carries.
+pub(crate) fn admitting_trust_policy() -> String {
+    trust_policy(
+        "Allow",
+        "\"sts:AssumeRole\"",
+        &format!("\"{SERVICE_PRINCIPAL}\""),
+    )
+}
+
+/// The trust documents the one assume-role rule generalises over, and whether a
+/// role carrying one may be used: `(case, document, admitted)`.
+///
+/// ONE table for every suite about that rule — `tests/all/sync_job_role_trust.rs`
+/// for a sync job's role member, `tests/all/workspace_role_trust.rs` for a
+/// workspace's — because one rule decides every member of this service that
+/// names a role (`state::assume_role_refusal`), so two tables could drift apart
+/// and stop testing the same forms.
+///
+/// The rows run over every form of the question: the trust forms IAM admits (the
+/// action and the principal as strings or as lists, the wildcards, the casing),
+/// the forms that withhold the grant (another principal, an explicit deny,
+/// another action, a statement list granting nothing) and the case that is no
+/// evidence either way — `None` for the document, the row whose ARN names no
+/// role of this account at all, which is admitted.
+///
+/// There is no row for a trust document that is not a policy at all: IAM itself
+/// refuses `CreateRole` for one ("AssumeRolePolicyDocument must be a JSON object
+/// carrying a Statement element"), so no role of this account can carry such a
+/// document.
+pub(crate) fn trust_policy_rows() -> Vec<(&'static str, Option<String>, bool)> {
+    let principal = format!("\"{SERVICE_PRINCIPAL}\"");
+    vec![
+        (
+            "the action and the principal as strings",
+            Some(admitting_trust_policy()),
+            true,
+        ),
+        (
+            "both as lists",
+            Some(trust_policy(
+                "Allow",
+                "[\"sts:TagSession\",\"sts:AssumeRole\"]",
+                &format!("[\"ec2.amazonaws.com\",\"{SERVICE_PRINCIPAL}\"]"),
+            )),
+            true,
+        ),
+        (
+            "a service wildcard in the action",
+            Some(trust_policy("Allow", "\"sts:*\"", &principal)),
+            true,
+        ),
+        (
+            "every action",
+            Some(trust_policy("Allow", "\"*\"", &principal)),
+            true,
+        ),
+        (
+            "the principal in another casing",
+            Some(trust_policy(
+                "Allow",
+                "\"STS:ASSUMEROLE\"",
+                "\"IoTTwinMaker.amazonaws.com\"",
+            )),
+            true,
+        ),
+        (
+            "another service's principal only",
+            Some(trust_policy(
+                "Allow",
+                "\"sts:AssumeRole\"",
+                "\"ec2.amazonaws.com\"",
+            )),
+            false,
+        ),
+        (
+            "an explicit deny",
+            Some(trust_policy("Deny", "\"sts:AssumeRole\"", &principal)),
+            false,
+        ),
+        (
+            "an action that is not assuming the role",
+            Some(trust_policy("Allow", "\"s3:GetObject\"", &principal)),
+            false,
+        ),
+        (
+            "a statement list granting nothing",
+            Some("{\"Version\":\"2012-10-17\",\"Statement\":[]}".to_string()),
+            false,
+        ),
+        ("a role this account does not hold", None, true),
+    ]
+}
+
+/// The ARN of a role named `name` carrying `document`, or — when the row names
+/// no document — a modelled `RoleArn` the IAM records hold no role for.
+pub(crate) async fn trusted_role_arn(
+    emulator: &Emulator,
+    name: &str,
+    document: Option<&String>,
+) -> String {
+    match document {
+        Some(document) => emulator.create_iam_role(name, document).await,
+        None => format!("arn:aws:iam::{ACCOUNT}:role/unknown-to-iam-{name}"),
+    }
 }
 
 /// Percent-encode a value for use as a query-parameter value, the way an SDK

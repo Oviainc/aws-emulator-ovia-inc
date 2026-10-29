@@ -680,13 +680,93 @@ pub const SYNC_JOB_ERROR_MESSAGE: &str =
 ///
 /// A `syncRole` "is used by the SyncJob to read from the syncSource, and create,
 /// update, or delete the corresponding resources"
-/// (`smithy_query(query="operation",operation="CreateSyncJob")`), so the service
-/// itself assumes that role — which IAM only lets it do when the role's trust
-/// policy grants this principal `sts:AssumeRole`. The rule that reads a role's
-/// trust policy against this principal lives with the operation that owns the
-/// only member naming such a role
-/// (`crate::ops::create_sync_job::assume_role_refusal`).
+/// (`smithy_query(query="operation",operation="CreateSyncJob")`), and a
+/// workspace's `role` is "the ARN of the execution role associated with the
+/// workspace"
+/// (`smithy_query(query="doc",shape="CreateWorkspaceRequest",member="role")`),
+/// so the service itself assumes each of them — which IAM only lets it do when
+/// the role's trust policy grants this principal `sts:AssumeRole`. The rule that
+/// reads a role's trust policy against this principal is [`assume_role_refusal`],
+/// shared by every operation that accepts such a role.
 pub const SERVICE_PRINCIPAL: &str = "iottwinmaker.amazonaws.com";
+
+/// The IAM store a caller-supplied role is resolved against.
+///
+/// It is the IAM service's OWN state struct, reached through the SAME shared
+/// engine this service's store lives in, so the roles read here are the very
+/// records `CreateRole` wrote rather than a second copy of them.
+pub type IamState =
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::ComAmazonawsIamAwsidentitymanagementv20100508State;
+
+/// The IAM store in the SAME shared engine, which is where the account's roles
+/// live. This is the IAM service's OWN accessor, called rather than copied;
+/// `None` has the same meaning as for [`service_state`]: the engine carries no
+/// such store, which a handler reports as a server fault.
+pub fn iam_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<IamState>> {
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)
+}
+
+/// The member a workspace's execution role travels under, on the create and on
+/// the update alike (`CreateWorkspaceRequest$role`,
+/// `UpdateWorkspaceRequest$role`, both `RoleArn`).
+pub const WORKSPACE_ROLE_MEMBER: &str = "role";
+
+/// The member a sync job's role travels under
+/// (`CreateSyncJobRequest$syncRole`, also `RoleArn`).
+pub const SYNC_ROLE_MEMBER: &str = "syncRole";
+
+/// `None` when this emulator has no reason to think the service could not act as
+/// the role `role_arn` that `member` names; otherwise the message its refusal
+/// carries.
+///
+/// Where a request names a role THIS service has to act as — a workspace's
+/// execution role ([`WORKSPACE_ROLE_MEMBER`]) or a sync job's
+/// ([`SYNC_ROLE_MEMBER`]) — the role is resolved against the account's IAM
+/// records before anything is persisted, and a role whose trust policy withholds
+/// `sts:AssumeRole` from [`SERVICE_PRINCIPAL`] is refused synchronously rather
+/// than stored and left to fail later. ONE function for every such member: the
+/// rule is about the role, not about the operation that named it, so `member` is
+/// the only thing that differs between its callers — and it is what the message
+/// names, so the caller knows which value to fix.
+///
+/// NOTHING is parsed here. The role is found by COMPARING the stored ARN string
+/// with the one the request carried — no splitting, no indexing, no arithmetic —
+/// and the trust document is read by the ONE shared reader every service that
+/// resolves a caller-supplied role uses
+/// (`service_common::iam_trust_policy::admits_service_principal`, which is total
+/// over arbitrary text: it answers `None` for anything it cannot read as a
+/// policy), so two services asked about the same document cannot answer
+/// differently and no input can panic. Both reads are O(the account's roles)
+/// over records only an IAM call can create.
+///
+/// An ARN the IAM store holds no role for is NOT evidence of a missing trust
+/// (the role may belong to another account, or to a client that never told this
+/// emulator about it), so such a request goes ahead; nor is a document this
+/// emulator cannot read as a policy.
+///
+/// That last part is why this reads the IAM store directly rather than calling
+/// `service_common::iam_role::role_is_unassumable`, which answers the same
+/// question for the services that refuse a role IAM reports ABSENT: this service
+/// accepts such a role — it has no record saying the role is unusable — so the
+/// two readings answer differently where IAM holds no role, and only the trust
+/// half of the question is shared (the one reader
+/// `service_common::iam_trust_policy::admits_service_principal`).
+pub fn assume_role_refusal(member: &str, role_arn: &str, iam: &IamState) -> Option<String> {
+    let role = iam.roles.values().find(|role| role.arn == role_arn)?;
+    let document = role.assume_role_policy_document.as_deref()?;
+    match ::service_common::iam_trust_policy::admits_service_principal(document, SERVICE_PRINCIPAL) {
+        // A document this emulator cannot read as a policy is no evidence either
+        // way, and one that grants the principal the action is the grant itself.
+        None | Some(true) => None,
+        Some(false) => Some(format!(
+            "{member} {role_arn} cannot be assumed by {SERVICE_PRINCIPAL}: its trust policy must \
+             grant {} to that service principal",
+            ::service_common::iam_trust_policy::ASSUME_ROLE_ACTION
+        )),
+    }
+}
 
 /// The `PricingMode` an account that has never changed its pricing plan is on,
 /// and the `UpdateReason` such a plan carries.

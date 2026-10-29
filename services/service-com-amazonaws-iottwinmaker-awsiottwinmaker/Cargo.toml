@@ -32,8 +32,9 @@ regex = "1.12"
 # reading of an RFC 3339 timestamp's UTC offset, for the `Time` strings the time-series
 # data plane carries.
 service-common = { path = "../common" }
-# The IAM store `CreateSyncJob` resolves a `syncRole` against, to check the role's trust
-# policy grants iottwinmaker.amazonaws.com sts:AssumeRole before a sync job is created.
+# The IAM store every caller-supplied role is resolved against (a workspace's `role`, a
+# sync job's `syncRole`), to check the role's trust policy grants
+# iottwinmaker.amazonaws.com sts:AssumeRole before the resource is stored.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]

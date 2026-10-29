@@ -21,7 +21,8 @@
 //! * `syncRole` names a role of this account whose trust policy withholds
 //!   `sts:AssumeRole` from [`crate::state::SERVICE_PRINCIPAL`] — a
 //!   `ValidationException`, because the job does its work AS that role and this
-//!   service could not assume it ([`assume_role_refusal`]);
+//!   service could not assume it ([`crate::state::assume_role_refusal`], the one
+//!   rule every member of this service naming such a role is decided by);
 //! * `syncSource` is not [`crate::state::SYNC_SOURCE_SITEWISE`] — a
 //!   `ValidationException`, because the member's own documentation says that is
 //!   the only source the service supports and the modelled pattern cannot;
@@ -138,70 +139,6 @@ pub enum CreateSyncJobErrorModeled {
 /// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
 pub type CreateSyncJobError = crate::scaffolded::Scaffolded<CreateSyncJobErrorModeled>;
 
-/// The IAM store a caller-supplied role is resolved against.
-///
-/// It is the IAM service's OWN state struct, reached through the SAME shared
-/// engine this service's store lives in, so the roles read here are the very
-/// records `CreateRole` wrote rather than a second copy of them.
-pub type IamState =
-    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::ComAmazonawsIamAwsidentitymanagementv20100508State;
-
-/// The IAM store in the SAME shared engine, which is where the account's roles
-/// live. This is the IAM service's OWN accessor, called rather than copied;
-/// `None` has the same meaning as for [`crate::state::service_state`]: the
-/// engine carries no such store, which this handler reports as a server fault.
-pub fn iam_state<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-) -> Option<::engine::ServiceState<IamState>> {
-    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)
-}
-
-/// `None` when this emulator has no reason to think the service could not act as
-/// the role `role_arn` that `member` names; otherwise the message its refusal
-/// carries.
-///
-/// Where a request names a role THIS service has to assume to carry out the work
-/// the call starts, the role is resolved against the account's IAM records
-/// before anything is persisted, and a role whose trust policy withholds
-/// `sts:AssumeRole` from [`crate::state::SERVICE_PRINCIPAL`] is refused
-/// synchronously rather than accepted and left to fail later.
-///
-/// NOTHING is parsed here. The role is found by COMPARING the stored ARN string
-/// with the one the request carried — no splitting, no indexing, no arithmetic —
-/// and the trust document is read by the ONE shared reader every service that
-/// resolves a caller-supplied role uses
-/// (`service_common::iam_trust_policy::admits_service_principal`, which is total
-/// over arbitrary text: it answers `None` for anything it cannot read as a
-/// policy), so two services asked about the same document cannot answer
-/// differently and no input can panic. Both reads are O(the account's roles)
-/// over records only an IAM call can create.
-///
-/// An ARN the IAM store holds no role for is NOT evidence of a missing trust
-/// (the role may belong to another account, or to a client that never told this
-/// emulator about it), so such a request goes ahead; nor is a document this
-/// emulator cannot read as a policy. `member` is the member that named the role,
-/// so the message says which value the caller has to fix: `syncRole` is this
-/// service's only such member today, and a second one would move this rule to
-/// `crate::state` beside the rules every operation shares.
-pub fn assume_role_refusal(member: &str, role_arn: &str, iam: &IamState) -> Option<String> {
-    let role = iam.roles.values().find(|role| role.arn == role_arn)?;
-    let document = role.assume_role_policy_document.as_deref()?;
-    match ::service_common::iam_trust_policy::admits_service_principal(
-        document,
-        crate::state::SERVICE_PRINCIPAL,
-    ) {
-        // A document this emulator cannot read as a policy is no evidence either
-        // way, and one that grants the principal the action is the grant itself.
-        None | Some(true) => None,
-        Some(false) => Some(format!(
-            "{member} {role_arn} cannot be assumed by {}: its trust policy must grant {} to that \
-             service principal",
-            crate::state::SERVICE_PRINCIPAL,
-            ::service_common::iam_trust_policy::ASSUME_ROLE_ACTION
-        )),
-    }
-}
-
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
 /// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
@@ -280,12 +217,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // different store in the same engine, and no IAM handler reads this one;
         // its guard is taken and released BEFORE this service's, so no two
         // orders of the same two locks exist.
-        let iam = iam_state(&*self.engine).ok_or_else(|| {
+        let iam = crate::state::iam_state(&*self.engine).ok_or_else(|| {
             CreateSyncJobErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the IAM store is unavailable".to_string()),
             })
         })?;
-        let role_refusal = assume_role_refusal("syncRole", &input.sync_role, &iam.lock());
+        let role_refusal = crate::state::assume_role_refusal(
+            crate::state::SYNC_ROLE_MEMBER,
+            &input.sync_role,
+            &iam.lock(),
+        );
         if let Some(message) = role_refusal {
             return Err(CreateSyncJobErrorModeled::ValidationException(ValidationException {
                 message: Some(message),
