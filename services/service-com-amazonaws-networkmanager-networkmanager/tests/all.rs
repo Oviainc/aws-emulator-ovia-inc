@@ -43,6 +43,8 @@ mod connect_peer_lifecycle;
 mod connect_peer_tie_removal_refusals;
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
+#[path = "all/connection_teardown_order.rs"]
+mod connection_teardown_order;
 #[path = "all/core_network_change_events.rs"]
 mod core_network_change_events;
 #[path = "all/core_network_change_set.rs"]

@@ -157,7 +157,11 @@ async fn device_ids(emulator: &Emulator, network: &str) -> Vec<String> {
 /// Assert the invariant the refusal exists for: every link and device a stored connection
 /// of `network` reports is still answered by the reader of that resource, so no reader
 /// reports an id another reader cannot resolve.
-async fn assert_every_reference_resolves(case: &str, emulator: &Emulator, network: &str) {
+pub(crate) async fn assert_every_reference_resolves(
+    case: &str,
+    emulator: &Emulator,
+    network: &str,
+) {
     let (status, connections) = get_connections(emulator, network, "maxResults=50").await;
     assert_eq!(
         status, 200,
