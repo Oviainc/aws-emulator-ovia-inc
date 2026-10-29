@@ -122,3 +122,5 @@ mod restricted_channel_members;
 mod channel_members_by_input_type;
 #[path = "all/entity_tag_precondition_precedence.rs"]
 mod entity_tag_precondition_precedence;
+#[path = "all/tagging_arn_refusal_parity.rs"]
+mod tagging_arn_refusal_parity;
