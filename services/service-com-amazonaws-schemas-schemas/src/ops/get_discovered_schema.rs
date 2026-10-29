@@ -193,8 +193,9 @@ const DEFAULT_HASH_TABLE_BUCKETS: usize = 16;
 
 /// Which document the request's `Type` asks for.
 ///
-/// The two values are [`TYPE_VALUES`], the model's `Type` enum. They differ in more
-/// than the envelope: each dialect spells a nullable position its own way.
+/// One variant per schema language the service knows ([`crate::state::SchemaType`],
+/// which is where a request's `Type` is admitted or refused): they differ in more than
+/// the envelope, because each dialect spells a nullable position its own way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dialect {
     OpenApi3,
@@ -202,13 +203,11 @@ enum Dialect {
 }
 
 impl Dialect {
-    /// The dialect a request's `Type` names, or `None` for a value the model's enum
-    /// does not hold.
-    fn from_modeled(r#type: &str) -> Option<Self> {
-        match r#type {
-            "OpenApi3" => Some(Self::OpenApi3),
-            "JSONSchemaDraft4" => Some(Self::JsonSchemaDraft4),
-            _ => None,
+    /// The document one of the service's schema languages asks for.
+    fn of(schema_type: crate::state::SchemaType) -> Self {
+        match schema_type {
+            crate::state::SchemaType::OpenApi3 => Self::OpenApi3,
+            crate::state::SchemaType::JsonSchemaDraft4 => Self::JsonSchemaDraft4,
         }
     }
 }
@@ -753,14 +752,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same reason the generated scaffold bound them.
         let _ = (ctx, &self.engine);
 
-        let dialect = Dialect::from_modeled(&input.r#type).ok_or_else(|| {
-            GetDiscoveredSchemaError::from(GetDiscoveredSchemaErrorModeled::BadRequestException(
-                crate::state::bad_request(format!(
-                    "Type must be one of {}.",
-                    TYPE_VALUES.join(", ")
-                )),
-            ))
-        })?;
+        // The `Type` this handler reads is a raw string, so the schema language it
+        // names is admitted — or refused — by the service's one rule for that, the
+        // same one `ExportSchema` reads: `crate::state::SchemaType::from_modeled`.
+        // What this operation adds is the mapping from that language to the document
+        // it writes.
+        let dialect = crate::state::SchemaType::from_modeled(&input.r#type)
+            .map(Dialect::of)
+            .map_err(|refusal| {
+                GetDiscoveredSchemaError::from(
+                    GetDiscoveredSchemaErrorModeled::BadRequestException(refusal),
+                )
+            })?;
 
         // Unify the whole sample into one description, then render it once: the
         // events describe the same position, so this is the same join the elements

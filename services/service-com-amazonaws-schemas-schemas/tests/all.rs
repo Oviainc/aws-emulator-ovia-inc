@@ -73,6 +73,8 @@ mod schema_last_modified;
 mod schema_name_collation;
 #[path = "all/schema_read_resolution.rs"]
 mod schema_read_resolution;
+#[path = "all/schema_type_admission.rs"]
+mod schema_type_admission;
 #[path = "all/schema_type_after_version_deletion.rs"]
 mod schema_type_after_version_deletion;
 #[path = "all/schema_version_deletion.rs"]

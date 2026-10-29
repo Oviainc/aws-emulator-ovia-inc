@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     BadRequestException, ConflictException, ForbiddenException, InternalServerErrorException,
-    NotFoundException, PreconditionFailedException,
+    NotFoundException, PreconditionFailedException, TYPE_VALUES,
 };
 
 /// Per-service state for com-amazonaws-schemas-schemas. A handler reaches it through [`service_state`].
@@ -1858,8 +1858,9 @@ pub fn managed_version_count(schema_name: &str) -> u64 {
 
 /// The `Type` every schema of the service-owned catalogue is stored as: AWS stores its
 /// event schemas as OpenAPI 3 documents, and `ExportSchema` is what converts one to
-/// JSON Schema draft 4.
-pub const AWS_MANAGED_SCHEMA_TYPE: &str = "OpenApi3";
+/// JSON Schema draft 4. Read from [`SchemaType`], so the catalogue is seeded with a
+/// language a request can actually name.
+pub const AWS_MANAGED_SCHEMA_TYPE: &str = SchemaType::OpenApi3.as_wire();
 
 /// The registry AWS publishes its discovered event schemas in — the read-only
 /// catalogue of every AWS service event type, which every account sees without
@@ -2827,6 +2828,94 @@ pub fn code_binding_language(requested: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|language| *language == requested)
+}
+
+/// A schema LANGUAGE this service knows, as a request's `Type` names it.
+///
+/// One variant per value of [`TYPE_VALUES`], the model's `Type` enum, and the
+/// correspondence is checked at COMPILE time below — so the set a `Type` is admitted
+/// from, the set a refusal names ([`unsupported_schema_type`]) and the branches the
+/// handlers take are one list, not three that can drift apart.
+///
+/// The languages differ in more than their name — each spells a nullable position its
+/// own way, and only one of them is a language an export can be rendered FROM — so
+/// every operation that decides something from a `Type` branches on this rather than
+/// comparing wire strings of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaType {
+    /// JSON Schema draft 4.
+    JsonSchemaDraft4,
+    /// OpenAPI 3.
+    OpenApi3,
+}
+
+impl SchemaType {
+    /// Every language this service knows, in [`TYPE_VALUES`] order.
+    pub const ALL: &'static [Self] = &[Self::JsonSchemaDraft4, Self::OpenApi3];
+
+    /// This language as `Type` renders it on the wire — its value in [`TYPE_VALUES`].
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::JsonSchemaDraft4 => "JSONSchemaDraft4",
+            Self::OpenApi3 => "OpenApi3",
+        }
+    }
+
+    /// The language a request's `Type` names, or the refusal of a value the model's
+    /// `Type` enum does not hold.
+    ///
+    /// Every operation whose `Type` the boundary validator cannot check for it —
+    /// because the member is modelled a plain `__string` there — reaches the admitted
+    /// set through here, so no two of them can disagree about which languages this
+    /// service takes. The comparison is exact: these are wire values, and a service
+    /// that quietly accepted another spelling would answer a language the request did
+    /// not ask for.
+    pub fn from_modeled(requested: &str) -> Result<Self, BadRequestException> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|language| language.as_wire() == requested)
+            .ok_or_else(unsupported_schema_type)
+    }
+}
+
+/// [`SchemaType`] holds exactly the values the model's `Type` enum does, in its order.
+/// A model that gains or renames one fails the BUILD here rather than leaving a handler
+/// refusing a value the refusal it answers with says is admitted.
+const _: () = {
+    assert!(SchemaType::ALL.len() == TYPE_VALUES.len());
+    let mut index = 0;
+    while index < SchemaType::ALL.len() {
+        assert!(same_text(SchemaType::ALL[index].as_wire(), TYPE_VALUES[index]));
+        index += 1;
+    }
+};
+
+/// Whether two strings are the same text, decidable while the crate is being compiled —
+/// which `==` on `str` is not. See the assertion above, its only caller.
+const fn same_text(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Refuse a `Type` that is not a schema language this service knows.
+///
+/// Names the member and the values it admits — [`TYPE_VALUES`], the model's own `Type`
+/// enum, which is also the set [`SchemaType::from_modeled`] tests against — as a
+/// validation refusal does. The rejected value is not echoed back: the caller already
+/// holds what it sent, and the admitted set is what it needs.
+pub fn unsupported_schema_type() -> BadRequestException {
+    bad_request(format!("Type must be one of {}.", TYPE_VALUES.join(", ")))
 }
 
 /// The constraint this service holds one of its caller-supplied resource NAMES to:

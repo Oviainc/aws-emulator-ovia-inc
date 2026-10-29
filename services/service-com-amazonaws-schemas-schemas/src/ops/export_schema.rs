@@ -76,7 +76,7 @@ use super::types::*;
 // documents these constants describe (the event envelope and the component refs that
 // point at it) and this operation converts them, so one definition keeps the writer
 // and the reader from drifting apart.
-use crate::state::{JsonNode, JSON_SCHEMA_DRAFT4_URI, OPENAPI_COMPONENT_REF};
+use crate::state::{JsonNode, SchemaType, JSON_SCHEMA_DRAFT4_URI, OPENAPI_COMPONENT_REF};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -158,17 +158,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Type` is modelled `__string` on this operation, not the `Type` enum, so the
         // boundary validator admits anything: the handler is what refuses a value that
-        // is not a schema language this service knows. Named members and admitted
-        // values, as a validation refusal does.
-        if !TYPE_VALUES.contains(&input.r#type.as_str()) {
-            return Err(ExportSchemaErrorModeled::BadRequestException(
-                crate::state::bad_request(format!(
-                    "Type must be one of {}.",
-                    TYPE_VALUES.join(", ")
-                )),
-            )
-            .into());
-        }
+        // is not a schema language this service knows. The admitted set and the
+        // refusal that names it are the service's, not this operation's — see
+        // `crate::state::SchemaType::from_modeled`, which `GetDiscoveredSchema` reads
+        // the same rule from.
+        let requested = SchemaType::from_modeled(&input.r#type).map_err(|refusal| {
+            ExportSchemaError::from(ExportSchemaErrorModeled::BadRequestException(refusal))
+        })?;
 
         // The names this request supplies are checked against the service's own
         // constraints for them before the store is reached: a name outside one names no
@@ -218,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // OpenAPI document needs around it, so there is no rendering of it to serve —
         // the refusal the modelled `ForbiddenException` covers, named by the stored
         // type rather than by the registry it sits in.
-        if version.r#type != OPEN_API_3_TYPE {
+        if version.r#type != SchemaType::OpenApi3.as_wire() {
             return Err(ExportSchemaErrorModeled::ForbiddenException(
                 crate::state::forbidden(format!(
                     "Exporting of a schema with type {} is not supported.",
@@ -228,21 +224,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let content = if input.r#type == JSON_SCHEMA_DRAFT4_TYPE {
-            to_json_schema_draft4(&version.content).ok_or_else(|| {
-                ExportSchemaError::from(ExportSchemaErrorModeled::BadRequestException(
-                    crate::state::bad_request(format!(
-                        "Version {} of schema {} is not an OpenAPI 3 document with component \
-                         schemas, so it cannot be exported as {}.",
-                        version.version, input.schema_name, JSON_SCHEMA_DRAFT4_TYPE
-                    )),
-                ))
-            })?
-        } else {
-            // `Type` is one of `TYPE_VALUES` (anything else was refused above), so what
-            // is left is the OpenAPI 3 language this version is already stored in: the
-            // export is the stored document.
-            version.content.clone()
+        let content = match requested {
+            SchemaType::JsonSchemaDraft4 => to_json_schema_draft4(&version.content).ok_or_else(
+                || {
+                    ExportSchemaError::from(ExportSchemaErrorModeled::BadRequestException(
+                        crate::state::bad_request(format!(
+                            "Version {} of schema {} is not an OpenAPI 3 document with component \
+                             schemas, so it cannot be exported as {}.",
+                            version.version,
+                            input.schema_name,
+                            SchemaType::JsonSchemaDraft4.as_wire()
+                        )),
+                    ))
+                },
+            )?,
+            // The OpenAPI 3 language this version is already stored in: the export is
+            // the stored document.
+            SchemaType::OpenApi3 => version.content.clone(),
         };
 
         Ok(ExportSchemaOutput {
@@ -254,12 +252,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The two schema languages this service stores, as [`TYPE_VALUES`] spells them.
-const JSON_SCHEMA_DRAFT4_TYPE: &str = "JSONSchemaDraft4";
-
-/// See [`JSON_SCHEMA_DRAFT4_TYPE`].
-const OPEN_API_3_TYPE: &str = "OpenApi3";
 
 /// Where a JSON Schema draft-4 document keeps the same, as a `$ref` names one.
 const DRAFT4_DEFINITION_REF: &str = "#/definitions/";
