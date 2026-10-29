@@ -474,6 +474,16 @@ fn kind_label(kind: &str) -> String {
 ///
 /// A REQUIRED reference is not passed through here: it must name a resource, so the empty
 /// string stays the unresolvable reference its own refusal reports.
+///
+/// A listing that SELECTS on an optional reference member reads it through here too, so one
+/// member has one reading whether a request writes it or filters by it: the empty string
+/// names no resource, so it narrows the listing by nothing and the listing answers exactly
+/// what the omitted member asks for. Two kinds of member are NOT read through here: a
+/// DESCRIPTIVE one — a link's type or provider, a Region, a state — is not a reference and
+/// its writers store the empty string verbatim, so a record can carry it and a filter naming
+/// it keeps matching it literally; and one whose modelled shape does not admit the empty
+/// string at all (an id pattern, a minimum length) never reaches a handler empty, because the
+/// constraint walk refuses it first.
 pub fn optional_reference<Id: AsRef<str>>(supplied: Option<Id>) -> Option<Id> {
     supplied.filter(|id| !id.as_ref().is_empty())
 }

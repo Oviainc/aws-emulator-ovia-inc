@@ -226,6 +226,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // inside it, so one core network's associations are a contiguous run of the store,
         // ordered by that ARN — the order this listing reports, and the key offset its page
         // token names.
+        // token names. `PrefixListArn` is not read through
+        // [`crate::state::optional_reference`]: this operation refuses a filter that is no
+        // well-formed managed-prefix-list ARN above, the empty string included, so a value
+        // that names no prefix list never reaches this match.
         let prefix = crate::state::prefix_list_association_key(&input.core_network_id, "");
         let entries: Vec<(String, PrefixListAssociation)> = store
             .prefix_list_associations

@@ -183,6 +183,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // entry rather than failing the read. The attachments are held in a `BTreeMap`
         // keyed by attachment id, so the listing order is stable and the page token below
         // can name a key offset into it.
+        //
+        // No filter here is read through [`crate::state::optional_reference`]: the modelled
+        // `CoreNetworkId` carries `pattern ^core-network-([0-9a-f]{8,17})$` and
+        // `EdgeLocation` `length 1..63`, so the empty string never reaches this handler, and
+        // the other two select a VALUE rather than a resource.
         let now = ::std::time::SystemTime::now();
         let entries: Vec<(String, Attachment)> = store
             .attachments

@@ -142,6 +142,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // `DeviceId` and `LinkId` are OPTIONAL reference members, so what each names is
+        // read the way every other reader and writer of an optional reference reads it
+        // ([`crate::state::optional_reference`]): the empty string names no resource, so it
+        // is the ABSENCE of that selector — both for the precondition below and for the
+        // narrowing further down.
+        let device_filter = crate::state::optional_reference(input.device_id.as_deref());
+        let link_filter = crate::state::optional_reference(input.link_id.as_deref());
+
         // "Gets the link associations for a device or a link. Either the device ID or the
         // link ID must be specified." (`smithy_query query="doc"
         // shape="GetLinkAssociations"`) — both members are optional in the model, which
@@ -149,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // selects neither names no subject to report associations for. The request's own
         // members are checked BEFORE any stored resource is looked up, so this 400 is the
         // answer even when the global network in the path names nothing either.
-        if input.device_id.is_none() && input.link_id.is_none() {
+        if device_filter.is_none() && link_filter.is_none() {
             let reason = "either DeviceId or LinkId must be specified";
             return Err(GetLinkAssociationsErrorModeled::ValidationException(
                 ValidationException {
@@ -198,26 +206,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // `DeviceId` and `LinkId` narrow the global network's associations, the way every
-        // other listing of this service treats the selectors its query string carries: an
-        // id that names nothing stored matches no association rather than failing the
-        // read, and naming both reports the one pair they identify, if it is associated.
+        // The two selectors narrow the global network's associations, the way every other
+        // listing of this service treats the selectors its query string carries: an id that
+        // names nothing stored matches no association rather than failing the read, and
+        // naming both reports the one pair they identify, if it is associated.
         let entries: Vec<(String, LinkAssociation)> = store
             .link_associations
             .iter()
             .filter(|(_, record)| record.global_network_id == input.global_network_id)
-            .filter(|(_, record)| {
-                input
-                    .device_id
-                    .as_deref()
-                    .is_none_or(|want| record.device_id == want)
-            })
-            .filter(|(_, record)| {
-                input
-                    .link_id
-                    .as_deref()
-                    .is_none_or(|want| record.link_id == want)
-            })
+            .filter(|(_, record)| device_filter.is_none_or(|want| record.device_id == want))
+            .filter(|(_, record)| link_filter.is_none_or(|want| record.link_id == want))
             .map(|(key, record)| (key.clone(), record.to_shape(now)))
             .collect();
         drop(store);

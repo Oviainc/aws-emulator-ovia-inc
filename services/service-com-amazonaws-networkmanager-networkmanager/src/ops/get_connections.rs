@@ -201,14 +201,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DeviceId` ("The ID of the device", `smithy_query query="doc"
         // shape="GetConnectionsRequest" member="DeviceId"`) matches a connection that names
         // that device at EITHER end — a connection is the tie between two devices, and
-        // neither end is privileged.
+        // neither end is privileged. `DeviceId` is an OPTIONAL reference member, so what it
+        // names is read the way every other reader and writer of an optional reference
+        // reads it ([`crate::state::optional_reference`]): the empty string names no
+        // resource, so it is the absence of the filter.
+        let device_filter = crate::state::optional_reference(input.device_id.as_deref());
         let entries: Vec<(String, Connection)> = store
             .connections
             .iter()
             .filter(|(_, record)| record.global_network_id == input.global_network_id)
             .filter(|(id, _)| requested.is_empty() || requested.iter().any(|want| want == *id))
             .filter(|(_, record)| {
-                input.device_id.as_deref().is_none_or(|want| {
+                device_filter.is_none_or(|want| {
                     record.device_id == want || record.connected_device_id == want
                 })
             })

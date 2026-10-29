@@ -219,6 +219,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for a gateway-side connection, say — matches nothing rather than everything.
         // `AccountId` is matched against the account that owns the resource, which is the
         // one its ARN carries and the one the entry reports.
+        //
+        // `ResourceArn` and `RegisteredGatewayArn` are OPTIONAL reference members whose
+        // modelled shape (`ResourceArn`, `length 0..1500`, `pattern ^[\s\S]*$`) admits the
+        // empty string, so what each names is read the way every other reader and writer of
+        // an optional reference reads it ([`crate::state::optional_reference`]): the empty
+        // string names no resource, so it is the absence of that filter. `ResourceType`,
+        // `AwsRegion` and `AccountId` select a VALUE rather than a resource, so each keeps
+        // matching literally, and `CoreNetworkId` carries an id pattern the empty string
+        // does not satisfy, so it never reaches this handler empty.
+        let resource_arn_filter = crate::state::optional_reference(input.resource_arn.as_deref());
+        let gateway_filter =
+            crate::state::optional_reference(input.registered_gateway_arn.as_deref());
         let entries: Vec<(String, NetworkTelemetry)> = store
             .telemetry_resources
             .iter()
@@ -230,10 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .is_none_or(|want| record.resource_type == want)
             })
             .filter(|(_, record)| {
-                input
-                    .resource_arn
-                    .as_deref()
-                    .is_none_or(|want| record.resource_arn == want)
+                resource_arn_filter.is_none_or(|want| record.resource_arn == want)
             })
             .filter(|(_, record)| {
                 input
@@ -242,9 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .is_none_or(|want| record.core_network_id.as_deref() == Some(want))
             })
             .filter(|(_, record)| {
-                input
-                    .registered_gateway_arn
-                    .as_deref()
+                gateway_filter
                     .is_none_or(|want| record.registered_gateway_arn.as_deref() == Some(want))
             })
             .filter(|(_, record)| {

@@ -101,6 +101,8 @@ mod direct_connect_gateway_attachment_lifecycle;
 mod disassociate_connect_peer;
 #[path = "all/empty_optional_reference.rs"]
 mod empty_optional_reference;
+#[path = "all/empty_reference_filter.rs"]
+mod empty_reference_filter;
 #[path = "all/filter_id_list_maximum.rs"]
 mod filter_id_list_maximum;
 #[path = "all/filter_maximum_table.rs"]

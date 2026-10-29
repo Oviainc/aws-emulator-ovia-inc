@@ -246,6 +246,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let selects = |want: Option<&str>, reported: Option<&str>| {
             want.is_none_or(|value| reported == Some(value))
         };
+        // `ResourceArn` and `RegisteredGatewayArn` are OPTIONAL reference members whose
+        // modelled shape (`ResourceArn`, `length 0..1500`, `pattern ^[\s\S]*$`) admits the
+        // empty string, so what each names is read the way every other reader and writer of
+        // an optional reference reads it ([`crate::state::optional_reference`]): the empty
+        // string names no resource, so it is the absence of that filter. `ResourceType`,
+        // `AwsRegion` and `AccountId` select a VALUE rather than a resource, so each keeps
+        // matching literally, and `CoreNetworkId` carries an id pattern the empty string
+        // does not satisfy, so it never reaches this handler empty.
+        let resource_arn_filter = crate::state::optional_reference(input.resource_arn.as_deref());
+        let gateway_filter =
+            crate::state::optional_reference(input.registered_gateway_arn.as_deref());
         let selected = |arn: &str| {
             let held = inventory.get(arn);
             let resource_type = held
@@ -257,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let aws_region = held
                 .and_then(|resource| resource.aws_region.as_deref())
                 .or_else(|| crate::state::arn_region(arn));
-            selects(input.resource_arn.as_deref(), Some(arn))
+            selects(resource_arn_filter, Some(arn))
                 && selects(input.resource_type.as_deref(), resource_type)
                 && selects(input.account_id.as_deref(), account_id)
                 && selects(input.aws_region.as_deref(), aws_region)
@@ -266,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     held.and_then(|resource| resource.core_network_id.as_deref()),
                 )
                 && selects(
-                    input.registered_gateway_arn.as_deref(),
+                    gateway_filter,
                     held.and_then(|resource| resource.registered_gateway_arn.as_deref()),
                 )
         };

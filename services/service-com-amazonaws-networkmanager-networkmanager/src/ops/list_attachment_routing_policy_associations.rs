@@ -205,7 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // `AttachmentId` narrows that listing the way every other selector of this service
         // does: an id naming nothing stored — or an attachment of another core network —
-        // matches no entry rather than failing the read.
+        // matches no entry rather than failing the read. It is not read through
+        // [`crate::state::optional_reference`]: the modelled `AttachmentId` carries `pattern
+        // ^attachment-([0-9a-f]{8,17})$`, so the empty string never reaches this handler.
         let entries: Vec<(String, AttachmentRoutingPolicyAssociationSummary)> = store
             .attachments
             .iter()

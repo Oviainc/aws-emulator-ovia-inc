@@ -215,6 +215,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        // `SiteId` is an OPTIONAL reference member, so what it names is read the way every
+        // other reader and writer of an optional reference reads it
+        // ([`crate::state::optional_reference`]): the empty string names no resource, so it
+        // is the absence of the filter. `Type` and `Provider` are DESCRIPTIVE members whose
+        // writers store what the request spells verbatim, the empty string included, so
+        // those keep matching literally.
+        let site_filter = crate::state::optional_reference(input.site_id.as_deref());
+
         // Every filter the request carries narrows the global network's links; an absent
         // one matches everything, and `LinkIds` filters on the ids it names.
         let entries: Vec<(String, Link)> = store
@@ -222,12 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .filter(|(_, record)| record.global_network_id == input.global_network_id)
             .filter(|(id, _)| requested.is_empty() || requested.iter().any(|want| want == *id))
-            .filter(|(_, record)| {
-                input
-                    .site_id
-                    .as_deref()
-                    .is_none_or(|want| record.site_id == want)
-            })
+            .filter(|(_, record)| site_filter.is_none_or(|want| record.site_id == want))
             .filter(|(_, record)| {
                 input
                     .r#type

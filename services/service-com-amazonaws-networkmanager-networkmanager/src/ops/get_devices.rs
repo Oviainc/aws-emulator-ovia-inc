@@ -190,19 +190,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        // `SiteId` is an OPTIONAL reference member, so what it names is read the way every
+        // other reader and writer of an optional reference reads it
+        // ([`crate::state::optional_reference`]): the empty string names no resource, so it
+        // is the absence of the filter rather than a site nothing can be stored under.
+        let site_filter = crate::state::optional_reference(input.site_id.as_deref());
+
         // Every filter the request carries narrows the global network's devices; an absent
         // one matches everything, and `DeviceIds` filters on the ids it names. A device
-        // that was created without a site matches no `SiteId` filter.
+        // that was created without a site matches no `SiteId` filter that names a site.
         let entries: Vec<(String, Device)> = store
             .devices
             .iter()
             .filter(|(_, record)| record.global_network_id == input.global_network_id)
             .filter(|(id, _)| requested.is_empty() || requested.iter().any(|want| want == *id))
             .filter(|(_, record)| {
-                input
-                    .site_id
-                    .as_deref()
-                    .is_none_or(|want| record.site_id.as_deref() == Some(want))
+                site_filter.is_none_or(|want| record.site_id.as_deref() == Some(want))
             })
             .map(|(id, record)| (id.clone(), record.to_shape(now)))
             .collect();

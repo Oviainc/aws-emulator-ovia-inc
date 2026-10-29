@@ -167,6 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // than failing the read. The peers are held in a `BTreeMap` keyed by peer id, so the
         // listing order is stable and the page token below can name a key offset into it.
         let now = ::std::time::SystemTime::now();
+        // Neither selector is read through [`crate::state::optional_reference`]: both are
+        // modelled with an id pattern (`^core-network-([0-9a-f]{8,17})$`,
+        // `^attachment-([0-9a-f]{8,17})$`), so the empty string never reaches this handler.
         let entries: Vec<(String, ConnectPeerSummary)> = store
             .connect_peers
             .iter()
