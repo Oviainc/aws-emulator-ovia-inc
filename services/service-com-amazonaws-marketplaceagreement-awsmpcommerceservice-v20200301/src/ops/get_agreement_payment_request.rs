@@ -183,11 +183,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // A pure report: it reads the stored payment request and writes nothing,
-        // so two reads of the same request answer the same thing and a later
-        // caller sees what this one saw.
+        // A report: the only writes are the transitions the clock had already
+        // made due before this call — the automatic approval a payment request
+        // sent under a term configured for it is owed at its own stored instant
+        // (`crate::state::settle_payment_requests`), and the agreement
+        // transitions below.
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        store.settle_payment_requests(now);
         // The parent this call resolves against is settled BEFORE its id is
         // resolved: an agreement whose own stored end date has passed reached
         // it at that instant whether or not anybody called, and the renewal

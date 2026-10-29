@@ -171,8 +171,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store holds, so every end-date transition the clock has already made
         // due is materialised first (`crate::state::settle_agreements`, what
         // the scanning reports of this crate call): the charges of a renewal an
-        // end date created are charges of the store from that date on.
+        // end date created are charges of the store from that date on. The
+        // charge an automatic payment-request approval creates is owed from its
+        // own stored instant in the same way, so that transition is materialised
+        // here too (`crate::state::settle_payment_requests`) and such a charge
+        // is one this call can associate a purchase order with.
         store.settle_agreements(now);
+        store.settle_payment_requests(now);
         let owners = store.charge_owners();
         // The revision each of those charges is at, as the charge report states
         // it, which is what an element's `chargeRevision` precondition is

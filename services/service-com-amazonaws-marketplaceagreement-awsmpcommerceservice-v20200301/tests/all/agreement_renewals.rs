@@ -47,6 +47,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_marketplaceagreement_awsmpcommerceservice_v20200301::state::service_state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::agreement_expiry::{aged_agreement, days};
@@ -758,6 +759,87 @@ async fn the_renewal_is_the_clocks_and_happens_once() {
         again, links,
         "a refused call changes nothing about the chain, got {again:?}"
     );
+}
+
+/// The ceiling the store declines a new quote at, which is also the ceiling a
+/// clock-driven renewal stops at: the crate's own bound on how many agreement
+/// requests it holds. Spelled out here rather than imported from the crate, so a
+/// crate that moved the bound fails this test rather than agreeing with it.
+const STORE_QUOTA: usize = 1_000;
+
+/// Fill the store's quotes up to [`STORE_QUOTA`] by copying one stored quote
+/// under fresh keys, so the next record a renewal would insert is past the
+/// ceiling.
+///
+/// In-process, like the aging this suite already does: a thousand creates over
+/// the wire would say the same thing far more slowly. The ids carry a prefix no
+/// minted id uses, so nothing the service mints collides with them.
+fn fill_quotes(engine: &engine::InMemoryEngine) {
+    let state =
+        service_state(engine).expect("the emulator's own engine carries this store");
+    let mut store = state.lock();
+    let template = store
+        .agreement_requests
+        .values()
+        .next()
+        .cloned()
+        .expect("the accepted agreement left its own quote in the store");
+    let mut index = 0;
+    while store.agreement_requests.len() < STORE_QUOTA {
+        store
+            .agreement_requests
+            .insert(format!("ar-filled-{index:04}"), template.clone());
+        index += 1;
+    }
+}
+
+/// A renewal is a WRITE the clock owes, so it stops at the same ceiling the
+/// create path declines at: with the store already full, the end date of a
+/// renewing agreement inserts nothing — however many readers settle it — and the
+/// store it would have grown stays exactly as large as it was.
+#[tokio::test]
+async fn the_clock_renews_nothing_once_the_store_is_full() {
+    let (router, engine) = emulator_over_engine();
+    let source = aged_agreement(
+        &router,
+        &engine,
+        "ap-renewalFull",
+        renewing_terms("P1M"),
+        days(31),
+    )
+    .await;
+    fill_quotes(&engine);
+
+    let agreements = |engine: &engine::InMemoryEngine| {
+        let state = service_state(engine).expect("the engine carries this store");
+        let store = state.lock();
+        (store.agreements.len(), store.agreement_requests.len())
+    };
+    let before = agreements(&engine);
+
+    // Every reader that settles the end date is asked, twice, and none of them
+    // takes the store past its ceiling.
+    for attempt in 1..=2 {
+        let described = described(&router, &source).await;
+        assert_eq!(
+            described.body["status"].as_str(),
+            Some(ACTIVE),
+            "attempt {attempt}: a renewal the store cannot hold leaves the agreement as it \
+             stands, got {:?}",
+            described.body
+        );
+        let links = chain_of(&router, &source).await;
+        assert_eq!(
+            links.len(),
+            1,
+            "attempt {attempt}: no renewal is inserted past the ceiling, got {links:?}"
+        );
+        assert_eq!(
+            agreements(&engine),
+            before,
+            "attempt {attempt}: expected the store to hold {before:?} records still"
+        );
+    }
 }
 
 /// The limit these rows count renewals against is the one the accepted renewal

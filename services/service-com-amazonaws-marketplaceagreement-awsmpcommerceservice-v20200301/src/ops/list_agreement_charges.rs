@@ -193,10 +193,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the charges of a renewal the clock already owed part of this answer
         // and the renewal's own id one this listing holds an agreement for,
         // whether or not some unrelated call read something else first. Nothing
-        // else here writes: every charge is read from the quote that minted it.
+        // else here writes: every charge is read from the quote that minted it,
+        // or from the payment request whose approval created it — so the
+        // approval a term configured for it owes its requests is materialised
+        // here too, the charge it creates being a charge of the agreement the
+        // request was sent under (`crate::state::settle_payment_requests`).
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.settle_agreements(now);
+        store.settle_payment_requests(now);
 
         // "The unique identifier of the agreement": an `agreementId` the store
         // holds no agreement for names no agreement of this account, so it is

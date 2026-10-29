@@ -201,10 +201,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the whole store first — an agreement an end date created exists
         // because that date passed, not because some unrelated call read it
         // first. Nothing else here writes: every member of a summary is read
-        // from the stored payment request and the agreement it was sent under.
+        // from the stored payment request and the agreement it was sent under —
+        // and the status it reports is the one the clock has already left the
+        // request in, so the automatic approval a term configured for it owes
+        // its requests is materialised too
+        // (`crate::state::settle_payment_requests`).
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.settle_agreements(now);
+        store.settle_payment_requests(now);
 
         // "An optional parameter to list payment requests for a specific
         // agreement": an `agreementId` the store holds no agreement for names no

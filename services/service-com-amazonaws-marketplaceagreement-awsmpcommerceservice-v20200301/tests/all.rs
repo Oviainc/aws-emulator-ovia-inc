@@ -65,6 +65,8 @@ mod listing_resolution_order;
 mod page_token_scopes;
 #[path = "all/payment_request_approval.rs"]
 mod payment_request_approval;
+#[path = "all/payment_request_auto_approval.rs"]
+mod payment_request_auto_approval;
 #[path = "all/payment_request_balance.rs"]
 mod payment_request_balance;
 #[path = "all/payment_request_cancellation.rs"]

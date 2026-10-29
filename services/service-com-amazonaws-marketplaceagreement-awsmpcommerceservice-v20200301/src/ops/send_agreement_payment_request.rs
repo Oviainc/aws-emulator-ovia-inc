@@ -2,8 +2,9 @@
 
 //! @op SendAgreementPaymentRequest
 //! Stores a payment request against an agreement's `VariablePaymentTerm`, in the
-//! `PENDING_APPROVAL` status the service documents. This is the ONLY file to
-//! touch for this operation.
+//! `PENDING_APPROVAL` status the service documents, together with the instant the
+//! term's own configuration makes its automatic approval due at. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -191,6 +192,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // left the agreement in: one past its own stored end date ended at
         // that instant, so no new request is taken under it.
         store.settle_before_lookup(&input.agreement_id, now);
+        // The same holds for the payment requests already sent under the term
+        // this one is sent against: one the clock has already approved on
+        // expiration was approved at that instant whether or not anybody
+        // called, so the ceiling below is measured against the statuses the
+        // clock has left them in, and a replayed token reports the request as
+        // it now stands (`crate::state::settle_payment_requests`).
+        store.settle_payment_requests(now);
 
         // `@idempotencyToken`: the same token names the same payment request, so
         // a retried send reports the first one rather than charging the buyer
@@ -310,8 +318,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing has decided the request yet, so there is no additional
             // context about its status to report.
             status_message: None,
-            // The charge is created when the buyer approves the request.
+            // The charge is created when the request is approved.
             charge_id: None,
+            // "The duration after which a payment request is automatically
+            // approved if no further action is taken. This only applies when
+            // the payment request approval strategy is set to
+            // `AUTO_APPROVE_ON_EXPIRATION`": the acceptor's configuration of
+            // the term this request is sent under decides whether the clock
+            // owes this request its approval, and when
+            // (`crate::state::payment_request_auto_approval`). A term
+            // configured to wait for the buyer owes none, so the record carries
+            // no instant and only the buyer's decision moves it.
+            auto_approves_at: crate::state::payment_request_auto_approval(term, now),
             // This call is the seller's, so the account that made it is the
             // payment request's proposer.
             proposer_account_id: ::engine::emulator_account_id().to_string(),

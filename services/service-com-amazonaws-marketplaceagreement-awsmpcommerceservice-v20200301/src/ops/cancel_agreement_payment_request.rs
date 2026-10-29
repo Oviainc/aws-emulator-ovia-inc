@@ -203,6 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock already owes resolves here whether or not another call looked
         // at the store first (`crate::state::settle_before_lookup`).
         store.settle_before_lookup(&input.agreement_id, now);
+        // The status this call guards on is the one the clock has already left
+        // the request in: a request sent under a term that approves its requests
+        // on expiration was approved at that instant whether or not anybody
+        // called, so a decision arriving after it earns the conflict a second
+        // decision on one request earns (`crate::state::settle_payment_requests`).
+        store.settle_payment_requests(now);
 
         // A payment request is a child of the agreement it was sent under, and
         // this call names both. Resolution goes PARENT-FIRST, so

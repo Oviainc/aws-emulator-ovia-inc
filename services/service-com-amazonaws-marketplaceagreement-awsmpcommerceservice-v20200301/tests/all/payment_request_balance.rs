@@ -74,7 +74,11 @@ fn amount_of(count: u128) -> String {
 
 /// The accepted `VariablePaymentTerm` of `agreement` that `term_id` names, as
 /// `GetAgreementTerms` reports it.
-async fn variable_payment_term_of(
+///
+/// `pub(crate)` because the suite over the approval a term's own configuration
+/// makes due (`tests/all/payment_request_auto_approval.rs`) reads the same
+/// accepted term back rather than building a second reader.
+pub(crate) async fn variable_payment_term_of(
     router: &MultiServiceRouter,
     agreement: &str,
     term_id: &str,

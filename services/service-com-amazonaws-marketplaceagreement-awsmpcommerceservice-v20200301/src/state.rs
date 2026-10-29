@@ -1229,6 +1229,46 @@ pub const PAYMENT_REQUEST_STATUS_REJECTED: &str = "REJECTED";
 /// never be charged ([`PaymentRequest::holds_term_balance`]).
 pub const PAYMENT_REQUEST_STATUS_VALIDATION_FAILED: &str = "VALIDATION_FAILED";
 
+/// The `PaymentRequestApprovalStrategy` value that leaves the approval of a
+/// payment request to the CLOCK rather than to the buyer's own decision.
+///
+/// `VariablePaymentTermConfiguration$paymentRequestApprovalStrategy` "defines
+/// the strategy for approving payment requests. Values include
+/// `AUTO_APPROVE_ON_EXPIRATION` and `WAIT_FOR_APPROVAL`", and the duration the
+/// expiration is measured by is that configuration's own `expirationDuration`:
+/// "the duration after which a payment request is automatically approved if no
+/// further action is taken. This only applies when the payment request approval
+/// strategy is set to `AUTO_APPROVE_ON_EXPIRATION`."
+pub const PAYMENT_REQUEST_APPROVAL_ON_EXPIRATION: &str = "AUTO_APPROVE_ON_EXPIRATION";
+
+/// The instant the automatic approval of a payment request sent under `term` at
+/// `sent_at` is owed at, or `None` when that term owes none.
+///
+/// The acceptor's configuration of the term is what decides: only a term
+/// configured [`PAYMENT_REQUEST_APPROVAL_ON_EXPIRATION`] has its requests
+/// approved on expiration, and the expiration is that configuration's
+/// `expirationDuration` after the send — the acceptor's OWN value, read as the
+/// span its ISO 8601 duration names (`service_common::iso8601_span`, the one
+/// reading of such a member this project makes) rather than as a span this
+/// service chose. Under the other strategy, and for a term carrying no
+/// configuration at all, nothing but the buyer's decision moves the request.
+///
+/// `None` as well for a value naming no span that can be placed after the send:
+/// `ISO8601Duration`'s pattern admits a signed duration, and a negative one
+/// names no instant the clock will reach. Such a request waits for the buyer,
+/// which is what a configuration naming no expiration does.
+pub fn payment_request_auto_approval(
+    term: &VariablePaymentTerm,
+    sent_at: SystemTime,
+) -> Option<SystemTime> {
+    let configuration = term.configuration.as_ref()?;
+    if configuration.payment_request_approval_strategy != PAYMENT_REQUEST_APPROVAL_ON_EXPIRATION {
+        return None;
+    }
+    let expiration = configuration.expiration_duration.as_deref()?;
+    sent_at.checked_add(::service_common::iso8601_span::iso8601_span(expiration)?)
+}
+
 /// Every value a `partyType` admits. `PartyType` is modelled a plain string
 /// (`@length(1, 32)`, `^[A-Za-z]+$`), not an enum, so the boundary validator
 /// cannot refuse a party type that is neither of these — the handler does, with
@@ -2668,6 +2708,17 @@ pub struct PaymentRequest {
     pub proposer_account_id: String,
     /// The `clientToken` the send carried, if any.
     pub client_token: Option<String>,
+    /// The instant this request's automatic approval is owed at, for a request
+    /// sent under a term whose acceptor configured one
+    /// ([`payment_request_auto_approval`]), and `None` for a request only the
+    /// buyer's own decision moves.
+    ///
+    /// Held on the record rather than re-derived from the term, the way the
+    /// sibling [`BillingAdjustmentRequest::completes_at`] holds the instant its
+    /// own transition is owed at: the configuration the send read is what
+    /// governs that send, and the instant is materialised rather than slept for
+    /// ([`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::settle_payment_requests`]).
+    pub auto_approves_at: Option<SystemTime>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
 }
@@ -2698,6 +2749,18 @@ impl PaymentRequest {
     /// deciding now would move it a second time.
     pub fn is_pending_approval(&self) -> bool {
         self.status == PAYMENT_REQUEST_STATUS_PENDING_APPROVAL
+    }
+
+    /// The instant this request's automatic approval was owed at, once `now` has
+    /// reached it — `None` for a request that is owed none, one whose instant is
+    /// still ahead, and one a decision has already moved.
+    ///
+    /// The instant itself is the answer rather than a yes/no, because the
+    /// approval is dated at the instant it was DUE and not at the instant
+    /// somebody looked.
+    pub fn auto_approval_due(&self, now: SystemTime) -> Option<SystemTime> {
+        let due = self.auto_approves_at?;
+        (self.is_pending_approval() && now >= due).then_some(due)
     }
 
     /// Cancel this payment request at `now`: the one transition to
@@ -4452,6 +4515,17 @@ pub struct ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     pub idempotency: HashMap<String, String>,
     /// The counter every id this service mints is drawn from.
     pub id_sequence: u64,
+    /// The instant the last STORE-WIDE settling walk
+    /// ([`Self::settle_agreements`]) brought every chain this store holds up
+    /// to, and `None` while no walk has run.
+    ///
+    /// What bounds how often that walk runs: nothing can become due at an
+    /// instant a walk has already covered, so a second walk at the same instant
+    /// would read every agreement again to change nothing. One is therefore run
+    /// at most once per instant of the clock, however many calls ask for one —
+    /// which is what keeps resolving an id this store holds nothing under from
+    /// paying for the same walk again and again at one instant.
+    pub settled_through: Option<SystemTime>,
 }
 
 impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
@@ -4891,6 +4965,10 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
         for id in ids {
             self.settle_agreement(&id, now);
         }
+        // Every chain this store holds is up to date as at `now`, which is what
+        // lets a walk asked for again at the same instant be skipped
+        // ([`Self::settled_through`]).
+        self.settled_through = Some(now);
     }
 
     /// Materialise what the clock has already made due BEFORE the id
@@ -4908,11 +4986,15 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     /// whether some other call had walked that chain first. Once every chain is
     /// settled the id either names the agreement the clock created or names
     /// nothing at all, and the operation's own refusal is what the latter
-    /// earns. The store-wide walk runs only on that miss, so resolving an
-    /// agreement this store already holds stays the settling of its own chain.
+    /// earns. The store-wide walk runs only on that miss, and only when no walk
+    /// has already brought every chain up to THIS instant
+    /// ([`Self::settled_through`]) — so resolving an agreement this store
+    /// already holds stays the settling of its own chain, and repeated misses at
+    /// one instant do not pay for the same walk again.
     pub fn settle_before_lookup(&mut self, agreement_id: &str, now: SystemTime) {
         self.settle_agreement(agreement_id, now);
-        if !self.agreements.contains_key(agreement_id) {
+        let settled = self.settled_through.is_some_and(|through| through >= now);
+        if !self.agreements.contains_key(agreement_id) && !settled {
             self.settle_agreements(now);
         }
     }
@@ -4954,7 +5036,21 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     /// mints no second renewal. An agreement whose own quote this store no
     /// longer holds is left as it stands: the terms the renewal would re-state
     /// are read from that quote.
+    ///
+    /// Nothing is due either once the store has reached the ceiling a create
+    /// declines at ([`AGREEMENT_REQUEST_QUOTA`]): a renewal inserts a quote and
+    /// an agreement and issues that agreement's invoices, exactly what the
+    /// create path checks that ceiling before doing, so past it the chain is
+    /// left where it stands rather than taking the store further. That bound is
+    /// what keeps the records a clock-driven renewal creates finite however many
+    /// calls settle however many chains — [`RENEWALS_PER_CALL`] bounds ONE
+    /// walk's steps, this bounds the store.
     fn renew_agreement(&mut self, agreement_id: &str, now: SystemTime) -> Option<String> {
+        if self.agreement_requests.len() >= AGREEMENT_REQUEST_QUOTA
+            || self.agreements.len() >= AGREEMENT_REQUEST_QUOTA
+        {
+            return None;
+        }
         let source = self.agreements.get(agreement_id)?;
         if source.status != STATUS_ACTIVE
             || !source.reached_end_date(now)
@@ -5034,6 +5130,39 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
             let _ = renewed.renew(end);
         }
         Some(id)
+    }
+
+    /// Materialise every automatic payment-request approval the clock has
+    /// already made due by `now`.
+    ///
+    /// A payment request sent under a term whose acceptor configured approval on
+    /// expiration is owed its `APPROVED` status at the instant the send recorded
+    /// ([`payment_request_auto_approval`]) whether or not anybody calls — "the
+    /// duration after which a payment request is automatically approved if no
+    /// further action is taken" — so an operation that reports a payment
+    /// request, reports the charges of an agreement, or guards on a request's
+    /// status materialises it before it answers, exactly as the sibling
+    /// [`Self::settle_billing_adjustments`] does for a submitted adjustment.
+    ///
+    /// The transition is the one the buyer's own accept performs
+    /// ([`Self::approve_payment_request`]), so the charge the approval creates
+    /// is minted by that single writer; no purchase order reference is recorded,
+    /// because no call supplied one. `updated_at` becomes the instant the
+    /// approval was DUE, never the instant it was observed, so repeated reads
+    /// report the same value and the charge it created carries that same date.
+    pub fn settle_payment_requests(&mut self, now: SystemTime) {
+        let due: Vec<(String, SystemTime)> = self
+            .payment_requests
+            .values()
+            .filter_map(|request| {
+                request
+                    .auto_approval_due(now)
+                    .map(|at| (request.id.clone(), at))
+            })
+            .collect();
+        for (id, at) in due {
+            let _ = self.approve_payment_request(&id, None, at);
+        }
     }
 
     /// Materialise every billing adjustment status change the clock has already
