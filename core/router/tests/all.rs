@@ -25,6 +25,11 @@ mod kinesisvideo_signing_name_routing;
 #[path = "all/kafka_placement_subnets_resolve_in_ec2.rs"]
 mod kafka_placement_subnets_resolve_in_ec2;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `b…` span (where every batch suite would land) are both regions concurrently
+// landing suites add their line to.
+#[path = "all/batch_job_state_change_is_scoped_to_its_own_job_queue.rs"]
+mod batch_job_state_change_is_scoped_to_its_own_job_queue;
+// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `t…` span are both regions concurrently landing suites add their line to.
 #[path = "all/tagged_hosted_zone_selects_a_sending_domain.rs"]
 mod tagged_hosted_zone_selects_a_sending_domain;
