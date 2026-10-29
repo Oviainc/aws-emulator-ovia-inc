@@ -4030,15 +4030,21 @@ pub fn router_input_connected_source(
     }
 }
 
-/// The values that tell two transit decryption configurations apart: the key type, and the
+/// The values that tell two transit encryption configurations apart: the key type, and the
 /// secret and the role a Secrets Manager key is read with (an automatic key is managed by
 /// the service and carries nothing else to compare).
-type TransitDecryptionIdentity<'a> = (Option<&'a str>, Option<(&'a str, &'a str)>);
+///
+/// One reading for both directions of a router: a router input's `sourceTransitDecryption`
+/// and a router output's `destinationTransitEncryption` are the SAME two shapes
+/// (`FlowTransitEncryption`, `MediaLiveTransitEncryption`), so the rule that neither may
+/// change while the resource is connected compares through one identity rather than two.
+type TransitEncryptionIdentity<'a> = (Option<&'a str>, Option<(&'a str, &'a str)>);
 
-/// [`TransitDecryptionIdentity`] for the decryption of a flow source connected to an input.
-fn flow_transit_decryption_identity(
+/// [`TransitEncryptionIdentity`] for the transit encryption of a flow connected to a router
+/// input (its source decryption) or to a router output (its destination encryption).
+fn flow_transit_encryption_identity(
     encryption: &FlowTransitEncryption,
-) -> TransitDecryptionIdentity<'_> {
+) -> TransitEncryptionIdentity<'_> {
     (
         encryption.encryption_key_type.as_deref(),
         match &encryption.encryption_key_configuration {
@@ -4050,11 +4056,12 @@ fn flow_transit_decryption_identity(
     )
 }
 
-/// [`TransitDecryptionIdentity`] for the decryption of a MediaLive channel output connected
-/// to an input.
-fn media_live_transit_decryption_identity(
+/// [`TransitEncryptionIdentity`] for the transit encryption of a MediaLive resource
+/// connected to a router input (a channel output's decryption) or to a router output (an
+/// input's destination encryption).
+fn media_live_transit_encryption_identity(
     encryption: &MediaLiveTransitEncryption,
-) -> TransitDecryptionIdentity<'_> {
+) -> TransitEncryptionIdentity<'_> {
     (
         encryption.encryption_key_type.as_deref(),
         match &encryption.encryption_key_configuration {
@@ -4085,15 +4092,80 @@ pub fn router_input_source_transit_decryption_differs(
             RouterInputConfiguration::MediaConnectFlow(stored),
             RouterInputConfiguration::MediaConnectFlow(requested),
         ) => {
-            flow_transit_decryption_identity(&stored.source_transit_decryption)
-                != flow_transit_decryption_identity(&requested.source_transit_decryption)
+            flow_transit_encryption_identity(&stored.source_transit_decryption)
+                != flow_transit_encryption_identity(&requested.source_transit_decryption)
         }
         (
             RouterInputConfiguration::MediaLiveChannel(stored),
             RouterInputConfiguration::MediaLiveChannel(requested),
         ) => {
-            media_live_transit_decryption_identity(&stored.source_transit_decryption)
-                != media_live_transit_decryption_identity(&requested.source_transit_decryption)
+            media_live_transit_encryption_identity(&stored.source_transit_decryption)
+                != media_live_transit_encryption_identity(&requested.source_transit_decryption)
+        }
+        _ => false,
+    }
+}
+
+/// The DESTINATION an output configured by `configuration` is currently CONNECTED to, named
+/// as the kind of resource it is, or `None` for a configuration that is connected to no such
+/// destination.
+///
+/// The output-side counterpart of [`router_input_connected_source`]: two router output
+/// configurations deliver into a resource of another AWS service, and each documents what
+/// connects it — "to connect the router output to the flow source, provide both `flowArn`
+/// and `flowSourceArn`. To disconnect it, call the update operation and omit both fields
+/// while keeping this configuration object"
+/// (`smithy_query(query="shape",shape="MediaConnectFlowRouterOutputConfiguration")`), and
+/// the same for both `mediaLiveInputArn` and `mediaLivePipelineId`
+/// (`smithy_query(query="shape",shape="MediaLiveInputRouterOutputConfiguration")`). A
+/// STANDARD output egresses on a network interface of this account and names no such
+/// destination, so it is connected to none.
+pub fn router_output_connected_destination(
+    configuration: &RouterOutputConfiguration,
+) -> Option<&'static str> {
+    match configuration {
+        RouterOutputConfiguration::MediaConnectFlow(flow) => {
+            (flow.flow_arn.is_some() && flow.flow_source_arn.is_some()).then_some("a flow source")
+        }
+        RouterOutputConfiguration::MediaLiveInput(media_live) => (media_live
+            .media_live_input_arn
+            .is_some()
+            && media_live.media_live_pipeline_id.is_some())
+        .then_some("a MediaLive input"),
+        RouterOutputConfiguration::Standard(_) => None,
+    }
+}
+
+/// Whether the configuration `requested` asks for a different DESTINATION TRANSIT
+/// ENCRYPTION than the one `stored` carries.
+///
+/// "You can't change `destinationTransitEncryption` while the router output is connected to
+/// a flow source. To change it, first disconnect the router output, then update the
+/// encryption"
+/// (`smithy_query(query="shape",shape="MediaConnectFlowRouterOutputConfiguration")`, and the
+/// same note on `MediaLiveInputRouterOutputConfiguration`), so an operation that replaces a
+/// configuration asks HERE whether it would change that member — the output-side counterpart
+/// of [`router_input_source_transit_decryption_differs`]. Two configurations of different
+/// kinds carry no one encryption to compare, and a STANDARD one carries none at all, so
+/// neither is a change of one.
+pub fn router_output_destination_transit_encryption_differs(
+    stored: &RouterOutputConfiguration,
+    requested: &RouterOutputConfiguration,
+) -> bool {
+    match (stored, requested) {
+        (
+            RouterOutputConfiguration::MediaConnectFlow(stored),
+            RouterOutputConfiguration::MediaConnectFlow(requested),
+        ) => {
+            flow_transit_encryption_identity(&stored.destination_transit_encryption)
+                != flow_transit_encryption_identity(&requested.destination_transit_encryption)
+        }
+        (
+            RouterOutputConfiguration::MediaLiveInput(stored),
+            RouterOutputConfiguration::MediaLiveInput(requested),
+        ) => {
+            media_live_transit_encryption_identity(&stored.destination_transit_encryption)
+                != media_live_transit_encryption_identity(&requested.destination_transit_encryption)
         }
         _ => false,
     }

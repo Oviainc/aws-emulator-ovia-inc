@@ -120,6 +120,18 @@ fn refused_by_output(detail: impl Into<String>) -> UpdateRouterOutputError {
     .into()
 }
 
+/// Refuse the request with `ConflictException` (HTTP 409): the request "would cause a
+/// conflict with the current state of a service resource associated with the request.
+/// Resolve the conflict before retrying this request" — the state the addressed output is
+/// already in rather than the request's content, so the sentence carries neither
+/// `BadRequestException` envelope.
+fn conflict(detail: impl Into<String>) -> UpdateRouterOutputError {
+    UpdateRouterOutputErrorModeled::ConflictException(ConflictException {
+        message: detail.into(),
+    })
+    .into()
+}
+
 /// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources in
 /// the request does not exist in the system" — the router output `identifier` addressed, in
 /// this service's not-found envelope ([`crate::state::not_found_message`]).
@@ -242,22 +254,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ConflictException` describes ("would cause a conflict with the current state of a
         // service resource associated with the request", 409 and retryable).
         if output.is_deleting() {
-            return Err(UpdateRouterOutputErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "Router output {} is in state {} and is being deleted, so it cannot \
-                         be updated.",
-                        output.arn, output.state
-                    ),
-                },
-            )
-            .into());
+            return Err(conflict(format!(
+                "Router output {} is in state {} and is being deleted, so it cannot be \
+                 updated.",
+                output.arn, output.state
+            )));
         }
 
         // What the request is judged against is the output as the store holds it now. Read
         // off the record BEFORE anything below needs the store again, so one borrow of the
         // store does not outlive another.
         let stored_arn = output.arn.clone();
+        let stored_configuration = output.configuration.clone();
         let stored_type = output.output_type();
         let stored_tier = output.tier.clone();
         let stored_bitrate = output.maximum_bitrate;
@@ -293,6 +301,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "You can't change destinationTransitEncryption while the router output is
+        // connected to a flow source. To change it, first disconnect the router output, then
+        // update the encryption" (`MediaConnectFlowRouterOutputConfiguration`, and the same
+        // note on `MediaLiveInputRouterOutputConfiguration`) — a request the output's
+        // current connection to its destination refuses, which is what `ConflictException`
+        // describes. Both halves are the crate's one reading of that relation
+        // (`crate::state::router_output_connected_destination` and
+        // `crate::state::router_output_destination_transit_encryption_differs`), so the rule
+        // holds for every configuration that carries a destination encryption rather than
+        // for one of them.
+        if let Some(configuration) = requested_configuration.as_ref() {
+            if let Some(destination) =
+                crate::state::router_output_connected_destination(&stored_configuration)
+            {
+                if crate::state::router_output_destination_transit_encryption_differs(
+                    &stored_configuration,
+                    configuration,
+                ) {
+                    return Err(conflict(format!(
+                        "Router output {stored_arn} is connected to {destination}, so its \
+                         DestinationTransitEncryption cannot be changed. Disconnect the \
+                         router output first, then update the encryption."
+                    )));
+                }
+            }
+        }
+
         // The replacement configuration's target is what the output would egress to, so a
         // reference it carries to a resource of THIS service is RESOLVED against the store
         // before it is stored — through the one function CreateRouterOutput resolves a new
@@ -314,16 +349,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the documented precondition, and carries neither of this service's
         // `BadRequestException` envelopes.
         if input.fabric_configuration.is_some() && stored_is_routed {
-            return Err(UpdateRouterOutputErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "Router output {stored_arn} has an active route from router input \
-                         {stored_routed_input_arn}, so its FabricConfiguration cannot be \
-                         updated. Unroute the output first."
-                    ),
-                },
-            )
-            .into());
+            return Err(conflict(format!(
+                "Router output {stored_arn} has an active route from router input \
+                 {stored_routed_input_arn}, so its FabricConfiguration cannot be updated. \
+                 Unroute the output first."
+            )));
         }
 
         // What the tier and the bitrate become once this request is applied: the requested

@@ -14,7 +14,9 @@
 //! variant the output holds and which of the five protocols a STANDARD one is reconfigured
 //! with, every tier in the published catalog at its bitrate ceiling and one bit per second
 //! past it, which direction a configuration-type change is attempted in, whether the output
-//! has an active route, and whether the ARN addresses an output at all.
+//! has an active route, whether it is connected to the destination its configuration names
+//! and which way its transit encryption is moved, and whether the ARN addresses an output
+//! at all.
 //!
 //! The harness is the one `flow_lifecycle` owns (one router, one shared engine) and the
 //! request helpers are the ones `router_outputs` owns, so every case drives the same request
@@ -36,7 +38,7 @@ use crate::router_output_take_input::take_router_input;
 use crate::router_outputs::{
     batch_get_router_outputs, create_router_output, minted_configuration_targets,
     minted_flow_source, now_epoch_seconds, reported_timestamp, standard, standard_with_protocol,
-    PERSISTED_MEMBERS, UNKNOWN_ARN,
+    MEDIALIVE_INPUT_ARN, PERSISTED_MEMBERS, ROLE_ARN, SECRET_ARN, UNKNOWN_ARN,
 };
 
 /// Long enough for a transition the clock owes to be due: twice [`mc::TRANSITION_SPAN`], so
@@ -921,4 +923,264 @@ async fn the_fabric_configuration_cannot_be_updated_while_the_output_is_routed()
         json!({"recoveryLatencyMode": "LOW_LATENCY"}),
         "the accepted update stored the new FabricConfiguration, got {answered}"
     );
+}
+
+/// A second Secrets Manager key pair, each ARN matching the same modelled pattern as the
+/// pair `router_outputs` owns
+/// (`smithy_query(query="shape",shape="SecretsManagerEncryptionKeyConfiguration")`:
+/// `SecretArn` `^arn:(aws[a-zA-Z-]*):secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[a-zA-Z0-9/_+=.@-]+$`,
+/// `RoleArn` `^arn:(aws[a-zA-Z-]*):iam::[0-9]{12}:role/[a-zA-Z0-9_+=,.@-]+$`), so a case can
+/// move the KEY a SECRETS_MANAGER encryption is read with without moving its key type.
+const OTHER_SECRET_ARN: &str =
+    "arn:aws:secretsmanager:us-east-1:000000000000:secret:router-key-rotated";
+const OTHER_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/router-output-role-rotated";
+
+/// An AUTOMATIC transit encryption — the key the service manages itself
+/// (`smithy_query(query="shape",shape="FlowTransitEncryption")`, whose
+/// `EncryptionKeyConfiguration` union carries `Automatic` or `SecretsManager`; the
+/// `MediaLiveTransitEncryption` shape models the same two).
+fn automatic_encryption() -> Value {
+    json!({"encryptionKeyType": "AUTOMATIC", "encryptionKeyConfiguration": {"Automatic": {}}})
+}
+
+/// A SECRETS_MANAGER transit encryption, reading the key `secret_arn` with `role_arn`.
+fn secrets_manager_encryption(secret_arn: &str, role_arn: &str) -> Value {
+    json!({"encryptionKeyType": "SECRETS_MANAGER", "encryptionKeyConfiguration": {
+        "SecretsManager": {"secretArn": secret_arn, "roleArn": role_arn}}})
+}
+
+/// A `MediaConnectFlow` router output configuration carrying `encryption`: CONNECTED to the
+/// flow source when `flow` names one, disconnected when it names none — "to connect the
+/// router output to the flow source, provide both flowArn and flowSourceArn. To disconnect
+/// it, call the update operation and omit both fields while keeping this configuration
+/// object" (`smithy_query(query="shape",shape="MediaConnectFlowRouterOutputConfiguration")`).
+fn mediaconnect_flow(flow: Option<(&str, &str)>, encryption: Value) -> Value {
+    let mut configuration = json!({"destinationTransitEncryption": encryption});
+    if let Some((flow_arn, flow_source_arn)) = flow {
+        configuration["flowArn"] = json!(flow_arn);
+        configuration["flowSourceArn"] = json!(flow_source_arn);
+    }
+    json!({"MediaConnectFlow": configuration})
+}
+
+/// A `MediaLiveInput` router output configuration carrying `encryption`: CONNECTED to the
+/// MediaLive input when `pipeline_id` names a pipeline, disconnected when it names none —
+/// the same documented pair, on `mediaLiveInputArn` and `mediaLivePipelineId`
+/// (`smithy_query(query="shape",shape="MediaLiveInputRouterOutputConfiguration")`).
+fn medialive_input(pipeline_id: Option<&str>, encryption: Value) -> Value {
+    let mut configuration = json!({"destinationTransitEncryption": encryption});
+    if let Some(pipeline_id) = pipeline_id {
+        configuration["mediaLiveInputArn"] = json!(MEDIALIVE_INPUT_ARN);
+        configuration["mediaLivePipelineId"] = json!(pipeline_id);
+    }
+    json!({"MediaLiveInput": configuration})
+}
+
+/// A create carrying `configuration`, at a tier with room for the bitrate it asks for.
+fn configuration_create(name: &str, configuration: Value) -> Value {
+    json!({
+        "name": name,
+        "configuration": configuration,
+        "maximumBitrate": 50_000_000i64,
+        "routingScope": "GLOBAL",
+        "tier": "OUTPUT_50",
+    })
+}
+
+/// One row of the connected-destination rule: the configuration the output is created
+/// CONNECTED with, a replacement that moves only its `destinationTransitEncryption`, a
+/// replacement that keeps that encryption while moving something else about the connection,
+/// and the replacement that DISCONNECTS the output while keeping the encryption it had.
+struct EncryptionCase {
+    case: &'static str,
+    name: &'static str,
+    connected: Value,
+    changed_encryption: Value,
+    same_encryption: Value,
+    disconnected: Value,
+}
+
+#[tokio::test]
+async fn the_destination_transit_encryption_cannot_change_while_the_output_is_connected() {
+    let emulator = Emulator::new();
+    let targets = Targets::mint(&emulator).await;
+    let flow = Some((targets.flow_arn.as_str(), targets.flow_source_arn.as_str()));
+    let other_flow = Some((
+        targets.other_flow_arn.as_str(),
+        targets.other_flow_source_arn.as_str(),
+    ));
+
+    // Both configurations that deliver into a resource of another service carry a
+    // `destinationTransitEncryption` and document the same precondition, so both are rows —
+    // and each is moved in both directions the key configuration union admits, plus the move
+    // that keeps the key TYPE and changes only the key the encryption is read with.
+    let cases = vec![
+        EncryptionCase {
+            case: "a MEDIACONNECT_FLOW output, AUTOMATIC onto SECRETS_MANAGER",
+            name: "ro-connected-flow-automatic",
+            connected: mediaconnect_flow(flow, automatic_encryption()),
+            changed_encryption: mediaconnect_flow(
+                flow,
+                secrets_manager_encryption(SECRET_ARN, ROLE_ARN),
+            ),
+            same_encryption: mediaconnect_flow(other_flow, automatic_encryption()),
+            disconnected: mediaconnect_flow(None, automatic_encryption()),
+        },
+        EncryptionCase {
+            case: "a MEDIACONNECT_FLOW output, onto another Secrets Manager key of the same \
+                   type",
+            name: "ro-connected-flow-rotated",
+            connected: mediaconnect_flow(flow, secrets_manager_encryption(SECRET_ARN, ROLE_ARN)),
+            changed_encryption: mediaconnect_flow(
+                flow,
+                secrets_manager_encryption(OTHER_SECRET_ARN, OTHER_ROLE_ARN),
+            ),
+            same_encryption: mediaconnect_flow(
+                other_flow,
+                secrets_manager_encryption(SECRET_ARN, ROLE_ARN),
+            ),
+            disconnected: mediaconnect_flow(
+                None,
+                secrets_manager_encryption(SECRET_ARN, ROLE_ARN),
+            ),
+        },
+        EncryptionCase {
+            case: "a MEDIALIVE_INPUT output, SECRETS_MANAGER onto AUTOMATIC",
+            name: "ro-connected-medialive-secrets",
+            connected: medialive_input(
+                Some("PIPELINE_0"),
+                secrets_manager_encryption(SECRET_ARN, ROLE_ARN),
+            ),
+            changed_encryption: medialive_input(Some("PIPELINE_0"), automatic_encryption()),
+            same_encryption: medialive_input(
+                Some("PIPELINE_1"),
+                secrets_manager_encryption(SECRET_ARN, ROLE_ARN),
+            ),
+            disconnected: medialive_input(
+                None,
+                secrets_manager_encryption(SECRET_ARN, ROLE_ARN),
+            ),
+        },
+        EncryptionCase {
+            case: "a MEDIALIVE_INPUT output, AUTOMATIC onto SECRETS_MANAGER",
+            name: "ro-connected-medialive-automatic",
+            connected: medialive_input(Some("PIPELINE_1"), automatic_encryption()),
+            changed_encryption: medialive_input(
+                Some("PIPELINE_1"),
+                secrets_manager_encryption(SECRET_ARN, ROLE_ARN),
+            ),
+            same_encryption: medialive_input(Some("PIPELINE_0"), automatic_encryption()),
+            disconnected: medialive_input(None, automatic_encryption()),
+        },
+    ];
+
+    for EncryptionCase {
+        case,
+        name,
+        connected,
+        changed_encryption,
+        same_encryption,
+        disconnected,
+    } in cases
+    {
+        let (arn, created) =
+            create_output(&emulator, configuration_create(name, connected.clone())).await;
+        assert_eq!(
+            created["configuration"], connected,
+            "case {case:?}: the create stored the connected configuration, got {:?}",
+            created["configuration"]
+        );
+
+        // "You can't change destinationTransitEncryption while the router output is
+        // connected."
+        let (status, code, refusal) = update_router_output(
+            &emulator,
+            &arn,
+            json!({"configuration": changed_encryption.clone()}),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_deref()),
+            (409, Some("ConflictException")),
+            "case {case:?}: a connected output refuses an encryption change, got {status} \
+             {code:?}: {refusal}"
+        );
+        let message = refusal["message"].as_str().unwrap_or_default().to_string();
+        assert!(
+            !message.starts_with(mc::BAD_REQUEST_PREFIX)
+                && !message.starts_with(mc::VALIDATION_FAILED_PREFIX),
+            "case {case:?}: a refusal about the output's current state carries neither \
+             BadRequestException envelope, got {message:?}"
+        );
+        let stored = read_output(&emulator, case, &arn).await;
+        assert_eq!(
+            stored["configuration"], created["configuration"],
+            "case {case:?}: the refused update left the stored Configuration alone, got {:?}",
+            stored["configuration"]
+        );
+
+        // The refusal is about that ONE member: the same connected output takes a
+        // replacement that leaves its encryption alone.
+        let (status, code, answered) = update_router_output(
+            &emulator,
+            &arn,
+            json!({"configuration": same_encryption.clone()}),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_deref()),
+            (202, None),
+            "case {case:?}: a connected output takes a replacement that leaves its encryption \
+             alone, got {status} {code:?}: {answered}"
+        );
+        assert_eq!(
+            answered["routerOutput"]["configuration"], same_encryption,
+            "case {case:?}: the accepted update stored the replacement, got {:?}",
+            answered["routerOutput"]["configuration"]
+        );
+
+        // "To change it, first disconnect the router output, then update the encryption" —
+        // and once it is disconnected, the same change is accepted.
+        let (status, code, answered) = update_router_output(
+            &emulator,
+            &arn,
+            json!({"configuration": disconnected.clone()}),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_deref()),
+            (202, None),
+            "case {case:?}: disconnecting the output is accepted, got {status} {code:?}: \
+             {answered}"
+        );
+        assert_eq!(
+            answered["routerOutput"]["configuration"], disconnected,
+            "case {case:?}: the disconnected configuration is what the store now holds, got \
+             {:?}",
+            answered["routerOutput"]["configuration"]
+        );
+        let (status, code, answered) = update_router_output(
+            &emulator,
+            &arn,
+            json!({"configuration": changed_encryption.clone()}),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_deref()),
+            (202, None),
+            "case {case:?}: a disconnected output takes the encryption change, got {status} \
+             {code:?}: {answered}"
+        );
+        assert_eq!(
+            answered["routerOutput"]["configuration"], changed_encryption,
+            "case {case:?}: the accepted update stored the new encryption, got {:?}",
+            answered["routerOutput"]["configuration"]
+        );
+        let stored = read_output(&emulator, case, &arn).await;
+        assert_eq!(
+            stored["configuration"], changed_encryption,
+            "case {case:?}: the new encryption is what a later reader sees, got {:?}",
+            stored["configuration"]
+        );
+    }
 }
