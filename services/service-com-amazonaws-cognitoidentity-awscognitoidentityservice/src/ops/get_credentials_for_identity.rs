@@ -405,13 +405,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
                         .map(|(configured, pool)| configured.mapped_role(pool, &logins))
                         .unwrap_or(MappedRole::Unmapped);
                     match mapped {
-                        MappedRole::Denied => {
+                        MappedRole::Denied(provider) => {
                             return Err(
                                 GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
                                     NotAuthorizedException {
                                         message: Some(
-                                            crate::state::DENIED_ROLE_RESOLUTION_MESSAGE
-                                                .to_string(),
+                                            crate::state::denied_role_resolution_message(
+                                                &provider,
+                                            ),
                                         ),
                                     },
                                 )

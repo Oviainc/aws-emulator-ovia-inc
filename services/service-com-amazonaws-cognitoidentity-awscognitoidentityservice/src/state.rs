@@ -840,7 +840,7 @@ impl IdentityPoolRoles {
                 match mapping_resolved_role_arn(mapping, &claims) {
                     Some(role_arn) => return MappedRole::Resolved(role_arn),
                     None if unresolved.is_none() => {
-                        unresolved = Some(ambiguous_role_resolution(mapping));
+                        unresolved = Some(ambiguous_role_resolution(mapping, provider));
                     }
                     None => {}
                 }
@@ -943,7 +943,9 @@ pub enum MappedRole {
     /// `authenticated` role is what the exchange assumes.
     AuthenticatedRole,
     /// The same, with the `Deny` resolution: the exchange is refused and nothing is vended.
-    Denied,
+    /// Carries the identity provider that mapping decided the login under, which the refusal
+    /// names ([`denied_role_resolution_message`]).
+    Denied(String),
 }
 
 /// What ONE mapping states for the case its rules resolve no role: its
@@ -954,9 +956,9 @@ pub enum MappedRole {
 /// A mapping stored with no resolution at all — which `SetIdentityPoolRoles` refuses for
 /// the two types that require one — states no `Deny`, so it leaves the exchange to the
 /// pool-wide role rather than refusing it.
-fn ambiguous_role_resolution(mapping: &RoleMapping) -> MappedRole {
+fn ambiguous_role_resolution(mapping: &RoleMapping, provider: &str) -> MappedRole {
     match mapping.ambiguous_role_resolution.as_deref() {
-        Some(DENY_ROLE_RESOLUTION) => MappedRole::Denied,
+        Some(DENY_ROLE_RESOLUTION) => MappedRole::Denied(provider.to_string()),
         Some(AUTHENTICATED_ROLE_RESOLUTION) => MappedRole::AuthenticatedRole,
         _ => MappedRole::Unmapped,
     }
@@ -2231,9 +2233,16 @@ pub const INVALID_POOL_CONFIGURATION_MESSAGE: &str =
 /// AUTHORIZATION decision about the token presented, which is `NotAuthorizedException` —
 /// "thrown when a user is not authorized to access the requested resource".
 ///
-/// Entirely fixed text, with no request- or state-derived part: an unauthenticated caller
-/// learns that role resolution refused the exchange and nothing about the pool's mappings.
-pub const DENIED_ROLE_RESOLUTION_MESSAGE: &str = "Role resolution failed.";
+/// The refusal names WHICH mapped identity provider decided against the exchange —
+/// `provider` is the identity provider the login being resolved was made under, the name the
+/// pool's `RoleMappings` entry is keyed by (for a user-pool provider,
+/// `cognito-idp.<region>.amazonaws.com/<user pool id>`) — around text that is otherwise
+/// fixed for every mapping type and every reason a mapping resolved no role. Nothing else of
+/// the pool's configuration is reported: the caller of `GetCredentialsForIdentity` is an
+/// unauthenticated one.
+pub fn denied_role_resolution_message(provider: &str) -> String {
+    format!("The ambiguous role mapping rules for: {provider} denied this request.")
+}
 
 /// A role as the IAM store in the same engine holds it, reduced to the facts an assume
 /// decides on.

@@ -18,11 +18,17 @@
 //! mapping denies the exchange is not. A mapping that DOES resolve a role is unaffected by
 //! its resolution, and so is an exchange no mapping of the pool's decides.
 //!
+//! That refusal NAMES the mapped identity provider that decided against the exchange: the
+//! message is `The ambiguous role mapping rules for: <provider> denied this request.`, fixed
+//! around one variable part, and that part is the provider the denied login was made under —
+//! the `Logins` key — whatever identifier the `RoleMappings` entry is keyed by, which for a
+//! provider issuing to an app client also names the client.
+//!
 //! The rows differ along what the rule generalises over: the resolution the mapping states,
 //! the mapping `Type` (`Rules` and `Token`, the two the model defines), what the presented
 //! token's claims make of that mapping's rules or group claims (matching, non-matching,
-//! absent, single-valued, multi-valued), the key the mapping is held under, and the flow
-//! the request is in.
+//! absent, single-valued, multi-valued), the key the mapping is held under, the provider the
+//! denied login is made under, and the flow the request is in.
 //!
 //! The fixture is `mapped_role_resolution`'s — the suite that asserts WHICH role a mapping
 //! resolves — driven through `vended_role_session`'s harness: this service and STS on ONE
@@ -33,7 +39,7 @@ use serde_json::{json, Value};
 
 use crate::mapped_role_resolution::{
     identity_token, pool, rule, seeded_roles, set_roles, user_pool_claims, vended_session_arn,
-    Role, PUBLIC_PROVIDER, USER_POOL_PROVIDER,
+    Role, CLIENT_ID, PUBLIC_PROVIDER, USER_POOL_PROVIDER,
 };
 use crate::vended_role_session::{expected_session_arn, Emulator};
 
@@ -43,10 +49,17 @@ use crate::vended_role_session::{expected_session_arn, Emulator};
 const AUTHENTICATED_ROLE: &str = "AuthenticatedRole";
 const DENY: &str = "Deny";
 
-/// The message the refusal of a vend a role mapping DENIED carries
-/// (`crate::state::DENIED_ROLE_RESOLUTION_MESSAGE`) — pinned here as a literal for the same
-/// reason. Fixed text: it carries no part taken from the request or from stored state.
-const DENIED_MESSAGE: &str = "Role resolution failed.";
+/// The message the refusal of a vend a role mapping DENIED carries — spelled out here, so
+/// the wire-visible wording is pinned by the test rather than by the code under test.
+///
+/// The fixed text is `The ambiguous role mapping rules for: ` … ` denied this request.` and
+/// the one variable part is `provider`: the identity provider the login the mapping decided
+/// was made under. That is the provider NAME — the `Logins` key — whatever identifier the
+/// `RoleMappings` entry that denied is keyed by, which for a provider issuing to an app
+/// client also names the client.
+fn denied_message(provider: &str) -> String {
+    format!("The ambiguous role mapping rules for: {provider} denied this request.")
+}
 
 /// A `Rules` role mapping of `rules`, keyed by `key` and stating `resolution` for the case
 /// no rule matches.
@@ -72,8 +85,9 @@ fn token_mapping(key: &str, resolution: &str) -> Value {
 enum Outcome<'a> {
     /// A session of this role is vended.
     Session(&'a Role),
-    /// Nothing is vended: the mapping denied the exchange and the call is refused.
-    Refused,
+    /// Nothing is vended: the mapping denied the exchange and the call is refused, naming
+    /// this identity provider — the one the denied login was made under.
+    Refused(&'a str),
 }
 
 /// Assert `outcome` of a vend for an identity of `pool_id` presenting `logins`.
@@ -94,7 +108,7 @@ async fn assert_outcome(
                 role.name
             );
         }
-        Outcome::Refused => {
+        Outcome::Refused(provider) => {
             let federated = logins
                 .as_object()
                 .is_some_and(|presented| !presented.is_empty());
@@ -116,10 +130,11 @@ async fn assert_outcome(
                 code.ends_with("NotAuthorizedException"),
                 "case {case:?}: expected NotAuthorizedException, got {code:?} in {body}"
             );
+            let expected = denied_message(provider);
             assert_eq!(
                 body["message"].as_str(),
-                Some(DENIED_MESSAGE),
-                "case {case:?}: expected the fixed denied-resolution message, got {body}"
+                Some(expected.as_str()),
+                "case {case:?}: expected the message {expected:?}, got {body}"
             );
             assert!(
                 body.get("Credentials").is_none(),
@@ -141,9 +156,10 @@ type RulesRow<'a> = (
     Outcome<'a>,
 );
 
-/// One row of the `Token` table: the case name, the resolution the mapping states, the group
-/// claims the presented token carries, and what the vend must come to.
-type TokenRow<'a> = (&'a str, &'a str, Value, Outcome<'a>);
+/// One row of the `Token` table: the case name, the key the mapping is held under, the
+/// resolution the mapping states, the group claims the presented token carries, and what the
+/// vend must come to.
+type TokenRow<'a> = (&'a str, String, &'a str, Value, Outcome<'a>);
 
 /// RULE, the `Rules` type: the resolution decides only the exchange no rule of the mapping
 /// matches — a matching rule still specifies the role whatever the resolution states, and an
@@ -173,6 +189,15 @@ async fn a_rules_mapping_matching_nothing_is_decided_by_its_ambiguous_role_resol
     // A login that is no token at all, and the empty map of an exchange presenting none.
     let untokenized = json!({PUBLIC_PROVIDER: "not-a-token"});
     let no_login = json!({});
+    // A token of the OTHER provider the fixture pool accepts, so a refusal under a second
+    // provider names that provider rather than the first.
+    let public_sales = json!({PUBLIC_PROVIDER: identity_token(&json!({
+        "iss": format!("https://{PUBLIC_PROVIDER}"),
+        "sub": "ambiguous-public-sales",
+        "aud": "9876543210",
+        "custom:dept": "sales",
+        "exp": 4_102_444_800u64,
+    }))});
 
     let rows: Vec<RulesRow<'_>> = vec![
         (
@@ -189,7 +214,7 @@ async fn a_rules_mapping_matching_nothing_is_decided_by_its_ambiguous_role_resol
             DENY,
             vec![rule("custom:dept", "Equals", "engineering", mapped)],
             &sales,
-            Outcome::Refused,
+            Outcome::Refused(USER_POOL_PROVIDER),
         ),
         (
             "no rule matches, under AuthenticatedRole: the pool's authenticated role",
@@ -205,7 +230,7 @@ async fn a_rules_mapping_matching_nothing_is_decided_by_its_ambiguous_role_resol
             DENY,
             vec![rule("custom:absent", "Equals", "engineering", mapped)],
             &engineering,
-            Outcome::Refused,
+            Outcome::Refused(USER_POOL_PROVIDER),
         ),
         (
             "the rule's claim is absent from the token, under AuthenticatedRole",
@@ -225,7 +250,24 @@ async fn a_rules_mapping_matching_nothing_is_decided_by_its_ambiguous_role_resol
                 rule("cognito:groups", "Contains", "admins", mapped),
             ],
             &engineering,
-            Outcome::Refused,
+            Outcome::Refused(USER_POOL_PROVIDER),
+        ),
+        (
+            "no rule matches, under Deny, through a mapping keyed by the provider AND the \
+             client the token names",
+            format!("{USER_POOL_PROVIDER}:{CLIENT_ID}"),
+            DENY,
+            vec![rule("custom:dept", "Equals", "engineering", mapped)],
+            &sales,
+            Outcome::Refused(USER_POOL_PROVIDER),
+        ),
+        (
+            "no rule matches, under Deny, for a login of the pool's OTHER provider",
+            PUBLIC_PROVIDER.to_string(),
+            DENY,
+            vec![rule("custom:dept", "Equals", "engineering", mapped)],
+            &public_sales,
+            Outcome::Refused(PUBLIC_PROVIDER),
         ),
         (
             "several rules, the last of them matching, under Deny",
@@ -293,22 +335,26 @@ async fn a_token_mapping_falls_to_its_resolution_when_the_group_claims_name_no_o
     let (group, other) = (&roles[2], &roles[3]);
 
     // The rows differ along what the token's group claims say: one role, several with a
-    // preference among them, several without one, and none at all.
+    // preference among them, several without one, and none at all — and along the key the
+    // mapping is held under, which the refusal does NOT name.
     let rows: Vec<TokenRow<'_>> = vec![
         (
             "a single cognito:roles entry under Deny: that role",
+            USER_POOL_PROVIDER.to_string(),
             DENY,
             json!({"cognito:roles": [&group.arn]}),
             Outcome::Session(group),
         ),
         (
             "a cognito:preferred_role claim under Deny: the preferred role",
+            USER_POOL_PROVIDER.to_string(),
             DENY,
             json!({"cognito:preferred_role": &other.arn}),
             Outcome::Session(other),
         ),
         (
             "several roles with a preference among them, under Deny",
+            USER_POOL_PROVIDER.to_string(),
             DENY,
             json!({
                 "cognito:roles": [&group.arn, &other.arn],
@@ -318,37 +364,49 @@ async fn a_token_mapping_falls_to_its_resolution_when_the_group_claims_name_no_o
         ),
         (
             "several roles and no preference, under Deny: nothing is vended",
+            USER_POOL_PROVIDER.to_string(),
             DENY,
             json!({"cognito:roles": [&group.arn, &other.arn]}),
-            Outcome::Refused,
+            Outcome::Refused(USER_POOL_PROVIDER),
+        ),
+        (
+            "several roles and no preference, under Deny, keyed by the provider AND the \
+             client the token names",
+            format!("{USER_POOL_PROVIDER}:{CLIENT_ID}"),
+            DENY,
+            json!({"cognito:roles": [&group.arn, &other.arn]}),
+            Outcome::Refused(USER_POOL_PROVIDER),
         ),
         (
             "several roles and no preference, under AuthenticatedRole",
+            USER_POOL_PROVIDER.to_string(),
             AUTHENTICATED_ROLE,
             json!({"cognito:roles": [&group.arn, &other.arn]}),
             Outcome::Session(authenticated),
         ),
         (
             "no group claim at all, under Deny: nothing is vended",
+            USER_POOL_PROVIDER.to_string(),
             DENY,
             json!({}),
-            Outcome::Refused,
+            Outcome::Refused(USER_POOL_PROVIDER),
         ),
         (
             "no group claim at all, under AuthenticatedRole",
+            USER_POOL_PROVIDER.to_string(),
             AUTHENTICATED_ROLE,
             json!({}),
             Outcome::Session(authenticated),
         ),
     ];
 
-    for (index, (case, resolution, claims, outcome)) in rows.iter().enumerate() {
+    for (index, (case, key, resolution, claims, outcome)) in rows.iter().enumerate() {
         set_roles(
             &emulator,
             &pool_id,
             authenticated,
             unauthenticated,
-            token_mapping(USER_POOL_PROVIDER, resolution),
+            token_mapping(key, resolution),
         )
         .await;
         let logins = json!({USER_POOL_PROVIDER: identity_token(&user_pool_claims(
