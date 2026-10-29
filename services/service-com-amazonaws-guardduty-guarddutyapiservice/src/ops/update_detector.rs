@@ -166,18 +166,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // Refuse an unacceptable feature list before anything is written, so a
-        // rejected update leaves the detector exactly as it was.
+        // Refuse a feature list whose own entries are unacceptable before anything
+        // is written, so a rejected update leaves the detector exactly as it was.
         if let Err(message) = crate::state::validate_feature_configurations(input.features.as_ref())
         {
             return Err(bad_request(message));
         }
 
         let mut state = state.lock();
-        if state.detector_in(&region, &input.detector_id).is_none() {
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
             return Err(bad_request(crate::state::not_owned_message(
                 crate::state::DETECTOR_ID_MEMBER,
             )));
+        };
+        // This is a PARTIAL update of the detector's switches, so the exclusion
+        // between the two Runtime Monitoring features is judged on the configuration
+        // the update would LEAVE BEHIND rather than on the entries the request
+        // happens to carry: it is checked against the stored switches, and before the
+        // first write.
+        if let Err(message) =
+            crate::state::validate_feature_exclusion(&detector.features, input.features.as_ref())
+        {
+            return Err(bad_request(message));
         }
         let now = state.tick_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {

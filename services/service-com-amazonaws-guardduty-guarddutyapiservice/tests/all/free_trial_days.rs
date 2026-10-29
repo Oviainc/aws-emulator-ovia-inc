@@ -375,7 +375,14 @@ async fn a_feature_enabled_later_starts_its_own_free_trial() {
         let (router, engine, detector_id) = detector_over_engine().await;
         let administrator = administrator();
         age_trials(&engine, DEFAULT_REGION, &detector_id, None, AGED_DAYS);
-        configure(&router, &detector_id, &[(switch, "ENABLED")]).await;
+        // Runtime Monitoring already covers Amazon EKS, so the switch a bare create
+        // left ENABLED for EKS Runtime Monitoring goes off in the same call that
+        // enables it: the two cannot both end up enabled.
+        let mut switches = vec![(switch, "ENABLED")];
+        if switch == "RUNTIME_MONITORING" {
+            switches.push(("EKS_RUNTIME_MONITORING", "DISABLED"));
+        }
+        configure(&router, &detector_id, &switches).await;
 
         let body = free_trial_of(&router, &detector_id, &[&administrator]).await;
         let account = account_of(&body, &administrator)

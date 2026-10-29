@@ -2578,10 +2578,7 @@ impl Detector {
     /// The status of one feature, or [`DISABLED`] when the detector does not carry
     /// it.
     pub fn feature_status(&self, name: &str) -> &str {
-        self.features
-            .iter()
-            .find(|f| f.name == name)
-            .map_or(DISABLED, |f| f.status.as_str())
+        feature_status_in(&self.features, name)
     }
 
     /// What one data source reports: the status of the feature that governs it and
@@ -5544,15 +5541,62 @@ pub fn default_features(now: i64) -> Vec<FeatureRecord> {
         .collect()
 }
 
-/// Refuse a `Features` list this service cannot accept, with the message the
-/// refusal carries.
+/// The feature set a create gives a detector, resolved against the `Features` list
+/// the create itself carries.
 ///
-/// Three rules, two of them from `CreateDetector`'s own documentation: a feature
-/// name must be a `DetectorFeature` member, EKS Runtime Monitoring and Runtime
-/// Monitoring cannot both be requested because Runtime Monitoring already includes
-/// Amazon EKS, and — since each entry configures one member of that enum — a list
-/// may carry no more entries than the enum has members
-/// ([`validate_feature_list_length`]).
+/// [`default_features`] is what a detector created without a `Features` list gets.
+/// A create that ENABLES one of the two mutually exclusive Runtime Monitoring
+/// features and leaves the other one to the default is accepted — only asking for
+/// both is "an error" — so the default the SERVICE picks for the other one yields to
+/// what the request asked for and starts [`DISABLED`], and its free trial has
+/// therefore not begun either. That way the set a create stores never carries the
+/// combination the service "can add only one of"
+/// (`smithy_query(query="doc",shape="DetectorFeatureConfiguration")`).
+pub fn default_features_for(
+    now: i64,
+    features: Option<&Vec<crate::ops::types::DetectorFeatureConfiguration>>,
+) -> Vec<FeatureRecord> {
+    let mut records = default_features(now);
+    // The LAST entry naming a feature is the one that lands, as applying the list
+    // writes the entries in order, and an entry that states no status enables the
+    // feature ([`apply_feature_configurations`]).
+    let requested = |wanted: &str| -> Option<bool> {
+        Some(
+            features?
+                .iter()
+                .rfind(|feature| feature.name.as_deref() == Some(wanted))?
+                .status
+                .as_deref()
+                != Some(DISABLED),
+        )
+    };
+    for (asked_for, other) in [
+        (FEATURE_RUNTIME_MONITORING, FEATURE_EKS_RUNTIME_MONITORING),
+        (FEATURE_EKS_RUNTIME_MONITORING, FEATURE_RUNTIME_MONITORING),
+    ] {
+        // Only where the request says nothing about the other one: a request that
+        // names it states its status itself, and a request that enables both is
+        // refused before anything is stored.
+        if requested(asked_for) != Some(true) || requested(other).is_some() {
+            continue;
+        }
+        if let Some(record) = records.iter_mut().find(|record| record.name == other) {
+            record.status = DISABLED.to_string();
+            record.free_trial_started_at_millis = None;
+        }
+    }
+    records
+}
+
+/// Refuse a `Features` list whose own entries this service cannot accept, with the
+/// message the refusal carries.
+///
+/// Two rules, both from `CreateDetector`'s own documentation: a feature name must be
+/// a `DetectorFeature` member, and — since each entry configures one member of that
+/// enum — a list may carry no more entries than the enum has members
+/// ([`validate_feature_list_length`]). Both are judged on the REQUEST alone, so they
+/// are answered whatever the store holds; the rule that spans the list and the
+/// configuration it is applied over is [`validate_feature_exclusion`].
 pub fn validate_feature_configurations(
     features: Option<&Vec<crate::ops::types::DetectorFeatureConfiguration>>,
 ) -> Result<(), String> {
@@ -5573,19 +5617,18 @@ pub fn validate_feature_configurations(
             )?;
         }
     }
-    validate_runtime_monitoring_pair(features.iter().map(|f| (f.name.as_deref(), f.status.as_deref())))
+    Ok(())
 }
 
-/// Refuse a member-account `Features` list this service cannot accept, with the
-/// message the refusal carries.
+/// Refuse a member-account `Features` list whose own entries this service cannot
+/// accept, with the message the refusal carries.
 ///
 /// The member side of [`validate_feature_configurations`], and the same two rules:
 /// `MemberFeaturesConfiguration.Name` targets `OrgFeature`
 /// (`smithy_query(shape="MemberFeaturesConfiguration")`), so the accepted catalog
-/// is [`MEMBER_FEATURES`] rather than [`DETECTOR_FEATURES`], and
-/// `UpdateMemberDetectors` documents the same Runtime Monitoring exclusion
-/// `CreateDetector` does. An `AdditionalConfiguration` entry is checked the same
-/// way against the `OrgFeatureAdditionalConfiguration` members it may name.
+/// is [`MEMBER_FEATURES`] rather than [`DETECTOR_FEATURES`]. An
+/// `AdditionalConfiguration` entry is checked the same way against the
+/// `OrgFeatureAdditionalConfiguration` members it may name.
 pub fn validate_member_feature_configurations(
     features: Option<&Vec<crate::ops::types::update_member_detectors_types::MemberFeaturesConfiguration>>,
 ) -> Result<(), String> {
@@ -5616,7 +5659,49 @@ pub fn validate_member_feature_configurations(
             )?;
         }
     }
-    validate_runtime_monitoring_pair(features.iter().map(|f| (f.name.as_deref(), f.status.as_deref())))
+    Ok(())
+}
+
+/// Refuse a `Features` list that would leave the detector it is applied to with
+/// both Runtime Monitoring features enabled, with the message the refusal carries.
+///
+/// `stored` is the configuration the list is applied over — the detector's own
+/// switches — and is EMPTY where no configuration exists yet, a create resolving
+/// its default set against the request afterwards ([`default_features_for`]).
+pub fn validate_feature_exclusion(
+    stored: &[FeatureRecord],
+    features: Option<&Vec<crate::ops::types::DetectorFeatureConfiguration>>,
+) -> Result<(), String> {
+    let Some(features) = features else {
+        return Ok(());
+    };
+    validate_runtime_monitoring_pair(
+        stored,
+        features
+            .iter()
+            .map(|f| (f.name.as_deref(), f.status.as_deref())),
+    )
+}
+
+/// Refuse a member-account `Features` list that would leave the member account's
+/// configuration with both Runtime Monitoring features enabled: the member side of
+/// [`validate_feature_exclusion`], which `UpdateMemberDetectors` documents the same
+/// exclusion for.
+pub fn validate_member_feature_exclusion(
+    stored: &[FeatureRecord],
+    features: Option<
+        &Vec<crate::ops::types::update_member_detectors_types::MemberFeaturesConfiguration>,
+    >,
+) -> Result<(), String> {
+    let Some(features) = features else {
+        return Ok(());
+    };
+    validate_runtime_monitoring_pair(
+        stored,
+        features
+            .iter()
+            .map(|f| (f.name.as_deref(), f.status.as_deref())),
+    )
 }
 
 /// Refuse a feature list longer than the enum `catalog` its entries name: each
@@ -5674,22 +5759,46 @@ fn validate_feature_entry(
     Ok(())
 }
 
-/// Refuse a feature list that asks for EKS Runtime Monitoring and Runtime
-/// Monitoring together: "Specifying both EKS Runtime Monitoring
-/// (EKS_RUNTIME_MONITORING) and Runtime Monitoring (RUNTIME_MONITORING) will cause
-/// an error. You can add only one of these two features because Runtime Monitoring
-/// already includes the threat detection for Amazon EKS resources"
+/// Refuse a feature list that would ADD EKS Runtime Monitoring to a configuration
+/// that has Runtime Monitoring, or the other way round: "Specifying both EKS Runtime
+/// Monitoring (EKS_RUNTIME_MONITORING) and Runtime Monitoring (RUNTIME_MONITORING)
+/// will cause an error. You can add only one of these two features because Runtime
+/// Monitoring already includes the threat detection for Amazon EKS resources"
 /// (`smithy_query(query="doc",shape="UpdateMemberDetectors")`, which
 /// `CreateDetector` and `UpdateDetector` document identically).
+///
+/// A `Features` list is a PARTIAL update — a feature it does not name keeps the
+/// status it already had ([`apply_feature_configurations`]) — so the exclusion is
+/// judged on the status each of the two ENDS UP with once the list has been applied,
+/// not on what the request happens to mention: the list's own value where it names
+/// the feature (the LAST entry naming it, which is the one the applier leaves
+/// behind, and an entry that states no status enables it), and the status `stored`
+/// already holds otherwise. This is the reading
+/// [`validate_org_feature_configurations`] gives an organization's list, over the
+/// same primitive.
+///
+/// It is the list's own ADDITION that is refused: a list that enables neither of the
+/// two configures neither, so it is accepted whatever the stored configuration
+/// holds.
 fn validate_runtime_monitoring_pair<'a>(
+    stored: &[FeatureRecord],
     entries: impl Iterator<Item = (Option<&'a str>, Option<&'a str>)> + Clone,
 ) -> Result<(), String> {
-    let named = |wanted: &str| {
+    let requested = |wanted: &str| -> Option<bool> {
         entries
             .clone()
-            .any(|(name, status)| name == Some(wanted) && status != Some(DISABLED))
+            .filter(|(name, _)| *name == Some(wanted))
+            .map(|(_, status)| status != Some(DISABLED))
+            .last()
     };
-    refuse_runtime_monitoring_overlap(named)
+    if requested(FEATURE_EKS_RUNTIME_MONITORING) != Some(true)
+        && requested(FEATURE_RUNTIME_MONITORING) != Some(true)
+    {
+        return Ok(());
+    }
+    refuse_runtime_monitoring_overlap(|wanted| {
+        requested(wanted).unwrap_or_else(|| feature_status_in(stored, wanted) == ENABLED)
+    })
 }
 
 /// Refuse a `DestinationType` this service does not support, returning the AWS
@@ -6029,6 +6138,18 @@ fn set_additional_configuration_status_in(
             updated_at_millis: now,
         },
     );
+}
+
+/// The status a stored feature list holds for one feature, or [`DISABLED`] where
+/// the list does not carry it at all.
+///
+/// [`Detector::feature_status`] over a feature list held anywhere, so a detector's
+/// own switches and a member account's are read the same way.
+pub fn feature_status_in<'a>(features: &'a [FeatureRecord], name: &str) -> &'a str {
+    features
+        .iter()
+        .find(|feature| feature.name == name)
+        .map_or(DISABLED, |feature| feature.status.as_str())
 }
 
 /// What one data source reports, read off the feature that governs it: that

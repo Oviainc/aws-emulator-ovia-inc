@@ -239,7 +239,11 @@ async fn count_by_feature_counts_the_active_members_holding_each_feature_enabled
         (
             "a feature that defaults DISABLED switched on for two members",
             &all[..2],
-            json!({"features": [{"name": "RUNTIME_MONITORING", "status": "ENABLED"}]}),
+            // Runtime Monitoring already covers Amazon EKS, so enabling it switches
+            // EKS Runtime Monitoring off in the same call: the two cannot both end up
+            // enabled on one account.
+            json!({"features": [{"name": "RUNTIME_MONITORING", "status": "ENABLED"},
+                                {"name": "EKS_RUNTIME_MONITORING", "status": "DISABLED"}]}),
         ),
         (
             "a feature switched off on every member",

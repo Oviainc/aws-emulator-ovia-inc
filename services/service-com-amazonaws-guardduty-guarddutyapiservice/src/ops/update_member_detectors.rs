@@ -173,8 +173,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) = crate::state::account_ids_rejection(&input.account_ids) {
             return Err(bad_request(message));
         }
-        // Refuse an unacceptable feature list before anything is written, so a
-        // rejected update leaves every member exactly as it was.
+        // Refuse a feature list whose own entries are unacceptable before anything
+        // is written, so a rejected update leaves every member exactly as it was.
         if let Err(message) =
             crate::state::validate_member_feature_configurations(input.features.as_ref())
         {
@@ -184,8 +184,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         // Members hang off the detector that administers them, so only the
         // account/Region that owns it configures them.
-        if state.detector_in(&region, &input.detector_id).is_none() {
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
             return Err(not_owned(&input.detector_id));
+        };
+        // Each member account carries its own stored configuration, and this is a
+        // PARTIAL update of it, so the exclusion between the two Runtime Monitoring
+        // features is judged per account the call would configure, against what that
+        // account already holds. One account the list cannot be applied to refuses
+        // the whole call, because a refused update writes nothing for any of them.
+        for account_id in &input.account_ids {
+            let Some(member) = detector
+                .members
+                .get(account_id)
+                .filter(|member| member.is_associated())
+            else {
+                continue;
+            };
+            if let Err(message) = crate::state::validate_member_feature_exclusion(
+                &member.features,
+                input.features.as_ref(),
+            ) {
+                return Err(bad_request(message));
+            }
         }
         // The configuration changes now, so the clock advances once for the whole
         // call: every switch this call moves carries the same instant.

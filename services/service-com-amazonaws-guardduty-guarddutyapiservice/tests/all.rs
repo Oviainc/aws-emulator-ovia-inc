@@ -171,6 +171,8 @@ mod resource_tag_addition;
 mod resource_tag_listing;
 #[path = "all/resource_tag_removal.rs"]
 mod resource_tag_removal;
+#[path = "all/runtime_monitoring_exclusion.rs"]
+mod runtime_monitoring_exclusion;
 #[path = "all/sample_finding_catalog.rs"]
 mod sample_finding_catalog;
 #[path = "all/state_roundtrip.rs"]

@@ -110,7 +110,7 @@ const FOUNDATIONAL_NODES: [&str; 3] = ["cloudTrail", "dnsLogs", "flowLogs"];
 
 /// `UpdateMemberDetectors` over the wire, with whatever configuration members
 /// `extra` names beside the required `accountIds`.
-async fn update_member_detectors(
+pub(crate) async fn update_member_detectors(
     router: &Router,
     detector_id: &str,
     account_ids: &[&str],
@@ -130,7 +130,7 @@ async fn update_member_detectors(
 }
 
 /// `GetMemberDetectors` over the wire.
-async fn get_member_detectors(
+pub(crate) async fn get_member_detectors(
     router: &Router,
     detector_id: &str,
     account_ids: &[&str],
@@ -298,6 +298,36 @@ async fn every_member_feature_round_trips_through_both_views() {
         let start = default_status(feature_name);
         let case = format!("member {account_id} feature {feature_name}");
 
+        // Runtime Monitoring already covers Amazon EKS, so the two cannot both end up
+        // enabled: the EKS Runtime Monitoring switch a recorded member starts ENABLED
+        // goes off before this row walks the Runtime Monitoring switch through its
+        // own value space.
+        if feature_name == "RUNTIME_MONITORING" {
+            let (status, body) = update_member_detectors(
+                &router,
+                &detector_id,
+                &[account_id],
+                json!({"features": [{"name": "EKS_RUNTIME_MONITORING", "status": "DISABLED"}]}),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "{case}: switching EKS Runtime Monitoring off first expected 200, got {status} \
+                 {body:?}"
+            );
+        }
+
+        // What every OTHER feature holds once the row's own preparation is done: the
+        // default, except for the EKS Runtime Monitoring switch a Runtime Monitoring
+        // row had to turn off above.
+        let prepared = |other: &str| -> &'static str {
+            if feature_name == "RUNTIME_MONITORING" && other == "EKS_RUNTIME_MONITORING" {
+                "DISABLED"
+            } else {
+                default_status(other)
+            }
+        };
+
         let got = configuration(&router, &detector_id, account_id).await;
         let mut last = feature_instant(&got, feature_name, &case);
         assert_eq!(
@@ -362,7 +392,7 @@ async fn every_member_feature_round_trips_through_both_views() {
                 }
                 assert_eq!(
                     feature_status(&again, other, &case),
-                    default_status(other),
+                    prepared(other),
                     "{case} -> {target}: expected feature {other} to be untouched, got {again:?}"
                 );
             }
@@ -572,7 +602,11 @@ async fn configuring_a_member_leaves_its_member_record_alone() {
     let batches: [(&[&str], Value); 3] = [
         (
             &ids[..1],
-            json!({"features": [{"name": "RUNTIME_MONITORING", "status": "ENABLED"}]}),
+            // Runtime Monitoring already covers Amazon EKS, so the EKS Runtime
+            // Monitoring switch a recorded member starts ENABLED goes off in the
+            // same call that enables Runtime Monitoring.
+            json!({"features": [{"name": "RUNTIME_MONITORING", "status": "ENABLED"},
+                                {"name": "EKS_RUNTIME_MONITORING", "status": "DISABLED"}]}),
         ),
         (
             &ids[..2],
@@ -770,7 +804,8 @@ async fn a_features_additional_configuration_is_one_stored_entry_per_name() {
             &router,
             &detector_id,
             &[account_id],
-            json!({"features": [{"name": "RUNTIME_MONITORING",
+            json!({"features": [{"name": "EKS_RUNTIME_MONITORING", "status": "DISABLED"},
+                                {"name": "RUNTIME_MONITORING",
                                  "status": "ENABLED",
                                  "additionalConfiguration": additional.clone()}]}),
         )

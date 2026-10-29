@@ -169,8 +169,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Refuse an unacceptable feature list before anything is written, so a
-        // rejected request leaves no detector behind.
+        // rejected request leaves no detector behind. A create holds no stored
+        // configuration for the list to be applied over, so the exclusion between the
+        // two Runtime Monitoring features is judged over an empty one: the default set
+        // is resolved against the request afterwards
+        // (`crate::state::default_features_for`), which never leaves both enabled.
         if let Err(message) = crate::state::validate_feature_configurations(input.features.as_ref())
+        {
+            return Err(bad_request(message));
+        }
+        if let Err(message) = crate::state::validate_feature_exclusion(&[], input.features.as_ref())
         {
             return Err(bad_request(message));
         }
@@ -247,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .clone()
                     .unwrap_or_else(|| DEFAULT_FINDING_PUBLISHING_FREQUENCY.to_string()),
             ),
-            features: crate::state::default_features(now),
+            features: crate::state::default_features_for(now, input.features.as_ref()),
             tags: input
                 .tags
                 .as_ref()
