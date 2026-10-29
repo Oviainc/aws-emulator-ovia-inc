@@ -30,7 +30,11 @@
 //! A `ContextId` names the resource the increase is asked for, on a quota AWS
 //! publishes as adjustable per resource: the request is recorded at the `RESOURCE`
 //! level and, once approved, its value is in force for THAT resource alone, leaving
-//! every other resource and the account-wide value where they were.
+//! every other resource and the account-wide value where they were. A `ContextId` that
+//! names no resource — neither an Amazon Resource Name nor the every-resource `*` — is
+//! not refused: it is the one failure the model gives a request `Status` of its own, so
+//! the request is stored like any other and the step that would take it up settles it
+//! to `INVALID_REQUEST`, with no support case and nothing put in force.
 //!
 //! Refusals:
 //!

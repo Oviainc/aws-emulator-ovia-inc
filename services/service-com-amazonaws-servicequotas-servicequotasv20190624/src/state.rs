@@ -162,6 +162,39 @@ pub const CONTEXT_SCOPE_ACCOUNT: &str = "ACCOUNT";
 /// value of their own has been applied to, and to any new such resource.
 pub const CONTEXT_ID_EVERY_RESOURCE: &str = "*";
 
+/// Whether `context_id` names a resource plane at all, which is the WHOLE domain
+/// `QuotaContextInfo$ContextId` gives the member: "The value for this field is either
+/// an Amazon Resource Name (ARN) or *" (`smithy_query(query="shape",
+/// shape="QuotaContextInfo")`, member `ContextId`), the same thing
+/// `RequestServiceQuotaIncreaseRequest$ContextId` and `GetServiceQuotaRequest$ContextId`
+/// state as "Specifies the resource with an Amazon Resource Name (ARN)". The target
+/// shape `QuotaContextId` carries neither a `@pattern` nor a `@length`, so the
+/// boundary's constraint walk refuses nothing and this is where the member's domain is
+/// decided.
+///
+/// An ARN is read by its SHAPE —
+/// `arn:<partition>:<service>:<region>:<account>:<resource>` with an AWS partition
+/// (`aws(-[\w]+)*`, the partition form the modelled `AmazonResourceName` pattern
+/// spells) and a non-empty service namespace and resource part. The region and the
+/// account segments may be empty, because the ARNs of a global service and of a
+/// resource no account owns carry none, and WHICH resource an ARN names is the owning
+/// service's fact rather than this one's — so nothing narrower is checked here. The
+/// wildcard is [`CONTEXT_ID_EVERY_RESOURCE`], which names every resource of the quota's
+/// context scope type.
+pub fn names_a_resource(context_id: &str) -> bool {
+    if context_id == CONTEXT_ID_EVERY_RESOURCE {
+        return true;
+    }
+    let segments: Vec<&str> = context_id.splitn(6, ':').collect();
+    let [prefix, partition, namespace, _region, _account, resource] = segments[..] else {
+        return false;
+    };
+    prefix == "arn"
+        && is_aws_partition(partition)
+        && !namespace.is_empty()
+        && !resource.is_empty()
+}
+
 /// `OptInStatus` member `ENABLED`: Automatic Management is started.
 pub const OPT_IN_STATUS_ENABLED: &str = "ENABLED";
 /// `OptInStatus` member `DISABLED`: Automatic Management is stopped — and what an
@@ -188,6 +221,17 @@ pub const STATUS_APPROVED: &str = "APPROVED";
 /// member="SupportCaseAllowed")`) — "If you set the flag to False, Amazon Web Services
 /// does not open a support case and updates the request status to Not approved."
 pub const STATUS_NOT_APPROVED: &str = "NOT_APPROVED";
+/// `RequestStatus` member `INVALID_REQUEST`: the terminal status of a resource-level
+/// request Service Quotas cannot process, because the `ContextId` it carries names no
+/// resource ([`names_a_resource`]).
+///
+/// Source: the member's own documentation (`smithy_query(query="shape",
+/// shape="RequestedServiceQuotaChange")`, member `Status`) — "`INVALID_REQUEST`:
+/// Service Quotas couldn't process your resource-level quota increase request because
+/// the Amazon Resource Name (ARN) specified as part of the `ContextId` is invalid."
+/// Reaching it is what keeps a value from being put in force on a plane no resource
+/// answers to: the request is stored, like any other, and decided without an overlay.
+pub const STATUS_INVALID_REQUEST: &str = "INVALID_REQUEST";
 
 /// What `SupportCaseAllowed` means when a request does not carry it: the model's own
 /// default, "By default, this flag is set to True".
@@ -505,7 +549,8 @@ pub struct AppliedQuota {
 /// The key one applied-overlay entry is stored under: the `(ServiceCode, QuotaCode)`
 /// pair, and the resource context the value was applied to — `None` for the
 /// account-wide value, `Some(id)` for the `ContextId` an increase named (an ARN, or
-/// [`CONTEXT_ID_EVERY_RESOURCE`]).
+/// [`CONTEXT_ID_EVERY_RESOURCE`]) — the domain [`names_a_resource`] decides, which is
+/// why no entry can be keyed by a context no resource answers to.
 type AppliedKey = (String, String, Option<String>);
 
 /// The account's Service Quotas Automatic Management configuration.
@@ -1089,6 +1134,11 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     /// given) names a quota that is adjustable per resource. The ceiling is enforced
     /// HERE, at the one insertion point, so no caller can grow the store past it.
     ///
+    /// Whether `context_id` names a RESOURCE is not a condition of storing the request:
+    /// the model gives that failure a request `Status` of its own
+    /// ([`STATUS_INVALID_REQUEST`]), so such a request is recorded like any other and
+    /// [`Self::settle_due_requests`] is where it ends.
+    ///
     /// `context_id` is what decides the level the request is recorded at, and the key
     /// the approved value lands on: a request naming a resource context is recorded at
     /// the RESOURCE level and applies to that resource alone.
@@ -1170,6 +1220,11 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     ///   the review it waits on is what decides it: the increase is `APPROVED` and its
     ///   desired value becomes the quota's applied value.
     ///
+    /// Before any of those, a request whose `ContextId` names no resource
+    /// ([`names_a_resource`]) ends [`STATUS_INVALID_REQUEST`] at its first due step:
+    /// there is no resource plane to put a value in force on, so no case processes it
+    /// and NOTHING is applied.
+    ///
     /// One call can owe MORE than one step (a request minted long enough ago has had
     /// its case opened AND the decision on that case fall due), so the steps are
     /// materialised until none is due: every step is owed at its own `due_at` whether
@@ -1222,6 +1277,21 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
                 };
                 // The step happened when it came due, not when somebody looked.
                 let due_at = request.due_at;
+                // A resource-level request whose `ContextId` names no resource has no
+                // plane for a value to be put in force on, so Service Quotas cannot
+                // process it: the step that would take it up decides it
+                // INVALID_REQUEST instead, leaving no overlay behind. Checked before
+                // the support case, because a case cannot process it either \u2014 whether
+                // one was opened for it here or by `CreateSupportCase`.
+                if request
+                    .context_id
+                    .as_deref()
+                    .is_some_and(|context_id| !names_a_resource(context_id))
+                {
+                    request.status = STATUS_INVALID_REQUEST.to_string();
+                    request.last_updated = due_at;
+                    continue;
+                }
                 if request.status == STATUS_PENDING && request.case_id.is_none() {
                     if request.support_case_allowed {
                         open_case_on(request, due_at);

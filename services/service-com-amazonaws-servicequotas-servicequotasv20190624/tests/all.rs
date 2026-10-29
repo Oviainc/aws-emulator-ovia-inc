@@ -31,6 +31,8 @@ mod auto_management_stop;
 mod catalog_identity;
 #[path = "all/catalog_pagination.rs"]
 mod catalog_pagination;
+#[path = "all/context_id_domain.rs"]
+mod context_id_domain;
 #[path = "all/cross_region_settlement.rs"]
 mod cross_region_settlement;
 #[path = "all/default_quota_catalog.rs"]

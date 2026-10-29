@@ -9,7 +9,10 @@
 //!
 //! * an unknown pair is `NoSuchResourceException`;
 //! * a `ContextId` for a quota that is only adjustable at the account level is
-//!   `IllegalArgumentException` — there is no resource context to read a value for.
+//!   `IllegalArgumentException` — there is no resource context to read a value for;
+//! * a `ContextId` that is neither an Amazon Resource Name nor the every-resource `*`
+//!   is `IllegalArgumentException` too — it names no resource, so the quota has no
+//!   such plane to report.
 //!
 //! A `ContextId` on a quota AWS publishes as adjustable per resource SELECTS that
 //! resource's plane: the answer is the value in force for that resource, reported at
@@ -135,6 +138,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                              adjustable at the ACCOUNT level only and has no quota context",
                             input.quota_code
                         )),
+                    },
+                )
+                .into());
+            }
+            // A `ContextId` that is neither an ARN nor the every-resource wildcard
+            // names no resource, so the quota has no such plane to answer for: the
+            // value is an illegal one for the member, refused in this service's own
+            // one sentence for that (`crate::service::ILLEGAL_VALUE_MESSAGE`), which
+            // names neither the member nor the rule. A read cannot report the failure
+            // any other way — only a quota increase request has a `Status` to carry
+            // it (`crate::state::STATUS_INVALID_REQUEST`).
+            if !crate::state::names_a_resource(context_id) {
+                return Err(GetServiceQuotaErrorModeled::IllegalArgumentException(
+                    IllegalArgumentException {
+                        message: Some(crate::service::ILLEGAL_VALUE_MESSAGE.to_string()),
                     },
                 )
                 .into());
