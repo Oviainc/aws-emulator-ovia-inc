@@ -8,26 +8,29 @@
 //! `ValidationException` (HTTP 400) naming that member, before any listing is computed.
 //! The model expresses the bound nowhere — `GlobalNetworkIdList`, `SiteIdList`,
 //! `LinkIdList` and `DeviceIdList` carry a length on their member STRING only — so the
-//! rule holds for every such filter, not only the one the issue cited. It reaches
-//! `GetConnectionsRequest$ConnectionIds` too, whose own documentation is only "One or more
-//! connection IDs." (`smithy_query query="doc" shape="GetConnectionsRequest"
-//! member="ConnectionIds"`): that filter takes the class's bound, not a sentence of its
-//! own.
+//! rule holds for every such filter, not only the one the issue cited. It does NOT reach a
+//! filter member whose own documentation publishes no such sentence — the members
+//! `crate::unpublished_filter_maximum` covers, `GetConnectionsRequest$ConnectionIds` among
+//! them ("One or more connection IDs.", `smithy_query query="doc"
+//! shape="GetConnectionsRequest" member="ConnectionIds"`) — since the bound each filter
+//! takes is the one its member publishes.
 //!
 //! The table of lengths is the shared one `crate::filter_maximum_table` defines, with rows
 //! differing along the NUMBER of ids the filter carries: none, a few, the bound
 //! itself, one past it and far past it, plus a row whose values repeat (the bound counts
 //! the values the list carries, not the distinct resources they name). This suite spans
-//! every id-list filter this crate's implemented listings take over those rows.
+//! every id-list filter of this crate's implemented listings that publishes the bound, over
+//! those rows.
 //!
 //! The harness is the one `global_network_lifecycle` defines — one shared engine, this
 //! service, the production dispatch.
 
 use serde_json::json;
 
-use crate::connection_lifecycle::{create_connection_ok, id_of};
 use crate::device_lifecycle::create_device_ok;
-use crate::filter_maximum_table::{assert_filter_refusal, FIXTURE_COUNT, MAX_FILTER_VALUES, ROWS};
+use crate::filter_maximum_table::{
+    assert_filter_refusal, filtered_uri, FIXTURE_COUNT, MAX_FILTER_VALUES, ROWS,
+};
 use crate::global_network_lifecycle::{error_code, ids_of, Emulator};
 use crate::link_lifecycle::{create_link_ok, plain_link};
 
@@ -48,21 +51,8 @@ struct Filter {
     ids: Vec<String>,
 }
 
-/// The URI a row addresses: the listing plus one query parameter per filter value, the way
-/// a client binds a list to `@httpQuery` (ids of this service are hex and need no escaping).
-fn uri_for(filter: &Filter, values: &[String]) -> String {
-    if values.is_empty() {
-        return filter.uri.clone();
-    }
-    let query: Vec<String> = values
-        .iter()
-        .map(|id| format!("{}={id}", filter.query))
-        .collect();
-    format!("{}?{}", filter.uri, query.join("&"))
-}
-
-/// Create the fixture — [`FIXTURE_COUNT`] global networks, and that many sites, links,
-/// devices and connections inside the first of them — and describe each filter over it.
+/// Create the fixture — [`FIXTURE_COUNT`] global networks, and that many sites, links and
+/// devices inside the first of them — and describe each filter over it.
 async fn filters(emulator: &Emulator) -> Vec<Filter> {
     let mut networks: Vec<String> = Vec::new();
     for index in 0..FIXTURE_COUNT {
@@ -91,20 +81,6 @@ async fn filters(emulator: &Emulator) -> Vec<Filter> {
             )
             .await,
         );
-    }
-
-    // A connection ties two of the global network's devices together, so the connections
-    // come after the devices and all hang off the same pair.
-    let mut connections: Vec<String> = Vec::new();
-    for _ in 0..FIXTURE_COUNT {
-        connections.push(id_of(
-            &create_connection_ok(
-                emulator,
-                &parent,
-                json!({ "DeviceId": devices[0], "ConnectedDeviceId": devices[1] }),
-            )
-            .await,
-        ));
     }
 
     vec![
@@ -144,15 +120,6 @@ async fn filters(emulator: &Emulator) -> Vec<Filter> {
             uri: format!("/global-networks/{parent}/devices"),
             ids: devices,
         },
-        Filter {
-            operation: "GetConnections",
-            member: "ConnectionIds",
-            query: "connectionIds",
-            list: "Connections",
-            id_member: "ConnectionId",
-            uri: format!("/global-networks/{parent}/connections"),
-            ids: connections,
-        },
     ]
 }
 
@@ -174,7 +141,7 @@ async fn id_list_filters_are_honoured_up_to_the_documented_maximum_and_refused_p
         for row in &ROWS {
             let case = format!("{operation}/{}", row.name);
             let values = row.values(&filter.ids);
-            let uri = uri_for(filter, &values);
+            let uri = filtered_uri(&filter.uri, filter.query, &values, "");
             let (status, body) = emulator.get(&uri).await;
 
             if values.len() > MAX_FILTER_VALUES {

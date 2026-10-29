@@ -5486,11 +5486,13 @@ pub fn field_rejection(member: &str, reason: &str, message: String) -> Validatio
 
 /// How many ids ONE id-list filter of a reporting operation may name.
 ///
-/// Every id-list filter this service models documents the same bound: "The IDs of one or
-/// more global networks. The maximum is 10." on
+/// The bound is the one the member's OWN documentation publishes, so it reaches exactly
+/// the id-list filters whose documentation carries the sentence that publishes it: "The IDs
+/// of one or more global networks. The maximum is 10." on
 /// `DescribeGlobalNetworksRequest$GlobalNetworkIds`, and the same sentence on
 /// `GetSitesRequest$SiteIds` ("One or more site IDs. The maximum is 10."),
-/// `GetLinksRequest$LinkIds`, `GetDevicesRequest$DeviceIds` and
+/// `GetLinksRequest$LinkIds`, `GetDevicesRequest$DeviceIds`,
+/// `GetTransitGatewayRegistrationsRequest$TransitGatewayArns` and
 /// `GetCustomerGatewayAssociationsRequest$CustomerGatewayArns` ("One or more customer
 /// gateway Amazon Resource Names (ARNs). The maximum is 10.": `smithy_query query="doc"
 /// shape="<Request>" member="<Member>"`). The modelled list shapes do NOT express it as
@@ -5499,6 +5501,14 @@ pub fn field_rejection(member: &str, reason: &str, message: String) -> Validatio
 /// carries a length on the member STRING only — so the pre-handler constraint walk
 /// cannot enforce it and [`check_filter_ids`] does, exactly as the device and link
 /// descriptor maxima ([`MAX_DEVICE_DESCRIPTOR_CHARS`]) are enforced in handler code.
+///
+/// The id-list filters whose documentation publishes NO maximum do not take this bound and
+/// get no such refusal invented for them — `GetConnectionsRequest$ConnectionIds` ("One or
+/// more connection IDs."), `GetConnectPeerAssociationsRequest$ConnectPeerIds` and
+/// `GetTransitGatewayConnectPeerAssociationsRequest$TransitGatewayConnectPeerArns`: each of
+/// those listings serves a filter of any length: each selects by ONE pass over the records
+/// it holds, testing them against the ids the request named, so what the selection costs is
+/// bounded by what the store holds rather than by the length of the caller's list.
 pub const MAX_FILTER_IDS: usize = 10;
 
 /// Check one id-list filter against [`MAX_FILTER_IDS`].
@@ -5507,7 +5517,8 @@ pub const MAX_FILTER_IDS: usize = 10;
 /// empty one, which always passes), otherwise the modelled `ValidationException`
 /// (HTTP 400) naming `member` — the input member that carried the list — so a request past
 /// the documented maximum is refused before any listing is computed. Shared by every
-/// reporting operation that takes such a filter, so one rule reaches all of them.
+/// reporting operation whose id-list filter member PUBLISHES that maximum (see
+/// [`MAX_FILTER_IDS`] for which do and which do not), so one rule reaches all of them.
 pub fn check_filter_ids(member: &str, ids: &[String]) -> Result<(), ValidationException> {
     check_filter_list(member, ids.len(), "name", "ids")
 }
@@ -5523,11 +5534,11 @@ pub fn check_filter_ids(member: &str, ids: &[String]) -> Result<(), ValidationEx
 ///
 /// The bound MATTERS beyond tidiness: selecting a listing compares every entry it holds
 /// against every value a filter carries, so the work is the product of the two, and the
-/// count is what caps the caller's factor of it. It is the same number this service allows
-/// an id-list filter, so one maximum covers every filter of every reporting operation — but
-/// unlike that one it is CHOSEN rather than documented: no match list of this service
-/// carries a published maximum, so a request real AWS would plausibly accept is refused
-/// here past it.
+/// count is what caps the caller's factor of it — a value-match filter selects by COMPARING
+/// values rather than by looking an id up, so there is no keyed lookup to serve it with.
+/// It is the same number this service allows a documented id-list filter — but unlike that
+/// one it is CHOSEN rather than documented: no match list of this service carries a
+/// published maximum, so a request real AWS would plausibly accept is refused here past it.
 pub fn check_filter_values(member: &str, values: &[String]) -> Result<(), ValidationException> {
     check_filter_list(member, values.len(), "carry", "values")
 }

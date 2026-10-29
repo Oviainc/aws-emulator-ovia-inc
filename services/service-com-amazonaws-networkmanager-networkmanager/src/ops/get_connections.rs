@@ -7,9 +7,9 @@
 //! A read, so nothing is written: every connection's lifecycle state is a function of the
 //! clock, so a later caller sees the same records. An unknown `GlobalNetworkId` is the
 //! missing-resource answer (404 `ResourceNotFoundException`); each filter the query string
-//! carries narrows the listing and an absent one matches everything; `ConnectionIds` is
-//! bounded at the documented maximum of 10 ids and `DeviceId` matches a connection at
-//! EITHER end, since a connection ties two devices together.
+//! carries narrows the listing and an absent one matches everything; `ConnectionIds`
+//! publishes no maximum number of ids, so a filter of any length is served, and `DeviceId`
+//! matches a connection at EITHER end, since a connection ties two devices together.
 //!
 //! ## Shape of an operation
 //!
@@ -162,10 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = ::std::time::SystemTime::now();
-        // `ConnectionIds` documents a maximum of 10 ids that the modelled
-        // `ConnectionIdList` does not express as `@length`, so a longer filter is refused —
-        // before anything is listed — rather than silently honoured.
+        // The filter the request carried, turned into a SET before the store lock is taken:
+        // the set holds one entry per id however often the filter repeats it, and building it
+        // is work done OUTSIDE the lock every other caller of this service's store waits on.
         let requested = input.connection_ids.unwrap_or_default();
+        let wanted: ::std::collections::HashSet<&str> =
+            requested.iter().map(String::as_str).collect();
         let store = state.lock();
         // The resource the path addresses is checked first: an unknown global network is
         // not found whatever the query string carries.
@@ -178,9 +180,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-
-        crate::state::check_filter_ids("ConnectionIds", &requested)
-            .map_err(GetConnectionsErrorModeled::ValidationException)?;
 
         let after = match input.next_token.as_deref() {
             Some(token) => Some(
@@ -199,16 +198,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names is read the way every other reader and writer of an optional reference
         // reads it ([`crate::state::optional_reference`]): the empty string names no
         // resource, so it is the absence of the filter.
+        //
+        // `ConnectionIds` is "One or more connection IDs." (`smithy_query query="doc"
+        // shape="GetConnectionsRequest" member="ConnectionIds"`), which publishes none of
+        // the "The maximum is 10." bound `crate::state::check_filter_ids` guards for the
+        // filters that do, so no such refusal is invented here: a filter of any length is
+        // served the listing it selects.
+        //
+        // Selecting walks the stored connections ONCE and tests each against the set above,
+        // so the work done while the shared store is locked is bounded by what the store
+        // holds (itself bounded by [`crate::state::MAX_CONNECTIONS_PER_GLOBAL_NETWORK`] per
+        // global network) however long the list the caller sent — never the product of the
+        // two — and the answer keeps the store's own key order, which is the order a page
+        // token offsets into.
         let device_filter = crate::state::optional_reference(input.device_id.as_deref());
         let entries: Vec<(String, Connection)> = store
             .connections
             .iter()
-            .filter(|(_, record)| record.global_network_id == input.global_network_id)
-            .filter(|(id, _)| requested.is_empty() || requested.iter().any(|want| want == *id))
-            .filter(|(_, record)| {
-                device_filter.is_none_or(|want| {
-                    record.device_id == want || record.connected_device_id == want
-                })
+            .filter(|(id, record)| {
+                record.global_network_id == input.global_network_id
+                    // An ABSENT filter matches everything, which is the empty set here.
+                    && (wanted.is_empty() || wanted.contains(id.as_str()))
+                    && device_filter.is_none_or(|want| {
+                        record.device_id == want || record.connected_device_id == want
+                    })
             })
             .map(|(id, record)| (id.clone(), record.to_shape(now)))
             .collect();

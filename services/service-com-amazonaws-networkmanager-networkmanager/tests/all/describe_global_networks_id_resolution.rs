@@ -27,6 +27,7 @@
 //! The harness is the one `global_network_lifecycle` defines — one shared engine, this
 //! service, the production dispatch.
 
+use crate::filter_maximum_table::filtered_uri;
 use crate::global_network_lifecycle::{error_code, ids_of, Emulator, ListingCase};
 
 /// An id of the minted shape (`global-network-<17 lowercase hex>`) that names nothing:
@@ -42,20 +43,12 @@ const OTHER_KIND: &str = "site-f0000000000000003";
 /// still decided by the intersection with state.
 const NOT_AN_ID: &str = "nothing-like-an-id";
 
-/// The URI a request addresses: the listing plus one `globalNetworkIds` parameter per id
-/// (the way a client binds a list to `@httpQuery`), and `maxResults` when a row sets one.
+/// The URI a request addresses: the listing plus one `globalNetworkIds` parameter per id,
+/// and `maxResults` when a row sets one. The list-to-`@httpQuery` binding itself is
+/// `crate::filter_maximum_table`'s one statement of it.
 fn uri_for(ids: &[String], max_results: Option<usize>) -> String {
-    let mut query: Vec<String> = ids
-        .iter()
-        .map(|id| format!("globalNetworkIds={id}"))
-        .collect();
-    if let Some(size) = max_results {
-        query.push(format!("maxResults={size}"));
-    }
-    if query.is_empty() {
-        return "/global-networks".to_string();
-    }
-    format!("/global-networks?{}", query.join("&"))
+    let extra = max_results.map_or_else(String::new, |size| format!("maxResults={size}"));
+    filtered_uri("/global-networks", "globalNetworkIds", ids, &extra)
 }
 
 /// Ask `uri` for a page, assert it is a 200, and answer the ids it carries.

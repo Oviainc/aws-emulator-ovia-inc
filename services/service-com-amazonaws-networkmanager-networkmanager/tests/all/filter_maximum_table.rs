@@ -20,14 +20,40 @@
 //! handler's to answer.
 //!
 //! The suites that consume this table: `crate::filter_id_list_maximum` (every id-list
-//! filter, by length), `crate::site_ids_filter_maximum` (`SiteIds` and
-//! `TransitGatewayArns`, crossed with the rest of the query string) and
+//! filter that publishes the bound, by length), `crate::site_ids_filter_maximum` (`SiteIds`
+//! and `TransitGatewayArns`, crossed with the rest of the query string),
 //! `crate::link_ids_filter_maximum` (`LinkIds` and `DeviceIds`, crossed with the value
-//! selectors their listings take).
+//! selectors their listings take) and `crate::unpublished_filter_maximum` (the OTHER half
+//! of the rule: the filter members that publish no maximum, which take the same lengths and
+//! are served every one of them).
 
 use serde_json::{json, Value};
 
 use crate::global_network_lifecycle::error_code;
+use crate::resource_tagging::escape;
+
+/// The URI one row of such a table addresses: the listing's `uri`, one `query` parameter per
+/// filter value (the way a client binds a list to `@httpQuery`), and `extra` — any further
+/// query fragment the row carries (`maxResults=1`, a page token), already spelled as a
+/// client sends it — appended last.
+///
+/// Every value is percent-encoded with [`escape`], which is the identity on an id of this
+/// service and what a client does to a filter value that is an ARN. One statement of the
+/// binding for every suite of this class, so none of them can disagree with another about
+/// how a list reaches the wire.
+pub(crate) fn filtered_uri(uri: &str, query: &str, values: &[String], extra: &str) -> String {
+    let mut parameters: Vec<String> = values
+        .iter()
+        .map(|value| format!("{query}={}", escape(value)))
+        .collect();
+    if !extra.is_empty() {
+        parameters.push(extra.to_string());
+    }
+    if parameters.is_empty() {
+        return uri.to_string();
+    }
+    format!("{uri}?{}", parameters.join("&"))
+}
 
 /// The published maximum number of values one of these filter members may carry (see this
 /// module's own documentation for the sentence that publishes it and the members it is

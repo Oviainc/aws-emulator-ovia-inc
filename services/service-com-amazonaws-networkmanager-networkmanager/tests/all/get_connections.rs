@@ -5,9 +5,9 @@
 //!
 //! What the siblings already cover: `connection_lifecycle` pins the stored record, the
 //! narrowing on either end of a connection and the walk over every accepted page size;
-//! `filter_id_list_maximum` pins the `ConnectionIds` bound alongside the other id-list
-//! filters of this service; `global_network_lifecycle` pins the refusal of a continuation
-//! token this service did not mint, `GetConnections` included.
+//! `unpublished_filter_maximum` pins the `ConnectionIds` filter at every length, that
+//! member publishing no maximum; `global_network_lifecycle` pins the refusal of a
+//! continuation token this service did not mint, `GetConnections` included.
 //!
 //! What this suite adds:
 //!

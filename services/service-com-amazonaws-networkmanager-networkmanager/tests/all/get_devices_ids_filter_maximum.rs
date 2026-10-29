@@ -41,10 +41,10 @@ use serde_json::json;
 
 use crate::device_lifecycle::create_device_ok;
 use crate::filter_maximum_table::{
-    assert_filter_refusal, unknown_ids, EXTRAS, FIXTURE_COUNT, MAX_FILTER_VALUES, ROWS,
+    assert_filter_refusal, filtered_uri, unknown_ids, EXTRAS, FIXTURE_COUNT, MAX_FILTER_VALUES,
+    ROWS,
 };
 use crate::global_network_lifecycle::{error_code, ids_of, Emulator};
-use crate::resource_tagging::escape;
 
 /// One row of the provenance table: what the ids the filter carries name.
 struct Provenance {
@@ -122,21 +122,15 @@ async fn fixture(emulator: &Emulator) -> Fixture {
 }
 
 /// The devices URI of `network`, carrying one `deviceIds` parameter per value plus `extra`
-/// (already a query fragment, so it travels unescaped).
+/// (already a query fragment, so it travels unescaped). The list-to-`@httpQuery` binding is
+/// `crate::filter_maximum_table`'s one statement of it.
 fn uri_for(network: &str, values: &[String], extra: &str) -> String {
-    let mut query: Vec<String> = values
-        .iter()
-        .map(|id| format!("deviceIds={}", escape(id)))
-        .collect();
-    if !extra.is_empty() {
-        query.push(extra.to_string());
-    }
-    let base = format!("/global-networks/{network}/devices");
-    if query.is_empty() {
-        base
-    } else {
-        format!("{base}?{}", query.join("&"))
-    }
+    filtered_uri(
+        &format!("/global-networks/{network}/devices"),
+        "deviceIds",
+        values,
+        extra,
+    )
 }
 
 #[tokio::test]
