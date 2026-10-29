@@ -4064,15 +4064,20 @@ pub struct StageParticipant {
     pub attributes: HashMap<String, String>,
 }
 
-/// The participant `participant_id` of the stage `stage_arn`, or `None` when this
-/// service issued no identity for that participant in that stage.
+/// The identity this service ISSUED for `participant_id` against the stage `stage_arn`,
+/// or `None` when it issued none.
 ///
 /// A participant id is "assigned by IVS and returned by `CreateParticipantToken`" (the
 /// model's doc for the member, on every operation that takes one) or minted with an
 /// ingest configuration's credentials, so the identities this store holds for a stage are
 /// exactly its token records and the credentials of the ingest configurations associated
-/// with it. The ONE lookup for "does this stage have this participant, and may it
-/// publish", so no two operations can disagree about it.
+/// with it. The ONE lookup for "what did this service issue this participant for this
+/// stage, and may it publish there" — the capability a request to publish on its behalf
+/// turns on, and the name and attributes such a request carries over.
+///
+/// This is NOT the question "is this participant in this stage": a stage holds whatever
+/// participant records its sessions hold, including one whose identity was issued against
+/// another stage, which is [`participant_attached_to_stage`].
 pub fn stage_participant(
     state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     stage_arn: &str,
@@ -4110,6 +4115,38 @@ pub fn stage_participant(
             user_id: configuration.user_id.clone(),
             attributes: configuration.attributes.clone(),
         })
+}
+
+/// Whether the participant `participant_id` is attached to the stage `stage_arn` — the
+/// relation `DisconnectParticipant$stageArn` names ("ARN of the stage to which the
+/// participant is attached").
+///
+/// A stage has the participants its own records hold: every participant record in a
+/// session of that stage, whatever opened it and whatever state it is now in — a join over
+/// the stage's data plane, or a replication putting a replica of another stage's publisher
+/// into it ([`record_replicated_participant`]) — together with the identities this service
+/// issued against the stage ([`stage_participant`]), which a holder can present to the
+/// stage whether or not it has joined yet.
+///
+/// The ONE answer to "does this stage have this participant", so an operation that acts on
+/// a participant of a stage and the readers that report that stage's participants
+/// (`ListParticipants`, `GetParticipant`) cannot disagree about which participants the
+/// stage has. `false` for a stage this store holds nothing of, and for a participant whose
+/// records and identities all belong to other stages.
+pub fn participant_attached_to_stage(
+    state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    participant_id: &str,
+) -> bool {
+    let recorded = state.stage_sessions.get(stage_arn).is_some_and(|sessions| {
+        sessions.iter().any(|session| {
+            session
+                .participants
+                .iter()
+                .any(|participant| participant.participant_id == participant_id)
+        })
+    });
+    recorded || stage_participant(state, stage_arn, participant_id).is_some()
 }
 
 /// One publisher broadcasting with an ingest configuration right now: the session of

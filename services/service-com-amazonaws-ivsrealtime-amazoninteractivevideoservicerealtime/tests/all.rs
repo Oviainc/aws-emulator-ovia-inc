@@ -43,6 +43,8 @@ mod delete_stage_ends_replications;
 mod delete_storage_configuration;
 #[path = "all/disconnect_participant.rs"]
 mod disconnect_participant;
+#[path = "all/disconnect_participant_stage_records.rs"]
+mod disconnect_participant_stage_records;
 #[path = "all/documented_member_defaults.rs"]
 mod documented_member_defaults;
 #[path = "all/empty_response_framing.rs"]

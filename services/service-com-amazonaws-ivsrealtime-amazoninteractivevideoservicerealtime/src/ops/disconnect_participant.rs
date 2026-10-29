@@ -10,6 +10,12 @@
 //! associated with no stage (`crate::state::NO_ASSOCIATED_STAGE_ARN`), which is what the
 //! operation's own doc states it does.
 //!
+//! The participant it can act on is any participant the named stage HAS
+//! (`crate::state::participant_attached_to_stage`): one the stage's own records hold —
+//! whichever call recorded it, a data-plane join or a replication putting a replica of
+//! another stage's publisher into it — or an identity this service issued against the
+//! stage. Only a participant that is neither is the modelled `ResourceNotFoundException`.
+//!
 //! `reason` describes "why this participant is being disconnected" and no member of any
 //! shape this service reports carries it (`Participant`, `ParticipantSummary` and `Event`
 //! each have no such member), so it is read and not persisted.
@@ -180,17 +186,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both identifiers the request carries name a resource, so neither being held is
         // the modelled `ResourceNotFoundException` (HTTP 404) — the stage first, in this
         // request's own region's view of the account, then the participant "attached" to
-        // it, resolved through the ONE lookup for "does this stage have this participant"
-        // (`crate::state::stage_participant`) that `StartParticipantReplication` resolves
-        // one with.
+        // it, resolved through the ONE answer to "does this stage have this participant"
+        // (`crate::state::participant_attached_to_stage`): a participant the stage's own
+        // records hold, whichever call recorded it, or an identity this service issued
+        // against the stage. The readers of the same stage report exactly those
+        // participants, so a participant `ListParticipants` reports is one this operation
+        // can take out of the stage.
         if store.stage_in(&region, &input.stage_arn).is_none() {
             return Err(crate::state::resource_not_found(
                 DisconnectParticipantErrorModeled::ResourceNotFoundException,
                 &input.stage_arn,
             ));
         }
-        if crate::state::stage_participant(&store, &input.stage_arn, &input.participant_id).is_none()
-        {
+        if !crate::state::participant_attached_to_stage(
+            &store,
+            &input.stage_arn,
+            &input.participant_id,
+        ) {
             return Err(crate::state::resource_not_found(
                 DisconnectParticipantErrorModeled::ResourceNotFoundException,
                 &input.participant_id,
