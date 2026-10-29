@@ -2912,6 +2912,40 @@ pub fn leave_stage_session(
     true
 }
 
+/// Record the end of a now-ENDED replication as an occurrence of the session its
+/// replicated publisher is in.
+///
+/// The ONE place the end of a replication is written into the SOURCE session, whichever way
+/// that replication ended — a caller stopping it, or a stage it names going away — so the
+/// session that recorded [`EVENT_REPLICATION_STARTED`] when the replication began always
+/// records the counterpart when it ends, and a reader of that session's occurrences is told
+/// why the replication it saw start is no longer running. The model marks
+/// `Event$destinationStageArn` and `Event$destinationSessionId` "applicable only if the
+/// event name is REPLICATION_STARTED or REPLICATION_STOPPED", so the occurrence carries the
+/// destination the ended replication named. The publisher itself is not a replica — it
+/// publishes in the source stage — so `replica` stays false.
+///
+/// `ended` must already have stopped being [`REPLICATION_STATE_ACTIVE`] in this store (the
+/// caller has stopped it, or is about to drop its record), so that no replication still
+/// running is reported as having ended.
+///
+/// `false` — nothing recorded — when this store no longer holds that source session, which
+/// is what the SOURCE stage of the replication being the one going away leaves.
+pub fn record_replication_stopped(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    ended: &ParticipantReplicaRecord,
+) -> bool {
+    let mut event = ParticipantEvent::new(EVENT_REPLICATION_STOPPED, &ended.participant_id);
+    event.destination_stage_arn = Some(ended.destination_stage_arn.clone());
+    event.destination_session_id = Some(ended.destination_session_id.clone());
+    record_participant_event(
+        state,
+        &ended.source_stage_arn,
+        &ended.source_session_id,
+        event,
+    )
+}
+
 /// Take the replica a now-ENDED replication put into its destination stage back out of
 /// that stage's session.
 ///
@@ -2962,7 +2996,9 @@ pub fn release_ended_replica(
 /// it would be had each of those replications been stopped instead.
 ///
 /// The replicas replicated INTO `stage_arn` need no departure: those records are records of
-/// this stage's own sessions, which go with the stage.
+/// this stage's own sessions, which go with the stage. Their SOURCE session is what survives
+/// that delete, and it is left as a stop would have left it: the end of each of those
+/// replications is an occurrence of it ([`record_replication_stopped`]).
 pub fn end_replications_of_stage(
     state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     stage_arn: &str,
@@ -2972,17 +3008,36 @@ pub fn end_replications_of_stage(
     // replications [`release_ended_replica`] keeps a replica in a stage for, and it is
     // still the record every report of that departing participant reads its replication
     // members off.
-    let mut ended: Vec<ParticipantReplicaRecord> = Vec::new();
+    let mut sourced_here: Vec<ParticipantReplicaRecord> = Vec::new();
     if let Some(sourced) = state.participant_replicas.get_mut(stage_arn) {
         for replication in sourced
             .iter_mut()
             .filter(|replication| replication.replication_state == REPLICATION_STATE_ACTIVE)
         {
             replication.replication_state = REPLICATION_STATE_STOPPED.to_string();
-            ended.push(replication.clone());
+            sourced_here.push(replication.clone());
         }
     }
-    for replication in &ended {
+    // Every replication INTO this stage ends with it too, and reaches its stopped state the
+    // same way first. Only the ones still RUNNING end here: a replication a caller already
+    // stopped recorded its end then.
+    let mut into_here: Vec<ParticipantReplicaRecord> = Vec::new();
+    for replications in state.participant_replicas.values_mut() {
+        for replication in replications.iter_mut().filter(|replication| {
+            replication.destination_stage_arn == stage_arn
+                && replication.replication_state == REPLICATION_STATE_ACTIVE
+        }) {
+            replication.replication_state = REPLICATION_STATE_STOPPED.to_string();
+            into_here.push(replication.clone());
+        }
+    }
+    for replication in sourced_here.iter().chain(into_here.iter()) {
+        // The end of a replication is an occurrence of the session its publisher is in,
+        // through the one place that is written — which records nothing for a replication
+        // this stage SOURCED, whose source session went with the stage above.
+        record_replication_stopped(state, replication);
+    }
+    for replication in &sourced_here {
         release_ended_replica(state, replication);
     }
     // The replications sourced from this stage go with its key; the ones replicated INTO it

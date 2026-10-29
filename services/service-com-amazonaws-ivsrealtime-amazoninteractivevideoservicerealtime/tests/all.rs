@@ -95,6 +95,8 @@ mod participants;
 mod region_scoped_resources;
 #[path = "all/replicated_participant_views.rs"]
 mod replicated_participant_views;
+#[path = "all/replication_end_recorded_in_source_session.rs"]
+mod replication_end_recorded_in_source_session;
 #[path = "all/response_headers.rs"]
 mod response_headers;
 #[path = "all/signing_name_routing.rs"]

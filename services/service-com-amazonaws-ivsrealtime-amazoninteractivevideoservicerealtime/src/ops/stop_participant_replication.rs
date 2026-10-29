@@ -237,23 +237,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stopped = replication.clone();
 
         // Replication stopping is an occurrence during the session the replicated publisher
-        // is in, the counterpart of the one its start recorded: the model marks
-        // `Event$destinationStageArn` and `Event$destinationSessionId` "applicable only if
-        // the event name is REPLICATION_STARTED or REPLICATION_STOPPED", so this event
-        // carries the destination the stopped replication named. The publisher itself is
-        // not a replica — it publishes in the source stage — so `replica` stays false.
-        let mut event = crate::state::ParticipantEvent::new(
-            crate::state::EVENT_REPLICATION_STOPPED,
-            &stopped.participant_id,
-        );
-        event.destination_stage_arn = Some(stopped.destination_stage_arn.clone());
-        event.destination_session_id = Some(stopped.destination_session_id.clone());
-        crate::state::record_participant_event(
-            &mut store,
-            &stopped.source_stage_arn,
-            &stopped.source_session_id,
-            event,
-        );
+        // is in, the counterpart of the one its start recorded, written through the one
+        // place the end of a replication is recorded there
+        // (`crate::state::record_replication_stopped`) — so this stop and the end of the
+        // same replication reached by deleting a stage it names leave that session the
+        // same.
+        crate::state::record_replication_stopped(&mut store, &stopped);
 
         // The replica is what the replication put into the destination stage, so stopping
         // it takes that participant back out of the destination stage's session, through
