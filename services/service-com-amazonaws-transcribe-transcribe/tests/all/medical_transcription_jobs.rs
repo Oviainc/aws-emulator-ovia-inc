@@ -7,7 +7,10 @@
 //! dispatches on, so these tests exercise the awsJson1_1 envelope, the boundary
 //! constraint validation and the handlers' own refusals — not just the handler bodies.
 //! The emulator, the call and the answer assertions are the transcription-job suite's
-//! harness (`crate::transcription_jobs`), reused rather than stood up a second time.
+//! harness (`crate::transcription_jobs`), reused rather than stood up a second time —
+//! in the variant that mounts the object store beside the service, because a row that
+//! applies a custom medical vocabulary needs one the service has BUILT, and this
+//! family's terms come only from the table file at its `VocabularyFileUri`.
 //!
 //! THE RULE UNDER TEST: a medical transcription job is a stored record of what the
 //! start request asked for, `IN_PROGRESS` from the moment it is started and moved to
@@ -156,27 +159,34 @@ fn expected_transcript_uri(request: &Value) -> String {
     }
 }
 
-/// `CreateMedicalVocabulary` for every custom medical vocabulary the rows of
-/// [`start_requests`] apply, so the account holds them: a start may only name a custom
-/// medical vocabulary this account created (see the `settings_co_requirements` suite,
-/// which asserts that rule).
-async fn create_the_vocabularies_the_rows_name(transcribe: &Transcribe) {
+/// Every media location the rows of [`start_requests`] name, plus the one the
+/// shared-name row starts a NON-medical job with: with the object store mounted, a
+/// start whose media it does not hold is refused, so what the rows name is staged.
+const STAGED_MEDIA: &[&str] = &[
+    "s3://example-media/dictation.wav",
+    "s3://example-media/two-channel.flac",
+    "s3://example-media/notes.mp3",
+    "s3://example-media/not-medical.wav",
+];
+
+/// An emulator holding everything the rows of [`start_requests`] name: the media each
+/// start is pointed at, and every custom medical vocabulary a row applies, built from a
+/// table file the object store serves and waited out until it is `READY`.
+///
+/// A start may only name a custom medical vocabulary this account holds AND has finished
+/// building (see the `medical_job_start_vocabulary_state` suite, which asserts that
+/// rule), and this family's terms come only from its table file — so these rows need the
+/// object store beside the service.
+async fn given_what_the_rows_name() -> Transcribe {
+    let transcribe = Transcribe::with_object_store();
+    transcribe.given_media_objects(STAGED_MEDIA).await;
     for (_, request) in start_requests() {
         let Some(name) = request["Settings"]["VocabularyName"].as_str() else {
             continue;
         };
-        transcribe
-            .call(
-                "CreateMedicalVocabulary",
-                json!({
-                    "VocabularyName": name,
-                    "LanguageCode": "en-US",
-                    "VocabularyFileUri": "s3://DOC-EXAMPLE-BUCKET/clinical-terms.txt"
-                }),
-            )
-            .await
-            .ok(&format!("CreateMedicalVocabulary {name:?}"));
+        transcribe.medical_vocabulary_ready(name).await;
     }
+    transcribe
 }
 
 /// `GetMedicalTranscriptionJob` for `name`.
@@ -191,8 +201,7 @@ async fn get(transcribe: &Transcribe, name: &str) -> crate::transcription_jobs::
 
 #[tokio::test]
 async fn a_started_medical_transcription_job_reads_back_exactly_as_it_was_started() {
-    let transcribe = Transcribe::new();
-    create_the_vocabularies_the_rows_name(&transcribe).await;
+    let transcribe = given_what_the_rows_name().await;
 
     for (case, request) in start_requests() {
         let started = transcribe
@@ -271,8 +280,7 @@ async fn a_started_medical_transcription_job_reads_back_exactly_as_it_was_starte
 
 #[tokio::test]
 async fn a_medical_transcription_job_completes_once_its_processing_span_has_elapsed() {
-    let transcribe = Transcribe::new();
-    create_the_vocabularies_the_rows_name(&transcribe).await;
+    let transcribe = given_what_the_rows_name().await;
 
     for (case, request) in start_requests() {
         transcribe
@@ -445,8 +453,7 @@ async fn a_start_whose_members_cannot_hold_together_is_refused() {
 
 #[tokio::test]
 async fn a_second_start_under_a_live_job_name_is_a_conflict() {
-    let transcribe = Transcribe::new();
-    create_the_vocabularies_the_rows_name(&transcribe).await;
+    let transcribe = given_what_the_rows_name().await;
 
     for (case, request) in start_requests() {
         transcribe
@@ -478,8 +485,7 @@ async fn a_second_start_under_a_live_job_name_is_a_conflict() {
 /// in use in both families at once and each read answers its own record.
 #[tokio::test]
 async fn a_medical_job_and_a_transcription_job_may_share_a_name() {
-    let transcribe = Transcribe::new();
-    create_the_vocabularies_the_rows_name(&transcribe).await;
+    let transcribe = given_what_the_rows_name().await;
 
     for (case, request) in start_requests() {
         let name = job_name(&request);

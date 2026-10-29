@@ -79,6 +79,8 @@ mod list_cursor_spelling_rule;
 mod list_paging_rule;
 #[path = "all/media_object_resolution.rs"]
 mod media_object_resolution;
+#[path = "all/medical_job_start_vocabulary_state.rs"]
+mod medical_job_start_vocabulary_state;
 #[path = "all/medical_scribe_clinical_note_template.rs"]
 mod medical_scribe_clinical_note_template;
 #[path = "all/medical_scribe_job_listing.rs"]

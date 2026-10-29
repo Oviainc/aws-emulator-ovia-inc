@@ -31,6 +31,20 @@ const PAST_EVERY_TRANSITION: Duration = Duration::from_millis(1_300);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const POLLS_FOR_READY: usize = 40;
 
+/// The bucket the table files [`Transcribe::medical_vocabulary_ready`] stages live in —
+/// the CALLER's own bucket, the one a caller uploads its vocabulary table to before
+/// calling ("you must first upload a text file that contains your vocabulary table into
+/// an Amazon S3 bucket").
+pub(crate) const VOCABULARY_TABLE_BUCKET: &str = "example-vocabulary-tables";
+
+/// What such a staged table file holds: the `Phrase IPA SoundsLike DisplayAs` column
+/// header `CreateMedicalVocabulary` documents for a vocabulary table, and one row under
+/// it. What a build reads OUT of such a file is
+/// `crate::vocabulary_file_objects`' subject; here it only has to be a table the store
+/// serves.
+const MEDICAL_VOCABULARY_TABLE: &[u8] = b"Phrase\tIPA\tSoundsLike\tDisplayAs\n\
+                                          Tympanic-membrane\t\t\tTympanic membrane\n";
+
 /// One emulator: the service mounted on a single shared engine behind the router.
 ///
 /// `pub(crate)`, like [`Reply`] and [`dispatch`] below it: the vocabulary suite in this
@@ -59,6 +73,23 @@ impl Transcribe {
         );
         Self {
             router: Arc::new(router),
+        }
+    }
+
+    /// One emulator with this service AND the Amazon S3 its builds read their files
+    /// from, both on a single shared engine — the media-resolution suite's emulator
+    /// (`crate::media_object_resolution::emulator`), reused rather than assembled a
+    /// second time.
+    ///
+    /// A suite needs this harness where a record it names has to be BUILT from a file:
+    /// a custom medical vocabulary's terms come only from the table file at its
+    /// `VocabularyFileUri`, so only an object store that serves that file can make one
+    /// usable ([`Self::medical_vocabulary_ready`]). With the store mounted, the media a
+    /// start names is resolved against it too, so a suite using this harness stages the
+    /// media its rows name first ([`Self::given_media_objects`]).
+    pub(crate) fn with_object_store() -> Self {
+        Self {
+            router: crate::media_object_resolution::emulator(),
         }
     }
 
@@ -106,10 +137,91 @@ impl Transcribe {
     /// The one home for "wait out a vocabulary's build": [`Self::vocabulary_ready`] is
     /// this plus the assertion that the build succeeded.
     pub(crate) async fn vocabulary_settled(&self, name: &str, region: Option<&str>) -> String {
-        let case = format!("GetVocabulary {name:?}");
+        self.vocabulary_state_settled("GetVocabulary", name, region)
+            .await
+    }
+
+    /// Stage every `s3://<bucket>/<key>` location of `uris` as an object of this
+    /// emulator's own Amazon S3 — the upload a caller performs before a start names the
+    /// media ("you must first upload your media file into an Amazon S3 bucket").
+    ///
+    /// Only needed with [`Self::with_object_store`]: with the store mounted, a start
+    /// whose media it reports it does not hold is refused, so a suite that mounts it
+    /// stages what its rows name. A location that is not an object address (an
+    /// `http(s)` URI naming a host) is left alone — the object store is never asked
+    /// about one.
+    pub(crate) async fn given_media_objects(&self, uris: &[&str]) {
+        for uri in uris {
+            let Some((bucket, key)) = uri
+                .strip_prefix("s3://")
+                .and_then(|rest| rest.split_once('/'))
+            else {
+                continue;
+            };
+            self.given_object(bucket, key, crate::media_object_resolution::MEDIA_BYTES)
+                .await;
+        }
+    }
+
+    /// `CreateMedicalVocabulary` for `name` from a table file this emulator's own
+    /// Amazon S3 serves, waited out until its build has settled and asserted `READY` —
+    /// the one state a job may apply a custom medical vocabulary in ("If the state is
+    /// READY, you can use the custom vocabulary in a StartMedicalTranscriptionJob
+    /// request", the model's doc for `GetMedicalVocabularyResponse$VocabularyState`).
+    ///
+    /// This family's terms can come from nowhere but that file, so a suite that starts
+    /// a job naming a custom medical vocabulary needs [`Self::with_object_store`] and
+    /// this helper. One home for it beside the dispatcher, exactly as
+    /// [`Self::vocabulary_ready`] is the non-medical family's.
+    pub(crate) async fn medical_vocabulary_ready(&self, name: &str) {
+        let key = format!("{name}.txt");
+        self.given_object(VOCABULARY_TABLE_BUCKET, &key, MEDICAL_VOCABULARY_TABLE)
+            .await;
+        self.call(
+            "CreateMedicalVocabulary",
+            json!({
+                "VocabularyName": name,
+                // "US English (en-US) is the only language supported with Amazon
+                // Transcribe Medical" (the model's doc for this request's LanguageCode).
+                "LanguageCode": "en-US",
+                "VocabularyFileUri": format!("s3://{VOCABULARY_TABLE_BUCKET}/{key}")
+            }),
+        )
+        .await
+        .ok(&format!("CreateMedicalVocabulary {name:?}"));
+        let state = self.medical_vocabulary_settled(name).await;
+        assert_eq!(
+            state, "READY",
+            "case {name:?}: a medical vocabulary built from a table file the object \
+             store serves must settle READY, got {state:?}"
+        );
+    }
+
+    /// Poll `GetMedicalVocabulary` until the build of the custom MEDICAL vocabulary
+    /// `name` has FINISHED, and answer the `VocabularyState` it settled in — `READY`
+    /// for one whose table file the object store served, `FAILED` for one whose file it
+    /// did not. The medical family's half of [`Self::vocabulary_settled`].
+    pub(crate) async fn medical_vocabulary_settled(&self, name: &str) -> String {
+        self.vocabulary_state_settled("GetMedicalVocabulary", name, None)
+            .await
+    }
+
+    /// Poll the reader `get` of a custom-vocabulary family until the build of `name`,
+    /// held in `region`, has FINISHED, and answer the `VocabularyState` it settled in.
+    ///
+    /// BOTH custom-vocabulary families report the same member for the same reason — a
+    /// build is `PENDING` while it runs and settles in one of the terminal values of
+    /// that one enum — so the two waits differ in nothing but the reader they poll.
+    async fn vocabulary_state_settled(
+        &self,
+        get: &str,
+        name: &str,
+        region: Option<&str>,
+    ) -> String {
+        let case = format!("{get} {name:?}");
         for _ in 0..POLLS_FOR_READY {
             let reply = self
-                .call_in_region("GetVocabulary", json!({"VocabularyName": name}), region)
+                .call_in_region(get, json!({"VocabularyName": name}), region)
                 .await;
             let state = reply.ok(&case)["VocabularyState"]
                 .as_str()
@@ -121,6 +233,18 @@ impl Transcribe {
             std::thread::sleep(POLL_INTERVAL);
         }
         panic!("case {case:?}: the custom vocabulary's build never finished");
+    }
+
+    /// Store `bytes` at `key` of `bucket` in this emulator's own Amazon S3, creating
+    /// the bucket first — the caller's own bucket, which the caller creates and uploads
+    /// to before calling, as the real service requires.
+    ///
+    /// `pub(crate)` so a suite staging a file of its own (a vocabulary table whose
+    /// content it chose) reaches the store the same way, through the one staging path
+    /// (`crate::media_object_resolution::given_object`). Needs
+    /// [`Self::with_object_store`].
+    pub(crate) async fn given_object(&self, bucket: &str, key: &str, bytes: &[u8]) {
+        crate::media_object_resolution::given_object(&self.router, bucket, key, bytes).await;
     }
 
     /// Wait until the custom language model `name`, held in `region`, is one a job may
@@ -167,6 +291,24 @@ impl Transcribe {
         }
         panic!("case {case:?}: the custom language model's training never finished");
     }
+}
+
+/// How this service refuses a start that names a custom resource it cannot APPLY: the
+/// kind of resource, the name the request asked for, the state this account holds that
+/// resource in, and the one value of that family's own processing member its model
+/// documents as the usable one.
+///
+/// The expected wording, spelled once for every suite that asserts a start refused for a
+/// resource's state (`crate::job_start_vocabulary_state`,
+/// `crate::job_start_language_model_status` and
+/// `crate::medical_job_start_vocabulary_state`), so three suites cannot drift apart
+/// about the same modelled text.
+pub(crate) fn not_usable_message(kind: &str, name: &str, state: &str, usable: &str) -> String {
+    format!(
+        "The custom {kind} {name} is in the {state} state and can't be used. A custom \
+         {kind} can only be used when its state is {usable}. Check the state of the \
+         {kind} and try your request again."
+    )
 }
 
 /// One awsJson1_1 call through `router`, signed for `region` when one is given.

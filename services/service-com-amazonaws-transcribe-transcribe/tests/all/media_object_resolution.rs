@@ -66,7 +66,10 @@ pub(crate) const STAGED_KEYS: &[&str] = &["dictation.wav", "clinic/visits/consul
 
 /// The bytes every staged object holds. Nothing reads a media file's content — no audio
 /// is transcribed — so one short payload serves every row.
-const MEDIA_BYTES: &[u8] = b"RIFF....WAVEfmt emulator media object";
+///
+/// `pub(crate)` because the shared harness stages media through it too
+/// ([`crate::transcription_jobs::Transcribe::given_media_objects`]).
+pub(crate) const MEDIA_BYTES: &[u8] = b"RIFF....WAVEfmt emulator media object";
 
 /// Long enough for the `IN_PROGRESS -> COMPLETED` (or `-> FAILED`) transition of a job
 /// started during the test to have fallen due: one span of
@@ -143,25 +146,45 @@ pub(crate) async fn s3(
     (response.status().as_u16(), response.body().clone())
 }
 
+/// `PUT /<bucket>` — `CreateBucket` — then `PUT /<bucket>/<key>` — `PutObject`, so the
+/// object store really holds `bytes` at that address — the upload a caller performs
+/// before naming the location in a request.
+///
+/// The ONE staging path for [`REGION`]: [`given_staged_media`] stages this suite's media
+/// through it, and the shared harness stages whatever a suite of its own names through
+/// the same function ([`crate::transcription_jobs::Transcribe::given_object`]), so two
+/// suites cannot disagree about what staging an object means. The language-model suite
+/// keeps its own pair (`crate::language_model_training_data::create_bucket` and `stage`)
+/// because it signs for another Region and creates its bucket with that Region's
+/// `LocationConstraint`.
+pub(crate) async fn given_object(
+    emulator: &MultiServiceRouter,
+    bucket: &str,
+    key: &str,
+    bytes: &[u8],
+) {
+    let (status, body) = s3(emulator, "PUT", &format!("/{bucket}"), &[]).await;
+    assert_eq!(
+        status,
+        200,
+        "the bucket {bucket} must be created first, got HTTP {status} with body {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    let (status, body) = s3(emulator, "PUT", &format!("/{bucket}/{key}"), bytes).await;
+    assert_eq!(
+        status,
+        200,
+        "the object {bucket}/{key} must be stored, got HTTP {status} with body {:?}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
 /// `PUT /<bucket>` — `CreateBucket` — then `PUT /<bucket>/<key>` — `PutObject` — for
 /// every key of [`STAGED_KEYS`], so the object store really holds the media the
 /// accepted rows below name.
 pub(crate) async fn given_staged_media(emulator: &MultiServiceRouter) {
-    let (status, body) = s3(emulator, "PUT", &format!("/{BUCKET}"), &[]).await;
-    assert_eq!(
-        status,
-        200,
-        "the media bucket must be created first, got {status} with body {:?}",
-        String::from_utf8_lossy(&body)
-    );
     for key in STAGED_KEYS {
-        let (status, body) = s3(emulator, "PUT", &format!("/{BUCKET}/{key}"), MEDIA_BYTES).await;
-        assert_eq!(
-            status,
-            200,
-            "the media object {BUCKET}/{key} must be stored, got {status} with body {:?}",
-            String::from_utf8_lossy(&body)
-        );
+        given_object(emulator, BUCKET, key, MEDIA_BYTES).await;
     }
 }
 

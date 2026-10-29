@@ -179,26 +179,33 @@ fn job_name(request: &Value) -> String {
         .to_string()
 }
 
-/// `CreateMedicalVocabulary` for every custom medical vocabulary the rows apply, so the
-/// account holds them: a start may only name a custom medical vocabulary this account
-/// created (the `settings_co_requirements` suite asserts that rule).
-async fn create_the_vocabularies_the_rows_name(transcribe: &Transcribe) {
+/// Every media location the rows name as an object of the emulator's own Amazon S3:
+/// with the object store mounted, a start whose media it does not hold is refused, so
+/// what the rows name is staged.
+const STAGED_MEDIA: &[&str] = &[
+    "s3://example-media/dictation.wav",
+    "s3://example-media/two-channel.flac",
+    "s3://example-media/notes.mp3",
+];
+
+/// An emulator holding everything the rows name: the media each start is pointed at,
+/// and every custom medical vocabulary a row applies, built from a table file the object
+/// store serves and waited out until it is `READY`.
+///
+/// A start may only name a custom medical vocabulary this account holds AND has finished
+/// building (the `medical_job_start_vocabulary_state` suite asserts that rule), and this
+/// family's terms come only from its table file — so these rows need the object store
+/// beside the service.
+async fn given_what_the_rows_name() -> Transcribe {
+    let transcribe = Transcribe::with_object_store();
+    transcribe.given_media_objects(STAGED_MEDIA).await;
     for (_, request) in start_requests() {
         let Some(name) = request["Settings"]["VocabularyName"].as_str() else {
             continue;
         };
-        transcribe
-            .call(
-                "CreateMedicalVocabulary",
-                json!({
-                    "VocabularyName": name,
-                    "LanguageCode": "en-US",
-                    "VocabularyFileUri": "s3://DOC-EXAMPLE-BUCKET/clinical-terms.txt"
-                }),
-            )
-            .await
-            .ok(&format!("CreateMedicalVocabulary {name:?}"));
+        transcribe.medical_vocabulary_ready(name).await;
     }
+    transcribe
 }
 
 /// `GetMedicalTranscriptionJob` for `name`.
@@ -260,8 +267,7 @@ fn arn(name: &str) -> String {
 
 #[tokio::test]
 async fn a_finished_medical_job_is_deleted_and_one_still_being_processed_is_refused() {
-    let transcribe = Transcribe::new();
-    create_the_vocabularies_the_rows_name(&transcribe).await;
+    let transcribe = given_what_the_rows_name().await;
     let rows = start_requests();
 
     for (case, request) in &rows {

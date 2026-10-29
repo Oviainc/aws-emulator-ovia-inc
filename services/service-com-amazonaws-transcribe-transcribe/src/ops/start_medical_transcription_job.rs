@@ -373,9 +373,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The name of the custom vocabulary you want to use when processing your
         // medical transcription job" (model doc for
         // `MedicalTranscriptionSetting$VocabularyName`): a job may only apply a custom
-        // medical vocabulary this REGION holds, so a name no `CreateMedicalVocabulary`
-        // ever recorded here is refused rather than stored on a job that would report
-        // it back — the rule every job family's settings follow, see
+        // medical vocabulary this REGION holds, and only one whose build has finished
+        // successfully ("If the state is READY, you can use the custom vocabulary in a
+        // StartMedicalTranscriptionJob request" — the model doc for
+        // `GetMedicalVocabularyResponse$VocabularyState`), so a name no
+        // `CreateMedicalVocabulary` ever recorded here, or one whose build is still
+        // running or produced no terms, is refused rather than stored on a job that
+        // would report it back — the rule every job family's settings follow, see
         // [`crate::state::unheld_reference_error`]. The name belongs to the MEDICAL
         // vocabulary family, which is a family of its own: a custom vocabulary of the
         // same name is a different resource.

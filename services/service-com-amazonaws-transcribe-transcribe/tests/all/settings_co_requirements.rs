@@ -331,34 +331,34 @@ async fn a_medical_scribe_start_with_a_speaker_ceiling_and_no_partitioning_is_re
     }
 }
 
-/// `CreateMedicalVocabulary` for `name`, so the account holds a custom medical
-/// vocabulary of that name.
-async fn create_medical_vocabulary(transcribe: &Transcribe, name: &str) {
-    let case = format!("CreateMedicalVocabulary {name:?}");
+/// The media the medical family's rows name, staged in the object store the two
+/// medical-vocabulary tests below mount beside the service: with a store to ask, a
+/// start whose media it does not hold is refused for the media, which is another
+/// suite's subject (`crate::media_object_resolution`).
+const STAGED_MEDIA: &[&str] = &["s3://example-media/dictation.wav"];
+
+/// An emulator that can hold a USABLE custom medical vocabulary: the service with the
+/// object store beside it, and the media the medical rows name already staged.
+///
+/// A custom medical vocabulary's terms come only from the table file at its
+/// `VocabularyFileUri`, so a build that makes one `READY` needs a store that serves
+/// that file ([`Transcribe::medical_vocabulary_ready`]).
+async fn given_the_object_store() -> Transcribe {
+    let transcribe = Transcribe::with_object_store();
+    transcribe.given_media_objects(STAGED_MEDIA).await;
     transcribe
-        .call(
-            "CreateMedicalVocabulary",
-            json!({
-                "VocabularyName": name,
-                "LanguageCode": "en-US",
-                "VocabularyFileUri": "s3://DOC-EXAMPLE-BUCKET/clinical-terms.txt"
-            }),
-        )
-        .await
-        .ok(&case);
 }
 
 /// A start whose `Settings.VocabularyName` names a custom medical vocabulary this
-/// account never created is refused and stores nothing; the same name, created first,
-/// is accepted and read back.
+/// account never created is refused and stores nothing; the same name, created and
+/// built first, is accepted and read back.
 ///
-/// Holding the name is what the start checks: a custom medical vocabulary's terms come
-/// only from the table file at its `VocabularyFileUri`, which this emulator does not
-/// read, so no medical vocabulary here reaches `READY` and a usable-state rule would
-/// make the member unusable.
+/// Holding the name is what this test is about; that the vocabulary must also be in a
+/// state a job may APPLY it in is the `medical_job_start_vocabulary_state` suite's
+/// subject, so every vocabulary here is waited out until its build settled `READY`.
 #[tokio::test]
 async fn a_start_naming_a_custom_medical_vocabulary_this_account_lacks_is_refused() {
-    let transcribe = Transcribe::new();
+    let transcribe = given_the_object_store().await;
     let family = families()
         .into_iter()
         .find(|family| family.start == "StartMedicalTranscriptionJob")
@@ -397,7 +397,7 @@ async fn a_start_naming_a_custom_medical_vocabulary_this_account_lacks_is_refuse
     for (index, vocabulary) in names.iter().enumerate() {
         let case = format!("a job naming the held custom medical vocabulary {vocabulary:?}");
         let name = format!("held-vocabulary-{index}");
-        create_medical_vocabulary(&transcribe, vocabulary).await;
+        transcribe.medical_vocabulary_ready(vocabulary).await;
         transcribe
             .call(
                 family.start,
@@ -422,7 +422,7 @@ async fn a_start_naming_a_custom_medical_vocabulary_this_account_lacks_is_refuse
 /// to a medical transcription job.
 #[tokio::test]
 async fn a_custom_vocabulary_does_not_stand_in_for_a_custom_medical_vocabulary() {
-    let transcribe = Transcribe::new();
+    let transcribe = given_the_object_store().await;
     let family = families()
         .into_iter()
         .find(|family| family.start == "StartMedicalTranscriptionJob")
@@ -454,8 +454,8 @@ async fn a_custom_vocabulary_does_not_stand_in_for_a_custom_medical_vocabulary()
             .await
             .refused(&case, 400, "BadRequestException");
 
-        // Created in the MEDICAL family too, the same name is accepted.
-        create_medical_vocabulary(&transcribe, vocabulary).await;
+        // Created in the MEDICAL family too, and built, the same name is accepted.
+        transcribe.medical_vocabulary_ready(vocabulary).await;
         let accepted = format!("medical-family-{index}");
         transcribe
             .call(

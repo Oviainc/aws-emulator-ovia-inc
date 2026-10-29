@@ -1936,9 +1936,13 @@ impl ComAmazonawsTranscribeTranscribeState {
     /// of it a job may apply the resource in, so a resource held in any other value of
     /// that member is refused ([`resource_not_usable_message`]):
     ///
-    /// * a custom vocabulary reaches [`VOCABULARY_STATE_READY`] when its build
-    ///   succeeded, and a request can find one `PENDING` while that build runs or
-    ///   `FAILED` once it produced no terms;
+    /// * a custom vocabulary of EITHER family — the plain one ([`VocabularyRecord`]) and
+    ///   the MEDICAL one ([`MedicalVocabularyRecord`]) each carry the same modelled
+    ///   `VocabularyState` for the same reason ("If the state is READY, you can use the
+    ///   custom vocabulary in a `StartMedicalTranscriptionJob` request" — the model's own
+    ///   doc for `GetMedicalVocabularyResponse$VocabularyState`) — reaches
+    ///   [`VOCABULARY_STATE_READY`] when its build succeeded, and a request can find one
+    ///   `PENDING` while that build runs or `FAILED` once it produced no terms;
     /// * a custom LANGUAGE model reaches [`MODEL_STATUS_COMPLETED`] when its training
     ///   ended on data the object store answered for ("When the status displays as
     ///   COMPLETED the model is ready for use" — the model's own doc for
@@ -1947,18 +1951,11 @@ impl ComAmazonawsTranscribeTranscribeState {
     ///   be read ([`is_terminal_model_status`] is the same enum's finished/unfinished
     ///   split, which the operations that DELETE or UPDATE a model read).
     ///
-    /// The other families a settings reference can name carry no such member, or none
-    /// this emulator can hold a usable record of, so they are checked for existence
-    /// only:
+    /// The other families a settings reference can name carry no such member at all, so
+    /// they are checked for existence only:
     ///
     /// * a custom vocabulary FILTER models no processing state anywhere (see
     ///   [`VocabularyFilterRecord`]), so a held filter is always applicable;
-    /// * a custom MEDICAL vocabulary ([`MedicalVocabularyRecord`]) can be built only
-    ///   from a table file an object store serves, so a record of that family reaches a
-    ///   usable state only where one is mounted beside this service. Refusing every job
-    ///   that names one would refuse a request the real service serves — a limitation of
-    ///   this emulator's build, not an error in the caller's request — so a held medical
-    ///   vocabulary is applied as named;
     /// * the job families are never the target of a settings reference.
     fn unusable_reference_state(
         &mut self,
@@ -1970,6 +1967,11 @@ impl ComAmazonawsTranscribeTranscribeState {
         match family {
             ResourceFamily::Vocabulary => {
                 let record = self.vocabulary_mut(region, name, now)?;
+                (record.state != VOCABULARY_STATE_READY)
+                    .then(|| (record.state.clone(), VOCABULARY_STATE_READY))
+            }
+            ResourceFamily::MedicalVocabulary => {
+                let record = self.medical_vocabulary_mut(region, name, now)?;
                 (record.state != VOCABULARY_STATE_READY)
                     .then(|| (record.state.clone(), VOCABULARY_STATE_READY))
             }

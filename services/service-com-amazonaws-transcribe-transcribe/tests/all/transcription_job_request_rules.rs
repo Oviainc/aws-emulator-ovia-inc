@@ -701,6 +701,18 @@ async fn a_custom_resource_of_another_family_does_not_stand_in() {
     }
 }
 
+/// The media locations the rows of
+/// [`every_job_family_refuses_a_start_naming_a_vocabulary_it_lacks`] name, staged in the
+/// object store that suite's emulator mounts: a start whose media the store does not
+/// hold is refused for the media, which is another suite's subject
+/// (`crate::media_object_resolution`).
+const STAGED_MEDIA: &[&str] = &[
+    "s3://example-media/audio.flac",
+    "s3://example-media/dictation.wav",
+    "s3://example-media/call.flac",
+    "s3://example-media/consult.flac",
+];
+
 /// One row of [`every_job_family_refuses_a_start_naming_a_vocabulary_it_lacks`]: a
 /// start operation of this service, the request that applies the custom vocabulary
 /// `name`, and the family that name must be held in.
@@ -784,8 +796,12 @@ async fn every_job_family_refuses_a_start_naming_a_vocabulary_it_lacks() {
 
     for (index, family) in families.iter().enumerate() {
         // A fresh emulator per family, so one family's vocabulary cannot be what makes
-        // the next family's start succeed.
-        let transcribe = Transcribe::new();
+        // the next family's start succeed. With the object store mounted beside the
+        // service — a custom MEDICAL vocabulary's terms come only from a table file it
+        // serves, so only there can one of that family be built — the media each row
+        // names is staged first, or the start would be refused for its media instead.
+        let transcribe = Transcribe::with_object_store();
+        transcribe.given_media_objects(STAGED_MEDIA).await;
         let case = family.case;
         let vocabulary = format!("family-terms-{index}");
 
@@ -800,21 +816,24 @@ async fn every_job_family_refuses_a_start_naming_a_vocabulary_it_lacks() {
             "case {case:?}: unexpected refusal message, got {message:?}"
         );
 
-        // The vocabulary the operation's own family reads, then the same start.
-        let mut create = json!({"VocabularyName": vocabulary, "LanguageCode": "en-US"});
+        // The vocabulary the operation's own family reads, then the same start. A held
+        // custom vocabulary of EITHER family is applicable only once its build has
+        // finished: READY is what makes one usable, so each create is waited out.
         if family.create == "CreateVocabulary" {
-            create["Phrases"] = json!(["Aardvark"]);
-        } else {
-            create["VocabularyFileUri"] = json!("s3://DOC-EXAMPLE-BUCKET/clinical-terms.txt");
-        }
-        transcribe
-            .call(family.create, create)
-            .await
-            .ok(&format!("{} {vocabulary:?}", family.create));
-        // A held custom vocabulary is applicable only once its build has finished:
-        // READY is what makes one usable.
-        if family.create == "CreateVocabulary" {
+            transcribe
+                .call(
+                    family.create,
+                    json!({
+                        "VocabularyName": vocabulary,
+                        "LanguageCode": "en-US",
+                        "Phrases": ["Aardvark"]
+                    }),
+                )
+                .await
+                .ok(&format!("{} {vocabulary:?}", family.create));
             transcribe.vocabulary_ready(&vocabulary, None).await;
+        } else {
+            transcribe.medical_vocabulary_ready(&vocabulary).await;
         }
         transcribe
             .call(family.start, (family.request)("held-job", &vocabulary))

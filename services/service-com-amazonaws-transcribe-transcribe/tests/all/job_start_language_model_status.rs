@@ -34,7 +34,7 @@ use crate::language_model_training_data::{
     call, create_bucket, create_request, emulator, stage, TRAINING_FILE,
 };
 use crate::language_models::{language_model_request, PAST_THE_TRANSITION};
-use crate::transcription_jobs::{Reply, Transcribe};
+use crate::transcription_jobs::{not_usable_message as state_refusal, Reply, Transcribe};
 
 /// The bucket the `FAILED` rows stage their media in — and under whose prefixes their
 /// training data is deliberately NOT staged, which is what the object store's answer
@@ -173,12 +173,7 @@ fn model_names() -> Vec<String> {
 /// the name the request asked for, the status this account holds that model in, and the
 /// one status the model's own documentation makes it usable in.
 fn not_usable_message(name: &str, status: &str) -> String {
-    format!(
-        "The custom {kind} {name} is in the {status} state and can't be used. A custom \
-         {kind} can only be used when its state is COMPLETED. Check the state of the \
-         {kind} and try your request again.",
-        kind = "language model",
-    )
+    state_refusal("language model", name, status, "COMPLETED")
 }
 
 /// The media URI a row of the no-object-store half names: nothing answers for it, and a

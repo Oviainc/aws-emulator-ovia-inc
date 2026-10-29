@@ -27,7 +27,7 @@
 
 use serde_json::{json, Value};
 
-use crate::transcription_jobs::{Reply, Transcribe};
+use crate::transcription_jobs::{not_usable_message as state_refusal, Reply, Transcribe};
 
 /// A `DataAccessRoleArn` of the form the member's `@pattern` pins, for the operations
 /// that model one `@required`.
@@ -170,12 +170,7 @@ fn vocabulary_names() -> Vec<String> {
 /// How this service refuses a start that names a custom vocabulary it cannot apply: the
 /// name the request asked for and the state this account holds that vocabulary in.
 fn not_usable_message(name: &str, state: &str) -> String {
-    format!(
-        "The custom {kind} {name} is in the {state} state and can't be used. A custom \
-         {kind} can only be used when its state is READY. Check the state of the {kind} \
-         and try your request again.",
-        kind = "vocabulary",
-    )
+    state_refusal("vocabulary", name, state, "READY")
 }
 
 /// `CreateVocabulary` for `name` from the terms the request LISTS, which settles `READY`.
