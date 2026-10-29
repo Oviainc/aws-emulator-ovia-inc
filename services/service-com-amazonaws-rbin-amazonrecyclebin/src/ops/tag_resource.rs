@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let projected = rule.tag_count_after(&input.tags);
         if projected > crate::state::MAX_TAGS_PER_RULE {
             return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
-                crate::state::tag_quota_exceeded(crate::state::TaggedRule::Addressed, projected),
+                crate::state::quota_exceeded(),
             )
             .into());
         }

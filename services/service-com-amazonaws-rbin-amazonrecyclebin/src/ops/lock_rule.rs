@@ -3,8 +3,11 @@
 //! @op LockRule
 //! IMPLEMENTED: locks the stored Region-level retention rule the request addresses —
 //! persisting the requested lock configuration and the `locked` lock state in
-//! [`crate::state`] — and answers with the STORED record (HTTP 200). This is the ONLY
-//! file to touch for this operation.
+//! [`crate::state`] — and answers with the STORED record (HTTP 200). A request naming
+//! the unlock delay already in force on a locked rule asks for the state that rule is
+//! already in, so it is completed out of the stored record too; only a request that
+//! would CHANGE the lock in force is refused. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -212,14 +215,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // A rule that is already `locked` "can't be modified", and a lock request
-        // carries a lock configuration, so locking it again would modify it.
+        // A lock request that asks for the lock the rule ALREADY holds — the same unlock
+        // delay in force — asks for the state the rule is already in, so it is satisfied
+        // by the stored rule: answer it with that rule, unchanged, rather than refusing
+        // it. This is what makes a retried or concurrently issued lock request
+        // idempotent.
+        if rule.locked_with(&input.lock_configuration) {
+            return Ok(stored_lock_response(rule));
+        }
+        // What is left is a request that would CHANGE the lock in force on a rule that is
+        // already locked — a different unlock delay — and a locked rule "can't be
+        // modified", so the lock request can't be completed.
         if rule.lock_state.as_deref() == Some(crate::state::LOCK_STATE_LOCKED) {
             return Err(LockRuleErrorModeled::ConflictException(
                 crate::state::rule_state_conflict(
                     crate::state::BlockedAction::Lock,
                     &rule.identifier,
-                    crate::state::BlockingCondition::AlreadyLocked,
+                    crate::state::BlockingCondition::DifferentUnlockDelay,
                 ),
             )
             .into());
@@ -234,17 +246,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         rule.lock_end_time = None;
 
         // Answer out of the STORED record, so the caller sees what a later GetRule sees.
-        Ok(LockRuleOutput {
-            identifier: Some(rule.identifier.clone()),
-            description: rule.description.clone(),
-            resource_type: Some(rule.resource_type.clone()),
-            retention_period: Some(rule.retention_period.clone()),
-            resource_tags: Some(rule.resource_tags.clone()),
-            status: Some(rule.status.clone()),
-            lock_configuration: rule.lock_configuration.clone(),
-            lock_state: rule.lock_state.clone(),
-            rule_arn: Some(rule.rule_arn.clone()),
-            exclude_resource_tags: Some(rule.exclude_resource_tags.clone()),
-        })
+        Ok(stored_lock_response(rule))
+    }
+}
+
+/// This operation's response, read out of the STORED rule, so the caller sees what a
+/// later `GetRule` sees — on the request that locks the rule and on the one the rule's
+/// existing lock already satisfies alike.
+fn stored_lock_response(rule: &crate::state::Rule) -> LockRuleOutput {
+    LockRuleOutput {
+        identifier: Some(rule.identifier.clone()),
+        description: rule.description.clone(),
+        resource_type: Some(rule.resource_type.clone()),
+        retention_period: Some(rule.retention_period.clone()),
+        resource_tags: Some(rule.resource_tags.clone()),
+        status: Some(rule.status.clone()),
+        lock_configuration: rule.lock_configuration.clone(),
+        lock_state: rule.lock_state.clone(),
+        rule_arn: Some(rule.rule_arn.clone()),
+        exclude_resource_tags: Some(rule.exclude_resource_tags.clone()),
     }
 }

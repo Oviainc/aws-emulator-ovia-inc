@@ -24,7 +24,7 @@ use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 
 use crate::ops::types::{
     ConflictException, LockConfiguration, ResourceNotFoundException, ResourceTag, RetentionPeriod,
-    RuleSummary, ServiceQuotaExceededException, Tag, ValidationException,
+    RuleSummary, ServiceQuotaExceededException, Tag, UnlockDelay, ValidationException,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -118,89 +118,19 @@ fn resource_tag_pair(tag: &ResourceTag) -> (&str, &str) {
     )
 }
 
-/// The modelled 402 envelope every quota refusal of this service takes: the bound's own
-/// sentence, and the sole `Reason` the model declares for the error.
+/// The modelled 402 EVERY quota refusal of this service answers with: the reason token
+/// the model declares for the error, carried as the `Message` as well as the `Reason`.
 ///
-/// Each quota below states its own `message` and nothing else, so no caller of this
-/// module re-types the reason enum or decides again which members the body carries.
-fn quota_exceeded(message: String) -> ServiceQuotaExceededException {
+/// Recycle Bin states a quota refusal by the token alone — the body names the fault
+/// class and nothing else, so no part of the request (a count, a key, a Region) and no
+/// bound of the service is rendered into it. Every bound below therefore reaches the
+/// wire through this one body, which is also why a caller classifies a quota refusal by
+/// the error code and reason rather than by prose.
+pub fn quota_exceeded() -> ServiceQuotaExceededException {
     ServiceQuotaExceededException {
-        message: Some(message),
+        message: Some(SERVICE_QUOTA_REASON_EXCEEDED.to_string()),
         reason: Some(SERVICE_QUOTA_REASON_EXCEEDED.to_string()),
     }
-}
-
-/// The modelled 402 for a request that would push a resource tag key and value pair
-/// past [`MAX_RULES_PER_RESOURCE_TAG`].
-///
-/// The message states the quota, not the pair the request named: the bound is a fact of
-/// the service, and nothing of the request is echoed back.
-pub fn resource_tag_quota_exceeded() -> ServiceQuotaExceededException {
-    quota_exceeded(format!(
-        "The request would exceed the quota of {MAX_RULES_PER_RESOURCE_TAG} retention \
-         rules per resource tag key and value pair"
-    ))
-}
-
-/// Which retention rule a request past the tags-per-resource quota would have left
-/// holding its tags, which is all the refusal's wording turns on: the rule the request
-/// asked to MINT, or the stored rule it addressed.
-///
-/// The two operations held to [`MAX_TAGS_PER_RULE`] — `CreateRule` and `TagResource` —
-/// differ in nothing else, so both reach the body through [`tag_quota_exceeded`] and
-/// neither can word the refusal class its own way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaggedRule {
-    /// The rule a create would have minted carrying the request's tags.
-    Created,
-    /// The stored rule a tag assignment addressed.
-    Addressed,
-}
-
-impl TaggedRule {
-    /// What the message says the request would do, ahead of the tag count.
-    fn clause(self) -> &'static str {
-        match self {
-            Self::Created => "create a retention rule with",
-            Self::Addressed => "leave the retention rule with",
-        }
-    }
-}
-
-/// The modelled 402 for a request that would leave a retention rule carrying more tags
-/// than [`MAX_TAGS_PER_RULE`] allows.
-///
-/// `tags` is the number the rule would be left HOLDING, not the number the request
-/// names: assignment replaces a key's value rather than adding a second tag for it.
-pub fn tag_quota_exceeded(rule: TaggedRule, tags: usize) -> ServiceQuotaExceededException {
-    quota_exceeded(format!(
-        "The request would {} {tags} tags, exceeding the quota of {MAX_TAGS_PER_RULE} \
-         tags per resource",
-        rule.clause()
-    ))
-}
-
-/// The modelled 402 for a create the Region's own published quota of retention rules
-/// ([`MAX_RULES`]) leaves no room for.
-///
-/// The message states the quota alone: how many rules the Region already holds is the
-/// count that reached it, and the bound is the fact the caller can act on.
-pub fn rule_quota_exceeded() -> ServiceQuotaExceededException {
-    quota_exceeded(format!(
-        "The request would exceed the quota of {MAX_RULES} retention rules per Region"
-    ))
-}
-
-/// The modelled 402 for a create the emulator's own ceiling on the WHOLE store
-/// ([`RULE_STORE_LIMIT`]) leaves no room for, whatever Region the request is signed for.
-///
-/// `stored` is how many rules the store holds, which is what distinguishes this refusal
-/// from the per-Region one above.
-pub fn rule_store_full(stored: usize) -> ServiceQuotaExceededException {
-    quota_exceeded(format!(
-        "this emulator already holds {stored} retention rules, the most it \
-         stores ({RULE_STORE_LIMIT})"
-    ))
 }
 
 /// Assign `tags` to the tag list `held`, keyed by tag key.
@@ -406,6 +336,20 @@ impl Rule {
         self.lock_configuration.is_some() || self.lock_state.is_some()
     }
 
+    /// Whether the rule is `locked` under exactly the lock `requested` asks for — the
+    /// unlock delay already in force.
+    ///
+    /// This is what tells a lock request that asks for the state the rule is already in
+    /// from one that would CHANGE the lock in force: the first is satisfied by the
+    /// stored rule, the second is the request a lock conflict refuses.
+    pub fn locked_with(&self, requested: &LockConfiguration) -> bool {
+        self.lock_state.as_deref() == Some(LOCK_STATE_LOCKED)
+            && self
+                .lock_configuration
+                .as_ref()
+                .is_some_and(|held| same_unlock_delay(&held.unlock_delay, &requested.unlock_delay))
+    }
+
     /// Assign `tags` to the rule, as [`upsert_tags`] defines assigning.
     pub fn apply_tags(&mut self, tags: Vec<Tag>) {
         upsert_tags(&mut self.tags, tags);
@@ -491,6 +435,19 @@ impl Rule {
             .iter()
             .all(|wanted| contains_resource_tag(&self.exclude_resource_tags, wanted))
     }
+}
+
+/// Whether two unlock delays are the SAME period: the same value, measured in the same
+/// unit.
+///
+/// `UnlockDelay` carries exactly those two members, both required
+/// (smithy_query(query="shape", shape="UnlockDelay")), so they are the whole of a delay
+/// and comparing them compares the periods. The unit is compared as it was sent: the
+/// model declares one unit, and the boundary validator refuses any other before a
+/// handler runs, so no two spellings of one period reach here.
+pub fn same_unlock_delay(held: &UnlockDelay, requested: &UnlockDelay) -> bool {
+    held.unlock_delay_value == requested.unlock_delay_value
+        && held.unlock_delay_unit == requested.unlock_delay_unit
 }
 
 /// The instant an unlock requested at `now` leaves its unlock delay.
@@ -645,8 +602,9 @@ pub enum BlockingCondition {
     /// answer to "why was this refused", so the stored lock-state token stays out of the
     /// message.
     Locked,
-    /// The rule is already `locked`, so locking it again would modify it.
-    AlreadyLocked,
+    /// The rule is already `locked` under a DIFFERENT unlock delay than the request
+    /// asked for, so completing the request would change the lock in force.
+    DifferentUnlockDelay,
     /// The rule has no lock to release: it has never been locked, is `unlocked`, or is
     /// already serving its unlock delay.
     NotLocked,
@@ -659,14 +617,16 @@ pub enum BlockingCondition {
 }
 
 impl BlockingCondition {
-    /// How the message describes the condition, after "because it is".
+    /// How the message describes the condition — the whole predicate, after "because
+    /// it", so a condition that is something the rule HAS reads as naturally as one it
+    /// IS.
     fn describe(self) -> &'static str {
         match self {
-            Self::Locked => "locked",
-            Self::AlreadyLocked => "already locked",
-            Self::NotLocked => "not locked",
-            Self::TagLevelRule => "a tag-level rule",
-            Self::RuleWithExclusionTags => "a Region-level rule with exclusion tags",
+            Self::Locked => "is locked",
+            Self::DifferentUnlockDelay => "has a different unlock delay already set",
+            Self::NotLocked => "is not locked",
+            Self::TagLevelRule => "is a tag-level rule",
+            Self::RuleWithExclusionTags => "is a Region-level rule with exclusion tags",
         }
     }
 }
@@ -905,7 +865,7 @@ pub fn rule_state_conflict(
 ) -> ConflictException {
     ConflictException {
         message: Some(format!(
-            "Cannot {} Recycle Bin rule {identifier} because it is {}.",
+            "Cannot {} Recycle Bin rule {identifier} because it {}.",
             action.verb(),
             condition.describe()
         )),

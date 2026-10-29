@@ -3,15 +3,15 @@
 //! End-to-end HTTP tests for the BODY this service answers a quota refusal with.
 //!
 //! The rule asserted here: a request past a bound this service holds a retention rule
-//! to is refused with HTTP 402 `ServiceQuotaExceededException`, whose `Reason` is the
-//! sole value the model declares for that error
-//! (smithy_query(query="shape", shape="ServiceQuotaExceededExceptionReason")) and whose
-//! `Message` states the bound that was reached — and the body of ONE bound is the same
-//! wherever the request arrived, so the two operations held to the tags-per-resource
-//! quota (`CreateRule` and `TagResource`) answer one wording of it rather than two.
+//! to is refused with HTTP 402 `ServiceQuotaExceededException` whose `Reason` AND
+//! `Message` are both the sole reason value the model declares for that error
+//! (smithy_query(query="shape", shape="ServiceQuotaExceededExceptionReason")) — the
+//! token alone, with nothing of the request and no bound of the service rendered into
+//! it — so every quota refusal of this service answers one body, whichever bound was
+//! reached and whichever operation the request arrived through.
 //!
-//! Every row compares the wire body with the body `crate::state` composes for that
-//! bound, which is what pins the handlers to the service's single composer: a handler
+//! Every row compares the wire body with the body `crate::state` composes for a quota
+//! refusal, which is what pins the handlers to the service's single composer: a handler
 //! that worded a refusal of its own would answer a body no constructor produces.
 //!
 //! The tables span what the rule generalises over — the operation the request reaches
@@ -35,8 +35,7 @@ use service_com_amazonaws_rbin_amazonrecyclebin::ops::types::{
     ServiceQuotaExceededException, SERVICE_QUOTA_EXCEEDED_EXCEPTION_REASON_VALUES,
 };
 use service_com_amazonaws_rbin_amazonrecyclebin::state::{
-    rule_quota_exceeded, tag_quota_exceeded, TaggedRule, MAX_RULES, MAX_TAGS_PER_RULE,
-    SERVICE_QUOTA_REASON_EXCEEDED,
+    quota_exceeded, MAX_RULES, MAX_TAGS_PER_RULE, SERVICE_QUOTA_REASON_EXCEEDED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -57,17 +56,6 @@ struct TagRow {
 }
 
 impl TagRow {
-    /// How many tags a rule assigned [`Self::tags`] would be left HOLDING: one per
-    /// distinct key, since assignment replaces a key's value rather than adding a second
-    /// tag for it.
-    fn projected(&self) -> usize {
-        self.tags
-            .iter()
-            .map(|(key, _)| key.as_str())
-            .collect::<BTreeSet<_>>()
-            .len()
-    }
-
     /// The row split for the `TagResource` path: the tags a rule is CREATED with — one
     /// for each of the first [`MAX_TAGS_PER_RULE`] distinct keys, so the rule starts
     /// exactly at its quota — and the tags the refused assignment then names, which are
@@ -152,39 +140,14 @@ fn create_body(tags: &TagPairs) -> Value {
     })
 }
 
-/// What the tags-per-resource refusal says the request would do: mint the rule holding
-/// the tags, or leave the rule it addressed holding them. Written out in this suite, so
-/// the wire text is pinned here and not only by the composer under test.
-const CREATED_CLAUSE: &str = "create a retention rule with";
-const ADDRESSED_CLAUSE: &str = "leave the retention rule with";
-
-/// The bound half of the tags-per-resource refusal: the sentence both doors end with,
-/// stating the tags the rule would be left holding and the quota they exceed.
-fn tags_per_resource_bound(projected: usize) -> String {
-    format!("{projected} tags, exceeding the quota of {MAX_TAGS_PER_RULE} tags per resource")
-}
-
-/// The tags-per-resource refusal as the service words it.
-fn tags_per_resource_message(clause: &str, projected: usize) -> String {
-    format!(
-        "The request would {clause} {}",
-        tags_per_resource_bound(projected)
-    )
-}
-
-/// The rules-per-Region refusal as the service words it: the bound alone, since how many
-/// rules the Region already holds is the count that reached it.
-fn rules_per_region_message() -> String {
-    format!("The request would exceed the quota of {MAX_RULES} retention rules per Region")
-}
-
-/// Assert the body `crate::state` composes for a bound is the one this suite words for
-/// it, so the composer is held to the text and not merely to itself.
-fn assert_composed(case: &str, composed: &ServiceQuotaExceededException, stated: &str) {
+/// Assert the body `crate::state` composes for a quota refusal is the token-only body
+/// this suite words for it, so the composer is held to the text and not merely to
+/// itself: `Message` and `Reason` alike are the modelled reason token.
+fn assert_composed(case: &str, composed: &ServiceQuotaExceededException) {
     assert_eq!(
         composed.message.as_deref(),
-        Some(stated),
-        "case {case:?}: expected the composed Message {stated:?}, got {:?}",
+        Some(SERVICE_QUOTA_REASON_EXCEEDED),
+        "case {case:?}: expected the composed Message {SERVICE_QUOTA_REASON_EXCEEDED:?}, got {:?}",
         composed.message
     );
     assert_eq!(
@@ -262,18 +225,12 @@ async fn rule_holding(router: &MultiServiceRouter, case: &str, tags: &TagPairs) 
 #[tokio::test]
 async fn create_rule_and_tag_resource_answer_one_tags_per_resource_quota_body() {
     for row in tag_rows() {
-        let projected = row.projected();
-
         // The CREATE door: the whole set in one `CreateRule`, which would mint a rule
         // holding more tags than the quota allows.
         let router = router();
         let case = format!("{}: CreateRule", row.case);
-        let created = tag_quota_exceeded(TaggedRule::Created, projected);
-        assert_composed(
-            &case,
-            &created,
-            &tags_per_resource_message(CREATED_CLAUSE, projected),
-        );
+        let created = quota_exceeded();
+        assert_composed(&case, &created);
         let (status, body) = create_rule(&router, create_body(&row.tags)).await;
         assert_quota_body(&case, status, &body, &created);
         assert_eq!(
@@ -298,12 +255,8 @@ async fn create_rule_and_tag_resource_answer_one_tags_per_resource_quota_body() 
         let (held, assigned) = row.split_at_quota();
         let case = format!("{}: TagResource", row.case);
         let rule_arn = rule_holding(&router, &case, &held).await;
-        let addressed = tag_quota_exceeded(TaggedRule::Addressed, projected);
-        assert_composed(
-            &case,
-            &addressed,
-            &tags_per_resource_message(ADDRESSED_CLAUSE, projected),
-        );
+        let addressed = quota_exceeded();
+        assert_composed(&case, &addressed);
         let (status, body) = tag_resource(&router, &rule_arn, &assigned).await;
         assert_quota_body(&case, status, &body, &addressed);
         let (status, tags) = list_tags(&router, &rule_arn).await;
@@ -318,14 +271,14 @@ async fn create_rule_and_tag_resource_answer_one_tags_per_resource_quota_body() 
             tags["Tags"]
         );
 
-        // The two doors state the SAME bound and differ only in which rule the refusal
-        // speaks of, so neither handler words the quota its own way.
-        let tail = tags_per_resource_bound(projected);
+        // The two doors answer the SAME body: the refusal names the fault class and
+        // nothing of the request, so neither handler words the quota its own way and
+        // neither echoes back the tags, the count or the bound.
         for (door, composed) in [("CreateRule", &created), ("TagResource", &addressed)] {
             let stated = composed.message.clone().unwrap_or_default();
-            assert!(
-                stated.ends_with(&tail),
-                "case {:?}: {door} must state the bound as {tail:?}, got {stated:?}",
+            assert_eq!(
+                stated, SERVICE_QUOTA_REASON_EXCEEDED,
+                "case {:?}: {door} must state the reason token alone, got {stated:?}",
                 row.case
             );
         }
@@ -352,15 +305,11 @@ async fn create_rule_answers_one_rules_per_region_quota_body() {
         );
     }
 
-    // Every request past it is refused with the one body `crate::state` composes for
-    // that bound, whatever the request itself asks for: the rules-per-Region refusal
-    // states the quota, not the request.
-    let expected = rule_quota_exceeded();
-    assert_composed(
-        "the rules-per-Region bound",
-        &expected,
-        &rules_per_region_message(),
-    );
+    // Every request past it is refused with the one body `crate::state` composes for a
+    // quota refusal, whatever the request itself asks for: the refusal states the fault
+    // class, not the request and not the bound.
+    let expected = quota_exceeded();
+    assert_composed("the rules-per-Region bound", &expected);
     let over_quota = [
         (
             "a plain rule past the quota",
@@ -389,13 +338,14 @@ async fn create_rule_answers_one_rules_per_region_quota_body() {
         assert_quota_body(case, status, &refused, &expected);
     }
 
-    // The per-Region bound and the tags-per-resource bound are DIFFERENT sentences, so a
-    // caller can tell which quota it reached.
-    let tags = tag_quota_exceeded(TaggedRule::Created, MAX_TAGS_PER_RULE + 1);
-    assert_ne!(
+    // Reaching another bound answers the same body: a quota refusal names the fault
+    // class, so a caller tells quota refusals from other refusals by the error code and
+    // reason, never by prose.
+    let tags = quota_exceeded();
+    assert_eq!(
         expected.message, tags.message,
-        "case \"two bounds\": each quota must state its own bound, got {:?} twice",
-        expected.message
+        "case \"two bounds\": every quota refusal must state the one token, got {:?} and {:?}",
+        expected.message, tags.message
     );
 
     // Freeing one slot admits one rule again, and the rule it admits is readable — so

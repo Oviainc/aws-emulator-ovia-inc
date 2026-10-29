@@ -272,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::upsert_tags(&mut tags, input.tags.unwrap_or_default());
         if tags.len() > crate::state::MAX_TAGS_PER_RULE {
             return Err(CreateRuleErrorModeled::ServiceQuotaExceededException(
-                crate::state::tag_quota_exceeded(crate::state::TaggedRule::Created, tags.len()),
+                crate::state::quota_exceeded(),
             )
             .into());
         }
@@ -284,7 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = store.rules.len();
         if stored >= crate::state::RULE_STORE_LIMIT {
             return Err(CreateRuleErrorModeled::ServiceQuotaExceededException(
-                crate::state::rule_store_full(stored),
+                crate::state::quota_exceeded(),
             )
             .into());
         }
@@ -296,7 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // neither this Region's quota nor its endpoint.
         if store.rule_count_in_region(&region) >= crate::state::MAX_RULES {
             return Err(CreateRuleErrorModeled::ServiceQuotaExceededException(
-                crate::state::rule_quota_exceeded(),
+                crate::state::quota_exceeded(),
             )
             .into());
         }
@@ -307,7 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rule this request would create does not exist yet.
         if store.exceeds_resource_tag_quota(&region, &resource_tags, None) {
             return Err(CreateRuleErrorModeled::ServiceQuotaExceededException(
-                crate::state::resource_tag_quota_exceeded(),
+                crate::state::quota_exceeded(),
             )
             .into());
         }

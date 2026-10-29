@@ -22,10 +22,12 @@
 //!    `ResourceArn`.
 //! 3. A lock, modify or delete the rule's own state forbids is `Conflict`: HTTP 409,
 //!    `Reason` `INVALID_RULE_STATE`, and `Message` composed from the identifier and the
-//!    blocking condition (`Cannot <action> Recycle Bin rule <id> because it is
-//!    <condition>.`), never from the stored lock-state token. Asserted over every
+//!    blocking condition (`Cannot <action> Recycle Bin rule <id> because it
+//!    <predicate>.`), never from the stored lock-state token. Asserted over every
 //!    blocking condition this service can report, including a rule inside its unlock
 //!    delay, and each refusal is read back through `GetRule` to show it changed nothing.
+//!    The lock requests a locked rule COMPLETES, and the delay mismatch that is the one
+//!    lock request it refuses, are owned by `tests/all/lock_rule_idempotence.rs`.
 //!
 //! Every case drives the service through the real router, so the wire protocol, the
 //! route table, the input-validation gate and the handlers are exercised exactly as a
@@ -603,10 +605,14 @@ impl Action {
     async fn call(self, router: &MultiServiceRouter, identifier: &str) -> (u16, Value) {
         match self {
             Self::Lock => {
+                // The delay this lock request names is NOT the one the locked fixture
+                // below holds: a request asking for the lock already in force is
+                // satisfied by the stored rule, so only a request that would change it
+                // reaches a refusal.
                 lock_rule(
                     router,
                     identifier,
-                    json!({ "LockConfiguration": lock_configuration(UNLOCK_DELAY_MIN) }),
+                    json!({ "LockConfiguration": lock_configuration(UNLOCK_DELAY_MAX) }),
                 )
                 .await
             }
@@ -620,12 +626,13 @@ impl Action {
 }
 
 /// One row of the conflict table: the case, the request, and the sentence the refusal
-/// must state once the identifier is interpolated.
+/// must state once the identifier is interpolated. `predicate` is the whole of what the
+/// message says about the rule, after "because it".
 struct ConflictRow {
     case: &'static str,
     identifier: String,
     action: Action,
-    condition: &'static str,
+    predicate: &'static str,
     /// The `LockState` the rule must still report after the refusal.
     lock_state: Option<&'static str>,
 }
@@ -693,70 +700,70 @@ async fn a_state_that_blocks_a_lock_modify_or_delete_is_reported_as_the_conditio
             case: "LockRule on a tag-level rule",
             identifier: tag_level.clone(),
             action: Action::Lock,
-            condition: "a tag-level rule",
+            predicate: "is a tag-level rule",
             lock_state: None,
         },
         ConflictRow {
             case: "LockRule on a Region-level rule with exclusion tags",
             identifier: excluded.clone(),
             action: Action::Lock,
-            condition: "a Region-level rule with exclusion tags",
+            predicate: "is a Region-level rule with exclusion tags",
             lock_state: None,
         },
         ConflictRow {
-            case: "LockRule on a rule that is already locked",
+            case: "LockRule on a locked rule, under another unlock delay",
             identifier: locked.clone(),
             action: Action::Lock,
-            condition: "already locked",
+            predicate: "has a different unlock delay already set",
             lock_state: Some("locked"),
         },
         ConflictRow {
             case: "UpdateRule on a locked rule",
             identifier: locked.clone(),
             action: Action::Modify,
-            condition: "locked",
+            predicate: "is locked",
             lock_state: Some("locked"),
         },
         ConflictRow {
             case: "DeleteRule on a locked rule",
             identifier: locked.clone(),
             action: Action::Delete,
-            condition: "locked",
+            predicate: "is locked",
             lock_state: Some("locked"),
         },
         ConflictRow {
             case: "UpdateRule on a rule inside its unlock delay",
             identifier: pending_unlock.clone(),
             action: Action::Modify,
-            condition: "locked",
+            predicate: "is locked",
             lock_state: Some("pending_unlock"),
         },
         ConflictRow {
             case: "DeleteRule on a rule inside its unlock delay",
             identifier: pending_unlock.clone(),
             action: Action::Delete,
-            condition: "locked",
+            predicate: "is locked",
             lock_state: Some("pending_unlock"),
         },
         ConflictRow {
             case: "UnlockRule on a rule that has never been locked",
             identifier: never_locked.clone(),
             action: Action::Unlock,
-            condition: "not locked",
+            predicate: "is not locked",
             lock_state: None,
         },
         ConflictRow {
             case: "UnlockRule on a rule already inside its unlock delay",
             identifier: pending_unlock.clone(),
             action: Action::Unlock,
-            condition: "not locked",
+            predicate: "is not locked",
             lock_state: Some("pending_unlock"),
         },
         ConflictRow {
             case: "UnlockRule on a tag-level rule, which has no lock to release",
             identifier: tag_level.clone(),
             action: Action::Unlock,
-            condition: "not locked",
+            predicate: "is not locked",
             lock_state: None,
         },
     ];
@@ -781,9 +788,9 @@ async fn a_state_that_blocks_a_lock_modify_or_delete_is_reported_as_the_conditio
             body.get("Reason")
         );
         let expected = format!(
-            "Cannot {} Recycle Bin rule {identifier} because it is {}.",
+            "Cannot {} Recycle Bin rule {identifier} because it {}.",
             row.action.verb(),
-            row.condition
+            row.predicate
         );
         let stated = message(&body);
         assert_eq!(

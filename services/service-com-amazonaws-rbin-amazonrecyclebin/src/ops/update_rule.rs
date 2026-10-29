@@ -299,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.exceeds_resource_tag_quota(&region, &merged_resource_tags, Some(&input.identifier))
         {
             return Err(UpdateRuleErrorModeled::ServiceQuotaExceededException(
-                crate::state::resource_tag_quota_exceeded(),
+                crate::state::quota_exceeded(),
             )
             .into());
         }

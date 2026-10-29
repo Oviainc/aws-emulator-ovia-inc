@@ -4,12 +4,14 @@
 //! `LockRule` and `UnlockRule`, read back through `GetRule`, `UpdateRule` and
 //! `DeleteRule`.
 //!
-//! The rule under test: a lock request is completed only for a Region-level rule (no
-//! resource tags) that carries no exclusion tags and is not already locked, and it
-//! persists the requested lock configuration with lock state `locked`; an unlock
-//! request is completed only for a `locked` rule, and it persists lock state
-//! `pending_unlock` with a lock end time one configured unlock delay away. Every other
-//! lock or unlock request is refused with its modelled error and changes nothing.
+//! The rule under test: a lock request is completed for a Region-level rule (no
+//! resource tags) that carries no exclusion tags, and it persists the requested lock
+//! configuration with lock state `locked`; an unlock request is completed only for a
+//! `locked` rule, and it persists lock state `pending_unlock` with a lock end time one
+//! configured unlock delay away. Every other lock or unlock request is refused with its
+//! modelled error and changes nothing — a lock request against a locked rule is refused
+//! only when it names ANOTHER unlock delay, which `tests/all/lock_rule_idempotence.rs`
+//! owns together with the repeat of a lock request the rule already satisfies.
 //!
 //! Each case drives the service through the real router, exactly as a signed SDK
 //! request would, and every row states its own case so a failure names the input.
@@ -259,9 +261,10 @@ async fn lock_rule_locks_every_region_level_rule_and_persists_its_configuration(
 async fn lock_rule_is_refused_for_every_rule_that_cannot_be_locked() {
     let router = router();
 
-    // A tag-level rule, a Region-level rule with exclusion tags, and an already locked
-    // rule: none of them can be locked. Each row carries the state the refused rule
-    // must still report afterwards.
+    // A tag-level rule, a Region-level rule with exclusion tags, and a rule already
+    // locked under another unlock delay: for none of them can a lock request naming the
+    // delay below be completed. Each row carries the state the refused rule must still
+    // report afterwards.
     let tag_level = created_identifier(
         &router,
         "tag-level rule",
@@ -292,7 +295,6 @@ async fn lock_rule_is_refused_for_every_rule_that_cannot_be_locked() {
         }),
     )
     .await;
-
     // The 404 for an identifier no rule holds carries no `Reason`: the member is optional
     // and this service does not populate it on that path (see
     // `tests/all/not_found_error_body_members.rs`, which asserts those bodies over the
@@ -314,7 +316,7 @@ async fn lock_rule_is_refused_for_every_rule_that_cannot_be_locked() {
             None,
         ),
         (
-            "already locked rule",
+            "already locked rule, under another unlock delay",
             already_locked.as_str(),
             409,
             Some("INVALID_RULE_STATE"),
