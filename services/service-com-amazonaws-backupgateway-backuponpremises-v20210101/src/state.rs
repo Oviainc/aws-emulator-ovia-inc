@@ -687,11 +687,12 @@ pub const MAX_STORED_VIRTUAL_MACHINES: usize = 10_000;
 /// A mint sequence is a `u64` per kind per region a record has been minted in, and the
 /// region a record is minted in comes off the request — so the registry is bounded here
 /// for the same reason the stores above are. The ceiling is the stores' own ceilings
-/// together, because a pair with a record stored under it must keep its sequence: once
-/// the registry reaches it, the sequences of the pairs this store holds NO record for are
-/// dropped ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::bound_mint_sequences`]),
-/// which never drops a sequence a stored record needs — and a region holding no record
-/// lists nothing, so a token naming it resumes an empty listing either way.
+/// together, because a pair with a record stored under it must keep its own sequence:
+/// once the registry reaches it, the ENTRIES of the pairs this store holds no record for
+/// are dropped, and the sequence each had reached is folded into that kind's floor
+/// ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::bound_mint_sequences`]), so
+/// bounding the registry frees entries without un-spending an identity: a later mint for a
+/// dropped pair resumes at or above every sequence that was dropped, never back at zero.
 pub const MAX_MINT_SEQUENCES: usize =
     MAX_STORED_GATEWAYS + MAX_STORED_HYPERVISORS + MAX_STORED_VIRTUAL_MACHINES;
 
@@ -1415,7 +1416,9 @@ pub struct ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// the `<kind>/<id>` ARN suffix.
     ///
     /// Monotonic per PAIR, so every minted ARN is unique within a run and the sequence a
-    /// test sees is reproducible. Per pair rather than one counter per kind because every
+    /// test sees is reproducible — a pair this registry holds no entry for starts from its
+    /// kind's `minted_sequence_floors` entry, so dropping an entry to bound the registry
+    /// does not restart one. Per pair rather than one counter per kind because every
     /// resource of this service is REGIONAL while one store serves every region a client
     /// addresses: a sequence is minted in exactly one region, so a counter scoped to the
     /// region is what lets
@@ -1424,6 +1427,20 @@ pub struct ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// which is not the question a page boundary asks. Bounded by
     /// [`MAX_MINT_SEQUENCES`](crate::state::MAX_MINT_SEQUENCES).
     next_resource_ids: BTreeMap<(MintedResource, String), u64>,
+    /// The lowest sequence a (kind, region) pair with NO entry in `next_resource_ids` may
+    /// mint next, per kind: the high-water mark of the sequences
+    /// [`Self::bound_mint_sequences`] has dropped.
+    ///
+    /// Bounding the registry may drop a pair's entry, but it must not un-spend the
+    /// identities that entry stands for — an id this store handed out is handed out once in
+    /// a run — so a dropped sequence is folded in here and a pair with no entry mints, and
+    /// counts as having minted ([`Self::next_resource_id`]), from this floor upward. Per
+    /// KIND rather than per pair because a per-pair record is the very thing the bound
+    /// drops: one floor at or above every sequence dropped for that kind in ANY region is
+    /// above what the dropped pair itself reached, which is what a region needs to resume
+    /// minting without repeating itself. At most one `u64` per kind, so the whole registry
+    /// stays inside [`MAX_MINT_SEQUENCES`](crate::state::MAX_MINT_SEQUENCES).
+    minted_sequence_floors: BTreeMap<MintedResource, u64>,
     /// The activation keys this service has issued and no create has redeemed, by key.
     ///
     /// The registry `CreateGateway` resolves its `ActivationKey` against: the activation
@@ -2285,7 +2302,12 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// even where that boundary's own region segment is this listing's.
     ///
     /// The mint sequence rather than the record map is what is consulted, because a record
-    /// this store minted and has since removed was still minted.
+    /// this store minted and has since removed was still minted — including after the
+    /// registry's bound dropped that pair's entry, where the sequence a pair has minted is
+    /// read off its kind's floor ([`Self::next_resource_id`]), which is at or above every
+    /// sequence the pair reached. So a boundary this store issued stays accepted for as
+    /// long as a client holds it; a region that minted nothing at all holds no record
+    /// either, so a boundary the floor accepts for such a region resumes an empty listing.
     fn is_minted_resource_arn(&self, arn: &str, resource_type: &str) -> bool {
         let Some(resource) = MintedResource::for_resource_type(resource_type) else {
             return false;
@@ -2308,10 +2330,21 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     }
 
     /// The sequence this store mints NEXT for a `resource` record of `region`, which is
-    /// also how many it has minted there.
+    /// also the first sequence it has NOT minted there: a pair the registry holds an entry
+    /// for answers from that entry, and one it does not from the kind's floor, which is at
+    /// or above every sequence a dropped entry had reached.
     fn next_resource_id(&self, resource: MintedResource, region: &str) -> u64 {
         self.next_resource_ids
             .get(&(resource, arn_region(region)))
+            .copied()
+            .unwrap_or_else(|| self.minted_sequence_floor(resource))
+    }
+
+    /// The floor a `resource` pair with no registry entry mints from — zero until the
+    /// registry's bound has dropped an entry of that kind. See `minted_sequence_floors`.
+    fn minted_sequence_floor(&self, resource: MintedResource) -> u64 {
+        self.minted_sequence_floors
+            .get(&resource)
             .copied()
             .unwrap_or_default()
     }
@@ -2325,28 +2358,51 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     fn mint_resource(&mut self, resource: MintedResource, region: &str) -> (String, String) {
         self.bound_mint_sequences();
         let region = arn_region(region);
+        // A pair with no entry starts at its kind's floor, not at zero: bounding the
+        // registry drops entries, and an identity a dropped entry had already handed out
+        // stays handed out.
+        let floor = self.minted_sequence_floor(resource);
         let sequence = self
             .next_resource_ids
             .entry((resource, region.clone()))
-            .or_default();
+            .or_insert(floor);
         let id = minted_resource_id(resource.id_prefix(), *sequence);
         let arn = minted_resource_arn(resource, &region, *sequence);
         *sequence += 1;
         (id, arn)
     }
 
-    /// Keep the mint registry inside [`MAX_MINT_SEQUENCES`] by dropping the sequences of
-    /// the (kind, region) pairs this store holds no record for.
+    /// Keep the mint registry inside [`MAX_MINT_SEQUENCES`] by dropping the ENTRIES of the
+    /// (kind, region) pairs this store holds no record for — and folding the sequence each
+    /// of them had reached into that kind's floor.
     ///
-    /// A pair a record is stored under keeps its sequence, so no minted ARN can ever be
-    /// minted twice; a pair with no record lists nothing, so the page boundaries its
-    /// sequence would have resumed name an empty listing anyway.
+    /// A pair a record is stored under keeps its own entry. A pair whose entry is dropped
+    /// keeps its identities SPENT: the floor it will mint from afterwards is at or above
+    /// the sequence it had reached ([`Self::minted_sequence_floor`]), so no ARN this store
+    /// has handed out is ever handed out again, and no boundary it has issued stops being
+    /// one it issued. What the bound frees is the per-pair bookkeeping, which is the part
+    /// that grows with the regions a caller addresses.
     fn bound_mint_sequences(&mut self) {
         if self.next_resource_ids.len() < MAX_MINT_SEQUENCES {
             return;
         }
         let stored = self.stored_mint_sequence_keys();
-        self.next_resource_ids.retain(|key, _| stored.contains(key));
+        let mut floors = ::std::mem::take(&mut self.minted_sequence_floors);
+        self.next_resource_ids.retain(|key, next| {
+            if stored.contains(key) {
+                return true;
+            }
+            let floor = floors.entry(key.0).or_default();
+            *floor = (*floor).max(*next);
+            false
+        });
+        self.minted_sequence_floors = floors;
+    }
+
+    /// How many (kind, region) mint sequences the registry holds — the registry whose size
+    /// [`MAX_MINT_SEQUENCES`] bounds, so a test can tell the bound really ran.
+    pub fn mint_sequence_count(&self) -> usize {
+        self.next_resource_ids.len()
     }
 
     /// The (kind, region) pairs this store holds at least one record under.
