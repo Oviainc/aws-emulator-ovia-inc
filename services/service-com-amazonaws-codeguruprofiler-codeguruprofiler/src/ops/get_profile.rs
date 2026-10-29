@@ -299,6 +299,12 @@ impl Representation {
     /// answer.
     const ALL: [Self; 2] = [Self::Json, Self::Ion];
 
+    /// The representation a served profile is announced under when nothing about it names
+    /// one of them, as the model's `GetProfileResponse$contentType` doc names it: "The
+    /// content type of the profile in the payload. It is either application/json or the
+    /// default application/x-amzn-ion."
+    const DEFAULT: Self = Self::Ion;
+
     /// The media type this representation is announced and requested under: its media
     /// TYPE and SUBTYPE, which are also what a media range in an `Accept` header matches
     /// against.
@@ -318,14 +324,29 @@ impl Representation {
     }
 
     /// The representation `media_type` names, or `None` for a media type that is neither
-    /// of them (including one that is no media type at all). Parameters and case are the
-    /// media-type grammar's, so the parse is the `mime` crate's and the comparison is on
-    /// the essence — `application/json; charset=utf-8` is JSON.
+    /// of them (including one that is no media type at all). The parse and the comparison
+    /// are the `mime` crate's, so the media-type grammar decides what names what: the
+    /// comparison is on the type and subtype, which are case-insensitive and carry no
+    /// parameter — `application/json; charset=utf-8` and `APPLICATION/JSON` both name
+    /// JSON.
     fn of(media_type: &str) -> Option<Self> {
         let parsed: ::mime::Mime = media_type.parse().ok()?;
-        Self::ALL
-            .into_iter()
-            .find(|representation| parsed.essence_str() == representation.media_type())
+        Self::ALL.into_iter().find(|representation| {
+            let (media_type, subtype) = representation.type_and_subtype();
+            parsed.type_() == media_type && parsed.subtype() == subtype
+        })
+    }
+
+    /// The representation the stored media type `media_type` announces, out of the ones
+    /// this service serves: the one it names ([`Self::of`]), and [`Self::DEFAULT`] where
+    /// it names neither — a media type of some other format, or no media type at all.
+    ///
+    /// The media type an upload was announced under is a caller's string, and never what a
+    /// response reports: the media types this service announces a profile under are the
+    /// two it reads and writes, so an announcement outside them names no representation to
+    /// report and leaves the default.
+    fn announced(media_type: &str) -> Self {
+        Self::of(media_type).unwrap_or(Self::DEFAULT)
     }
 
     /// Whether the media range `range` allows this representation: a range allows it when
@@ -397,8 +418,8 @@ fn quality_of(accept: &str, representation: Representation) -> Option<f32> {
 /// [`ion_document`], which drives the reader level by level so nothing recurses on a
 /// caller-chosen depth. The number is `serde_json`'s own default, so neither
 /// representation is read deeper than the other. A document nested deeper than this is
-/// not one this operation re-encodes — it is served exactly as it is stored, under the
-/// media type it really has.
+/// not one this operation re-encodes — it is served exactly as it is stored, announced
+/// under one of the two media types this service serves.
 const DOCUMENT_NESTING_LIMIT: u32 = 128;
 
 /// The bytes to serve and the media type to announce them under, for `profile` read with
@@ -413,11 +434,13 @@ const DOCUMENT_NESTING_LIMIT: u32 = 128;
 /// is served byte for byte, and anything else is the stored document re-encoded. The
 /// representation a stored profile is read in is the one its bytes are a document in
 /// ([`stored_document`]), never the one they were announced under, so both members are
-/// honoured for every stored profile this service can read at all; `contentType` reports
-/// the representation the served bytes are in. Bytes that are a document in NEITHER
-/// representation hold no frames this service can see — there is nothing in them to
-/// re-encode or to bound — so they are served as stored, under the media type they were
-/// announced with, which is what `contentType` then reports.
+/// honoured for every stored profile this service can read at all. `contentType` reports
+/// the representation the served bytes are announced in, which is always one of the two
+/// this service serves ([`Representation::media_type`]) and never a media type carried
+/// over from an upload: bytes that are a document in NEITHER representation hold no frames
+/// this service can see — there is nothing in them to re-encode or to bound — so they are
+/// served as stored, announced under the representation their stored media type names, or
+/// under the default ([`Representation::announced`]) when it names neither.
 fn served_profile(
     profile: &crate::state::AgentProfile,
     accept: Option<&str>,
@@ -428,9 +451,16 @@ fn served_profile(
     let keep = max_depth.and_then(|depth| u32::try_from(depth).ok());
 
     let Some((stored, document)) = stored_document(profile) else {
-        // Bytes that are a document in neither representation: served as stored, under
-        // the media type they were announced with.
-        return (profile.bytes.clone(), profile.content_type.clone());
+        // Bytes that are a document in neither representation: served as stored, and
+        // announced under the representation this service serves that their stored media
+        // type names — the default where it names neither, since a media type this service
+        // does not serve is not one `contentType` can report.
+        return (
+            profile.bytes.clone(),
+            Representation::announced(&profile.content_type)
+                .media_type()
+                .to_string(),
+        );
     };
     // The stored bytes, announced under the representation they ARE a document in: the
     // answer whenever the document itself is not to be changed, and the one left when a

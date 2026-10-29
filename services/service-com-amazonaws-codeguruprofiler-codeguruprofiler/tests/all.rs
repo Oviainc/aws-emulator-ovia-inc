@@ -75,6 +75,8 @@ mod refusal_message_rules;
 mod resource_policy;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/served_media_type.rs"]
+mod served_media_type;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stored_profile_representation.rs"]

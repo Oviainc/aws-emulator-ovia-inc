@@ -693,8 +693,10 @@ async fn a_document_past_the_read_bound_is_served_as_it_is_stored() {
 
 /// A payload that is not a document in the representation it was posted under holds no
 /// frames this service can see and has no other representation to be written out in, so
-/// it is served exactly as it is stored, under the media type it really has — which is
-/// what `contentType` then reports.
+/// it is served exactly as it is stored, announced under the representation its stored
+/// media type names — which is what `contentType` then reports. (What is announced for a
+/// media type naming NEITHER representation this service serves is `served_media_type`'s
+/// table.)
 #[tokio::test]
 async fn a_payload_that_is_no_document_is_served_as_it_is_stored() {
     let harness = Harness::new();
