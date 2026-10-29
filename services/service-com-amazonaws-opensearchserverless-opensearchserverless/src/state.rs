@@ -28,7 +28,7 @@ use crate::ops::types::{
     CreateCollectionDetail, CreateCollectionGroupDetail, CreateVpcEndpointDetail, CurrentCapacity,
     DeleteCollectionDetail, DeleteVpcEndpointDetail, FipsEndpoints, IamFederationConfigOptions,
     IamIdentityCenterConfigOptions, LifecyclePolicyDetail, LifecyclePolicyErrorDetail,
-    SamlConfigOptions, SecurityConfigDetail, SecurityConfigSummary, SecurityPolicyDetail,
+    LifecyclePolicySummary, SamlConfigOptions, SecurityConfigDetail, SecurityConfigSummary, SecurityPolicyDetail,
     SecurityPolicySummary, Tag, UpdateCollectionDetail, UpdateCollectionGroupDetail,
     UpdateIamIdentityCenterConfigOptions, VectorOptions, VpcEndpointDetail, VpcEndpointErrorDetail,
 };
@@ -317,6 +317,13 @@ pub const DEFAULT_COLLECTION_GROUP_MAX_SEARCH_CAPACITY_IN_OCU: f32 = 96.0;
 /// `maxResults` documentation: "The maximum number of results to return. Default is 20."
 /// (`ListCollectionsRequest`), "The default is 20." (`ListSecurityConfigsRequest`).
 pub const DEFAULT_PAGE_SIZE: i32 = 20;
+
+/// The page bound the LIFECYCLE-POLICY listing applies when the caller names none, which
+/// its own `maxResults` documentation puts lower than the listings above:
+/// `ListLifecyclePoliciesRequest$maxResults` reads "An optional parameter that specifies
+/// the maximum number of results to return. You can use use `nextToken` to get the next
+/// page of results. The default is 10."
+pub const DEFAULT_LIFECYCLE_POLICY_PAGE_SIZE: i32 = 10;
 
 /// The largest page a listing serves: the maximum of `maxResults`' own
 /// `@range(min: 1, max: 100)`.
@@ -1205,7 +1212,11 @@ impl SecurityPolicyRecord {
 /// the `Resource` entries it applies to — an encryption policy being one such object and a
 /// network policy a LIST of them — which is why both forms are walked here. The resource
 /// entry already carries its own type (`collection/<name>`, `index/<collection>/<index>`),
-/// so a rule's `ResourceType` adds nothing to what a resource filter can select on.
+/// so a rule's `ResourceType` adds nothing to what a resource filter can select on. A
+/// RETENTION lifecycle policy's document is in that same form — "Amazon OpenSearch
+/// Serverless data lifecycle policies" writes it as a `Rules` list whose every rule carries
+/// a `ResourceType` and the `Resource` entries it applies to, the form
+/// [`validate_retention_policy`] checks — so the resources its rules name are read here too.
 ///
 /// Nothing is validated here: a document that is not in that form simply names no
 /// resources, because `CreateSecurityPolicy` accepts any JSON document a caller signs.
@@ -1296,6 +1307,9 @@ pub type SecurityPolicyListingEntry = PolicyListingEntry<SecurityPolicySummary>;
 
 /// What `ListAccessPolicies` pages over.
 pub type AccessPolicyListingEntry = PolicyListingEntry<AccessPolicySummary>;
+
+/// What `ListLifecyclePolicies` pages over.
+pub type LifecyclePolicyListingEntry = PolicyListingEntry<LifecyclePolicySummary>;
 
 /// A policy listing is of ONE `type` (the member is required), inside which the
 /// `PolicyName` is unique — so the name is this entry's place in that listing's order.
@@ -1833,6 +1847,32 @@ impl LifecyclePolicyRecord {
             policy: Some(self.policy.clone()),
             created_date: Some(self.created_date),
             last_modified_date: Some(self.last_modified_date),
+        }
+    }
+
+    /// The `LifecyclePolicySummary` body for this record — the shape
+    /// `ListLifecyclePolicies` pages over. It is `LifecyclePolicyDetail` without the policy
+    /// document itself, so a listing and a read cannot disagree about the members they
+    /// share.
+    pub fn summary(&self) -> LifecyclePolicySummary {
+        LifecyclePolicySummary {
+            r#type: Some(self.kind.clone()),
+            name: Some(self.name.clone()),
+            policy_version: Some(self.policy_version.clone()),
+            description: self.description.clone(),
+            created_date: Some(self.created_date),
+            last_modified_date: Some(self.last_modified_date),
+        }
+    }
+
+    /// What a listing needs of this record, COPIED OUT of the store; see
+    /// [`SecurityPolicyRecord::listing_entry`] for why the copy is taken under the lock and
+    /// what bounds it.
+    pub fn listing_entry(&self) -> LifecyclePolicyListingEntry {
+        LifecyclePolicyListingEntry {
+            summary: self.summary(),
+            name: self.name.clone(),
+            resources: policy_document_resources(&self.policy),
         }
     }
 

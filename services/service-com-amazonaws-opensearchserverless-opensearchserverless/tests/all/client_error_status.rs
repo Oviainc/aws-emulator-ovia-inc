@@ -372,15 +372,11 @@ async fn an_answer_that_is_not_a_client_error_keeps_its_own_status() {
     let router = emulator();
 
     // A scaffolded operation answers the framework's 501, not a client error: collapsing
-    // it would tell a client its request was at fault. `ListTagsForResource` is no longer
-    // one of them — it reads the stored tag set — so the row names operations whose
-    // handlers still carry the scaffold marker.
-    for operation in ["ListVpcEndpoints", "ListLifecyclePolicies"] {
-        let request = match operation {
-            "ListLifecyclePolicies" => json!({ "type": "retention" }),
-            _ => json!({}),
-        };
-        let (status, code, answer) = call(&router, operation, request).await;
+    // it would tell a client its request was at fault. `ListTagsForResource` and
+    // `ListLifecyclePolicies` are no longer among them — each reads stored records — so the
+    // row names operations whose handlers still carry the scaffold marker.
+    for operation in ["ListVpcEndpoints", "ListCollectionGroups"] {
+        let (status, code, answer) = call(&router, operation, json!({})).await;
         assert_eq!(
             (status, code.as_str()),
             (501, "NotImplemented"),
