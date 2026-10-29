@@ -329,15 +329,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let ndi_feature = if crate::state::ndi_is_enabled(ndi_config.as_ref()) {
                 Some(format!("NdiConfig.NdiState {STATE_ENABLED}"))
             } else if input.flow_size.is_some() {
-                // The source type is the other half of the same pair: "if you're switching
-                // from an NDI source to a transport stream (TS) source and want to
-                // downgrade the flow size: first, use the UpdateFlowSource operation to
-                // change the flow source type" (this operation's own documentation). Only a
-                // request that changes the size is refused for it.
+                // What the flow already HOLDS is the other half of the same pair: "if
+                // you're switching from an NDI source to a transport stream (TS) source and
+                // want to downgrade the flow size: first, use the UpdateFlowSource
+                // operation to change the flow source type" (this operation's own
+                // documentation). A stored source OR a stored output on the NDI transport
+                // makes the flow one that includes NDI, exactly as it does on the create
+                // and add sides, so both are read here. Only a request that changes the
+                // size is refused for them.
                 flow.sources
                     .iter()
                     .find(|source| crate::state::stored_source_uses_ndi(source))
                     .map(|source| format!("The NDI source {:?}", source.name))
+                    .or_else(|| {
+                        flow.outputs
+                            .iter()
+                            .find(|output| crate::state::stored_output_uses_ndi(output))
+                            .map(|output| format!("The NDI output {:?}", output.name))
+                    })
             } else {
                 None
             };

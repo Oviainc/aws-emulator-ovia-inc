@@ -49,6 +49,8 @@ mod flow_listing_default_page;
 mod flow_media_streams;
 #[path = "all/flow_name_references.rs"]
 mod flow_name_references;
+#[path = "all/flow_ndi_resize.rs"]
+mod flow_ndi_resize;
 #[path = "all/flow_ndi_sizing.rs"]
 mod flow_ndi_sizing;
 #[path = "all/flow_outputs.rs"]

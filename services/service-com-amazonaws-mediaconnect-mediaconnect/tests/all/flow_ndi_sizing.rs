@@ -19,7 +19,9 @@
 //! and AddFlowOutputs (which append one), and UpdateFlowSource / UpdateFlowOutput (which
 //! move an existing one onto the NDI transport). UpdateFlow's own half of the rule — the
 //! `NdiConfig` / `FlowSize` pair on an existing flow — is asserted in
-//! `tests/all/update_flow.rs`.
+//! `tests/all/update_flow.rs`, and the resize of a flow that ALREADY includes NDI, by
+//! whichever marker, in `tests/all/flow_ndi_resize.rs`, which reads the catalog table and
+//! the request builders below rather than restating them.
 //!
 //! The rows span the WHOLE `FlowSize` catalog (`smithy_query(query="shape",
 //! shape="FlowSize")`: MEDIUM | LARGE | LARGE_4X) plus the flow whose size was never set,
@@ -43,14 +45,16 @@ use crate::flow_sources::{add_flow_sources, described_sources, failover_active};
 /// (`smithy_query(query="shape",shape="Protocol")`: … | ndi-speed-hq), written out here
 /// rather than read from the crate so these cases check the rule and not the code's own
 /// idea of it.
-const NDI_PROTOCOL: &str = "ndi-speed-hq";
+pub(crate) const NDI_PROTOCOL: &str = "ndi-speed-hq";
 
 /// The whole `FlowSize` catalog (`smithy_query(query="shape",shape="FlowSize")`: MEDIUM |
 /// LARGE | LARGE_4X), plus the flow whose size the request never set, with whether each
 /// one's "feature set" carries NDI®: `CreateFlowRequest$FlowSize` names `LARGE` as the size
 /// that enables NDI, so `MEDIUM` — and a size never set at all — does not, and `LARGE_4X`,
 /// which is larger than `LARGE`, does.
-fn flow_sizes() -> Vec<(&'static str, Option<&'static str>, bool)> {
+/// `pub(crate)` because `tests/all/flow_ndi_resize.rs` judges the same rule against the
+/// same catalog, and one catalog is one rule.
+pub(crate) fn flow_sizes() -> Vec<(&'static str, Option<&'static str>, bool)> {
     vec![
         ("no flow size at all", None, false),
         ("MEDIUM", Some("MEDIUM"), false),
@@ -60,7 +64,7 @@ fn flow_sizes() -> Vec<(&'static str, Option<&'static str>, bool)> {
 }
 
 /// A source request on a protocol that is not the NDI transport.
-fn plain_source(name: &str) -> Value {
+pub(crate) fn plain_source(name: &str) -> Value {
     json!({ "name": name, "protocol": "rtp", "whitelistCidr": "10.0.0.0/16" })
 }
 
@@ -77,12 +81,12 @@ fn ndi_source(name: &str) -> Value {
 }
 
 /// An output request on a protocol that is not the NDI transport.
-fn plain_output(name: &str) -> Value {
+pub(crate) fn plain_output(name: &str) -> Value {
     json!({ "name": name, "protocol": "rtp", "destination": "198.51.100.7", "port": 6100 })
 }
 
 /// An output request on the NDI® transport.
-fn ndi_output(name: &str) -> Value {
+pub(crate) fn ndi_output(name: &str) -> Value {
     json!({ "name": name, "protocol": NDI_PROTOCOL, "ndiProgramName": "programme" })
 }
 

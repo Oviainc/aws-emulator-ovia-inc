@@ -1068,6 +1068,20 @@ pub fn output_request_uses_ndi(request: &AddOutputRequest) -> bool {
     uses_ndi_transport(request.protocol.as_deref(), false)
 }
 
+/// Whether a stored output is an NDI® output: the same single marker
+/// [`output_request_uses_ndi`] reads — the protocol that carries it — on the record the
+/// request was materialised into, so the stored output and the request it came from are
+/// NDI for the same reason.
+pub fn stored_output_uses_ndi(output: &StoredOutput) -> bool {
+    uses_ndi_transport(
+        output
+            .transport
+            .as_ref()
+            .map(|transport| transport.protocol.as_str()),
+        false,
+    )
+}
+
 /// The detail a request is refused with when it would leave a flow including NDI® at a size
 /// that does not carry it: `ndi_feature` names what uses NDI, `flow_size` is the size the
 /// flow ends up with. `None` when that size is NDI-capable ([`flow_size_supports_ndi`]), so
