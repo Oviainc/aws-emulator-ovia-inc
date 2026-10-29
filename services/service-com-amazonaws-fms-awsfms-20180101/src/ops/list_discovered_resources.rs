@@ -15,6 +15,15 @@
 //! ([`crate::state::discovered_resources`]), filtered by the member account and
 //! the resource type the request names and served in bounded pages.
 //!
+//! `MemberAccountIds` states two rules in one sentence pair, and BOTH are
+//! enforced: only one account per request, and that account must be one of the
+//! organisation's ([`crate::state::organization_accounts`] — the definition
+//! `ListMemberAccounts` answers with and the batch membership operations weigh a
+//! resource's account against). An account outside the organisation is therefore
+//! the modelled `InvalidInputException`, not an empty page: the empty page means
+//! "this MEMBER account owns nothing of that type", which a caller must be able
+//! to tell apart.
+//!
 //! That inventory is DISCOVERED, not registered: Firewall Manager holds no copy
 //! of the organisation's resources, so it is read from the stores of the
 //! emulated services that OWN each kind of resource through the one shared
@@ -22,9 +31,9 @@
 //! and so on for every type [`crate::state::DISCOVERABLE_RESOURCE_TYPES`]
 //! names. A resource created through one of those services is therefore
 //! discoverable with no propagation step, and one deleted there stops being
-//! discovered. An account that owns nothing, and a resource type no emulated
-//! service holds, both answer an EMPTY `Items`: the honest answer, never an
-//! invented resource.
+//! discovered. A MEMBER account that owns nothing, and a resource type no
+//! emulated service holds, both answer an EMPTY `Items`: the honest answer,
+//! never an invented resource.
 //!
 //! ## Shape of an operation
 //!
@@ -188,15 +197,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
-        {
+        // The accounts the discoverable inventory reports resources in, read
+        // BEFORE this service's store is locked: that read takes the locks of the
+        // services that own those resources, and this service holds no lock of
+        // its own while it does (see `crate::state::discoverable_accounts`).
+        let discoverable = crate::state::discoverable_accounts(&*self.engine, &region);
+        let accounts = {
             // The authorization gate, BEFORE the request's members are examined.
-            // Its guard is released as soon as it has answered: the inventory is
+            // Its guard is released as soon as it has answered and the
+            // organization's accounts have been read: the inventory itself is
             // read from OTHER services' stores, and this service holds no lock of
             // its own while it does that (see
             // `crate::state::discovered_resources`).
             let store = state.lock();
             crate::state::require_administrator(&store, &region)?;
-        }
+            crate::state::organization_accounts(&store, discoverable)
+        };
 
         // "Only one account is supported per request" — `MemberAccountIds`' own
         // documentation. The modelled list carries no length constraint, so the
@@ -212,6 +228,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // "The account must be a member of your organization" — the OTHER half of
+        // the same sentence pair of `MemberAccountIds`' documentation. Who is in
+        // the organization is the one definition this service holds
+        // ([`crate::state::organization_accounts`], the set `ListMemberAccounts`
+        // reports together with the accounts the inventory reports resources in),
+        // the SAME set the batch membership operations weigh a resource's account
+        // against — so an account the organization does not hold is refused here
+        // with the modelled `InvalidInputException` rather than answered with an
+        // empty page, which a caller cannot tell apart from "this member account
+        // owns nothing of that type".
+        if !accounts.contains(account) {
+            return Err(ListDiscoveredResourcesErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "MemberAccountIds names account {account}, which is not a member of your \
+                         organization"
+                    )),
+                },
+            )
+            .into());
+        }
 
         // A token this service did not mint for an inventory page names no page
         // boundary: this page is keyed by a resource URI, so a token whose

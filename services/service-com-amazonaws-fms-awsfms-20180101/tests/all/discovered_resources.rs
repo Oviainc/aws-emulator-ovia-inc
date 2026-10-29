@@ -11,7 +11,9 @@
 //! bounded pages; it keeps no inventory of its own, so a resource created
 //! through the owning service's API is discoverable with no propagation step and
 //! one deleted there stops being discovered, and a type no emulated service owns
-//! and an account that owns nothing both report an EMPTY list.
+//! and a MEMBER account that owns nothing both report an EMPTY list, while an
+//! account the organisation does not hold is refused outright
+//! ([`the_member_account_must_be_one_of_the_organizations_accounts`]).
 //!
 //! LIMIT of the Region half of that rule, asserted as such in
 //! [`a_resource_whose_service_records_no_region_is_discovered_from_every_region`]:
@@ -51,15 +53,23 @@ use service_com_amazonaws_ec2_amazonec2 as ec2;
 use service_com_amazonaws_fms_awsfms_20180101::state;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::administrator_gated_operations::{associate_admin, with_store};
+use crate::administrator_gated_operations::{associate_admin, error_message, with_store};
 use crate::policy_lifecycle::{call, call_in, ACCOUNT, REGION};
 
 /// A second Region, to assert a resource is discoverable in the Region its
 /// owning service recorded it in rather than in every Region.
 const OTHER_REGION: &str = "us-east-1";
 
-/// An account id that is not this emulator's, so nothing it holds belongs to it.
+/// An account id this organisation does not hold: no administrator association
+/// and no policy scope map names it, and nothing this emulator holds belongs to
+/// it.
 const FOREIGN_ACCOUNT: &str = "222233334444";
+
+/// An account the organisation DOES hold — a policy scope map names it — that
+/// owns nothing, which is what tells the two empty-looking answers apart: a
+/// member account owning nothing of a type is an empty page, an account outside
+/// the organisation is a refusal.
+const MEMBER_WITHOUT_RESOURCES: &str = "100000000009";
 
 /// The image id the EC2 launches below name. Any well-formed `ami-` id serves:
 /// what is under test is the instance that ends up in EC2's store, not the image.
@@ -361,6 +371,35 @@ async fn list(
         "case {account}/{resource_type}: expected HTTP 200, got {status} with {body}"
     );
     body
+}
+
+/// Store one policy whose `IncludeMap` or `ExcludeMap` names `accounts` under
+/// the `ACCOUNT` scope key — how an account other than the administrator comes
+/// to be recorded as one of the organisation's: those entries are the accounts
+/// the policy applies to or leaves out, which is the membership
+/// `ListMemberAccounts` reports.
+async fn put_account_scoped_policy(
+    router: &MultiServiceRouter,
+    name: &str,
+    scope_map: &str,
+    accounts: &[&str],
+) {
+    let mut policy = json!({
+        "PolicyName": name,
+        "SecurityServicePolicyData": {
+            "Type": "WAFV2",
+            "ManagedServiceData": "{\"type\":\"WAFV2\"}"
+        },
+        "ResourceType": state::RESOURCE_TYPE_ELBV2_LOAD_BALANCER,
+        "ExcludeResourceTags": false,
+        "RemediationEnabled": false
+    });
+    policy[scope_map] = json!({ "ACCOUNT": accounts });
+    let (status, body) = call(router, "PutPolicy", &json!({ "Policy": policy })).await;
+    assert_eq!(
+        status, 200,
+        "case {name:?}: expected PutPolicy to answer 200, got {status} with {body}"
+    );
 }
 
 /// The `Items` of one page, as `(URI, AccountId, Type, Name)` quadruples.
@@ -935,13 +974,26 @@ async fn a_resource_whose_service_records_no_region_is_discovered_from_every_reg
     }
 }
 
-/// RULE: nothing is discovered for an account that owns nothing, or for a
+/// RULE: nothing is discovered for a MEMBER account that owns nothing, or for a
 /// resource type no emulated service holds resources of — an empty `Items` and
 /// no `NextToken`, never a refusal and never an invented resource.
+///
+/// An account the organisation does NOT hold is the other case entirely, and is
+/// refused: see [`the_member_account_must_be_one_of_the_organizations_accounts`].
 #[tokio::test]
 async fn an_inventory_with_nothing_in_it_is_empty() {
     let (router, _engine) = emulator();
     associate_admin(&router).await;
+
+    // An account of the organisation that owns nothing, so the empty answer
+    // below is about what that MEMBER account holds.
+    put_account_scoped_policy(
+        &router,
+        "fms-member-without-resources",
+        "IncludeMap",
+        &[MEMBER_WITHOUT_RESOURCES],
+    )
+    .await;
 
     // Make EC2 hold something, so an empty answer is about the FILTER rather
     // than about an emulator that holds nothing at all.
@@ -957,11 +1009,12 @@ async fn an_inventory_with_nothing_in_it_is_empty() {
         "the VPC must be discoverable before the empty cases are asserted"
     );
 
-    // Rows differ in WHY the inventory is empty: a foreign account, catalogued
-    // types whose owning service is mounted and holds nothing, a documented type
-    // no emulated service owns, and a type that is not a resource type at all.
+    // Rows differ in WHY the inventory is empty: a member account that owns
+    // nothing, catalogued types whose owning service is mounted and holds
+    // nothing, a documented type no emulated service owns, and a type that is
+    // not a resource type at all.
     let cases = [
-        (FOREIGN_ACCOUNT, state::RESOURCE_TYPE_EC2_VPC),
+        (MEMBER_WITHOUT_RESOURCES, state::RESOURCE_TYPE_EC2_VPC),
         (ACCOUNT, state::RESOURCE_TYPE_ELBV2_LOAD_BALANCER),
         (ACCOUNT, state::RESOURCE_TYPE_CLOUDFRONT_DISTRIBUTION),
         (ACCOUNT, state::RESOURCE_TYPE_APIGATEWAY_STAGE),
@@ -979,6 +1032,220 @@ async fn an_inventory_with_nothing_in_it_is_empty() {
         assert!(
             body["NextToken"].is_null(),
             "case {account}/{resource_type}: an empty page carries no NextToken, got {body}"
+        );
+    }
+}
+
+/// RULE: the account a discovery request names must be one of the caller's
+/// organisation's accounts — the set this service records as the organisation's,
+/// which is what `ListMemberAccounts` reports and what a resource's account is
+/// weighed against when it is associated with a resource set — so an account the
+/// organisation does not hold is refused with the operation's modelled
+/// `InvalidInputException` instead of being answered with the empty page that
+/// means "this member account owns nothing of that type".
+#[tokio::test]
+async fn the_member_account_must_be_one_of_the_organizations_accounts() {
+    let (router, _engine) = emulator();
+    associate_admin(&router).await;
+
+    // One instance, so an accepted row is answered from an inventory that really
+    // holds something.
+    let instance = element(
+        "instance",
+        &ec2_ok(
+            "instance",
+            &router,
+            "RunInstances",
+            &[p("ImageId", AMI), p("MinCount", "1"), p("MaxCount", "1")],
+        )
+        .await,
+        "instanceId",
+    );
+    let owned = ec2_arn(&format!("instance/{instance}"));
+
+    // Rows differ in HOW the account became one of the organisation's and in the
+    // length of the account id — `AWSAccountId` is `^[0-9]+$` of length 1..1024,
+    // from `smithy_query(query="shape", shape="AWSAccountId")`, so a one-digit
+    // and a twenty-digit id are both well-formed account ids.
+    let onboarded = "100000000001";
+    let included = "100000000002";
+    let excluded = "12345678901234567890";
+    let (status, body) = call(
+        &router,
+        "PutAdminAccount",
+        &json!({ "AdminAccount": onboarded }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "PutAdminAccount must onboard {onboarded}, got {status} with {body}"
+    );
+    put_account_scoped_policy(
+        &router,
+        "fms-included-accounts",
+        "IncludeMap",
+        &[included, MEMBER_WITHOUT_RESOURCES],
+    )
+    .await;
+    put_account_scoped_policy(&router, "fms-excluded-accounts", "ExcludeMap", &[excluded]).await;
+
+    let members = [
+        (
+            "the associated administrator, which owns the instance",
+            ACCOUNT,
+        ),
+        ("an account PutAdminAccount onboarded", onboarded),
+        ("an account a policy's IncludeMap names", included),
+        (
+            "a second account the same IncludeMap names",
+            MEMBER_WITHOUT_RESOURCES,
+        ),
+        (
+            "a twenty-digit account a policy's ExcludeMap names",
+            excluded,
+        ),
+    ];
+    let outsiders = [
+        (
+            "a twelve-digit account nothing in this organisation names",
+            FOREIGN_ACCOUNT,
+        ),
+        ("a one-digit account id", "7"),
+        ("a sixteen-digit account id", "1234567890123456"),
+        ("an account id one digit from a member's", "100000000012"),
+    ];
+
+    // The organisation's accounts as the service itself reports them, so the
+    // table is weighed against the membership rather than against itself.
+    let (status, body) = call(&router, "ListMemberAccounts", &json!({})).await;
+    assert_eq!(
+        status, 200,
+        "ListMemberAccounts must answer 200, got {status} with {body}"
+    );
+    let reported: BTreeSet<String> = body["MemberAccounts"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|account| account.as_str().map(str::to_string))
+        .collect();
+    let expected: BTreeSet<String> = members
+        .iter()
+        .map(|(_, account)| (*account).to_string())
+        .collect();
+    assert_eq!(
+        reported, expected,
+        "the organisation's accounts must be exactly the seeded members, got {reported:?}"
+    );
+    for (case, account) in outsiders {
+        assert!(
+            !reported.contains(account),
+            "case {case:?}: {account} must not be one of the organisation's accounts, got \
+             {reported:?}"
+        );
+    }
+
+    // ACCEPTED: a member account is served its own inventory — the instance for
+    // the account that owns it, an empty page for a member that owns nothing.
+    for (case, account) in members {
+        let body = list(
+            &router,
+            account,
+            state::RESOURCE_TYPE_EC2_INSTANCE,
+            None,
+            None,
+        )
+        .await;
+        let served: Vec<String> = items(&body).into_iter().map(|(uri, ..)| uri).collect();
+        let expected: Vec<String> = if account == ACCOUNT {
+            vec![owned.clone()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            served, expected,
+            "case {case:?}: expected {expected:?} for member account {account}, got {served:?}"
+        );
+    }
+
+    // REFUSED: an account the organisation does not hold.
+    for (case, account) in outsiders {
+        let (status, body) = call(
+            &router,
+            "ListDiscoveredResources",
+            &json!({
+                "MemberAccountIds": [account],
+                "ResourceType": state::RESOURCE_TYPE_EC2_INSTANCE,
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, crate::policy_lifecycle::error_code(&body).as_str()),
+            (400, "InvalidInputException"),
+            "case {case:?}: an account outside the organisation must be refused, got {status} \
+             with {body}"
+        );
+        let message = error_message(&body);
+        assert!(
+            message.contains(account),
+            "case {case:?}: the refusal must name the account the request sent, got {message:?}"
+        );
+        assert!(
+            body["Items"].is_null() && body["NextToken"].is_null(),
+            "case {case:?}: a refused call must report nothing, got {body}"
+        );
+    }
+
+    // The two surfaces read ONE definition of who is in the organisation: an
+    // account a resource may not be associated from (`NOT_VALID_ACCOUNT_ID`) is
+    // an account no discovery is served for, and the other way round.
+    let (_, created) = call(
+        &router,
+        "PutResourceSet",
+        &json!({
+            "ResourceSet": {
+                "Name": "fms-membership",
+                "ResourceTypeList": [state::RESOURCE_TYPE_EC2_INSTANCE],
+            },
+        }),
+    )
+    .await;
+    let id = created["ResourceSet"]["Id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("PutResourceSet must mint an Id, got {created}"))
+        .to_string();
+    let parity = members
+        .iter()
+        .map(|(case, account)| (*case, *account, false))
+        .chain(
+            outsiders
+                .iter()
+                .map(|(case, account)| (*case, *account, true)),
+        );
+    for (case, account, outside) in parity {
+        let uri = format!("arn:aws:ec2:{REGION}:{account}:instance/i-0123456789abcdef0");
+        let (status, body) = call(
+            &router,
+            "BatchAssociateResource",
+            &json!({ "ResourceSetIdentifier": id, "Items": [uri] }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: BatchAssociateResource must answer 200, got {status} with {body}"
+        );
+        let reason = body["FailedItems"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .find(|item| item["URI"].as_str() == Some(uri.as_str()))
+            .and_then(|item| item["Reason"].as_str().map(str::to_string));
+        let expected = outside.then(|| "NOT_VALID_ACCOUNT_ID".to_string());
+        assert_eq!(
+            reason, expected,
+            "case {case:?}: the two operations must agree on who is in the organisation, got \
+             {reason:?} in {body}"
         );
     }
 }
