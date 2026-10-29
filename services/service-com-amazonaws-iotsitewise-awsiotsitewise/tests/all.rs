@@ -41,6 +41,13 @@ mod client_token_spent_on_another_request;
 #[path = "all/workspace_scoped_path_resolution.rs"]
 mod workspace_scoped_path_resolution;
 
+// `workspace_scoped_job_reads` is declared HERE, beside the suite it belongs
+// with, for the reason the note above gives: the sorted list and the END of this
+// file are both where every concurrent iotsitewise change puts a declaration of
+// its own. Fold it into the list once the churn settles.
+#[path = "all/workspace_scoped_job_reads.rs"]
+mod workspace_scoped_job_reads;
+
 // `list_workspaces` is declared HERE, beside the note above, rather than in the
 // sorted list or at the END of the file: those are the two stretches every
 // concurrent iotsitewise change puts a declaration of its own in. Fold it into
