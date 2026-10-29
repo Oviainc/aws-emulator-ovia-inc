@@ -285,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rounded one below, because the cap is about what was requested.
         let requested_datapoints = ((end - requested_start) / period).ceil();
         if requested_datapoints > MAX_DATAPOINTS {
-            return Err(invalid_combination(datapoint_cap_exceeded(
+            return Err(invalid_combination(crate::state::datapoint_cap_exceeded(
                 requested_datapoints,
                 MAX_DATAPOINTS,
             )));
@@ -382,23 +382,6 @@ fn invalid_combination(message: String) -> GetMetricStatisticsError {
         },
     )
     .into()
-}
-
-/// What a read that asks for more data points than one call returns is told.
-///
-/// "The maximum number of data points returned from a single call is 1,440. If you request
-/// more than 1,440 data points, CloudWatch returns an error. To reduce the number of data
-/// points, you can narrow the specified time range and make multiple requests across adjacent
-/// time ranges, or you can increase the specified period." (`GetMetricStatistics`) — the
-/// sentence states what the request asked for, the cap it broke, and the two remedies, so the
-/// caller can turn it into a request that is served. Both numbers come from the request and
-/// the cap, never from fixed text.
-fn datapoint_cap_exceeded(requested: f64, cap: f64) -> String {
-    format!(
-        "You have requested up to {requested:.0} datapoints, which exceeds the limit of \
-         {cap:.0}. You may reduce the datapoints requested by increasing Period, or decreasing \
-         the time range."
-    )
 }
 
 /// Refuse a `Period` the member does not document, in the words the one shared rule

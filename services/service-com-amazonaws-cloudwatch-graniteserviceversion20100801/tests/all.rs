@@ -85,6 +85,8 @@ mod get_dashboard_reader;
 mod harness;
 #[path = "all/insight_rule_batch_failures.rs"]
 mod insight_rule_batch_failures;
+#[path = "all/insight_rule_report.rs"]
+mod insight_rule_report;
 #[path = "all/insight_rule_state.rs"]
 mod insight_rule_state;
 #[path = "all/insight_rules.rs"]

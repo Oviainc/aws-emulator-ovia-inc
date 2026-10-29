@@ -275,6 +275,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         });
                         continue;
                     }
+                    let definition = managed_definition(&origin);
                     store.insight_rules.insert(
                         rule_name.clone(),
                         crate::state::StoredInsightRule {
@@ -291,12 +292,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 // "For managed rules, this is `{"Name": "ServiceLogRule",
                                 // "Version": 1}`" (`InsightRule$Schema`).
                                 schema: crate::state::MANAGED_INSIGHT_RULE_SCHEMA.to_string(),
-                                definition: managed_definition(&origin),
+                                definition: definition.clone(),
                                 // "An optional built-in rule that Amazon Web Services
                                 // manages." (`InsightRule$ManagedRule`)
                                 managed_rule: Some(true),
                                 apply_on_transformed_logs: Some(false),
                             },
+                            // Read from the definition this rule carries, by the one rule every
+                            // stored definition is read by: a managed rule's names the template
+                            // and the resource its data comes from rather than a log group a
+                            // caller writes to, so it selects none and collects nothing from an
+                            // ingest.
+                            collection: crate::state::insight_rules::LogRuleDefinition::parse(
+                                &definition,
+                            ),
+                            observations: Vec::new(),
                             tags: rule.tags.clone().unwrap_or_default(),
                             managed: Some(origin),
                         },

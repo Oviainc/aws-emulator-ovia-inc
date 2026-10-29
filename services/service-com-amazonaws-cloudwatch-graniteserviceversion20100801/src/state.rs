@@ -22,7 +22,9 @@
 //!   metric streams written by `PutMetricStream` and read back by `GetMetricStream`.
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::insight_rules`] — the
 //!   Contributor Insights rules written by `PutInsightRule`, read back by
-//!   `DescribeInsightRules` and removed by `DeleteInsightRules`.
+//!   `DescribeInsightRules` and removed by `DeleteInsightRules`, each holding what the log
+//!   events it has evaluated contributed ([`insight_rules`]), which is what
+//!   `GetInsightRuleReport` reports from.
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::anomaly_detectors`] — the
 //!   anomaly detection models written by `PutAnomalyDetector`, read back by
 //!   `DescribeAnomalyDetectors` and removed by `DeleteAnomalyDetector`, each reported
@@ -62,6 +64,11 @@ pub mod alarm_actions;
 
 /// A metric alarm's `StateValue`, computed from the datapoints this store holds.
 pub mod alarm_evaluation;
+
+/// The Contributor Insights rule syntax a `RuleDefinition` carries, evaluated over the log
+/// events ingested into the log groups a rule names, and the report `GetInsightRuleReport`
+/// answers from what that evaluation collected.
+pub mod insight_rules;
 
 /// The metric math expression language a `MetricDataQuery$Expression` carries, parsed and
 /// evaluated over the series this store holds.
@@ -1097,6 +1104,19 @@ pub struct StoredMetricStream {
 pub struct StoredInsightRule {
     /// The rule as `DescribeInsightRules` reports it.
     pub rule: InsightRule,
+    /// The rule's `Definition` as the evaluation READS it ([`insight_rules::LogRuleDefinition`]),
+    /// or `None` for a definition that is not a log rule this emulator evaluates (a managed
+    /// rule's, which names no log group and no contribution).
+    ///
+    /// Derived from `rule.definition` by the write that stored the rule, so an ingest decides
+    /// which rules collect from a log group without re-reading the definition TEXT of every
+    /// rule the store holds — the first factor of an ingest's cost
+    /// ([`insight_rules::State::rules_collecting_from`]).
+    pub collection: Option<insight_rules::LogRuleDefinition>,
+    /// What the log events this rule has evaluated contributed — what `GetInsightRuleReport`
+    /// reports from ([`insight_rules`]). A rule collects them while it is ENABLED, as the
+    /// events arrive, so this is empty for a rule nothing has been ingested for yet.
+    pub observations: Vec<insight_rules::ContributorObservation>,
     /// The tags the rule was created with.
     pub tags: Vec<Tag>,
     /// What this rule was enabled from, for a rule `PutManagedInsightRules` created;
@@ -2122,6 +2142,28 @@ pub const MAX_SERIES: usize = 20_000;
 /// long-running emulator's memory stays bounded while recent reads stay exact.
 pub const MAX_DATAPOINTS_PER_SERIES: usize = 50_000;
 
+/// What a read that asks for more data points than one call returns is told.
+///
+/// "The maximum number of data points returned from a single call is 1,440. If you request
+/// more than 1,440 data points, CloudWatch returns an error. To reduce the number of data
+/// points, you can narrow the specified time range and make multiple requests across adjacent
+/// time ranges, or you can increase the specified period." (`GetMetricStatistics`) — the
+/// sentence states what the request asked for, the cap it broke, and the two remedies, so the
+/// caller can turn it into a request that is served. Both numbers come from the request and
+/// the cap, never from fixed text.
+///
+/// One wording for every read whose answer is one datapoint per period of a caller-chosen
+/// window, since the condition and the two remedies are the same whichever of them asked:
+/// `GetMetricStatistics` over a metric's series, and `GetInsightRuleReport` over a Contributor
+/// Insights rule's.
+pub fn datapoint_cap_exceeded(requested: f64, cap: f64) -> String {
+    format!(
+        "You have requested up to {requested:.0} datapoints, which exceeds the limit of \
+         {cap:.0}. You may reduce the datapoints requested by increasing Period, or decreasing \
+         the time range."
+    )
+}
+
 /// CloudWatch's published alarm quota: 5,000 alarms per Region per account — which is also
 /// what `LimitExceededFault` ("The quota for alarms for this customer has already been
 /// reached") reports on `PutMetricAlarm`.
@@ -2266,10 +2308,13 @@ const INSIGHT_RULE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 /// which member of the entry the failure is about, here the rule name the request carried.
 const INSIGHT_RULE_NAME_FAILURE_CODE: &str = "RULE_NAME";
 
-/// How a batch Contributor Insights rule operation states that one of the names it was given
-/// is not a rule this store holds: fixed text around the name the request carried, ended as a
-/// sentence.
-fn unknown_insight_rule(rule_name: &str) -> String {
+/// How CloudWatch states that one of the names it was given is not a rule this store holds:
+/// fixed text around the name the request carried, ended as a sentence.
+///
+/// One wording for every operation that answers for a name no rule answers to — the batch
+/// operations report it as a `Failures` entry's description and `GetInsightRuleReport` as its
+/// `ResourceNotFoundException` message, so the two cannot drift apart.
+pub fn unknown_insight_rule(rule_name: &str) -> String {
     format!("Rule {rule_name} does not exist.")
 }
 

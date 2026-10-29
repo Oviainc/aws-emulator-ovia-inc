@@ -70,6 +70,11 @@ mod cloudwatch_alarm_action_reaches_its_subscribed_queue;
 #[path = "all/cloudwatch_breaching_alarm_fires_through_the_whole_router.rs"]
 mod cloudwatch_breaching_alarm_fires_through_the_whole_router;
 // Declared beside the entry above, at the head, for the same reason: the appended tail and
+// the sorted `c…` span (where the other cloudwatch suites land) are both regions concurrently
+// landing suites add their line to.
+#[path = "all/contributor_insights_log_events.rs"]
+mod contributor_insights_log_events;
+// Declared beside the entry above, at the head, for the same reason: the appended tail and
 // the sorted `c…` span (where every cloudformation suite lands) are both regions concurrently
 // landing suites add their line to.
 #[path = "all/cloudformation_records_per_resource_stack_events.rs"]

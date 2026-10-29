@@ -7,10 +7,12 @@
 //! `rejectedLogEventsInfo`, and mints the stream's next sequence token. Every event it
 //! stores also publishes the CloudWatch metric data the log group's metric filters extract
 //! from it ([`crate::state::metric_filters`]) and the metrics an Embedded Metric Format
-//! message declares ([`crate::state::emf`]), and is DELIVERED to the destination of every
+//! message declares ([`crate::state::emf`]), is DELIVERED to the destination of every
 //! subscription filter of its log group whose `filterPattern` matches it
-//! ([`crate::state::subscription_delivery`]). This is the ONLY file to touch for this
-//! operation.
+//! ([`crate::state::subscription_delivery`]), and is evaluated against the Contributor
+//! Insights rules collecting from the log group
+//! (`service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::insight_rules`).
+//! This is the ONLY file to touch for this operation.
 //!
 //! THE INGESTION WINDOW is per event, not per batch: an event more than
 //! [`MAX_EVENT_FUTURE_MS`] in the future, older than [`MAX_EVENT_AGE_MS`], or preceding
@@ -594,6 +596,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
             extracted.extend(metric_filters.datapoints(message, *timestamp, remaining));
         }
         crate::state::emf::publish(&*self.engine, &extracted);
+
+        // The same stored events are what the ENABLED Contributor Insights rules collecting
+        // from this log group evaluate: "Rules evaluate log events in a CloudWatch Logs log
+        // group, enabling you to find contributor data for the log events in that log group."
+        // (CloudWatch `PutInsightRule`) — so an event's contribution is attributed as the event
+        // ARRIVES, in the one store `GetInsightRuleReport` reports from, rather than by reading
+        // this service's streams back at report time.
+        ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::insight_rules::
+            record_log_events(&*self.engine, &input.log_group_name, &stored_messages);
 
         Ok((
             PutLogEventsOutput {

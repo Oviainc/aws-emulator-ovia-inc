@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInsightRuleReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInsightRuleReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInsightRuleReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the time series data a Contributor Insights rule collected, from this service's
+//! store. Implemented here, and the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -122,6 +115,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The Contributor Insights rule evaluation this report reads: the rule syntax a
+/// `RuleDefinition` carries, and the per-period fold of what the rule's log events contributed.
+use crate::state::insight_rules;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -133,9 +130,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `GetInsightRuleReportError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#GetInsightRuleReport")]
+//
+// `InternalServiceFault` — "Request processing has failed due to some unknown error,
+// exception, or failure." — is widened in through `extra_errors`: this SERVICE models the
+// shape (and other operations declare it), but this operation's own `errors` list omits it,
+// and an unreachable shared store has to be reportable as the server failure it is rather
+// than as a parameter fault the caller could act on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#GetInsightRuleReport",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum GetInsightRuleReportErrorModeled {
+    InternalServiceFault(InternalServiceFault),
     InvalidParameterValueException(InvalidParameterValueException),
     MissingRequiredParameterException(MissingRequiredParameterException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -192,18 +199,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInsightRuleReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInsightRuleReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInsightRuleReport"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetInsightRuleReportErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some(
+                    "the CloudWatch Contributor Insights rule store is unavailable".into(),
+                ),
+            })
+        })?;
+
+        // Every value below is prose the model carries no constraint for, so the request
+        // reaches this handler having satisfied the modelled ones already: `RuleName`'s
+        // 1..128 length and pattern, `Period`'s 1.. range, and `OrderBy`'s 1..32 length.
+        let request = report_request(&input)?;
+
+        let store = state.lock();
+        let rule = store.insight_rules.get(&input.rule_name).ok_or_else(|| {
+            GetInsightRuleReportErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                resource_type: None,
+                resource_id: None,
+                message: Some(crate::state::unknown_insight_rule(&input.rule_name)),
+            })
+        })?;
+        // A pure read of what the rule collected while its log events were ingested, so two
+        // reports of one window are the same report and neither changes what a later caller
+        // sees.
+        let report = insight_rules::report(rule, &request);
+
+        Ok(GetInsightRuleReportOutput {
+            key_labels: Some(report.key_labels),
+            aggregation_statistic: report.aggregation_statistic,
+            aggregate_value: Some(report.aggregate_value),
+            approximate_unique_count: Some(report.approximate_unique_count),
+            contributors: Some(report.contributors),
+            metric_datapoints: Some(report.metric_datapoints),
+        })
     }
+}
+
+/// How CloudWatch states that the window a report was asked over is not one it can report.
+///
+/// A window shorter than the `Period` its datapoints are aggregated over spans no whole
+/// period, so there is no datapoint in it to report. The refusal names the condition by its
+/// CODE, the way this service's other Contributor Insights refusals do
+/// (`crate::state::EMPTY_RULE_NAMES`), and echoes neither instant.
+const INVALID_TIME_RANGE: &str = "INVALID_TIME_RANGE";
+
+/// How many `Period`-wide datapoints ONE report may span.
+///
+/// EMULATOR CEILING on the RATIO the caller chooses: the series is one datapoint per period of
+/// the window, so the window divided by the `Period` is what the answer's size is proportional
+/// to, and bounding each of them on its own (the model bounds `Period` only as `range 1..`)
+/// does not bound that ratio. The number is the one CloudWatch publishes for the same kind of
+/// read — "A GetMetricData operation that does not include a query can retrieve as many as 500
+/// different metrics in a single request, with a total of as many as 100,800 data points."
+/// (`GetMetricData`) — so a report a client could really ask for is still served.
+const MAX_REPORTED_PERIODS: i64 = 100_800;
+
+/// Refuse the request with this operation's modelled `InvalidParameterValueException`
+/// (HTTP 400): "The value of an input parameter is bad or out-of-range."
+fn invalid_parameter_value(message: String) -> GetInsightRuleReportError {
+    GetInsightRuleReportErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// What this request asks the rule's observations for, or the refusal of a value no report can
+/// be computed for.
+///
+/// The window is `[StartTime, EndTime)` and has to span at least one whole `Period`: a report
+/// is a series of `Period`-wide datapoints, so a shorter window holds none. It must also not
+/// span more periods than one report carries ([`MAX_REPORTED_PERIODS`]).
+fn report_request(
+    input: &GetInsightRuleReportInput,
+) -> Result<insight_rules::ReportRequest, GetInsightRuleReportError> {
+    let start_secs = crate::state::from_timestamp(&input.start_time);
+    let end_secs = crate::state::from_timestamp(&input.end_time);
+    // Held at one second here rather than relying on the model's `range 1..`, so nothing below
+    // divides by a period this handler was somehow reached with.
+    let period_secs = i64::from(input.period).max(1);
+    #[allow(clippy::cast_precision_loss)]
+    let period_width = period_secs as f64;
+    let window = end_secs - start_secs;
+    if !window.is_finite() || window < period_width {
+        return Err(invalid_parameter_value(INVALID_TIME_RANGE.to_string()));
+    }
+    // How many datapoints the REQUEST asks for: the window the caller named over the period the
+    // caller named, which is the ratio the answer's size is proportional to.
+    let requested_periods = (window / period_width).ceil();
+    #[allow(clippy::cast_precision_loss)]
+    let cap = MAX_REPORTED_PERIODS as f64;
+    if requested_periods > cap {
+        return Err(invalid_parameter_value(crate::state::datapoint_cap_exceeded(
+            requested_periods,
+            cap,
+        )));
+    }
+
+    // "The maximum number of contributors to include in the report. The range is 1 to 100. If
+    // you omit this, the default of 10 is used."
+    // (`GetInsightRuleReportInput$MaxContributorCount`) — a range the model expresses only as
+    // an unbounded integer, so it is held here.
+    let max_contributor_count = match input.max_contributor_count {
+        None => insight_rules::DEFAULT_MAX_CONTRIBUTOR_COUNT,
+        Some(asked)
+            if (insight_rules::MIN_MAX_CONTRIBUTOR_COUNT
+                ..=insight_rules::MAX_MAX_CONTRIBUTOR_COUNT)
+                .contains(&asked) =>
+        {
+            asked
+        }
+        Some(asked) => {
+            return Err(invalid_parameter_value(format!(
+                "The value {asked} for parameter MaxContributorCount is not valid: the range is \
+                 {} to {}",
+                insight_rules::MIN_MAX_CONTRIBUTOR_COUNT,
+                insight_rules::MAX_MAX_CONTRIBUTOR_COUNT
+            )));
+        }
+    };
+
+    // "Determines what statistic to use to rank the contributors. Valid values are Sum and
+    // Maximum." (`GetInsightRuleReportInput$OrderBy`) — a two-value set the model expresses
+    // only as a 1..32 string, so any other value is refused here.
+    let order_by = input
+        .order_by
+        .as_deref()
+        .unwrap_or(insight_rules::ORDER_BY_SUM);
+    if !insight_rules::ORDER_BY.contains(&order_by) {
+        return Err(invalid_parameter_value(format!(
+            "The value {order_by} for parameter OrderBy is not valid: valid values are {} and {}",
+            insight_rules::ORDER_BY_SUM,
+            insight_rules::ORDER_BY_MAXIMUM
+        )));
+    }
+
+    // The statistics a datapoint may carry are the ones this operation documents; nothing else
+    // is a statistic it could report.
+    let metrics = input.metrics.clone().unwrap_or_default();
+    if let Some(unknown) = metrics
+        .iter()
+        .find(|metric| !insight_rules::INSIGHT_RULE_METRICS.contains(&metric.as_str()))
+    {
+        return Err(invalid_parameter_value(format!(
+            "The value {unknown} for parameter Metrics is not valid: valid values are {}",
+            insight_rules::INSIGHT_RULE_METRICS.join(", ")
+        )));
+    }
+
+    Ok(insight_rules::ReportRequest {
+        start_secs,
+        end_secs,
+        period_secs,
+        max_contributors: usize::try_from(max_contributor_count).unwrap_or_default(),
+        order_by_maximum: order_by == insight_rules::ORDER_BY_MAXIMUM,
+        metrics,
+    })
 }

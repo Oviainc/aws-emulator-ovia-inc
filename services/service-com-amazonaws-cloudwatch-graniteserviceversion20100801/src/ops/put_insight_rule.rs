@@ -85,6 +85,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The log formats a rule can be written against, and what it aggregates contributor data on,
+// are the Contributor Insights rule syntax this service EVALUATES
+// (`crate::state::insight_rules`), so the syntax this operation accepts and the syntax the
+// evaluation reads cannot drift apart.
+use crate::state::insight_rules::{AGGREGATE_ON, AGGREGATE_ON_SUM, LOG_FORMATS};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -202,6 +208,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             || input.tags.clone().unwrap_or_default(),
             |stored| stored.tags.clone(),
         );
+        // What the rule has already collected: a put that leaves the definition as it was is
+        // the same standing evaluation, so it keeps its observations; one that CHANGES the
+        // definition starts collection over, because what was collected describes the fields,
+        // filters and aggregation of the definition it was collected under.
+        let observations = existing
+            .filter(|stored| stored.rule.definition == input.rule_definition)
+            .map(|stored| stored.observations.clone())
+            .unwrap_or_default();
 
         store.insight_rules.insert(
             input.rule_name.clone(),
@@ -223,6 +237,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         input.apply_on_transformed_logs.unwrap_or(false),
                     ),
                 },
+                // The definition as the evaluation reads it, derived here so an ingest decides
+                // which rules collect from its log group without re-reading every stored
+                // rule's definition text.
+                collection: crate::state::insight_rules::LogRuleDefinition::parse(
+                    &input.rule_definition,
+                ),
+                observations,
                 tags,
                 // Not a rule Amazon Web Services manages: it carries no managed-rule
                 // template, so `ListManagedInsightRules` never reports it.
@@ -277,21 +298,6 @@ fn validate_tags(tags: Option<&[Tag]>) -> Result<(), PutInsightRuleError> {
         Some(message) => Err(invalid_parameter_value(message)),
     }
 }
-
-/// The log formats a rule can be written against: "LogFormat" in the Contributor Insights
-/// rule syntax takes `JSON` or `CLF`.
-const LOG_FORMATS: [&str; 2] = ["JSON", "CLF"];
-
-/// What a rule aggregates contributor data on: the count of occurrences, or the sum over the
-/// field `ValueOf` names. `GetInsightRuleReport` reports the same choice back as its
-/// `AggregationStatistic`.
-const AGGREGATE_ON_COUNT: &str = "Count";
-
-/// The aggregation that sums the field a contribution's `ValueOf` names.
-const AGGREGATE_ON_SUM: &str = "Sum";
-
-/// The two aggregations a rule definition may name.
-const AGGREGATE_ON: [&str; 2] = [AGGREGATE_ON_COUNT, AGGREGATE_ON_SUM];
 
 /// The contribution's `Keys` are "an array of up to four log fields used as dimensions to
 /// classify contributors" in the Contributor Insights rule syntax.
