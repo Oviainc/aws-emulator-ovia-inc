@@ -149,10 +149,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Nothing caller-sized reaches the store unchecked — the per-entry bound on what
-        // one record's tags may hold is stated once, in `crate::state`.
-        if let Err(message) = crate::state::bound_tags(&input.tags) {
+        // one record's tags may hold is stated once, in `crate::state`. The clause goes
+        // through the one envelope every constraint refusal of this service is reported
+        // in, so the same broken bound reads the same whichever operation caught it.
+        if let Err(clause) = crate::state::bound_tags(&input.tags) {
             return Err(TagResourceErrorModeled::ValidationException(ValidationException {
-                message,
+                message: crate::state::validation_envelope(&[clause]),
                 reason: Some("CONSTRAINT_VIOLATION".to_string()),
             })
             .into());
@@ -184,9 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .keys()
             .filter(|key| !tags.contains_key(*key))
             .count();
-        if let Err(message) = crate::state::bound_tag_count(tags.len() + added) {
+        if let Err(clause) = crate::state::bound_tag_count(tags.len() + added) {
             return Err(TagResourceErrorModeled::ValidationException(ValidationException {
-                message,
+                message: crate::state::validation_envelope(&[clause]),
                 reason: Some("CONSTRAINT_VIOLATION".to_string()),
             })
             .into());

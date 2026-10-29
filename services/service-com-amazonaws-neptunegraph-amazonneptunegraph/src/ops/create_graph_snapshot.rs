@@ -166,30 +166,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Every refusal below is a constraint the BOUNDARY validator cannot check, so
+        // this is where it is enforced; each is worded by the same builders in
+        // `crate::state` the boundary refusal renderer uses, and — as that renderer does
+        // — the request is walked to the END before it is refused, so ONE envelope
+        // reports every constraint this request broke and a caller cannot tell which side
+        // of the boundary caught the violation.
+        let mut violations: Vec<String> = Vec::new();
+
         // `snapshotName`'s modelled pattern opens with a negative lookahead, which the
         // boundary validator's regex engine cannot compile — and an uncompilable
-        // `@pattern` is treated as matching — so the one input constraint that reaches
-        // this handler unchecked is enforced here, through the same shared rule
-        // `CreateGraph` enforces `graphName` with. Length (1..63) is already refused at
-        // the boundary by the `@length` trait, so the value echoed below is bounded by
-        // the model.
+        // `@pattern` is treated as matching — so the name rule is enforced here, through
+        // the same shared rule `CreateGraph` enforces `graphName` with. Length (1..63) is
+        // already refused at the boundary by the `@length` trait, so the value echoed
+        // below is bounded by the model.
         if !crate::state::resource_name_is_well_formed(
             &input.snapshot_name,
             crate::state::SNAPSHOT_NAME_RESERVED_PREFIX,
         ) {
-            return Err(CreateGraphSnapshotErrorModeled::ValidationException(
-                ValidationException {
-                    message: crate::state::validation_envelope(&[
-                        crate::state::constraint_clause(
-                            "snapshotName",
-                            Some(&input.snapshot_name),
-                            &crate::state::pattern_requirement(SNAPSHOT_NAME_PATTERN),
-                        ),
-                    ]),
-                    reason: Some("CONSTRAINT_VIOLATION".to_string()),
-                },
-            )
-            .into());
+            violations.push(crate::state::constraint_clause(
+                "snapshotName",
+                Some(&input.snapshot_name),
+                &crate::state::pattern_requirement(SNAPSHOT_NAME_PATTERN),
+            ));
         }
 
         // Nothing caller-sized reaches the store unchecked — the bound on what one
@@ -197,14 +196,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // every operation that accepts a `tags` map.
         if let Some(tags) = input.tags.as_ref() {
             if let Err(message) = crate::state::bound_tags(tags) {
-                return Err(CreateGraphSnapshotErrorModeled::ValidationException(
-                    ValidationException {
-                        message,
-                        reason: Some("CONSTRAINT_VIOLATION".to_string()),
-                    },
-                )
-                .into());
+                violations.push(message);
             }
+        }
+
+        if !violations.is_empty() {
+            return Err(CreateGraphSnapshotErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::validation_envelope(&violations),
+                    reason: Some("CONSTRAINT_VIOLATION".to_string()),
+                },
+            )
+            .into());
         }
 
         let region = crate::state::request_region(ctx);

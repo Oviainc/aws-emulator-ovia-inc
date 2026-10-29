@@ -225,25 +225,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Every refusal below is a constraint the BOUNDARY validator cannot check, so
+        // this is where it is enforced; each is worded by the same builders in
+        // `crate::state` the boundary refusal renderer uses, and — as that renderer does
+        // — the request is walked to the END before it is refused, so ONE envelope
+        // reports every constraint this request broke and a caller cannot tell which side
+        // of the boundary caught the violation.
+        let mut violations: Vec<String> = Vec::new();
+
         // `source` is a bare `String` in the model — no `@length`, no `@pattern` — so
         // it is the one caller-sized member that reaches the store unchecked, and the
         // only one whose emptiness nothing refuses at the boundary. The rule is stated
         // ONCE, in `crate::state::import_source_requirement`, and reached by every
         // operation that accepts an import `source` (`CreateGraphUsingImportTask` too),
-        // so the two cannot drift into different acceptance sets. Neither refusal
-        // echoes the value: the one that broke the upper bound is exactly the value
-        // that must not be sent back.
+        // so the two cannot drift into different acceptance sets. The clause echoes no
+        // value: the one that broke the upper bound is exactly the value that must not
+        // be sent back.
         if let Some(requirement) = crate::state::import_source_requirement(&input.source) {
-            return Err(StartImportTaskErrorModeled::ValidationException(
-                ValidationException {
-                    message: crate::state::validation_envelope(&[crate::state::length_clause(
-                        "source",
-                        &requirement,
-                    )]),
-                    reason: Some("CONSTRAINT_VIOLATION".to_string()),
-                },
-            )
-            .into());
+            violations.push(crate::state::length_clause("source", &requirement));
         }
 
         // The documented dependency between `format` and `blankNodeHandling` is stated
@@ -254,9 +253,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.format.as_deref(),
             input.blank_node_handling.as_deref(),
         ) {
+            violations.push(clause);
+        }
+
+        if !violations.is_empty() {
             return Err(StartImportTaskErrorModeled::ValidationException(
                 ValidationException {
-                    message: crate::state::validation_envelope(&[clause]),
+                    message: crate::state::validation_envelope(&violations),
                     reason: Some("CONSTRAINT_VIOLATION".to_string()),
                 },
             )

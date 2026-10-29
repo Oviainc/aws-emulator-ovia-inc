@@ -195,21 +195,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Every refusal below is a constraint the BOUNDARY validator cannot check, so
+        // this is where it is enforced; each is worded by the same builders in
+        // `crate::state` the boundary refusal renderer uses, and — as that renderer does
+        // — the request is walked to the END before it is refused, so ONE envelope
+        // reports every constraint this request broke and a caller cannot tell which side
+        // of the boundary caught the violation.
+        let mut violations: Vec<String> = Vec::new();
+
         // `graphName`'s modelled pattern opens with a negative lookahead, which the
         // boundary validator's regex engine cannot compile — and an uncompilable
-        // `@pattern` is treated as matching — so the one input constraint that reaches
-        // this handler unchecked is enforced here. Length (1..63) is already refused at
-        // the boundary by the `@length` trait, so the value echoed below is bounded by
-        // the model. The refusal is worded by the same builder the boundary refusal
-        // renderer uses (`crate::service`), so a caller cannot tell which side of the
-        // boundary caught the violation.
+        // `@pattern` is treated as matching — so the name rule is enforced here, through
+        // the same shared rule `RestoreGraphFromSnapshot` enforces it with. Length
+        // (1..63) is already refused at the boundary by the `@length` trait, so the value
+        // echoed below is bounded by the model.
         if !graph_name_is_well_formed(&input.graph_name) {
+            violations.push(crate::state::constraint_clause(
+                "graphName",
+                Some(&input.graph_name),
+                &crate::state::pattern_requirement(GRAPH_NAME_PATTERN),
+            ));
+        }
+
+        // Nothing caller-sized reaches the store unchecked — the bound on what one
+        // record's tags may hold is stated once, in `crate::state`, and is reached by
+        // every operation that accepts a `tags` map.
+        if let Some(tags) = input.tags.as_ref() {
+            if let Err(message) = crate::state::bound_tags(tags) {
+                violations.push(message);
+            }
+        }
+
+        if !violations.is_empty() {
             return Err(CreateGraphErrorModeled::ValidationException(ValidationException {
-                message: crate::state::validation_envelope(&[crate::state::constraint_clause(
-                    "graphName",
-                    Some(&input.graph_name),
-                    &crate::state::pattern_requirement(GRAPH_NAME_PATTERN),
-                )]),
+                message: crate::state::validation_envelope(&violations),
                 reason: Some("CONSTRAINT_VIOLATION".to_string()),
             })
             .into());
@@ -217,20 +236,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
-
-        // Nothing caller-sized reaches the store unchecked — the bound on what one
-        // record's tags may hold is stated once, in `crate::state`, and is reached by
-        // every operation that accepts a `tags` map.
-        if let Some(tags) = input.tags.as_ref() {
-            if let Err(message) = crate::state::bound_tags(tags) {
-                return Err(CreateGraphErrorModeled::ValidationException(ValidationException {
-                    message,
-                    reason: Some("CONSTRAINT_VIOLATION".to_string()),
-                })
-                .into());
-            }
-        }
-
         let mut store = state.lock();
 
         // The names a graph reserves are released when its deletion completes, so the

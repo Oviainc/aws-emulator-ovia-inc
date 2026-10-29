@@ -212,25 +212,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Every refusal below is a constraint the BOUNDARY validator cannot check, so
+        // this is where it is enforced; each is worded by the same builders in
+        // `crate::state` the boundary refusal renderer uses, and — as that renderer does
+        // — the request is walked to the END before it is refused, so ONE envelope
+        // reports every constraint this request broke and a caller cannot tell which side
+        // of the boundary caught the violation.
+        let mut violations: Vec<String> = Vec::new();
+
         // `destination` is modelled as a plain `String` of 1..1024 characters, so its
         // length is refused at the boundary but its FORM is not: the member is the
         // Amazon S3 URI data is exported to, and a value that is not one addresses no
-        // destination at all. Refused in the same wording every other constraint
-        // violation of this service is reported in.
+        // destination at all.
         if !crate::state::is_s3_uri(&input.destination) {
-            return Err(StartExportTaskErrorModeled::ValidationException(
-                ValidationException {
-                    message: crate::state::validation_envelope(&[
-                        crate::state::constraint_clause(
-                            "destination",
-                            Some(&input.destination),
-                            &crate::state::s3_uri_requirement(),
-                        ),
-                    ]),
-                    reason: Some("CONSTRAINT_VIOLATION".to_string()),
-                },
-            )
-            .into());
+            violations.push(crate::state::constraint_clause(
+                "destination",
+                Some(&input.destination),
+                &crate::state::s3_uri_requirement(),
+            ));
         }
 
         // Nothing caller-sized reaches the store unchecked — the bound on what one
@@ -238,14 +237,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // every operation that accepts a `tags` map.
         if let Some(tags) = input.tags.as_ref() {
             if let Err(message) = crate::state::bound_tags(tags) {
-                return Err(StartExportTaskErrorModeled::ValidationException(
-                    ValidationException {
-                        message,
-                        reason: Some("CONSTRAINT_VIOLATION".to_string()),
-                    },
-                )
-                .into());
+                violations.push(message);
             }
+        }
+
+        if !violations.is_empty() {
+            return Err(StartExportTaskErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::validation_envelope(&violations),
+                    reason: Some("CONSTRAINT_VIOLATION".to_string()),
+                },
+            )
+            .into());
         }
 
         let region = crate::state::request_region(ctx);
