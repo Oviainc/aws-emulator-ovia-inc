@@ -448,7 +448,8 @@ use super::template::{
     ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
-    ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, KMS_ALIAS, KMS_KEY,
+    ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, KINESIS_STREAM,
+    KMS_ALIAS, KMS_KEY,
     MQ_BROKER, MSK_CLUSTER,
     MSK_SERVERLESS_CLUSTER, OPENSEARCH_DOMAIN, REDSHIFT_CLUSTER, ROUTE53RESOLVER_ENDPOINT,
     ROUTE53RESOLVER_FIREWALL_DOMAIN_LIST, ROUTE53RESOLVER_FIREWALL_RULE_GROUP,
@@ -542,6 +543,10 @@ const INVALID_REQUEST_PROVIDED: &str = "Invalid request provided: ";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Provisioner {
     FirehoseDeliveryStream,
+    /// `AWS::Kinesis::Stream`: a data stream of Amazon Kinesis Data Streams — a different
+    /// service from the Firehose one above — which `CreateStream` creates and
+    /// `DeleteStream` deletes.
+    KinesisStream,
     CloudWatchMetricStream,
     CloudWatchDashboard,
     EcrPublicRepository,
@@ -666,6 +671,7 @@ pub(super) enum Provisioner {
 pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
     match resource_type {
         FIREHOSE_DELIVERY_STREAM => Some(Provisioner::FirehoseDeliveryStream),
+        KINESIS_STREAM => Some(Provisioner::KinesisStream),
         CLOUDWATCH_METRIC_STREAM => Some(Provisioner::CloudWatchMetricStream),
         CLOUDWATCH_DASHBOARD => Some(Provisioner::CloudWatchDashboard),
         ECR_PUBLIC_REPOSITORY => Some(Provisioner::EcrPublicRepository),
@@ -791,6 +797,9 @@ impl Provisioner {
         match self {
             Self::FirehoseDeliveryStream => {
                 create_delivery_stream(ctx, region, resource, propagated).await
+            }
+            Self::KinesisStream => {
+                create_kinesis_stream(ctx, region, resource, propagated).await
             }
             Self::CloudWatchMetricStream => {
                 put_metric_stream(ctx, region, resource, propagated).await
@@ -1143,6 +1152,11 @@ impl Provisioner {
                 | Self::EcsCluster
                 | Self::EcrPublicRepository
                 | Self::FirehoseDeliveryStream
+                // Amazon Kinesis Data Streams refuses a tag key in the reserved namespace
+                // on every call that takes tags — `CreateStream`'s `Tags`, `TagResource` and
+                // `AddTagsToStream` alike — so a stream carries the stack's own tags
+                // without the three.
+                | Self::KinesisStream
                 | Self::S3VectorsVectorBucket
                 | Self::S3VectorsIndex
                 | Self::SchedulerScheduleGroup
@@ -1252,6 +1266,16 @@ impl Provisioner {
             // that service reports it `ACTIVE`.
             Self::FirehoseDeliveryStream => {
                 delivery_stream_readiness(ctx, region, physical_resource_id).await
+            }
+            // `CreateStream` "is an asynchronous operation. Upon receiving a CreateStream
+            // request, Kinesis Data Streams immediately returns and sets the stream status
+            // to CREATING. After the stream is created, Kinesis Data Streams sets the stream
+            // status to ACTIVE. You should perform read and write operations only on an
+            // ACTIVE stream", so a stream the create has just answered for serves no read
+            // or write yet and the resource's creation is finished once that service reports
+            // it `ACTIVE`.
+            Self::KinesisStream => {
+                kinesis_stream_readiness(ctx, region, physical_resource_id).await
             }
             _ => Ok(Readiness::Ready),
         }
@@ -1469,6 +1493,13 @@ impl Provisioner {
             Self::SchedulerScheduleGroup => {
                 retag_schedule_group(ctx, region, resource, declared, propagated).await
             }
+            // A stream's tags are Amazon Kinesis Data Streams' own `AddTagsToStream` and
+            // `RemoveTagsFromStream`: `CreateStream`'s `Tags` member applies to the stream
+            // that call creates and to no stream that already exists, so this is where the
+            // set a stream is to end up carrying is reconciled.
+            Self::KinesisStream => {
+                retag_kinesis_stream(ctx, region, resource, declared, propagated).await
+            }
             // Every other type's re-tagging is its own entry here, for the same reason its
             // create, update and delete are: the tag set is the same for every type, but the
             // calls that apply it are each service's own.
@@ -1495,6 +1526,9 @@ impl Provisioner {
         match self {
             Self::FirehoseDeliveryStream => {
                 delete_delivery_stream(ctx, region, physical_resource_id).await
+            }
+            Self::KinesisStream => {
+                delete_kinesis_stream(ctx, region, physical_resource_id).await
             }
             Self::CloudWatchMetricStream => {
                 delete_metric_stream(ctx, region, physical_resource_id).await
@@ -1778,6 +1812,9 @@ impl Provisioner {
         match self {
             Self::FirehoseDeliveryStream => {
                 describe_delivery_stream(ctx, region, physical_resource_id).await
+            }
+            Self::KinesisStream => {
+                describe_kinesis_stream(ctx, region, physical_resource_id).await
             }
             Self::CloudWatchMetricStream => {
                 describe_metric_stream(ctx, region, physical_resource_id).await
@@ -2212,6 +2249,504 @@ async fn describe_delivery_stream(
         Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Amazon Kinesis Data Streams: AWS::Kinesis::Stream
+// ---------------------------------------------------------------------------
+
+/// Amazon Kinesis Data Streams' signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: kinesis`, service shape `Kinesis_20131202`), which speaks `awsJson1_1`.
+const KINESIS_SIGNING_NAME: &str = "kinesis";
+const KINESIS_TARGET_PREFIX: &str = "Kinesis_20131202";
+
+/// The error code Amazon Kinesis Data Streams answers for a stream it holds none of.
+const KINESIS_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The `StreamStatus` a stream serves its callers in: "ACTIVE - The stream exists and is
+/// ready for read and write operations or deletion. You should perform read and write
+/// operations only on an ACTIVE stream" (`StreamDescriptionSummary$StreamStatus`).
+const KINESIS_STREAM_ACTIVE: &str = "ACTIVE";
+
+/// The `StreamStatus` a created stream starts in ("CREATING - The stream is being created")
+/// and the one an accepted change leaves it in ("UPDATING"): the two that service brings a
+/// stream out of by itself.
+const KINESIS_STREAM_CREATING: &str = "CREATING";
+const KINESIS_STREAM_UPDATING: &str = "UPDATING";
+
+/// The `StreamStatus` of a stream whose deletion that service has accepted: "DELETING - The
+/// stream is being deleted", which is the state a delete of the resource asks for.
+const KINESIS_STREAM_DELETING: &str = "DELETING";
+
+/// The retention window a stream carries until something changes it: "The default value is
+/// 24" (`CreateStream`'s own documented default retention period), which is the window the
+/// create this arm makes leaves the stream with. So a declaration stating exactly it asks
+/// for no change at all.
+const KINESIS_DEFAULT_RETENTION_HOURS: i32 = 24;
+
+/// Every property of `AWS::Kinesis::Stream` this arm carries to Amazon Kinesis Data Streams
+/// (AWS's resource reference for the type): the name CloudFormation decides, the two
+/// `CreateStream` takes as its own members, the tag set the create carries, and the two a
+/// SECOND call applies to the stream that create made.
+///
+/// A property outside this set reaches no call, so a declaration stating one is REFUSED
+/// rather than deployed as a stream configured differently from its declaration.
+const KINESIS_STREAM_PROPERTIES: &[&str] = &[
+    "Name",
+    "ShardCount",
+    "StreamModeDetails",
+    "Tags",
+    KINESIS_RETENTION_PROPERTY,
+    KINESIS_STREAM_ENCRYPTION_PROPERTY,
+];
+
+/// The `AWS::Kinesis::Stream` properties `CreateStream` takes under the SAME member name, as
+/// `(property, member)` pairs: the capacity mode, which `CreateStreamInput$StreamModeDetails`
+/// spells identically, with the one member (`StreamMode`) its structure carries.
+///
+/// `ShardCount` is not here although that call takes it too: the member is modelled an
+/// integer and a template may write a whole number as a quoted scalar, so it goes through
+/// [`whole_number`]. `Name` is not here because it is the one value CloudFormation decides,
+/// `Tags` because the create takes a tag MAP while the type publishes a tag LIST, and the
+/// last two because they are no members of that call at all.
+const KINESIS_STREAM_CREATE_MEMBERS: &[(&str, &str)] =
+    &[("StreamModeDetails", "StreamModeDetails")];
+
+/// The property that asks for server-side encryption on the stream: the `EncryptionType` and
+/// the `KeyId` `StartStreamEncryption` takes under those same member names.
+const KINESIS_STREAM_ENCRYPTION_PROPERTY: &str = "StreamEncryption";
+
+/// The property that asks for a retention window other than the default one.
+const KINESIS_RETENTION_PROPERTY: &str = "RetentionPeriodHours";
+
+/// One property of the type that carries a WHOLE NUMBER, in either spelling a template gives
+/// one ([`whole_number`]); `None` for a declaration that does not state it at all.
+///
+/// A property the declaration DOES state and that is no whole number is REFUSED rather than
+/// left out of the call: the members these two reach are modelled integers, so sending
+/// nothing for one would deploy a stream configured differently from its declaration.
+fn kinesis_whole_number(
+    properties: &Map<String, Value>,
+    property: &str,
+) -> Result<Option<i32>, Refusal> {
+    if !properties.contains_key(property) {
+        return Ok(None);
+    }
+    whole_number(properties.get(property))
+        .map(Some)
+        .ok_or_else(|| Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!("{KINESIS_STREAM}'s {property} is no whole number"),
+        })
+}
+
+/// The `StreamDescriptionSummary` members that service reports under this type's own
+/// property names, as `(property, member)` pairs, for drift detection.
+///
+/// `ShardCount` is read off `OpenShardCount` — "The number of open shards in the stream",
+/// which is what a declared count provisions. `Tags` is left out for the reason it is
+/// everywhere else here (the tags a resource carries change independently of its
+/// declaration), and [`KINESIS_STREAM_ENCRYPTION_PROPERTY`] because the summary reports its
+/// two members FLAT rather than as the structure the property is, and a stream encrypted
+/// under an alias reports the key that service resolved the alias to — so comparing either
+/// would need a mapping this module would have to invent, and a property the actual document
+/// does not carry is not evidence of anything ([`super::drift`]).
+const KINESIS_STREAM_REPORTED_PROPERTIES: &[(&str, &str)] = &[
+    ("Name", "StreamName"),
+    ("RetentionPeriodHours", "RetentionPeriodHours"),
+    ("ShardCount", "OpenShardCount"),
+    ("StreamModeDetails", "StreamModeDetails"),
+];
+
+/// How often this arm asks Amazon Kinesis Data Streams whether a stream has come out of the
+/// transient status a call left it in, and how many times.
+///
+/// The product is an upper bound on the wait, not a duration anything is owed: that service
+/// owes the stream `ACTIVE` a moment after the create ("Upon receiving a CreateStream
+/// request, Kinesis Data Streams immediately returns and sets the stream status to CREATING.
+/// After the stream is created, Kinesis Data Streams sets the stream status to ACTIVE"), the
+/// check is far shorter than that moment, and the whole wait is a small multiple of it —
+/// enough that a loaded machine still gets there, and bounded so one stack operation cannot
+/// hold its request open.
+const KINESIS_STREAM_CHECK_INTERVAL: ::std::time::Duration =
+    ::std::time::Duration::from_millis(25);
+const KINESIS_STREAM_CHECKS: usize = 80;
+
+/// Create the data stream an `AWS::Kinesis::Stream` declares — so a client that deployed the
+/// stack and then calls `kinesis DescribeStreamSummary`, `ListTagsForResource` or `PutRecord`
+/// with the name or the ARN the stack publishes reaches the stream rather than a
+/// `ResourceNotFoundException`.
+///
+/// "Ref returns the stream name", which is this resource's physical id and the identifier
+/// every Kinesis operation addresses a stream by, so the stream is created under it and the
+/// id the stack already computed stays in force. `Fn::GetAtt Arn` is re-pointed at the ARN
+/// that service keyed the stream by, read back off its own summary.
+///
+/// The stream carries the tags the declaration asks for plus the stack's own ([`tags_of`]),
+/// as `CreateStream`'s own tag MAP — the one member of that call this arm does not take
+/// verbatim off the declaration, the type publishing its `Tags` as a list.
+///
+/// The type's other two properties are no members of that create: a retention window and
+/// server-side encryption are applied to the stream it made, which is what
+/// [`configure_kinesis_stream`] does. The resource the template declares is the stream AND
+/// that configuration, so a configuration that service refuses fails the resource, and the
+/// stream this arm already created is removed before that refusal propagates (the stack
+/// records no physical id for a resource whose create failed, so nothing else would ever
+/// delete it).
+async fn create_kinesis_stream(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    if let Some(unmapped) = properties
+        .keys()
+        .find(|property| !KINESIS_STREAM_PROPERTIES.contains(&property.as_str()))
+    {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: format!(
+                "this emulator does not carry the {unmapped} property of an {KINESIS_STREAM} \
+                 to Amazon Kinesis Data Streams"
+            ),
+        });
+    }
+
+    // Both whole-number properties are read BEFORE anything is created, so a declaration
+    // this arm cannot carry leaves no stream behind.
+    let shards = kinesis_whole_number(&properties, "ShardCount")?;
+    let retention = kinesis_whole_number(&properties, KINESIS_RETENTION_PROPERTY)?
+        .filter(|hours| *hours != KINESIS_DEFAULT_RETENTION_HOURS);
+
+    let name = resource.physical_resource_id.clone();
+    let mut request = Map::new();
+    request.insert("StreamName".to_string(), Value::String(name.clone()));
+    copy_members(&properties, KINESIS_STREAM_CREATE_MEMBERS, &mut request);
+    if let Some(shards) = shards {
+        request.insert("ShardCount".to_string(), Value::Number(shards.into()));
+    }
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
+        request.insert("Tags".to_string(), Value::Object(tags));
+    }
+    call_kinesis(ctx, region, "CreateStream", &Value::Object(request)).await?;
+
+    if let Err(refusal) =
+        configure_kinesis_stream(ctx, region, &name, &properties, retention).await
+    {
+        delete_kinesis_stream(ctx, region, &name)
+            .await
+            .map_err(|failure| Refusal {
+                code: refusal.code.clone(),
+                message: format!("{refusal}; the stream it created was left behind: {failure}"),
+            })?;
+        return Err(refusal);
+    }
+
+    // The ARN is the one that service keyed the stream by, read off its own summary rather
+    // than computed here: a create whose stream that service then reports no ARN for has
+    // published nothing `Fn::GetAtt Arn` could resolve to, so it fails rather than leaving
+    // the resource holding a value the owning service does not know.
+    let arn = describe_kinesis_stream_summary(ctx, region, &name)
+        .await?
+        .as_ref()
+        .and_then(|summary| summary.get("StreamARN"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "the created stream carries no StreamARN".to_string(),
+        })?;
+    let mut attributes = BTreeMap::new();
+    attributes.insert("Arn".to_string(), arn);
+    Ok(Created::attributes(attributes))
+}
+
+/// Apply the two properties `CreateStream` takes no member for to the stream it just created:
+/// the retention window, which `IncreaseStreamRetentionPeriod` and
+/// `DecreaseStreamRetentionPeriod` change in either direction from the default the create
+/// left ([`KINESIS_DEFAULT_RETENTION_HOURS`]), and the server-side encryption
+/// `StartStreamEncryption` turns on.
+///
+/// Both calls publish the same precondition — "For successful operation, the resource must be
+/// in the ACTIVE state" — and the create leaves the stream `CREATING`, so this waits for that
+/// service to report the stream out of that status ([`awaited_kinesis_stream_status`]) before
+/// either is made. A declaration asking for neither property waits for nothing: the create
+/// already said everything there was to say about such a stream.
+async fn configure_kinesis_stream(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+    properties: &Map<String, Value>,
+    retention: Option<i32>,
+) -> Result<(), Refusal> {
+    let encryption = properties.get(KINESIS_STREAM_ENCRYPTION_PROPERTY);
+    if retention.is_none() && encryption.is_none() {
+        return Ok(());
+    }
+    awaited_kinesis_stream_status(ctx, region, name).await?;
+
+    if let Some(hours) = retention {
+        // "If you choose a longer stream retention period, this operation increases the time
+        // period during which records that have not yet expired are accessible", and the
+        // sibling call is the one that shortens it: which of the two carries a declared
+        // window is decided by the window the create left.
+        let operation = if hours > KINESIS_DEFAULT_RETENTION_HOURS {
+            "IncreaseStreamRetentionPeriod"
+        } else {
+            "DecreaseStreamRetentionPeriod"
+        };
+        call_kinesis(
+            ctx,
+            region,
+            operation,
+            &serde_json::json!({ "StreamName": name, "RetentionPeriodHours": hours }),
+        )
+        .await?;
+    }
+
+    if let Some(encryption) = encryption {
+        let (Some(encryption_type), Some(key_id)) = (
+            encryption.get("EncryptionType").and_then(scalar_text),
+            encryption.get("KeyId").and_then(scalar_text),
+        ) else {
+            // Both members are required by the type, so a declaration carrying neither
+            // describes no encryption that could be turned on.
+            return Err(Refusal {
+                code: MISSING_PROPERTY_CODE.to_string(),
+                message: format!(
+                    "{KINESIS_STREAM}'s {KINESIS_STREAM_ENCRYPTION_PROPERTY} declares no \
+                     EncryptionType and KeyId"
+                ),
+            });
+        };
+        call_kinesis(
+            ctx,
+            region,
+            "StartStreamEncryption",
+            &serde_json::json!({
+                "StreamName": name,
+                "EncryptionType": encryption_type,
+                "KeyId": key_id,
+            }),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Wait until Amazon Kinesis Data Streams reports the stream out of the transient status a
+/// call left it in, and answer the status it reports then; `None` for a stream that service
+/// no longer holds.
+///
+/// A wait that runs out answers the last status read: every call that follows one publishes
+/// its own precondition on the status, so what a stream still coming up owes its caller is
+/// that service's own refusal rather than one invented here.
+async fn awaited_kinesis_stream_status(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+) -> Result<Option<String>, Refusal> {
+    let mut reported = String::new();
+    for _ in 0..KINESIS_STREAM_CHECKS {
+        let Some(summary) = describe_kinesis_stream_summary(ctx, region, name).await? else {
+            return Ok(None);
+        };
+        reported = kinesis_stream_status(&summary);
+        if reported != KINESIS_STREAM_CREATING && reported != KINESIS_STREAM_UPDATING {
+            return Ok(Some(reported));
+        }
+        ::tokio::time::sleep(KINESIS_STREAM_CHECK_INTERVAL).await;
+    }
+    Ok(Some(reported))
+}
+
+/// Whether Amazon Kinesis Data Streams has finished bringing up the stream a stack created.
+///
+/// `ACTIVE` is the status a stream serves reads and writes in, `CREATING` the one its create
+/// left it in and `UPDATING` the one a change this arm made leaves it in — both of which that
+/// service brings the stream out of by itself. Every other status is one no wait will bring a
+/// stream out of: a stream being deleted, and one that service no longer holds at all, since
+/// nothing is going to create it.
+async fn kinesis_stream_readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Readiness, Refusal> {
+    let Some(summary) = describe_kinesis_stream_summary(ctx, region, physical_resource_id).await?
+    else {
+        return Ok(Readiness::Failed(format!(
+            "Amazon Kinesis Data Streams holds no stream {physical_resource_id}"
+        )));
+    };
+    let status = kinesis_stream_status(&summary);
+    match status.as_str() {
+        KINESIS_STREAM_ACTIVE => Ok(Readiness::Ready),
+        KINESIS_STREAM_CREATING | KINESIS_STREAM_UPDATING => {
+            Ok(Readiness::Pending(status.clone()))
+        }
+        other => Ok(Readiness::Failed(format!(
+            "Amazon Kinesis Data Streams reports stream {physical_resource_id} as {other}"
+        ))),
+    }
+}
+
+/// Delete the stream a stack created, addressed by its NAME — this resource's physical id,
+/// which is what `Ref` returns for the type.
+///
+/// "If the stream is in the ACTIVE state, you can delete it", and the delete is refused for a
+/// stream in any other state ("For successful operation, the resource must be in the ACTIVE
+/// state"), so a stream that service still reports coming up is waited for exactly as the
+/// create's own configuration calls wait for it — which is what lets the rollback of a create
+/// that failed take down the stream it had just made. A stream it no longer holds
+/// (`ResourceNotFoundException`, judged on the CODE and never on a message that carries the
+/// request's own name), and one whose deletion it has already accepted, are already in the
+/// state the delete asks for.
+async fn delete_kinesis_stream(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    match awaited_kinesis_stream_status(ctx, region, physical_resource_id).await? {
+        None => return Ok(()),
+        Some(status) if status == KINESIS_STREAM_DELETING => return Ok(()),
+        Some(_) => {}
+    }
+    let request = serde_json::json!({ "StreamName": physical_resource_id });
+    match call_kinesis(ctx, region, "DeleteStream", &request).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == KINESIS_RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Bring the tags of the stream a resource record names to the ones this deployment gives it,
+/// through Amazon Kinesis Data Streams' own `AddTagsToStream` and `RemoveTagsFromStream`.
+///
+/// The set is the declaration's own `Tags` beside the ones CloudFormation propagates
+/// ([`tags_of`]) — the same set the CREATE applied — so a key outside it is one this
+/// deployment no longer gives the resource and is removed, and one in it with another value
+/// is re-valued. Where the two sets already agree nothing is called at all, which is what
+/// makes this safe to ask on every deployment.
+///
+/// A stream that service no longer holds has no tags to reconcile.
+async fn retag_kinesis_stream(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Result<(), Refusal> {
+    let name = resource.physical_resource_id.clone();
+    if describe_kinesis_stream_summary(ctx, region, &name)
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
+    let desired = tags_of(declared, propagated);
+    // "You can assign up to 50 tags to a Kinesis resource", which is the `Limit` of one tag
+    // read, so the first page carries every tag a stream can hold.
+    let listed = call_kinesis(
+        ctx,
+        region,
+        "ListTagsForStream",
+        &serde_json::json!({ "StreamName": &name }),
+    )
+    .await?;
+    // That service answers its tag read as the same `[{Key, Value}]` list a declaration's
+    // `Tags` property is written as, so one reader serves both sides.
+    let (added, removed) = tag_delta(&declared_tags(&listed), &desired);
+    if !added.is_empty() {
+        call_kinesis(
+            ctx,
+            region,
+            "AddTagsToStream",
+            &serde_json::json!({
+                "StreamName": &name,
+                "Tags": Value::Object(tags_as_map(&added)),
+            }),
+        )
+        .await?;
+    }
+    if !removed.is_empty() {
+        call_kinesis(
+            ctx,
+            region,
+            "RemoveTagsFromStream",
+            &serde_json::json!({
+                "StreamName": &name,
+                "TagKeys": tag_keys_as_list(&removed),
+            }),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// The stream's configuration as Amazon Kinesis Data Streams reports it, for drift
+/// detection, under this type's own property names
+/// ([`KINESIS_STREAM_REPORTED_PROPERTIES`]). A stream it no longer holds was deleted.
+async fn describe_kinesis_stream(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    Ok(
+        describe_kinesis_stream_summary(ctx, region, physical_resource_id)
+            .await?
+            .map(|summary| {
+                reported_as_properties(&summary, KINESIS_STREAM_REPORTED_PROPERTIES)
+            }),
+    )
+}
+
+/// The `StreamDescriptionSummary` that service reports for a stream now, or `None` for one it
+/// no longer holds (`ResourceNotFoundException`, judged on the CODE alone).
+async fn describe_kinesis_stream_summary(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "StreamName": name });
+    match call_kinesis(ctx, region, "DescribeStreamSummary", &request).await {
+        Ok(answer) => Ok(Some(reported_member(&answer, "StreamDescriptionSummary"))),
+        Err(refusal) if refusal.code == KINESIS_RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The `StreamStatus` one reported summary carries, or the empty text for an answer that
+/// carries none.
+fn kinesis_stream_status(summary: &Value) -> String {
+    summary
+        .get("StreamStatus")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Call one Amazon Kinesis Data Streams operation on the awsJson1_1 wire its model declares.
+async fn call_kinesis(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_json_rpc(
+        ctx,
+        KINESIS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{KINESIS_TARGET_PREFIX}.{operation}"),
+        request,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

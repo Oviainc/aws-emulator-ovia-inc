@@ -2323,6 +2323,10 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // Amazon Data Firehose `CreateDeliveryStream.DeliveryStreamName`:
         // `@length(min: 1, max: 64)` (Firehose's own Smithy model).
         FIREHOSE_DELIVERY_STREAM => rules(64, Characters::AsGenerated),
+        // Amazon Kinesis Data Streams `CreateStream.StreamName`: `@length(min: 1, max:
+        // 128)` with the pattern `^[a-zA-Z0-9_.-]+$` (that service's own model), which
+        // admits every character a generated name is built from.
+        KINESIS_STREAM => rules(128, Characters::AsGenerated),
         // Amazon ECR `CreateRepository.repositoryName`: `RepositoryName`,
         // `@length(min: 2, max: 256)`, lowercase (Amazon ECR's own Smithy model).
         ECR_REPOSITORY => rules(256, Characters::LowercaseAlphanumeric),
@@ -2915,6 +2919,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::IAM::Role",
     KMS_KEY,
     FIREHOSE_DELIVERY_STREAM,
+    KINESIS_STREAM,
     "AWS::Lambda::Function",
     "AWS::Logs::LogGroup",
     MQ_BROKER,
@@ -3392,6 +3397,19 @@ fn return_values(
                     region,
                     &format!("deliverystream/{name}"),
                 ),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the stream name"; Fn::GetAtt: Arn. This is the type
+        // `super::provisioning` creates in Amazon Kinesis Data Streams itself, which then
+        // reports the stream's own ARN back over this attribute — the same ARN this
+        // computes, since both are built from the one account id this emulator mints and
+        // the stream's name, which is how that service keys a stream (`stream_arn` in its
+        // own state module).
+        KINESIS_STREAM => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn("kinesis", region, &format!("stream/{name}")),
             );
             (name.to_string(), attributes)
         }
@@ -4111,6 +4129,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         "AWS::IAM::Role" => &["Arn"],
         ECR_PUBLIC_REPOSITORY => &["Arn"],
         FIREHOSE_DELIVERY_STREAM => &["Arn"],
+        KINESIS_STREAM => &["Arn"],
         ECR_REPOSITORY => &["Arn", "RepositoryUri"],
         ECS_CLUSTER => &["Arn"],
         BATCH_COMPUTE_ENVIRONMENT => &["ComputeEnvironmentArn"],
@@ -4346,6 +4365,15 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
 /// The middle segment is the Firehose model's own `awsService.cloudFormationName`
 /// (`smithy_query(query="service_info")` on that service's model).
 pub const FIREHOSE_DELIVERY_STREAM: &str = "AWS::KinesisFirehose::DeliveryStream";
+
+/// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Kinesis data stream — a
+/// different service from the Firehose one above, whose middle segment is the Kinesis
+/// model's own `awsService.cloudFormationName` (`Kinesis`).
+///
+/// "Ref returns the stream name", which is the name the owning service creates the stream
+/// under, so a GENERATED one is held to that service's own rules for it ([`naming_rules`])
+/// and the identity is not service-assigned.
+pub const KINESIS_STREAM: &str = "AWS::Kinesis::Stream";
 
 /// The `AWS::<cloudFormationName>::<Resource>` types of the two OpenSearch Serverless
 /// resources a stack creates. The middle segment is that service's own

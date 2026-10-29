@@ -35,6 +35,11 @@ mod kinesisanalytics_signing_name_routing;
 #[path = "all/s3control_tags_a_general_purpose_bucket.rs"]
 mod s3control_tags_a_general_purpose_bucket;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `c…` span (where every cloudformation suite lands) are both regions
+// concurrently landing suites add their line to.
+#[path = "all/cloudformation_provisions_kinesis_streams.rs"]
+mod cloudformation_provisions_kinesis_streams;
+// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `e…` span (where the other ecr/eks suites land) are both regions concurrently
 // landing suites add their line to.
 #[path = "all/ecr_public_action_scoped_iam_identity.rs"]
