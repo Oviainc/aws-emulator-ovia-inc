@@ -54,8 +54,16 @@
 //! The poller is started by the operations that make a pipe RUNNING (`CreatePipe`,
 //! `StartPipe`, `UpdatePipe`) and ends itself as soon as the pipe's `CurrentState` is no
 //! longer one a running pipe rests in — so a `STOPPED` pipe consumes nothing, its
-//! backlog stays visible and undeleted, and `StartPipe` resumes consumption of
-//! everything that accumulated while it was stopped. At most one poller runs per pipe
+//! backlog stays visible and undeleted, and the next call that makes the pipe RUNNING
+//! again resumes consumption of everything that accumulated while it was stopped. That
+//! gate is the pipe's own record and it is re-read before EVERY read of the source
+//! ([`LiveRecord::runs_now`]), not once per batch: a poll that is still collecting —
+//! which it does for as long as `MaximumBatchingWindowInSeconds` allows — takes nothing
+//! more from the source the moment the record says the pipe no longer runs, so a record
+//! that arrives after the pipe was stopped is left on the source, visible and counted,
+//! rather than consumed by a poll that began while it was still running. The records
+//! that poll had already taken are finished as usual, because they entered the pipe
+//! while it ran and delivery is at-least-once. At most one poller runs per pipe
 //! ([`ComAmazonawsPipesPipesState::claim_poller`]). While the pipe is still reaching
 //! RUNNING the poller consumes nothing, but it does take up its position in a stream
 //! source ([`establish_cursors`]), so a change made to the table between the call that
@@ -519,7 +527,7 @@ fn next_pass(store: &mut ComAmazonawsPipesPipesState, claim: &mut PollerClaim) -
         claim.release(store);
         return Pass::Stop;
     };
-    if pipe.current_state == pipe_state::RUNNING {
+    if pipe.rests_in_running() {
         return match resolve_run(pipe) {
             Ok(run) => Pass::Run(Box::new(run)),
             // A configuration this data plane cannot serve is reported by the pass
@@ -832,6 +840,25 @@ impl LiveRecord<'_> {
             .map(|pipe| pipe.role_arn.clone())
     }
 
+    /// Whether the pipe's record says it RUNS at this instant: the one gate every read of
+    /// its source is taken under.
+    ///
+    /// Read from the record when the question is asked, never captured for the length of
+    /// a poll, so a call that moved the pipe out of `RUNNING` while a batch was being
+    /// collected is seen by the very next read — the records that arrive after it are left
+    /// on the source for whichever later poll runs under a record that says the pipe runs
+    /// again. The moves the clock has already made due are materialised first, exactly as
+    /// every other reader of a `CurrentState` does, so a pipe whose settle span has lapsed
+    /// is seen as the state it became and not as the one it was leaving.
+    fn runs_now(&self) -> bool {
+        let mut store = self.pipes.lock();
+        store.settle_due_transitions();
+        store
+            .pipes
+            .get(self.pipe)
+            .is_some_and(PipeRecord::rests_in_running)
+    }
+
     /// Whether the pipe's record still asks for exactly what `run` was resolved from —
     /// `false` once a call has reconfigured it, and for a pipe the store no longer holds.
     fn still_configured_as(&self, run: &RunningPipe) -> bool {
@@ -989,7 +1016,15 @@ async fn collect_batch(
                 return Ok(Polled::Messages(collected));
             }
             let deadline = Instant::now() + run.batching_window;
-            while collected.len() < run.batch_size && Instant::now() < deadline {
+            // The run gate, re-read before every FURTHER read of this source (the first
+            // one is the decision this pass was taken under, made moments ago while the
+            // store was locked): a pipe moved out of RUNNING while the batch was being
+            // collected receives nothing more, so the records sent to the queue after
+            // that move stay on it, visible and counted.
+            while collected.len() < run.batch_size
+                && Instant::now() < deadline
+                && record.runs_now()
+            {
                 let wanted = run.batch_size - collected.len();
                 let more = receive(callback, clients, run, url, wanted).await?;
                 if more.is_empty() {
@@ -1126,7 +1161,10 @@ async fn collect_stream_batch(
             continue;
         }
         let deadline = Instant::now() + run.batching_window;
-        while records.len() < run.batch_size && Instant::now() < deadline {
+        // The same run gate the queue source's collection is held to: a stream that is
+        // still being read when the pipe leaves RUNNING is read no further, so the
+        // records written after that move are left for a later poll.
+        while records.len() < run.batch_size && Instant::now() < deadline && record.runs_now() {
             let Some(iterator) = next.clone() else {
                 break;
             };

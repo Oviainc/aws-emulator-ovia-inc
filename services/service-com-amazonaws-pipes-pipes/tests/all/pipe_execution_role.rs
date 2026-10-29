@@ -106,7 +106,10 @@ const HELD_ATTRIBUTES: [&str; 2] = ["ApproximateNumberOfMessages", IN_FLIGHT_ATT
 /// The attribute that says how many records a consumer has TAKEN from a queue and not
 /// deleted: "messages that are in flight" (`ApproximateNumberOfMessagesNotVisible`) —
 /// which is what the record of a batch the pipe is still working on is.
-const IN_FLIGHT_ATTRIBUTE: &str = "ApproximateNumberOfMessagesNotVisible";
+///
+/// `pub(crate)` because `tests/all/pipe_desired_state.rs` asks the same question of a
+/// queue — has the poller taken this record yet? — and reads it through this one name.
+pub(crate) const IN_FLIGHT_ATTRIBUTE: &str = "ApproximateNumberOfMessagesNotVisible";
 
 /// How many records the queue at `url` still holds, through this crate's ONE queue-attribute
 /// read.
@@ -578,7 +581,10 @@ const IN_FLIGHT_BATCH_SIZE: i64 = 10;
 
 /// Wait until the pipe `name` reports the `CurrentState` `want`, answering what it
 /// reported last: only a pipe the clock has moved into `RUNNING` polls its source at all.
-async fn wait_for_state(
+///
+/// `pub(crate)` because `tests/all/pipe_desired_state.rs` waits for a pipe to settle on the
+/// state its own `UpdatePipe` asked for, and waits through this one read.
+pub(crate) async fn wait_for_state(
     router: &MultiServiceRouter,
     name: &str,
     want: &str,

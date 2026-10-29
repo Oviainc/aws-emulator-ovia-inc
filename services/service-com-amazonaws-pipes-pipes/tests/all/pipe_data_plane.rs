@@ -318,9 +318,19 @@ pub(crate) async fn counted(router: &MultiServiceRouter, url: &str, attributes: 
         .sum()
 }
 
+/// The attribute that says how many records are WAITING on a queue — the ones a consumer
+/// could still take: "ApproximateNumberOfMessages ... the approximate number of visible
+/// messages in a queue" (`GetQueueAttributes$AttributeNames`). A record a consumer has
+/// taken and not deleted is not one of them, which is what tells a withheld record from a
+/// consumed one.
+///
+/// `pub(crate)` with the two reads below, because `tests/all/pipe_desired_state.rs` asks
+/// the same question of a queue and reaches it through this one name.
+pub(crate) const VISIBLE_ATTRIBUTE: &str = "ApproximateNumberOfMessages";
+
 /// `ApproximateNumberOfMessages` of the queue at `url`.
-async fn visible(router: &MultiServiceRouter, url: &str) -> i64 {
-    counted(router, url, &["ApproximateNumberOfMessages"]).await
+pub(crate) async fn visible(router: &MultiServiceRouter, url: &str) -> i64 {
+    counted(router, url, &[VISIBLE_ATTRIBUTE]).await
 }
 
 /// Wait until the attributes `attributes` names at the queue `url` sum to `want`, answering
@@ -344,20 +354,13 @@ pub(crate) async fn wait_for_counted(
 
 /// Wait until the queue at `url` reports `want` visible messages, answering what it
 /// reported last.
-async fn wait_for_visible(
+pub(crate) async fn wait_for_visible(
     router: &MultiServiceRouter,
     url: &str,
     want: i64,
     budget: Duration,
 ) -> i64 {
-    wait_for_counted(
-        router,
-        url,
-        &["ApproximateNumberOfMessages"],
-        want,
-        budget,
-    )
-    .await
+    wait_for_counted(router, url, &[VISIBLE_ATTRIBUTE], want, budget).await
 }
 
 /// `CreatePipe`, answered as the lifecycle harness reads a reply.

@@ -897,6 +897,17 @@ impl PipeRecord {
             .copied()
     }
 
+    /// Whether this pipe RESTS in `RUNNING`, which is the one state its data plane reads
+    /// its source in ([`data_plane`]). Call
+    /// [`ComAmazonawsPipesPipesState::settle_due_transitions`] first, so a pipe the clock
+    /// has already moved into `RUNNING` is seen as the running pipe it became.
+    ///
+    /// The one place that question is answered, so the pass the poller decides and the
+    /// gate each of its source reads is taken under cannot drift apart.
+    pub fn rests_in_running(&self) -> bool {
+        self.current_state == pipe_state::RUNNING
+    }
+
     /// The source type this pipe reads from, as the token this service names a source by.
     ///
     /// It is resolved from the pipe's `Source`, which is fixed when the pipe is created

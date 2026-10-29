@@ -21,6 +21,8 @@ mod pipe_data_plane;
 mod pipe_fifo_delivery;
 #[path = "all/pipe_description.rs"]
 mod pipe_description;
+#[path = "all/pipe_desired_state.rs"]
+mod pipe_desired_state;
 #[path = "all/pipe_dynamodb_stream_source.rs"]
 mod pipe_dynamodb_stream_source;
 #[path = "all/pipe_execution_role.rs"]
