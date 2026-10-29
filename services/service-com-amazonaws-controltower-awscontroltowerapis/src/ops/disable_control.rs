@@ -19,6 +19,11 @@
 //! the modelled `ValidationException`; one naming an enablement this account does not hold
 //! is the modelled `ResourceNotFoundException`; and either way nothing is torn down.
 //!
+//! A MANDATORY control is one AWS Control Tower applies to every target it governs itself,
+//! so it is not a caller's to turn off: a request naming such an enablement is refused with
+//! the modelled `ValidationException`, the same property `EnableControl` refuses a mandatory
+//! `controlIdentifier` by. What removes one is the target ceasing to be governed.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -343,6 +348,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // A MANDATORY control is one AWS Control Tower applies to every target it governs
+        // itself rather than one a caller enabled, so it is not a caller's to turn off
+        // either: what removes it is the target ceasing to be governed. Read off the
+        // catalog entry this enablement's control resolves to — the same property
+        // `EnableControl` refuses a mandatory `controlIdentifier` by — so a request naming
+        // one is refused rather than tearing down a control the service applied.
+        if let Some(mandatory) = crate::state::resolve_control(&enabled.control_identifier)
+            .filter(|control| !control.enablable)
+        {
+            return Err(DisableControlErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "control {} is a mandatory control, which AWS Control Tower applies \
+                         itself; only strongly recommended and elective controls may be \
+                         disabled, with the exception of the Region deny control",
+                        mandatory.name
+                    ),
+                },
+            )
+            .into());
+        }
         if enabled.status == crate::state::EnablementStatus::UnderChange {
             let in_flight = enabled.last_operation_identifier.clone();
             return Err(DisableControlErrorModeled::ConflictException(

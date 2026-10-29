@@ -61,6 +61,8 @@ mod get_control_operation;
 mod get_enabled_baseline;
 #[path = "all/get_enabled_control.rs"]
 mod get_enabled_control;
+#[path = "all/governed_target_mandatory_controls.rs"]
+mod governed_target_mandatory_controls;
 #[path = "all/in_flight_configuration_change_drift.rs"]
 mod in_flight_configuration_change_drift;
 #[path = "all/in_flight_control_change_reporting.rs"]

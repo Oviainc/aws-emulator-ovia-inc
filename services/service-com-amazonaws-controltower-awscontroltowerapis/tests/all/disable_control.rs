@@ -674,7 +674,8 @@ async fn a_request_acts_on_the_enablement_it_names() {
             }),
         ),
         (
-            "a pair naming a mandatory control, which no enablement can exist for",
+            "a pair naming a mandatory control, which this ungoverned target carries no \
+             enablement of",
             serde_json::json!({
                 "controlIdentifier": control(mandatory_control().name),
                 "targetIdentifier": first_target,

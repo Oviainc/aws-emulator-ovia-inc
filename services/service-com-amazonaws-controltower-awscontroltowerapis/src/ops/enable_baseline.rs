@@ -12,7 +12,13 @@
 //! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace names a tag Amazon Web Services
 //! applies itself, so a request carrying one is refused with the modelled
 //! `ValidationException` (400) and nothing is written.
-//! Implemented here because `GetBaselineOperation` has nothing to resolve until some call
+//!
+//! The baseline that brings a target under AWS Control Tower's governance also makes the
+//! service apply the MANDATORY controls to that target itself, so enabling it writes those
+//! enablements into the one control store `ListEnabledControls`/`GetEnabledControl` read
+//! (`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::apply_governance_controls`);
+//! `DisableBaseline` withdraws them again.
+//!//! Implemented here because `GetBaselineOperation` has nothing to resolve until some call
 //! mints a baseline operation; the remaining baseline operations keep their own stub
 //! issues.
 //!
@@ -333,6 +339,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(tags) = input.tags {
             store.tags.insert(arn.clone(), tags.into_iter().collect());
         }
+
+        // Enabling the baseline that brings a target under AWS Control Tower's governance
+        // makes the service responsible for that target, and the controls it applies to a
+        // governed target itself are the mandatory ones — so they land in the one control
+        // store the control reporting operations read, started together with this
+        // enablement. A baseline that establishes no governance applies nothing.
+        store.apply_governance_controls(baseline, &input.target_identifier, &region, now);
 
         Ok(EnableBaselineOutput {
             arn,

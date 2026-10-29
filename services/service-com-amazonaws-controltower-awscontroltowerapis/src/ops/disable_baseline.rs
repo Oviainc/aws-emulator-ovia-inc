@@ -8,6 +8,11 @@
 //! alongside `EnableBaseline` so the baseline operation log holds more than one operation
 //! type; the remaining baseline operations keep their own stub issues.
 //!
+//! Disabling the baseline that brought a target under AWS Control Tower's governance ends
+//! that governance, so the MANDATORY controls the service applied to the target are torn
+//! down with it, each through its own asynchronous `DISABLE_CONTROL` operation
+//! (`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::withdraw_governance_controls`).
+//!
 //! AUTHORIZATION and THROTTLING are NOT emulated here, so the modelled
 //! `AccessDeniedException` (403) and `ThrottlingException` (429) are deliberately
 //! unreachable from this handler: the emulator verifies the request signature at its
@@ -230,6 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A target stops being governed when the baseline that brought it under AWS
+        // Control Tower's governance is disabled, so the mandatory controls the service
+        // applied to that target are torn down with it — each through its own asynchronous
+        // operation, exactly as a caller's disable tears an enablement of its own down.
+        store.withdraw_governance_controls(&arn, now);
 
         Ok(DisableBaselineOutput {
             operation_identifier,

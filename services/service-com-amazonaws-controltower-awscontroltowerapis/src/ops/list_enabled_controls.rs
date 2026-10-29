@@ -2,10 +2,12 @@
 
 //! @op ListEnabledControls
 //!
-//! Lists the controls `EnableControl` has enabled, oldest ARN first, narrowed by
-//! `targetIdentifier` and by every member of `filter`, and paginated by `maxResults` and
-//! `nextToken`. Derived entirely from [`crate::state`], so it is empty before any
-//! enablement and every field it reports is the one the enabling call persisted.
+//! Lists the controls enabled on this account's targets — the ones `EnableControl`
+//! enabled and the mandatory ones AWS Control Tower applies to a target brought under its
+//! governance itself — oldest ARN first, narrowed by `targetIdentifier` and by every member
+//! of `filter`, and paginated by `maxResults` and `nextToken`. Derived entirely from
+//! [`crate::state`], so it is empty before any enablement and every field it reports is
+//! the one the enabling call persisted.
 //!
 //! `includeChildren` asks for the controls enabled on the target's child organizational
 //! units and accounts as well. This service records the target each control was enabled

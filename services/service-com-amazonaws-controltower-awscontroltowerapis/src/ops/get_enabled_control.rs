@@ -2,8 +2,8 @@
 
 //! @op GetEnabledControl
 //!
-//! Reports one enabled control, read from [`crate::state`] by the ARN `EnableControl`
-//! returned: the same persisted record `ListEnabledControls` summarises, plus the
+//! Reports one enabled control, read from [`crate::state`] by the ARN this service minted
+//! for it: the same persisted record `ListEnabledControls` summarises, plus the
 //! parameters the enablement was given and the regions the landing zone governs now.
 //! An identifier no enablement minted is `ResourceNotFoundException` (HTTP 404).
 //!

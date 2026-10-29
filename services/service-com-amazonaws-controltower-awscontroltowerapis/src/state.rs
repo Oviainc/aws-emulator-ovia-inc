@@ -50,8 +50,10 @@
 //!   [`record_enablement`]), because an enablement is a resource a caller must tear down
 //!   rather than a history record a newer one may evict;
 //! * `enabled_controls` holds at most [`MAX_ENABLED_CONTROLS`] control enablements — one
-//!   per control/target pair `EnableControl` is called for — and `EnableControl` is
-//!   REFUSED past that cap for the same reason as `EnableBaseline`;
+//!   per control/target pair, whether `EnableControl` was called for it or the service
+//!   applied it to a target brought under its governance ([`apply_governance_controls`]) —
+//!   and `EnableControl` is REFUSED past that cap for the same reason as `EnableBaseline`,
+//!   while a service-applied control is simply not written past it;
 //! * `tags` is keyed by the ARNs of the stores above, and an entry is dropped with the
 //!   resource it tags, so it is bounded by them; one resource's tag map holds at most
 //!   [`MAX_TAGS_PER_RESOURCE`] entries and `TagResource` is REFUSED past that count (see
@@ -77,6 +79,7 @@
 //!
 //! [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
 //! [`record_enablement`]: ComAmazonawsControltowerAwscontroltowerapisState::record_enablement
+//! [`apply_governance_controls`]: ComAmazonawsControltowerAwscontroltowerapisState::apply_governance_controls
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
@@ -1185,9 +1188,12 @@ pub struct ComAmazonawsControltowerAwscontroltowerapisState {
     /// [`MAX_LANDING_ZONE_OPERATIONS`] records; see the module header on retention.
     pub landing_zone_operations: HashMap<String, LandingZoneOperation>,
     /// Enabled controls keyed by their own ARN — the single home for this service's
-    /// control enablements, written by `EnableControl` and read by
+    /// control enablements, written by `EnableControl` and by the service itself when a
+    /// target comes under its governance ([`apply_governance_controls`]), and read by
     /// `ListEnabledControls`/`GetEnabledControl`. Holds at most
     /// [`MAX_ENABLED_CONTROLS`] entries.
+    ///
+    /// [`apply_governance_controls`]: Self::apply_governance_controls
     pub enabled_controls: HashMap<String, EnabledControl>,
     /// The control operation log, keyed by `operationIdentifier`. Written by every call
     /// that acts on an `EnabledControl` and read by
@@ -2118,6 +2124,134 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
         Some(operation_identifier)
     }
 
+    /// Apply every MANDATORY control of [`CONTROL_CATALOG`] to `target_identifier`, the
+    /// controls AWS Control Tower applies to a target it governs itself.
+    ///
+    /// Enabling the baseline that brings a target under governance
+    /// ([`CatalogBaseline::establishes_governance`]) is what makes the service responsible
+    /// for a target, and the controls it applies itself are the mandatory ones — the
+    /// entries no caller may enable ([`CatalogControl::enablable`]) — so they become
+    /// enablements of this account's one control store and every control reporting
+    /// operation reports them beside the ones a caller enabled. A baseline that establishes
+    /// no governance applies nothing.
+    ///
+    /// Each lands as its OWN `EnabledControl` with its own `ENABLE_CONTROL` operation,
+    /// `UNDER_CHANGE` until the clock makes that operation due, exactly as a caller's
+    /// enablement does: the deployment is asynchronous whoever started it, and these are
+    /// started together with the enablement that brought the target under governance. A
+    /// control already enabled on the target is left alone, so nothing is applied twice,
+    /// and nothing is written past [`MAX_ENABLED_CONTROLS`]: the store's bound holds
+    /// whoever writes into it.
+    pub fn apply_governance_controls(
+        &mut self,
+        baseline: &CatalogBaseline,
+        target_identifier: &str,
+        region: &str,
+        now: SystemTime,
+    ) {
+        if !baseline.establishes_governance {
+            return;
+        }
+
+        for control in CONTROL_CATALOG.iter().filter(|control| !control.enablable) {
+            if self.enabled_controls.len() >= MAX_ENABLED_CONTROLS {
+                break;
+            }
+            if self
+                .enabled_control_on_target(control, target_identifier)
+                .is_some()
+            {
+                continue;
+            }
+
+            // The control is named by its AWS Control Tower ARN, the identifier form whose
+            // resource segment is the control's name, so what is persisted is an identifier
+            // a caller can read back into any member that names a control.
+            let control_identifier = control_arn(region, control.name);
+            let arn = enabled_control_arn(region, &new_enabled_control_id());
+            let operation_identifier = self.record_control_operation(
+                ControlOperationType::EnableControl,
+                &control_identifier,
+                target_identifier,
+                &arn,
+                now,
+            );
+            self.enabled_controls.insert(
+                arn.clone(),
+                EnabledControl {
+                    arn,
+                    control_identifier,
+                    target_identifier: target_identifier.to_string(),
+                    // Applied directly to the target the baseline named, so it inherits its
+                    // configuration from no other enabled control — the same reading
+                    // `EnableControl` gives this member.
+                    parent_identifier: None,
+                    // A mandatory control declares no enablement parameter, so there is no
+                    // configuration for one to carry.
+                    parameters: Vec::new(),
+                    enablement_region: region.to_string(),
+                    status: EnablementStatus::UnderChange,
+                    last_operation_identifier: operation_identifier,
+                    // Drift is not assessable until the configuration is deployed;
+                    // [`settle`] moves these to `IN_SYNC` once the enablement is due.
+                    drift_status: DriftStatus::Unknown,
+                    inheritance_drift_status: DriftStatus::Unknown,
+                    resource_drift_status: DriftStatus::Unknown,
+                    due_at: now + OPERATION_SETTLE_AFTER,
+                    pending_update: None,
+                    pending_deletion: None,
+                },
+            );
+        }
+    }
+
+    /// Start the teardown of every MANDATORY control applied to the target of the enabled
+    /// baseline `arn` names.
+    ///
+    /// The counterpart of [`apply_governance_controls`]: a target stops being governed when
+    /// the baseline that brought it under governance is disabled, so the controls the
+    /// service applied to it are no longer enablements of this account. Each goes through
+    /// the asynchronous teardown a caller's disable starts
+    /// ([`record_enabled_control_disable`]), so a caller polling straight after the call
+    /// still sees them `UNDER_CHANGE` and [`settle`] removes them once the clock makes them
+    /// due. An enablement of a baseline that establishes no governance, and an `arn` naming
+    /// no enablement, withdraw nothing.
+    ///
+    /// [`settle`]: Self::settle
+    /// [`apply_governance_controls`]: Self::apply_governance_controls
+    /// [`record_enabled_control_disable`]: Self::record_enabled_control_disable
+    pub fn withdraw_governance_controls(&mut self, arn: &str, now: SystemTime) {
+        let Some(target_identifier) = self
+            .enabled_baselines
+            .get(arn)
+            .filter(|enabled| {
+                resolve_baseline(&enabled.baseline_identifier)
+                    .is_some_and(|baseline| baseline.establishes_governance)
+            })
+            .map(|enabled| enabled.target_identifier.clone())
+        else {
+            return;
+        };
+
+        // The ARNs order the teardowns totally, so the operations they start are started in
+        // one order whatever order the store iterates in. A control already being torn down
+        // is left to the teardown it carries rather than given a second one.
+        let mut applied: Vec<String> = self
+            .enabled_controls
+            .values()
+            .filter(|enabled| {
+                enabled.target_identifier == target_identifier
+                    && enabled.pending_deletion.is_none()
+                    && is_mandatory_control(&enabled.control_identifier)
+            })
+            .map(|enabled| enabled.arn.clone())
+            .collect();
+        applied.sort();
+        for control_arn in &applied {
+            let _ = self.record_enabled_control_disable(control_arn, now);
+        }
+    }
+
     /// Whether `arn` names a resource of this service that tags attach to.
     ///
     /// The three resource stores are the whole set: a landing zone, an enabled control
@@ -2645,6 +2779,20 @@ pub struct CatalogBaseline {
     /// a baseline publishes; an enablement of a baseline this is `false` for reports no
     /// `driftStatusSummary` at all.
     pub detects_inheritance_drift: bool,
+    /// Whether enabling this baseline is what brings a target under AWS Control Tower's
+    /// GOVERNANCE.
+    ///
+    /// One baseline sets up the resources and permissions AWS Control Tower requires to
+    /// govern the accounts of a target organizational unit — enabling it on a target is how
+    /// a caller brings that target under governance — and governance is what makes the
+    /// service apply the mandatory controls to the target itself
+    /// ([`apply_governance_controls`]). It is a property of the BASELINE, not of one
+    /// enablement, so it lives in the catalog beside the rest of what a baseline publishes.
+    /// The baselines that configure a landing zone's shared accounts, and the ones that
+    /// apply backup configuration, govern nothing and so establish none.
+    ///
+    /// [`apply_governance_controls`]: ComAmazonawsControltowerAwscontroltowerapisState::apply_governance_controls
+    pub establishes_governance: bool,
 }
 
 impl CatalogBaseline {
@@ -2685,6 +2833,9 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
         versions: &["1.0", "2.0", "3.0", "4.0"],
         parameters: &["IdentityCenterEnabledForBaseline"],
         detects_inheritance_drift: true,
+        // The one baseline that governs a target organizational unit's accounts, which is
+        // what registering that target with AWS Control Tower means.
+        establishes_governance: true,
     },
     CatalogBaseline {
         id: "4T4HA1KMO10S6311",
@@ -2694,6 +2845,7 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
         versions: &["1.0"],
         parameters: &[],
         detects_inheritance_drift: false,
+        establishes_governance: false,
     },
     CatalogBaseline {
         id: "TR7NC4VPG9DH2KLM",
@@ -2703,6 +2855,7 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
         versions: &["1.0"],
         parameters: &[],
         detects_inheritance_drift: false,
+        establishes_governance: false,
     },
     CatalogBaseline {
         id: "QXK3R9ZB7PN5TD2H",
@@ -2712,6 +2865,7 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
         versions: &["1.0"],
         parameters: &[],
         detects_inheritance_drift: true,
+        establishes_governance: false,
     },
     CatalogBaseline {
         id: "WM8FJ6YHL3QS5XKB",
@@ -2721,6 +2875,7 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
         versions: &["1.0"],
         parameters: &[],
         detects_inheritance_drift: false,
+        establishes_governance: false,
     },
     CatalogBaseline {
         id: "LN25R72TTG6IGPTQ",
@@ -2730,6 +2885,7 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
         versions: &["1.0", "4.0"],
         parameters: &[],
         detects_inheritance_drift: false,
+        establishes_governance: false,
     },
     CatalogBaseline {
         id: "2V6DZ8QKR4JT7MWN",
@@ -2739,6 +2895,7 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
         versions: &["1.0"],
         parameters: &[],
         detects_inheritance_drift: false,
+        establishes_governance: false,
     },
 ];
 
@@ -2872,8 +3029,11 @@ pub struct CatalogControl {
     /// and Elective controls are permitted, with the exception of the Region deny
     /// control": the MANDATORY controls AWS Control Tower applies to every governed
     /// account itself are named by a `controlIdentifier` — `ListEnabledControls` reports
-    /// them — but cannot be enabled by a caller, so a request naming one is refused rather
-    /// than persisted. False for exactly those.
+    /// them, as the enablements the service writes for a target brought under its
+    /// governance ([`apply_governance_controls`]) — but cannot be enabled by a caller, so a
+    /// request naming one is refused rather than persisted. False for exactly those.
+    ///
+    /// [`apply_governance_controls`]: ComAmazonawsControltowerAwscontroltowerapisState::apply_governance_controls
     pub enablable: bool,
     /// The mechanism AWS Control Tower implements this control with.
     ///
@@ -3131,6 +3291,31 @@ pub const CONTROL_CATALOG: &[CatalogControl] = &[
         parameters: &["AllowedRegions", "ExemptedPrincipalArns", "ExemptedActions"],
     },
 ];
+
+/// `arn:aws:controltower:<region>::control/<CONTROL_NAME>` — the AWS Control Tower ARN
+/// form of a catalog control, whose resource segment is the control's name.
+///
+/// The account segment is EMPTY for the reason [`baseline_arn`]'s is, which is also why
+/// this is not built through `engine::emulator_arn` the way the per-account resources are:
+/// a control is AWS-managed catalog data that no account owns, and only an account-less
+/// control ARN names one. [`resolve_control`] reads this form back, so an identifier built
+/// here names the control it was built from wherever a `controlIdentifier` is accepted.
+pub fn control_arn(region: &str, control_name: &str) -> String {
+    format!("arn:aws:{ARN_NAMESPACE}:{region}::control/{control_name}")
+}
+
+/// Whether `control_identifier` names a MANDATORY control: one AWS Control Tower applies
+/// to every target it governs itself, which is exactly the set no caller may enable
+/// ([`CatalogControl::enablable`]).
+///
+/// The one place that question is asked of a STORED enablement, so every call that treats
+/// a control the service applied differently from one a caller enabled reads the same
+/// answer. Read off the catalog entry the identifier resolves to rather than off its text,
+/// because one control is published under two ARN forms; an identifier naming no catalog
+/// control is not mandatory, and no stored enablement carries one.
+pub fn is_mandatory_control(control_identifier: &str) -> bool {
+    resolve_control(control_identifier).is_some_and(|control| !control.enablable)
+}
 
 /// The catalog entry a `controlIdentifier` names, or `None` when the identifier is not a
 /// control ARN or the catalog holds no control it names.
