@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStreamConsumers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStreamConsumers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStreamConsumers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the enhanced fan-out consumers `RegisterStreamConsumer` registered with the stream
+//! the request's `StreamARN` — or the stream its `NextToken` names — addresses in
+//! `crate::state`'s `streams` store, serving them one `MaxResults`-sized page at a time in
+//! consumer-name order. Reporting only: the page token a truncated listing hands back
+//! carries where to resume INSIDE the token, so no read writes anything a later caller
+//! could see.
 //!
 //! ## Shape of an operation
 //!
@@ -120,7 +118,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kinesis-kinesis-2013120
 // here — hence the `ListStreamConsumersError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#ListStreamConsumers")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#ListStreamConsumers",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models
+    // it ("The processing of the request failed because of an unknown error, exception, or
+    // failure"), the operation shape does not list it, and it is the only honest answer
+    // for a service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum ListStreamConsumersErrorModeled {
     ExpiredNextTokenException(ExpiredNextTokenException),
@@ -128,6 +133,7 @@ pub enum ListStreamConsumersErrorModeled {
     LimitExceededException(LimitExceededException),
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -153,6 +159,49 @@ impl From<ListStreamConsumersErrorModeled> for ListStreamConsumersError {
 /// concrete engine where it mounts the service, not here.
 pub struct ListStreamConsumers<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// Refuse the request with the error this operation models for a parameter that "exceeds
+/// its restrictions, is not supported, or can't be used".
+fn invalid_argument(message: String) -> ListStreamConsumersError {
+    ListStreamConsumersErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled refusal for an identifier this account and region hold no stream under.
+fn not_found(identifier: &str) -> ListStreamConsumersError {
+    ListStreamConsumersErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::stream_not_found_message(identifier)),
+    })
+    .into()
+}
+
+/// The modelled refusal for a `NextToken` this service never issued for this listing, or
+/// one past its lifetime: either way it names no page any more.
+fn expired_next_token() -> ListStreamConsumersError {
+    ListStreamConsumersErrorModeled::ExpiredNextTokenException(ExpiredNextTokenException {
+        message: Some(crate::state::next_token_expired_message()),
+    })
+    .into()
+}
+
+/// The modelled refusal for a request whose `StreamARN` names no stream of this account and
+/// region, worded exactly as every other operation of this service words it. `StreamARN` is
+/// this operation's only stream identifier, so a request that names no stream with it names
+/// no stream at all.
+fn lookup_refusal(
+    failure: crate::state::StreamLookupFailure,
+    identifier: &str,
+) -> ListStreamConsumersError {
+    match failure {
+        crate::state::StreamLookupFailure::Unspecified
+        | crate::state::StreamLookupFailure::Mismatch => {
+            invalid_argument(crate::state::STREAM_ARN_REQUIRED_MESSAGE.to_string())
+        }
+        crate::state::StreamLookupFailure::NotFound => not_found(identifier),
+    }
 }
 
 impl<Eng> ListStreamConsumers<Eng> {
@@ -181,18 +230,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStreamConsumers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStreamConsumersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStreamConsumers"))
+        // A stream "is also scoped by Amazon Web Services Region" (`CreateStream`), so the
+        // stream this listing addresses is one of the region the request was signed for.
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListStreamConsumersError::from(
+                ListStreamConsumersErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some("the stream store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // Which stream, and where in its consumers to carry on: a `NextToken`
+        // "unambiguously identifies the stream", so a request carrying one takes the stream
+        // and the resume point from the token; a request carrying none resolves its
+        // `StreamARN` the way every stream operation of this service does. `StreamId` is
+        // documented "Not Implemented. Reserved for future use", so no stream carries one
+        // and it names no stream here.
+        let (stream, resume_at) = match input.next_token.as_deref() {
+            None => (
+                store
+                    .resolve_stream(now, &region, None, Some(&input.stream_arn))
+                    .map_err(|failure| lookup_refusal(failure, &input.stream_arn))?,
+                None,
+            ),
+            Some(token) => {
+                // "Don't specify StreamName or StreamCreationTimestamp if you specify
+                // NextToken because the latter unambiguously identifies the stream"
+                // (`ListStreamConsumersInput$NextToken`).
+                if input.stream_creation_timestamp.is_some() {
+                    return Err(invalid_argument(
+                        crate::state::next_token_conflict_message("StreamCreationTimestamp"),
+                    ));
+                }
+                // A token this service never issued names no page, and one past its
+                // lifetime names no page any more: both are the modelled expiry refusal,
+                // which is what keeps a caller from constructing a cursor of its own.
+                let resume = crate::state::ConsumerPageToken::decode(token)
+                    .filter(|resume| !resume.is_expired(now))
+                    .ok_or_else(expired_next_token)?;
+                // `StreamARN` is `@required`, so a resumed request carries one too: it has
+                // to name the stream the token names, or the two name different streams.
+                if input.stream_arn != resume.stream_arn {
+                    return Err(invalid_argument(
+                        crate::state::NEXT_TOKEN_STREAM_MISMATCH_MESSAGE.to_string(),
+                    ));
+                }
+                let stream = store
+                    .stream_by_arn(now, &region, &resume.stream_arn)
+                    .filter(|stream| resume.names(stream))
+                    .ok_or_else(|| not_found(&resume.stream_arn))?;
+                (stream, Some(resume.next_consumer_name))
+            }
+        };
+
+        // "Specify this input parameter to distinguish data streams that have the same
+        // name... you can use this input parameter to specify which of the two streams you
+        // want to list the consumers for" (`ListStreamConsumersInput$StreamCreationTimestamp`):
+        // a timestamp that is not this stream's names another stream, which this account and
+        // region do not hold.
+        if let Some(asked) = input.stream_creation_timestamp {
+            let created = crate::state::timestamp(stream.created_at);
+            if asked.to_millis().ok() != created.to_millis().ok() {
+                return Err(not_found(&input.stream_arn));
+            }
+        }
+
+        // "The resource is not available for this operation. For successful operation, the
+        // resource must be in the ACTIVE state" (`ResourceInUseException`): a stream whose
+        // create or whose removal is still due serves no listing of what is registered with
+        // it. One whose shard count is being changed DOES serve a read: "you can continue to
+        // read and write data to your stream while its status is UPDATING"
+        // (`UpdateShardCount`).
+        if !stream.serves_shards(now) {
+            return Err(ListStreamConsumersErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(crate::state::stream_not_active_message(
+                        &stream.name,
+                        stream.status(now),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The default value is 100. If you specify a value greater than 100, at most 100
+        // results are returned" (`ListStreamConsumersInput$MaxResults`) — a caller-chosen
+        // page size is clamped server-side before it sizes anything.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::DEFAULT_LIST_STREAM_CONSUMERS_LIMIT)
+                .clamp(1, crate::state::MAX_LIST_STREAM_CONSUMERS_LIMIT),
+        )
+        .unwrap_or(1);
+
+        // A cursor names the first consumer the earlier page did NOT return, so the page
+        // that resumes it starts AT that consumer rather than after it.
+        let mut beyond_cursor = stream
+            .consumers_ordered()
+            .into_iter()
+            .filter(|consumer| {
+                resume_at
+                    .as_deref()
+                    .is_none_or(|from| consumer.name.as_str() >= from)
+            })
+            .peekable();
+        let page: Vec<Consumer> = beyond_cursor
+            .by_ref()
+            .take(page_size)
+            .map(|consumer| consumer.to_shape(now))
+            .collect();
+
+        Ok(ListStreamConsumersOutput {
+            consumers: Some(page),
+            // A cursor is handed back exactly when the stream carries a consumer past this
+            // page, and it names that consumer.
+            next_token: beyond_cursor.peek().map(|consumer| {
+                crate::state::ConsumerPageToken::new(
+                    &stream.arn,
+                    stream.created_at,
+                    &consumer.name,
+                    now,
+                )
+                .encode()
+            }),
+        })
     }
 }

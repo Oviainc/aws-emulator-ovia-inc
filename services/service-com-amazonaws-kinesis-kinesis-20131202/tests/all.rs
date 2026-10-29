@@ -31,6 +31,8 @@ mod channel_listing;
 mod channel_removal;
 #[path = "all/consumer_deregistration.rs"]
 mod consumer_deregistration;
+#[path = "all/consumer_listing.rs"]
+mod consumer_listing;
 #[path = "all/data_records.rs"]
 mod data_records;
 #[path = "all/encrypted_records.rs"]

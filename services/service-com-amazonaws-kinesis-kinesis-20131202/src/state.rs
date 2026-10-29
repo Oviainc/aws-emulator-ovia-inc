@@ -320,6 +320,17 @@ pub const DEFAULT_LIST_STREAMS_LIMIT: i32 = 100;
 /// `range 1..10000` deliberately leaves room above.
 pub const MAX_LIST_STREAMS_LIMIT: i32 = 100;
 
+/// How many consumers `ListStreamConsumers` returns when the request names no `MaxResults`:
+/// "The maximum number of consumers that you want a single call of ListStreamConsumers to
+/// return. The default value is 100" (`ListStreamConsumersInput$MaxResults`).
+pub const DEFAULT_LIST_STREAM_CONSUMERS_LIMIT: i32 = 100;
+
+/// The most consumers `ListStreamConsumers` returns in one call: "If you specify a value
+/// greater than 100, at most 100 results are returned"
+/// (`ListStreamConsumersInput$MaxResults`), which the modelled `range 1..10000`
+/// deliberately leaves room above.
+pub const MAX_LIST_STREAM_CONSUMERS_LIMIT: i32 = 100;
+
 /// How many records `GetRecords` returns when the request names no `Limit`: "The maximum
 /// number of records to return. Specify a value of up to 10,000... The default value is
 /// 10,000" (`GetRecordsInput$Limit`).
@@ -1406,6 +1417,18 @@ impl Stream {
     /// The consumer the stream carries under `arn`, if any.
     pub fn consumer_by_arn(&self, arn: &str) -> Option<&ConsumerRecord> {
         self.consumers.iter().find(|consumer| consumer.arn == arn)
+    }
+
+    /// Every consumer registered with the stream, ordered by name.
+    ///
+    /// A listing of them is paged by an opaque cursor that names the consumer the next page
+    /// starts at ([`ConsumerPageToken`]), so the consumers a read reports need ONE total
+    /// order that every page agrees on, and a consumer's name is unique inside its stream:
+    /// the order is by name, whatever order the registrations arrived in.
+    pub fn consumers_ordered(&self) -> Vec<&ConsumerRecord> {
+        let mut consumers: Vec<&ConsumerRecord> = self.consumers.iter().collect();
+        consumers.sort_by(|left, right| left.name.cmp(&right.name));
+        consumers
     }
 
     /// How many of the stream's consumers are still in `CREATING` at `now`, which is what
@@ -3471,9 +3494,75 @@ pub fn put_records_data_path(position: usize) -> String {
     ])
 }
 
-/// What a `ListShards` pagination token is tagged with, so a string the service never
-/// issued is refused rather than read as a shard id.
-const SHARD_PAGE_TOKEN_TAG: &str = "listShards";
+/// Which listing of ONE stream's members a cursor belongs to, which is what it is tagged
+/// with: a string this service never issued, and one minted for ANOTHER listing, both name
+/// no page of the listing being asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamListing {
+    /// `ListShards`, whose cursor names the shard its next page starts at.
+    Shards,
+    /// `ListStreamConsumers`, whose cursor names the consumer its next page starts at.
+    Consumers,
+}
+
+impl StreamListing {
+    /// The tag this listing's cursors carry.
+    const fn tag(self) -> &'static str {
+        match self {
+            Self::Shards => "listShards",
+            Self::Consumers => "listStreamConsumers",
+        }
+    }
+}
+
+/// The wire form of a cursor into one stream's members: the listing it was minted for, the
+/// instant it was minted, the instant the stream was created, the member the next page
+/// starts at, and the stream's ARN.
+///
+/// Opaque (hex of a tagged byte string) because the model gives `NextToken` no structure: a
+/// client passes back what it was handed rather than constructing one. Two hex characters
+/// per byte keeps it far inside the modelled length 1..1048576.
+fn encode_stream_page(
+    listing: StreamListing,
+    issued_at_millis: u128,
+    stream_created_at_millis: u128,
+    next_name: &str,
+    stream_arn: &str,
+) -> String {
+    hex::encode(format!(
+        "{}:{issued_at_millis}:{stream_created_at_millis}:{next_name}:{stream_arn}",
+        listing.tag()
+    ))
+}
+
+/// What `token` carries for `listing` — the instant it was minted, the instant the stream
+/// was created, the member the next page starts at and the stream's ARN — or `None` when it
+/// is not one this service issued for that listing.
+fn decode_stream_page(
+    listing: StreamListing,
+    token: &str,
+) -> Option<(u128, u128, String, String)> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    // The ARN carries colons of its own, so it is the LAST field: the tag, the two
+    // instants and the member's name (whose `@pattern` admits no colon) are taken first.
+    let mut fields = decoded.splitn(5, ':');
+    if fields.next()? != listing.tag() {
+        return None;
+    }
+    let issued_at_millis = fields.next()?.parse().ok()?;
+    let stream_created_at_millis = fields.next()?.parse().ok()?;
+    let next_name = fields.next()?.to_string();
+    let stream_arn = fields.next()?.to_string();
+    if next_name.is_empty() || stream_arn.is_empty() {
+        return None;
+    }
+    Some((
+        issued_at_millis,
+        stream_created_at_millis,
+        next_name,
+        stream_arn,
+    ))
+}
 
 /// Milliseconds since the epoch at `at`, which is how an instant travels inside a
 /// pagination token.
@@ -3522,37 +3611,22 @@ impl ShardPageToken {
         }
     }
 
-    /// This token as the opaque `NextToken` a client is handed.
-    ///
-    /// Opaque (hex of a tagged byte string) because the model gives `NextToken` no
-    /// structure: a client passes back what it was handed rather than constructing one. Two
-    /// hex characters per byte keeps it far inside the modelled length 1..1048576.
+    /// This token as the opaque `NextToken` a client is handed
+    /// ([`encode_stream_page`]).
     pub fn encode(&self) -> String {
-        hex::encode(format!(
-            "{SHARD_PAGE_TOKEN_TAG}:{}:{}:{}:{}",
+        encode_stream_page(
+            StreamListing::Shards,
             self.issued_at_millis,
             self.stream_created_at_millis,
-            self.next_shard_id,
-            self.stream_arn
-        ))
+            &self.next_shard_id,
+            &self.stream_arn,
+        )
     }
 
     /// The token `token` carries, or `None` when it is not one this service issued.
     pub fn decode(token: &str) -> Option<Self> {
-        let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-        // The ARN carries colons of its own, so it is the LAST field: the tag, the two
-        // instants and the shard id (whose `@pattern` admits no colon) are taken first.
-        let mut fields = decoded.splitn(5, ':');
-        if fields.next()? != SHARD_PAGE_TOKEN_TAG {
-            return None;
-        }
-        let issued_at_millis = fields.next()?.parse().ok()?;
-        let stream_created_at_millis = fields.next()?.parse().ok()?;
-        let next_shard_id = fields.next()?.to_string();
-        let stream_arn = fields.next()?.to_string();
-        if next_shard_id.is_empty() || stream_arn.is_empty() {
-            return None;
-        }
+        let (issued_at_millis, stream_created_at_millis, next_shard_id, stream_arn) =
+            decode_stream_page(StreamListing::Shards, token)?;
         Some(Self {
             stream_arn,
             stream_created_at_millis,
@@ -3568,6 +3642,87 @@ impl ShardPageToken {
     }
 
     /// Whether the token is past its lifetime at `now` ([`LIST_SHARDS_TOKEN_TTL`]).
+    ///
+    /// A mint instant no clock of this emulator could have produced — one that cannot be
+    /// represented, or one still in the future — names no page either, so it counts as past
+    /// its lifetime rather than reaching the store.
+    pub fn is_expired(&self, now: SystemTime) -> bool {
+        is_past_token_lifetime(self.issued_at_millis, now)
+    }
+}
+
+/// Where a truncated `ListStreamConsumers` page continues, which stream's consumers it
+/// continues, and when the page that handed the token out was served.
+///
+/// The token "unambiguously identifies the stream" (`ListStreamConsumersInput$NextToken`),
+/// so it carries the stream's ARN AND the instant that stream was created — a name a delete
+/// released and a later create took again is another stream, and the pair names only one of
+/// them — beside the consumer the next page starts at; and it expires, so it carries the
+/// instant it was minted. All of it travels INSIDE the token: a read mints one without
+/// writing anything a later caller could see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerPageToken {
+    /// The ARN of the stream whose consumers are being listed.
+    pub stream_arn: String,
+    /// When that stream was created, in milliseconds since the epoch.
+    pub stream_created_at_millis: u128,
+    /// The name of the first consumer the page did NOT return, which the next page starts
+    /// at.
+    pub next_consumer_name: String,
+    /// When the page that handed this token out was served, in milliseconds since the
+    /// epoch.
+    pub issued_at_millis: u128,
+}
+
+impl ConsumerPageToken {
+    /// The token that resumes at `next_consumer_name` for the stream `stream_arn` created
+    /// at `stream_created_at`, minted at `issued_at`.
+    pub fn new(
+        stream_arn: &str,
+        stream_created_at: SystemTime,
+        next_consumer_name: &str,
+        issued_at: SystemTime,
+    ) -> Self {
+        Self {
+            stream_arn: stream_arn.to_string(),
+            stream_created_at_millis: epoch_millis(stream_created_at),
+            next_consumer_name: next_consumer_name.to_string(),
+            issued_at_millis: epoch_millis(issued_at),
+        }
+    }
+
+    /// This token as the opaque `NextToken` a client is handed
+    /// ([`encode_stream_page`]).
+    pub fn encode(&self) -> String {
+        encode_stream_page(
+            StreamListing::Consumers,
+            self.issued_at_millis,
+            self.stream_created_at_millis,
+            &self.next_consumer_name,
+            &self.stream_arn,
+        )
+    }
+
+    /// The token `token` carries, or `None` when it is not one this service issued for this
+    /// listing.
+    pub fn decode(token: &str) -> Option<Self> {
+        let (issued_at_millis, stream_created_at_millis, next_consumer_name, stream_arn) =
+            decode_stream_page(StreamListing::Consumers, token)?;
+        Some(Self {
+            stream_arn,
+            stream_created_at_millis,
+            next_consumer_name,
+            issued_at_millis,
+        })
+    }
+
+    /// Whether the token names `stream`: the same ARN, created at the same instant.
+    pub fn names(&self, stream: &Stream) -> bool {
+        self.stream_arn == stream.arn
+            && self.stream_created_at_millis == epoch_millis(stream.created_at)
+    }
+
+    /// Whether the token is past its lifetime at `now` ([`PAGE_TOKEN_TTL`]).
     ///
     /// A mint instant no clock of this emulator could have produced — one that cannot be
     /// represented, or one still in the future — names no page either, so it counts as past
@@ -3928,6 +4083,14 @@ pub const INVALID_SHARD_ITERATOR_MESSAGE: &str = "Invalid ShardIterator.";
 pub const ITERATOR_STREAM_MISMATCH_MESSAGE: &str =
     "StreamARN names a different stream than the ShardIterator does; the iterator already \
      identifies the stream its position is in";
+
+/// How a listing refuses a request whose `StreamARN` names a different stream than its
+/// `NextToken` does: the token already names the stream whose listing it resumes, so the
+/// pair has to name ONE stream — the same rule [`STREAM_IDENTIFIER_MISMATCH_MESSAGE`]
+/// states for a request that names a stream twice.
+pub const NEXT_TOKEN_STREAM_MISMATCH_MESSAGE: &str =
+    "StreamARN names a different stream than the NextToken does; the token already \
+     identifies the stream whose listing it resumes";
 
 /// How a read refuses an iterator past its lifetime: the sentence Kinesis answers for
 /// `ExpiredIteratorException` ("The provided iterator exceeds the maximum age allowed"),
