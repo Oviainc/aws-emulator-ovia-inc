@@ -63,6 +63,8 @@ mod policy_templates;
 mod policy_update;
 #[path = "all/policy_validation.rs"]
 mod policy_validation;
+#[path = "all/repeated_entity_identifiers.rs"]
+mod repeated_entity_identifiers;
 #[path = "all/resource_names.rs"]
 mod resource_names;
 #[path = "all/response_fidelity.rs"]

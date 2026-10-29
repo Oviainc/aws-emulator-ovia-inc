@@ -971,8 +971,10 @@ pub fn load_policies(store: &super::PolicyStore) -> Result<PreparedPolicies, Ref
 /// values an authorization request carries. So a slice the schema cannot type is
 /// still parsed, untyped, and evaluated — whatever the evaluation then raises
 /// about it is reported in-band in the response's `errors`. Only a payload that
-/// is no Cedar entity store at all (a duplicate uid, an unparseable entity type)
-/// is refused as a bad request.
+/// is no Cedar entity store at all (an unparseable entity type, a uid repeated in
+/// a `cedarJson` store) is refused as a bad request; a repeated identifier in the
+/// modelled `entityList` is not, because [`entities_to_cedar_json`] has already
+/// collapsed it onto the entity given last.
 pub fn build_entities(
     entities: serde_json::Value,
     schema: Option<&cedar_policy::Schema>,
@@ -1369,6 +1371,12 @@ pub fn context_path(context: Option<&ContextDefinition>) -> &'static str {
 /// The request's `entities` as Cedar JSON (an array of entity objects). An absent
 /// entity set is the empty store.
 ///
+/// The modelled `entityList` arm is keyed by `identifier`, so a list that names
+/// one identifier more than once is accepted and collapsed onto the entity given
+/// for that identifier LAST; the earlier ones take no part in the decision. The
+/// `cedarJson` arm is a Cedar entity store as written, so what is a valid store
+/// there is Cedar's own question, answered by [`build_entities`].
+///
 /// Refuses a set past [`MAX_ENTITIES_PER_REQUEST`]: an authorization request is
 /// evaluated in-process, so the entity store it carries is capped at the
 /// published quota.
@@ -1387,9 +1395,29 @@ pub fn entities_to_cedar_json(
     let value = match entities {
         None => serde_json::Value::Array(Vec::new()),
         Some(EntitiesDefinition::entityList(items)) => {
-            let mut out = Vec::with_capacity(items.len().min(MAX_ENTITIES_PER_REQUEST + 1));
+            let mut out: Vec<serde_json::Value> =
+                Vec::with_capacity(items.len().min(MAX_ENTITIES_PER_REQUEST + 1));
+            // The list is keyed by `identifier`: repeating one identifier is a
+            // SUCCESS path on which only the LAST entity given for it is processed
+            // (`smithy_query(query="shape", shape="EntitiesDefinition")`, member
+            // `entityList`). So the list is collapsed onto its identifiers here,
+            // each identifier keeping the entity the request named for it last —
+            // which is also what makes it a Cedar entity store, where one uid
+            // carries one entity.
+            let mut at: HashMap<(&str, &str), usize> = HashMap::new();
             for item in items.iter().take(MAX_ENTITIES_PER_REQUEST + 1) {
-                out.push(entity_item_to_cedar_json(item)?);
+                let entity = entity_item_to_cedar_json(item)?;
+                let identifier = (
+                    item.identifier.entity_type.as_str(),
+                    item.identifier.entity_id.as_str(),
+                );
+                match at.get(&identifier) {
+                    Some(&seen) => out[seen] = entity,
+                    None => {
+                        at.insert(identifier, out.len());
+                        out.push(entity);
+                    }
+                }
             }
             if items.len() > MAX_ENTITIES_PER_REQUEST {
                 return Err(too_many(items.len()));
