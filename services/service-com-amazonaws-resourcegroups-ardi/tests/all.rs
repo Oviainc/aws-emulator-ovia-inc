@@ -53,6 +53,8 @@ mod region_isolation;
 mod region_scoped_pagination_tokens;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
+#[path = "all/resource_arns_rule.rs"]
+mod resource_arns_rule;
 #[path = "all/resource_group_lifecycle.rs"]
 mod resource_group_lifecycle;
 #[path = "all/state_roundtrip.rs"]

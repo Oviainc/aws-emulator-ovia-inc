@@ -179,35 +179,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // `ResourceArns` is modelled `length 1..10` and the framework refuses a longer
-        // list before this handler runs. Checking it again here is what BOUNDS the work
-        // below: every scan over the request is at most this many entries.
-        if input.resource_arns.len() > MAX_RESOURCE_ARNS {
-            return Err(GroupResourcesErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "ResourceArns carries {} entries, which is more than the {} this \
-                     operation accepts",
-                    input.resource_arns.len(),
-                    MAX_RESOURCE_ARNS,
-                )),
+        // The `ResourceArns` rules this service decides in one place, so this call
+        // and the ungrouping one bound the same list the same way and refuse the
+        // same entries with the same sentence. Passing it is what BOUNDS the work
+        // below: every scan over the request is at most
+        // `crate::state::MAX_RESOURCE_ARNS` entries. Judged before the group is
+        // resolved and before anything is written, so a refused list records no
+        // membership.
+        crate::state::check_resource_arns(&input.resource_arns).map_err(|message| {
+            GroupResourcesErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
             })
-            .into());
-        }
-        // Every member must be an ARN: the modelled `ResourceArn` is
-        // `arn:<partition>:<service>:<region>:<account>:<resource>`, and a string
-        // that is not one names no resource to add.
-        if let Some(not_an_arn) = input
-            .resource_arns
-            .iter()
-            .find(|arn| !crate::state::is_resource_arn(arn))
-        {
-            return Err(GroupResourcesErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "ResourceArns contains {not_an_arn}, which is not a resource ARN"
-                )),
-            })
-            .into());
-        }
+        })?;
 
         let mut store = state.lock();
         let not_found = || {
@@ -243,9 +226,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // counting it twice would refuse a request that stays under the ceiling.
         //
         // The work this does while holding the store lock is bounded by the two
-        // constants and nothing else: at most `MAX_RESOURCE_ARNS` request entries, each
-        // looked up by BINARY SEARCH over the group's memberships, which `add_member`
-        // keeps sorted by ARN.
+        // constants and nothing else: at most `crate::state::MAX_RESOURCE_ARNS`
+        // request entries, each looked up by BINARY SEARCH over the group's
+        // memberships, which `add_member` keeps sorted by ARN.
         let added: std::collections::BTreeSet<&str> = input
             .resource_arns
             .iter()
@@ -274,7 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reported from the memberships the group now holds, not from the request:
         // an ARN appears in `Succeeded` because it IS a member. Looked up by binary
         // search over the sorted memberships, so this too is bounded by
-        // `MAX_RESOURCE_ARNS` lookups.
+        // `crate::state::MAX_RESOURCE_ARNS` lookups.
         let succeeded: Vec<String> = input
             .resource_arns
             .iter()
@@ -313,9 +296,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The most `ResourceArns` entries one request carries: the maximum the modelled
-/// `ResourceArnList` declares (`length 1..10`). It is what bounds the per-request
-/// work this handler does while holding the store lock.
-const MAX_RESOURCE_ARNS: usize = 10;
 

@@ -1912,6 +1912,45 @@ pub fn is_resource_arn(arn: &str) -> bool {
     parse_arn(arn).is_some()
 }
 
+/// The most `ResourceArns` entries one request carries: the maximum the modelled
+/// `ResourceArnList` declares (`length 1..10`). It is what bounds the per-request
+/// work a static-membership handler does while holding the store lock.
+pub const MAX_RESOURCE_ARNS: usize = 10;
+
+/// `Ok(())` when `resource_arns` is a `ResourceArns` list this service acts on,
+/// else the message the refusal reports.
+///
+/// The ONE place this service decides whether a static-membership request names
+/// resources it can act on, so the call that records memberships and the one that
+/// drops them bound the same list to [`MAX_RESOURCE_ARNS`] entries and refuse the
+/// same entry with the same sentence, and the bound and those sentences cannot
+/// drift apart between them:
+///
+/// * the list carries at most [`MAX_RESOURCE_ARNS`] entries, which is what BOUNDS
+///   the work a handler does per request: every scan it makes over the request is
+///   at most this many entries;
+/// * every entry is shaped like the modelled `ResourceArn` ([`is_resource_arn`]) —
+///   a string that is not one names no resource to act on.
+///
+/// The framework refuses a list outside the modelled length before a handler runs;
+/// checking the maximum again here is what makes the bound the handler's own.
+pub fn check_resource_arns(resource_arns: &[String]) -> Result<(), String> {
+    if resource_arns.len() > MAX_RESOURCE_ARNS {
+        return Err(format!(
+            "ResourceArns carries {} entries, which is more than the {} this \
+             operation accepts",
+            resource_arns.len(),
+            MAX_RESOURCE_ARNS,
+        ));
+    }
+    if let Some(not_an_arn) = resource_arns.iter().find(|arn| !is_resource_arn(arn)) {
+        return Err(format!(
+            "ResourceArns contains {not_an_arn}, which is not a resource ARN"
+        ));
+    }
+    Ok(())
+}
+
 /// The service and resource portions of `arn`, or `None` when the string is not
 /// an ARN.
 ///
