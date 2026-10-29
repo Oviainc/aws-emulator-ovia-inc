@@ -171,12 +171,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `nextToken` this listing did not issue names no position, so it is refused
         // rather than read as "start from the beginning" — including a token from this
-        // service's other listings, which name a position among records these pages do
-        // not hold.
+        // service's other listings, and one this listing issued in ANOTHER region, each
+        // of which names a position among records these pages do not hold.
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                crate::state::decode_composition_page_token(token).ok_or_else(|| {
+                crate::state::decode_composition_page_token(&region, token).ok_or_else(|| {
                     crate::state::validation_failed(
                         ListCompositionsErrorModeled::ValidationException,
                         // The one rule this service words a foreign page token with,
@@ -234,8 +234,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         // A token only when a composition is left over, and it names the position this
         // page ended at: the last page carries none.
-        let next_token = (matching.len() > page_size)
-            .then(|| crate::state::encode_composition_page_token(matching[page_size - 1].sequence));
+        let next_token = (matching.len() > page_size).then(|| {
+            crate::state::encode_composition_page_token(&region, matching[page_size - 1].sequence)
+        });
 
         Ok(ListCompositionsOutput {
             compositions,

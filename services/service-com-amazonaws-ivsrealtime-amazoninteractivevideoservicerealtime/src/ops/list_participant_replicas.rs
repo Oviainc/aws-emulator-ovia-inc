@@ -162,19 +162,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `nextToken` this listing did not issue names no position, so it is refused
         // rather than read as "start from the beginning" — a token from `ListStages`
-        // included; see `crate::state::decode_replica_page_token`.
+        // included, and one this listing issued for ANOTHER source stage or participant:
+        // a position is an ordinal among one participant's replicas, so the token is read
+        // only for the scope this request itself names; see
+        // `crate::state::decode_replica_page_token`.
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
-            Some(token) => {
-                Some(crate::state::decode_replica_page_token(token).ok_or_else(|| {
+            Some(token) => Some(
+                crate::state::decode_replica_page_token(
+                    &region,
+                    &input.source_stage_arn,
+                    &input.participant_id,
+                    token,
+                )
+                .ok_or_else(|| {
                     crate::state::validation_failed(
                         ListParticipantReplicasErrorModeled::ValidationException,
                         // The one rule this service words a foreign page token with,
                         // shared with its other listings.
                         crate::state::foreign_page_token_message(Self::NAME),
                     )
-                })?)
-            }
+                })?,
+            ),
         };
         let page_size = input
             .max_results
@@ -210,8 +219,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         // A token only when a replica is left over, and it names the position this page
         // ended at: the last page carries none.
-        let next_token = (remaining.len() > page_size)
-            .then(|| crate::state::encode_replica_page_token(remaining[page_size - 1].sequence));
+        let next_token = (remaining.len() > page_size).then(|| {
+            crate::state::encode_replica_page_token(
+                &region,
+                &input.source_stage_arn,
+                &input.participant_id,
+                remaining[page_size - 1].sequence,
+            )
+        });
 
         Ok(ListParticipantReplicasOutput {
             replicas,

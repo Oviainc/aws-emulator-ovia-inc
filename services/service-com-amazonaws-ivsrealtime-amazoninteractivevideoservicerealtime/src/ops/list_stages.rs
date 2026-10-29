@@ -157,17 +157,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // A `nextToken` this service did not issue names no position, so it is
-        // refused rather than read as "start from the beginning".
+        // refused rather than read as "start from the beginning" — including one this
+        // listing issued in ANOTHER region, whose position is an ordinal among that
+        // region's stages and not among these.
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
-            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
-                crate::state::validation_failed(
-                    ListStagesErrorModeled::ValidationException,
-                    // The one rule this service words a foreign page token with, shared
-                    // with its other listings.
-                    crate::state::foreign_page_token_message(Self::NAME),
-                )
-            })?),
+            Some(token) => Some(
+                crate::state::decode_page_token(&region, token).ok_or_else(|| {
+                    crate::state::validation_failed(
+                        ListStagesErrorModeled::ValidationException,
+                        // The one rule this service words a foreign page token with, shared
+                        // with its other listings.
+                        crate::state::foreign_page_token_message(Self::NAME),
+                    )
+                })?,
+            ),
         };
         let page_size = input
             .max_results
@@ -193,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A token only when a stage is left over, and it names the position this page
         // ended at: the last page carries none.
         let next_token = (remaining.len() > page_size)
-            .then(|| crate::state::encode_page_token(remaining[page_size - 1].sequence));
+            .then(|| crate::state::encode_page_token(&region, remaining[page_size - 1].sequence));
 
         Ok(ListStagesOutput { stages, next_token })
     }

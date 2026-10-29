@@ -188,12 +188,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `nextToken` this operation did not issue names no position, so it is
         // refused rather than read as "start from the beginning" — including a token
-        // from this service's other listings, which name a position among records these
-        // pages do not hold.
+        // from this service's other listings, and one this operation issued for ANOTHER
+        // participant or session: a position is an ordinal among the events of one
+        // participant of one session, so the token is read only for the scope this
+        // request itself names.
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                crate::state::decode_participant_event_page_token(token).ok_or_else(|| {
+                crate::state::decode_participant_event_page_token(
+                    &region,
+                    &input.stage_arn,
+                    &input.session_id,
+                    &input.participant_id,
+                    token,
+                )
+                .ok_or_else(|| {
                     crate::state::validation_failed(
                         ListParticipantEventsErrorModeled::ValidationException,
                         // The one rule this service words a foreign page token with,
@@ -239,7 +248,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = page
             .last()
             .filter(|_| matching.len() > page_size)
-            .map(|record| crate::state::encode_participant_event_page_token(record.sequence));
+            .map(|record| {
+                crate::state::encode_participant_event_page_token(
+                    &region,
+                    &input.stage_arn,
+                    &input.session_id,
+                    &input.participant_id,
+                    record.sequence,
+                )
+            });
 
         Ok(ListParticipantEventsOutput { events, next_token })
     }
