@@ -219,15 +219,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested_secret_arn = input.secret_identifier.as_deref().map(|secret_identifier| {
             crate::state::secret_resources::resolve_secret_arn(&region, secret_identifier)
         });
-        // One instant for everything this call changes, so the connector record and the
-        // environment that holds it are stamped with the same `modifiedAt`.
-        let modified_at_ms = crate::state::now_ms();
-
         let mut state = state.lock();
         // Reporting only: this materialises the state changes the clock already owed,
         // which were due whether or not anybody called, so the connector is in the
         // state that is due at this instant before the update is applied.
         state.materialise_due_transitions();
+        // One instant for everything this call changes, so the connector record and the
+        // environment that holds it are stamped with the same `modifiedAt`. Read with the
+        // store lock HELD and after the materialisation above: the update is applied at
+        // this instant, not at the one the request arrived at, so the stamp cannot predate
+        // a change the same call just materialised onto the connector.
+        let modified_at_ms = crate::state::now_ms();
 
         // Regional resource: an environment exists at the endpoint of the Region it was
         // created in, so its connectors can only be updated from that Region. An

@@ -332,6 +332,28 @@ pub fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
+/// Date one stored record's `modifiedAt` at a change applied at `at_ms`, taking the
+/// LATER of that instant and the instant the record already carries.
+///
+/// The guard the environment and the VLANs it holds are both re-stamped through, because
+/// those records share ONE lifecycle transition and so one stamp: a
+/// [`PendingTransition`] moves the environment and every VLAN of it together and dates
+/// them both at the instant it came due ([`PendingTransition::due_at_ms`]). A change to a
+/// VLAN is a change to the environment that holds it, so the pair is re-stamped by one
+/// call; dating either of them at an instant EARLIER than that transition would report
+/// the record as last modified before the state change the same response reports, and
+/// would let the VLAN's stamp fall behind the environment's for the very change both
+/// carry.
+///
+/// A host, a connector and an entitlement each ride a transition of their OWN and are
+/// dated from the instant their change is applied, read with the store lock held and
+/// after the materialisation ([`ComAmazonawsEvsAmazonelasticvmwareserviceState::materialise_due_transitions`]),
+/// which is never earlier than a stamp that materialisation wrote: a transition is
+/// materialised only once its due instant has passed.
+pub fn note_modified_at(modified_at_ms: &mut i64, at_ms: i64) {
+    *modified_at_ms = (*modified_at_ms).max(at_ms);
+}
+
 /// A stored millisecond timestamp as the modelled `Timestamp` type.
 pub fn timestamp(ms: i64) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_millis(ms)
@@ -1623,9 +1645,10 @@ impl StoredEnvironment {
     /// The stamp never goes backwards: a change is dated at the later of the instant it
     /// happened and the instant the record already carried, so a transition the clock
     /// owed at a future instant ([`Self::materialise_due_transition`]) is not undone by a
-    /// child change evaluated before it comes due.
+    /// child change evaluated before it comes due. That is [`note_modified_at`], the
+    /// guard every record of this service is re-stamped through.
     pub fn note_child_change(&mut self, at_ms: i64) {
-        self.modified_at_ms = self.modified_at_ms.max(at_ms);
+        note_modified_at(&mut self.modified_at_ms, at_ms);
     }
 
     /// Drop the oldest host records this environment is FINISHED with, until it holds no

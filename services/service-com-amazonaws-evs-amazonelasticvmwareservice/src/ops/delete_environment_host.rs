@@ -214,15 +214,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(denied);
         }
-        // One instant for everything this call changes, so the host record and the
-        // environment that holds it are stamped with the same `modifiedAt`.
-        let modified_at_ms = crate::state::now_ms();
-
         let mut state = state.lock();
         // Reporting only: this materialises the state changes the clock already owed,
         // which were due whether or not anybody called, so the environment and its hosts
         // are in the state that is due at this instant before the delete is evaluated.
         state.materialise_due_transitions();
+        // One instant for everything this call changes, so the host record and the
+        // environment that holds it are stamped with the same `modifiedAt`. Read with the
+        // store lock HELD and after the materialisation above: the delete is applied at
+        // this instant, not at the one the request arrived at, so the stamp cannot predate
+        // a transition the same call just materialised onto the host.
+        let modified_at_ms = crate::state::now_ms();
 
         // Regional resource: an environment exists at the endpoint of the Region it was
         // created in, so its hosts can only be deleted from that Region. An environment

@@ -90,6 +90,8 @@ mod list_while_initializing;
 mod page_size_bound;
 #[path = "all/public_vlan_netmask.rs"]
 mod public_vlan_netmask;
+#[path = "all/record_stamp_monotonicity.rs"]
+mod record_stamp_monotonicity;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/route_server_peer_references.rs"]

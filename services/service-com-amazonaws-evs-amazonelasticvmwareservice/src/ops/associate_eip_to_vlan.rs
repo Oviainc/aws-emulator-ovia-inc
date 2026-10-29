@@ -223,13 +223,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(denied);
         }
-        let modified_at_ms = crate::state::now_ms();
-
         let mut state = state.lock();
         // Reporting only: this materialises the state changes the clock already owed,
         // which were due whether or not anybody called, so the VLAN is in the state that
         // is due at this instant before the association is evaluated.
         state.materialise_due_transitions();
+        // One instant for everything this call changes, read with the store lock HELD and
+        // after the materialisation above: the association is applied at this instant, not
+        // at the one the request arrived at, so the stamp cannot predate a transition the
+        // same call just materialised onto the record it is about to change.
+        let modified_at_ms = crate::state::now_ms();
 
         // Regional resource: an environment exists at the endpoint of the Region it was
         // created in. One that has reached DELETED is gone as far as this operation is
@@ -440,7 +443,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|vlan| {
                         if let Some(association) = association.clone() {
                             vlan.eip_associations.push(association);
-                            vlan.modified_at_ms = modified_at_ms;
+                            // The VLAN's own stamp goes through the same guard the
+                            // environment's does below, so neither can move backwards past
+                            // a transition the clock had already made due.
+                            crate::state::note_modified_at(
+                                &mut vlan.modified_at_ms,
+                                modified_at_ms,
+                            );
                         }
                         vlan.to_wire()
                     });
