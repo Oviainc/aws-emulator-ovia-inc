@@ -360,14 +360,23 @@ async fn every_sampling_call_captures_a_turn_and_serves_what_it_recorded() {
     }
 }
 
-/// RULE: a trajectory is keyed by the `(JobArn, TrajectoryId)` PAIR, so the same
-/// trajectory id under a different job is a different trajectory.
+/// RULE: a trajectory is keyed by the JOB the call resolves to and its
+/// `TrajectoryId`, so the same trajectory id under a DIFFERENT job — another job
+/// name, or another job category — is a different trajectory. (A different
+/// partition, Region or account is not a different job: that half of the rule is
+/// pinned in `job_identity_keys_the_trajectory.rs`.)
 #[tokio::test]
 async fn the_trajectory_key_is_the_job_and_trajectory_pair() {
     let (engine, router) = mounted_service();
     let first = job_arn("aws", "us-east-1", "123456789012", "AgentRFT", "run-a");
     let second = job_arn("aws", "us-east-1", "123456789012", "AgentRFT", "run-b");
-    let third = job_arn("aws", "eu-west-1", "123456789012", "AgentRFT", "run-a");
+    let third = job_arn(
+        "aws",
+        "eu-west-1",
+        "123456789012",
+        "AgentRFTEvaluation",
+        "run-a",
+    );
     let rows = [(&first, 2usize), (&second, 1), (&third, 3)];
 
     for (arn, _turns) in rows {
@@ -917,26 +926,41 @@ async fn an_unresolvable_or_unsealed_trajectory_is_answered_before_the_reward_co
 // Refusals
 // ---------------------------------------------------------------------------
 
-/// RULE: a `CompleteRollout` or `UpdateReward` naming a `(JobArn,
-/// TrajectoryId)` pair this emulator holds no trajectory for is not found.
+/// RULE: a `CompleteRollout` or `UpdateReward` naming a pair — the job its
+/// `JobArn` resolves to and its `TrajectoryId` — this emulator holds no
+/// trajectory for is not found.
 #[tokio::test]
 async fn an_unknown_trajectory_is_not_found() {
     let known = job_arn("aws", "us-east-1", "123456789012", "AgentRFT", "run-1");
     let other_job = job_arn("aws", "us-east-1", "123456789012", "AgentRFT", "run-2");
-    let other_region = job_arn("aws", "eu-central-1", "123456789012", "AgentRFT", "run-1");
+    let other_category = job_arn(
+        "aws",
+        "eu-central-1",
+        "123456789012",
+        "AgentRFTEvaluation",
+        "run-1",
+    );
 
     // Rows: the pair that is looked up, against a store holding exactly
-    // (known, "traj-1").
+    // (known, "traj-1"). The job each row addresses EXISTS (it is created below), so a
+    // row is refused because the pair names no trajectory and not because the job is
+    // unresolvable — including the last row, whose job name matches the sampled one but
+    // whose category names another job however it is addressed.
     let rows: [(&str, &String, &str); 4] = [
         ("never-sampled trajectory id", &known, "never-sampled"),
         ("trajectory id that differs by case", &known, "TRAJ-1"),
         ("known trajectory id, other job run", &other_job, "traj-1"),
-        ("known trajectory id, other region", &other_region, "traj-1"),
+        (
+            "known trajectory id, other job category in another region",
+            &other_category,
+            "traj-1",
+        ),
     ];
 
     for (case, arn, trajectory_id) in rows {
         let (engine, router) = mounted_service();
         create_job(&engine, &known);
+        create_job(&engine, arn);
         assert_eq!(
             sample(&router, &known, "traj-1", &chat_payload("go"), false)
                 .await
@@ -1140,7 +1164,7 @@ async fn the_turn_bound_is_reported_as_a_service_quota() {
                 .collect();
             guard
                 .trajectories
-                .insert((arn.clone(), "traj-full".to_string()), trajectory);
+                .insert(state::trajectory_key(&arn, "traj-full"), trajectory);
         }
 
         let reply = sample(&router, &arn, "traj-full", &chat_payload("one more"), streamed).await;

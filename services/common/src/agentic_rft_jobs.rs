@@ -41,6 +41,21 @@ pub const MAX_REGISTERED_JOBS: usize = 10_000;
 /// job runtime's (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:job/[a-zA-Z0-9_\-]+/…`).
 const JOB_RESOURCE_TYPE: &str = "job";
 
+/// The identity of the job the ARN `job_arn` names: the `<category>/<name>` resource path
+/// a record is keyed by ([`JobRecord::key`]), or `None` when the value is not a well-formed
+/// ARN naming a `job` resource.
+///
+/// The ONE reading of WHICH job an ARN addresses, so nothing that holds per-job state can
+/// disagree with this directory about when two ARNs name one job: the partition, the Region
+/// and the account an ARN was addressed through identify no job here (an emulator serves one
+/// account in one Region), so they are not part of the identity, and a data plane that keys
+/// its own per-job records by the job a call names derives that key from here rather than
+/// from the ARN string the request happened to carry.
+#[must_use]
+pub fn job_identity_of_arn(job_arn: &str) -> Option<&str> {
+    crate::arn::resource_id_of_type(job_arn, JOB_RESOURCE_TYPE)
+}
+
 /// One job the control plane created, as the directory records it.
 #[derive(Debug, Clone)]
 pub struct JobRecord {
@@ -107,15 +122,14 @@ impl JobDirectory {
     /// was ever created.
     ///
     /// Only a well-formed ARN naming a `job` resolves (read through
-    /// [`crate::arn::resource_id_of_type`], this crate's ONE parse of a caller-supplied
-    /// resource ARN), so a value carrying slashes for some other reason cannot be
-    /// mistaken for an ARN's tail. Two ARNs that differ only in partition, Region or
-    /// account collapse onto one record, which is correct for an emulator serving a
-    /// single account and Region.
+    /// [`job_identity_of_arn`], over [`crate::arn::resource_id_of_type`], this crate's ONE
+    /// parse of a caller-supplied resource ARN), so a value carrying slashes for some other
+    /// reason cannot be mistaken for an ARN's tail. Two ARNs that differ only in partition,
+    /// Region or account collapse onto one record, which is correct for an emulator serving
+    /// a single account and Region.
     #[must_use]
     pub fn get_by_arn(&self, job_arn: &str) -> Option<&JobRecord> {
-        self.jobs
-            .get(crate::arn::resource_id_of_type(job_arn, JOB_RESOURCE_TYPE)?)
+        self.jobs.get(job_identity_of_arn(job_arn)?)
     }
 
     /// The job `category` / `name` names, as the control plane addresses one.

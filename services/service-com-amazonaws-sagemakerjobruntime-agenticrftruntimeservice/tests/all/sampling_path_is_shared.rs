@@ -319,7 +319,7 @@ async fn apply_setup(
                 })
                 .collect();
             guard.trajectories.insert(
-                (case.job_arn.clone(), case.trajectory_id.clone()),
+                state::trajectory_key(&case.job_arn, &case.trajectory_id),
                 trajectory,
             );
         }

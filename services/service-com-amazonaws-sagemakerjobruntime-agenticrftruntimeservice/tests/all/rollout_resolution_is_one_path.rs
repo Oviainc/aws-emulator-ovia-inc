@@ -487,8 +487,9 @@ struct Pair {
 }
 
 /// RULE: the trajectory the shared resolution hands an operation is the one stored under the
-/// EXACT pair the call carries, so a seal by `CompleteRollout` and a reward by
-/// `UpdateReward` land on that pair and leave every other pair of the store as it was.
+/// pair the call carries — the JOB its `JobArn` resolves to and its trajectory id — so a
+/// seal by `CompleteRollout` and a reward by `UpdateReward` land on that pair and leave
+/// every other pair of the store as it was.
 #[tokio::test]
 async fn the_shared_resolution_keys_each_rollout_call_on_its_own_pair() {
     // Rows differ along what else the store holds — the same id under another job, another

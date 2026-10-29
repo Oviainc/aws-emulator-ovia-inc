@@ -19,6 +19,9 @@ mod enum_refusal_echo_is_bounded;
 #[path = "all/job_arn_is_the_callers_job.rs"]
 mod job_arn_is_the_callers_job;
 
+#[path = "all/job_identity_keys_the_trajectory.rs"]
+mod job_identity_keys_the_trajectory;
+
 #[path = "all/job_resolution.rs"]
 mod job_resolution;
 

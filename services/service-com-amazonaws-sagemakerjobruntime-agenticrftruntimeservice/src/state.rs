@@ -3,9 +3,9 @@
 //! Engine state for the com-amazonaws-sagemakerjobruntime-agenticrftruntimeservice service.
 //!
 //! The service's primary resource is a **trajectory**: the ordered turns of one
-//! rollout inside a SageMaker job, keyed by the pair `(JobArn, TrajectoryId)`
-//! that every operation of this service carries. The lifecycle the model
-//! documents is linear:
+//! rollout inside a SageMaker job, keyed by the JOB the `JobArn` of a call
+//! resolves to and the `TrajectoryId` it carries ([`trajectory_key`]). The
+//! lifecycle the model documents is linear:
 //!
 //! * `Sample` / `SampleWithResponseStream` create the trajectory on its first
 //!   turn and append a turn on every later call — "Each turn (prompt and
@@ -180,8 +180,10 @@ pub struct Turn {
 /// One rollout's trajectory: its turns, its lifecycle status and its rewards.
 #[derive(Debug, Clone)]
 pub struct Trajectory {
-    /// The job the rollout belongs to.
-    pub job_arn: String,
+    /// The job the rollout belongs to, as the shared job directory identifies one: the
+    /// `<category>/<name>` resource path of its ARN, which is also the job half of the
+    /// key this trajectory is held under ([`trajectory_key`]).
+    pub job: String,
     /// The trajectory id that groups the turns.
     pub trajectory_id: String,
     /// Where the trajectory is in the lifecycle.
@@ -206,9 +208,10 @@ impl Trajectory {
     /// A fresh, empty, in-progress trajectory for `job_arn` / `trajectory_id`.
     #[must_use]
     pub fn new(job_arn: &str, trajectory_id: &str, now: SystemTime) -> Self {
+        let (job, trajectory_id) = trajectory_key(job_arn, trajectory_id);
         Self {
-            job_arn: job_arn.to_string(),
-            trajectory_id: trajectory_id.to_string(),
+            job,
+            trajectory_id,
             status: TrajectoryStatus::InProgress,
             turns: Vec::new(),
             completion_status: None,
@@ -221,8 +224,34 @@ impl Trajectory {
     }
 }
 
-/// The key a trajectory is stored under: the job it belongs to and its id.
+/// The key a trajectory is stored under: the JOB it belongs to — as the shared directory
+/// identifies one, NOT the ARN string a request spelled it with — and its id.
 pub type TrajectoryKey = (String, String);
+
+/// The key the trajectory of `job_arn` / `trajectory_id` is held under.
+///
+/// A trajectory belongs to the JOB a call resolves to, and this crate resolves a `JobArn`
+/// against the shared directory, which identifies a job by the `<category>/<name>` resource
+/// path of its ARN alone ([`::service_common::agentic_rft_jobs::job_identity_of_arn`]): the
+/// partition, the Region and the account an ARN was addressed through identify no job, so
+/// they cannot distinguish one job's trajectories either. Keying by the identity rather than
+/// by the request's own string is what keeps the turns of one rollout in ONE trajectory
+/// however its calls address the job, keeps the seal `CompleteRollout` writes in the way of
+/// a later turn, and keeps the rollout-lifecycle pair resolving against the trajectory the
+/// sampling calls built.
+///
+/// A value naming no job resource has no identity to key by and is held under itself; every
+/// operation refuses such a call before it reaches the store, because no job can resolve for
+/// it ([`job_exists`]).
+#[must_use]
+pub fn trajectory_key(job_arn: &str, trajectory_id: &str) -> TrajectoryKey {
+    (
+        ::service_common::agentic_rft_jobs::job_identity_of_arn(job_arn)
+            .unwrap_or(job_arn)
+            .to_string(),
+        trajectory_id.to_string(),
+    )
+}
 
 /// How this service reports a `(JobArn, TrajectoryId)` pair it holds no trajectory for.
 ///
@@ -262,22 +291,23 @@ impl Default for ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
 }
 
 impl ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
-    /// The trajectory `job_arn` / `trajectory_id` names, if this emulator has
-    /// one.
+    /// The trajectory the JOB `job_arn` resolves to holds under `trajectory_id`, if
+    /// this emulator has one.
     #[must_use]
     pub fn trajectory(&self, job_arn: &str, trajectory_id: &str) -> Option<&Trajectory> {
         self.trajectories
-            .get(&(job_arn.to_string(), trajectory_id.to_string()))
+            .get(&trajectory_key(job_arn, trajectory_id))
     }
 
-    /// The trajectory `job_arn` / `trajectory_id` names, for writing.
+    /// The trajectory the JOB `job_arn` resolves to holds under `trajectory_id`, for
+    /// writing.
     pub fn trajectory_mut(
         &mut self,
         job_arn: &str,
         trajectory_id: &str,
     ) -> Option<&mut Trajectory> {
         self.trajectories
-            .get_mut(&(job_arn.to_string(), trajectory_id.to_string()))
+            .get_mut(&trajectory_key(job_arn, trajectory_id))
     }
 
     /// How many bytes of payload every captured turn of this store retains.
@@ -312,12 +342,9 @@ impl ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
         // The job a call names is the job its caller is running under, created in the
         // SageMaker control plane and resolved by the handler against the shared job
         // directory before it gets here (`crate::state::job_exists`): the trajectory is
-        // keyed by the `(JobArn, TrajectoryId)` pair the request carries, and created on
-        // that pair's first turn.
-        let key = (
-            request.job_arn.to_string(),
-            request.trajectory_id.to_string(),
-        );
+        // keyed by the JOB that resolution identifies and the request's trajectory id
+        // (`trajectory_key`), and created on that pair's first turn.
+        let key = trajectory_key(request.job_arn, request.trajectory_id);
         if !self.trajectories.contains_key(&key) && self.trajectories.len() >= MAX_TRAJECTORIES {
             return Err(AppendRefusal::TrajectoryQuota);
         }
@@ -808,13 +835,16 @@ pub fn count_text_tokens(text: &str) -> u64 {
 
 /// The opaque, stable id of one turn's completion.
 ///
-/// Derived from the trajectory's identity and the turn's position, so the same
-/// turn always reports the same id and two different turns do not collide. It
-/// is not a random value: nothing about it changes between reads.
+/// Derived from the trajectory's identity — the JOB the call resolves to and the
+/// trajectory id, the pair the turn is stored under ([`trajectory_key`]) — and the
+/// turn's position, so the same turn always reports the same id however its call
+/// addressed the job, and two different turns do not collide. It is not a random
+/// value: nothing about it changes between reads.
 #[must_use]
 pub fn completion_id(job_arn: &str, trajectory_id: &str, index: usize) -> String {
+    let (job, trajectory_id) = trajectory_key(job_arn, trajectory_id);
     let mut hasher = sha2::Sha256::new();
-    hasher.update(job_arn.as_bytes());
+    hasher.update(job.as_bytes());
     hasher.update([0u8]);
     hasher.update(trajectory_id.as_bytes());
     hasher.update([0u8]);
