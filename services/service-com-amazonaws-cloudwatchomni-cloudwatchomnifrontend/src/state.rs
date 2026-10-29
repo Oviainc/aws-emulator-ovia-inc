@@ -15,7 +15,10 @@
 
 use std::collections::HashMap;
 
-use crate::ops::types::{Domain, EncryptionConfiguration, IdentityProviderConfiguration, Space, SpaceSummary};
+use crate::ops::types::{
+    AccessProfile, Domain, EncryptionConfiguration, IdentityProviderConfiguration, Space,
+    SpaceSummary,
+};
 
 /// The region a resource is recorded in when the request carries no SigV4
 /// credential scope to read one from (an unsigned, in-process call).
@@ -34,6 +37,20 @@ pub const DOMAIN_STATUS_ACTIVE: &str = "ACTIVE";
 /// `SpaceStatus` declares ACTIVE, SUSPENDED and MOVING — none of them a transient
 /// "creating" state, so a created space is recorded ready.
 pub const SPACE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `AssumeStatus`'s value for a principal that MAY assume an access profile — its
+/// model doc: "The calling principal is authorized to assume the access profile."
+pub const ASSUME_STATUS_ALLOWED: &str = "ALLOWED";
+
+/// `AssumeStatus`'s value for a principal that may NOT — its model doc: "The calling
+/// principal is not authorized to assume the access profile."
+pub const ASSUME_STATUS_DENIED: &str = "DENIED";
+
+/// `AccessProfileType`'s value for a profile a customer created, which is what every
+/// profile created through this API is: the model doc for the value reads "Created and
+/// owned by a customer", against SERVICE_MANAGED's "Provisioned and owned by the
+/// service. Cannot be deleted by customers."
+pub const ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED";
 
 /// `EncryptionStrategy`'s value for a resource encrypted with an AWS owned key.
 pub const ENCRYPTION_STRATEGY_AWS_OWNED: &str = "AWS_OWNED";
@@ -76,6 +93,18 @@ pub const DOMAIN_QUOTA: usize = 1_000;
 /// [`domain_has_spaces`]: ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::domain_has_spaces
 pub const SPACE_QUOTA: usize = 10_000;
 
+/// How many access profiles the store holds before `CreateAccessProfile` refuses with
+/// the modelled `ServiceQuotaExceededException`.
+///
+/// The emulator's OWN bound, for the same reason as [`DOMAIN_QUOTA`]. It bounds
+/// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::access_profiles`] and, with
+/// it, `create_access_profile_tokens` (one entry per live profile) — and therefore the
+/// per-request work [`access_profile_named`] does under the store lock, which is linear
+/// in the number of stored profiles.
+///
+/// [`access_profile_named`]: ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::access_profile_named
+pub const ACCESS_PROFILE_QUOTA: usize = 10_000;
+
 /// A domain as persisted, with the bookkeeping the wire shape does not carry.
 #[derive(Debug, Clone)]
 pub struct StoredDomain {
@@ -102,11 +131,30 @@ pub struct StoredSpace {
     pub tags: HashMap<String, String>,
 }
 
+/// An access profile as persisted. The wire `AccessProfile` shape carries the parent
+/// space's id, so the record needs no separate parent field.
+#[derive(Debug, Clone)]
+pub struct StoredAccessProfile {
+    /// Creation order, so `ListAccessProfiles`-style enumeration is stable.
+    pub seq: u64,
+    /// The profile as persisted. `assumeStatus` is left unset here: it reports the
+    /// CALLING principal's authorization rather than a property of the profile, so it
+    /// is computed when the profile is reported ([`access_profile_view`]).
+    pub profile: AccessProfile,
+    /// The ids of the trust grants recorded against this profile — the grants that
+    /// authorize a principal to assume it. A create records none, which is why a
+    /// profile reports `assumeStatus` DENIED until a grant names it.
+    pub assume_grant_ids: Vec<String>,
+    /// The request's `tags`; no modelled operation reads them back yet.
+    pub tags: HashMap<String, String>,
+}
+
 /// Per-service state for com-amazonaws-cloudwatchomni-cloudwatchomnifrontend. A handler reaches it through [`service_state`].
 ///
 /// Every map here is BOUNDED: `domains` (and the two maps keyed one-to-one to a live
 /// domain) by [`DOMAIN_QUOTA`], `spaces` (and the token map keyed to a live space) by
-/// [`SPACE_QUOTA`]. `CreateDomain`/`CreateSpace` refuse with the modelled
+/// [`SPACE_QUOTA`], `access_profiles` (and the token map keyed to a live profile) by
+/// [`ACCESS_PROFILE_QUOTA`]. The creates refuse with the modelled
 /// `ServiceQuotaExceededException` once the bound is reached, and the deletes release
 /// records and their tokens together, so nothing in the store grows without end.
 #[derive(Debug, Default)]
@@ -121,7 +169,11 @@ pub struct ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
     pub create_domain_tokens: HashMap<String, String>,
     /// `CreateSpace` `clientToken` -> the `spaceId` that token created.
     pub create_space_tokens: HashMap<String, String>,
-    /// Hands out [`StoredDomain::seq`] / [`StoredSpace::seq`].
+    /// Every persisted access profile, keyed by its `profileId`.
+    pub access_profiles: HashMap<String, StoredAccessProfile>,
+    /// `CreateAccessProfile` `clientToken` -> the `profileId` that token created.
+    pub create_access_profile_tokens: HashMap<String, String>,
+    /// Hands out [`StoredDomain::seq`] / [`StoredSpace::seq`] / [`StoredAccessProfile::seq`].
     next_seq: u64,
 }
 
@@ -146,6 +198,15 @@ impl ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
             .collect();
         selected.sort_by_key(|stored| stored.seq);
         selected
+    }
+
+    /// The access profile `space_id` holds under `name`, if the store holds one.
+    ///
+    /// Linear in the number of stored profiles, which [`ACCESS_PROFILE_QUOTA`] bounds.
+    pub fn access_profile_named(&self, space_id: &str, name: &str) -> Option<&StoredAccessProfile> {
+        self.access_profiles
+            .values()
+            .find(|stored| stored.profile.space_id == space_id && stored.profile.name == name)
     }
 
     /// Whether any stored space still belongs to `domain_id`.
@@ -237,6 +298,17 @@ pub fn mint_space_id() -> String {
     fresh_uuid()
 }
 
+/// A fresh `profileId`.
+///
+/// `ProfileId` states no format of its own ("assigned when the profile is created")
+/// beyond `@length(1..64)` and `^[a-zA-Z0-9_-]+$`; every other id this backend mints
+/// and does not document a prefix for is a v4 UUID (`SpaceId`, `GrantId`,
+/// `DashboardId`), and a canonical UUID is 36 characters drawn from that character
+/// class, so that is what this mints.
+pub fn mint_profile_id() -> String {
+    fresh_uuid()
+}
+
 /// The ARN of a domain, in this service's ARN namespace.
 pub fn domain_arn(region: &str, domain_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("domain/{domain_id}"))
@@ -245,6 +317,19 @@ pub fn domain_arn(region: &str, domain_id: &str) -> String {
 /// The ARN of a space, in this service's ARN namespace.
 pub fn space_arn(region: &str, space_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("space/{space_id}"))
+}
+
+/// The ARN of an access profile, in this service's ARN namespace.
+///
+/// An access profile lives IN a space (`AccessProfile.spaceId`: "The ID of the space
+/// the profile belongs to"), so its ARN is the parent space's resource path with the
+/// profile appended — the ARN of a child resource names its parent.
+pub fn access_profile_arn(region: &str, space_id: &str, profile_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("space/{space_id}/access-profile/{profile_id}"),
+    )
 }
 
 /// A domain's HTTPS endpoint URL, built from its id, its region and this service's
@@ -330,6 +415,25 @@ pub fn space_summary(space: &Space) -> SpaceSummary {
     }
 }
 
+/// Project a stored access profile into the `AccessProfile` an operation returns.
+///
+/// Every member but `assumeStatus` is the persisted record verbatim. `assumeStatus`
+/// reports "the calling principal's authorization to assume this access profile", and
+/// that authorization comes from a trust grant recorded against the profile — so it is
+/// read from the grants the store holds for it: a profile no grant names cannot be
+/// assumed, and reports DENIED.
+pub fn access_profile_view(stored: &StoredAccessProfile) -> AccessProfile {
+    let assume_status = if stored.assume_grant_ids.is_empty() {
+        ASSUME_STATUS_DENIED
+    } else {
+        ASSUME_STATUS_ALLOWED
+    };
+    AccessProfile {
+        assume_status: Some(assume_status.to_string()),
+        ..stored.profile.clone()
+    }
+}
+
 /// The prefix a space-list page token carries, so a token minted for one collection
 /// cannot be replayed against another.
 const SPACE_PAGE_TOKEN_PREFIX: &str = "spaces:";
@@ -360,6 +464,52 @@ mod tests {
             "base36(u128::MAX) is {} chars, over DomainId's 25-char budget",
             base36(u128::MAX).len()
         );
+    }
+
+    #[test]
+    fn a_profile_reports_assume_status_from_the_grants_recorded_against_it() {
+        // Rows: no trust grant, one, and several. The status is read from the grant
+        // list, so it is DENIED exactly when the list is empty.
+        let at = now();
+        let profile = AccessProfile {
+            profile_id: "profile".to_string(),
+            space_id: "space".to_string(),
+            arn: "arn:aws:cloudwatch:us-east-1:000000000000:space/space/access-profile/profile"
+                .to_string(),
+            name: "a profile".to_string(),
+            description: None,
+            created_at: at,
+            updated_at: at,
+            assume_status: None,
+            profile_type: Some(ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED.to_string()),
+        };
+        for (grants, expected) in [
+            (vec![], ASSUME_STATUS_DENIED),
+            (vec!["grant-a".to_string()], ASSUME_STATUS_ALLOWED),
+            (
+                vec!["grant-a".to_string(), "grant-b".to_string()],
+                ASSUME_STATUS_ALLOWED,
+            ),
+        ] {
+            let stored = StoredAccessProfile {
+                seq: 1,
+                profile: profile.clone(),
+                assume_grant_ids: grants.clone(),
+                tags: HashMap::new(),
+            };
+            let view = access_profile_view(&stored);
+            assert_eq!(
+                view.assume_status.as_deref(),
+                Some(expected),
+                "case {grants:?}: expected assumeStatus {expected}, got {:?}",
+                view.assume_status
+            );
+            assert_eq!(
+                view.profile_id, stored.profile.profile_id,
+                "case {grants:?}: the projection must not change profileId, got {:?}",
+                view.profile_id
+            );
+        }
     }
 
     #[test]
