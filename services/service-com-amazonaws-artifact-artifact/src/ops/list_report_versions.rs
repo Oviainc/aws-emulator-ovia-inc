@@ -184,12 +184,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::page_size(input.max_results);
 
         let store = state.lock();
-        let Some(report) = store.reports.get(&input.report_id) else {
-            // Authorization of the targeted report precedes the catalog lookup as far as
-            // a caller can tell: an id the catalog does not publish names no report this
-            // account may read, so the front door's refusal is what it sees.
-            return Err(crate::scaffolded::Scaffolded::unauthorized());
-        };
+        // Stage one of the service's one report-resolution rule, decided in
+        // `crate::state`: this operation reports a report's VERSIONS, so it resolves no
+        // single version and the catalog refusal is the only one it can get.
+        let report = store
+            .catalog_report(&input.report_id)
+            .map_err(crate::scaffolded::Scaffolded::FrontDoor)?;
 
         // The service's one page-walk rule: resume at the cursor's POSITION in this
         // operation's own ascending order — so a page is still served when the version the

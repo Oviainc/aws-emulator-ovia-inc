@@ -171,22 +171,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
-        let Some(report) = store.reports.get(&input.report_id) else {
-            // Authorization of the targeted report precedes the catalog lookup as far as
-            // a caller can tell: an id the catalog does not publish names no report this
-            // account may read, so the front door's refusal is what it sees.
-            return Err(crate::scaffolded::Scaffolded::unauthorized());
-        };
-        let Some(version) = report.resolve(input.report_version) else {
-            // The report itself IS reachable, so this is a plain not-found on one of its
-            // versions. Total in both shapes: the request either named a version this
-            // report never published, or named none and the report publishes none at
-            // all. Nothing a request carries may abort the handler, so neither arm
-            // unwraps.
-            let missing =
-                crate::state::report_version_not_found(&input.report_id, input.report_version);
-            return Err(GetReportMetadataErrorModeled::ResourceNotFoundException(missing).into());
-        };
+        // Which of the two refusals a request that resolves no report version gets is the
+        // service's one rule, decided in `crate::state`; this handler only lifts it into
+        // its own modelled not-found variant.
+        let (report, version) = store
+            .report_version(&input.report_id, input.report_version)
+            .map_err(|refusal| {
+                refusal.lift(GetReportMetadataErrorModeled::ResourceNotFoundException)
+            })?;
 
         Ok(GetReportMetadataOutput {
             report_details: Some(report.to_detail(version, &region)),

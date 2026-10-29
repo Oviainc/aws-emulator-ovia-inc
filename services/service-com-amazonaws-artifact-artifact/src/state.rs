@@ -1661,6 +1661,52 @@ impl ComAmazonawsArtifactArtifactState {
         }
     }
 
+    /// The report `report_id` names, when the account's catalog publishes it.
+    ///
+    /// The FIRST stage of the one rule every report-reading operation of this service
+    /// resolves its target by: the catalog IS the account's entitlement, so an id it does
+    /// not hold names no report this account may read and the answer is the front door's
+    /// authorization refusal rather than a modelled not-found — this service never
+    /// confirms whether a report the caller cannot reach exists.
+    ///
+    /// Decided here so the operations that need only this stage and the ones that go on to
+    /// resolve a VERSION ([`Self::report_version`]) cannot disagree about the same
+    /// `reportId`. The refusal is handed back for the caller to lift into its own error
+    /// channel, exactly as [`resume_position`] hands back its own.
+    pub fn catalog_report(
+        &self,
+        report_id: &str,
+    ) -> Result<&Report, crate::scaffolded::FrontDoorRefusal> {
+        self.reports
+            .get(report_id)
+            .ok_or_else(crate::scaffolded::FrontDoorRefusal::unauthorized)
+    }
+
+    /// The report and the one version of it a request targets: the version `requested`
+    /// names, or the newest published one when it names none.
+    ///
+    /// BOTH stages of the rule, in the order a caller can tell them apart by: an id the
+    /// catalog does not hold is the front door's refusal ([`Self::catalog_report`]), while
+    /// a report that IS reachable and never published the version asked for — or, when the
+    /// request named no version, never published any at all — is the modelled not-found
+    /// ([`report_version_not_found`]). Which refusal applies is decided once, here; the
+    /// variant the modelled one travels in is the only part that differs per operation,
+    /// so it is left to [`ReportRefusal::lift`].
+    pub fn report_version(
+        &self,
+        report_id: &str,
+        requested: Option<i64>,
+    ) -> Result<(&Report, &ReportVersion), ReportRefusal> {
+        let report = self
+            .catalog_report(report_id)
+            .map_err(ReportRefusal::FrontDoor)?;
+        // TOTAL in both shapes, so nothing a request carries may abort the handler.
+        let version = report.resolve(requested).ok_or_else(|| {
+            ReportRefusal::VersionNotFound(report_version_not_found(report_id, requested))
+        })?;
+        Ok((report, version))
+    }
+
     /// The taggable resource `arn` names, for a WRITE to its tag set, or `None` when this
     /// account holds no such resource. The read-only counterpart, and which ARNs name a
     /// resource at all, is [`tagged_resource`](Self::tagged_resource).
@@ -2328,6 +2374,40 @@ pub fn report_version_not_found(report_id: &str, version: Option<i64>) -> Resour
         message,
         resource_id: report_id.to_string(),
         resource_type: REPORT_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// Which of the two refusals a request naming a report version is answered with — the
+/// outcome [`ComAmazonawsArtifactArtifactState::report_version`] hands back when it
+/// resolves nothing.
+///
+/// The refusal travels as data so each operation can lift it into its OWN error channel,
+/// the idiom [`resume_position`] already uses: which modelled variant the not-found is
+/// reported in is the only part of this decision that differs between the report-reading
+/// operations.
+#[derive(Debug, Clone)]
+pub enum ReportRefusal {
+    /// The account's catalog holds no such report, so the front door's authorization
+    /// refusal is what the caller sees.
+    FrontDoor(crate::scaffolded::FrontDoorRefusal),
+    /// The report is reachable and never published the version asked for.
+    VersionNotFound(ResourceNotFoundException),
+}
+
+impl ReportRefusal {
+    /// This refusal in one operation's error channel: `version_not_found` names that
+    /// operation's own modelled `ResourceNotFoundException` variant, and the front door's
+    /// refusal travels in the channel's own variant because its shape is not modelled.
+    pub fn lift<Modeled>(
+        self,
+        version_not_found: impl FnOnce(ResourceNotFoundException) -> Modeled,
+    ) -> crate::scaffolded::Scaffolded<Modeled> {
+        match self {
+            Self::FrontDoor(refusal) => crate::scaffolded::Scaffolded::FrontDoor(refusal),
+            Self::VersionNotFound(missing) => {
+                crate::scaffolded::Scaffolded::Modeled(version_not_found(missing))
+            }
+        }
     }
 }
 

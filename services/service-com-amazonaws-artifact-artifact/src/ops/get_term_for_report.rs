@@ -185,19 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // Resolve the report version the grant will cover BEFORE minting anything, so a
-        // request naming no report leaves no grant behind.
-        let Some(report) = store.reports.get(&input.report_id) else {
-            // Authorization of the targeted report precedes the catalog lookup as far as
-            // a caller can tell: an id the catalog does not publish names no report this
-            // account may read, so the front door's refusal is what it sees.
-            return Err(crate::scaffolded::Scaffolded::unauthorized());
-        };
-        let Some(version) = report.resolve(input.report_version) else {
-            // The report is reachable; this version of it does not exist.
-            let missing =
-                crate::state::report_version_not_found(&input.report_id, input.report_version);
-            return Err(GetTermForReportErrorModeled::ResourceNotFoundException(missing).into());
-        };
+        // request naming no report leaves no grant behind. Which of the two refusals a
+        // request that resolves no report version gets is the service's one rule, decided
+        // in `crate::state`; this handler only lifts it into its own modelled not-found
+        // variant.
+        let (report, version) = store
+            .report_version(&input.report_id, input.report_version)
+            .map_err(|refusal| {
+                refusal.lift(GetTermForReportErrorModeled::ResourceNotFoundException)
+            })?;
         let resolved_version = version.version;
         let report = report.clone();
 
