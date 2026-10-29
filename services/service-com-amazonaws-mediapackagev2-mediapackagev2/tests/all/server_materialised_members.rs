@@ -18,8 +18,9 @@
 use serde_json::{json, Value};
 
 // The crate's one emulator client, declared in the channel-lifecycle suite `pub(crate)`
-// for exactly this reuse: every suite in this test target drives the emulator through it.
-use crate::channel_lifecycle::Emulator;
+// for exactly this reuse: every suite in this test target drives the emulator through it,
+// and reads an absent-or-present member through the harness's `at`.
+use crate::channel_lifecycle::{at, Emulator};
 
 /// A channel group and a channel to hang an endpoint off, named for the case index.
 async fn parent_chain(emulator: &Emulator, index: usize) -> (String, String) {
@@ -36,13 +37,6 @@ async fn parent_chain(emulator: &Emulator, index: usize) -> (String, String) {
         "CreateChannel for {channel} answered {status} {body}"
     );
     (group, channel)
-}
-
-/// The value at a JSON pointer, or `Value::Null` when the member is absent — the shape
-/// of the defect this suite covers is an ABSENT member, so a missing one must compare
-/// unequal to the concrete value the service reports.
-fn at(body: &Value, pointer: &str) -> Value {
-    body.pointer(pointer).cloned().unwrap_or(Value::Null)
 }
 
 /// One row of a projection table: a create body plus the `(pointer, value)` pairs every
@@ -501,18 +495,6 @@ async fn an_origin_endpoint_reports_the_settings_the_service_applied() {
     }
 }
 
-/// `GET /channelGroup/{group}/channel` — the `ListChannels` binding from the model's
-/// `http` trait, for the list projection of a channel's materialised members.
-async fn list_channels(emulator: &Emulator, group: &str) -> (u16, Value) {
-    emulator
-        .call(
-            "GET",
-            &format!("/channelGroup/{group}/channel?maxResults=100"),
-            None,
-        )
-        .await
-}
-
 /// RULE — a channel member the model documents a service-applied default for is
 /// materialised ONCE, at create time, from the submitted value or that default, and
 /// stored: every projection of the channel (the create response, a later read, an
@@ -575,7 +557,7 @@ async fn a_channel_reports_the_documented_defaults_the_service_applied() {
             "case {label:?}: UpdateChannel expected 200, got {status} {updated}"
         );
 
-        let (status, listed) = list_channels(&emulator, &group).await;
+        let (status, listed) = emulator.list_channels(&group, "?maxResults=100").await;
         assert_eq!(
             status, 200,
             "case {label:?}: ListChannels expected 200, got {status} {listed}"

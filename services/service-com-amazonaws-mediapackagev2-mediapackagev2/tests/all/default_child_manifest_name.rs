@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 // The crate's one emulator client, declared in the channel-lifecycle suite `pub(crate)`
 // for exactly this reuse.
-use crate::channel_lifecycle::Emulator;
+use crate::channel_lifecycle::{at, Emulator};
 
 /// The child manifest name the service applies when a manifest configuration names none.
 ///
@@ -37,12 +37,6 @@ const DEFAULT_CHILD_MANIFEST_NAME: &str = "index_1";
 /// (`smithy_query(query="shape", shape="CreateHlsManifestConfiguration")`).
 const MIN_NAME_LENGTH: usize = 1;
 const MAX_NAME_LENGTH: usize = 256;
-
-/// The value at a JSON pointer, or `Value::Null` when the member is absent: an absent
-/// member is exactly the defect under test, so it must compare unequal to a name.
-fn at(body: &Value, pointer: &str) -> Value {
-    body.pointer(pointer).cloned().unwrap_or(Value::Null)
-}
 
 /// One row: a packaging configuration to create (and then to re-submit as an update), plus
 /// the `(pointer, value)` pairs every projection of the endpoint must report.

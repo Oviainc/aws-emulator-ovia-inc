@@ -21,16 +21,10 @@ use serde_json::{json, Value};
 
 use crate::channel_lifecycle::Emulator;
 
-/// `GET /channelGroup/{group}/channel` — the `ListChannels` binding, with a page size
-/// large enough to hold every channel these tests create.
+/// `GET /channelGroup/{group}/channel` — the `ListChannels` binding through the shared
+/// harness, with a page size large enough to hold every channel these tests create.
 async fn list_channels(emulator: &Emulator, group: &str) -> Value {
-    let (status, body) = emulator
-        .call(
-            "GET",
-            &format!("/channelGroup/{group}/channel?maxResults=100"),
-            None,
-        )
-        .await;
+    let (status, body) = emulator.list_channels(group, "?maxResults=100").await;
     assert_eq!(status, 200, "ListChannels expected 200, got {status} {body}");
     body
 }

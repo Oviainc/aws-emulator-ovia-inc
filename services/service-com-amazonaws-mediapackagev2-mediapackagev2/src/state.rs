@@ -1041,10 +1041,12 @@ pub struct Channel {
     pub input_type: String,
     pub ingest_endpoints: Vec<IngestEndpoint>,
     /// Materialised at create time rather than only when the caller sends one: the
-    /// service reports a channel's switching state on every projection of it.
+    /// service reports a channel's switching state on every projection of it — see
+    /// [`materialized_input_switch_configuration`].
     pub input_switch_configuration: InputSwitchConfiguration,
     /// Materialised at create time, for the same reason as
-    /// [`Channel::input_switch_configuration`].
+    /// [`Channel::input_switch_configuration`]: see
+    /// [`materialized_output_header_configuration`].
     pub output_header_configuration: OutputHeaderConfiguration,
     pub multiview_configuration: Option<MultiviewConfiguration>,
     /// Materialised at create time on a channel whose input type may carry the member,
@@ -1440,8 +1442,11 @@ pub fn harvest_job_in_progress_at(
 /// MediaPackage materialises the block on the server side, so a channel created without
 /// one still has a switching state to report: the submitted block if there is one, with
 /// `MQCSInputSwitching` filled in from the model's documented default ("Default is
-/// false") when the caller left it out. `PreferredInput` has no documented default and
-/// the service reports none, so an omitted one stays omitted.
+/// false") when the caller left it out. The recorded service reports the member on a
+/// channel of ANY input type, not only on one that may carry a SUBMITTED one, which is
+/// what tells this member apart from [`materialized_output_locking_mode`].
+/// `PreferredInput` has no documented default and the service reports none, so an omitted
+/// one stays omitted.
 pub fn materialized_input_switch_configuration(
     submitted: Option<InputSwitchConfiguration>,
 ) -> InputSwitchConfiguration {
@@ -1452,7 +1457,9 @@ pub fn materialized_input_switch_configuration(
 
 /// The output-header configuration a channel is stored with — the same materialisation
 /// as [`materialized_input_switch_configuration`], one member wide: CMSD header
-/// publication is off unless the caller turned it on.
+/// publication is off unless the caller turned it on. The off state is the one the
+/// recorded service reports for a channel created without the block, on a channel of any
+/// input type.
 pub fn materialized_output_header_configuration(
     submitted: Option<OutputHeaderConfiguration>,
 ) -> OutputHeaderConfiguration {
@@ -1477,23 +1484,15 @@ pub fn materialized_input_type(submitted: Option<String>) -> String {
 /// The model documents a service-applied default for the member ("If you don't specify a
 /// value, the default is `EPOCH_LOCKED`") AND restricts which input types may carry it at
 /// all, so the default is materialised only on a channel whose input type may carry it; a
-/// channel that may not has no mode and reports none. The restriction is read off the
-/// same table a SUBMITTED mode is refused by ([`channel_input_type_violation`]), so a
-/// stored mode and a refused one can never disagree about which input types carry the
-/// member.
+/// channel that may not has no mode and reports none — which is what the recorded service
+/// reports for such a channel. The restriction is read off the same table a SUBMITTED
+/// mode is refused by ([`channel_carries_member`]), so a stored mode and a refused one can
+/// never disagree about which input types carry the member.
 pub fn materialized_output_locking_mode(
     submitted: Option<String>,
     input_type: &str,
 ) -> Option<String> {
-    if channel_input_type_violation(
-        SubmittedChannelMembers {
-            output_locking_mode: true,
-            ..SubmittedChannelMembers::default()
-        },
-        input_type,
-    )
-    .is_some()
-    {
+    if !channel_carries_member(|members| members.output_locking_mode = true, input_type) {
         return None;
     }
     Some(submitted.unwrap_or_else(|| DEFAULT_OUTPUT_LOCKING_MODE.to_string()))
@@ -3134,6 +3133,21 @@ pub fn channel_input_type_violation(
                 rule.exception_type,
             )
         })
+}
+
+/// Whether a channel of this input type may carry a restricted member at all.
+///
+/// `member` marks the ONE member it is asked about on an otherwise empty
+/// [`SubmittedChannelMembers`], so the answer comes off the same table a SUBMITTED member
+/// is refused by ([`channel_input_type_violation`]). A materialisation that WITHHOLDS a
+/// member from a channel whose input type may not carry it decides through here —
+/// [`materialized_output_locking_mode`] does, for the one channel member the model
+/// documents with both a default and that restriction — so a stored member and a refused
+/// one can never disagree about which input types carry it.
+pub fn channel_carries_member(member: fn(&mut SubmittedChannelMembers), input_type: &str) -> bool {
+    let mut submitted = SubmittedChannelMembers::default();
+    member(&mut submitted);
+    channel_input_type_violation(submitted, input_type).is_none()
 }
 
 /// The member an input type REQUIRES that the request does not carry, as the modeled

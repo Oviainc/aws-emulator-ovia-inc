@@ -116,3 +116,7 @@ mod endpoint_member_input_type_restriction;
 mod harvest_job_scheduled_window;
 #[path = "all/request_refusal_precedence.rs"]
 mod request_refusal_precedence;
+#[path = "all/restricted_channel_members.rs"]
+mod restricted_channel_members;
+#[path = "all/channel_members_by_input_type.rs"]
+mod channel_members_by_input_type;

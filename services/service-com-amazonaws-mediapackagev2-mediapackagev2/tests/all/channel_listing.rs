@@ -18,14 +18,6 @@ use serde_json::{json, Value};
 
 use crate::channel_lifecycle::{error_type, Emulator};
 
-/// `GET /channelGroup/{group}/channel{query}` — the `ListChannels` binding from the
-/// model's `http` trait.
-async fn list_channels(emulator: &Emulator, group: &str, query: &str) -> (u16, Value) {
-    emulator
-        .call("GET", &format!("/channelGroup/{group}/channel{query}"), None)
-        .await
-}
-
 /// Walk every page of `ListChannels` for one group, returning the channel names in the
 /// order they were reported. Asserts the per-page invariants as it goes: no page is
 /// longer than the effective page size, no item belongs to another group, and a token is
@@ -55,7 +47,7 @@ async fn drain_pages(
             format!("?{}", query.join("&"))
         };
 
-        let (status, body) = list_channels(emulator, group, &query).await;
+        let (status, body) = emulator.list_channels(group, &query).await;
         assert_eq!(
             status, 200,
             "case {label:?}: ListChannels expected 200, got {status} {body}"
@@ -234,7 +226,7 @@ async fn a_listed_channel_carries_the_values_the_create_persisted() {
         );
     }
 
-    let (status, listed) = list_channels(&emulator, "grp", "?maxResults=100").await;
+    let (status, listed) = emulator.list_channels("grp", "?maxResults=100").await;
     assert_eq!(status, 200, "ListChannels expected 200, got {status} {listed}");
     let items = listed["Items"].as_array().cloned().unwrap_or_default();
 
@@ -288,7 +280,7 @@ async fn the_list_reflects_every_create_and_delete() {
         );
     }
 
-    let (_, before) = list_channels(&emulator, "grp", "?maxResults=100").await;
+    let (_, before) = emulator.list_channels("grp", "?maxResults=100").await;
     let created_beta = before["Items"]
         .as_array()
         .and_then(|items| {
@@ -314,7 +306,7 @@ async fn the_list_reflects_every_create_and_delete() {
             .0,
         200
     );
-    let (_, after) = list_channels(&emulator, "grp", "?maxResults=100").await;
+    let (_, after) = emulator.list_channels("grp", "?maxResults=100").await;
     let recreated_beta = after["Items"]
         .as_array()
         .and_then(|items| {
@@ -383,7 +375,7 @@ async fn a_source_channel_reports_the_multiview_channels_that_attach_it() {
         );
     }
 
-    let (status, body) = list_channels(&emulator, "grp", "?maxResults=100").await;
+    let (status, body) = emulator.list_channels("grp", "?maxResults=100").await;
     assert_eq!(status, 200, "ListChannels expected 200, got {status} {body}");
     let items = body["Items"].as_array().cloned().unwrap_or_default();
 
@@ -419,7 +411,7 @@ async fn listing_a_group_that_does_not_resolve_is_not_found() {
     );
 
     for group in ["absent", "gone", "Another_Group-9"] {
-        let (status, body) = list_channels(&emulator, group, "").await;
+        let (status, body) = emulator.list_channels(group, "").await;
         assert_eq!(
             status, 404,
             "case {group:?}: expected 404, got {status} {body}"
@@ -444,7 +436,7 @@ async fn a_pagination_token_the_service_did_not_issue_is_refused() {
     );
 
     for token in ["zzz", "not-a-token", "0"] {
-        let (status, body) = list_channels(&emulator, "grp", &format!("?nextToken={token}")).await;
+        let (status, body) = emulator.list_channels("grp", &format!("?nextToken={token}")).await;
         assert_eq!(
             status, 400,
             "case {token:?}: expected 400, got {status} {body}"
@@ -578,14 +570,14 @@ async fn max_results_is_accepted_on_its_bounds_and_refused_past_them() {
     }
 
     for limit in [1, 100] {
-        let (status, body) = list_channels(&emulator, "grp", &format!("?maxResults={limit}")).await;
+        let (status, body) = emulator.list_channels("grp", &format!("?maxResults={limit}")).await;
         assert_eq!(
             status, 200,
             "case maxResults={limit}: expected 200, got {status} {body}"
         );
     }
     for limit in [0, 101] {
-        let (status, body) = list_channels(&emulator, "grp", &format!("?maxResults={limit}")).await;
+        let (status, body) = emulator.list_channels("grp", &format!("?maxResults={limit}")).await;
         assert_eq!(
             status, 400,
             "case maxResults={limit}: expected 400, got {status} {body}"

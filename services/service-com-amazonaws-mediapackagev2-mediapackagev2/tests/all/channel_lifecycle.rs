@@ -268,11 +268,33 @@ impl Emulator {
         .await
     }
 
+    /// `ListChannels` — `GET /channelGroup/{group}/channel`, with `query` carrying
+    /// `maxResults` / `nextToken` when the case needs them. The channel list projection
+    /// (`ChannelListConfiguration`) is a different shape from `GetChannelResponse`, so a
+    /// suite that checks what the list reports sends through here (see
+    /// `tests/all/channel_members_by_input_type.rs`).
+    pub(crate) async fn list_channels(&self, group: &str, query: &str) -> (u16, Value) {
+        self.call("GET", &format!("/channelGroup/{group}/channel{query}"), None)
+            .await
+    }
+
     /// `ListChannelGroups` — `GET /channelGroup`, with `query` carrying `maxResults` /
     /// `nextToken` when the case needs them.
     pub(crate) async fn list_groups(&self, query: &str) -> (u16, Value) {
         self.call("GET", &format!("/channelGroup{query}"), None).await
     }
+}
+
+/// The value at a JSON pointer in a response body, or `Value::Null` when the member is
+/// absent.
+///
+/// `pub(crate)` on the shared harness because an ABSENT member is half of what several
+/// suites assert, and a missing one has to compare unequal to a reported value in all of
+/// them (see `tests/all/channel_members_by_input_type.rs`,
+/// `tests/all/server_materialised_members.rs` and
+/// `tests/all/default_child_manifest_name.rs`).
+pub(crate) fn at(body: &Value, pointer: &str) -> Value {
+    body.pointer(pointer).cloned().unwrap_or(Value::Null)
 }
 
 /// The `__type` discriminator of an error envelope.
