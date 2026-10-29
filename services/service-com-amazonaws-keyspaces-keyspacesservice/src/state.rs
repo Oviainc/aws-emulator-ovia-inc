@@ -2846,14 +2846,19 @@ pub fn auto_scaling_resource_id(keyspace_name: &str, table_name: &str) -> String
     format!("keyspace/{keyspace_name}/table/{table_name}")
 }
 
-/// The identity of one capacity's scalable target: the `cassandra` namespace, the table's
-/// resource id and that capacity's dimension.
+/// The identity of one capacity's scalable target: the Region the table lives in, the
+/// `cassandra` namespace, the table's resource id and that capacity's dimension.
+///
+/// A scalable target is a regional resource, so the table's Region is part of the identity
+/// its settings are written under and read back from.
 fn scalable_target_key(
+    region: &str,
     keyspace_name: &str,
     table_name: &str,
     capacity: TableCapacity,
 ) -> application_auto_scaling::state::TargetKey {
     application_auto_scaling::state::TargetKey {
+        region: region.to_string(),
         service_namespace: AUTO_SCALING_NAMESPACE.to_string(),
         resource_id: auto_scaling_resource_id(keyspace_name, table_name),
         scalable_dimension: capacity.scalable_dimension().to_string(),
@@ -2950,8 +2955,7 @@ pub fn publish_auto_scaling<Eng: Send + Sync + 'static>(
         let wanted = managed_target(keyspace_name, table_name, capacity, settings);
         application_auto_scaling::state::apply_managed_target(
             engine,
-            region,
-            &scalable_target_key(keyspace_name, table_name, capacity),
+            &scalable_target_key(region, keyspace_name, table_name, capacity),
             wanted.as_ref(),
         );
     }
@@ -2970,8 +2974,7 @@ pub fn retire_auto_scaling<Eng: Send + Sync + 'static>(
     for capacity in TableCapacity::ALL {
         application_auto_scaling::state::apply_managed_target(
             engine,
-            region,
-            &scalable_target_key(keyspace_name, table_name, capacity),
+            &scalable_target_key(region, keyspace_name, table_name, capacity),
             None,
         );
     }
@@ -2996,6 +2999,7 @@ pub fn retire_auto_scaling<Eng: Send + Sync + 'static>(
 /// Call it with NO store lock held.
 pub fn reported_auto_scaling<Eng: Send + Sync + 'static>(
     engine: &Eng,
+    region: &str,
     keyspace_name: &str,
     table_name: &str,
     stored: Option<&AutoScalingSpecification>,
@@ -3007,7 +3011,7 @@ pub fn reported_auto_scaling<Eng: Send + Sync + 'static>(
     let mut reported = AutoScalingSpecification::default();
     let mut configured = false;
     for capacity in TableCapacity::ALL {
-        let key = scalable_target_key(keyspace_name, table_name, capacity);
+        let key = scalable_target_key(region, keyspace_name, table_name, capacity);
         let policy_name = managed_policy_name(keyspace_name, table_name);
         let settings = match application_auto_scaling::state::managed_target_settings(
             &store,

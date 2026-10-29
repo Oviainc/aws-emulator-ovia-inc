@@ -194,6 +194,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(validation)?;
 
         let key = TargetKey {
+            // The target this endpoint can deregister is the one registered in the Region
+            // the request was sent to; another Region's target is one it cannot see.
+            region: crate::state::request_region(ctx.parts()),
             service_namespace: input.service_namespace.clone(),
             resource_id: input.resource_id.clone(),
             scalable_dimension: input.scalable_dimension.clone(),

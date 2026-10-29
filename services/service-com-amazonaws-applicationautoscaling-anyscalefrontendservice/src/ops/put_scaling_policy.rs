@@ -256,8 +256,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             check_enum("policyType", policy_type, POLICY_TYPE_VALUES).map_err(validation)?;
         }
 
+        // The policy belongs to the scalable target of the REGION this request was sent
+        // to, which is the only Region whose targets this endpoint can see.
+        let region = crate::state::request_region(ctx.parts());
         let key = PolicyKey {
             target: TargetKey {
+                region: region.clone(),
                 service_namespace: input.service_namespace.clone(),
                 resource_id: input.resource_id.clone(),
                 scalable_dimension: input.scalable_dimension.clone(),
@@ -269,14 +273,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // computed from. Read from the service that owns the resource BEFORE this
         // service's store is locked, so no request holds two stores at once; a resource
         // that cannot be resolved falls back to the target's own floor.
-        let region = crate::state::request_region(ctx.parts());
-        let resolved_capacity = crate::state::resolve_target_resource(
-            &*self.engine,
-            &region,
-            &key.target,
-        )
-        .ok()
-        .flatten();
+        let resolved_capacity = crate::state::resolve_target_resource(&*self.engine, &key.target)
+            .ok()
+            .flatten();
 
         let mut state = state.lock();
 
@@ -417,7 +416,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 }
                 (
-                    scaling_policy_arn(&region, &key),
+                    scaling_policy_arn(&key),
                     ::std::time::SystemTime::now(),
                 )
             }
@@ -448,7 +447,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in CloudWatch and records it on the policy. Planned under this service's lock,
         // applied with it RELEASED, then recorded under it again — so the CloudWatch write
         // never happens inside this service's critical section.
-        let plan = crate::state::plan_target_alarms(&state, &region, &key.target, resolved_capacity);
+        let plan = crate::state::plan_target_alarms(&state, &key.target, resolved_capacity);
         drop(state);
         let minted = crate::state::apply_target_alarms(&*self.engine, &plan);
         let (alarms, orphaned) = {

@@ -216,12 +216,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(validation)?;
         let page_size = page_size(input.max_results).map_err(validation)?;
 
+        // Only this Region's scheduled actions: an action is scoped to the Region it was
+        // created in, which is the endpoint the request was sent to.
+        let region = crate::state::request_region(ctx.parts());
+
         // The token carries the full identity of the last action the previous page
         // emitted — its target plus its name — so this page resumes at the next key.
         let resume_after = match input.next_token.as_deref() {
             None => None,
             Some(token) => {
-                let Some(fields) = decode_next_token(token, 4) else {
+                let Some(fields) = decode_next_token(token, &region, 4) else {
                     return Err(
                         DescribeScheduledActionsErrorModeled::InvalidNextTokenException(
                             InvalidNextTokenException {
@@ -233,6 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 };
                 Some(ScheduledActionKey {
                     target: TargetKey {
+                        region: region.clone(),
                         service_namespace: fields[0].clone(),
                         resource_id: fields[1].clone(),
                         scalable_dimension: fields[2].clone(),
@@ -253,6 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let matching: Vec<ScheduledAction> = state
             .scheduled_actions
             .iter()
+            .filter(|(key, _)| key.target.region == region)
             .filter(|(key, _)| key.target.service_namespace == input.service_namespace)
             .filter(|(key, _)| {
                 input
@@ -277,19 +283,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         let (scheduled_actions, next_token) = take_page(matching, page_size, |action| {
-            encode_next_token(&[
-                &action.service_namespace,
-                &action.resource_id,
-                action.scalable_dimension.as_deref().unwrap_or_default(),
-                &action.scheduled_action_name,
-            ])
+            encode_next_token(
+                &region,
+                &[
+                    &action.service_namespace,
+                    &action.resource_id,
+                    action.scalable_dimension.as_deref().unwrap_or_default(),
+                    &action.scheduled_action_name,
+                ],
+            )
         });
         drop(state);
 
         // A movement an occurrence just made is one the scaled resource is owed, and a policy
         // whose alarm is in ALARM was owed its execution from the instant that alarm
         // transitioned: both are settled here, with this service's lock released.
-        let region = crate::state::request_region(ctx.parts());
         crate::state::policy_execution::settle_policy_executions(&*self.engine, &region);
         crate::state::policy_execution::drive_scaling_clock(&self.engine, &region);
 

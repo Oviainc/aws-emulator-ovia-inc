@@ -236,6 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // asked for.
         let auto_scaling_specification = crate::state::reported_auto_scaling(
             &*self.engine,
+            &region,
             &table.keyspace_name,
             &table.table_name,
             table.auto_scaling_specification.as_ref(),

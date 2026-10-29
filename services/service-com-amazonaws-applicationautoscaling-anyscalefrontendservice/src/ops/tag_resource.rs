@@ -148,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
             check_tag_count, check_tag_key, check_tag_keys_unreserved, check_tag_value,
@@ -196,8 +196,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // target is a 400 `ValidationException` carrying `Access Denied`: a WRITE to a
         // target the caller holds none of is answered as a permission failure, not as a
         // report that the resource is absent (which is what the READ answers, see
-        // `list_tags_for_resource`).
-        let resolved = state.arn_index.get(&input.resource_arn).cloned();
+        // `list_tags_for_resource`). A scalable target is regional, so an ARN of another
+        // Region identifies no target this endpoint holds either.
+        let region = crate::state::request_region(ctx.parts());
+        let resolved = state
+            .arn_index
+            .get(&input.resource_arn)
+            .filter(|key| key.region == region)
+            .cloned();
         let Some(record) = resolved.and_then(|key| state.targets.get_mut(&key)) else {
             return Err(validation(ACCESS_DENIED));
         };

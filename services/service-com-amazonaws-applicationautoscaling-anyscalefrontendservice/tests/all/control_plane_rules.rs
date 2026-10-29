@@ -110,14 +110,22 @@ async fn policy_names(emulator: &Emulator, target: &Value, case: &str) -> Vec<St
 
 #[tokio::test]
 async fn a_predefined_metric_is_accepted_only_on_a_dimension_it_is_published_for() {
+    use service_com_amazonaws_applicationautoscaling_anyscalefrontendservice::state::predefined_metric_target_range;
+
     for row in METRIC_CATALOG {
         let case = format!("{} on {}", row.metric_type, row.dimension);
         // One emulator per row, so a refused row is judged against an empty policy set.
         let emulator = Emulator::empty();
         let target = emulator.given_target(row.dimension, 1, 20).await;
-        // A target value every row's metric accepts: inside the published window of the
-        // provisioned-throughput metrics, and a plain count for the rest.
-        let request = tracking_policy(&target, "tracker", row.metric_type, 50.0);
+        // A target value every row's metric accepts: inside the window the metric's own
+        // service publishes, in the unit that metric is measured in, and a plain count for
+        // a metric that publishes no window. This row is about the metric/dimension
+        // pairing, so the value must never be what decides it.
+        let target_value = match predefined_metric_target_range(row.metric_type) {
+            Some((low, high)) => (low + high) / 2.0,
+            None => 50.0,
+        };
+        let request = tracking_policy(&target, "tracker", row.metric_type, target_value);
         let (status, body) = emulator.call("PutScalingPolicy", request).await;
 
         if row.accepted {
@@ -172,8 +180,11 @@ struct TargetValueRow {
 ///
 /// Both services whose scalable dimension IS a provisioned read/write throughput publish the
 /// same window for a target utilisation, and recorded behaviour of each is that it runs from
-/// 10 to 90 percent INCLUSIVE — so each bound is tested, and one step past it. A metric that
-/// is a COUNT publishes no window, and a large count is accepted.
+/// 10 to 90 percent INCLUSIVE — so each bound is tested, and one step past it. A Lambda
+/// provisioned-concurrency utilisation is a FRACTION of the allocated concurrency rather
+/// than a percentage of it, and the window the AWS Lambda Developer Guide publishes for it
+/// is 0.1 to 0.9, so a percentage-style value for that metric is outside its window. A
+/// metric that is a COUNT publishes no window, and a large count is accepted.
 const TARGET_VALUE_CATALOG: &[TargetValueRow] = &[
     TargetValueRow { dimension: "dynamodb:table:ReadCapacityUnits", metric_type: "DynamoDBReadCapacityUtilization", target_value: 10.0, accepted: true },
     TargetValueRow { dimension: "dynamodb:table:ReadCapacityUnits", metric_type: "DynamoDBReadCapacityUtilization", target_value: 20.0, accepted: true },
@@ -187,6 +198,15 @@ const TARGET_VALUE_CATALOG: &[TargetValueRow] = &[
     TargetValueRow { dimension: "cassandra:table:ReadCapacityUnits", metric_type: "CassandraReadCapacityUtilization", target_value: 10.0, accepted: true },
     TargetValueRow { dimension: "cassandra:table:ReadCapacityUnits", metric_type: "CassandraReadCapacityUtilization", target_value: 90.0, accepted: true },
     TargetValueRow { dimension: "cassandra:table:ReadCapacityUnits", metric_type: "CassandraReadCapacityUtilization", target_value: 99.0, accepted: false },
+    // The fraction window, at each of its bounds, inside it, one step past each bound and
+    // at the percentage-style value that reads as 7000 percent of the allocation.
+    TargetValueRow { dimension: "lambda:function:ProvisionedConcurrency", metric_type: "LambdaProvisionedConcurrencyUtilization", target_value: 0.1, accepted: true },
+    TargetValueRow { dimension: "lambda:function:ProvisionedConcurrency", metric_type: "LambdaProvisionedConcurrencyUtilization", target_value: 0.7, accepted: true },
+    TargetValueRow { dimension: "lambda:function:ProvisionedConcurrency", metric_type: "LambdaProvisionedConcurrencyUtilization", target_value: 0.9, accepted: true },
+    TargetValueRow { dimension: "lambda:function:ProvisionedConcurrency", metric_type: "LambdaProvisionedConcurrencyUtilization", target_value: 0.09, accepted: false },
+    TargetValueRow { dimension: "lambda:function:ProvisionedConcurrency", metric_type: "LambdaProvisionedConcurrencyUtilization", target_value: 0.91, accepted: false },
+    TargetValueRow { dimension: "lambda:function:ProvisionedConcurrency", metric_type: "LambdaProvisionedConcurrencyUtilization", target_value: 1.0, accepted: false },
+    TargetValueRow { dimension: "lambda:function:ProvisionedConcurrency", metric_type: "LambdaProvisionedConcurrencyUtilization", target_value: 70.0, accepted: false },
     // A request count per target is not a percentage of anything, so nothing bounds it.
     TargetValueRow { dimension: "ecs:service:DesiredCount", metric_type: "ALBRequestCountPerTarget", target_value: 1000.0, accepted: true },
     TargetValueRow { dimension: "ecs:service:DesiredCount", metric_type: "ECSServiceAverageCPUUtilization", target_value: 95.0, accepted: true },

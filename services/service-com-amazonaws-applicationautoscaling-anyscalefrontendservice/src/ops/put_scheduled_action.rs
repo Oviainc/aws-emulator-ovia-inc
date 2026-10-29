@@ -286,8 +286,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The action belongs to the scalable target of the REGION this request was sent
+        // to: a scheduled action is scoped to the Region it was created in.
+        let region = crate::state::request_region(ctx.parts());
         let key = ScheduledActionKey {
             target: TargetKey {
+                region: region.clone(),
                 service_namespace: input.service_namespace.clone(),
                 resource_id: input.resource_id.clone(),
                 scalable_dimension: input.scalable_dimension.clone(),
@@ -346,10 +350,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
-                (
-                    scheduled_action_arn(&crate::state::request_region(ctx.parts()), &key),
-                    timestamp_of(now),
-                )
+                (scheduled_action_arn(&key), timestamp_of(now))
             }
         };
 
@@ -395,7 +396,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An occurrence this call materialised moved the target's capacity, which the scaled
         // resource is owed; delivered with this service's lock released.
-        let region = crate::state::request_region(ctx.parts());
         crate::state::policy_execution::settle_policy_executions(&*self.engine, &region);
         crate::state::policy_execution::drive_scaling_clock(&self.engine, &region);
 

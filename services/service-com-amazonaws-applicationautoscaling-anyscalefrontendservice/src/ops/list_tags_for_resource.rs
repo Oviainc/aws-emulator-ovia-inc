@@ -139,7 +139,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServiceException(
@@ -154,11 +154,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A pure read: the ARN is resolved through the index `RegisterScalableTarget`
         // populates and the stored tag set is COPIED out, so the store is left exactly as
-        // the next caller will find it.
+        // the next caller will find it. Only a target of THIS Region resolves: a scalable
+        // target is a regional resource, so another Region's ARN names nothing here.
+        let region = crate::state::request_region(ctx.parts());
         let state = state.lock();
         let record = state
             .arn_index
             .get(&input.resource_arn)
+            .filter(|key| key.region == region)
             .and_then(|key| state.targets.get(key));
 
         // "Returns all the tags on the specified Application Auto Scaling scalable

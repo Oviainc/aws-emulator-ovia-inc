@@ -126,7 +126,17 @@ impl Emulator {
 
     /// Call an Application Auto Scaling operation.
     pub async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
-        self.dispatch(
+        self.call_in(REGION, operation, body).await
+    }
+
+    /// Call an Application Auto Scaling operation against the endpoint of `region`.
+    ///
+    /// Application Auto Scaling is a REGIONAL service: the credential scope of a request is
+    /// what names the Region it is addressed to, and each Region holds its own scalable
+    /// targets. A suite that asserts that partitioning has to be able to call two of them.
+    pub async fn call_in(&self, region: &str, operation: &str, body: Value) -> (u16, Value) {
+        self.dispatch_in(
+            region,
             "application-autoscaling",
             "application/x-amz-json-1.1",
             &format!("AnyScaleFrontendService.{operation}"),
@@ -137,7 +147,19 @@ impl Emulator {
 
     /// Call a DynamoDB operation.
     pub async fn call_dynamodb(&self, operation: &str, body: Value) -> (u16, Value) {
-        self.dispatch(
+        self.call_dynamodb_in(REGION, operation, body).await
+    }
+
+    /// Call a DynamoDB operation against the endpoint of `region`, whose table store is the
+    /// one a scalable target of that Region resolves against.
+    pub async fn call_dynamodb_in(
+        &self,
+        region: &str,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        self.dispatch_in(
+            region,
             "dynamodb",
             "application/x-amz-json-1.0",
             &format!("DynamoDB_20120810.{operation}"),
@@ -293,6 +315,19 @@ impl Emulator {
         target: &str,
         body: Value,
     ) -> (u16, Value) {
+        self.dispatch_in(REGION, signing_name, content_type, target, body)
+            .await
+    }
+
+    /// Dispatch one request whose credential scope names `region`.
+    async fn dispatch_in(
+        &self,
+        region: &str,
+        signing_name: &str,
+        content_type: &str,
+        target: &str,
+        body: Value,
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -301,7 +336,7 @@ impl Emulator {
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEMULATOR/20260101/{REGION}/{signing_name}\
+                    "AWS4-HMAC-SHA256 Credential=AKIDEMULATOR/20260101/{region}/{signing_name}\
                      /aws4_request, SignedHeaders=host, Signature=0"
                 ),
             )

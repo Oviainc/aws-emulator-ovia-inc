@@ -229,13 +229,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let page_size = page_size(input.max_results).map_err(validation)?;
 
+        // The Region the request was addressed to: a scaling activity belongs to the target
+        // it moved, so this endpoint reports its own Region's log and resumes only a token it
+        // issued itself.
+        let region = crate::state::request_region(ctx.parts());
+
         // The token carries the id of the last activity the previous page emitted, so
         // this page resumes at the one recorded just before it. A token this service did
         // not issue, or one naming an activity this filtered log no longer holds, is
         // refused rather than silently read as "from the newest".
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match decode_next_token(token, 1) {
+            Some(token) => match decode_next_token(token, &region, 1) {
                 Some(fields) => Some(fields[0].clone()),
                 None => return Err(invalid_next_token()),
             },
@@ -249,7 +254,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that alarm transitioned, and the activity it records is one this log already held
         // at that instant — so what the clock has made due is performed before the log is
         // read, and the clock is left watching for the next breach.
-        let region = crate::state::request_region(ctx.parts());
         crate::state::policy_execution::settle_policy_executions(&*self.engine, &region);
         crate::state::policy_execution::drive_scaling_clock(&self.engine, &region);
 
@@ -263,6 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut matching: Vec<&ScalingActivityRecord> = state
             .activities
             .iter()
+            // An activity belongs to the Region whose target it moved, so this endpoint
+            // reports only its own Region's log.
+            .filter(|activity| activity.target.region == region)
             .filter(|activity| activity.target.service_namespace == input.service_namespace)
             .filter(|activity| {
                 input
@@ -303,7 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|activity| scaling_activity_of(activity, now))
             .collect();
         let (scaling_activities, next_token) = take_page(rendered, page_size, |activity| {
-            encode_next_token(&[&activity.activity_id])
+            encode_next_token(&region, &[&activity.activity_id])
         });
 
         Ok(DescribeScalingActivitiesOutput {

@@ -158,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{check_dimension_namespace, check_enum, PolicyKey, TargetKey};
 
@@ -200,6 +200,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let key = PolicyKey {
             target: TargetKey {
+                // The forecast is of a policy of THIS Region's scalable target.
+                region: crate::state::request_region(ctx.parts()),
                 service_namespace: input.service_namespace.clone(),
                 resource_id: input.resource_id.clone(),
                 scalable_dimension: input.scalable_dimension.clone(),

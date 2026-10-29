@@ -132,7 +132,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{check_tag_key, check_tag_keys_unreserved, ACCESS_DENIED};
 
@@ -155,7 +155,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
-        let resolved = state.arn_index.get(&input.resource_arn).cloned();
+        // Only a target of THIS Region: a scalable target is a regional resource, so
+        // another Region's ARN names none this endpoint holds (see `tag_resource`).
+        let region = crate::state::request_region(ctx.parts());
+        let resolved = state
+            .arn_index
+            .get(&input.resource_arn)
+            .filter(|key| key.region == region)
+            .cloned();
         let Some(record) = resolved.and_then(|key| state.targets.get_mut(&key)) else {
             return Err(validation(ACCESS_DENIED));
         };

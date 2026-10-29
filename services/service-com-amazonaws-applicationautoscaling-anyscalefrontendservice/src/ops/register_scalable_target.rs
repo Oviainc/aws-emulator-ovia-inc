@@ -275,6 +275,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.scalable_dimension,
         )
         .map_err(validation)?;
+        // And the resource it names has to be one the dimension's capacity exists on: a
+        // qualifier that can carry no provisioned concurrency names no capacity to scale,
+        // whatever shape the id has.
+        crate::state::check_provisionable_resource(&input.resource_id, &input.scalable_dimension)
+            .map_err(validation)?;
 
         // A capacity window has to be one the owning service can provision: a dimension
         // whose unit has a documented floor cannot be scaled below it, and no dimension
@@ -301,7 +306,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             check_capacity_range(min_capacity, max_capacity)?;
         }
 
+        // The target is registered in the REGION this request was sent to: the resource it
+        // scales lives there, and another Region's endpoint holds its own targets. Resolved
+        // before the key so both the identity and the resource lookup name one Region.
+        let region = crate::state::request_region(ctx.parts());
         let key = TargetKey {
+            region: region.clone(),
             service_namespace: input.service_namespace.clone(),
             resource_id: input.resource_id.clone(),
             scalable_dimension: input.scalable_dimension.clone(),
@@ -312,7 +322,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused registration leaves no record behind, and OUTSIDE this service's own
         // store lock — the capacity it answers is also what the alarm thresholds are
         // computed from below.
-        let region = crate::state::request_region(ctx.parts());
 
         // This registration's read-modify-write of the target is IN FLIGHT from here: a
         // second registration of the SAME target that overlaps it is the modelled
@@ -344,8 +353,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ::tokio::task::yield_now().await;
 
         let resolved_capacity =
-            crate::state::resolve_target_resource(&*self.engine, &region, &key)
-                .map_err(validation)?;
+            crate::state::resolve_target_resource(&*self.engine, &key).map_err(validation)?;
 
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
@@ -406,8 +414,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
-                let arn =
-                    scalable_target_arn(&crate::state::request_region(ctx.parts()), &key, now);
+                let arn = scalable_target_arn(&key, now);
                 let record = ScalableTargetRecord {
                     arn: arn.clone(),
                     min_capacity,
@@ -451,7 +458,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service's lock, applied with it RELEASED, recorded under it again. The capacity
         // the thresholds are computed from is the one the resource is left at, not the one
         // it was read at.
-        let plan = crate::state::plan_target_alarms(state, &region, &key, effective_capacity);
+        let plan = crate::state::plan_target_alarms(state, &key, effective_capacity);
         drop(guard);
         let minted = crate::state::apply_target_alarms(&*self.engine, &plan);
         let orphaned = crate::state::record_minted_alarms(&mut self_state.lock(), minted);

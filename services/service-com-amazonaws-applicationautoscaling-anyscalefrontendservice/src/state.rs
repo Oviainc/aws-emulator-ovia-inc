@@ -5,8 +5,11 @@
 //! A scalable target's identity in Application Auto Scaling is the triple
 //! (`ServiceNamespace`, `ResourceId`, `ScalableDimension`) — the model documents that
 //! "scalable targets are uniquely identified by the combination of resource ID, scalable
-//! dimension, and namespace" — so [`TargetKey`] is that triple and both maps below are
-//! keyed by it. A scaling policy adds its `PolicyName` ([`PolicyKey`]).
+//! dimension, and namespace" — inside ONE Region, which is the endpoint the request was
+//! sent to: this is a regional service, so [`TargetKey`] carries the Region beside that
+//! triple and every map below is keyed by it. A scaling policy adds its `PolicyName`
+//! ([`PolicyKey`]), and a scheduled action its own name ([`ScheduledActionKey`]), so both
+//! are regional with the target they belong to.
 //!
 //! Both maps are `BTreeMap`s, so `Describe*` enumerates in a stable order and an opaque
 //! `NextToken` only has to carry the last key a page emitted.
@@ -31,8 +34,16 @@ pub mod policy_execution;
 
 /// The natural AWS identity of a scalable target, and the prefix of a scaling policy's
 /// and a scheduled action's identity.
+///
+/// The identity opens with the REGION the target was registered in, because a scalable
+/// target is a regional resource: the resource it scales lives in one Region, the ARN this
+/// service mints for it names that Region, and the same `ResourceId` in another Region is
+/// another resource with a scalable target of its own. Region first also makes the order
+/// `BTreeMap` keeps a per-Region order, so a `Describe` of one Region walks a contiguous
+/// run of keys.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TargetKey {
+    pub region: String,
     pub service_namespace: String,
     pub resource_id: String,
     pub scalable_dimension: String,
@@ -445,13 +456,16 @@ pub fn request_region(parts: &http::request::Parts) -> String {
 
 /// A scalable target's ARN: `arn:aws:application-autoscaling:<region>:<account>:scalable-target/<id>`.
 ///
+/// The Region is the target's own, which its identity carries ([`TargetKey`]), so the ARN
+/// cannot name a Region the target is not registered in.
+///
 /// The opaque id is derived from the target's identity AND from the instant it was
 /// registered at, because a scalable target is a RESOURCE and not just a name:
 /// deregistering it retires that resource, and registering the same identity again mints
 /// a new one, which carries a new ARN and none of the retired target's tags or policies.
 /// Deriving the id from the registration instant is what gives the new resource its own
 /// identity while keeping the ARN stable for every read of the target that holds it.
-pub fn scalable_target_arn(region: &str, key: &TargetKey, registered_at: SystemTime) -> String {
+pub fn scalable_target_arn(key: &TargetKey, registered_at: SystemTime) -> String {
     let registered_nanos = registered_at
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -459,6 +473,7 @@ pub fn scalable_target_arn(region: &str, key: &TargetKey, registered_at: SystemT
     let id = opaque_id(
         &[
             "scalable-target",
+            &key.region,
             &key.service_namespace,
             &key.resource_id,
             &key.scalable_dimension,
@@ -469,17 +484,18 @@ pub fn scalable_target_arn(region: &str, key: &TargetKey, registered_at: SystemT
     );
     ::emulator_server::emulator_arn(
         "application-autoscaling",
-        region,
+        &key.region,
         &format!("scalable-target/{id}"),
     )
 }
 
 /// A scaling policy's ARN, in the shape Application Auto Scaling documents:
 /// `arn:aws:autoscaling:<region>:<account>:scalingPolicy:<id>:resource/<namespace>/<resource id>:policyName/<name>`.
-pub fn scaling_policy_arn(region: &str, key: &PolicyKey) -> String {
+pub fn scaling_policy_arn(key: &PolicyKey) -> String {
     let id = uuid_shaped_id(
         &[
             "scalingPolicy",
+            &key.target.region,
             &key.target.service_namespace,
             &key.target.resource_id,
             &key.target.scalable_dimension,
@@ -489,7 +505,7 @@ pub fn scaling_policy_arn(region: &str, key: &PolicyKey) -> String {
     );
     ::emulator_server::emulator_arn(
         "autoscaling",
-        region,
+        &key.target.region,
         &format!(
             "scalingPolicy:{id}:resource/{}/{}:policyName/{}",
             key.target.service_namespace, key.target.resource_id, key.policy_name
@@ -502,10 +518,11 @@ pub fn scaling_policy_arn(region: &str, key: &PolicyKey) -> String {
 ///
 /// Derived from the action's identity for the same reason the policy ARN is: re-putting
 /// the same scheduled action must not hand the caller a second ARN.
-pub fn scheduled_action_arn(region: &str, key: &ScheduledActionKey) -> String {
+pub fn scheduled_action_arn(key: &ScheduledActionKey) -> String {
     let id = uuid_shaped_id(
         &[
             "scheduledAction",
+            &key.target.region,
             &key.target.service_namespace,
             &key.target.resource_id,
             &key.target.scalable_dimension,
@@ -515,7 +532,7 @@ pub fn scheduled_action_arn(region: &str, key: &ScheduledActionKey) -> String {
     );
     ::emulator_server::emulator_arn(
         "autoscaling",
-        region,
+        &key.target.region,
         &format!(
             "scheduledAction:{id}:resource/{}/{}:scheduledActionName/{}",
             key.target.service_namespace, key.target.resource_id, key.scheduled_action_name
@@ -533,6 +550,7 @@ pub fn scaling_activity_id(sequence: u64, key: &TargetKey) -> String {
         &[
             "scalingActivity",
             &sequence.to_string(),
+            &key.region,
             &key.service_namespace,
             &key.resource_id,
             &key.scalable_dimension,
@@ -900,9 +918,14 @@ pub fn page_size(max_results: Option<i32>) -> Result<usize, String> {
 /// recovers exactly the fields that were encoded.
 const TOKEN_SEPARATOR: char = '\u{1f}';
 
-/// An opaque `NextToken` carrying the key a page ended on.
-pub fn encode_next_token(fields: &[&str]) -> String {
-    hex::encode(fields.join(&TOKEN_SEPARATOR.to_string()))
+/// An opaque `NextToken` carrying the Region that issued it and the key a page ended on.
+///
+/// A page is a walk through ONE Region's resources, so the token names that Region
+/// ([`decode_next_token`] refuses one issued by another).
+pub fn encode_next_token(region: &str, fields: &[&str]) -> String {
+    let mut payload = vec![region];
+    payload.extend_from_slice(fields);
+    hex::encode(payload.join(&TOKEN_SEPARATOR.to_string()))
 }
 
 /// How this service states a `NextToken` it did not issue.
@@ -913,16 +936,24 @@ pub fn encode_next_token(fields: &[&str]) -> String {
 /// holds, and the refusal is about the whole value rather than a part of it.
 pub const INVALID_NEXT_TOKEN: &str = "The NextToken value is not valid";
 
-/// The fields a `NextToken` carries, or `None` when the token is not one this service
+/// The fields a `NextToken` carries, or `None` when the token is not one this endpoint
 /// issued — the caller answers that with `InvalidNextTokenException`.
-pub fn decode_next_token(token: &str, field_count: usize) -> Option<Vec<String>> {
+///
+/// A token issued by ANOTHER Region is not one this endpoint issued: the resources it walks
+/// are regional, so resuming its key here would resume inside a different set. The Region
+/// is part of the payload and is checked rather than returned.
+pub fn decode_next_token(token: &str, region: &str, field_count: usize) -> Option<Vec<String>> {
     let bytes = hex::decode(token).ok()?;
     let text = String::from_utf8(bytes).ok()?;
-    let fields: Vec<String> = text
+    let mut fields: Vec<String> = text
         .split(TOKEN_SEPARATOR)
         .map(ToString::to_string)
         .collect();
-    (fields.len() == field_count).then_some(fields)
+    if fields.len() != field_count + 1 || fields.first().is_none_or(|issuer| issuer != region) {
+        return None;
+    }
+    fields.remove(0);
+    Some(fields)
 }
 
 /// Cut `items` (already filtered and in key order) down to one page.
@@ -1143,6 +1174,57 @@ pub fn check_resource_id_form(
     ))
 }
 
+/// The function name and qualifier a `lambda` `ResourceId` names: "The resource type is
+/// `function` and the unique identifier is the function name with a function version or
+/// alias name suffix that is not `$LATEST`. Example: `function:my-function:prod`" (the
+/// model's own `ResourceId` documentation).
+fn split_lambda_resource_id(resource_id: &str) -> Option<(&str, &str)> {
+    let rest = resource_id.strip_prefix("function:")?;
+    let (function_name, qualifier) = rest.split_once(':')?;
+    (!function_name.is_empty() && !qualifier.is_empty() && !qualifier.contains(':'))
+        .then_some((function_name, qualifier))
+}
+
+/// The qualifier naming a Lambda function's unpublished version, which is the one
+/// qualifier no provisioned concurrency can be allocated to.
+const LAMBDA_UNPUBLISHED_VERSION: &str = "$LATEST";
+
+/// `Ok` when the resource `resource_id` names can CARRY the capacity `scalable_dimension`
+/// scales, else the `ValidationException` message saying which resource it has to name.
+///
+/// A resource id of the documented form ([`check_resource_id_form`]) still has to name a
+/// resource the capacity exists on, and for one dimension that is a rule about the id
+/// itself rather than about the resource's state: `lambda:function:ProvisionedConcurrency`
+/// scales a function's provisioned concurrency, which is allocated to a published version
+/// or an alias and never to the unpublished version — the model's own `ResourceId`
+/// documentation requires "a function version or alias name suffix that is not `$LATEST`",
+/// and Lambda itself refuses a configuration on it ("Provisioned Concurrency Configs cannot
+/// be applied to unpublished function versions"). So a target naming it could never be
+/// enforced, and the registration is refused instead of stored.
+///
+/// One arm per dimension whose capacity has such a rule; a dimension with none is answered
+/// on the form alone. An id of a shape this cannot read is left to
+/// [`check_resource_id_form`], which is the check that owns the shape.
+pub fn check_provisionable_resource(
+    resource_id: &str,
+    scalable_dimension: &str,
+) -> Result<(), String> {
+    match scalable_dimension {
+        "lambda:function:ProvisionedConcurrency" => {
+            let qualifier = split_lambda_resource_id(resource_id).map(|(_, qualifier)| qualifier);
+            if qualifier.is_none_or(|qualifier| qualifier == LAMBDA_UNPUBLISHED_VERSION) {
+                return Err(format!(
+                    "ResourceId not valid for ScalableDimension {scalable_dimension}: \
+                     {resource_id} must name an alias or a published version of the function, \
+                     and {LAMBDA_UNPUBLISHED_VERSION} is neither"
+                ));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Whether `value` matches one [`RESOURCE_ID_FORMS`] template.
 fn matches_resource_id_form(template: &str, value: &str) -> bool {
     /// The characters that separate a resource id's segments, so a `{...}` placeholder
@@ -1209,15 +1291,17 @@ fn matches_resource_id_form(template: &str, value: &str) -> bool {
 ///   resolve and the registration is answered on its own terms;
 /// * `Err(message)` — the resource cannot carry this target, as a `ValidationException`
 ///   message naming the member and why.
+///
+/// The resource is resolved in the target's own Region, which its identity carries: a table
+/// of that name in another Region is not the resource this target scales.
 pub fn resolve_target_resource<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    region: &str,
     target: &TargetKey,
 ) -> Result<Option<i64>, String> {
     match target.service_namespace.as_str() {
         "dynamodb" => resolve_dynamodb_capacity(
             engine,
-            region,
+            &target.region,
             &target.resource_id,
             &target.scalable_dimension,
         ),
@@ -1595,6 +1679,16 @@ const WORKSPACES_POOL: &[&str] = &["workspaces:workspacespool:DesiredUserSession
 /// utilisation of ten percent of the provisioned capacity is accepted, and so is ninety.
 const PROVISIONED_UTILIZATION_RANGE: (f64, f64) = (10.0, 90.0);
 
+/// The window a Lambda provisioned-concurrency utilisation target must lie in.
+///
+/// `ProvisionedConcurrencyUtilization` is "the fraction of the allocated provisioned
+/// concurrency that is in use", so this target is a FRACTION rather than a percentage, and
+/// the AWS Lambda Developer Guide's auto scaling walkthrough states the window it may lie in
+/// as 0.1 to 0.9 (its own example target is 0.7). A percentage-style value is outside it, so
+/// it is refused rather than driving provisioned concurrency at a utilisation Lambda can
+/// never reach.
+const LAMBDA_CONCURRENCY_UTILIZATION_RANGE: (f64, f64) = (0.1, 0.9);
+
 const PREDEFINED_METRICS: &[PredefinedMetric] = &[
     metric("DynamoDBReadCapacityUtilization", "AWS/DynamoDB", "ConsumedReadCapacityUnits", "Sum", true, 60, DYNAMODB_READ, Some(PROVISIONED_UTILIZATION_RANGE)),
     metric("DynamoDBWriteCapacityUtilization", "AWS/DynamoDB", "ConsumedWriteCapacityUnits", "Sum", true, 60, DYNAMODB_WRITE, Some(PROVISIONED_UTILIZATION_RANGE)),
@@ -1613,7 +1707,7 @@ const PREDEFINED_METRICS: &[PredefinedMetric] = &[
     metric("NeptuneReaderAverageCPUUtilization", "AWS/Neptune", "CPUUtilization", "Average", false, 60, NEPTUNE_CLUSTER, None),
     metric("AppStreamAverageCapacityUtilization", "AWS/AppStream", "CapacityUtilization", "Average", false, 60, APPSTREAM_FLEET, None),
     metric("ComprehendInferenceUtilization", "AWS/Comprehend", "InferenceUtilization", "Average", false, 60, COMPREHEND_ENDPOINTS, None),
-    metric("LambdaProvisionedConcurrencyUtilization", "AWS/Lambda", "ProvisionedConcurrencyUtilization", "Average", false, 60, LAMBDA_CONCURRENCY, None),
+    metric("LambdaProvisionedConcurrencyUtilization", "AWS/Lambda", "ProvisionedConcurrencyUtilization", "Average", false, 60, LAMBDA_CONCURRENCY, Some(LAMBDA_CONCURRENCY_UTILIZATION_RANGE)),
     metric("KafkaBrokerStorageUtilization", "AWS/Kafka", "KafkaDataLogsDiskUsed", "Average", false, 60, KAFKA_STORAGE, None),
     metric("ElastiCacheEngineCPUUtilization", "AWS/ElastiCache", "EngineCPUUtilization", "Average", false, 60, ELASTICACHE, None),
     metric("ElastiCachePrimaryEngineCPUUtilization", "AWS/ElastiCache", "EngineCPUUtilization", "Average", false, 60, ELASTICACHE, None),
@@ -1992,6 +2086,7 @@ pub fn policy_alarm_name(key: &PolicyKey, kind: AlarmKind) -> String {
     let id = uuid_shaped_id(
         &[
             "alarm",
+            &key.target.region,
             &key.target.service_namespace,
             &key.target.resource_id,
             &key.target.scalable_dimension,
@@ -2030,6 +2125,7 @@ pub fn policy_alarm_action(policy_arn: &str, key: &PolicyKey) -> String {
     let id = uuid_shaped_id(
         &[
             "createdBy",
+            &key.target.region,
             &key.target.service_namespace,
             &key.target.resource_id,
             &key.target.scalable_dimension,
@@ -2492,6 +2588,8 @@ pub struct AlarmPlan {
 /// STEP 1 of the alarm sync, under this service's lock ONLY: what every policy of `target`
 /// wants its alarm set to be.
 ///
+/// The alarms are scoped to the target's own Region, which its identity carries.
+///
 /// `resolved_capacity` is the resource's own provisioned capacity, read from the service
 /// that owns it BEFORE this lock was taken. `None` falls back to the target's
 /// `MinCapacity`, which Application Auto Scaling keeps a scalable resource at or above, in
@@ -2501,7 +2599,6 @@ pub struct AlarmPlan {
 /// that store has a resolver, which is a row in [`resolve_target_resource`].
 pub fn plan_target_alarms(
     state: &ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
-    region: &str,
     target: &TargetKey,
     resolved_capacity: Option<i64>,
 ) -> AlarmPlan {
@@ -2524,7 +2621,7 @@ pub fn plan_target_alarms(
         })
         .collect();
     AlarmPlan {
-        region: region.to_string(),
+        region: target.region.clone(),
         policies,
     }
 }
@@ -2760,7 +2857,6 @@ pub struct ManagedTarget {
 /// nothing when this service's store is not reachable from `engine`.
 pub fn apply_managed_target<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    region: &str,
     key: &TargetKey,
     wanted: Option<&ManagedTarget>,
 ) {
@@ -2828,7 +2924,7 @@ pub fn apply_managed_target<Eng: Send + Sync + 'static>(
                     // scalable target.
                     None if !room => None,
                     None => {
-                        let arn = scalable_target_arn(region, key, now);
+                        let arn = scalable_target_arn(key, now);
                         store.arn_index.insert(arn.clone(), key.clone());
                         store.targets.insert(
                             key.clone(),
@@ -2866,7 +2962,7 @@ pub fn apply_managed_target<Eng: Send + Sync + 'static>(
                             Some((existing.policy_arn.clone(), existing.creation_time))
                         }
                         None if store.policies.len() >= MAX_SCALING_POLICIES => None,
-                        None => Some((scaling_policy_arn(region, &policy_key), now)),
+                        None => Some((scaling_policy_arn(&policy_key), now)),
                     };
                     // What the policy has already been executed for survives a re-write of
                     // it too: this is the same policy, so a breach it has performed must not
@@ -2899,7 +2995,7 @@ pub fn apply_managed_target<Eng: Send + Sync + 'static>(
                             },
                         );
                     }
-                    plan = Some(plan_target_alarms(store, region, key, None));
+                    plan = Some(plan_target_alarms(store, key, None));
                 }
             }
         }
@@ -3228,7 +3324,8 @@ fn cron_field_parses(index: usize, field: &str) -> bool {
 /// The occurrence that fires is the first one after the action was last applied (or after it
 /// was created), bounded by `StartTime` and `EndTime` when it carries them: "when you specify
 /// start and end times with a recurring schedule using a cron expression or rates, they form
-/// the boundaries for when the recurring action starts and stops".
+/// the boundaries for when the recurring action starts and stops". An occurrence whose target
+/// has scheduled scaling SUSPENDED is not initiated, and not replayed when it resumes.
 ///
 /// Every step is fallible on purpose: an action whose schedule, time zone or instants cannot
 /// be computed with is skipped, so no stored record can make this pass fail.
@@ -3277,9 +3374,24 @@ pub fn apply_due_scheduled_actions(
         let Some(occurrence) = applied else {
             continue;
         };
+        // "Set the value to true if you don't want Application Auto Scaling to add or remove
+        // capacity by initiating scheduled actions" (`SuspendedState$ScheduledScalingSuspended`):
+        // while scheduled scaling is suspended on the target, a due occurrence is not
+        // initiated at all, so it moves neither the target's bounds nor its capacity. It is
+        // still CONSUMED below rather than held back, because the instant has passed: an
+        // occurrence missed under a suspension is not run when scaling resumes, which is
+        // also why the call that resumes scaling materialises what the clock owed BEFORE it
+        // clears the flag.
+        let scheduled_scaling_suspended = state.targets.get(&key.target).is_some_and(|target| {
+            target
+                .suspended_state
+                .as_ref()
+                .and_then(|suspended| suspended.scheduled_scaling_suspended)
+                .unwrap_or(false)
+        });
         let mut movement = None;
-        if let Some(target) = state.targets.get_mut(&key.target) {
-            if let Some(action) = action {
+        if !scheduled_scaling_suspended {
+            if let (Some(target), Some(action)) = (state.targets.get_mut(&key.target), action) {
                 if let Some(min) = action.min_capacity {
                     target.min_capacity = min;
                 }

@@ -174,10 +174,10 @@ pub fn settle_policy_executions<Eng: Send + Sync + 'static>(engine: &Eng, region
     };
     // A capacity movement another call made and the owning service has not been told about
     // yet goes first: it is older than anything this pass is about to perform.
-    deliver_pending_capacity(engine, region, &state);
+    deliver_pending_capacity(engine, &state);
     // STEP 1, under this service's lock: which policies an alarm could be firing, and what
     // each of them has already been executed for.
-    let candidates = { firing_candidates(&state.lock()) };
+    let candidates = { firing_candidates(&state.lock(), region) };
     if candidates.is_empty() {
         return;
     }
@@ -197,7 +197,7 @@ pub fn settle_policy_executions<Eng: Send + Sync + 'static>(engine: &Eng, region
     let resolved: BTreeMap<TargetKey, i32> = targets
         .iter()
         .filter_map(|target| {
-            resource_capacity(engine, region, target).map(|capacity| (target.clone(), capacity))
+            resource_capacity(engine, target).map(|capacity| (target.clone(), capacity))
         })
         .collect();
     // STEP 4, under this service's lock again: the arithmetic, the clamp into the window the
@@ -209,7 +209,7 @@ pub fn settle_policy_executions<Eng: Send + Sync + 'static>(engine: &Eng, region
     }
     // STEP 5, with this service's lock released: the capacity each movement owes the resource
     // it scales, written in the service that owns it.
-    deliver_pending_capacity(engine, region, &state);
+    deliver_pending_capacity(engine, &state);
 }
 
 /// Write every queued capacity movement into the service that owns the resource it moved.
@@ -218,10 +218,10 @@ pub fn settle_policy_executions<Eng: Send + Sync + 'static>(engine: &Eng, region
 /// write cannot happen under this service's lock, so a movement is QUEUED by the call that made
 /// it (`record_capacity_change`) and delivered here. Delivery is at-most-once: a taken movement
 /// is gone from the queue, and the capacity delivered for a target is the last one queued for
-/// it, which is the capacity that target holds.
+/// it, which is the capacity that target holds. Each movement is written in the REGION of the
+/// target it moved, which is where that resource lives.
 fn deliver_pending_capacity<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    region: &str,
     state: &::engine::ServiceState<ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState>,
 ) {
     let pending = {
@@ -229,7 +229,7 @@ fn deliver_pending_capacity<Eng: Send + Sync + 'static>(
         ::std::mem::take(&mut store.pending_capacity)
     };
     for (target, capacity) in pending {
-        set_resource_capacity(engine, region, &target, capacity);
+        set_resource_capacity(engine, &target.region, &target, capacity);
     }
 }
 
@@ -375,13 +375,17 @@ fn is_alarm_driven(policy_type: &str) -> bool {
 ///
 /// A policy whose scalable target is gone is left out: the target is what carries the window a
 /// movement is clamped into and the capacity it moves, so there is nothing to execute against.
-/// So is one whose own configuration is absent, which states no capacity to move to.
+/// So is one whose own configuration is absent, which states no capacity to move to. And so is
+/// one of ANOTHER Region: its alarms and the resource it scales live in that Region, so a pass
+/// for this one neither reads nor moves them.
 fn firing_candidates(
     store: &ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
+    region: &str,
 ) -> Vec<FiringPolicy> {
     store
         .policies
         .iter()
+        .filter(|(key, _)| key.target.region == region)
         .filter(|(key, _)| store.targets.contains_key(&key.target))
         .filter_map(|(key, record)| {
             let config = match record.policy_type.as_str() {
@@ -829,16 +833,15 @@ fn percentage_magnitude(
 /// "Application Auto Scaling retrieves the current capacity of the resource": an adjustment is
 /// computed from the resource's OWN capacity, not from what this service last set. Read
 /// through the one resolver a registration validates the resource with
-/// ([`super::resolve_target_resource`]), so both see the same capacity; for a namespace whose
-/// resource store this emulator does not hold — and for a resource that resolver refuses —
-/// there is nothing to read, and the capacity this service tracks for the target is what the
-/// adjustment is computed from instead.
+/// ([`super::resolve_target_resource`]), in the target's own Region, so both see the same
+/// capacity; for a namespace whose resource store this emulator does not hold — and for a
+/// resource that resolver refuses — there is nothing to read, and the capacity this service
+/// tracks for the target is what the adjustment is computed from instead.
 pub fn resource_capacity<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    region: &str,
     target: &TargetKey,
 ) -> Option<i32> {
-    super::resolve_target_resource(engine, region, target)
+    super::resolve_target_resource(engine, target)
         .ok()
         .flatten()
         .and_then(|capacity| i32::try_from(capacity).ok())

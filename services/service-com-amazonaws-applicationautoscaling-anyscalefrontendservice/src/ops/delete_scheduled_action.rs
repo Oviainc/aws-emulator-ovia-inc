@@ -205,6 +205,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource or dimension is another action and this call leaves it alone.
         let key = ScheduledActionKey {
             target: TargetKey {
+                // A scheduled action belongs to the target of the Region it was created in.
+                region: crate::state::request_region(ctx.parts()),
                 service_namespace: input.service_namespace.clone(),
                 resource_id: input.resource_id.clone(),
                 scalable_dimension: input.scalable_dimension.clone(),

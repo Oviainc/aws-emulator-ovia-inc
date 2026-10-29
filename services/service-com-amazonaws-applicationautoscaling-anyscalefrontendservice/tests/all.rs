@@ -25,6 +25,8 @@ mod predictive_scaling_forecast;
 mod refusal_messages;
 #[path = "all/refusal_texts.rs"]
 mod refusal_texts;
+#[path = "all/regional_scalable_targets.rs"]
+mod regional_scalable_targets;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/scalable_target_lifecycle.rs"]
@@ -41,6 +43,8 @@ mod scheduled_action_deletion;
 mod scheduled_action_lifecycle;
 #[path = "all/scheduled_actions.rs"]
 mod scheduled_actions;
+#[path = "all/scheduled_scaling_suspension.rs"]
+mod scheduled_scaling_suspension;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/step_scaling_execution.rs"]

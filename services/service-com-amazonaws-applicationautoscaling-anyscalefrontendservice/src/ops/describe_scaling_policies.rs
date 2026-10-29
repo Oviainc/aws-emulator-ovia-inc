@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
             check_dimension_namespace, check_enum, decode_next_token, encode_next_token, page_size,
@@ -214,12 +214,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let page_size = page_size(input.max_results).map_err(validation)?;
 
+        // Only the policies of THIS Region's scalable targets: the service is regional, so
+        // the endpoint a request was sent to is what it reports over.
+        let region = crate::state::request_region(ctx.parts());
+
         // The token carries the full identity of the last policy the previous page
         // emitted — its target plus its name — so this page resumes at the next key.
         let resume_after = match input.next_token.as_deref() {
             None => None,
             Some(token) => {
-                let Some(fields) = decode_next_token(token, 4) else {
+                let Some(fields) = decode_next_token(token, &region, 4) else {
                     return Err(
                         DescribeScalingPoliciesErrorModeled::InvalidNextTokenException(
                             InvalidNextTokenException {
@@ -231,6 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 };
                 Some(PolicyKey {
                     target: TargetKey {
+                        region: region.clone(),
                         service_namespace: fields[0].clone(),
                         resource_id: fields[1].clone(),
                         scalable_dimension: fields[2].clone(),
@@ -244,6 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let matching: Vec<ScalingPolicy> = state
             .policies
             .iter()
+            .filter(|(key, _)| key.target.region == region)
             .filter(|(key, _)| key.target.service_namespace == input.service_namespace)
             .filter(|(key, _)| {
                 input
@@ -268,12 +274,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         let (scaling_policies, next_token) = take_page(matching, page_size, |policy| {
-            encode_next_token(&[
-                &policy.service_namespace,
-                &policy.resource_id,
-                &policy.scalable_dimension,
-                &policy.policy_name,
-            ])
+            encode_next_token(
+                &region,
+                &[
+                    &policy.service_namespace,
+                    &policy.resource_id,
+                    &policy.scalable_dimension,
+                    &policy.policy_name,
+                ],
+            )
         });
 
         Ok(DescribeScalingPoliciesOutput {

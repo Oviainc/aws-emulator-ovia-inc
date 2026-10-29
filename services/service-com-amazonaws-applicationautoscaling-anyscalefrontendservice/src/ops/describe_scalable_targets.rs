@@ -203,13 +203,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let page_size = page_size(input.max_results).map_err(validation)?;
 
+        // A scaling policy whose alarm is in ALARM was owed its execution from the instant
+        // that alarm transitioned, so it is performed BEFORE this report is built: the
+        // capacity it moved is part of what the target reports now, not of the next read.
+        // The Region the request was sent to is also the only Region it reports over.
+        let region = crate::state::request_region(ctx.parts());
+        crate::state::policy_execution::settle_policy_executions(&*self.engine, &region);
+
         // A `NextToken` carries the identity of the last target the previous page
         // emitted, so this page resumes at the next key in order. A token this service
         // did not issue is refused rather than silently read as "from the start".
         let resume_after = match input.next_token.as_deref() {
             None => None,
             Some(token) => {
-                let Some(fields) = decode_next_token(token, 3) else {
+                let Some(fields) = decode_next_token(token, &region, 3) else {
                     return Err(DescribeScalableTargetsErrorModeled::InvalidNextTokenException(
                         InvalidNextTokenException {
                             message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
@@ -218,18 +225,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 };
                 Some(TargetKey {
+                    region: region.clone(),
                     service_namespace: fields[0].clone(),
                     resource_id: fields[1].clone(),
                     scalable_dimension: fields[2].clone(),
                 })
             }
         };
-
-        // A scaling policy whose alarm is in ALARM was owed its execution from the instant
-        // that alarm transitioned, so it is performed BEFORE this report is built: the
-        // capacity it moved is part of what the target reports now, not of the next read.
-        let region = crate::state::request_region(ctx.parts());
-        crate::state::policy_execution::settle_policy_executions(&*self.engine, &region);
 
         let mut state = state.lock();
         // A scheduled action's occurrence moves the target's capacity bounds, and it was
@@ -239,6 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let matching: Vec<ScalableTarget> = state
             .targets
             .iter()
+            .filter(|(key, _)| key.region == region)
             .filter(|(key, _)| key.service_namespace == input.service_namespace)
             .filter(|(key, _)| match input.resource_ids.as_deref() {
                 // An absent or empty `ResourceIds` does not narrow the result: the
@@ -258,11 +261,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         let (scalable_targets, next_token) = take_page(matching, page_size, |target| {
-            encode_next_token(&[
-                &target.service_namespace,
-                &target.resource_id,
-                &target.scalable_dimension,
-            ])
+            encode_next_token(
+                &region,
+                &[
+                    &target.service_namespace,
+                    &target.resource_id,
+                    &target.scalable_dimension,
+                ],
+            )
         });
         drop(state);
 
