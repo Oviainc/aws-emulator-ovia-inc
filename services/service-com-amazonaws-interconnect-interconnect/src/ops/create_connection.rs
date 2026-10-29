@@ -488,7 +488,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             billing_tier: None,
             owner_account: ::emulator_server::emulator_account_id().to_string(),
             activation_key: activation_key.clone(),
-            tags: input.tags.clone(),
+            // Held the way every writer of a tag set here holds one
+            // (`crate::state::stored_tag_set`): the entries the request carries, and
+            // "no tags" in its one representation — so a create carrying a `tags`
+            // map with no entries in it leaves the connection exactly as a create
+            // carrying no `tags` member does, and neither reads back differently
+            // from the other or from what the tagging operations leave.
+            tags: crate::state::stored_tag_set(input.tags.as_ref()),
         };
 
         // Keep the record count bounded as well as the live-connection count: at

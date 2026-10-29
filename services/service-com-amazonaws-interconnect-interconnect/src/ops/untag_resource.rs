@@ -216,18 +216,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Only the listed keys go; the rest of the map is untouched. A resource left
-        // with no tags holds `None`, which is how a connection created without tags
-        // is stored, so "no tags" has ONE representation in the store however it was
-        // reached.
-        if let Some(tags) = stored.connection.tags.as_mut() {
-            for key in &input.tag_keys {
-                tags.remove(key);
-            }
-            if tags.is_empty() {
-                stored.connection.tags = None;
-            }
-        }
+        // Only the listed keys go; the rest of the map is untouched. The one rule
+        // every writer of a tag set here follows (`crate::state::untag_tags`) leaves
+        // the result in the single representation "no tags" has in the store, which
+        // is how a connection created without tags is held, so that state reads back
+        // the same however it was reached.
+        crate::state::untag_tags(&mut stored.connection.tags, &input.tag_keys);
 
         Ok(UntagResourceOutput {})
     }

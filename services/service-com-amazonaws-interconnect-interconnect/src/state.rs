@@ -262,8 +262,12 @@ pub struct IdempotentCreate {
     pub description: Option<String>,
     /// `CreateConnection$remoteAccount` as it was sent, absent included.
     pub remote_account: Option<RemoteAccountIdentifier>,
-    /// `CreateConnection$tags` as they were sent, absent included.
-    pub tags: Option<std::collections::HashMap<String, String>>,
+    /// The tag set `CreateConnection$tags` asked for, in the one representation this
+    /// service holds a tag set in ([`stored_tag_set`]) — so the comparison below
+    /// judges the tag set the create ASKED FOR, which a `tags` map with no entries
+    /// and no `tags` member at all are equally a request for, rather than which of
+    /// the two spellings carried it.
+    pub tags: StoredTagSet,
 }
 
 /// Whether `stored` is a connection a request signed for `region` can see.
@@ -288,20 +292,24 @@ impl IdempotentCreate {
             attach_point: input.attach_point.clone(),
             description: input.description.clone(),
             remote_account: input.remote_account.clone(),
-            tags: input.tags.clone(),
+            tags: stored_tag_set(input.tags.as_ref()),
         }
     }
 
     /// Whether a repeated request is the SAME request this token created a
     /// connection for: every member of the create the caller owns compared, absence
     /// included, so a repeat differing in any one of them is a different request.
+    ///
+    /// The tag set is compared as the set the create ASKED FOR ([`stored_tag_set`]),
+    /// which is what the connection the token names was given: two spellings of "no
+    /// tags" ask for the same set, so neither is a different request from the other.
     pub fn matches(&self, input: &CreateConnectionInput) -> bool {
         self.environment_id == input.environment_id
             && self.bandwidth == input.bandwidth
             && attach_point_eq(&self.attach_point, &input.attach_point)
             && self.description == input.description
             && remote_account_eq(self.remote_account.as_ref(), input.remote_account.as_ref())
-            && self.tags == input.tags
+            && self.tags == stored_tag_set(input.tags.as_ref())
     }
 }
 
@@ -1323,6 +1331,60 @@ pub fn tag_write_violation(
     None
 }
 
+/// A resource's tag set as this service HOLDS it: the entries it carries, or `None`
+/// for a resource carrying none.
+pub type StoredTagSet = Option<std::collections::HashMap<String, String>>;
+
+/// How a tag set a request supplied is HELD: a set with entries is stored as it is,
+/// and a set with NO entries is stored as `None`.
+///
+/// "No tags" therefore has exactly ONE representation in the store — `None`, which is
+/// how a resource created without a `tags` member is held and what [`untag_tags`]
+/// leaves once the last key goes — so a tag map a request carries with no entries in
+/// it is the same input as no `tags` member at all, and every later read reports one
+/// wire form for that one state however it was reached. Every writer of a tag set
+/// normalises here, so no path can store the second, empty-map form.
+pub fn stored_tag_set(
+    supplied: Option<&std::collections::HashMap<String, String>>,
+) -> StoredTagSet {
+    supplied.filter(|tags| !tags.is_empty()).cloned()
+}
+
+/// Merge `supplied` into the tag set a resource `held`: each key the request carries
+/// is written over whatever the resource held for it, and every key the request does
+/// not name keeps the value it had.
+///
+/// Merge, never replace — so a request carrying no tag at all adds nothing — and the
+/// result is left in the one representation [`stored_tag_set`] defines, so a merge
+/// that writes nothing cannot turn "no tags" into an empty map.
+pub fn merge_tags(
+    held: &mut StoredTagSet,
+    supplied: Option<&std::collections::HashMap<String, String>>,
+) {
+    let Some(supplied) = stored_tag_set(supplied) else {
+        return;
+    };
+    held.get_or_insert_with(std::collections::HashMap::new)
+        .extend(supplied);
+}
+
+/// Remove `keys` from the tag set a resource `held`: only the listed keys go, and the
+/// rest of the map is untouched.
+///
+/// The result is left in the one representation [`stored_tag_set`] defines, so a
+/// resource whose last key has just been removed holds "no tags" the same way one
+/// created without any does.
+pub fn untag_tags(held: &mut StoredTagSet, keys: &[String]) {
+    if let Some(tags) = held.as_mut() {
+        for key in keys {
+            tags.remove(key);
+        }
+        if tags.is_empty() {
+            *held = None;
+        }
+    }
+}
+
 /// The terminal `ConnectionState` a completed `DeleteConnection` settles into.
 pub const DELETED_CONNECTION_STATE: &str = "deleted";
 
@@ -1432,15 +1494,10 @@ pub fn apply_acceptance(
     if let Some(description) = description {
         stored.connection.description = description.clone();
     }
-    // "No tags" keeps its one representation in the store (`None`) when the request
-    // carries none.
-    if let Some(tags) = tags.filter(|tags| !tags.is_empty()) {
-        stored
-            .connection
-            .tags
-            .get_or_insert_with(std::collections::HashMap::new)
-            .extend(tags.iter().map(|(key, value)| (key.clone(), value.clone())));
-    }
+    // The tags the acceptance carries are written by the one rule every writer of a
+    // tag set here follows ([`merge_tags`]): merge, never replace, and "no tags" keeps
+    // its single representation in the store when the request carries none.
+    merge_tags(&mut stored.connection.tags, tags);
     stored.proposal_accepted = true;
     stored.connection.state = ACCEPTED_CONNECTION_STATE.to_string();
     stored.pending_transition = owed_progression(ACCEPTED_CONNECTION_STATE, now);

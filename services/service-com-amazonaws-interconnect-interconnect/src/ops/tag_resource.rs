@@ -231,25 +231,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Merge, never replace: each key the request carries is written over
-        // whatever the resource held for it, and every key the request does not name
-        // keeps the value it had. "No tags" has ONE representation in the store
-        // (`None` — how a connection created without tags is held, and what
-        // `UntagResource` leaves once the last key goes), so a request carrying no
-        // tag leaves that representation alone instead of turning it into an empty
-        // map.
-        if !input.tags.is_empty() {
-            stored
-                .connection
-                .tags
-                .get_or_insert_with(::std::collections::HashMap::new)
-                .extend(
-                    input
-                        .tags
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value.clone())),
-                );
-        }
+        // Merge, never replace, by the one rule every writer of a tag set here
+        // follows (`crate::state::merge_tags`): each key the request carries is
+        // written over whatever the resource held for it, every key the request does
+        // not name keeps the value it had, and "no tags" keeps its single
+        // representation in the store, so a request carrying no tag leaves that
+        // representation alone instead of turning it into an empty map.
+        crate::state::merge_tags(&mut stored.connection.tags, Some(&input.tags));
 
         Ok(TagResourceOutput {})
     }

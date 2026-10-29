@@ -452,6 +452,40 @@ pub(crate) async fn create_with_tags_in(
     seed: usize,
     tags: &std::collections::BTreeMap<String, String>,
 ) -> Value {
+    let member = (!tags.is_empty()).then(|| json!(tags));
+    create_with_tag_member(emulator, region, placement, seed, member.as_ref()).await
+}
+
+/// [`create_with_tags_in`] with the request's `tags` member supplied VERBATIM, and
+/// left OUT altogether for `None` — so a suite can send the forms a map of entries
+/// cannot express, a `tags` member carrying no entries among them.
+pub(crate) async fn create_with_tag_member(
+    emulator: &Emulator,
+    region: &str,
+    placement: &(String, String),
+    seed: usize,
+    tags: Option<&Value>,
+) -> Value {
+    let request = create_request(emulator, placement, seed, tags, None).await;
+    let created = emulator.ic_ok_in(region, "CreateConnection", request).await;
+    created["connection"].clone()
+}
+
+/// ONE `CreateConnection` request body, which every create the shared harness makes
+/// is built from: the placement, an attach point that is a gateway of the account, a
+/// description distinguished by `seed`, the identifying information the Environment
+/// asks for, the `tags` member verbatim (`None` leaving it out) and `client_token`
+/// when the suite names one.
+///
+/// Handed back rather than posted, so a suite can send the SAME body twice — which is
+/// what judging a repeated `clientToken` takes.
+pub(crate) async fn create_request(
+    emulator: &Emulator,
+    placement: &(String, String),
+    seed: usize,
+    tags: Option<&Value>,
+    client_token: Option<&str>,
+) -> Value {
     let mut request = Map::new();
     request.insert("environmentId".to_string(), json!(placement.0));
     request.insert("bandwidth".to_string(), json!(placement.1));
@@ -463,13 +497,13 @@ pub(crate) async fn create_with_tags_in(
     if let Some(remote_account) = remote_account_for(&emulator.environment(&placement.0).await) {
         request.insert("remoteAccount".to_string(), remote_account);
     }
-    if !tags.is_empty() {
-        request.insert("tags".to_string(), json!(tags));
+    if let Some(tags) = tags {
+        request.insert("tags".to_string(), tags.clone());
     }
-    let created = emulator
-        .ic_ok_in(region, "CreateConnection", Value::Object(request))
-        .await;
-    created["connection"].clone()
+    if let Some(token) = client_token {
+        request.insert("clientToken".to_string(), json!(token));
+    }
+    Value::Object(request)
 }
 
 /// The `tags` member of a `Connection` or of a `ListTagsForResource` response, with
