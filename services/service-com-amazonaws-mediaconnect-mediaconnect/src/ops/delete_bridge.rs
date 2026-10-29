@@ -5,6 +5,14 @@
 //! Deletes one bridge out of [`crate::state`] and answers with the ARN of the bridge it
 //! deleted: DescribeBridge stops answering for that bridge afterwards.
 //!
+//! The delete is refused with the modelled `BadRequestException` (400), and the bridge left
+//! intact, while a FLOW the store holds takes its content from the bridge in a flow source:
+//! that reference is a required member of the stored source and every path that writes one
+//! resolves it against this store, so taking the bridge away would leave the flow source
+//! pointing at nothing — see
+//! [`crate::state::ComAmazonawsMediaconnectMediaconnectState::bridge_gateway_source_rejection`],
+//! the mirror of the refusal DeleteFlow answers while a bridge source names the flow.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -190,6 +198,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::BRIDGE_STATE_STANDBY,
                         "DELETE",
                     ),
+                },
+            )
+            .into());
+        }
+
+        // A flow's source fed by this bridge names it in a REQUIRED member, resolved against
+        // this store by every path that writes such a source, so a reference that outlived the
+        // bridge could not be dropped off the flow source and no later call could restate it.
+        // The delete is refused while one exists, exactly as it is for the mirror reference a
+        // bridge source holds on a flow
+        // (`crate::state::ComAmazonawsMediaconnectMediaconnectState::flow_bridge_source_rejection`)
+        // and for the router network interface a router record ingests on
+        // (`crate::state::ComAmazonawsMediaconnectMediaconnectState::associated_router_resource_rejection`),
+        // and the bridge is left exactly as it was.
+        if let Some(detail) = store.bridge_gateway_source_rejection(&input.bridge_arn) {
+            return Err(DeleteBridgeErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: crate::state::bad_request_message(&detail),
                 },
             )
             .into());

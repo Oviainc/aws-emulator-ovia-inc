@@ -5984,7 +5984,9 @@ impl ComAmazonawsMediaconnectMediaconnectState {
 
     /// Whether the store holds the bridge `arn` — the bridge-level counterpart of
     /// [`Self::holds_flow`]. A bridge leaves the store when DeleteBridge takes it out, so a
-    /// reference to a deleted bridge resolves nothing.
+    /// reference to a deleted bridge resolves nothing — which is why that removal is refused
+    /// while a stored flow source names the bridge
+    /// ([`Self::bridge_gateway_source_rejection`]).
     pub fn holds_bridge(&self, arn: &str) -> bool {
         self.bridges.contains_key(arn)
     }
@@ -6041,7 +6043,8 @@ impl ComAmazonawsMediaconnectMediaconnectState {
     /// account-level half of the references a source carries, whose flow-local half
     /// [`source_request_reference_rejection`] resolves. Every operation that writes one
     /// (CreateFlow's `Source` / `Sources`, AddFlowSources, UpdateFlowSource) resolves it
-    /// HERE, so a stored source never names a bridge the account has not got — the same
+    /// HERE, so a stored source never names a bridge the account has not got — kept true on
+    /// the removal side by [`Self::bridge_gateway_source_rejection`], and the same
     /// reading every other cross-resource ARN this store holds is resolved by
     /// ([`Self::unknown_flow_rejection`] for a bridge flow source's `FlowArn`,
     /// [`Self::unknown_router_network_interface_rejection`] for a router configuration's
@@ -6405,6 +6408,52 @@ impl ComAmazonawsMediaconnectMediaconnectState {
                         .flow_source
                         .as_ref()
                         .is_some_and(|flow_source| flow_source.flow_arn == flow_arn)
+                })
+            })
+            .count()
+    }
+
+    /// Why the bridge `bridge_arn` cannot be taken out of the store yet, or `None` when no
+    /// flow source the store holds names it.
+    ///
+    /// The bridge-side mirror of [`Self::flow_bridge_source_rejection`], and the same reading
+    /// of the same two halves: a flow source fed by a bridge names that bridge in a REQUIRED
+    /// member (`GatewayBridgeSource$BridgeArn`, "the ARN of the bridge feeding this flow"), and
+    /// every path that writes such a source resolves that member against this store rather
+    /// than taking it on trust ([`Self::source_bridge_reference_rejection`], called by
+    /// CreateFlow's `Source` / `Sources`, AddFlowSources and UpdateFlowSource). Taking the
+    /// bridge away while a flow source still names it would therefore leave that source
+    /// holding a reference nothing resolves ([`Self::holds_bridge`]), which no later call
+    /// could even restate; and unlike the optional router references a removal DROPS
+    /// ([`Self::clear_unresolvable_flow_references`]), a required member cannot be dropped off
+    /// the record. So the removal is refused while a flow source names the bridge, and the
+    /// caller clears the reference first, by removing those flow sources, pointing them at
+    /// another bridge or deleting the flows.
+    pub fn bridge_gateway_source_rejection(&self, bridge_arn: &str) -> Option<String> {
+        let flows = self.gateway_bridge_source_flow_count(bridge_arn);
+        if flows == 0 {
+            return None;
+        }
+        Some(format!(
+            "Bridge {bridge_arn} is still the source of {flows} flow(s). Remove those flow \
+             sources, point them at another bridge, or delete the flows, before deleting the \
+             bridge."
+        ))
+    }
+
+    /// How many flows hold a source whose gateway bridge source names the bridge
+    /// `bridge_arn` — the store's ONE reading of that relation, which
+    /// [`Self::bridge_gateway_source_rejection`] states its refusal from, counting HOLDERS
+    /// the way [`Self::bridge_flow_source_count`] counts them on the mirror side.
+    pub fn gateway_bridge_source_flow_count(&self, bridge_arn: &str) -> usize {
+        self.flows
+            .values()
+            .filter(|flow| {
+                flow.sources.iter().any(|source| {
+                    source
+                        .gateway_bridge_source
+                        .as_ref()
+                        .is_some_and(|bridge_source| bridge_source.bridge_arn == bridge_arn)
                 })
             })
             .count()
