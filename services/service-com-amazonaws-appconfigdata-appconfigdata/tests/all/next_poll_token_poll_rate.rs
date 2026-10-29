@@ -7,7 +7,7 @@
 //! presented before the poll interval the session negotiated has elapsed since the
 //! token was minted. Such a presentation is refused with the modelled
 //! `BadRequestException` (400), and the refusal has NO effect — it serves no
-//! configuration, rotates no token and consumes nothing, so the very same token is
+//! configuration, rotates no token and records nothing, so the very same token is
 //! accepted once the interval has passed. A session that negotiated no floor of its own
 //! has nothing to enforce, and a brand-new session is never made to wait: the
 //! obligation is per token, not per configuration.
@@ -288,15 +288,15 @@ fn assert_too_early(reply: &Reply, name: &str, attempt: &str) {
 /// not been marked as having served a call.
 fn assert_token_usable(emulator: &Emulator, token: &str, name: &str, attempt: &str) {
     let state = emulator.state();
-    let consumed = state
+    let served = state
         .lock()
         .sessions
         .get(token)
-        .map(|session| session.is_consumed());
+        .map(|session| session.has_served_a_poll());
     assert_eq!(
-        consumed,
+        served,
         Some(false),
-        "case {name}: {attempt} must leave the token usable, store says {consumed:?}"
+        "case {name}: {attempt} must leave the token usable, store says {served:?}"
     );
 }
 

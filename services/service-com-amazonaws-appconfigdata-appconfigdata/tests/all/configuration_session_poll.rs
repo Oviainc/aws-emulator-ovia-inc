@@ -25,11 +25,11 @@
 //! * a poll returns the content of the configuration version the environment's
 //!   in-force deployment deployed, with that version's content type and label, only
 //!   when it differs from the version the session was last served; otherwise the
-//!   payload is empty. Every poll returns a fresh single-use token and a non-zero poll
-//!   interval;
-//! * a token that resolves to no session, or that has been used or has expired, is
-//!   refused with `BadRequestException` (400) whose `Details.InvalidParameters` is
-//!   keyed by the offending input MEMBER and names the modelled problem;
+//!   payload is empty. Every poll returns a fresh token, usable for its own lifetime,
+//!   and a non-zero poll interval;
+//! * a token that resolves to no session, or whose lifetime has run out, is refused
+//!   with `BadRequestException` (400) whose `Details.InvalidParameters` is keyed by the
+//!   offending input MEMBER and names the modelled problem;
 //! * an absent `@required` input member is `BadRequestException` (400) whose `Message`
 //!   is the validation envelope naming that member and the constraint it failed —
 //!   never a 501, and never a 400 with no message.
@@ -149,7 +149,7 @@ impl Emulator {
 
     /// `GET /configuration` with whatever query string is given — `None` for a request
     /// that carries no `configuration_token` parameter at all.
-    async fn get_configuration(&self, query: Option<&str>) -> Reply {
+    pub(crate) async fn get_configuration(&self, query: Option<&str>) -> Reply {
         let path = match query {
             Some(query) => format!("/configuration?{query}"),
             None => "/configuration".to_string(),
@@ -998,15 +998,13 @@ async fn a_poll_with_nothing_in_force_for_its_profile_is_not_found() {
 enum TokenState {
     /// A syntactically valid token this emulator never minted.
     NeverMinted(&'static str),
-    /// A token that already served a poll.
-    AlreadyUsed,
     /// A token whose 24-hour lifetime has passed.
     Expired,
 }
 
-/// A token resolves to exactly one session and is good for exactly one call: anything
-/// else is `BadRequestException` (400) naming the modelled problem, under the input
-/// member the client got wrong.
+/// A token resolves to exactly one session and stays usable for as long as its lifetime
+/// lasts: anything else is `BadRequestException` (400) naming the modelled problem,
+/// under the input member the client got wrong.
 #[tokio::test]
 async fn an_unusable_token_is_refused_with_the_modelled_problem() {
     // `Corrupted` / `Expired` are two of the three modelled
@@ -1030,7 +1028,6 @@ async fn an_unusable_token_is_refused_with_the_modelled_problem() {
             TokenState::NeverMinted("x"),
             "Corrupted",
         ),
-        ("token already used for a poll", TokenState::AlreadyUsed, "Expired"),
         ("token past its 24-hour lifetime", TokenState::Expired, "Expired"),
     ];
 
@@ -1045,23 +1042,6 @@ async fn an_unusable_token_is_refused_with_the_modelled_problem() {
 
         let token = match state {
             TokenState::NeverMinted(token) => token.to_string(),
-            TokenState::AlreadyUsed => {
-                let token = emulator
-                    .session_token(
-                        &hierarchy.application_name,
-                        &hierarchy.environment_name,
-                        &hierarchy.profile_name,
-                    )
-                    .await;
-                let used = emulator.get_latest_configuration(&token).await;
-                assert_eq!(
-                    used.status, 200,
-                    "case {name}: the first poll must succeed, got {} body {}",
-                    used.status,
-                    used.text()
-                );
-                token
-            }
             TokenState::Expired => {
                 let token = emulator
                     .session_token(
@@ -1431,7 +1411,7 @@ async fn a_sessions_minimum_poll_interval_is_reported_and_enforced() {
             let state = emulator.state();
             let session = state.lock().session(&next).cloned();
             assert_eq!(
-                session.map(|session| session.is_consumed()),
+                session.map(|session| session.has_served_a_poll()),
                 Some(false),
                 "case {name}: a refused poll must leave the token usable"
             );

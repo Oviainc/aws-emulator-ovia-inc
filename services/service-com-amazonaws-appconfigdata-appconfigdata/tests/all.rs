@@ -21,3 +21,5 @@ mod next_poll_token_poll_rate;
 mod session_requires_a_deployment;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/token_validation_and_lifetime.rs"]
+mod token_validation_and_lifetime;

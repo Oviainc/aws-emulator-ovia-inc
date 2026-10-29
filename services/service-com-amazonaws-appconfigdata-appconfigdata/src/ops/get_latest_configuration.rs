@@ -2,7 +2,7 @@
 
 //! @op GetLatestConfiguration
 //!
-//! Implemented: resolves the single-use configuration token to its persisted session,
+//! Implemented: resolves the configuration token to its persisted session,
 //! then reads the AppConfig control plane for the configuration version deployed into
 //! the session's (application, environment, configuration profile) triple and returns
 //! the content only when that version differs from the one the session was last
@@ -164,6 +164,20 @@ const CONFIGURATION_TOKEN_MEMBER: &str = "ConfigurationToken";
 /// request carried a parameter the service could not use.
 const REASON_INVALID_PARAMETERS: &str = "InvalidParameters";
 
+/// What AppConfigData says when a request supplies no usable `ConfigurationToken`.
+///
+/// The service's OWN fixed text for that member rather than the standard validation
+/// envelope: the member is bound to the query string
+/// (`@httpQuery(configuration_token)`), so there is no body member for a caller to
+/// correct, and the sentence names the operation that mints a token instead. It carries
+/// nothing from the request.
+///
+/// Read by [`crate::service`] too, for the request that omits the parameter altogether —
+/// which never reaches this handler, because the member is `@required` — so both ways of
+/// supplying no token are answered in one wording.
+pub(crate) const CONFIGURATION_TOKEN_REQUIRED_MESSAGE: &str = "ConfigurationToken must be provided. \
+     Use the StartConfigurationSession API to obtain an InitialConfigurationToken";
+
 /// The modelled `InvalidParameterProblem` values, as `INVALID_PARAMETER_PROBLEM_VALUES`
 /// in `crate::ops::types` lists them, paired with the terse sentence AppConfigData
 /// states each one with.
@@ -217,6 +231,29 @@ fn bad_configuration_token(problem: &str) -> GetLatestConfigurationError {
     .into()
 }
 
+/// Refuse the call because the request supplied no usable value for the one `@required`
+/// input member — the modelled `BadRequestException` (HTTP 400), with
+/// [`CONFIGURATION_TOKEN_REQUIRED_MESSAGE`] and NO `Reason` or `Details`.
+///
+/// This is a refusal of the REQUEST, not a verdict about a token: the modelled
+/// `InvalidParameterProblem` values (`Corrupted`, `Expired`,
+/// `PollIntervalNotSatisfied`) each describe a token the caller presented, and a caller
+/// that presented none has nothing for them to describe — so attaching one would tell a
+/// client to restart a configuration session when what it has to fix is its own request.
+fn configuration_token_required() -> GetLatestConfigurationError {
+    tracing::debug!(
+        operation = "GetLatestConfiguration",
+        outcome = "BadRequestException",
+        "refused a request that supplied no configuration token"
+    );
+    GetLatestConfigurationErrorModeled::BadRequestException(BadRequestException {
+        message: Some(CONFIGURATION_TOKEN_REQUIRED_MESSAGE.to_string()),
+        reason: None,
+        details: None,
+    })
+    .into()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for GetLatestConfiguration<Eng>
 {
@@ -245,6 +282,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
         let token = input.configuration_token;
 
+        // STEP 0 — a request that supplies no usable value for the token member supplied
+        // no token, and is refused as the validation failure it is BEFORE any lookup: the
+        // verdict path below answers for a token the caller actually presented. A blank
+        // value cannot be one — the member targets `Token`, whose modelled pattern is
+        // `^\S{1,8192}$` (smithy_query query="shape" shape="Token"), which no run of
+        // whitespace satisfies.
+        if token.trim().is_empty() {
+            return Err(configuration_token_required());
+        }
+
         // STEP 1 — resolve the token and check it may be used, under this service's
         // own lock, which is RELEASED before the control plane is read: the two stores
         // are taken one at a time, never nested.
@@ -257,15 +304,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(bad_configuration_token("Corrupted"));
             };
 
-            // A token is valid for exactly ONE call, and for at most `TOKEN_LIFETIME`
-            // after it was minted; past either, it can no longer be used: `Expired`.
+            // A token is usable for at most `TOKEN_LIFETIME` after it was minted; past
+            // that it can no longer be used: `Expired`.
             if let Some(expired) = expiry_refusal(&session, now) {
                 return Err(expired);
             }
 
             // Honour the floor the session asked for: a session that set
-            // `RequiredMinimumPollIntervalInSeconds` may not poll faster than that,
-            // and the refusal leaves the token UNCONSUMED so the client can poll again
+            // `RequiredMinimumPollIntervalInSeconds` may not poll faster than that, and
+            // the refusal serves nothing and rotates nothing, so the same token answers
             // once the interval has passed.
             //
             // ONE value feeds both the floor enforced here and the interval reported
@@ -318,16 +365,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so "unchanged" is a comparison, never an assumption.
         let already_has_latest = session.last_served_version.as_deref() == Some(&deployed.version);
 
-        // STEP 4 — rotate the token. The model's own doc for this operation says
-        // each token is valid for one call and "the GetLatestConfiguration response
-        // includes a NextPollConfigurationToken that should always replace the token
-        // used for the just-completed call", so minting the successor is what this
-        // call is defined to do. The successor carries the version just served, so
-        // the next poll's comparison is against what the client now holds.
+        // STEP 4 — rotate the token. The model's own doc for this operation says "the
+        // GetLatestConfiguration response includes a NextPollConfigurationToken that
+        // should always replace the token used for the just-completed call", so minting
+        // the successor is what this call is defined to do. The successor carries the
+        // version just served, so the next poll's comparison is against what the client
+        // now holds.
         //
-        // The token is re-checked under the lock it is consumed under: the control
-        // plane was read with no guard held, so another poll could have spent the same
-        // token in between, and a token is good for exactly one call.
+        // The token is re-checked under the lock the poll is recorded under: the control
+        // plane was read with no guard held, so the entry could have reached its expiry in
+        // between.
         let next_poll_configuration_token = {
             let mut state = state.lock();
             match state.session(&token) {
@@ -338,7 +385,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
             }
-            state.consume_token(&token, now);
+            state.record_token_use(&token, now);
             let mut next_session = session.clone();
             next_session.last_served_version = Some(deployed.version.clone());
             next_session.last_polled_at = Some(now);
@@ -395,14 +442,22 @@ fn required_minimum(session: &crate::state::Session) -> Option<i32> {
         .filter(|seconds| *seconds > 0)
 }
 
-/// Why `session`'s token can no longer be used, if it cannot: it has already served
-/// its one call, or its lifetime has passed. Both are `Expired`.
+/// Why `session`'s token can no longer be used, if it cannot: its lifetime has passed.
+///
+/// A token is bounded by TIME and by nothing else. The model's own doc for both
+/// `ConfigurationToken` and `NextPollConfigurationToken` says "To support long poll use
+/// cases, the token is valid for up to 24 hours. If a `GetLatestConfiguration` call uses
+/// an expired token, the system returns `BadRequestException`" — so the one thing that
+/// makes a token `Expired` is its mint instant against [`crate::state::TOKEN_LIFETIME`].
+/// "This token should only be used once" is guidance to the CLIENT about which token to
+/// present next, not a second expiry: a client that re-presents a token it still holds —
+/// the documented recovery after a poll whose response it failed to persist — is inside
+/// that token's lifetime and is served.
 fn expiry_refusal(
     session: &crate::state::Session,
     now: std::time::SystemTime,
 ) -> Option<GetLatestConfigurationError> {
-    (session.is_consumed() || now >= session.expires_at)
-        .then(|| bad_configuration_token("Expired"))
+    (now >= session.expires_at).then(|| bad_configuration_token("Expired"))
 }
 
 /// This service's own session store could not be reached.

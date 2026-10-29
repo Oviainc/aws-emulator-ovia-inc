@@ -95,31 +95,24 @@ fn configuration_token_path() -> String {
     path::member("ConfigurationToken")
 }
 
-/// What AppConfigData says when a request carries no `ConfigurationToken` at all.
-///
-/// The service's OWN fixed text for that member rather than the standard validation
-/// envelope: the member is bound to the query string
-/// (`@httpQuery(configuration_token)`), so there is no body member for a caller to
-/// correct, and the sentence names the operation that mints a token instead. It
-/// carries nothing from the request.
-const CONFIGURATION_TOKEN_REQUIRED_MESSAGE: &str = "ConfigurationToken must be provided. \
-     Use the StartConfigurationSession API to obtain an InitialConfigurationToken";
-
 /// How this service states the refusal `violations` describe, or `None` when they
 /// describe none.
 ///
 /// Every violation but one earns the standard request-derived validation envelope
 /// naming the member and the constraint it failed — built by the framework's own
 /// renderer, so an absent member and a value outside a modelled bound read one way. An
-/// absent `ConfigurationToken` earns the service's own sentence; see
-/// [`CONFIGURATION_TOKEN_REQUIRED_MESSAGE`].
+/// absent `ConfigurationToken` earns the service's own sentence, the same one the
+/// operation answers a blank value with; see
+/// [`crate::ops::get_latest_configuration::CONFIGURATION_TOKEN_REQUIRED_MESSAGE`].
 fn refusal_message(violations: &[Violation]) -> Option<String> {
     let absent_token = violations.iter().any(|violation| {
         violation.kind == ViolationKind::MissingRequiredMember
             && violation.path == configuration_token_path()
     });
     if absent_token {
-        return Some(CONFIGURATION_TOKEN_REQUIRED_MESSAGE.to_string());
+        return Some(
+            crate::ops::get_latest_configuration::CONFIGURATION_TOKEN_REQUIRED_MESSAGE.to_string(),
+        );
     }
     aws_smithy_schema_server::envelope(violations)
 }

@@ -5,9 +5,9 @@
 //! AppConfigData is a two-operation polling data plane, so the only thing it owns is
 //! one map: [`ComAmazonawsAppconfigdataAppconfigdataState::sessions`], every live
 //! configuration session keyed by the opaque token the client currently holds.
-//! `StartConfigurationSession` inserts one; each `GetLatestConfiguration` consumes the
-//! token it was called with and inserts the rotated successor, so the token a client
-//! holds is always resolvable until it is used or expires.
+//! `StartConfigurationSession` inserts one; each `GetLatestConfiguration` inserts the
+//! rotated successor of the token it was called with, so the token a client holds is
+//! always resolvable until that token's lifetime runs out.
 //!
 //! Everything else a poll answers with — which applications, environments and
 //! configuration profiles exist, which configuration version is deployed into an
@@ -54,18 +54,11 @@ pub const DEFAULT_POLL_INTERVAL_IN_SECONDS: i32 = 60;
 /// Every poll stores the successor token's session, so a client polling in a loop
 /// would otherwise grow the map for as long as the process lives. Expiry alone does
 /// not bound it — a token lives up to [`TOKEN_LIFETIME`] — so the store also keeps a
-/// hard cap, past which the entries that can no longer serve a poll are dropped
-/// first (consumed ones, then the ones nearest their expiry). A real client holds one
-/// token at a time, so the cap is reached only by a request loop, and the token it
-/// is holding is the last thing evicted.
+/// hard cap, past which the entries least likely to serve another poll are dropped
+/// first (the ones that have already served one, then the ones nearest their expiry). A
+/// real client holds one token at a time, so the cap is reached only by a request loop,
+/// and the token it is holding is the last thing evicted.
 pub const MAX_SESSIONS: usize = 4_096;
-
-/// How long a consumed token's entry is kept after the poll that used it.
-///
-/// It is kept only so a client that retries the token it just used is told `Expired`
-/// rather than `Corrupted`; both are the same modelled `BadRequestException` with the
-/// same 400, so reclaiming the entry afterwards changes no status and no error code.
-pub const CONSUMED_TOKEN_RETENTION: Duration = Duration::from_secs(5 * 60);
 
 /// When a token minted at `now` stops being usable.
 ///
@@ -80,9 +73,9 @@ fn expiry(now: SystemTime) -> SystemTime {
 /// One configuration session: the triple it polls, the poll floor it asked for, and
 /// how far through the configuration's version history the client has been served.
 ///
-/// A session is stored once per token: rotating a token moves the (updated) session
-/// to a new key and marks the old entry consumed, so a replayed token is
-/// distinguishable from one that was never issued.
+/// A session is stored once per token: rotating a token stores the (updated) session
+/// under a new key and records the poll on the old entry, which stays usable for the
+/// rest of its own lifetime.
 #[derive(Debug, Clone)]
 pub struct Session {
     /// `ApplicationIdentifier` as the session was started with.
@@ -104,16 +97,19 @@ pub struct Session {
     /// When this session was last polled, which is what the session's own minimum
     /// poll interval is measured from. `None` until the first poll.
     pub last_polled_at: Option<SystemTime>,
-    /// When the token this entry is keyed by was used for a poll, if it was. A token
-    /// is valid for exactly one call, so an entry with a consumption instant is
-    /// refused — and reclaimed [`CONSUMED_TOKEN_RETENTION`] later.
-    pub consumed_at: Option<SystemTime>,
+    /// When the token this entry is keyed by was last used for a poll, if it has been.
+    /// A token is bounded by its lifetime and by nothing else, so this refuses no poll:
+    /// it records what the entry has already done, which is what orders eviction when
+    /// the store is at its cap ([`MAX_SESSIONS`]).
+    pub last_used_at: Option<SystemTime>,
 }
 
 impl Session {
-    /// Whether the token this entry is keyed by has already served a poll.
-    pub fn is_consumed(&self) -> bool {
-        self.consumed_at.is_some()
+    /// Whether the token this entry is keyed by has already served a poll — so the
+    /// client was handed a successor to present instead, and this entry is the one the
+    /// store gives up first when it has to give one up.
+    pub fn has_served_a_poll(&self) -> bool {
+        self.last_used_at.is_some()
     }
 
     /// When this entry was last touched: the poll that minted its token, or — for a
@@ -154,7 +150,7 @@ impl ComAmazonawsAppconfigdataAppconfigdataState {
             created_at: now,
             expires_at: expiry(now),
             last_polled_at: None,
-            consumed_at: None,
+            last_used_at: None,
         };
         self.store_session(session, now)
     }
@@ -163,14 +159,14 @@ impl ComAmazonawsAppconfigdataAppconfigdataState {
     ///
     /// Used both to start a session and to rotate one: the caller updates the
     /// session it read (its served version, its poll instant) and stores it back,
-    /// which is what gives the client a new single-use token pointing at the
-    /// progressed session. Storing also reclaims the entries this one supersedes,
-    /// so repeated polling cannot grow the store without limit.
+    /// which is what gives the client a fresh token pointing at the progressed
+    /// session. Storing also reclaims the entries whose lifetime has run out, so
+    /// repeated polling cannot grow the store without limit.
     pub fn store_session(&mut self, mut session: Session, now: SystemTime) -> String {
         self.reclaim_sessions(now);
         let token = self.mint_token(now);
         session.expires_at = expiry(now);
-        session.consumed_at = None;
+        session.last_used_at = None;
         self.sessions.insert(token.clone(), session);
         token
     }
@@ -180,35 +176,29 @@ impl ComAmazonawsAppconfigdataAppconfigdataState {
         self.sessions.get(token)
     }
 
-    /// Mark `token` used at `now`, so a second call with it is not taken for a fresh
-    /// poll.
-    pub fn consume_token(&mut self, token: &str, now: SystemTime) {
+    /// Record that `token` served a poll at `now`.
+    ///
+    /// It stays usable until its own expiry — the model bounds a token by time, not by
+    /// use — so this changes no verdict; it is what tells the store which entries to
+    /// give up first at its cap ([`Session::has_served_a_poll`]).
+    pub fn record_token_use(&mut self, token: &str, now: SystemTime) {
         if let Some(session) = self.sessions.get_mut(token) {
-            session.consumed_at = Some(now);
+            session.last_used_at = Some(now);
         }
     }
 
     /// Drop the session entries that can no longer serve a poll, and hold the store
     /// to [`MAX_SESSIONS`].
     ///
-    /// Three classes go, in order: an entry past its own expiry (its token is refused
-    /// either way), a consumed entry older than [`CONSUMED_TOKEN_RETENTION`], and —
-    /// only if the store is still at the cap — the LEAST RECENTLY TOUCHED entries:
-    /// consumed ones first, then the ones whose token was minted or last polled
-    /// longest ago. So under a mint flood an idle session is evicted before an active
-    /// one, and the entry the current call is about to store always survives it; a
-    /// client that holds one token at a time never reaches the cap at all.
+    /// Two classes go, in order: an entry past its own expiry (its token is refused
+    /// either way), and — only if the store is still at the cap — the entries least
+    /// likely to serve another poll: the ones that have already served one first, then
+    /// the ones whose token was minted longest ago. So under a mint flood an idle
+    /// session is evicted before an active one, and the entry the current call is about
+    /// to store always survives it; a client that holds one token at a time never
+    /// reaches the cap at all.
     fn reclaim_sessions(&mut self, now: SystemTime) {
-        self.sessions.retain(|_, session| {
-            if now >= session.expires_at {
-                return false;
-            }
-            session.consumed_at.is_none_or(|consumed_at| {
-                consumed_at
-                    .checked_add(CONSUMED_TOKEN_RETENTION)
-                    .is_none_or(|until| now < until)
-            })
-        });
+        self.sessions.retain(|_, session| now < session.expires_at);
         // One slot for the entry about to be stored.
         if self.sessions.len() < MAX_SESSIONS {
             return;
@@ -218,11 +208,16 @@ impl ComAmazonawsAppconfigdataAppconfigdataState {
             .sessions
             .iter()
             .map(|(token, session)| {
-                (!session.is_consumed(), session.last_touched_at(), token.clone())
+                (
+                    !session.has_served_a_poll(),
+                    session.last_touched_at(),
+                    token.clone(),
+                )
             })
             .collect();
-        // `!is_consumed` sorts the consumed entries first, then the oldest activity;
-        // the token breaks a tie so eviction does not depend on hash order.
+        // `!has_served_a_poll` sorts the entries that already served one first, then the
+        // oldest activity; the token breaks a tie so eviction does not depend on hash
+        // order.
         candidates.sort();
         for (_, _, token) in candidates.into_iter().take(excess) {
             self.sessions.remove(&token);
