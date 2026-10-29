@@ -45,6 +45,8 @@ mod policy_language_immutability;
 mod policy_read_projection;
 #[path = "all/policy_type.rs"]
 mod policy_type;
+#[path = "all/refused_parameter_element_names.rs"]
+mod refused_parameter_element_names;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
 #[path = "all/schedule_retention_floor.rs"]

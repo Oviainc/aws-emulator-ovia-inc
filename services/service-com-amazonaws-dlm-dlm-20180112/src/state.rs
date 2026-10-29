@@ -1136,6 +1136,30 @@ pub fn configuration_stated_twice(body_parameters: &[String]) -> InvalidRequestE
 /// alternative to.
 pub const POLICY_DETAILS_MEMBER: &str = "PolicyDetails";
 
+/// How a parameter name this service reports points at ONE element of a
+/// collection: the collection member's own name, SUBSCRIPTED by the key that
+/// picks the element out of it — a list element's 1-based position
+/// ([`element_key`]), a map entry's key.
+///
+/// Every layer that names a refused parameter spells an element through here —
+/// the constraint walk's path as `crate::service` renders it, and the
+/// cross-member rules below — so one element of one collection is named one way
+/// in `Message` and in `RequiredParameters` whichever of them refused the
+/// request, and a caller needs one convention to find the field it must correct.
+pub fn collection_element(collection: &str, key: &str) -> String {
+    format!("{collection}[{key}]")
+}
+
+/// The key that picks the element at the 0-based `index` out of a list: 1-based,
+/// as the validation path a request is walked along numbers a list element.
+pub fn element_key(index: usize) -> String {
+    (index + 1).to_string()
+}
+
+/// The wire name of the `PolicyDetails` member that carries a custom policy's
+/// schedules: `PolicyDetails$Schedules`.
+pub const SCHEDULES_MEMBER: &str = "Schedules";
+
 /// The wire name of the `PolicyDetails` member that states a default policy's
 /// resource type.
 pub const RESOURCE_TYPE_MEMBER: &str = "ResourceType";
@@ -1533,15 +1557,17 @@ pub fn unsupported_create_rule_interval(schedule: &str, interval: i32) -> Invali
 fn schedule_label(position: usize, schedule: &Schedule) -> String {
     match schedule.name.as_deref() {
         Some(name) if !name.is_empty() => name.to_string(),
-        // 1-based, as a validation path numbers a list element.
-        _ => format!("Schedules[{}]", position + 1),
+        _ => collection_element(SCHEDULES_MEMBER, &element_key(position)),
     }
 }
 
 /// The wire path a refusal names the schedule at `position` by, so a caller can
 /// tell which member of which list element to correct.
 fn schedule_path(position: usize) -> String {
-    format!("{POLICY_DETAILS_PREFIX}Schedules[{}]", position + 1)
+    collection_element(
+        &format!("{POLICY_DETAILS_PREFIX}{SCHEDULES_MEMBER}"),
+        &element_key(position),
+    )
 }
 
 /// The `PolicyDetails` members a request OMITTED that the kind of policy its
@@ -1578,7 +1604,7 @@ pub fn omitted_configuration_members(details: &PolicyDetails) -> Vec<String> {
         vec![
             ("ResourceTypes", details.resource_types.is_some()),
             ("TargetTags", details.target_tags.is_some()),
-            ("Schedules", details.schedules.is_some()),
+            (SCHEDULES_MEMBER, details.schedules.is_some()),
         ]
     };
     required

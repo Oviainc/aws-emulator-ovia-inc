@@ -105,7 +105,8 @@ const RESOURCE_NOT_FOUND_EXCEPTION_STATUS: u16 = 404;
 
 /// The path segment a validation path puts between a collection and its element
 /// (`schedules.1.member.createRule`). It names no parameter of the request, so a
-/// parameter name drops it.
+/// parameter name drops it and reads the segment BEFORE it as the key that picks
+/// the element out of the collection.
 const COLLECTION_PATH_STEP: &str = "member";
 
 /// The `message` member of the `AccessDeniedException` this service answers a
@@ -555,15 +556,36 @@ fn stated(violation: &Violation) -> String {
 /// The parameter a validation path names, as the model spells it.
 ///
 /// A validation path is lowerCamel (`description`, `policyDetails.schedules.1.member.name`)
-/// because that is the casing AWS validation paths use; a REQUEST parameter is
-/// named as the model declares the member, so each segment's first character is
-/// restored and the collection step is dropped.
+/// because that is the casing AWS validation paths use, and it reaches an
+/// element of a collection through two segments: the key that picks the element
+/// out — a list element's 1-based position, a map entry's key — followed by
+/// [`COLLECTION_PATH_STEP`]. A REQUEST parameter is named as the model declares
+/// the member, so each member segment's first character is restored, and the
+/// element is named the way this service names every collection element:
+/// subscripted onto the collection it belongs to
+/// ([`crate::state::collection_element`], the same spelling the cross-member
+/// rules in `crate::state` name a refused element by), with the key echoed as
+/// the path carries it, since it is the caller's and not a model name.
 fn parameter_name(path: &str) -> String {
-    path.split('.')
-        .filter(|segment| *segment != COLLECTION_PATH_STEP)
-        .map(upper_camel)
-        .collect::<Vec<String>>()
-        .join(".")
+    let segments: Vec<&str> = path.split('.').collect();
+    let mut named: Vec<String> = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
+        if *segment == COLLECTION_PATH_STEP {
+            continue;
+        }
+        let picks_an_element = segments.get(index + 1) == Some(&COLLECTION_PATH_STEP);
+        match named.last_mut() {
+            Some(collection) if picks_an_element => {
+                let element = crate::state::collection_element(collection, segment);
+                *collection = element;
+            }
+            // A member segment — and the fallback for an element key with no
+            // collection before it to subscript, which the walk cannot produce:
+            // it names the collection member before descending into an element.
+            _ => named.push(upper_camel(segment)),
+        }
+    }
+    named.join(".")
 }
 
 /// `segment` with its first character upper-cased, which is exactly the inverse
