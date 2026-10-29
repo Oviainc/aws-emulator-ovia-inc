@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/attribute_map_keys.rs"]
 mod attribute_map_keys;
+#[path = "all/buffered_requests_keep_what_was_submitted.rs"]
+mod buffered_requests_keep_what_was_submitted;
 #[path = "all/campaign_channel_subtype_config_deletion.rs"]
 mod campaign_channel_subtype_config_deletion;
 #[path = "all/campaign_channel_subtype_config_update.rs"]

@@ -230,12 +230,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut successful_requests = Vec::new();
         let mut failed_requests = Vec::new();
         for request in &input.profile_outbound_requests {
-            // The event this request was triggered by, when the caller named one: part
-            // of the record, so a later reader of the buffer has what was submitted.
-            let source_event = request
-                .event_trigger_context
-                .as_ref()
-                .and_then(|context| context.source_event.as_deref());
+            // The context this request was triggered from, when the caller sent one:
+            // part of the record, whole — its `sourceEvent` and its `channelContext`
+            // alike — so a later reader of the buffer has what was submitted.
             let outcome = store.take_profile_outbound_request(
                 crate::state::CampaignRef {
                     region: &region,
@@ -244,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &request.client_token,
                 &request.profile_id,
                 request.expiration_time,
-                source_event,
+                request.event_trigger_context.as_ref(),
                 now,
             );
             match outcome {

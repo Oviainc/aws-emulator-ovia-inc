@@ -50,7 +50,7 @@ use crate::ops::types::{
     CommunicationLimitsConfig, CommunicationTimeConfig, CustomerProfilesIntegrationConfig,
     CustomerProfilesIntegrationIdentifier, CustomerProfilesIntegrationSummary,
     EmailChannelSubtypeParameters, EncryptionConfig, EntryLimitsConfig, EventTrigger,
-    InstanceCommunicationLimitsConfig, InstanceConfig, InstanceOnboardingJobStatus,
+    EventTriggerContext, InstanceCommunicationLimitsConfig, InstanceConfig, InstanceOnboardingJobStatus,
     IntegrationConfig, IntegrationIdentifier, IntegrationSummary, InternalServerException,
     LambdaIntegrationConfig, LambdaIntegrationIdentifier, LambdaIntegrationSummary,
     OpenHours, QConnectIntegrationConfig, QConnectIntegrationIdentifier, QConnectIntegrationSummary,
@@ -814,6 +814,27 @@ pub fn channel_subtype_parameters_violation(
     }
 }
 
+/// The `ChannelSubtype` value a request's `channelSubtypeParameters` asks to reach
+/// someone on.
+///
+/// The union's four members are the four channels, and the values are the model's own
+/// `ChannelSubtype` catalog (`CHANNEL_SUBTYPE_VALUES` in [`crate::ops::types`]) — the
+/// same catalog [`StoredCampaign::channel_subtypes`] reports a campaign's configuration
+/// in, so the two can be compared directly.
+///
+/// The one place the union is read as a channel name: both the check a batch makes
+/// against the campaign's configuration and [`StoredOutboundRequest::channel_subtype`]
+/// go through it, so a stored request's channel is derived from the parameters it was
+/// submitted with rather than kept as a second copy of them.
+pub fn requested_channel_subtype(parameters: &ChannelSubtypeParameters) -> &'static str {
+    match parameters {
+        ChannelSubtypeParameters::Telephony(_) => "TELEPHONY",
+        ChannelSubtypeParameters::Sms(_) => "SMS",
+        ChannelSubtypeParameters::Email(_) => "EMAIL",
+        ChannelSubtypeParameters::whatsApp(_) => "WHATSAPP",
+    }
+}
+
 /// Encode a cursor-paged list's cursor: the sequence number of the last record on
 /// the page just returned, hex-encoded so the token is opaque rather than a
 /// readable position.
@@ -1104,8 +1125,18 @@ pub struct StoredOutboundRequest {
     /// counter, never from anything in the request, and within `DialRequestId`'s
     /// pattern `^[-_.a-zA-Z0-9]+$` and its 1..256 length bound.
     pub id: String,
-    /// The `ChannelSubtype` the request was submitted for.
-    pub channel_subtype: String,
+    /// The `channelSubtypeParameters` the request carried, whole: who this request is
+    /// to reach and with what — a telephony request's `destinationPhoneNumber`,
+    /// `attributes`, `connectSourcePhoneNumber`, `answerMachineDetectionConfig` and
+    /// `ringTimeout`, an email request's addresses, an SMS or WhatsApp request's
+    /// template and its parameters. Part of the record, not of any response — no
+    /// modelled member of this operation's output carries them — so a later reader of
+    /// the buffer has what was submitted, which is what makes the buffer a record of
+    /// the campaign's pending requests rather than of their count alone.
+    ///
+    /// The channel the request is for is the union's own member, read back through
+    /// [`Self::channel_subtype`] rather than stored beside it.
+    pub channel_subtype_parameters: ChannelSubtypeParameters,
     /// The `expirationTime` the caller sent: the instant after which this request is
     /// no longer dialable, which is why `OutboundRequest$expirationTime` is required.
     /// A record past it is no longer pending (see [`Self::is_expired_at`]).
@@ -1113,6 +1144,12 @@ pub struct StoredOutboundRequest {
 }
 
 impl StoredOutboundRequest {
+    /// The `ChannelSubtype` this request was submitted for, derived from the
+    /// parameters it carried by [`requested_channel_subtype`].
+    pub fn channel_subtype(&self) -> &'static str {
+        requested_channel_subtype(&self.channel_subtype_parameters)
+    }
+
     /// Whether this request's `expirationTime` has passed at `now`, so it is no
     /// longer dialable and no longer one of the campaign's pending requests.
     pub fn is_expired_at(&self, now: SystemTime) -> bool {
@@ -1136,10 +1173,12 @@ pub struct StoredProfileOutboundRequest {
     /// OPTIONAL, so a request that carries none never expires and stays pending until
     /// the campaign goes (see [`Self::is_expired_at`]).
     pub expires_at: Option<::aws_smithy_types::DateTime>,
-    /// The `eventTriggerContext$sourceEvent` the request carried, when it carried one:
-    /// the event this request was triggered by. Part of the record, not of any response
-    /// — no modelled member of this operation's output carries it.
-    pub source_event: Option<String>,
+    /// The `eventTriggerContext` the request carried, when it carried one, whole: the
+    /// `sourceEvent` this request was triggered by AND the `channelContext` it was
+    /// triggered from (a web notification's session and browser). Part of the record,
+    /// not of any response — no modelled member of this operation's output carries it —
+    /// so a later reader of the buffer has what was submitted.
+    pub event_trigger_context: Option<EventTriggerContext>,
 }
 
 impl StoredProfileOutboundRequest {
@@ -2611,11 +2650,16 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// buffer are materialised at the same instant
     /// ([`StoredCampaign::expire_outbound_requests`]), so a slot and a `clientToken`
     /// are both held only while their request is still pending.
+    ///
+    /// A request that IS taken is stored as it was submitted:
+    /// `channel_subtype_parameters` goes into the record whole (see
+    /// [`StoredOutboundRequest`]), so the buffer says what each pending request is for
+    /// and not merely that one is pending.
     pub fn take_outbound_request(
         &mut self,
         campaign: CampaignRef<'_>,
         client_token: &str,
-        channel_subtype: &str,
+        channel_subtype_parameters: &ChannelSubtypeParameters,
         expires_at: ::aws_smithy_types::DateTime,
         now: SystemTime,
     ) -> Option<OutboundRequestOutcome> {
@@ -2640,7 +2684,7 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
             client_token.to_string(),
             StoredOutboundRequest {
                 id: id.clone(),
-                channel_subtype: channel_subtype.to_string(),
+                channel_subtype_parameters: channel_subtype_parameters.clone(),
                 expires_at,
             },
         );
@@ -2675,13 +2719,17 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     ///
     /// `expires_at` is optional, as `ProfileOutboundRequest$expirationTime` is: a
     /// request that carries none has no instant to have passed, so it is always taken.
+    ///
+    /// A request that IS taken is stored as it was submitted: the `profile_id` it is to
+    /// reach and the whole `event_trigger_context` it carried go into the record (see
+    /// [`StoredProfileOutboundRequest`]).
     pub fn take_profile_outbound_request(
         &mut self,
         campaign: CampaignRef<'_>,
         client_token: &str,
         profile_id: &str,
         expires_at: Option<::aws_smithy_types::DateTime>,
-        source_event: Option<&str>,
+        event_trigger_context: Option<&EventTriggerContext>,
         now: SystemTime,
     ) -> Option<OutboundRequestOutcome> {
         {
@@ -2707,7 +2755,7 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
                 id: id.clone(),
                 profile_id: profile_id.to_string(),
                 expires_at,
-                source_event: source_event.map(ToString::to_string),
+                event_trigger_context: event_trigger_context.cloned(),
             },
         );
         Some(OutboundRequestOutcome::Taken(id))

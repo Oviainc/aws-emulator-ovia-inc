@@ -150,21 +150,6 @@ impl<Eng> PutOutboundRequestBatch<Eng> {
     }
 }
 
-/// The `ChannelSubtype` value a request's `channelSubtypeParameters` asks to dial on.
-///
-/// The union's four members are the four channels, and the values are the model's own
-/// `ChannelSubtype` catalog (`CHANNEL_SUBTYPE_VALUES` in [`crate::ops::types`]) — the
-/// same catalog `StoredCampaign::channel_subtypes` reports a campaign's configuration
-/// in, so the two can be compared directly.
-fn requested_channel_subtype(parameters: &ChannelSubtypeParameters) -> &'static str {
-    match parameters {
-        ChannelSubtypeParameters::Telephony(_) => "TELEPHONY",
-        ChannelSubtypeParameters::Sms(_) => "SMS",
-        ChannelSubtypeParameters::Email(_) => "EMAIL",
-        ChannelSubtypeParameters::whatsApp(_) => "WHATSAPP",
-    }
-}
-
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for PutOutboundRequestBatch<Eng>
 {
@@ -276,11 +261,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut successful_requests = Vec::new();
         let mut failed_requests = Vec::new();
         for request in &input.outbound_requests {
-            let channel_subtype = requested_channel_subtype(&request.channel_subtype_parameters);
             // A campaign dials only the channels its `channelSubtypeConfig`
             // configures; a request for any other channel is one this campaign
-            // cannot serve. `InvalidInput` and `BufferLimitExceeded` below are both
-            // from the model's own `FailureCode` catalog (`FAILURE_CODE_VALUES` in
+            // cannot serve. The channel a request asks for is the union's own member,
+            // read through the store's shared `requested_channel_subtype` so this
+            // check and the stored record cannot disagree about it.
+            let channel_subtype =
+                crate::state::requested_channel_subtype(&request.channel_subtype_parameters);
+            // `InvalidInput` and `BufferLimitExceeded` below are both from the model's
+            // own `FailureCode` catalog (`FAILURE_CODE_VALUES` in
             // `crate::ops::types`).
             if !configured.iter().any(|subtype| subtype == channel_subtype) {
                 failed_requests.push(FailedRequest {
@@ -294,13 +283,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // can never dial, so it is reported on the same per-request failure
             // channel, with the same `InvalidInput` code, as one the campaign cannot
             // serve for any other reason — and the rest of the batch is unaffected.
+            //
+            // The whole `channelSubtypeParameters` union goes to the store: who this
+            // request is to reach and with what is what the request IS, so the buffer
+            // keeps it even though no modelled member of this operation's output
+            // carries it back.
             let outcome = store.take_outbound_request(
                 crate::state::CampaignRef {
                     region: &region,
                     id: &input.id,
                 },
                 &request.client_token,
-                channel_subtype,
+                &request.channel_subtype_parameters,
                 request.expiration_time,
                 now,
             );

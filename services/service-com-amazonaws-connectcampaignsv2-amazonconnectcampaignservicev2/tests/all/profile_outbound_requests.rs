@@ -250,7 +250,10 @@ fn stored_request(
             (
                 stored.id.clone(),
                 stored.profile_id.clone(),
-                stored.source_event.clone(),
+                stored
+                    .event_trigger_context
+                    .as_ref()
+                    .and_then(|context| context.source_event.clone()),
             )
         })
 }
