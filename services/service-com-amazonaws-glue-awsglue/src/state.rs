@@ -10049,6 +10049,14 @@ pub mod messages {
     /// the table it was addressed in.
     pub const TABLE_VERSION_NOT_FOUND: &str = "Table version not found.";
 
+    /// The per-item failure of the BATCH version delete (`BatchDeleteTableVersion`) for a
+    /// version the addressed table's history does not hold. Recorded constant, and a
+    /// SHORTER sentence than the single-version delete's [`TABLE_VERSION_NOT_FOUND`] above
+    /// — which is why the two are not one shared string: an entry of `Errors` already names
+    /// the table and the version it is about in its own members, so the message says only
+    /// what went wrong with that item.
+    pub const BATCH_TABLE_VERSION_NOT_FOUND: &str = "Version not found.";
+
     /// Any table-version operation whose `VersionId` spells no version counter
     /// ([`super::parse_version_counter`]) — the version read's and the version delete's
     /// one refusal for an id that is not a version id at all. NOT recorded: the sentence

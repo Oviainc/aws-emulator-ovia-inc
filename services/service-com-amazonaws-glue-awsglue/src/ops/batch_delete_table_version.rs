@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteTableVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteTableVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteTableVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Drops SEVERAL versions out of ONE table's version history in a single call — the batch
+//! form of `crate::ops::delete_table_version`, over the same history: the table's live
+//! definition, which is the version its `VersionId` names, beside the definitions earlier
+//! writes archived (`crate::state::TableEntry::archived_versions`).
+//!
+//! Each addressed version is deleted on its own, so one item the table's history cannot
+//! give up fails only that item: `Errors` is "a list of errors encountered while trying to
+//! delete the specified table versions", which is where a per-item failure belongs rather
+//! than failing the whole batch or claiming a clean delete. An item whose `VersionId`
+//! spells no integer is reported as invalid input, because that is not a version id at all
+//! ("A VersionId is a string representation of an integer"); an item addressing the table's
+//! NEWEST version is reported the same way, because that version IS the live table and only
+//! `DeleteTable` removes it; and an item naming a version the history does not hold
+//! (including one an earlier item of the same batch just deleted) is reported as the miss it
+//! is. The list is reported whether or not anything failed, so an empty `Errors` is the
+//! positive statement that every addressed version is gone.
+//!
+//! The DATABASE and the TABLE are named once by the request rather than per item, so an
+//! absent one is not a per-item failure: the whole call is refused with
+//! `EntityNotFoundException`, exactly as the single-version delete refuses it.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +93,10 @@
 //! * `InternalServiceException` (HTTP 500) — An internal service error occurred.
 //! * `InvalidInputException` (HTTP 400) — The input provided was not valid.
 //! * `OperationTimeoutException` (HTTP 400) — The operation timed out.
+//! * `AccessDeniedException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   "Access to a resource was denied." A `CatalogId` naming another account's Data
+//!   Catalog is reachable only through that catalog's resource-based policy, so a caller
+//!   with no grant on it is refused here before any entity is looked up.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -94,9 +112,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `BatchDeleteTableVersionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#BatchDeleteTableVersion")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#BatchDeleteTableVersion",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum BatchDeleteTableVersionErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     EntityNotFoundException(EntityNotFoundException),
     InternalServiceException(InternalServiceException),
     InvalidInputException(InvalidInputException),
@@ -154,18 +176,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteTableVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteTableVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteTableVersion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchDeleteTableVersionErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // Whether the caller may address this catalog at all is decided BEFORE the entity
+        // lookup: a `CatalogId` of another account is reachable only through that
+        // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
+        if let Some(message) = crate::state::foreign_catalog_refusal(
+            &catalog_id,
+            &crate::state::request_region(ctx.parts()),
+            Self::NAME,
+        ) {
+            return Err(BatchDeleteTableVersionErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
+            return Err(BatchDeleteTableVersionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::database_not_found(
+                        &input.database_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // Read off the database before the table is borrowed out of it, so the log line
+        // below names the database this batch was served out of.
+        let database_name = database.name.clone();
+        let Some(entry) = database
+            .tables
+            .get_mut(&crate::state::fold_name(&input.table_name))
+        else {
+            return Err(BatchDeleteTableVersionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::TABLE_ENTITY_NOT_FOUND.to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // The table's own name as the catalog holds it, which is what every item of this
+        // batch is a version of.
+        let table_name = entry.name.clone();
+        let current = crate::state::parse_version_counter(&entry.version_id);
+
+        let mut errors: Vec<TableVersionError> = Vec::new();
+        let mut deleted = 0usize;
+        // The items are walked in the order they were sent, so a batch addressing the same
+        // version twice deletes it once and reports the second item as the miss it has
+        // become.
+        for requested in &input.version_ids {
+            let failure = match crate::state::parse_version_counter(requested) {
+                // Not a version id at all, so it addresses nothing: a bad parameter rather
+                // than a miss, exactly as the single-version delete reads it.
+                None => Some((
+                    "InvalidInputException",
+                    crate::state::messages::malformed_version_id(requested),
+                )),
+                // The newest version IS the live definition, so this operation cannot drop
+                // it: a table has a current version for as long as it exists, and removing
+                // that version means removing the table (`DeleteTable`).
+                Some(counter) if current == Some(counter) => Some((
+                    "InvalidInputException",
+                    crate::state::messages::TABLE_VERSION_IS_LATEST.to_string(),
+                )),
+                // Every other version is one an earlier write archived, so the delete takes
+                // it out of that history and leaves the live definition alone.
+                Some(counter) => {
+                    if entry.archived_versions.remove(&counter).is_some() {
+                        deleted += 1;
+                        None
+                    } else {
+                        Some((
+                            "EntityNotFoundException",
+                            crate::state::messages::BATCH_TABLE_VERSION_NOT_FOUND.to_string(),
+                        ))
+                    }
+                }
+            };
+            if let Some((error_code, message)) = failure {
+                errors.push(TableVersionError {
+                    // `TableVersionError$TableName` is "the name of the table in question":
+                    // the one table every item of this batch addresses, as the catalog
+                    // holds it.
+                    table_name: Some(table_name.clone()),
+                    // `TableVersionError$VersionId` is "the ID value of the version in
+                    // question" — the id this item sent, reported back exactly as sent so a
+                    // client can tell which of its items failed.
+                    version_id: Some(requested.clone()),
+                    error_detail: Some(crate::state::catalog_error_detail(error_code, message)),
+                });
+            }
+        }
+        ::tracing::info!(
+            operation = "BatchDeleteTableVersion",
+            catalog_id = %catalog_id,
+            database = %database_name,
+            table = %table_name,
+            deleted,
+            failed = errors.len(),
+            "deleted Data Catalog table versions in a batch"
+        );
+
+        // The list is reported whether or not anything failed, the way the sibling batches
+        // `BatchDeleteTable` and `BatchDeletePartition` report their own: an empty `Errors`
+        // is the positive statement that every addressed version was deleted, which is what
+        // a client checks before treating the batch as done.
+        Ok(BatchDeleteTableVersionOutput {
+            errors: Some(errors),
+        })
     }
 }

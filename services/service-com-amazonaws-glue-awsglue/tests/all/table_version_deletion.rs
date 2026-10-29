@@ -28,11 +28,15 @@ use crate::table_versions::{get_table, get_table_version, histories, write_histo
 use crate::wire::{call, emulator, error_code, error_message, ok};
 
 /// The refusal a delete of a table's CURRENT version earns, as the service words it.
-const LATEST_REFUSAL: &str = "VersionId cannot be equal to the latest.";
+///
+/// `pub(crate)` because the BATCH version delete reports the same refusal per item
+/// ([`crate::batch_table_version_deletion`]), so both suites read one spelling of it.
+pub(crate) const LATEST_REFUSAL: &str = "VersionId cannot be equal to the latest.";
 
 /// The refusal a read or a delete of a version the table's history does not hold earns —
-/// which is what a version becomes once it has been deleted.
-const MISSING_VERSION_REFUSAL: &str = "Table version not found.";
+/// which is what a version becomes once it has been deleted. `pub(crate)` for the same
+/// reason as [`LATEST_REFUSAL`].
+pub(crate) const MISSING_VERSION_REFUSAL: &str = "Table version not found.";
 
 /// One `DeleteTableVersion` call: its HTTP status and body.
 async fn delete_version(
@@ -53,7 +57,13 @@ async fn delete_version(
 }
 
 /// The `VersionId`s `GetTableVersions` reports for the table, in the order served.
-async fn listed_versions(router: &MultiServiceRouter, database: &str) -> Vec<String> {
+///
+/// `pub(crate)` because the BATCH version delete suite reads the surviving history back
+/// through the same listing ([`crate::batch_table_version_deletion`]).
+pub(crate) async fn listed_versions(
+    router: &MultiServiceRouter,
+    database: &str,
+) -> Vec<String> {
     let page = ok(
         router,
         "GetTableVersions",
@@ -74,7 +84,9 @@ async fn listed_versions(router: &MultiServiceRouter, database: &str) -> Vec<Str
 }
 
 /// The `TableVersion` body for every counter in `counters`, read one by one.
-async fn versions_of(
+///
+/// `pub(crate)` for the batch suite's sake, like [`listed_versions`].
+pub(crate) async fn versions_of(
     router: &MultiServiceRouter,
     database: &str,
     counters: &[usize],
