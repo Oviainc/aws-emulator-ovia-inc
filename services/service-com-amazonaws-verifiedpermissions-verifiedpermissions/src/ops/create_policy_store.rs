@@ -75,7 +75,10 @@ impl<Eng> CreatePolicyStore<Eng> {
 
 /// A canonical rendering of the parameters one `clientToken` was first used with.
 /// A replay carrying the same token must carry the same parameters, or the model
-/// documents a `ConflictException`.
+/// documents a `ConflictException`. Built with
+/// [`crate::state::idempotency_parameters`], the one canonical rendering every
+/// create in this crate uses, so each caller-supplied value is quoted and
+/// escaped and two different requests cannot render alike.
 fn canonical_parameters(input: &CreatePolicyStoreInput) -> String {
     let mut tags: Vec<(&String, &String)> = input
         .tags
@@ -83,10 +86,16 @@ fn canonical_parameters(input: &CreatePolicyStoreInput) -> String {
         .map(|t| t.iter().collect())
         .unwrap_or_default();
     tags.sort();
-    format!(
-        "mode={};description={:?};deletionProtection={:?};tags={:?}",
-        input.validation_settings.mode, input.description, input.deletion_protection, tags
-    )
+    // One escaped value of the rendering below: `{:?}` quotes every key and
+    // every value, so a tag carrying the separators cannot spell out a
+    // neighbouring member.
+    let tags = format!("{tags:?}");
+    crate::state::idempotency_parameters(&[
+        ("mode", Some(input.validation_settings.mode.as_str())),
+        ("description", input.description.as_deref()),
+        ("deletionProtection", input.deletion_protection.as_deref()),
+        ("tags", Some(tags.as_str())),
+    ])
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation

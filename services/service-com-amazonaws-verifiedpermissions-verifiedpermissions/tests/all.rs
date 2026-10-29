@@ -29,6 +29,8 @@ mod evaluation_errors;
 mod get_policy_store_tag_presence;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/idempotency_parameter_escaping.rs"]
+mod idempotency_parameter_escaping;
 #[path = "all/identity_source_configuration_writers.rs"]
 mod identity_source_configuration_writers;
 #[path = "all/identity_source_refusal_pointers.rs"]

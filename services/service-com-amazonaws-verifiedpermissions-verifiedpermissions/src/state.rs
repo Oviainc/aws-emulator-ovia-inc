@@ -499,30 +499,64 @@ impl IdentitySourceConfiguration {
     /// member by member rather than taken from `#[derive(Debug)]`, so what
     /// counts as "different parameters" is a stated contract that a later field
     /// rename cannot silently change.
+    ///
+    /// Every member goes through [`idempotency_parameters`], so each
+    /// caller-supplied value is quoted and escaped and no two configurations
+    /// that differ can render alike — a member whose value carries the `=` or
+    /// `;` separators (the modelled patterns of `issuer` and the claim names
+    /// admit both) cannot spell out its neighbours. A nested rendering (the
+    /// group configuration, the token selection, a list) is itself one escaped
+    /// value of the enclosing one, so the nesting cannot be flattened away
+    /// either.
     pub fn fingerprint(&self) -> String {
         match self {
-            Self::CognitoUserPool(cognito) => format!(
-                "cognito:userPoolArn={};clientIds={:?};groupEntityType={:?}",
-                cognito.user_pool_arn, cognito.client_ids, cognito.group_entity_type
-            ),
+            Self::CognitoUserPool(cognito) => {
+                let client_ids = idempotency_values(&cognito.client_ids);
+                idempotency_parameters(&[
+                    ("provider", Some("cognito")),
+                    ("userPoolArn", Some(cognito.user_pool_arn.as_str())),
+                    ("clientIds", Some(client_ids.as_str())),
+                    ("groupEntityType", cognito.group_entity_type.as_deref()),
+                ])
+            }
             Self::OpenIdConnect(oidc) => {
                 let groups = oidc.group_configuration.as_ref().map(|groups| {
-                    (groups.group_claim.as_str(), groups.group_entity_type.as_str())
+                    idempotency_parameters(&[
+                        ("groupClaim", Some(groups.group_claim.as_str())),
+                        ("groupEntityType", Some(groups.group_entity_type.as_str())),
+                    ])
                 });
                 let tokens = match &oidc.token_selection {
                     OpenIdConnectTokens::AccessToken {
                         principal_id_claim,
                         audiences,
-                    } => format!("accessTokenOnly:claim={principal_id_claim};audiences={audiences:?}"),
+                    } => {
+                        let audiences = idempotency_values(audiences);
+                        idempotency_parameters(&[
+                            ("tokens", Some("accessTokenOnly")),
+                            ("principalIdClaim", Some(principal_id_claim.as_str())),
+                            ("audiences", Some(audiences.as_str())),
+                        ])
+                    }
                     OpenIdConnectTokens::IdentityToken {
                         principal_id_claim,
                         client_ids,
-                    } => format!("identityTokenOnly:claim={principal_id_claim};clientIds={client_ids:?}"),
+                    } => {
+                        let client_ids = idempotency_values(client_ids);
+                        idempotency_parameters(&[
+                            ("tokens", Some("identityTokenOnly")),
+                            ("principalIdClaim", Some(principal_id_claim.as_str())),
+                            ("clientIds", Some(client_ids.as_str())),
+                        ])
+                    }
                 };
-                format!(
-                    "oidc:issuer={};entityIdPrefix={:?};groups={:?};tokenSelection={}",
-                    oidc.issuer, oidc.entity_id_prefix, groups, tokens
-                )
+                idempotency_parameters(&[
+                    ("provider", Some("oidc")),
+                    ("issuer", Some(oidc.issuer.as_str())),
+                    ("entityIdPrefix", oidc.entity_id_prefix.as_deref()),
+                    ("groups", groups.as_deref()),
+                    ("tokenSelection", Some(tokens.as_str())),
+                ])
             }
         }
     }
@@ -1341,12 +1375,29 @@ pub const ARN_SERVICE: &str = "verifiedpermissions";
 ///
 /// Every value is written through `{:?}`, which quotes and escapes it, so a
 /// member whose value contains the `=` or `;` separators cannot make two
-/// different requests render alike.
+/// different requests render alike. A member the request omitted renders as
+/// `None`, which a present value can never render as, so "absent" and "the
+/// string `None`" stay distinct.
+///
+/// EVERY caller-supplied value that reaches a `parameters` rendering goes
+/// through here (a list through [`idempotency_values`] first, a nested shape
+/// through its own call to this function, whose result is then one escaped
+/// value of the enclosing one), so no hand-rolled interpolation can reintroduce
+/// the ambiguity.
 pub fn idempotency_parameters(members: &[(&str, Option<&str>)]) -> String {
     members
         .iter()
         .map(|(name, value)| format!("{name}={value:?};"))
         .collect()
+}
+
+/// The same rendering for a LIST member: `{:?}` over the whole list, which
+/// quotes and escapes every element, so neither an element carrying the
+/// separators nor a different element count can make two different lists render
+/// alike. The result is one value of an [`idempotency_parameters`] member.
+pub fn idempotency_values<S: AsRef<str>>(values: &[S]) -> String {
+    let values: Vec<&str> = values.iter().map(AsRef::as_ref).collect();
+    format!("{values:?}")
 }
 
 /// `SystemTime::now()` as the model's `date-time` timestamp.

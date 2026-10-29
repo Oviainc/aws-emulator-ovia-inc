@@ -234,11 +234,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `@idempotencyToken` replay: the same token answers with the identity
         // source the first call created, and the same token with different
-        // parameters is the `ConflictException` the model documents.
-        let parameters = format!(
-            "store={store_id};principalEntityType={principal_entity_type};configuration={}",
-            configuration.fingerprint()
-        );
+        // parameters is the `ConflictException` the model documents. The
+        // rendering goes through `crate::state::idempotency_parameters`, the one
+        // canonical rendering every create in this crate uses, so each
+        // caller-supplied value — `principalEntityType` and every member of the
+        // configuration fingerprint — is quoted and escaped and two different
+        // requests cannot render alike.
+        let configuration_fingerprint = configuration.fingerprint();
+        let parameters = crate::state::idempotency_parameters(&[
+            ("store", Some(store_id.as_str())),
+            ("principalEntityType", Some(principal_entity_type.as_str())),
+            ("configuration", Some(configuration_fingerprint.as_str())),
+        ]);
         if let Some(token) = input.client_token.as_deref() {
             if let Some(record) = state.idempotency_replay("CreateIdentitySource", token) {
                 if record.parameters != parameters {
