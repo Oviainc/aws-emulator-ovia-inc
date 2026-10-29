@@ -131,7 +131,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{ExportJob, EXPORT_JOB_RESOURCE, SEARCH_JOB_RESOURCE};
+use crate::state::{ExportJob, SEARCH_JOB_RESOURCE};
 use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -350,26 +350,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // This store holds its export jobs for the life of the process and only this
         // operation adds one, so it is capped: past the cap the service's own quota error
-        // is the honest answer (`crate::state::MAX_EXPORT_JOBS`).
-        if state.export_jobs_full() {
-            return Err(
-                StartSearchResultExportJobErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: format!(
-                            "this account already holds the maximum of {} export jobs",
-                            crate::state::MAX_EXPORT_JOBS
-                        ),
-                        resource_id: ::engine::emulator_account_id().to_string(),
-                        resource_type: EXPORT_JOB_RESOURCE.to_string(),
-                        service_code: ctx.identity().signing_name().to_string(),
-                        // AWS publishes no quota code for this limit; this names the
-                        // quota the emulator enforces.
-                        quota_code: "ExportJobsPerAccount".to_string(),
-                    },
-                )
-                .into(),
-            );
-        }
+        // is the honest answer, by the one cap rule every capped store of this service
+        // follows (`crate::state::check_store_capacity`,
+        // `crate::state::MAX_EXPORT_JOBS`). The refusal is lifted into THIS operation's
+        // error channel; the rule itself lives in one place.
+        state
+            .check_export_job_capacity(ctx.identity().signing_name())
+            .map_err(StartSearchResultExportJobErrorModeled::ServiceQuotaExceededException)?;
 
         let export_identifier = state.mint_export_identifier().ok_or_else(|| {
             StartSearchResultExportJobError::from(

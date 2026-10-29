@@ -61,6 +61,8 @@ mod stop_driven_search_job_lifecycle;
 mod stop_search_job_cancel_window;
 #[path = "all/stop_search_job_status_gate.rs"]
 mod stop_search_job_status_gate;
+#[path = "all/store_cap_rule.rs"]
+mod store_cap_rule;
 #[path = "all/success_status.rs"]
 mod success_status;
 #[path = "all/tag_admission_rule.rs"]

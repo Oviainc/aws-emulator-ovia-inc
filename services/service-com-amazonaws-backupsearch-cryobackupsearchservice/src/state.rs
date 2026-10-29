@@ -67,8 +67,8 @@ use ::aws_smithy_types::DateTime;
 use crate::ops::types::{
     BackupCreationTimeFilter, ConflictException, CurrentSearchProgress, EBSItemFilter,
     EBSResultItem, ExportSpecification, ItemFilters, LongCondition, ResultItem, S3ItemFilter,
-    S3ResultItem, SearchJobBackupsResult, SearchScope, SearchScopeSummary, StringCondition,
-    TimeCondition,
+    S3ResultItem, SearchJobBackupsResult, SearchScope, SearchScopeSummary,
+    ServiceQuotaExceededException, StringCondition, TimeCondition,
 };
 
 /// The HTTP status a successful call of this service that has NO content to report
@@ -502,6 +502,61 @@ pub fn client_token_replay<'a, T: TokenedRecord>(
         });
     }
     Ok(Some(record))
+}
+
+/// A record kind this store CAPS — the parameters the quota refusal below reads off it.
+///
+/// Implemented by the record of each operation that grows a capped store of this service
+/// ([`SearchJob`] and [`ExportJob`]), which is what lets the cap rule be written ONCE for
+/// both. The resource type a refusal names is the one [`TokenedRecord`] already states for
+/// this kind of record, so the two refusals cannot disagree about it.
+pub trait CappedRecord: TokenedRecord {
+    /// How many records of this kind this store holds at most ([`MAX_SEARCH_JOBS`],
+    /// [`MAX_EXPORT_JOBS`]).
+    const STORE_CAP: usize;
+
+    /// The `quotaCode` a refusal about this kind of record names. AWS publishes no quota
+    /// code for either cap, so the emulator names the quota it enforces, by one
+    /// convention for both kinds: `<Kind>JobsPerAccount`.
+    const QUOTA_CODE: &'static str;
+
+    /// The word naming this kind of job in the cap sentence, as the refusal spells it.
+    const JOB_KIND: &'static str;
+}
+
+/// The CAP RULE every capped store of this service follows: a store already holding its
+/// maximum number of records refuses the call that would add another with the service's
+/// own modelled `ServiceQuotaExceededException` (HTTP 402), whose members name the account
+/// the quota is counted against, the kind of record it caps, the service enforcing it and
+/// the quota itself.
+///
+/// One rule behind both `Start` operations of this service — both stores hold their
+/// records for the life of the process and nothing evicts one — so the predicate, which
+/// member carries which value and the wording of the cap sentence are decided here once
+/// instead of per handler. The cap, the record type, the quota code and the job-kind word
+/// are parameters of the refusal ([`CappedRecord`]), not of the rule.
+///
+/// `Ok(())` means the call may mint a record. `Err` is the refusal, which each caller
+/// lifts into its own modelled error channel. `service_code` is the signing name of the
+/// service the request reached, which each handler takes from its own request.
+pub fn check_store_capacity<T: CappedRecord>(
+    records: &HashMap<String, T>,
+    service_code: &str,
+) -> Result<(), ServiceQuotaExceededException> {
+    if records.len() < T::STORE_CAP {
+        return Ok(());
+    }
+    Err(ServiceQuotaExceededException {
+        message: format!(
+            "this account already holds the maximum of {} {} jobs",
+            T::STORE_CAP,
+            T::JOB_KIND
+        ),
+        resource_id: ::engine::emulator_account_id().to_string(),
+        resource_type: T::RESOURCE_TYPE.to_string(),
+        service_code: service_code.to_string(),
+        quota_code: T::QUOTA_CODE.to_string(),
+    })
 }
 
 /// `MaxResults`'s modelled `@default(1000)`, shared by `ListSearchJobs` and
@@ -1110,6 +1165,14 @@ impl TokenedRecord for SearchJob {
     }
 }
 
+/// The search-job store is capped, so `StartSearchJob` refuses past it by the cap rule
+/// every capped store of this service follows ([`check_store_capacity`]).
+impl CappedRecord for SearchJob {
+    const STORE_CAP: usize = MAX_SEARCH_JOBS;
+    const QUOTA_CODE: &'static str = "SearchJobsPerAccount";
+    const JOB_KIND: &'static str = "search";
+}
+
 /// One recovery point of this account's backup index, WITH the items that index holds.
 ///
 /// A scan has two layers and this record carries both. The outer one is the recovery
@@ -1230,6 +1293,15 @@ impl TokenedRecord for ExportJob {
     fn record_identifier(&self) -> &str {
         &self.identifier
     }
+}
+
+/// The export-job store is capped for the same reason as the search-job one, and the SAME
+/// cap rule decides what the call that would grow it past the cap answers
+/// ([`check_store_capacity`]).
+impl CappedRecord for ExportJob {
+    const STORE_CAP: usize = MAX_EXPORT_JOBS;
+    const QUOTA_CODE: &'static str = "ExportJobsPerAccount";
+    const JOB_KIND: &'static str = "export";
 }
 
 /// Per-service state for com-amazonaws-backupsearch-cryobackupsearchservice. A handler reaches it through [`service_state`].
@@ -1453,10 +1525,20 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
         client_token_replay(&self.search_jobs, token, fingerprint, now, operation)
     }
 
-    /// Whether this store is already holding [`MAX_SEARCH_JOBS`] jobs, which is when
-    /// `StartSearchJob` must refuse rather than mint another.
-    pub fn is_full(&self) -> bool {
-        self.search_jobs.len() >= MAX_SEARCH_JOBS
+    /// Whether another search job may be minted, by the cap rule every capped store of
+    /// this service applies ([`check_store_capacity`]): `Err` is the refusal
+    /// `StartSearchJob` answers with once this store holds [`MAX_SEARCH_JOBS`] jobs, which
+    /// each handler lifts into its own error channel.
+    ///
+    /// The decision is the shared rule's, not this method's — the same rule
+    /// [`check_export_job_capacity`](Self::check_export_job_capacity) applies, because
+    /// both stores are capped for the same reason. `service_code` is the signing name the
+    /// handler took from its own request.
+    pub fn check_search_job_capacity(
+        &self,
+        service_code: &str,
+    ) -> Result<(), ServiceQuotaExceededException> {
+        check_store_capacity(&self.search_jobs, service_code)
     }
 
     /// Store a newly minted job, keeping the creation order.
@@ -1515,10 +1597,15 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
         client_token_replay(&self.export_jobs, token, fingerprint, now, operation)
     }
 
-    /// Whether this store is already holding [`MAX_EXPORT_JOBS`] export jobs, which is
-    /// when `StartSearchResultExportJob` must refuse rather than mint another.
-    pub fn export_jobs_full(&self) -> bool {
-        self.export_jobs.len() >= MAX_EXPORT_JOBS
+    /// Whether another export job may be minted — the SAME rule
+    /// [`check_search_job_capacity`](Self::check_search_job_capacity) answers a search-job
+    /// start by ([`check_store_capacity`]), over this store's export jobs and its own cap
+    /// [`MAX_EXPORT_JOBS`].
+    pub fn check_export_job_capacity(
+        &self,
+        service_code: &str,
+    ) -> Result<(), ServiceQuotaExceededException> {
+        check_store_capacity(&self.export_jobs, service_code)
     }
 
     /// Store a newly minted export job, keeping the creation order.

@@ -121,7 +121,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{SearchJob, SEARCH_JOB_RESOURCE};
+use crate::state::SearchJob;
 use std::collections::VecDeque;
 use std::time::SystemTime;
 
@@ -256,24 +256,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // This store holds its jobs for the life of the process and only this operation
         // adds one, so it is capped: past the cap the service's own quota error is the
-        // honest answer (`crate::state::MAX_SEARCH_JOBS`).
-        if state.is_full() {
-            return Err(StartSearchJobErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
-                        "this account already holds the maximum of {} search jobs",
-                        crate::state::MAX_SEARCH_JOBS
-                    ),
-                    resource_id: ::engine::emulator_account_id().to_string(),
-                    resource_type: SEARCH_JOB_RESOURCE.to_string(),
-                    service_code: ctx.identity().signing_name().to_string(),
-                    // AWS publishes no quota code for this limit, which it documents as
-                    // adjustable; this names the quota the emulator enforces.
-                    quota_code: "SearchJobsPerAccount".to_string(),
-                },
-            )
-            .into());
-        }
+        // honest answer, by the one cap rule every capped store of this service follows
+        // (`crate::state::check_store_capacity`, `crate::state::MAX_SEARCH_JOBS`). The
+        // refusal is lifted into THIS operation's error channel; the rule itself lives in
+        // one place.
+        state
+            .check_search_job_capacity(ctx.identity().signing_name())
+            .map_err(StartSearchJobErrorModeled::ServiceQuotaExceededException)?;
 
         let identifier = state.mint_identifier().ok_or_else(|| {
             StartSearchJobError::from(StartSearchJobErrorModeled::InternalServerException(
