@@ -49,6 +49,8 @@ mod delegation_request_filing;
 mod delegation_request_listing;
 #[path = "all/delegation_request_reads.rs"]
 mod delegation_request_reads;
+#[path = "all/delegation_request_updates.rs"]
+mod delegation_request_updates;
 #[path = "all/entities_for_policy.rs"]
 mod entities_for_policy;
 #[path = "all/enum_refusal_wording.rs"]

@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDelegationRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDelegationRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDelegationRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation answers on the wire
+//!
+//! A mutation: it resolves the `DelegationRequestId` the request carries against the
+//! delegation requests the account holds and, for one it holds, writes the additional
+//! information the call carried — "updates an existing delegation request with additional
+//! information. When the delegation request is updated, it reaches the
+//! `PENDING_APPROVAL` state" — so the read that follows reports the notes, the state and
+//! the last-updated instant this call wrote. The output shape is `Unit`, so what the call
+//! did is observable only through `GetDelegationRequest` and `ListDelegationRequests`.
+//!
+//! An identifier the account holds NO delegation request under references "a resource
+//! entity that does not exist", so the call is refused with the modelled
+//! `NoSuchEntityException` (HTTP 404, awsQuery code `NoSuchEntity`) whose message
+//! describes the resource asked about ([`crate::state::delegation_request_write_not_found_message`])
+//! and nothing is written for it — the identifier stays one the account holds nothing
+//! under.
+//!
+//! A caller whose identity-based policies do not permit the call is refused before the
+//! lookup, `403` `<Code>AccessDenied</Code>` ([`crate::state::authorization::authorize_named`]),
+//! so a request that was not allowed changes nothing and learns nothing about which
+//! requests the account holds.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +89,12 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The `stateType` value an updated delegation request reaches: "when the delegation
+/// request is updated, it reaches the `PENDING_APPROVAL` state"
+/// (`UpdateDelegationRequest`), one of the seven values `stateType` declares
+/// ([`super::types::STATE_TYPE_VALUES`]).
+const STATE_PENDING_APPROVAL: &str = "PENDING_APPROVAL";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -167,18 +186,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDelegationRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDelegationRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDelegationRequest"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateDelegationRequestErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A mutation: the operation "updates an existing delegation request with
+        // additional information", so the lock is held for write across the lookup and
+        // the write — a request the account does not hold cannot be written to between
+        // the two.
+        let mut store = state.lock();
+
+        // The acting principal the audit records below are attributed to.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // IAM decides a call against the caller's policies before it touches the
+        // resource, so the decision is made first and on the ARN the identifier names —
+        // the same ARN whether or not the account holds a request under it, which is what
+        // keeps a refused caller from learning which identifiers the account holds. A
+        // refusal names the request as the request named it.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::UPDATE_DELEGATION_REQUEST,
+            &crate::state::delegation_request_arn(&input.delegation_request_id),
+            &format!("delegation request {}", input.delegation_request_id),
+        )?;
+
+        // The identifier is the handle `CreateDelegationRequest` filed the request under,
+        // held verbatim, so it is looked up verbatim — exactly as `GetDelegationRequest`
+        // resolves it: `delegationRequestIdType` is a minted identifier rather than a
+        // friendly name, which is why it is not case-folded the way an IAM entity name
+        // is. An identifier the account holds nothing under is refused, and the refusal
+        // writes nothing: no record is filed under it, so the read that follows refuses
+        // it too.
+        let Some(held) = store
+            .delegation_requests
+            .get_mut(&input.delegation_request_id)
+        else {
+            ::tracing::info!(
+                audit = true,
+                operation = "UpdateDelegationRequest",
+                outcome = "refused_no_such_delegation_request",
+                caller_akid = %caller_akid,
+                delegation_request_id = %input.delegation_request_id,
+                "no delegation request was updated"
+            );
+            return Err(
+                UpdateDelegationRequestErrorModeled::NoSuchEntityException(NoSuchEntityException {
+                    message: Some(crate::state::delegation_request_write_not_found_message(
+                        &input.delegation_request_id,
+                    )),
+                })
+                .into(),
+            );
+        };
+
+        // "Additional notes or comments to add to the delegation request", which is the
+        // member that carries them on the record: "notes added to this delegation
+        // request, if this request was updated via the UpdateDelegationRequest API"
+        // (`DelegationRequest$Notes`). One value of `notesType` rather than a growing
+        // transcript — the member the record holds them in has the SAME 0..500 bound as
+        // the member the request carries them in, so a later update states the notes
+        // again rather than appending to them. A call that carries no notes at all
+        // supplies none, so the notes stay as the account holds them.
+        if let Some(notes) = input.notes {
+            held.notes = Some(notes);
+        }
+        // "When the delegation request is updated, it reaches the PENDING_APPROVAL
+        // state": the update itself is what moves the request there, whatever state it
+        // was in before, and this operation models no refusal for the state a request is
+        // already in.
+        held.state = Some(STATE_PENDING_APPROVAL.to_string());
+        // "Last updated timestamp of the request" (`DelegationRequest$UpdatedTime`): the
+        // instant this call wrote the record.
+        held.updated_time = Some(crate::state::now());
+
+        ::tracing::info!(
+            audit = true,
+            operation = "UpdateDelegationRequest",
+            outcome = "updated",
+            caller_akid = %caller_akid,
+            delegation_request_id = %input.delegation_request_id,
+            state = %STATE_PENDING_APPROVAL,
+            "the delegation request was updated"
+        );
+
+        // The operation's output shape is `Unit`: what was written is reported by
+        // `GetDelegationRequest`, which reads the record this call just wrote.
+        Ok(UpdateDelegationRequestOutput)
     }
 }
