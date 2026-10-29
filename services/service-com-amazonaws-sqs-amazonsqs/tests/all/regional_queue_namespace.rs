@@ -72,9 +72,12 @@ async fn attribute_in(
         .unwrap_or_else(|| panic!("case {attribute} of {url} in {region}: not reported"))
 }
 
-/// A `RedrivePolicy` value driving a queue's messages to `target_arn`.
+/// A `RedrivePolicy` value driving a queue's messages to `target_arn`, in the rendering a
+/// queue carrying it reports: what a policy's own document has to carry, and the one form it
+/// reads back in, are `redrive_policy_document`'s rules — this suite is about the REGION the
+/// target is read in.
 fn redrive_policy(target_arn: &str) -> String {
-    json!({"deadLetterTargetArn": target_arn, "maxReceiveCount": "3"}).to_string()
+    json!({"deadLetterTargetArn": target_arn, "maxReceiveCount": 3}).to_string()
 }
 
 /// A queue created in `region` reports the ARN of that region, and the url it is reachable

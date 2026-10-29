@@ -84,6 +84,15 @@
 //! queue's `ApproximateNumberOfMessages` falls as the target's rises and the move task
 //! below has something to drive back.
 //!
+//! That configuration is judged when it is WRITTEN, so no queue is left carrying one no
+//! redrive could ever act on: the document itself against what the attribute documents —
+//! both of its members, a count inside the range that member publishes and a target of this
+//! account and region ([`redrive_policy_refusal`]) — and the PAIR it links against the
+//! queue the target names and its type
+//! ([`ComAmazonawsSqsAmazonsqsState::dead_letter_target_refusal`]). What
+//! is stored and reported is the canonical rendering of the document
+//! ([`canonical_redrive_document`]), not the caller's own spelling of it.
+//!
 //! # Dead-letter redrive permission
 //!
 //! WHICH queues may drive their messages to a dead-letter queue is that queue's own
@@ -569,6 +578,24 @@ pub const POLICY: &str = "Policy";
 /// The attribute that makes a queue a dead-letter SOURCE queue: it names the queue its
 /// messages are driven to.
 pub const REDRIVE_POLICY: &str = "RedrivePolicy";
+
+/// The member of a `RedrivePolicy` naming the queue the messages go to: "the Amazon
+/// Resource Name (ARN) of the dead-letter queue to which Amazon SQS moves messages after
+/// the value of `maxReceiveCount` is exceeded" (the attribute's own documentation). One of
+/// the two the attribute documents, and one a policy has to carry.
+pub const DEAD_LETTER_TARGET_ARN_MEMBER: &str = "deadLetterTargetArn";
+
+/// The member of a `RedrivePolicy` bounding the deliveries: "the number of times a message
+/// is delivered to the source queue before being moved to the dead-letter queue" (the
+/// attribute's own documentation). The other member a policy has to carry, and the one
+/// documented as a NUMBER.
+pub const MAX_RECEIVE_COUNT_MEMBER: &str = "maxReceiveCount";
+
+/// The inclusive range a `maxReceiveCount` may carry, as Amazon SQS publishes it for that
+/// member: a count below the lower bound admits no delivery for the queue to make, and the
+/// upper bound is the most deliveries a dead-letter configuration can ask for. The refusal
+/// of a count outside it states these bounds ([`max_receive_count_reason`]).
+pub const MAX_RECEIVE_COUNT_RANGE: (i64, i64) = (1, 1_000);
 
 /// The attribute a dead-letter queue carries to say WHICH queues may drive their messages
 /// to it: "the parameters for the permissions for the dead-letter queue redrive permission
@@ -2347,6 +2374,47 @@ impl ComAmazonawsSqsAmazonsqsState {
         ))
     }
 
+    /// Why the queue `policy` would be written on may not drive its messages to the
+    /// dead-letter queue that `RedrivePolicy` value names, as the text of the refusal a
+    /// caller has to fix the request from, or `None` when it may.
+    ///
+    /// Two rules about the PAIR of queues, both of which need the store:
+    ///
+    /// * The target has to be a queue there IS. A redrive moves a message from the source
+    ///   queue to the target queue, so a policy naming a queue nothing holds configures a
+    ///   move that could never be made, and is refused rather than stored
+    ///   ([`DEAD_LETTER_TARGET_MISSING_REASON`]).
+    /// * It has to be a queue of the source's own TYPE: "the dead-letter queue of a FIFO
+    ///   queue must also be a FIFO queue. Similarly, the dead-letter queue of a standard
+    ///   queue must also be a standard queue" ([`DEAD_LETTER_TARGET_TYPE_REASON`]).
+    ///
+    /// `source_is_fifo` says which type the queue taking the policy is, which at create
+    /// time is what the request asks for and afterwards what the queue is. The target is
+    /// resolved in `region`, where a redrive link lives (see
+    /// [`Queue::dead_letter_target`]); a target of another namespace is refused by the
+    /// document's own rules ([`redrive_policy_refusal`]) before this is reached, and a
+    /// policy carrying no target at all is refused there too, so there is nothing here to
+    /// judge for one.
+    pub fn dead_letter_target_refusal(
+        &self,
+        region: &str,
+        source_is_fifo: bool,
+        policy: &str,
+    ) -> Option<String> {
+        let parsed = parsed_redrive_policy(policy)?;
+        let target_arn = redrive_target_arn(&parsed)?;
+        let refused =
+            |reason: &str| Some(invalid_parameter_message(policy, REDRIVE_POLICY, reason));
+        let Some(target) = queue_name_from_arn(target_arn, region)
+            .and_then(|name| self.queue(region, name))
+        else {
+            return refused(DEAD_LETTER_TARGET_MISSING_REASON);
+        };
+        (target.is_fifo() != source_is_fifo).then(|| {
+            invalid_parameter_message(policy, REDRIVE_POLICY, DEAD_LETTER_TARGET_TYPE_REASON)
+        })
+    }
+
     /// Move every message of the queue called `source_queue_name` that has had all the
     /// deliveries its `RedrivePolicy` allows onto the dead-letter queue that policy
     /// names, and answer how many moved.
@@ -3098,8 +3166,15 @@ fn parsed_redrive_policy(policy: &str) -> Option<::serde_json::Value> {
 }
 
 /// [`dead_letter_target_arn`] over a policy already parsed.
+///
+/// A member carrying no text names no queue, so it is read as a policy that carries no
+/// dead-letter target at all rather than as one naming the queue called "".
 fn redrive_target_arn(policy: &::serde_json::Value) -> Option<&str> {
-    policy.get("deadLetterTargetArn")?.as_str()
+    policy
+        .get(DEAD_LETTER_TARGET_ARN_MEMBER)?
+        .as_str()
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
 }
 
 /// The `maxReceiveCount` a parsed `RedrivePolicy` carries, or `None` when it carries no
@@ -3109,10 +3184,11 @@ fn redrive_target_arn(policy: &::serde_json::Value) -> Option<&str> {
 /// before being moved to the dead-letter queue" (the `RedrivePolicy` attribute's own
 /// documentation), so a count of zero or less admits no delivery to count and configures
 /// no dead-lettering. The count is read whether the JSON carries it as a number or as a
-/// string of digits, because this store keeps the attribute value exactly as the caller
-/// supplied it and either spelling says the same thing about the queue.
+/// string of digits: either spelling says the same thing about the queue, and a policy is
+/// STORED with the member as the number its documentation gives it
+/// ([`canonical_redrive_document`]).
 fn redrive_max_receive_count(policy: &::serde_json::Value) -> Option<u32> {
-    let count = policy.get("maxReceiveCount")?;
+    let count = policy.get(MAX_RECEIVE_COUNT_MEMBER)?;
     count
         .as_i64()
         .or_else(|| {
@@ -3144,29 +3220,169 @@ pub const DEAD_LETTER_TARGET_NAMESPACE_REASON: &str =
 /// Why the `RedrivePolicy` value `policy` cannot be stored on a queue of `region`, as the
 /// text of the refusal a caller has to fix the request from, or `None` when it can.
 ///
+/// A dead-letter configuration is judged when it is WRITTEN, against what the attribute's
+/// own documentation says such a document carries: both documented members, a
+/// `maxReceiveCount` inside the range that member publishes, and a `deadLetterTargetArn`
+/// naming a queue of the same account and region. A policy breaking any of them configures
+/// no redrive any delivery could ever make, so it is refused rather than stored — otherwise
+/// the wiring looks configured and black-holes.
+///
 /// A redrive link is between two queues of ONE account and region
 /// ([`DEAD_LETTER_TARGET_NAMESPACE_REASON`]): the target a policy names is read in the
 /// region the queue carrying the policy lives in, so a `deadLetterTargetArn` naming
 /// another region or another account names a queue no redrive from this queue could ever
-/// deliver to, and the policy is refused rather than stored — otherwise the wiring looks
-/// configured and black-holes.
+/// deliver to.
 ///
-/// The refusal is worded in the one template this service answers a refused parameter
+/// Each refusal is worded in the one template this service answers a refused parameter
 /// VALUE in ([`invalid_parameter_message`]), with the value taken from the request: the
 /// `RedrivePolicy` the caller supplied, exactly as supplied.
 ///
-/// What this judges is only which account and region a target ARN names: a policy naming
-/// no target, or one whose target is not an ARN at all, is left to the attribute's own
-/// value rules.
+/// What this judges is the document ALONE. Whether the two queues it links may be linked
+/// needs the store: whether the target is there at all and whether it is of the source's
+/// type ([`ComAmazonawsSqsAmazonsqsState::dead_letter_target_refusal`]), and the target's
+/// own `RedriveAllowPolicy`
+/// ([`ComAmazonawsSqsAmazonsqsState::redrive_allow_policy_refusal`]). A value that is not
+/// JSON at all is left to the attribute's own form rules ([`check_attribute_value`]).
 pub fn redrive_policy_refusal(region: &str, policy: &str) -> Option<String> {
-    let target = dead_letter_target_arn(policy)?;
-    match parse_queue_arn(&target, region) {
+    let parsed = parsed_redrive_policy(policy)?;
+    let refused =
+        |reason: &str| Some(invalid_parameter_message(policy, REDRIVE_POLICY, reason));
+    // Both members the attribute documents are mandatory: a policy missing the target names
+    // nowhere to move a message to, and one missing the count bounds no delivery, so neither
+    // configures dead-lettering at all.
+    let Some(target) = redrive_target_arn(&parsed) else {
+        return refused(&missing_redrive_member_reason(DEAD_LETTER_TARGET_ARN_MEMBER));
+    };
+    let Some(count) = parsed.get(MAX_RECEIVE_COUNT_MEMBER) else {
+        return refused(&missing_redrive_member_reason(MAX_RECEIVE_COUNT_MEMBER));
+    };
+    // A count the member's published range does not hold — including one that is not a whole
+    // number at all — is refused with the bounds it has to lie between, and the count quoted
+    // as the request wrote it.
+    let (min, max) = MAX_RECEIVE_COUNT_RANGE;
+    let within = redrive_max_receive_count(&parsed)
+        .is_some_and(|count| (min..=max).contains(&i64::from(count)));
+    if !within {
+        return refused(&max_receive_count_reason(&supplied_member_text(count)));
+    }
+    match parse_queue_arn(target, region) {
         QueueArn::OfThisRegion(_) | QueueArn::Malformed => None,
-        QueueArn::OfAnotherRegion { .. } | QueueArn::Elsewhere => Some(invalid_parameter_message(
-            policy,
-            REDRIVE_POLICY,
-            DEAD_LETTER_TARGET_NAMESPACE_REASON,
-        )),
+        QueueArn::OfAnotherRegion { .. } | QueueArn::Elsewhere => {
+            refused(DEAD_LETTER_TARGET_NAMESPACE_REASON)
+        }
+    }
+}
+
+/// The reason a refusal gives for a `RedrivePolicy` that does not carry one of the two
+/// members the attribute documents, naming the member the policy left out — the one thing
+/// the caller has to add.
+fn missing_redrive_member_reason(member: &str) -> String {
+    format!("Redrive policy does not contain mandatory attribute: {member}.")
+}
+
+/// The reason a refusal gives for a `maxReceiveCount` outside the range that member
+/// publishes: the count as the request wrote it, and the bounds it has to lie between
+/// ([`MAX_RECEIVE_COUNT_RANGE`]).
+fn max_receive_count_reason(supplied: &str) -> String {
+    let (min, max) = MAX_RECEIVE_COUNT_RANGE;
+    format!(
+        "Invalid value for maxReceiveCount: {supplied}, valid values are from {min} to {max} \
+         both inclusive."
+    )
+}
+
+/// One member of a policy document as the REQUEST wrote it, for a refusal to quote back: a
+/// string member without its quotes, and every other form as its own JSON.
+fn supplied_member_text(member: &::serde_json::Value) -> String {
+    member
+        .as_str()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| member.to_string())
+}
+
+/// The reason a refusal gives for a `RedrivePolicy` whose dead-letter target is not a queue
+/// of the SOURCE queue's own type.
+///
+/// A redrive moves a message from the source queue to the target queue, and the two queue
+/// types order and deliver messages differently, so a message cannot cross between them.
+/// The sentence is the rule as this service's own model states it, in the model's words:
+/// "The dead-letter queue of a FIFO queue must also be a FIFO queue. Similarly, the
+/// dead-letter queue of a standard queue must also be a standard queue"
+/// (`smithy_query(query="doc", shape="SetQueueAttributesRequest", member="Attributes",
+/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
+/// which is what a caller has to change the request against.
+pub const DEAD_LETTER_TARGET_TYPE_REASON: &str =
+    "The dead-letter queue of a FIFO queue must also be a FIFO queue. Similarly, the \
+     dead-letter queue of a standard queue must also be a standard queue.";
+
+/// The reason a refusal gives for a `RedrivePolicy` whose dead-letter target is not a queue
+/// this store holds.
+///
+/// A redrive MOVES a message from the source queue to the target queue, so a policy naming
+/// a queue that is not there configures a move nothing could ever make: the association is
+/// refused when it is written rather than discovered when a message is owed a redrive.
+/// Worded as Amazon SQS words what a dead-letter target has to be, the way the
+/// region and type rules above are.
+pub const DEAD_LETTER_TARGET_MISSING_REASON: &str = "Dead letter target does not exist.";
+
+/// The two attributes whose value is a JSON object this service's own documentation defines
+/// member by member, with the members it documents as NUMBERS.
+///
+/// A value of one of them is stored in the canonical rendering of that object rather than
+/// in the caller's own spelling ([`canonical_redrive_document`]), which is what makes a
+/// later read report one document for every spelling of it. `Policy` is not here: "a valid
+/// Amazon Web Services policy" is a document this service does not define member by member,
+/// so what it normalises is the one spelling AWS canonicalises
+/// ([`authorization::normalised_policy`]).
+const CANONICAL_JSON_ATTRIBUTES: &[(&str, &[&str])] = &[
+    (REDRIVE_POLICY, &[MAX_RECEIVE_COUNT_MEMBER]),
+    (REDRIVE_ALLOW_POLICY, &[]),
+];
+
+/// A redrive policy document as this service STORES and REPORTS it: the compact JSON of the
+/// object the caller supplied, with every member the attribute documents as a number held
+/// as that number even where the request quoted it.
+///
+/// The caller's whitespace, its member order and whether it wrote a numeric member quoted
+/// are its own formatting and say nothing about the queue, so they do not survive into what
+/// a later read reports: a client that json-loads the attribute and compares the count
+/// numerically, or re-submits the value it read, sees one document. A value that is not a
+/// JSON object is kept as supplied — its own form rules are what judge it.
+///
+/// The members are rendered in NAME ORDER, which is also the order the two attributes'
+/// documentation lists theirs in (`deadLetterTargetArn` before `maxReceiveCount`,
+/// `redrivePermission` before `sourceQueueArns`), so the rendering is a function of the
+/// document alone and not of the order a request happened to write it in.
+fn canonical_redrive_document(value: &str, numeric_members: &[&str]) -> String {
+    let Ok(::serde_json::Value::Object(members)) =
+        ::serde_json::from_str::<::serde_json::Value>(value)
+    else {
+        return value.to_string();
+    };
+    let canonical: BTreeMap<String, ::serde_json::Value> = members
+        .into_iter()
+        .map(|(member, supplied)| {
+            let held = if numeric_members.contains(&member.as_str()) {
+                numeric_member(supplied)
+            } else {
+                supplied
+            };
+            (member, held)
+        })
+        .collect();
+    ::serde_json::to_string(&canonical).unwrap_or_else(|_| value.to_string())
+}
+
+/// One member documented as a number, as the number it is: a count the request wrote as a
+/// string of digits is held as those digits' value, and anything else is left as it came so
+/// a malformed document is not rewritten into a different one.
+fn numeric_member(supplied: ::serde_json::Value) -> ::serde_json::Value {
+    match supplied
+        .as_str()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+    {
+        Some(number) => ::serde_json::Value::from(number),
+        None => supplied,
     }
 }
 
@@ -3196,7 +3412,7 @@ fn refused_redrive_policy_value(max_receive_count: &str, dead_letter_target_arn:
 /// supplied: the member is read whether the JSON carries it as a number or as a string
 /// (see [`redrive_max_receive_count`]), and a refusal quotes back what the caller wrote.
 fn redrive_max_receive_count_text(policy: &::serde_json::Value) -> Option<String> {
-    let count = policy.get("maxReceiveCount")?;
+    let count = policy.get(MAX_RECEIVE_COUNT_MEMBER)?;
     count
         .as_str()
         .map(|raw| raw.trim().to_string())
@@ -4320,6 +4536,9 @@ pub fn validate_attributes(
 /// * A `Policy` is stored in its normalised form
 ///   ([`authorization::normalised_policy`]), so every later read reports the principals
 ///   in the spelling AWS canonicalises them to.
+/// * A redrive policy attribute is stored in its canonical rendering
+///   ([`canonical_redrive_document`]), so every later read reports one document whatever
+///   spacing, member order or quoting the caller wrote it with.
 ///
 /// Both `CreateQueue` and `SetQueueAttributes` store through this, so the two cannot
 /// disagree about what a supplied value means.
@@ -4345,6 +4564,12 @@ pub fn stored_attribute(name: &str, value: &str) -> Option<String> {
     }
     if name == POLICY {
         return Some(authorization::normalised_policy(value));
+    }
+    if let Some((_, numeric_members)) = CANONICAL_JSON_ATTRIBUTES
+        .iter()
+        .find(|(attribute, _)| *attribute == name)
+    {
+        return Some(canonical_redrive_document(value, numeric_members));
     }
     Some(value.to_string())
 }

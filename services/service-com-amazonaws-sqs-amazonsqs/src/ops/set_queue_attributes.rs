@@ -279,6 +279,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
         }
+        // A redrive moves a message from this queue to the dead-letter queue the policy
+        // names, so that queue has to be there and has to be of this queue's own type:
+        // "the dead-letter queue of a FIFO queue must also be a FIFO queue. Similarly, the
+        // dead-letter queue of a standard queue must also be a standard queue". The pair is
+        // judged when the association is made, so a policy failing either is left unstored.
+        if let Some(why) = input
+            .attributes
+            .get(state::REDRIVE_POLICY)
+            .and_then(|value| store.dead_letter_target_refusal(&region, fifo, value))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
+        }
         // Whether a queue may drive its messages to a given dead-letter queue is that
         // queue's own `RedriveAllowPolicy` to decide, and the decision is taken when the
         // association is made: a policy the target does not admit this queue under is

@@ -92,9 +92,8 @@ async fn receive_batch(router: &MultiServiceRouter, url: &str, wait_seconds: i64
 async fn a_message_is_dead_lettered_once_its_queue_has_delivered_it_as_often_as_allowed() {
     // (case, the JSON `maxReceiveCount` the policy carries, the deliveries it allows, how
     // many messages are sent). The rows walk the allowance against the message count, and
-    // the last row spells the same count as a string of digits — this store keeps the
-    // attribute value exactly as the caller supplied it, and either spelling says the same
-    // thing about the queue.
+    // the last row spells the same count as a string of digits — either spelling says the
+    // same thing about the queue, and both bound the deliveries the same way.
     let rows: &[(&str, Value, i64, usize)] = &[
         ("one delivery allowed, one message", json!(1), 1, 1),
         ("one delivery allowed, three messages", json!(1), 1, 3),
@@ -256,6 +255,140 @@ async fn a_message_whose_allowance_is_unspent_stays_in_its_queue() {
             "case {case}: expected the dead-letter queue to have been handed nothing"
         );
     }
+}
+
+/// One row of the source-naming table: the case, and whether the pair of queues is FIFO —
+/// "the dead-letter queue of a FIFO queue must also be a FIFO queue", so the rule is
+/// asserted over both queue types.
+type NamingRow = (&'static str, bool);
+
+/// A dead-lettered message NAMES the queue that gave up on it: a receive from the
+/// dead-letter queue reports that queue's ARN under `DeadLetterQueueSourceArn`, a message in
+/// the queue it was sent to reports no such attribute, and the stamp travels with the
+/// message when a movement task drives it back out of the dead-letter queue.
+#[tokio::test]
+async fn a_dead_lettered_message_names_the_queue_it_was_driven_out_of() {
+    const ATTRIBUTE: &str = "DeadLetterQueueSourceArn";
+    let rows: &[NamingRow] = &[
+        ("a standard pair", false),
+        ("a FIFO pair", true),
+    ];
+
+    for (index, (case, fifo)) in rows.iter().enumerate() {
+        let router = emulator();
+        let suffix = if *fifo { ".fifo" } else { "" };
+        let dead_letter_name = format!("naming-{index}-dlq{suffix}");
+        let source_name = format!("naming-{index}-source{suffix}");
+        let dead_letter_arn = expected_arn(&dead_letter_name);
+        let source_arn = expected_arn(&source_name);
+        let mut dead_letter_attributes = json!({"VisibilityTimeout": "0"});
+        let mut source_attributes = json!({
+            // A visibility timeout of zero hands a message straight back to the next
+            // receive, so the row spends the allowance without waiting out a timeout.
+            "VisibilityTimeout": "0",
+            "RedrivePolicy": redrive_policy(&dead_letter_arn, &json!(1)),
+        });
+        if *fifo {
+            dead_letter_attributes["FifoQueue"] = json!("true");
+            source_attributes["FifoQueue"] = json!("true");
+        }
+        let dead_letter_url = create_ok(&router, &dead_letter_name, &dead_letter_attributes).await;
+        let source_url = create_ok(&router, &source_name, &source_attributes).await;
+
+        let body = format!("{case}: the poison message");
+        let send = if *fifo {
+            json!({
+                "QueueUrl": source_url,
+                "MessageBody": body,
+                "MessageGroupId": "naming",
+                "MessageDeduplicationId": format!("naming-{index}"),
+            })
+        } else {
+            json!({"QueueUrl": source_url, "MessageBody": body})
+        };
+        ok(&router, "SendMessage", send).await;
+
+        // In the queue it was sent to, nothing has dead-lettered it.
+        let delivered = receive_naming(&router, &source_url).await;
+        let (_, reported) = delivered
+            .first()
+            .unwrap_or_else(|| panic!("case {case}: the source queue delivered nothing"));
+        assert!(
+            reported.get(ATTRIBUTE).is_none(),
+            "case {case}: a message in the queue it was sent to must report no {ATTRIBUTE}, got \
+             {reported:?}"
+        );
+
+        // Spend what the policy allows, so the next receive drives it to the dead-letter
+        // queue instead of handing it over.
+        let deadline = Instant::now() + DEADLINE;
+        while count(&router, &dead_letter_url, "ApproximateNumberOfMessages").await < 1
+            && Instant::now() < deadline
+        {
+            receive_naming(&router, &source_url).await;
+        }
+        let delivered = receive_naming(&router, &dead_letter_url).await;
+        let (delivered_body, reported) = delivered
+            .first()
+            .unwrap_or_else(|| panic!("case {case}: the dead-letter queue delivered nothing"));
+        assert_eq!(
+            (delivered_body.as_str(), reported.get(ATTRIBUTE).map(String::as_str)),
+            (body.as_str(), Some(source_arn.as_str())),
+            "case {case}: the dead-lettered message must name the queue it was driven out of, \
+             got {reported:?}"
+        );
+
+        // Driven back by a movement task, the message keeps what the redrive recorded: the
+        // queue it was dead-lettered from is still the one it names.
+        ok(
+            &router,
+            "StartMessageMoveTask",
+            json!({"SourceArn": dead_letter_arn, "DestinationArn": source_arn}),
+        )
+        .await;
+        let deadline = Instant::now() + DEADLINE;
+        let mut driven_back: Vec<(String, BTreeMap<String, String>)> = Vec::new();
+        while driven_back.is_empty() && Instant::now() < deadline {
+            driven_back = receive_naming(&router, &source_url).await;
+        }
+        let (_, reported) = driven_back
+            .first()
+            .unwrap_or_else(|| panic!("case {case}: the move task drove nothing back"));
+        assert_eq!(
+            reported.get(ATTRIBUTE).map(String::as_str),
+            Some(source_arn.as_str()),
+            "case {case}: a message driven back out of the dead-letter queue must still name \
+             the queue it was dead-lettered from, got {reported:?}"
+        );
+    }
+}
+
+/// Receive from the queue at `url`, selecting every message system attribute, and answer
+/// each message's `(Body, attributes)`.
+async fn receive_naming(
+    router: &MultiServiceRouter,
+    url: &str,
+) -> Vec<(String, BTreeMap<String, String>)> {
+    let reply = ok(
+        router,
+        "ReceiveMessage",
+        json!({
+            "QueueUrl": url,
+            "MaxNumberOfMessages": 10,
+            "WaitTimeSeconds": 0,
+            "MessageSystemAttributeNames": ["All"],
+        }),
+    )
+    .await;
+    messages(&reply)
+        .iter()
+        .map(|message| {
+            (
+                message["Body"].as_str().unwrap_or_default().to_string(),
+                super::support::as_map(message.get("Attributes").unwrap_or(&Value::Null)),
+            )
+        })
+        .collect()
 }
 
 /// The whole poison-message recovery path: messages dead-lettered by the source queue's

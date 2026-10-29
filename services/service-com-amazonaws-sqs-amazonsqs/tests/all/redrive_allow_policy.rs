@@ -86,6 +86,13 @@ fn redrive_policy(
     json!({"deadLetterTargetArn": dead_letter_target_arn, "maxReceiveCount": count}).to_string()
 }
 
+/// The same document as the queue carrying it REPORTS it: the canonical rendering, whose
+/// count is the number the member is documented as whichever way the request spelled it.
+/// `redrive_policy_document` is where that rendering itself is under test.
+fn stored_redrive_policy(dead_letter_target_arn: &str, max_receive_count: &str) -> String {
+    redrive_policy(dead_letter_target_arn, max_receive_count, false)
+}
+
 /// A `RedriveAllowPolicy` document for `permission`, listing `source_queue_arns` when the
 /// permission is the one that takes a list.
 fn allow_policy(permission: &str, source_queue_arns: &[String]) -> String {
@@ -147,9 +154,9 @@ struct PermissionRow {
     lists_source: bool,
     /// The `maxReceiveCount` the association submits, in digits.
     max_receive_count: &'static str,
-    /// Whether the count is submitted as a JSON string rather than a JSON number: "this
-    /// store keeps the attribute value exactly as the caller supplied it and either
-    /// spelling says the same thing about the queue".
+    /// Whether the count is submitted as a JSON string rather than a JSON number: either
+    /// spelling says the same thing about the queue, and both read back as the one canonical
+    /// document ([`stored_redrive_policy`]).
     count_as_string: bool,
     /// Whether the pair of queues is FIFO: "the dead-letter queue of a FIFO queue must also
     /// be a FIFO queue".
@@ -294,6 +301,7 @@ async fn a_dead_letter_queue_admits_only_the_source_queues_its_permission_names(
         }
 
         let policy = redrive_policy(&dead_letter_arn, row.max_receive_count, row.count_as_string);
+        let stored_policy = stored_redrive_policy(&dead_letter_arn, row.max_receive_count);
         let expected_message = permission_refusal(row.max_receive_count, &dead_letter_arn);
 
         // The CREATE path: a queue created carrying the association.
@@ -312,7 +320,7 @@ async fn a_dead_letter_queue_admits_only_the_source_queues_its_permission_names(
                     .await
                     .get("RedrivePolicy")
                     .map(String::as_str),
-                Some(policy.as_str()),
+                Some(stored_policy.as_str()),
                 "case {case}: expected the accepted policy stored on the created queue"
             );
         } else {
@@ -347,7 +355,7 @@ async fn a_dead_letter_queue_admits_only_the_source_queues_its_permission_names(
             );
             assert_eq!(
                 stored.as_deref(),
-                Some(policy.as_str()),
+                Some(stored_policy.as_str()),
                 "case {case}: expected the accepted policy stored on the source queue"
             );
         } else {

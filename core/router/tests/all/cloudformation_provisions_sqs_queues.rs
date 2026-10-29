@@ -807,12 +807,12 @@ const ROWS: &[Row] = &[
                 expected_attributes: &[
                     ("VisibilityTimeout", "60"),
                     // The object the template declared, as the compact JSON string the
-                    // attribute is documented to carry — the members in the order the
-                    // template wrote them, with the intrinsic resolved to the other
-                    // queue's ARN.
+                    // attribute is documented to carry, with the intrinsic resolved to the
+                    // other queue's ARN — in the rendering SQS reports a redrive policy in,
+                    // which is the owning service's and not the template's member order.
                     (
                         "RedrivePolicy",
-                        r#"{"maxReceiveCount":3,"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:stack-dead-letters"}"#,
+                        r#"{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:stack-dead-letters","maxReceiveCount":3}"#,
                     ),
                 ],
                 message_plane: true,

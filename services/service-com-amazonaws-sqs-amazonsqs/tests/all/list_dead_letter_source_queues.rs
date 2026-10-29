@@ -123,7 +123,7 @@ struct Step {
 
 /// However a `RedrivePolicy` link came about and however it went away, the listing of
 /// each dead-letter queue reports exactly the queues currently naming it — never a queue
-/// naming another dead-letter queue, naming none, or naming one that does not exist.
+/// naming another dead-letter queue and never one naming none.
 #[tokio::test]
 async fn the_listing_reports_exactly_the_queues_whose_policy_names_the_addressed_queue() {
     let router = emulator();
@@ -212,19 +212,6 @@ async fn the_listing_reports_exactly_the_queues_whose_policy_names_the_addressed
             ],
         },
         Step {
-            case: "a policy naming a queue that was never created",
-            operation: "CreateQueue",
-            request: json!({
-                "QueueName": "source-orphan",
-                "Attributes": {"RedrivePolicy": policy(&expected_arn("never-created"))},
-            }),
-            expected: vec![
-                ("dlq-primary", vec!["plain", "source-b"]),
-                ("dlq-other", vec!["source-a"]),
-                ("dlq-queue.fifo", vec![]),
-            ],
-        },
-        Step {
             case: "a FIFO source of a FIFO dead-letter queue",
             operation: "CreateQueue",
             request: json!({
@@ -263,6 +250,45 @@ async fn the_listing_reports_exactly_the_queues_whose_policy_names_the_addressed
                 step.case
             );
         }
+    }
+
+    // A policy naming a queue nothing holds configures a redrive no delivery could ever
+    // make, so the create carrying it is refused and no source queue comes into being for
+    // any listing to report. (`redrive_policy_document` owns that refusal's own sentence;
+    // here it is the listing that must be untouched by it.)
+    let before: Vec<Vec<String>> = {
+        let mut listings = Vec::new();
+        for dead_letter in ["dlq-primary", "dlq-other", "dlq-queue.fifo"] {
+            listings.push(sources(&router, &expected_url(dead_letter)).await);
+        }
+        listings
+    };
+    let (status, parsed) = call(
+        &router,
+        "CreateQueue",
+        &json!({
+            "QueueName": "source-orphan",
+            "Attributes": {"RedrivePolicy": policy(&expected_arn("never-created"))},
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&parsed).as_str()),
+        (400, "InvalidParameterValue"),
+        "case a policy naming a queue that was never created: expected the create refused, \
+         got {status} with {parsed}"
+    );
+    for (index, dead_letter) in ["dlq-primary", "dlq-other", "dlq-queue.fifo"]
+        .iter()
+        .enumerate()
+    {
+        let reported = sources(&router, &expected_url(dead_letter)).await;
+        assert_eq!(
+            Some(&reported),
+            before.get(index),
+            "case a policy naming a queue that was never created on {dead_letter}: a refused \
+             create must leave the listing as it was, got {reported:?}"
+        );
     }
 
     // A listing changes nothing a later caller sees: the same request repeated answers

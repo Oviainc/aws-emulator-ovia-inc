@@ -104,7 +104,7 @@ async fn a_created_queue_reports_its_url_arn_supplied_attributes_and_documented_
                 "KmsMasterKeyId": "alias/aws/sqs",
                 "KmsDataKeyReusePeriodSeconds": "300",
                 "SqsManagedSseEnabled": "false",
-                "RedrivePolicy": r#"{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:orders_dead_letter","maxReceiveCount":"5"}"#,
+                "RedrivePolicy": r#"{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:orders_dead_letter","maxReceiveCount":5}"#,
                 "RedriveAllowPolicy": r#"{"redrivePermission":"allowAll"}"#,
             }),
         },
@@ -333,6 +333,10 @@ async fn an_integer_attribute_accepts_its_documented_range_and_refuses_anything_
 #[tokio::test]
 async fn a_non_integer_attribute_accepts_exactly_the_values_its_documentation_lists() {
     let router = emulator();
+    // The dead-letter queue the redrive row names: a `deadLetterTargetArn` has to name a
+    // queue there is, which is `redrive_policy_document`'s rule — this table is about the
+    // attribute's FORM.
+    let _ = create_ok(&router, "values-dlq", &json!({})).await;
     // (attribute, value, FIFO queue?, accepted)
     let rows: &[(&str, &str, bool, bool)] = &[
         ("SqsManagedSseEnabled", "true", false, true),
@@ -352,7 +356,10 @@ async fn a_non_integer_attribute_accepts_exactly_the_values_its_documentation_li
         ("Policy", QUEUE_POLICY, false, true),
         ("Policy", "{}", false, true),
         ("Policy", "not a policy", false, false),
-        ("RedrivePolicy", r#"{"maxReceiveCount":"5"}"#, false, true),
+        // A redrive policy is reported in its canonical rendering, so this row supplies the
+        // canonical document: what that rendering IS — and that a policy written any other
+        // way reads back as it — is `redrive_policy_document`'s own table.
+        ("RedrivePolicy", r#"{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:values-dlq","maxReceiveCount":5}"#, false, true),
         ("RedrivePolicy", "maxReceiveCount=5", false, false),
         ("RedriveAllowPolicy", r#"{"redrivePermission":"denyAll"}"#, false, true),
         ("RedriveAllowPolicy", "denyAll", false, false),
@@ -411,11 +418,32 @@ async fn an_unbounded_attribute_value_is_refused_past_the_documented_ceiling() {
         let overhead = r#"{"Pad":""}"#.len();
         format!(r#"{{"Pad":"{}"}}"#, "p".repeat(len - overhead))
     };
+    // A `RedrivePolicy` names a dead-letter queue there is and carries the two members the
+    // attribute documents, so a row of an exact length pads a member of its own: only the
+    // VALUE's length is at issue here, and what the document itself must carry is
+    // `redrive_policy_document`'s table.
+    let dead_letter = create_ok(&router, "bounded-dlq", &json!({})).await;
+    assert!(
+        !dead_letter.is_empty(),
+        "case the dead-letter queue the redrive rows name: it must have been created"
+    );
+    let redrive_json_of = |len: usize| {
+        let document = |pad: &str| {
+            json!({
+                "deadLetterTargetArn": expected_arn("bounded-dlq"),
+                "maxReceiveCount": 1,
+                "Pad": pad,
+            })
+            .to_string()
+        };
+        let overhead = document("").len();
+        document(&"p".repeat(len - overhead))
+    };
     let rows: Vec<(&str, String, bool)> = vec![
         ("Policy", json_of(CEILING), true),
         ("Policy", json_of(CEILING + 1), false),
-        ("RedrivePolicy", json_of(CEILING), true),
-        ("RedrivePolicy", json_of(CEILING + 1), false),
+        ("RedrivePolicy", redrive_json_of(CEILING), true),
+        ("RedrivePolicy", redrive_json_of(CEILING + 1), false),
         ("RedriveAllowPolicy", json_of(CEILING), true),
         ("RedriveAllowPolicy", json_of(CEILING + 1), false),
         ("KmsMasterKeyId", "k".repeat(CEILING), true),

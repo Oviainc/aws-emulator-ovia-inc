@@ -81,6 +81,8 @@ mod receive_message_attribute_names;
 mod recreate_and_tag_rules;
 #[path = "all/redrive_allow_policy.rs"]
 mod redrive_allow_policy;
+#[path = "all/redrive_policy_document.rs"]
+mod redrive_policy_document;
 #[path = "all/refusal_message_reasons.rs"]
 mod refusal_message_reasons;
 #[path = "all/refusal_taxonomy.rs"]
