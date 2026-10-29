@@ -83,6 +83,9 @@ mod state_roundtrip;
 #[path = "all/telemetry_records.rs"]
 mod telemetry_records;
 
+#[path = "all/terminal_cancel_and_reported_windows.rs"]
+mod terminal_cancel_and_reported_windows;
+
 #[path = "all/time_series_service_statistics.rs"]
 mod time_series_service_statistics;
 

@@ -252,20 +252,26 @@ async fn a_token_that_verifies_reaches_the_retrieval_it_names() {
         "the cancelled retrieval must read back as cancelled, got {listed:?}"
     );
 
-    // And a retrieval that is no longer ongoing is the THIRD class: the request
-    // is refused because there is no job left to cancel, naming the status it is
-    // in — not because the value was wrong and not because it is gone.
+    // And a retrieval that is no longer ongoing is NOT a third refusal class:
+    // the cancel asks for a state the retrieval is already in, so it is
+    // answered the empty result and the retrieval stands where it was.
     let again = xray
         .call("/CancelTraceRetrieval", &json!({"RetrievalToken": real}))
         .await;
     assert_eq!(
-        (again.status, again.error_type.as_deref()),
-        (400, Some("InvalidRequestException")),
-        "cancelling a cancelled retrieval must be refused, got {again:?}"
+        (again.status, &again.body),
+        (200, &json!({})),
+        "cancelling a cancelled retrieval must answer the empty result, got {again:?}"
     );
-    let said = again.message().unwrap_or_default();
-    assert!(
-        said.contains(RETRIEVAL_STATUS_CANCELLED) && said.contains(real.as_str()),
-        "the refusal must name the token and the status it is in, got {said:?}"
+    let still = xray
+        .call(
+            "/ListRetrievedTraces",
+            &json!({"RetrievalToken": real, "TraceFormat": "XRAY"}),
+        )
+        .await;
+    assert_eq!(
+        still.get("RetrievalStatus").as_str(),
+        Some(RETRIEVAL_STATUS_CANCELLED),
+        "the retrieval must still read back as cancelled, got {still:?}"
     );
 }

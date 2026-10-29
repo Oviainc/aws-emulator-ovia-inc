@@ -6,20 +6,23 @@
 //! of that token reports `RetrievalStatus` `CANCELLED` and answers no traces.
 //! A successful cancellation answers HTTP 200 with an empty body.
 //!
-//! Three refusals, and the ORDER is part of the contract \u2014 the request's own
+//! Cancelling is IDEMPOTENT over a retrieval's terminal statuses: a token whose
+//! retrieval has already reached one it can no longer leave — it completed, or
+//! a cancel already stopped it — is answered the same empty 200 result, and the
+//! stored retrieval is left exactly as it stands, so a client that cancels
+//! defensively on a shutdown needs to know nothing about where the job got to.
+//!
+//! Two refusals, and the ORDER is part of the contract \u2014 the request's own
 //! form is judged before the store is consulted:
 //!
 //! * a `RetrievalToken` this service could not have ISSUED
 //!   ([`crate::state::retrieval_token_defect`]) \u2014 one that is not of the token
 //!   form at all, or one of that form whose integrity check does not verify \u2014
 //!   could never have named a retrieval, so it is refused with
-//!   `InvalidRequestException` (400), each class in its own words;
+//!   `InvalidRequestException` (400), each class in its own words; and
 //! * a token that VERIFIES but names no retrieval, or whose retrieval has timed
 //!   out, names no retrieval and is refused with `ResourceNotFoundException`
-//!   (404); and
-//! * a retrieval that is no longer ongoing — one that already completed, or that
-//!   was already cancelled — is refused with `InvalidRequestException` (400)
-//!   naming the status it is in, because there is no job left to cancel.
+//!   (404).
 //!
 //! ## Shape of an operation
 //!
@@ -181,20 +184,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // A retrieval the token resolves to is cancelled if it is still
+        // ongoing and left as it stands if it is not: either way the caller
+        // asked for a state the retrieval is now in, which is the empty 200
+        // result. Only a token naming no retrieval has nothing to answer for.
         match store.cancel_trace_retrieval(&input.retrieval_token, now) {
-            Ok(_) => Ok(CancelTraceRetrievalOutput {}),
-            Err(Some(status)) => Err(
-                CancelTraceRetrievalErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(format!(
-                            "the retrieval for RetrievalToken `{}` is {status}, so there is no ongoing retrieval to cancel",
-                            input.retrieval_token
-                        )),
-                    },
-                )
-                .into(),
-            ),
-            Err(None) => Err(
+            Some(_) => Ok(CancelTraceRetrievalOutput {}),
+            None => Err(
                 CancelTraceRetrievalErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(format!(

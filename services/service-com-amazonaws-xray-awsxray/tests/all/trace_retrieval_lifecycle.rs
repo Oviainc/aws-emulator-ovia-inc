@@ -31,9 +31,9 @@
 //!   stands behind is refused with `ResourceNotFoundException` at HTTP 404;
 //! * `ListRetrievedTraces` requires a `TraceFormat`, and judges it before it
 //!   resolves the token; and
-//! * `CancelTraceRetrieval` moves an ONGOING retrieval to `CANCELLED` and is
-//!   refused with `InvalidRequestException` at HTTP 400 for one that is not
-//!   ongoing, leaving that retrieval as it was.
+//! * `CancelTraceRetrieval` moves an ONGOING retrieval to `CANCELLED`, and is
+//!   answered the same empty HTTP 200 result for one that is no longer ongoing,
+//!   leaving that retrieval as it was.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -263,7 +263,9 @@ async fn a_cancelled_retrieval_reports_cancelled_at_every_later_offset() {
 
     let cancelled_at = started + TRACE_RETRIEVAL_SCHEDULED_SPAN_SECONDS;
     assert!(
-        store.cancel_trace_retrieval(&token, cancelled_at).is_ok(),
+        store
+            .cancel_trace_retrieval(&token, cancelled_at)
+            .is_some(),
         "a running retrieval must be cancellable"
     );
 
@@ -281,14 +283,20 @@ async fn a_cancelled_retrieval_reports_cancelled_at_every_later_offset() {
         );
     }
 
+    // Cancelling what is already cancelled asks for the state it is in, so the
+    // record stands and the call has nothing to refuse; a token nothing minted
+    // names no record at all.
     assert_eq!(
-        store.cancel_trace_retrieval(&token, cancelled_at + 1.0).err(),
-        Some(Some(RETRIEVAL_STATUS_CANCELLED)),
-        "cancelling a cancelled retrieval must report the status it is in"
+        store
+            .cancel_trace_retrieval(&token, cancelled_at + 1.0)
+            .map(|retrieval| retrieval.status(cancelled_at + 1.0)),
+        Some(RETRIEVAL_STATUS_CANCELLED),
+        "cancelling a cancelled retrieval must leave it cancelled"
     );
-    assert_eq!(
-        store.cancel_trace_retrieval("a token nothing minted", cancelled_at).err(),
-        Some(None),
+    assert!(
+        store
+            .cancel_trace_retrieval("a token nothing minted", cancelled_at)
+            .is_none(),
         "cancelling an unknown token must report no retrieval at all"
     );
 }
@@ -759,11 +767,11 @@ async fn a_malformed_token_is_a_bad_request_and_a_well_formed_unknown_one_is_not
 }
 
 // =============================================================================
-// 6. Cancelling, and refusing to cancel what is not ongoing
+// 6. Cancelling, and asking again for a retrieval that is no longer ongoing
 // =============================================================================
 
 #[tokio::test]
-async fn cancel_stops_an_ongoing_retrieval_and_is_refused_once_it_is_not_ongoing() {
+async fn cancel_stops_an_ongoing_retrieval_and_is_a_no_op_once_it_is_not_ongoing() {
     let xray = Xray::new();
     let base = base_window_start();
     let trace = trace_id(490);
@@ -798,8 +806,9 @@ async fn cancel_stops_an_ongoing_retrieval_and_is_refused_once_it_is_not_ongoing
         );
     }
 
-    // A retrieval that completed, and one already cancelled, are both no longer
-    // ongoing jobs: there is nothing left to cancel.
+    // A retrieval that completed, and one already cancelled, are both in a
+    // status they can no longer leave: the cancel asks for a state each is
+    // already in, so it is answered the empty result and changes nothing.
     let completed = start_retrieval(&xray, std::slice::from_ref(&trace), base, base + 300.0).await;
     tokio::time::sleep(completion_wait()).await;
     for (case, token) in [
@@ -808,18 +817,18 @@ async fn cancel_stops_an_ongoing_retrieval_and_is_refused_once_it_is_not_ongoing
     ] {
         let answer = cancel_retrieval(&xray, token).await;
         assert_eq!(
-            (answer.status, answer.error_type.as_deref()),
-            (400, Some("InvalidRequestException")),
-            "case {case:?}: cancelling what is not ongoing must be refused, got {answer:?}"
+            (answer.status, &answer.body),
+            (200, &json!({})),
+            "case {case:?}: cancelling what is not ongoing must answer the empty result, got {answer:?}"
         );
     }
 
-    // And the refused cancel left the completed retrieval readable.
+    // And the no-op cancel left the completed retrieval readable.
     let listed = list_retrieved(&xray, &completed, None, None).await;
     assert_eq!(
         (listed.status, status_of(&listed).as_str(), listed_ids(&listed)),
         (200, RETRIEVAL_STATUS_COMPLETE, vec![trace.clone()]),
-        "a refused cancel must leave the retrieval as it was, got {listed:?}"
+        "a no-op cancel must leave the retrieval as it was, got {listed:?}"
     );
 }
 

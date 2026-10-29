@@ -16,10 +16,12 @@
 //!
 //! Two refusals come before that token exists:
 //!
-//! * a `[StartTime, EndTime]` window that names no interval of recorded traffic
-//!   — one running backwards, or one whose bounds are not times the data could
-//!   have — is refused with `InvalidRequestException` (400), through the one
-//!   window check in [`crate::state::validate_window`]; and
+//! * a `[StartTime, EndTime]` window that names no interval a retrieval could
+//!   cover — one running backwards, or one whose bounds are not times
+//!   retrievable traffic could carry — is refused with
+//!   `InvalidRequestException` (400), through the one window check in
+//!   [`crate::state::validate_retrieval_window`], each class in the service's
+//!   own fixed words for it; and
 //! * a call that arrives with the account's request budget empty is refused with
 //!   `ThrottledException` (429).
 //!
@@ -192,14 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let start = crate::state::epoch_seconds(&input.start_time);
         let end = crate::state::epoch_seconds(&input.end_time);
         let now = crate::state::now_epoch_seconds();
-        if let Err(window) = crate::state::validate_window(start, end, now) {
+        if let Err(window) = crate::state::validate_retrieval_window(start, end, now) {
             return Err(StartTraceRetrievalErrorModeled::InvalidRequestException(
                 InvalidRequestException {
-                    message: Some(format!(
-                        "{} {}",
-                        crate::state::INVALID_INPUT_PARAMETERS_PREAMBLE,
-                        window.message(start, end)
-                    )),
+                    message: Some(window.message()),
                 },
             )
             .into());

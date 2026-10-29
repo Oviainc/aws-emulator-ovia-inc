@@ -4437,6 +4437,75 @@ pub fn validate_window(start: f64, end: f64, now: f64) -> Result<(), WindowError
     Ok(())
 }
 
+/// When X-Ray became generally available, in seconds of epoch time
+/// (2017-04-19T00:00:00Z).
+///
+/// The FLOOR a retrieval's window is judged against: no trace can have been
+/// recorded before the service that records them existed, so a window ending
+/// below it names no retrievable traffic at all.
+pub const XRAY_GENERAL_AVAILABILITY_EPOCH_SECONDS: f64 = 1_492_560_000.0;
+
+/// What X-Ray tells a caller who asks to retrieve a window that lies outside
+/// the interval a retrieval can cover — below the floor the service's own
+/// availability sets, or past a time any recorded trace could carry, which is
+/// what a millisecond-scale epoch value read as seconds is.
+///
+/// A FIXED service text, its two sentences run together exactly as the service
+/// states them: it names neither bound and no limit, so nothing in it varies
+/// from run to run.
+pub const RETRIEVAL_WINDOW_OUT_OF_RANGE_MESSAGE: &str = "Invalid input parameters for starting trace retrieval.End time should not be before the service was generally available.";
+
+/// Why a retrieval's `[StartTime, EndTime]` window names no interval a
+/// retrieval could cover.
+///
+/// Separate from [`WindowError`] because the refusals a window-READER states
+/// are not the ones the retrieval STARTER states: each class here carries the
+/// service's own fixed sentence for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrievalWindowError {
+    /// `EndTime` is before `StartTime`, so the window contains no instant.
+    Inverted,
+    /// A bound lies outside the interval a retrieval can cover: below
+    /// [`XRAY_GENERAL_AVAILABILITY_EPOCH_SECONDS`], or further than
+    /// [`MAX_WINDOW_FUTURE_SKEW_SECONDS`] past now.
+    OutOfRange,
+}
+
+impl RetrievalWindowError {
+    /// What to tell the caller: the service's fixed text for this class,
+    /// interpolating nothing from the request.
+    pub fn message(self) -> String {
+        match self {
+            Self::Inverted => format!("{INVALID_INPUT_PARAMETERS_PREAMBLE} {INVERTED_WINDOW_MESSAGE}"),
+            Self::OutOfRange => RETRIEVAL_WINDOW_OUT_OF_RANGE_MESSAGE.to_string(),
+        }
+    }
+}
+
+/// Refuse a window a retrieval could not cover: one running backwards, and one
+/// whose bounds are not instants retrievable traffic could carry — below the
+/// floor the service's own general availability sets, or past the present by
+/// more than any clock skew.
+pub fn validate_retrieval_window(
+    start: f64,
+    end: f64,
+    now: f64,
+) -> Result<(), RetrievalWindowError> {
+    if !start.is_finite() || !end.is_finite() {
+        return Err(RetrievalWindowError::OutOfRange);
+    }
+    if validate_window_order(start, end).is_err() {
+        return Err(RetrievalWindowError::Inverted);
+    }
+    if end < XRAY_GENERAL_AVAILABILITY_EPOCH_SECONDS
+        || start > now + MAX_WINDOW_FUTURE_SKEW_SECONDS
+        || end > now + MAX_WINDOW_FUTURE_SKEW_SECONDS
+    {
+        return Err(RetrievalWindowError::OutOfRange);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // The per-account request budget
 // ---------------------------------------------------------------------------
@@ -4621,27 +4690,26 @@ impl ComAmazonawsXrayAwsxrayState {
         self.retrievals.get(retrieval_token)
     }
 
-    /// Stop an ongoing retrieval, so every later read of its token reports
-    /// `RETRIEVAL_STATUS_CANCELLED`.
+    /// Stop the retrieval a token names, so every later read of that token
+    /// reports `RETRIEVAL_STATUS_CANCELLED`.
     ///
-    /// `Ok` carries the cancelled retrieval. `Err(Some(status))` is a retrieval
-    /// that is no longer ongoing — there is no job left to cancel — and
-    /// `Err(None)` a token that names no retrieval at all.
+    /// IDEMPOTENT in the statuses a retrieval can no longer leave: a retrieval
+    /// that already reached a terminal status is left exactly as it stands —
+    /// cancelling asks for a state it is already in or past, so there is nothing
+    /// to do and nothing to refuse. `Some` is the stored retrieval as it stands
+    /// after the call; `None` is a token that names no retrieval at all, which is
+    /// the one thing a caller is refused for.
     pub fn cancel_trace_retrieval(
         &mut self,
         retrieval_token: &str,
         now: f64,
-    ) -> Result<&TraceRetrievalRecord, Option<&'static str>> {
+    ) -> Option<&TraceRetrievalRecord> {
         self.expire_trace_retrievals(now);
-        let Some(retrieval) = self.retrievals.get_mut(retrieval_token) else {
-            return Err(None);
-        };
-        let status = retrieval.status(now);
-        if !retrieval.is_ongoing(now) {
-            return Err(Some(status));
+        let retrieval = self.retrievals.get_mut(retrieval_token)?;
+        if retrieval.is_ongoing(now) {
+            retrieval.cancelled_at = Some(now);
         }
-        retrieval.cancelled_at = Some(now);
-        Ok(retrieval)
+        Some(retrieval)
     }
 
     /// The traces one retrieval holds: every requested trace id that names a
@@ -5535,32 +5603,42 @@ pub struct ReportedSamplingCounts {
     pub borrow_count: i64,
 }
 
-/// The counters one reporting window of a rule accumulated, summed over every
-/// service that reported for it — which is exactly what a
-/// `SamplingStatisticSummary` is ("aggregated request sampling data for a
-/// sampling rule across all services for a 10-second window").
+/// A set of sampling counters for one rule and one reporting window: either
+/// what ONE service states for that window, or — once every reporting service's
+/// is added up — what a `SamplingStatisticSummary` is ("aggregated request
+/// sampling data for a sampling rule across all services for a 10-second
+/// window").
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SamplingStatisticsWindow {
-    /// The summed `RequestCount`.
+    /// The `RequestCount` of the window.
     pub request_count: i64,
-    /// The summed `SampledCount`.
+    /// The `SampledCount` of the window.
     pub sampled_count: i64,
-    /// The summed `BorrowCount`.
+    /// The `BorrowCount` of the window.
     pub borrow_count: i64,
 }
 
 impl SamplingStatisticsWindow {
-    /// Accumulate one reported document's counters, saturatingly, so no
-    /// sequence of reports can overflow a total.
-    fn add(&mut self, report: ReportedSamplingCounts) {
-        self.request_count = self.request_count.saturating_add(report.request_count);
-        self.sampled_count = self.sampled_count.saturating_add(report.sampled_count);
-        self.borrow_count = self.borrow_count.saturating_add(report.borrow_count);
+    /// The counters one reported `SamplingStatisticsDocument` states.
+    fn of(report: ReportedSamplingCounts) -> Self {
+        Self {
+            request_count: report.request_count,
+            sampled_count: report.sampled_count,
+            borrow_count: report.borrow_count,
+        }
+    }
+
+    /// Add another service's counters for the same window, saturatingly, so no
+    /// number of reporting services can overflow a total.
+    fn add(&mut self, other: Self) {
+        self.request_count = self.request_count.saturating_add(other.request_count);
+        self.sampled_count = self.sampled_count.saturating_add(other.sampled_count);
+        self.borrow_count = self.borrow_count.saturating_add(other.borrow_count);
     }
 }
 
 /// One row of the account's reported sampling results: which rule and which
-/// window, and the counters that window holds.
+/// window, and the counters every service reporting that window stated.
 ///
 /// `GetSamplingStatisticSummaries` reports these, so the rows a reader walks
 /// are recomputed from what services reported rather than echoed from any one
@@ -5572,7 +5650,7 @@ pub struct SamplingStatisticsEntry {
     /// The start of the window, in whole seconds of epoch time — the summary's
     /// `Timestamp`, "the start time of the reporting window".
     pub window_start: i64,
-    /// The accumulated counters.
+    /// The counters of the window, added up across its reporting services.
     pub counts: SamplingStatisticsWindow,
 }
 
@@ -5655,9 +5733,15 @@ pub struct SamplingStatisticsStore {
     /// every read.
     pub rules_modified_at: f64,
     /// Reported results per rule, per [`SAMPLING_WINDOW_SECONDS`] window keyed
-    /// by the window's start, at most [`MAX_SAMPLING_WINDOWS_PER_RULE`] of them
-    /// per rule.
-    windows: BTreeMap<String, BTreeMap<i64, SamplingStatisticsWindow>>,
+    /// by the window's start, and within a window per reporting service's
+    /// `ClientID` — at most [`MAX_SAMPLING_WINDOWS_PER_RULE`] windows per rule
+    /// and [`MAX_SAMPLING_CLIENTS_PER_RULE`] services per window.
+    ///
+    /// Per SERVICE rather than one running total, because a summary aggregates
+    /// "across all services" for a window: what a service states for a window
+    /// is that service's whole contribution to it, so a service restating the
+    /// window replaces its own figures instead of being counted twice.
+    windows: BTreeMap<String, BTreeMap<i64, BTreeMap<String, SamplingStatisticsWindow>>>,
     /// The latest report each service made for a rule, keyed by rule and then
     /// by the reporting service's `ClientID`, at most
     /// [`MAX_SAMPLING_CLIENTS_PER_RULE`] of them per rule.
@@ -5680,9 +5764,15 @@ impl Default for SamplingStatisticsStore {
 }
 
 impl SamplingStatisticsStore {
-    /// Record one reported `SamplingStatisticsDocument`: accumulate its
-    /// counters into the rule's window, and remember the report as this
-    /// service's claim on the rule's reservoir.
+    /// Record one reported `SamplingStatisticsDocument`: store its counters as
+    /// the reporting service's figures for the window its `Timestamp` falls in,
+    /// and remember the report as this service's claim on the rule's reservoir.
+    ///
+    /// A document states the results of a reporting window, so a service that
+    /// reports the same window again — a client polling for its reservoir
+    /// share restates the window it is in — RESTATES its own figures rather
+    /// than adding to them; a summary of the window adds up what each service
+    /// stated for it.
     ///
     /// Answers the allocation the reporting service HOLDS for the rule — the one
     /// computed at the end of a cycle it already took part in — which is what
@@ -5697,10 +5787,22 @@ impl SamplingStatisticsStore {
         now: f64,
     ) -> Option<SamplingAllocation> {
         let windows = self.windows.entry(rule_name.to_string()).or_default();
-        windows
+        let window = windows
             .entry(sampling_window_start(report.timestamp))
-            .or_default()
-            .add(report);
+            .or_default();
+        window.insert(
+            client_id.to_string(),
+            SamplingStatisticsWindow::of(report),
+        );
+        while window.len() > MAX_SAMPLING_CLIENTS_PER_RULE {
+            // Which service's figures make room is arbitrary — the window holds
+            // no order over them — so the first by `ClientID` goes, and the
+            // window stays bounded.
+            let Some(crowded) = window.keys().next().cloned() else {
+                break;
+            };
+            window.remove(&crowded);
+        }
         while windows.len() > MAX_SAMPLING_WINDOWS_PER_RULE {
             let Some(oldest) = windows.keys().next().copied() else {
                 break;
@@ -5949,19 +6051,26 @@ impl SamplingStatisticsStore {
     /// Every reported window the account holds, in rule-name order and then in
     /// window order — what `GetSamplingStatisticSummaries` pages over.
     ///
+    /// Each row adds up what every service reporting that window stated for it,
+    /// which is what the summary aggregates "across all services".
+    ///
     /// Bounded by [`MAX_SAMPLING_STATISTIC_RULES`] *
     /// [`MAX_SAMPLING_WINDOWS_PER_RULE`].
     pub fn entries(&self) -> Vec<SamplingStatisticsEntry> {
         self.windows
             .iter()
             .flat_map(|(rule_name, windows)| {
-                windows
-                    .iter()
-                    .map(move |(window_start, counts)| SamplingStatisticsEntry {
+                windows.iter().map(move |(window_start, reporters)| {
+                    let mut counts = SamplingStatisticsWindow::default();
+                    for stated in reporters.values() {
+                        counts.add(*stated);
+                    }
+                    SamplingStatisticsEntry {
                         rule_name: rule_name.clone(),
                         window_start: *window_start,
-                        counts: *counts,
-                    })
+                        counts,
+                    }
+                })
             })
             .collect()
     }
