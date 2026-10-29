@@ -56,8 +56,9 @@ fn message(reply: &Reply) -> String {
     reply.message()
 }
 
-/// The `fieldList` entries a refusal carries, as `(name, message)` pairs.
-fn field_list(reply: &Reply) -> Vec<(String, String)> {
+/// The `fieldList` entries a refusal carries, as `(name, message)` pairs. `pub(crate)` so
+/// the suites that pin other refusals read the modelled list the SAME way.
+pub(crate) fn field_list(reply: &Reply) -> Vec<(String, String)> {
     reply
         .member("fieldList")
         .as_array()
@@ -81,8 +82,9 @@ fn field_list(reply: &Reply) -> Vec<(String, String)> {
 
 /// The document a validation refusal's message is: one `ValidationErrorFields` entry per
 /// refused request field. Spelled out here, independently of the handler, so what the test
-/// pins is the envelope rather than the code that built it.
-fn validation_error_fields(entries: &[(&str, &str)]) -> String {
+/// pins is the envelope rather than the code that built it. `pub(crate)` for the same
+/// reason as [`field_list`].
+pub(crate) fn validation_error_fields(entries: &[(&str, &str)]) -> String {
     let fields = entries
         .iter()
         .map(|(name, message)| format!(r#"{{"Name":"{name}","Message":"{message}"}}"#))

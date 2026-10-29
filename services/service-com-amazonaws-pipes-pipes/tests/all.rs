@@ -39,6 +39,8 @@ mod pipe_metrics;
 mod pipe_refusal_bodies;
 #[path = "all/pipe_tagging.rs"]
 mod pipe_tagging;
+#[path = "all/pipe_target_parameter_refusal.rs"]
+mod pipe_target_parameter_refusal;
 #[path = "all/pipe_update.rs"]
 mod pipe_update;
 #[path = "all/state_roundtrip.rs"]

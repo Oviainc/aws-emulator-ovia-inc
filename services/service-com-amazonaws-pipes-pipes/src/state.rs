@@ -571,17 +571,29 @@ const PATTERN_FIELD: &str = "Pattern";
 /// fault with no parse failure behind it, so no parser states it.
 const NOT_AN_OBJECT_REASON: &str = "Filter is not an object";
 
-/// The field a batch size the target cannot take is reported at, and the one a FIFO target
-/// with no message group id is: the member that would have had to carry something else.
+/// The field a batch size the target cannot take is reported at: the member that carried
+/// the value the target cannot take.
 const BATCH_SIZE_FIELD: &str = "BatchSize";
-const MESSAGE_GROUP_ID_FIELD: &str = "MessageGroupId";
 
-/// The request member that carries a pipe's source configuration, which a member nested
-/// inside it is reported under (`SourceParameters.<Member>`).
+/// The request members that carry a pipe's source and target configuration, which a member
+/// nested inside one is reported under (`SourceParameters.<Member>`,
+/// `TargetParameters.<Member>`).
 const SOURCE_PARAMETERS_MEMBER: &str = "SourceParameters";
+const TARGET_PARAMETERS_MEMBER: &str = "TargetParameters";
 
-/// What this service reports for a member the request had to carry and did not.
+/// The `PipeTargetParameters` member that configures an Amazon SQS queue target, as the
+/// model names it — the member a requirement of such a target is reported at.
+const SQS_QUEUE_PARAMETERS_MEMBER: &str = "SqsQueueParameters";
+
+/// What this service reports for a member the request had to carry and did not, and what it
+/// reports for a TARGET parameter the target resource requires that the configuration does
+/// not supply.
+///
+/// TWO sentences, deliberately: the service words the target side as its own refusal, naming
+/// the target, so neither constant is the other spelled differently and unifying them would
+/// change what a client reads.
 const MISSING_PARAMETER_MESSAGE: &str = "Missing required parameter.";
+const MISSING_TARGET_PARAMETER_MESSAGE: &str = "Missing required target parameter.";
 
 /// One `SourceParameters` member that belongs to a source TYPE.
 pub struct SourceTypeMember {
@@ -792,6 +804,13 @@ fn cross_resource_field(
     // the group literally or a path to read it from each event. A FIFO queue is one whose
     // NAME carries the suffix, which is the resource field of its ARN
     // (`service_common::arn` reads both fields).
+    //
+    // A target parameter the target RESOURCE requires and the configuration does not supply
+    // is reported at the `TargetParameters` member that configures that kind of target —
+    // the parameters the pipe needed and has not got, not the leaf inside them — with the
+    // one sentence that states a target parameter is missing
+    // ([`MISSING_TARGET_PARAMETER_MESSAGE`]), because what the caller has to supply is that
+    // member's configuration whether the member is absent altogether or merely incomplete.
     let fifo_target = ::service_common::arn::parse_of(target, PIPES_SERVICE_SQS)
         .is_some_and(|queue| queue.resource.ends_with(FIFO_QUEUE_SUFFIX));
     let message_group_id = target_parameters
@@ -800,8 +819,8 @@ fn cross_resource_field(
         .filter(|id| !id.is_empty());
     if fifo_target && message_group_id.is_none() {
         return Some(validation_field(
-            MESSAGE_GROUP_ID_FIELD,
-            "MessageGroupId is required for a FIFO queue target.",
+            format!("{TARGET_PARAMETERS_MEMBER}.{SQS_QUEUE_PARAMETERS_MEMBER}"),
+            MISSING_TARGET_PARAMETER_MESSAGE,
         ));
     }
 

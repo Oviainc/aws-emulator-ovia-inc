@@ -3,8 +3,8 @@
 //! The rules a pipe's configuration must satisfy ACROSS the resources it names, end to end
 //! over the wire.
 //!
-//! Three rules no per-member constraint can express, because each spans two members — and
-//! all three are enforced by both writes that can configure a pipe (`CreatePipe` and
+//! Two rules no per-member constraint can express, because each spans two members — and
+//! both are enforced by the two writes that can configure a pipe (`CreatePipe` and
 //! `UpdatePipe`), against the configuration the pipe would END UP with:
 //!
 //! * the batch size the SOURCE reads is bounded by what the TARGET takes in one delivery:
@@ -12,19 +12,23 @@
 //!   fewer entries per call caps it there (Amazon SQS `SendMessageBatch` and EventBridge
 //!   `PutEvents` 10, Kinesis `PutRecords` 500), and a target that takes one call per batch
 //!   (Lambda, Step Functions, …) caps it not at all;
-//! * a FIFO queue target needs the message group id its sends are ordered by, which for a
-//!   pipe is `TargetParameters.SqsQueueParameters.MessageGroupId`;
 //! * a filter pattern is an EventBridge event pattern, so text that is not a JSON object is
 //!   not a pattern at all and is refused with the parser's own diagnostic for why.
 //!
+//! The third such rule — a target parameter the TARGET RESOURCE requires that the
+//! configuration does not supply, which is how a FIFO queue target comes to need its message
+//! group — has its own suite in `tests/all/pipe_target_parameter_refusal.rs`, which reaches
+//! [`assert_refused`] below rather than copying it.
+//!
 //! Each table's rows span what the rule generalises over (the target service, the batch
-//! size relative to the cap, which source carries it, the queue type, the form of the
-//! pattern), and every refused call is checked to have persisted nothing. The harness is the
-//! one `pipe_lifecycle` and `pipe_update` already own.
+//! size relative to the cap, which source carries it, the form of the pattern), and every
+//! refused call is checked to have persisted nothing. The harness is the one
+//! `pipe_lifecycle` and `pipe_update` already own.
 
 use serde_json::{json, Value};
 
 use crate::pipe_lifecycle::{create, describe, minimal_body, router, Reply, PAST_SETTLE};
+use crate::pipe_refusal_bodies::{field_list, validation_error_fields};
 use crate::pipe_update::{create_body, update};
 
 const ROLE: &str = "arn:aws:iam::000000000000:role/pipes-role";
@@ -32,19 +36,17 @@ const SOURCE_SQS: &str = "arn:aws:sqs:us-west-2:000000000000:orders";
 const SOURCE_KINESIS: &str = "arn:aws:kinesis:us-west-2:000000000000:stream/events";
 const TARGET_LAMBDA: &str = "arn:aws:lambda:us-west-2:000000000000:function:handler";
 const TARGET_SQS: &str = "arn:aws:sqs:us-west-2:000000000000:results";
-const TARGET_SQS_FIFO: &str = "arn:aws:sqs:us-west-2:000000000000:results.fifo";
 const TARGET_EVENT_BUS: &str = "arn:aws:events:us-west-2:000000000000:event-bus/default";
 const TARGET_KINESIS: &str = "arn:aws:kinesis:us-west-2:000000000000:stream/results";
 
-/// The document this service words a refusal as: one `ValidationErrorFields` entry per
-/// refused request field. Spelled out here, independently of the handler, so what the test
-/// pins is the envelope rather than the code that built it.
-fn validation_error_fields(name: &str, message: &str) -> String {
-    format!(r#"{{"ValidationErrorFields":[{{"Name":"{name}","Message":"{message}"}}]}}"#)
-}
-
-/// Assert that `reply` is the modelled refusal naming `name` with `message`.
-fn assert_refused(case: &str, reply: &Reply, name: &str, message: &str) {
+/// Assert that `reply` is the modelled refusal naming `name` with `message`, in the
+/// exception's `ValidationErrorFields` document AND in the modelled `fieldList` — the two
+/// renderings a client may read, built from the one list. The document itself is spelled out
+/// by the shared helper in `tests/all/pipe_refusal_bodies.rs`, independently of the handler.
+///
+/// `pub(crate)` so the suite for the third cross-resource rule asserts a refusal the SAME
+/// way rather than copying this.
+pub(crate) fn assert_refused(case: &str, reply: &Reply, name: &str, message: &str) {
     assert_eq!(
         (reply.status, reply.error_code.as_str()),
         (400, "ValidationException"),
@@ -52,8 +54,14 @@ fn assert_refused(case: &str, reply: &Reply, name: &str, message: &str) {
     );
     assert_eq!(
         reply.message(),
-        validation_error_fields(name, message),
+        validation_error_fields(&[(name, message)]),
         "case {case:?}: expected the ValidationErrorFields document naming {name}, \
+         got {reply:?}"
+    );
+    assert_eq!(
+        field_list(reply),
+        vec![(name.to_string(), message.to_string())],
+        "case {case:?}: the fieldList must carry the same entry as the message, \
          got {reply:?}"
     );
 }
@@ -288,81 +296,6 @@ async fn an_update_into_a_batch_size_the_target_cannot_take_is_refused() {
             target,
             "case {case:?}: a refused update must leave the stored Target as it was, \
              got {described:?}"
-        );
-    }
-}
-
-/// RULE: a FIFO queue target orders its messages by group, so a pipe delivering to one
-/// needs `TargetParameters.SqsQueueParameters.MessageGroupId`; without it the write is
-/// refused with `ValidationException` (400) reporting that member, and nothing is stored. A
-/// standard queue target needs no such parameter.
-///
-/// The rows differ along the queue type, whether the parameter is present, and whether it
-/// is present but empty (which carries no group).
-#[tokio::test]
-async fn a_fifo_queue_target_without_a_message_group_id_is_refused() {
-    // (the case and pipe name, the target, the TargetParameters, whether it is accepted).
-    let rows: Vec<(&str, &str, Value, bool)> = vec![
-        ("fifonoparams", TARGET_SQS_FIFO, Value::Null, false),
-        (
-            "fifonogroup",
-            TARGET_SQS_FIFO,
-            json!({"SqsQueueParameters": {"MessageDeduplicationId": "d1"}}),
-            false,
-        ),
-        (
-            "fifoemptygroup",
-            TARGET_SQS_FIFO,
-            json!({"SqsQueueParameters": {"MessageGroupId": ""}}),
-            false,
-        ),
-        (
-            "fifowithgroup",
-            TARGET_SQS_FIFO,
-            json!({"SqsQueueParameters": {"MessageGroupId": "g1"}}),
-            true,
-        ),
-        ("standardnoparams", TARGET_SQS, Value::Null, true),
-        (
-            "standardnogroup",
-            TARGET_SQS,
-            json!({"InputTemplate": "$.detail"}),
-            true,
-        ),
-    ];
-
-    for (case, target, target_parameters, accepted) in rows {
-        let router = router();
-        let mut extra = json!({});
-        if !target_parameters.is_null() {
-            extra["TargetParameters"] = target_parameters.clone();
-        }
-        let created = create(&router, case, create_body(SOURCE_SQS, target, extra)).await;
-
-        if accepted {
-            assert_eq!(
-                created.status, 200,
-                "case {case:?}: this configuration must be accepted, got {created:?}"
-            );
-            let described = describe(&router, case).await;
-            assert_eq!(
-                described.string("Target"),
-                target,
-                "case {case:?}: the accepted pipe must read back, got {described:?}"
-            );
-            continue;
-        }
-
-        assert_refused(
-            case,
-            &created,
-            "MessageGroupId",
-            "MessageGroupId is required for a FIFO queue target.",
-        );
-        let described = describe(&router, case).await;
-        assert_eq!(
-            described.status, 404,
-            "case {case:?}: a refused CreatePipe must have stored no pipe, got {described:?}"
         );
     }
 }
