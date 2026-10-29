@@ -670,39 +670,73 @@ fn tunnel_key(region: &str, identifier: &str) -> (String, String) {
 /// whose resources the request can address at all: every operation of this
 /// service resolves a tunnel within it.
 ///
-/// Kept here rather than hoisted: the only crates above this one are the
-/// read-only `vendor/` framework, and this workspace has no shared `services/`
-/// crate (nor an editable root manifest to add one to), so a service-local
-/// helper is the one place it can live.
+/// Only a Region LABEL is taken from the scope — the same grammar
+/// [`tunnel_id_from_arn`] reads an ARN's Region field under — so the Region a
+/// record is filed and minted into its ARN under is always one the ARN-addressed
+/// operations can read back out of that ARN. Arbitrary text names no Region any
+/// endpoint has, so it falls back to [`DEFAULT_REGION`] exactly as an unsigned
+/// request does.
+///
+/// Kept here rather than hoisted: it reads this service's own
+/// `emulator_server` boundary for the one Region every operation of this service
+/// partitions its records by, so a service-local helper is where it belongs.
 pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
     emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .filter(|scope| ::service_common::arn::region_label(&scope.region).is_some())
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// The ARN resource prefix of a tunnel: a tunnel ARN addresses the resource as
-/// `tunnel/<tunnelId>`.
-const TUNNEL_ARN_RESOURCE_PREFIX: &str = "tunnel/";
+/// The type of resource a tunnel ARN names: `tunnel/<tunnelId>`.
+const TUNNEL_ARN_RESOURCE_TYPE: &str = "tunnel";
+
+/// `TunnelId`'s modelled `length` ceiling, from its pattern
+/// `^[a-zA-Z0-9_\-+=:]{1,128}$`.
+const MAX_TUNNEL_ID_LEN: usize = 128;
+
+/// Whether `candidate` is a value `TunnelId` admits, i.e. within its modelled
+/// pattern `^[a-zA-Z0-9_\-+=:]{1,128}$`.
+///
+/// The pattern's class is ASCII-only, so a byte walk decides it and the length
+/// bound counts the same units the pattern's `{1,128}` does.
+fn is_modelled_tunnel_id(candidate: &str) -> bool {
+    (1..=MAX_TUNNEL_ID_LEN).contains(&candidate.len())
+        && candidate.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+' | b'=' | b':')
+        })
+}
 
 /// The ARN of the tunnel `tunnel_id` in `region`.
 pub fn tunnel_arn(region: &str, tunnel_id: &str) -> String {
     ::engine::emulator_arn(
         TUNNEL_ARN_SERVICE,
         region,
-        &format!("{TUNNEL_ARN_RESOURCE_PREFIX}{tunnel_id}"),
+        &format!("{TUNNEL_ARN_RESOURCE_TYPE}/{tunnel_id}"),
     )
 }
 
 /// The `tunnelId` a resource ARN names, or `None` when `arn` is not of the form
 /// `arn:<partition>:iot:<region>:<account>:tunnel/<tunnelId>`.
 ///
-/// `TunnelId`'s modelled pattern `^[a-zA-Z0-9_\-+=:]{1,128}$` admits `:`, so the
-/// resource segment is everything after the fifth colon rather than the sixth
-/// colon-separated field.
+/// EVERY field of that form is checked, because an id is only lifted out of a
+/// string that really addresses a tunnel: a string failing any of them names no
+/// tunnel and so carries no id, however much of the shape of an ARN it has.
+///
+/// The ARN itself is read through `service_common::arn` — the workspace's ONE
+/// caller-supplied-ARN parse — which decides the `arn` marker, the partition and
+/// the [`TUNNEL_ARN_SERVICE`] namespace a tunnel is addressed in, and reads the
+/// resource in both of the `<type>/<id>` and `<type>:<id>` forms AWS writes one
+/// in. On top of that parse come the two constraints a TUNNEL carries: it is a
+/// regional, account-owned resource, so neither of those fields may be empty and
+/// the Region has to be a Region LABEL rather than arbitrary text; and its id is
+/// one `TunnelId` admits ([`is_modelled_tunnel_id`]).
 pub fn tunnel_id_from_arn(arn: &str) -> Option<&str> {
-    let resource = arn.splitn(6, ':').nth(5)?;
-    let tunnel_id = resource.strip_prefix(TUNNEL_ARN_RESOURCE_PREFIX)?;
-    (!tunnel_id.is_empty()).then_some(tunnel_id)
+    let parsed = ::service_common::arn::parse_of(arn, TUNNEL_ARN_SERVICE)?;
+    if ::service_common::arn::region_label(parsed.region).is_none() || parsed.account.is_empty() {
+        return None;
+    }
+    let tunnel_id = ::service_common::arn::resource_id_of_type(arn, TUNNEL_ARN_RESOURCE_TYPE)?;
+    is_modelled_tunnel_id(tunnel_id).then_some(tunnel_id)
 }
 
 /// The message every `ResourceNotFoundException` of this service carries.
