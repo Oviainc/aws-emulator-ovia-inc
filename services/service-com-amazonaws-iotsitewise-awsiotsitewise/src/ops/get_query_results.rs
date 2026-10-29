@@ -232,17 +232,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what the next step slices.
         let held = result.as_ref().map_or(0, |run| run.rows_held());
 
-        // `nextToken` is the index of the first row of the next page, in the one
-        // opaque form the engine that issues it owns ([`encode_row_offset`] /
-        // [`decode_row_offset`]), so the two operations that page a query's rows
-        // cannot drift about the form they emit or the text they read back. WHICH
-        // offsets this operation accepts is its own question, answered below: a
-        // token is issued only for a row this result HAS, so an offset at or past
-        // the end is one it never issued, and a query with no rows has no resume
-        // point at all.
+        // `nextToken` is the index of the first row of the next page BESIDE the
+        // enumeration that index counts in, in the one opaque form the engine that
+        // issues it owns ([`crate::ops::execute_query::encode_row_offset`] /
+        // [`crate::ops::execute_query::decode_row_offset`]), so the two operations
+        // that page a query's rows cannot drift about the form they emit or the text
+        // they read back. The enumeration here is the rows of the query the request
+        // ADDRESSES, and a query is a query OF a workspace, so the pair that
+        // addresses it is what a token issued here is bound to: a token minted while
+        // paging anything else — another query of this workspace, the same query id
+        // of another workspace, or a statement run through the synchronous query
+        // path — counts its position in another enumeration and names no page of
+        // this one. WHICH offsets of its OWN enumeration this operation accepts is
+        // its own question, answered below: a token is issued only for a row this
+        // result HAS, so an offset at or past the end is one it never issued, and a
+        // query with no rows has no resume point at all.
+        let scope = crate::ops::execute_query::RowPageScope::of_query(
+            &input.workspace_name,
+            &input.query_id,
+        );
         let start = match input.next_token.as_deref() {
             Some(token) => {
-                let resume = decode_token(token)?;
+                let resume = decode_token(token, &scope)?;
                 // A token is issued only for a row this result HAS, so an offset at
                 // or past the end is not one this operation issued — including
                 // every offset at all for a query that has no rows to page.
@@ -292,7 +303,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .unwrap_or_default(),
             ),
             next_token: (end < held)
-                .then(|| crate::ops::execute_query::encode_row_offset(end)),
+                .then(|| crate::ops::execute_query::encode_row_offset(end, &scope)),
         })
     }
 }
@@ -329,16 +340,20 @@ fn column_data_type(scalar_type: &str) -> &str {
     }
 }
 
-/// Decode a `nextToken` back into the row offset it resumes from — through the one
-/// decoder the engine that issues this token form owns, so the two operations that
-/// page a query's rows cannot drift about which tokens they accept.
-fn decode_token(token: &str) -> Result<usize, GetQueryResultsError> {
-    crate::ops::execute_query::decode_row_offset(token).ok_or_else(invalid_token)
+/// Decode a `nextToken` back into the row offset it resumes from in `scope` —
+/// through the one decoder the engine that issues this token form owns, so the two
+/// operations that page a query's rows cannot drift about which tokens they accept.
+fn decode_token(
+    token: &str,
+    scope: &crate::ops::execute_query::RowPageScope,
+) -> Result<usize, GetQueryResultsError> {
+    crate::ops::execute_query::decode_row_offset(token, scope).ok_or_else(invalid_token)
 }
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
-/// issued: text that is not one of its tokens, or an offset at or past the end of
-/// the result it was issued for.
+/// issued: text that is not one of its tokens, a token issued for another
+/// enumeration of rows, or an offset at or past the end of the result it was issued
+/// for.
 fn invalid_token() -> GetQueryResultsError {
     invalid_request("The nextToken is not a token this operation issued.".to_string())
 }

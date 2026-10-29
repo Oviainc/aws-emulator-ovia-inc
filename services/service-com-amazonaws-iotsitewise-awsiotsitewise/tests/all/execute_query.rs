@@ -429,6 +429,40 @@ async fn a_statement_is_answered_from_the_stored_resources() {
         second["nextToken"].as_str().is_none(),
         "the last page carries no token, got {second}"
     );
+    // A page token names a position IN the enumeration it was issued for, which here
+    // is the rows the STATEMENT answers: replayed against another statement it names
+    // no page, rather than silently serving that statement's result from the
+    // position and reporting its leading rows in no page at all.
+    for (case, statement) in [
+        (
+            "another statement over the same view",
+            "SELECT asset_id FROM asset ORDER BY asset_name",
+        ),
+        (
+            "another statement over another view",
+            "SELECT asset_id, property_name FROM asset_property",
+        ),
+    ] {
+        let (status, body) = call(
+            &router,
+            "POST",
+            "/queries/execution",
+            Some(json!({
+                "queryStatement": statement,
+                "nextToken": token,
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a token of another statement names no page, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidRequestException",
+            "case {case:?}: unexpected error code in {body}"
+        );
+    }
 
     // --- a qualifier that names no relation of the statement -------------
     for (case, statement) in [

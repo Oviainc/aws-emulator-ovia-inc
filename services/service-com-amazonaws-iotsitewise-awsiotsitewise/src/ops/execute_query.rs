@@ -181,10 +181,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let result = run_statement(&state, &input.query_statement).await?;
 
         // Paging over the computed result: `nextToken` is the index of the first row
-        // of the next page, hex-encoded (the member carries no pattern, and hex keeps
-        // it to the same alphabet every other token this service issues uses).
+        // of the next page beside the enumeration that index counts in, hex-encoded
+        // (the member carries no pattern, and hex keeps it to the same alphabet
+        // every other token this service issues uses). The enumeration here is the
+        // rows the STATEMENT this request carries answers, so a token minted while
+        // paging another statement — or by the operation that pages a stored query's
+        // rows — names no page of this one and is refused rather than silently
+        // resuming this result at that other enumeration's position.
+        let scope = RowPageScope::of_statement(&input.query_statement);
         let start = match input.next_token.as_deref() {
-            Some(token) => decode_token(token)?,
+            Some(token) => decode_token(token, &scope)?,
             None => 0,
         };
         if start > result.rows.len() {
@@ -197,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(DEFAULT_MAX_RESULTS)
             .clamp(1, MAX_ROWS_PER_PAGE) as usize;
         let end = start.saturating_add(max_results).min(result.rows.len());
-        let next_token = (end < result.rows.len()).then(|| encode_row_offset(end));
+        let next_token = (end < result.rows.len()).then(|| encode_row_offset(end, &scope));
 
         Ok(ExecuteQueryOutput {
             columns: Some(
@@ -2030,33 +2036,83 @@ fn unsupported(construct: &str) -> ExecuteQueryError {
     })
 }
 
-/// The `nextToken` that resumes a query's rows at `offset`.
+/// WHICH enumeration of a query's rows a page token was issued for.
 ///
-/// The token FORM belongs to this engine — the index of the first row of the next
-/// page, hex-encoded so it stays opaque to the caller — and every operation that
-/// pages a query's rows issues that same form, so it is built here once, beside the
-/// decoder that reads it back.
-pub(crate) fn encode_row_offset(offset: usize) -> String {
-    ::hex::encode(offset.to_string())
+/// A page token names a POSITION, and a position is only meaningful in the
+/// enumeration it was counted in: the rows of one enumeration stand in no relation
+/// to the rows of another, so a token carries what enumeration it came from and is
+/// honoured against that one alone. Each operation that pages a query's rows says
+/// what identifies its enumeration — the statement whose rows it answers, or the
+/// stored query whose rows it reads — and nothing else can forge that, because what
+/// the token carries is a digest of those identifying fields and not the fields
+/// themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RowPageScope(String);
+
+impl RowPageScope {
+    /// The enumeration of the rows a STATEMENT answers, as the synchronous query
+    /// path pages them: that result is a function of the statement, so two requests
+    /// carrying the same statement walk one enumeration and a request carrying
+    /// another statement walks a different one.
+    pub(crate) fn of_statement(statement: &str) -> Self {
+        Self(scope_fingerprint(SCOPE_STATEMENT, &[statement]))
+    }
+
+    /// The enumeration of the rows a stored query holds, as the asynchronous query
+    /// path pages them: those rows are addressed by the query OF a workspace, so the
+    /// pair that addresses it is what identifies the enumeration.
+    pub(crate) fn of_query(workspace_name: &str, query_id: &str) -> Self {
+        Self(scope_fingerprint(SCOPE_QUERY, &[workspace_name, query_id]))
+    }
 }
 
-/// The row offset a `nextToken` over a query's rows resumes from, or `None` for
-/// text this service never issued as one.
+/// Names the enumeration a statement's own rows form, in [`scope_fingerprint`].
+const SCOPE_STATEMENT: &str = "statement";
+
+/// Names the enumeration a stored query's rows form, in [`scope_fingerprint`].
+const SCOPE_QUERY: &str = "query";
+
+/// A short digest of what identifies one enumeration of rows: the `kind` of
+/// enumeration and the fields that address it, each terminated so no two field lists
+/// can run together into the same digest.
+fn scope_fingerprint(kind: &str, fields: &[&str]) -> String {
+    let mut digest = <::sha2::Sha256 as ::sha2::Digest>::new();
+    for field in ::std::iter::once(&kind).chain(fields.iter()) {
+        ::sha2::Digest::update(&mut digest, field.as_bytes());
+        ::sha2::Digest::update(&mut digest, b"\x1f");
+    }
+    ::hex::encode(&<::sha2::Sha256 as ::sha2::Digest>::finalize(digest)[..8])
+}
+
+/// The `nextToken` that resumes `scope`'s rows at `offset`.
+///
+/// The token FORM belongs to this engine — the index of the first row of the next
+/// page beside the enumeration it counts in, hex-encoded so it stays opaque to the
+/// caller — and every operation that pages a query's rows issues that same form, so
+/// it is built here once, beside the decoder that reads it back.
+pub(crate) fn encode_row_offset(offset: usize, scope: &RowPageScope) -> String {
+    ::hex::encode(format!("{offset}|{}", scope.0))
+}
+
+/// The row offset a `nextToken` over `scope`'s rows resumes from, or `None` for text
+/// this service never issued as a token for THIS enumeration — text that is not one
+/// of its tokens at all, or a token it issued for another enumeration.
 ///
 /// Reads back what [`encode_row_offset`] writes. WHICH offsets an operation then
 /// accepts is that operation's own question — each knows how many rows the result it
-/// is paging holds — so this answers only what the token says, and the operation
-/// lifts a `None`, or an offset outside its result, into its own modelled refusal.
-pub(crate) fn decode_row_offset(token: &str) -> Option<usize> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|text| text.parse().ok())
+/// is paging holds — so this answers only what the token says about an enumeration
+/// it belongs to, and the operation lifts a `None`, or an offset outside its result,
+/// into its own modelled refusal.
+pub(crate) fn decode_row_offset(token: &str, scope: &RowPageScope) -> Option<usize> {
+    let decoded = ::hex::decode(token).ok()?;
+    let (offset, fingerprint) = ::std::str::from_utf8(&decoded).ok()?.split_once('|')?;
+    (fingerprint == scope.0).then_some(())?;
+    offset.parse().ok()
 }
 
-/// Decode a `nextToken` back into the row offset it resumes from.
-fn decode_token(token: &str) -> Result<usize, ExecuteQueryError> {
-    decode_row_offset(token).ok_or_else(|| {
+/// Decode a `nextToken` back into the row offset it resumes from in `scope`.
+fn decode_token(token: &str, scope: &RowPageScope) -> Result<usize, ExecuteQueryError> {
+    decode_row_offset(token, scope).ok_or_else(|| {
         invalid_request("The nextToken is not a token this operation issued.".to_string())
     })
 }

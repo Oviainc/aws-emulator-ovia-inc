@@ -20,6 +20,9 @@
 //! * a workspace or a query this service does not hold is the modelled not-found
 //!   refusal, and a `nextToken` this operation never issued is the modelled invalid
 //!   request;
+//! * a page token names a position IN one enumeration of rows, so it is honoured
+//!   only against the query it was issued for and refused when it was issued for
+//!   another enumeration of rows;
 //! * a read reports: reading a query's results neither moves the query on nor
 //!   changes what the next read of it sees.
 //!
@@ -68,6 +71,11 @@ const FOUR_ROWS: &str = "SELECT asset_id, property_name, data_type FROM asset_pr
 /// A statement whose predicate keeps no row at all, so the query that runs it
 /// completes with a result holding nothing.
 const NO_ROWS: &str = "SELECT asset_id FROM asset WHERE asset_name = 'Chiller9'";
+
+/// A statement over a DIFFERENT view from [`FOUR_ROWS`], whose result also holds
+/// more than one row: paging it is a second enumeration of rows, so a token minted
+/// in it names a position counted somewhere other than in [`FOUR_ROWS`]' result.
+const TWO_ROWS: &str = "SELECT asset_id, asset_name FROM asset";
 
 /// `GET /workspaces/{workspaceName}/queries/{queryId}/results`, as `OPERATIONS.md`
 /// reports the route, with the query string a paged request carries.
@@ -444,16 +452,20 @@ async fn a_result_pages_by_max_results_and_resumes_at_the_next_row() {
                     "case {case:?}: a page carries at most {size} rows, got {body}"
                 );
             }
-            // The token is the index of the row the next page resumes at, hex
-            // encoded — checked against a token built here, not by the handler's own
-            // encoder.
+            // The token is OPAQUE: it names the row the next page resumes at inside
+            // the enumeration that row is counted in, so it is not the bare row
+            // index a client could write down for itself — `hex_token` is the
+            // harness's encoder of exactly that bare index. WHERE it resumes is
+            // pinned by the walk below, which must concatenate back into the whole
+            // result.
             let resumed = paged.len() + rows.len();
             match body["nextToken"].as_str() {
                 Some(issued) => {
-                    assert_eq!(
+                    assert_ne!(
                         issued,
                         hex_token(&resumed.to_string()),
-                        "case {case:?}: the token resumes at row {resumed}, got {body}"
+                        "case {case:?}: a token carries more than the row index {resumed}, \
+                         got {body}"
                     );
                     token = Some(issued.to_string());
                 }
@@ -484,6 +496,172 @@ async fn a_result_pages_by_max_results_and_resumes_at_the_next_row() {
             whole.len()
         );
     }
+}
+
+/// `StartQuery` in `workspace`, asserting it was accepted, and the `queryId` it
+/// minted — the workspace-query suite's own `start` always starts in [`WORKSPACE`],
+/// and this suite needs a query of a second workspace too.
+async fn start_in(router: &MultiServiceRouter, workspace: &str, statement: &str) -> String {
+    let (status, body) = call(
+        router,
+        "POST",
+        &format!("/workspaces/{workspace}/queries"),
+        Some(json!({ "queryStatement": statement })),
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "start {statement:?} in {workspace}: expected 202, got {status} {body}"
+    );
+    body["queryId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("start {statement:?} in {workspace}: no queryId in {body}"))
+        .to_string()
+}
+
+/// The `nextToken` a one-row page of `query_id`'s results carries — a token minted
+/// in THAT query's enumeration of rows.
+async fn token_of(router: &MultiServiceRouter, workspace: &str, query_id: &str) -> String {
+    let (status, body) = results(router, workspace, query_id, &max_results(1)).await;
+    assert_eq!(
+        status, 200,
+        "a page of {query_id} in {workspace}: got {status} {body}"
+    );
+    body["nextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a bounded page of {query_id} carries a token, got {body}"))
+        .to_string()
+}
+
+/// The `nextToken` a one-row page of the SYNCHRONOUS query path carries for
+/// `statement` — a token minted in the other enumeration of rows this service pages
+/// through the same token form.
+async fn execute_query_token(router: &MultiServiceRouter, statement: &str) -> String {
+    let (status, body) = call(
+        router,
+        "POST",
+        "/queries/execution",
+        Some(json!({ "queryStatement": statement, "maxResults": 1 })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "ExecuteQuery {statement:?} bounded to one row: got {status} {body}"
+    );
+    body["nextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a bounded ExecuteQuery page carries a token, got {body}"))
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_page_token_is_honoured_only_against_the_enumeration_that_issued_it() {
+    let router = router();
+    fixture(&router).await;
+    create_workspace(&router, OTHER_WORKSPACE).await;
+
+    // The enumeration under test, and the enumerations a token can be minted in
+    // INSTEAD: another query of the same workspace running another statement, a
+    // second query running the SAME statement (so the statement cannot be what
+    // identifies the enumeration), the same statement started as a query of another
+    // workspace, and the synchronous query path, which pages the same engine's rows
+    // through the same token form.
+    let paged = start(&router, FOUR_ROWS).await;
+    let other_statement = start(&router, TWO_ROWS).await;
+    let same_statement = start(&router, FOUR_ROWS).await;
+    let other_workspace_query = start_in(&router, OTHER_WORKSPACE, FOUR_ROWS).await;
+    tokio::time::sleep(settled()).await;
+
+    let whole = oracle_rows(&executed(&router, FOUR_ROWS).await);
+    let other_whole = oracle_rows(&executed(&router, TWO_ROWS).await);
+    assert!(
+        whole.len() >= 4 && other_whole.len() >= 2,
+        "the fixture must hold enough rows in both views to page over, \
+         got {whole:?} and {other_whole:?}"
+    );
+
+    // Tokens minted at SEVERAL positions of the enumeration under test: the rule is
+    // about which enumeration a position is counted in, so it is exercised at more
+    // than one position.
+    let mut minted: Vec<(usize, String)> = Vec::new();
+    for at in [1usize, 2] {
+        let body = read(&router, &paged, &max_results(at)).await;
+        let token = body["nextToken"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a page of {at} row(s) carries a token, got {body}"))
+            .to_string();
+        minted.push((at, token));
+    }
+
+    // The control: each of those tokens IS honoured against the query that issued
+    // it, and resumes the result at the row it names.
+    for (at, token) in &minted {
+        let mut params = max_results(whole.len());
+        params.extend(next_token(token));
+        let body = read(&router, &paged, &params).await;
+        assert_eq!(
+            page_rows(&body),
+            whole[*at..].to_vec(),
+            "case {at}: the issuing query's own token resumes its result at row {at}, \
+             got {body}"
+        );
+    }
+
+    // Replayed against the query under test, a token minted in any other
+    // enumeration names no page of it.
+    let foreign: Vec<(&str, String)> = vec![
+        (
+            "a token of another query of this workspace",
+            token_of(&router, WORKSPACE, &other_statement).await,
+        ),
+        (
+            "a token of another query running the same statement",
+            token_of(&router, WORKSPACE, &same_statement).await,
+        ),
+        (
+            "a token of a query of another workspace",
+            token_of(&router, OTHER_WORKSPACE, &other_workspace_query).await,
+        ),
+        (
+            "a token of the synchronous query path",
+            execute_query_token(&router, FOUR_ROWS).await,
+        ),
+    ];
+    for (case, token) in &foreign {
+        let (status, body) = results(&router, WORKSPACE, &paged, &next_token(token)).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400 for {token:?}, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidRequestException",
+            "case {case:?}: unexpected error code in {body}"
+        );
+    }
+
+    // And the other direction, the one that hides rows: this query's own token
+    // replayed against ANOTHER query is refused rather than re-paging that query's
+    // result from the position — so no leading row of it is reported in no page of
+    // its own enumeration.
+    for (at, token) in &minted {
+        let (status, body) = results(&router, WORKSPACE, &other_statement, &next_token(token)).await;
+        assert_eq!(
+            status, 400,
+            "case {at}: a token of another query names no page here, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidRequestException",
+            "case {at}: unexpected error code in {body}"
+        );
+    }
+    let body = read(&router, &other_statement, &[]).await;
+    assert_eq!(
+        page_rows(&body),
+        other_whole,
+        "the refused replay left every row of the other query's result readable, got {body}"
+    );
 }
 
 #[tokio::test]
@@ -584,14 +762,17 @@ async fn a_result_read_refuses_what_it_cannot_resolve() {
     }
 
     // A `nextToken` this operation never issued: text that is not a token at all,
-    // one that decodes to no row index, one at the end of the result (a token is
-    // issued only for a row the result HAS), and one past the end.
+    // one that decodes to no row index, a bare row index of the result (a position
+    // on its own is not one of this operation's tokens), one at the end of the
+    // result (a token is issued only for a row the result HAS), and one past the
+    // end.
     let at_the_end = hex_token(&held.to_string());
     let past_the_end = hex_token("9999");
     let tokens: Vec<(&str, String)> = vec![
         ("not hexadecimal at all", "zzz".to_string()),
         ("hexadecimal of no number", hex_token("page-two")),
         ("a negative offset", hex_token("-1")),
+        ("a bare row index of the result", hex_token("1")),
         ("an offset at the end of the result", at_the_end),
         ("an offset past the result", past_the_end),
     ];
