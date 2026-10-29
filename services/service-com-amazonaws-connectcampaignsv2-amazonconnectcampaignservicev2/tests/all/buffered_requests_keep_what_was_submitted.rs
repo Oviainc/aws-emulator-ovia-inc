@@ -81,7 +81,7 @@ fn every_channel_config() -> Value {
 
 /// A campaign on a freshly onboarded instance, configured for every channel and
 /// started, so it takes a batch on any of them. Returns its id.
-async fn running_campaign(router: &Harness, region: &str, instance: &str) -> String {
+pub(crate) async fn running_campaign(router: &Harness, region: &str, instance: &str) -> String {
     let id = create_campaign_with(
         router,
         region,
@@ -106,7 +106,7 @@ fn stored_map(entries: &HashMap<String, String>) -> Value {
 
 /// Put `value` on `object` under `member` when the record holds one, so an optional
 /// member is absent from the projection exactly when it is absent from the record.
-fn set_if_present(object: &mut Value, member: &str, value: Option<Value>) {
+pub(crate) fn set_if_present(object: &mut Value, member: &str, value: Option<Value>) {
     if let Some(value) = value {
         object[member] = value;
     }
@@ -287,7 +287,7 @@ fn stored_dial_request(
 /// What the profile buffer holds for the request taken under `client_token`: its
 /// minted id, the `profileId` it is to reach, and the `eventTriggerContext` it kept —
 /// `None` for the context when the request carried none.
-fn stored_profile_request(
+pub(crate) fn stored_profile_request(
     engine: &engine::InMemoryEngine,
     region: &str,
     campaign: &str,
@@ -314,7 +314,7 @@ fn stored_profile_request(
 
 /// Submit `requests` to `campaign` and return the minted id of every taken request,
 /// keyed by its `clientToken`, asserting the batch took all of them.
-async fn take_all(
+pub(crate) async fn take_all(
     router: &Harness,
     region: &str,
     campaign: &str,

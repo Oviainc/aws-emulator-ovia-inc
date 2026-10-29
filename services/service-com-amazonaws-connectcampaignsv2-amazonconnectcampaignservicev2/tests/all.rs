@@ -101,6 +101,8 @@ mod outbound_batch_is_one_rule;
 mod outbound_request_expiration;
 #[path = "all/profile_outbound_requests.rs"]
 mod profile_outbound_requests;
+#[path = "all/profile_request_event_trigger_context.rs"]
+mod profile_request_event_trigger_context;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
 #[path = "all/signing_name_path_claim.rs"]
