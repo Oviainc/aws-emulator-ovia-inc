@@ -202,25 +202,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let (mode, row) = {
-            let store = state.lock();
-            let mode = store
-                .effective_preferences(crate::state::caller_account_id())
-                .savings_estimation_mode;
-            // Only a recommendation this caller can read is found, over the
-            // same set the list readers select from
-            // (`crate::state::...::readable_recommendations`): the caller's own
-            // account, widened to the organization where the caller is its
-            // management account, with each owning account's enrollment still
-            // judged — so an id the list handed this caller resolves, and an id
-            // of an account that is not enrolled (or whose analysis is not due
-            // yet) is unknown to it.
-            let row = store
-                .readable_recommendations(crate::state::caller_account_id())
-                .into_iter()
-                .find(|row| row.recommendation_id == input.recommendation_id);
-            (mode, row)
-        };
+        // The caller's effective savings estimation mode and the rows it may
+        // read are the one rule every recommendation reader applies, written
+        // once beside the catalog
+        // (`crate::state::...::readable_recommendation_view`), so this reader
+        // asks for the same view the list readers are served rather than
+        // resolving the mode and the rows again here. The view a read of ONE
+        // recommendation gets is the caller's own account, widened to the
+        // organization where the caller is its management account, with each
+        // owning account's enrollment still judged — so an id the list handed
+        // this caller resolves, and an id of an account that is not enrolled
+        // (or whose analysis is not due yet) is unknown to it.
+        let view = state
+            .lock()
+            .readable_recommendation_view(crate::state::caller_account_id());
+        let mode = view.savings_estimation_mode;
+        let row = view
+            .rows
+            .into_iter()
+            .find(|row| row.recommendation_id == input.recommendation_id);
 
         let Some(row) = row else {
             // The resource this 404 is about is identified by `resourceId` —

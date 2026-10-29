@@ -25,7 +25,7 @@
 //! * `recommendations` + `recommendation_order` — the recommendation catalog
 //!   `ListRecommendations` pages over and `GetRecommendation` looks ids up in,
 //!   narrowed to what the calling account may read by
-//!   [`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::readable_recommendations`].
+//!   [`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::readable_recommendation_view`].
 //!   The catalog is part of the store's initial value, so both readers see the
 //!   same rows and neither has to write anything to serve a read.
 
@@ -1082,15 +1082,17 @@ impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
         accounts
     }
 
-    /// Every recommendation this caller may read, in catalog order, whichever
-    /// account owns it: the set a read of ONE recommendation resolves its id
-    /// over, because such a read names no account.
+    /// The view a read of ONE recommendation resolves its id over: every
+    /// recommendation this caller may read, in catalog order, whichever account
+    /// owns it, under the caller's effective savings estimation mode — the same
+    /// [`RecommendationView`] the list readers are served, because such a read
+    /// names no account and sets no filter.
     ///
     /// A read that names no account addresses the caller's own account, widened
     /// to the organization where the caller is its management account — the
     /// caller whose reads past its own account are admitted at all, and so the
     /// caller whose `filter.accountIds` a list reader serves another account's
-    /// rows to ([`Self::recommendation_view`]). This set is therefore the union
+    /// rows to ([`Self::recommendation_view`]). The rows are therefore the union
     /// of what this caller's list reads can select, and an id a list handed it
     /// reads back.
     ///
@@ -1098,10 +1100,10 @@ impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
     /// ([`Self::visible_recommendations_for`]), so an account that never opted
     /// in, one that opted out, and one that has just opted in hold no readable
     /// recommendation at all.
-    pub fn readable_recommendations(&self, account_id: &str) -> Vec<StoredRecommendation> {
+    pub fn readable_recommendation_view(&self, account_id: &str) -> RecommendationView {
         let addressed =
             self.addressed_accounts(account_id, &[], self.is_management_account(account_id));
-        self.visible_recommendations_for(&addressed)
+        self.view_over(account_id, &addressed, None)
     }
 
     /// The recommendations `accounts` can be read for, in catalog order.
@@ -1134,15 +1136,16 @@ impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
     /// The recommendation rows one request selects, and the savings estimation
     /// mode their money members are computed under.
     ///
-    /// The one place the rule both recommendation readers apply is written:
-    /// asking for the recommendations of accounts other than the caller's — a
-    /// populated `filter.accountIds` — is an organization view, which only the
+    /// The one place the rule both LIST readers apply is written: asking for
+    /// the recommendations of accounts other than the caller's — a populated
+    /// `filter.accountIds` — is an organization view, which only the
     /// organization's management account has, so any other caller is refused
     /// ([`OrganizationViewRequired`], which each reader answers through its own
     /// modelled error); otherwise the rows are the ones the accounts the
     /// request ADDRESSES may be read for ([`Self::addressed_accounts`],
-    /// [`Self::visible_recommendations_for`]) narrowed by every member the
-    /// filter sets, under the account's effective `savingsEstimationMode`.
+    /// `view_over`) narrowed by every member the filter sets, under the
+    /// account's effective `savingsEstimationMode` — the view the reader of ONE
+    /// recommendation is served too ([`Self::readable_recommendation_view`]).
     pub fn recommendation_view(
         &self,
         account_id: &str,
@@ -1161,22 +1164,43 @@ impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
         // named, else the caller's own — so a read admitted as reaching another
         // account answers that account's rows rather than an empty list.
         let addressed = self.addressed_accounts(account_id, named, false);
-        Ok(RecommendationView {
+        Ok(self.view_over(account_id, &addressed, filter))
+    }
+
+    /// The view every recommendation reader is served, given the accounts that
+    /// reader's own rule addresses: the rows those accounts may be read for
+    /// ([`Self::visible_recommendations_for`]) narrowed by every member the
+    /// filter sets, reported under the caller's effective
+    /// `savingsEstimationMode` ([`Self::effective_preferences`]).
+    ///
+    /// Written once here so the mode a reader reports its money members under,
+    /// and the narrowing it applies to the rows it selects, cannot be changed
+    /// for one reader and left behind in another: which accounts a reader
+    /// addresses is the only thing that differs between them, and it is what
+    /// each passes in.
+    fn view_over(
+        &self,
+        account_id: &str,
+        accounts: &[String],
+        filter: Option<&Filter>,
+    ) -> RecommendationView {
+        RecommendationView {
             savings_estimation_mode: self
                 .effective_preferences(account_id)
                 .savings_estimation_mode,
             rows: self
-                .visible_recommendations_for(&addressed)
+                .visible_recommendations_for(accounts)
                 .into_iter()
                 .filter(|row| filter.is_none_or(|filter| row.matches_filter(filter)))
                 .collect(),
-        })
+        }
     }
 }
 
-/// What [`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::recommendation_view`]
-/// hands a recommendation reader: the rows the request selects and the mode the
-/// money members of those rows are reported under.
+/// What the one view-building step of
+/// [`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState`] hands a
+/// recommendation reader: the rows the request selects and the mode the money
+/// members of those rows are reported under.
 #[derive(Debug)]
 pub struct RecommendationView {
     /// The caller's effective `savingsEstimationMode` preference, which decides
