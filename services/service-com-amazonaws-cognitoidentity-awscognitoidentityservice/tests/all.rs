@@ -21,6 +21,8 @@ mod anonymous_credential_vend;
 mod basic_flow_gate;
 #[path = "all/control_plane_audit.rs"]
 mod control_plane_audit;
+#[path = "all/custom_role_arn_from_token_roles.rs"]
+mod custom_role_arn_from_token_roles;
 #[path = "all/delete_identities.rs"]
 mod delete_identities;
 #[path = "all/describe_identity.rs"]

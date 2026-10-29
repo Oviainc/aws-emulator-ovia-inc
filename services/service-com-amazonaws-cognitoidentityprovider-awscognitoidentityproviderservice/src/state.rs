@@ -1246,6 +1246,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             stored_username,
             email,
             groups,
+            role_claims,
             signing_key,
             access_ttl,
             id_ttl,
@@ -1260,6 +1261,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
                 stored_username: user.username.clone(),
                 email: user.attributes.get("email").cloned(),
                 groups: pool.user_group_names(user),
+                role_claims: pool.user_group_role_claims(user),
                 signing_key: pool.signing_key.clone(),
                 access_ttl: client.access_token_ttl(),
                 id_ttl: client.id_token_ttl(),
@@ -1331,6 +1333,35 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
                 if let Some(members) = claims.as_object_mut() {
                     members.insert("cognito:groups".to_string(), claim.clone());
                 }
+            }
+        }
+
+        // The ROLE a group grants is the identity token's alone: "Amazon Cognito ID tokens
+        // have a `cognito:preferred_role` claim that presents the highest-precedence group
+        // that a user belongs to. Both ID and access tokens also contain a `cognito:groups`
+        // claim" (`CreateGroup`'s `RoleArn`, this service's model). Which roles those are,
+        // and whether the groups name one of them unambiguously, is the stored precedence's
+        // decision (`UserPool::user_group_role_claims`); a user whose groups grant no role
+        // carries neither claim rather than an empty list, and one whose best precedence is
+        // tied between different roles carries the list without a preference.
+        if let Some(members) = id_claims.as_object_mut() {
+            if !role_claims.roles.is_empty() {
+                members.insert(
+                    "cognito:roles".to_string(),
+                    serde_json::Value::Array(
+                        role_claims
+                            .roles
+                            .iter()
+                            .map(|role_arn| serde_json::Value::String(role_arn.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if let Some(preferred_role) = role_claims.preferred_role {
+                members.insert(
+                    "cognito:preferred_role".to_string(),
+                    serde_json::Value::String(preferred_role),
+                );
             }
         }
 
@@ -1831,6 +1862,60 @@ impl UserPool {
             .filter(|name| self.groups.contains_key(*name))
             .cloned()
             .collect()
+    }
+
+    /// The role claims this pool's groups put in `user`'s identity token: every role its
+    /// groups grant, best precedence first, and the ONE role the best-precedence group
+    /// prefers where the groups name it unambiguously.
+    ///
+    /// `CreateGroup`'s own `Precedence` documentation is the rule (this service's model):
+    /// "Zero is the highest precedence value. Groups with lower `Precedence` values take
+    /// precedence over groups with higher or null `Precedence` values. If a user belongs to
+    /// two or more groups, it is the group with the lowest precedence value whose role ARN is
+    /// given in the user's tokens for the `cognito:roles` and `cognito:preferred_role`
+    /// claims. Two groups can have the same `Precedence` value. If this happens, neither
+    /// group takes precedence over the other. If two groups with the same `Precedence` have
+    /// the same role ARN, that role is used in the `cognito:preferred_role` claim in tokens
+    /// for users in each group. If the two groups have different role ARNs, the
+    /// `cognito:preferred_role` claim isn't set."
+    ///
+    /// So a group that grants NO role contributes to neither claim, a stated precedence
+    /// ranks ahead of none at all, and the preference is withheld exactly when the groups
+    /// tied at the best precedence disagree about the role. Only groups the pool still
+    /// HOLDS count, for the reason [`UserPool::user_group_names`] states.
+    pub fn user_group_role_claims(&self, user: &User) -> GroupRoleClaims {
+        // Stable-sorted by precedence alone, so groups tied at one precedence keep their
+        // stored (name) order and a read renders the same claim twice.
+        let mut granting: Vec<(PrecedenceRank, &str)> = user
+            .groups
+            .iter()
+            .filter_map(|name| self.groups.get(name))
+            .filter_map(|group| {
+                group
+                    .role_arn
+                    .as_deref()
+                    .map(|role_arn| (precedence_rank(group.precedence), role_arn))
+            })
+            .collect();
+        granting.sort_by_key(|(rank, _)| *rank);
+
+        let mut roles: Vec<String> = Vec::new();
+        for (_, role_arn) in &granting {
+            if !roles.iter().any(|held| held == role_arn) {
+                roles.push((*role_arn).to_string());
+            }
+        }
+        let preferred_role = granting.first().and_then(|(best, role_arn)| {
+            granting
+                .iter()
+                .take_while(|(rank, _)| rank == best)
+                .all(|(_, tied)| tied == role_arn)
+                .then(|| (*role_arn).to_string())
+        });
+        GroupRoleClaims {
+            roles,
+            preferred_role,
+        }
     }
 
     /// The keys in [`UserPool::users`] of the users that belong to
@@ -4151,6 +4236,33 @@ pub enum TokenRejection {
     PoolGone,
     /// The token names a user its pool no longer holds.
     UserGone,
+}
+
+/// How ONE group's `Precedence` ranks against another's, lowest first.
+///
+/// `CreateGroup`'s `Precedence` (this service's model): "Groups with lower `Precedence`
+/// values take precedence over groups with higher or null `Precedence` values", so a group
+/// that states none ranks behind every group that states one — which the leading flag
+/// orders — while two groups stating the same value rank equally.
+type PrecedenceRank = (bool, i32);
+
+/// [`PrecedenceRank`] for a group whose stored `Precedence` is `precedence`.
+fn precedence_rank(precedence: Option<i32>) -> PrecedenceRank {
+    (precedence.is_none(), precedence.unwrap_or_default())
+}
+
+/// What a user's group memberships put in its identity token
+/// ([`UserPool::user_group_role_claims`]).
+#[derive(Debug, Clone, Default)]
+pub struct GroupRoleClaims {
+    /// The `cognito:roles` claim: each distinct role the user's groups grant, once, best
+    /// precedence first. Empty when no group of the user's grants a role, which is a token
+    /// that carries no such claim at all.
+    pub roles: Vec<String>,
+    /// The `cognito:preferred_role` claim: the role of the best-precedence group, and `None`
+    /// where the groups tied at that precedence name different roles — the case
+    /// `CreateGroup`'s `Precedence` documents the claim "isn't set" for.
+    pub preferred_role: Option<String>,
 }
 
 /// One stored group of a user pool: what `CreateGroup` stored and every later
@@ -6595,6 +6707,8 @@ struct TokenInputs {
     email: Option<String>,
     /// The names of the pool's groups the stored user belongs to, in stored order.
     groups: Vec<String>,
+    /// What those groups' roles and precedences put in the identity token.
+    role_claims: GroupRoleClaims,
     /// The pool's own token-signing key pair: every token of this sign-in is
     /// signed with it and names it by `kid`.
     signing_key: PoolSigningKey,

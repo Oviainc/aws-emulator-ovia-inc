@@ -24,13 +24,14 @@
 //! `AssumeRoleWithWebIdentity` event.
 //!
 //! The assume happens only where the role admits it. A pool that names no role for the
-//! request — a pool whose role mapping DENIES the exchange among them — a role the account
-//! does not hold, and a role whose trust policy does not admit an assume by THIS pool's
-//! users — the `cognito-identity.amazonaws.com:aud` condition that keeps one identity pool
-//! out of another pool's role — are each answered with the modelled
+//! request, a role the account does not hold, and a role whose trust policy does not admit
+//! an assume by THIS pool's users — the `cognito-identity.amazonaws.com:aud` condition that
+//! keeps one identity pool out of another pool's role — are each answered with the modelled
 //! `InvalidIdentityPoolConfigurationException` (HTTP 400), the error the real service
 //! raises when it has no role it can assume for the request, rather than with a session
-//! that stands for nothing.
+//! that stands for nothing. A role mapping that DENIES the exchange is a different refusal:
+//! the pool's configuration is not at fault, the token presented is simply not authorized
+//! to receive a credential, so that one is the modelled `NotAuthorizedException` (HTTP 403).
 //!
 //! `Logins` selects WHICH flow the exchange is: a request that presents a login is an
 //! authenticated one, and the pool's `authenticated` role is the one assumed where no
@@ -378,21 +379,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
             let methods = store.exchange_authentication_methods(&logins, now);
 
             // Which role this vend assumes: the `CustomRoleArn` the request names, which
-            // can only be honoured against the roles the pool has stored, or — for a
-            // request that names none — the role the pool's own configuration resolves for
-            // this exchange. A `RoleMappings` entry for the identity provider the login was
-            // made under is what resolves it there, and the pool-wide role for the flow the
-            // request is in is the fallback when no mapping of the pool's resolves one.
+            // can only be honoured against the roles this exchange could itself have
+            // resolved — the roles the pool has stored, and the roles the presented token
+            // carries — or, for a request that names none, the role the pool's own
+            // configuration resolves for this exchange. A `RoleMappings` entry for the
+            // identity provider the login was made under is what resolves it there, and the
+            // pool-wide role for the flow the request is in is the fallback when no mapping
+            // of the pool's resolves one.
             // A mapping that DECIDES the exchange without resolving a role is the case its
             // `AmbiguousRoleResolution` states the outcome of: `AuthenticatedRole` names the
-            // pool's own authenticated role, while `Deny` is a decision to vend NOTHING, so
-            // the exchange resolves no role at all and is answered with the refusal below —
-            // the modelled error whose own doc states the pool has no role configured for
-            // the request — instead of falling back to a role the mapping refused.
+            // pool's own authenticated role, while `Deny` is a decision to vend NOTHING —
+            // an authorization decision about the token presented, so the exchange is
+            // refused with `NotAuthorizedException` rather than falling back to a role the
+            // mapping refused.
             let configured = store.identity_pool_roles.get(&identity_pool_id);
             let role_arn = match &input.custom_role_arn {
                 Some(custom_role_arn) => configured
-                    .filter(|configured| configured.names_role_arn(custom_role_arn))
+                    .filter(|configured| {
+                        configured.admits_custom_role_arn(&logins, custom_role_arn)
+                    })
                     .map(|_| custom_role_arn.clone()),
                 None => {
                     let mapped = configured
@@ -400,7 +405,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
                         .map(|(configured, pool)| configured.mapped_role(pool, &logins))
                         .unwrap_or(MappedRole::Unmapped);
                     match mapped {
-                        MappedRole::Denied => None,
+                        MappedRole::Denied => {
+                            return Err(
+                                GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
+                                    NotAuthorizedException {
+                                        message: Some(
+                                            crate::state::DENIED_ROLE_RESOLUTION_MESSAGE
+                                                .to_string(),
+                                        ),
+                                    },
+                                )
+                                .into(),
+                            )
+                        }
                         MappedRole::Resolved(role_arn) => Some(role_arn),
                         MappedRole::AuthenticatedRole => configured
                             .and_then(|configured| configured.role_for(true))

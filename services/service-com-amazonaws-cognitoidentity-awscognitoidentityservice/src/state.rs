@@ -863,6 +863,55 @@ impl IdentityPoolRoles {
                 })
             })
     }
+
+    /// Whether an exchange presenting `logins` may be told to assume `role_arn` through
+    /// `CustomRoleArn`: "The Amazon Resource Name (ARN) of the role to be assumed when
+    /// MULTIPLE ROLES WERE RECEIVED IN THE TOKEN from the identity provider"
+    /// (`GetCredentialsForIdentityInput$CustomRoleArn`, this service's model).
+    ///
+    /// So the roles such a request may pick from are the roles the pool's own configuration
+    /// names ([`IdentityPoolRoles::names_role_arn`]) TOGETHER WITH the roles the presented
+    /// tokens themselves carry ([`token_claimed_role_arns`]) — the latter being the very
+    /// several-roles-in-one-token case the member exists for, which no stored rule of the
+    /// pool need name. Anything else is a role this exchange could not have resolved, so it
+    /// is not one a request may substitute.
+    pub fn admits_custom_role_arn(
+        &self,
+        logins: &HashMap<String, String>,
+        role_arn: &str,
+    ) -> bool {
+        self.names_role_arn(role_arn)
+            || token_claimed_role_arns(logins)
+                .iter()
+                .any(|claimed| claimed == role_arn)
+    }
+}
+
+/// The roles the tokens `logins` presents received from the identity provider that issued
+/// them: the values of the two claims a Cognito identity-provider token carries roles in
+/// ([`ROLES_CLAIM`] and [`PREFERRED_ROLE_CLAIM`], the claims `RoleMapping$Type` names for the
+/// `Token` type), each once, in the provider-name order the logins are considered in.
+///
+/// A login whose presented value carries no claim set at all states no role here: what such
+/// a token says is decided by the provider that issued it, which this emulator does not
+/// reach.
+fn token_claimed_role_arns(logins: &HashMap<String, String>) -> Vec<String> {
+    let mut presented: Vec<(&String, &String)> = logins.iter().collect();
+    presented.sort();
+    let mut claimed: Vec<String> = Vec::new();
+    for (_, token) in presented {
+        let Some(claims) = presented_token_claims(token) else {
+            continue;
+        };
+        for claim in [ROLES_CLAIM, PREFERRED_ROLE_CLAIM] {
+            for role_arn in claim_values(&claims, claim) {
+                if !claimed.contains(&role_arn) {
+                    claimed.push(role_arn);
+                }
+            }
+        }
+    }
+    claimed
 }
 
 /// The `RoleMappingType` values this emulator resolves a role for, from `RoleMapping$Type`
@@ -2169,6 +2218,22 @@ pub const WEB_IDENTITY_PUBLISHED_CONDITION_KEYS: &[&str] = &[
 /// about the pool's configuration beyond the fact that it is the configuration at fault.
 pub const INVALID_POOL_CONFIGURATION_MESSAGE: &str =
     "Invalid identity pool configuration. Check assigned IAM roles for this pool.";
+
+/// How AWS words the refusal of a vend a role MAPPING decided against: the mapping keyed by
+/// the provider the login was made under resolved no role from the presented token and states
+/// the `Deny` resolution for that case, so the exchange is not authorized to receive any
+/// credential.
+///
+/// This is not the pool-configuration refusal above: the pool may well configure a role for
+/// the flow the request is in, and `InvalidIdentityPoolConfigurationException` is the error
+/// for a pool that "has no authenticated role configured, or STS returned an error response"
+/// (that error's own doc, this service's model). A mapping that denies the exchange is an
+/// AUTHORIZATION decision about the token presented, which is `NotAuthorizedException` —
+/// "thrown when a user is not authorized to access the requested resource".
+///
+/// Entirely fixed text, with no request- or state-derived part: an unauthenticated caller
+/// learns that role resolution refused the exchange and nothing about the pool's mappings.
+pub const DENIED_ROLE_RESOLUTION_MESSAGE: &str = "Role resolution failed.";
 
 /// A role as the IAM store in the same engine holds it, reduced to the facts an assume
 /// decides on.

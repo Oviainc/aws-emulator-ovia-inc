@@ -10,10 +10,13 @@
 //! are multiple `cognito:roles` matches for the `Token` type"
 //! (`RoleMapping$AmbiguousRoleResolution`, this service's model): the `AuthenticatedRole`
 //! value falls the exchange back to the pool's own `authenticated` role, and the `Deny`
-//! value leaves it with no role at all, so `GetCredentialsForIdentity` is refused with the
-//! modelled `InvalidIdentityPoolConfigurationException` (HTTP 400) and vends nothing. A
-//! mapping that DOES resolve a role is unaffected by its resolution, and so is an exchange
-//! no mapping of the pool's decides.
+//! value refuses the exchange, so `GetCredentialsForIdentity` answers the modelled
+//! `NotAuthorizedException` (HTTP 403) and vends nothing. That refusal is an authorization
+//! decision about the token presented, not a report that the pool is misconfigured —
+//! `InvalidIdentityPoolConfigurationException` is for a pool that "has no authenticated role
+//! configured, or STS returned an error response" (that error's own doc), which a pool whose
+//! mapping denies the exchange is not. A mapping that DOES resolve a role is unaffected by
+//! its resolution, and so is an exchange no mapping of the pool's decides.
 //!
 //! The rows differ along what the rule generalises over: the resolution the mapping states,
 //! the mapping `Type` (`Rules` and `Token`, the two the model defines), what the presented
@@ -40,11 +43,10 @@ use crate::vended_role_session::{expected_session_arn, Emulator};
 const AUTHENTICATED_ROLE: &str = "AuthenticatedRole";
 const DENY: &str = "Deny";
 
-/// The message the refusal of a vend the pool resolves no role for carries
-/// (`crate::state::INVALID_POOL_CONFIGURATION_MESSAGE`) — pinned here as a literal for the
-/// same reason. Fixed text: it carries no part taken from the request or from stored state.
-const NO_ROLE_MESSAGE: &str =
-    "Invalid identity pool configuration. Check assigned IAM roles for this pool.";
+/// The message the refusal of a vend a role mapping DENIED carries
+/// (`crate::state::DENIED_ROLE_RESOLUTION_MESSAGE`) — pinned here as a literal for the same
+/// reason. Fixed text: it carries no part taken from the request or from stored state.
+const DENIED_MESSAGE: &str = "Role resolution failed.";
 
 /// A `Rules` role mapping of `rules`, keyed by `key` and stating `resolution` for the case
 /// no rule matches.
@@ -70,7 +72,7 @@ fn token_mapping(key: &str, resolution: &str) -> Value {
 enum Outcome<'a> {
     /// A session of this role is vended.
     Session(&'a Role),
-    /// Nothing is vended: the call is refused.
+    /// Nothing is vended: the mapping denied the exchange and the call is refused.
     Refused,
 }
 
@@ -105,20 +107,19 @@ async fn assert_outcome(
             }
             let (status, body) = emulator.call("GetCredentialsForIdentity", &request).await;
             assert_eq!(
-                status, 400,
-                "case {case:?}: expected the HTTP 400 of a refused vend, got {status} with \
+                status, 403,
+                "case {case:?}: expected the HTTP 403 of a denied vend, got {status} with \
                  {body}"
             );
             let code = body["__type"].as_str().unwrap_or_default();
             assert!(
-                code.ends_with("InvalidIdentityPoolConfigurationException"),
-                "case {case:?}: expected InvalidIdentityPoolConfigurationException, got \
-                 {code:?} in {body}"
+                code.ends_with("NotAuthorizedException"),
+                "case {case:?}: expected NotAuthorizedException, got {code:?} in {body}"
             );
             assert_eq!(
                 body["message"].as_str(),
-                Some(NO_ROLE_MESSAGE),
-                "case {case:?}: expected the fixed no-role refusal message, got {body}"
+                Some(DENIED_MESSAGE),
+                "case {case:?}: expected the fixed denied-resolution message, got {body}"
             );
             assert!(
                 body.get("Credentials").is_none(),

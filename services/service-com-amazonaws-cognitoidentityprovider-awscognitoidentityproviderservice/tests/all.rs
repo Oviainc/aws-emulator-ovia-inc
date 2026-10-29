@@ -89,6 +89,8 @@ mod get_user_auth_factors;
 mod group_lifecycle;
 #[path = "all/group_membership.rs"]
 mod group_membership;
+#[path = "all/group_role_claims.rs"]
+mod group_role_claims;
 #[path = "all/identity_provider_lifecycle.rs"]
 mod identity_provider_lifecycle;
 #[path = "all/initiate_auth.rs"]
