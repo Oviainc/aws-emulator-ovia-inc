@@ -353,8 +353,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // A Call Analytics job may only apply a custom vocabulary, custom vocabulary
-        // filter or custom language model this REGION holds — the rule every job
-        // family's settings follow, see [`crate::state::unheld_reference_error`]. The
+        // filter or custom language model this REGION holds, AND holds in a state its
+        // terms can be applied in — the rule every job family's settings follow, see
+        // [`crate::state::unheld_reference_error`]. The
         // per-language `LanguageIdSettings` name resources of the same families, so
         // every entry of it is checked too.
         let mut references = crate::state::custom_resource_references(

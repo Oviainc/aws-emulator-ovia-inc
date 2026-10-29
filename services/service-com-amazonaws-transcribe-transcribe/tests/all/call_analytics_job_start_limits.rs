@@ -171,9 +171,13 @@ async fn a_start_naming_a_custom_resource_this_account_lacks_is_refused() {
             .await
             .ok(&format!("{case}: {}", row.create));
         // A held custom vocabulary is applicable only once its build has finished:
-        // READY is what makes one usable.
+        // READY is what makes one usable. A custom language model is the same rule on
+        // its own member: COMPLETED is what makes one usable.
         if row.create == "CreateVocabulary" {
             transcribe.vocabulary_ready(&name, None).await;
+        }
+        if row.create == "CreateLanguageModel" {
+            transcribe.language_model_completed(&name, None).await;
         }
         let held = format!("held-job-{index}");
         transcribe

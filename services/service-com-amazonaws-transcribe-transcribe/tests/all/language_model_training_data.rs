@@ -58,12 +58,18 @@ const ABSENT_BUCKET: &str = "transcribe-clm-training-data-missing";
 /// plain text, and nothing of its CONTENT is reported by any operation of this family —
 /// the `LanguageModel` shape has no member for it — so one short payload serves every
 /// row.
-const TRAINING_FILE: &[u8] = b"the quick brown fox jumps over the lazy dog\n";
+///
+/// `pub(crate)`, like [`emulator`], [`call`], [`create_bucket`], [`stage`] and
+/// [`create_request`] below: the suite that asserts which model STATUS a job start may
+/// apply (`crate::job_start_language_model_status`) needs an object store to ground a
+/// model's training failure in, and drives it through these rather than standing up a
+/// second S3-mounted emulator that could drift from them.
+pub(crate) const TRAINING_FILE: &[u8] = b"the quick brown fox jumps over the lazy dog\n";
 
 /// One emulator: Transcribe and Amazon S3 on a single shared engine behind the
 /// production router — what `build_router` assembles, narrowed to the services under
 /// test.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -78,7 +84,7 @@ fn emulator() -> MultiServiceRouter {
 
 /// One Transcribe call through the emulator, signed for [`REGION`] so the handler
 /// resolves its data in the Region the buckets below live in.
-async fn call(emulator: &MultiServiceRouter, operation: &str, input: Value) -> Reply {
+pub(crate) async fn call(emulator: &MultiServiceRouter, operation: &str, input: Value) -> Reply {
     dispatch(emulator, operation, input, Some(REGION)).await
 }
 
@@ -104,7 +110,7 @@ async fn s3(
 
 /// `PUT /<bucket>` — `CreateBucket`, naming its `LocationConstraint` so the bucket
 /// lives in the Region this suite signs for.
-async fn create_bucket(emulator: &MultiServiceRouter, bucket: &str) {
+pub(crate) async fn create_bucket(emulator: &MultiServiceRouter, bucket: &str) {
     let payload = format!(
         "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <LocationConstraint>{REGION}</LocationConstraint></CreateBucketConfiguration>"
@@ -119,7 +125,7 @@ async fn create_bucket(emulator: &MultiServiceRouter, bucket: &str) {
 }
 
 /// `PUT /<bucket>/<key>` — `PutObject`, staging one file of a model's data.
-async fn stage(emulator: &MultiServiceRouter, bucket: &str, key: &str, bytes: &[u8]) {
+pub(crate) async fn stage(emulator: &MultiServiceRouter, bucket: &str, key: &str, bytes: &[u8]) {
     let (status, body) = s3(emulator, "PUT", &format!("/{bucket}/{key}"), bytes).await;
     assert_eq!(
         status,
@@ -131,7 +137,7 @@ async fn stage(emulator: &MultiServiceRouter, bucket: &str, key: &str, bytes: &[
 
 /// The `CreateLanguageModel` body for `name`, training from `s3_uri` and tuning from
 /// `tuning_uri` when one is given.
-fn create_request(name: &str, s3_uri: &str, tuning_uri: Option<&str>) -> Value {
+pub(crate) fn create_request(name: &str, s3_uri: &str, tuning_uri: Option<&str>) -> Value {
     let mut input_data_config = json!({"S3Uri": s3_uri, "DataAccessRoleArn": ROLE_ARN});
     if let Some(tuning_uri) = tuning_uri {
         input_data_config["TuningDataS3Uri"] = json!(tuning_uri);

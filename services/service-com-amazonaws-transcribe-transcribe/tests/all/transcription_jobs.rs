@@ -23,9 +23,11 @@ use smithy_server_runtime::MultiServiceRouter;
 /// available here.
 const PAST_EVERY_TRANSITION: Duration = Duration::from_millis(1_300);
 
-/// How long [`Transcribe::vocabulary_ready`] waits between two polls, and how many
-/// polls it makes before giving up: together comfortably past one
-/// `crate::state::VOCABULARY_TRANSITION_DELAY` (500 ms) even on a slow machine.
+/// How long [`Transcribe::vocabulary_ready`] and
+/// [`Transcribe::language_model_completed`] wait between two polls, and how many polls
+/// they make before giving up: together comfortably past one
+/// `crate::state::VOCABULARY_TRANSITION_DELAY` / `crate::state::MODEL_TRANSITION_DELAY`
+/// (500 ms each) even on a slow machine.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const POLLS_FOR_READY: usize = 40;
 
@@ -119,6 +121,51 @@ impl Transcribe {
             std::thread::sleep(POLL_INTERVAL);
         }
         panic!("case {case:?}: the custom vocabulary's build never finished");
+    }
+
+    /// Wait until the custom language model `name`, held in `region`, is one a job may
+    /// APPLY — polling `DescribeLanguageModel` exactly as a caller must.
+    ///
+    /// A custom language model is usable only once its training has finished
+    /// successfully ("When the status displays as COMPLETED the model is ready for use"
+    /// — the model's doc for `LanguageModel$ModelStatus`,
+    /// `smithy_query(query="doc", shape="LanguageModel", member="ModelStatus")`), and a
+    /// create leaves it `IN_PROGRESS` until its training falls due. So a suite that
+    /// starts a job naming a model it just created waits here first, exactly as the
+    /// vocabulary family's rows wait in [`Self::vocabulary_ready`].
+    pub(crate) async fn language_model_completed(&self, name: &str, region: Option<&str>) {
+        let status = self.language_model_settled(name, region).await;
+        assert_eq!(
+            status, "COMPLETED",
+            "case {name:?}: a model whose training data nothing contradicted must settle \
+             COMPLETED, got {status:?}"
+        );
+    }
+
+    /// Poll `DescribeLanguageModel` until the training of the custom language model
+    /// `name`, held in `region`, has FINISHED, and answer the `ModelStatus` it settled
+    /// in — `COMPLETED` for a model whose training data nothing contradicted, `FAILED`
+    /// for one whose training data the object store said it could not read.
+    ///
+    /// The one home for "wait out a model's training":
+    /// [`Self::language_model_completed`] is this plus the assertion that the training
+    /// succeeded.
+    pub(crate) async fn language_model_settled(&self, name: &str, region: Option<&str>) -> String {
+        let case = format!("DescribeLanguageModel {name:?}");
+        for _ in 0..POLLS_FOR_READY {
+            let reply = self
+                .call_in_region("DescribeLanguageModel", json!({"ModelName": name}), region)
+                .await;
+            let status = reply.ok(&case)["LanguageModel"]["ModelStatus"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: expected a ModelStatus"))
+                .to_string();
+            if status != "IN_PROGRESS" {
+                return status;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        panic!("case {case:?}: the custom language model's training never finished");
     }
 }
 

@@ -1058,21 +1058,24 @@ pub fn not_found_message(kind: &str) -> String {
     )
 }
 
-/// How this service refuses a request that would APPLY a custom resource whose build
-/// has not finished successfully: the resource of `kind` named `name` is in `state`,
-/// and only [`VOCABULARY_STATE_READY`] is a state its terms can be applied in ("If the
-/// state is READY, you can use the custom vocabulary" — the model's own doc for
-/// `VocabularyState`).
+/// How this service refuses a request that would APPLY a custom resource whose
+/// processing has not finished successfully: the resource of `kind` named `name` is in
+/// `state`, and `usable` is the one value of that family's own processing member a job
+/// may apply the resource in — [`VOCABULARY_STATE_READY`] for a custom vocabulary ("If
+/// the state is READY, you can use the custom vocabulary" — the model's own doc for
+/// `VocabularyState`), [`MODEL_STATUS_COMPLETED`] for a custom language model ("When
+/// the status displays as COMPLETED the model is ready for use" — the model's own doc
+/// for `LanguageModel$ModelStatus`).
 ///
 /// Worded like the state refusals the deletes of every family carry ("... is in the
 /// {state} state and can't be deleted. Wait until ..."), because it is the same kind of
 /// refusal: a resource whose processing has not produced something usable. The
-/// variable parts are the name the request asked for and the state this emulator holds
-/// the resource in.
-pub fn resource_not_usable_message(kind: &str, name: &str, state: &str) -> String {
+/// variable parts are the name the request asked for, the state this emulator holds
+/// the resource in, and the value that family's own model documents as the usable one.
+pub fn resource_not_usable_message(kind: &str, name: &str, state: &str, usable: &str) -> String {
     format!(
         "The custom {kind} {name} is in the {state} state and can't be used. A custom \
-         {kind} can only be used when its state is {VOCABULARY_STATE_READY}. Check the \
+         {kind} can only be used when its state is {usable}. Check the \
          state of the {kind} and try your request again."
     )
 }
@@ -1884,12 +1887,15 @@ impl ComAmazonawsTranscribeTranscribeState {
     /// stores, so a resource of one family never stands in for another's, and so is each
     /// Region, so a resource of another Region never stands in either.
     ///
-    /// A resource that IS held must also be one a job can apply: a custom vocabulary
-    /// carries a `VocabularyState` precisely so that only a build that finished
-    /// successfully is usable ("If the state is READY, you can use the custom
-    /// vocabulary"), so one still being built or one whose build failed is refused with
-    /// [`resource_not_usable_message`] — see [`Self::unusable_reference_state`] for
-    /// which families carry such a state here. Takes `&mut self` and `now` for that
+    /// A resource that IS held must also be one a job can apply: a family whose records
+    /// carry a processing member carries it precisely so that only processing which
+    /// finished successfully is usable — a custom vocabulary's `VocabularyState` ("If
+    /// the state is READY, you can use the custom vocabulary") and a custom language
+    /// model's `ModelStatus` ("When the status displays as COMPLETED the model is ready
+    /// for use") — so a resource still being built or trained, or one whose build or
+    /// training failed, is refused with [`resource_not_usable_message`] — see
+    /// [`Self::unusable_reference_state`] for which families carry such a member here.
+    /// Takes `&mut self` and `now` for that
     /// reason: the state compared against is the one the CLOCK already owes the
     /// resource, materialised first exactly as every reader of that family materialises
     /// it, so a build that fell due before this request is not mistaken for one still
@@ -1907,35 +1913,52 @@ impl ComAmazonawsTranscribeTranscribeState {
             if !self.holds(*family, region, name) {
                 return Some(not_found_message(family.kind()));
             }
-            if let Some(state) = self.unusable_reference_state(*family, region, name, now) {
-                return Some(resource_not_usable_message(family.kind(), name, &state));
+            if let Some((state, usable)) =
+                self.unusable_reference_state(*family, region, name, now)
+            {
+                return Some(resource_not_usable_message(
+                    family.kind(),
+                    name,
+                    &state,
+                    usable,
+                ));
             }
         }
         None
     }
 
     /// The state the resource of `family` named `name` is in when that state is NOT one
-    /// a job may apply the resource in, and `None` when it is usable — or when this
-    /// family has no such state here.
+    /// a job may apply the resource in, paired with the value that family's own model
+    /// documents as the usable one — and `None` when the resource is usable, or when
+    /// this family has no such state here.
     ///
-    /// The custom vocabulary family is the one whose records reach the usable state the
-    /// model defines, [`VOCABULARY_STATE_READY`], and whose records a request can
-    /// therefore find in a state that is not it: `PENDING` while the build runs, or
-    /// `FAILED` once it has not produced any terms. The other families a settings
-    /// reference can name are checked for existence only:
+    /// THE RULE: a family whose records carry a processing member has exactly one value
+    /// of it a job may apply the resource in, so a resource held in any other value of
+    /// that member is refused ([`resource_not_usable_message`]):
+    ///
+    /// * a custom vocabulary reaches [`VOCABULARY_STATE_READY`] when its build
+    ///   succeeded, and a request can find one `PENDING` while that build runs or
+    ///   `FAILED` once it produced no terms;
+    /// * a custom LANGUAGE model reaches [`MODEL_STATUS_COMPLETED`] when its training
+    ///   ended on data the object store answered for ("When the status displays as
+    ///   COMPLETED the model is ready for use" — the model's own doc for
+    ///   `LanguageModel$ModelStatus`), and a request can find one `IN_PROGRESS` while
+    ///   that training runs or `FAILED` once the store said its training data could not
+    ///   be read ([`is_terminal_model_status`] is the same enum's finished/unfinished
+    ///   split, which the operations that DELETE or UPDATE a model read).
+    ///
+    /// The other families a settings reference can name carry no such member, or none
+    /// this emulator can hold a usable record of, so they are checked for existence
+    /// only:
     ///
     /// * a custom vocabulary FILTER models no processing state anywhere (see
     ///   [`VocabularyFilterRecord`]), so a held filter is always applicable;
-    /// * a custom LANGUAGE model ([`LanguageModelRecord`]) is checked for existence
-    ///   only: whether a job may name a model still training, or one whose training
-    ///   failed, is a rule about what a job START admits, which each start operation's
-    ///   own validation owns rather than this lookup;
-    /// * a custom MEDICAL vocabulary ([`MedicalVocabularyRecord`]) is built only from a
-    ///   location this emulator reads nothing from, so no record of that family ever
-    ///   reaches a usable state. Refusing every job that names one would refuse a
-    ///   request the real service serves — a limitation of this emulator's build, not
-    ///   an error in the caller's request — so a held medical vocabulary is applied as
-    ///   named;
+    /// * a custom MEDICAL vocabulary ([`MedicalVocabularyRecord`]) can be built only
+    ///   from a table file an object store serves, so a record of that family reaches a
+    ///   usable state only where one is mounted beside this service. Refusing every job
+    ///   that names one would refuse a request the real service serves — a limitation of
+    ///   this emulator's build, not an error in the caller's request — so a held medical
+    ///   vocabulary is applied as named;
     /// * the job families are never the target of a settings reference.
     fn unusable_reference_state(
         &mut self,
@@ -1943,11 +1966,17 @@ impl ComAmazonawsTranscribeTranscribeState {
         region: &str,
         name: &str,
         now: SystemTime,
-    ) -> Option<String> {
+    ) -> Option<(String, &'static str)> {
         match family {
             ResourceFamily::Vocabulary => {
                 let record = self.vocabulary_mut(region, name, now)?;
-                (record.state != VOCABULARY_STATE_READY).then(|| record.state.clone())
+                (record.state != VOCABULARY_STATE_READY)
+                    .then(|| (record.state.clone(), VOCABULARY_STATE_READY))
+            }
+            ResourceFamily::LanguageModel => {
+                let record = self.language_model_mut(region, name, now)?;
+                (record.status != MODEL_STATUS_COMPLETED)
+                    .then(|| (record.status.clone(), MODEL_STATUS_COMPLETED))
             }
             _ => None,
         }

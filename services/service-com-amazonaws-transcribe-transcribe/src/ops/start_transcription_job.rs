@@ -478,11 +478,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // A job may only apply a custom vocabulary, custom vocabulary filter or custom
-        // language model this REGION holds: each of those members names a resource of
+        // language model this REGION holds, AND holds in a state its terms can be
+        // applied in: each of those members names a resource of
         // its own family ("The name of the custom vocabulary you want to use in your
         // transcription job request", and the same sentence for the filter and the
         // model), so a name no create of that family recorded here is refused rather
-        // than stored on a job that would report it back. The per-language
+        // than stored on a job that would report it back, and so is one whose own
+        // processing has not produced something usable. The per-language
         // `LanguageIdSettings` name resources of the very same families, so every
         // entry of it is checked too — see
         // [`crate::state::unheld_reference_error`].

@@ -53,6 +53,19 @@ pub(crate) const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
 /// (`smithy_query(query="operation", operation="StartCallAnalyticsJob")`).
 const ROLE_ARN: &str = "arn:aws:iam::111122223333:role/CallAnalyticsAccess";
 
+/// Where the custom language model [`create_named_resources`] creates is trained from:
+/// the bucket, the prefix the create names, and one file key under it.
+///
+/// `pub(crate)` because a suite that mounts an object store beside Transcribe has to
+/// STAGE that data before calling the helper: a model's training settles on what the
+/// store answers about this location, and only a model that settled `COMPLETED` is one a
+/// job may apply.
+pub(crate) const MODEL_TRAINING_BUCKET: &str = "DOC-EXAMPLE-BUCKET";
+/// See [`MODEL_TRAINING_BUCKET`].
+pub(crate) const MODEL_TRAINING_PREFIX: &str = "training/";
+/// See [`MODEL_TRAINING_BUCKET`].
+pub(crate) const MODEL_TRAINING_KEY: &str = "training/corpus.txt";
+
 /// The members `StartCallAnalyticsJob` accepts that the `CallAnalyticsJob` shape also
 /// carries, so a stored job must read them back unchanged
 /// (`smithy_query(query="shape", shape="CallAnalyticsJob")`).
@@ -226,7 +239,7 @@ pub(crate) async fn create_named_resources(transcribe: &Transcribe) {
                 "LanguageCode": "en-US",
                 "BaseModelName": "WideBand",
                 "InputDataConfig": {
-                    "S3Uri": "s3://DOC-EXAMPLE-BUCKET/training/",
+                    "S3Uri": format!("s3://{MODEL_TRAINING_BUCKET}/{MODEL_TRAINING_PREFIX}"),
                     "DataAccessRoleArn": ROLE_ARN
                 }
             }),
@@ -234,8 +247,13 @@ pub(crate) async fn create_named_resources(transcribe: &Transcribe) {
         .await
         .ok("CreateLanguageModel support-model");
     // A start may only apply a custom vocabulary once its build has finished: it is
-    // READY that makes one usable, and a create leaves it PENDING.
+    // READY that makes one usable, and a create leaves it PENDING. A custom language
+    // model is the same rule on its own member: COMPLETED is what makes one usable, and
+    // a create leaves it IN_PROGRESS.
     transcribe.vocabulary_ready("call-terms", None).await;
+    transcribe
+        .language_model_completed("support-model", None)
+        .await;
 }
 
 /// `ListCallAnalyticsJobs` with `request`.

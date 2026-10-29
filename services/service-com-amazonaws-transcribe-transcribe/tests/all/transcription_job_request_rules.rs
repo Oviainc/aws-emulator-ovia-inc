@@ -114,7 +114,9 @@ async fn create_vocabulary_filter(transcribe: &Transcribe, name: &str) {
         .ok(&format!("CreateVocabularyFilter {name:?}"));
 }
 
-/// `CreateLanguageModel` for `name`.
+/// `CreateLanguageModel` for `name`, so this account holds a custom language model of
+/// that name — and holds it in the status a start may apply it in, `COMPLETED`, which a
+/// create reaches only once its training falls due.
 async fn create_language_model(transcribe: &Transcribe, name: &str) {
     transcribe
         .call(
@@ -131,6 +133,7 @@ async fn create_language_model(transcribe: &Transcribe, name: &str) {
         )
         .await
         .ok(&format!("CreateLanguageModel {name:?}"));
+    transcribe.language_model_completed(name, None).await;
 }
 
 /// One row of [`a_start_naming_one_side_of_a_co_requirement_is_refused`]: the members
@@ -624,9 +627,13 @@ async fn a_start_naming_a_custom_resource_this_account_lacks_is_refused() {
                 .await
                 .ok(&format!("{operation} {resource:?}"));
             // A held custom vocabulary is applicable only once its build has finished:
-            // READY is what makes one usable.
+            // READY is what makes one usable. A custom language model is the same rule
+            // on its own member: COMPLETED is what makes one usable.
             if operation == "CreateVocabulary" {
                 transcribe.vocabulary_ready(resource, None).await;
+            }
+            if operation == "CreateLanguageModel" {
+                transcribe.language_model_completed(resource, None).await;
             }
             let members = (reference.members)(resource);
             transcribe

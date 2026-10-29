@@ -36,8 +36,13 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::call_analytics_jobs::{create_named_resources, get, list, names_of, PAST_THE_TRANSITION};
-use crate::media_object_resolution::{emulator, given_staged_media, ABSENT_BUCKET, BUCKET, STAGED_KEYS};
+use crate::call_analytics_jobs::{
+    create_named_resources, get, list, names_of, MODEL_TRAINING_BUCKET, MODEL_TRAINING_KEY,
+    PAST_THE_TRANSITION,
+};
+use crate::media_object_resolution::{
+    emulator, given_staged_media, s3, ABSENT_BUCKET, BUCKET, STAGED_KEYS,
+};
 use crate::transcription_job_absent_media_state::MEDIA_NAMES_NO_OBJECT;
 use crate::transcription_job_request_rules::not_found_message;
 use crate::transcription_jobs::Transcribe;
@@ -56,6 +61,22 @@ const LANGUAGE_MODEL: &str = "support-model";
 async fn emulator_with_staged_media() -> Transcribe {
     let router: Arc<smithy_server_runtime::MultiServiceRouter> = emulator();
     given_staged_media(&router).await;
+    // With an object store mounted, a custom language model's training settles on what
+    // that store answers about the data the create named, and only a model that settled
+    // `COMPLETED` is one a job may apply — so the training data
+    // [`create_named_resources`] names is staged too.
+    for path in [
+        format!("/{MODEL_TRAINING_BUCKET}"),
+        format!("/{MODEL_TRAINING_BUCKET}/{MODEL_TRAINING_KEY}"),
+    ] {
+        let (status, body) = s3(&router, "PUT", &path, b"a corpus of support calls\n").await;
+        assert_eq!(
+            status,
+            200,
+            "the training data at {path} must be stored, got {status} with body {:?}",
+            String::from_utf8_lossy(&body)
+        );
+    }
     Transcribe { router }
 }
 
