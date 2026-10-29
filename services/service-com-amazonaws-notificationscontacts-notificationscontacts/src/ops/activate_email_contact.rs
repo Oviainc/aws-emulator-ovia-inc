@@ -8,9 +8,11 @@
 //! ARN the store does not hold AND for a contact that holds no outstanding activation
 //! token — none was ever sent, or the one that was has run past the lifetime its
 //! `code` documents or spent the attempt budget it documents — and the modelled 400
-//! for a code that is not the token outstanding for this contact. Each call against an
-//! outstanding token spends one of its attempts. Idempotent: activating an
-//! already-active contact with its own code changes nothing and still answers 200.
+//! for a code that is not the token outstanding for this contact. Which of the two a
+//! disagreeing code gets turns on the token alone, never on the contact's status. Each
+//! call that is compared against an outstanding token spends one of its attempts.
+//! Idempotent: activating an already-active contact with its own code activates nothing,
+//! so it changes nothing — not even the attempt budget — and still answers 200.
 //!
 //! ## Shape of an operation
 //!
@@ -201,23 +203,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An activated contact has nothing left to activate, so repeating the call
         // that activated it is the no-op this `@idempotent` operation answers 200 for,
         // whatever has become of the code since: the bounds below govern whether a
-        // code can still ACTIVATE a contact.
-        if already_active {
-            return if code_matches {
-                Ok(ActivateEmailContactOutput {})
-            } else {
-                Err(ActivateEmailContactErrorModeled::ValidationException(
-                    crate::state::field_validation_failure("code", WRONG_CODE),
-                )
-                .into())
-            };
+        // code can still ACTIVATE a contact, and this call activates nothing.
+        if already_active && code_matches {
+            return Ok(ActivateEmailContactOutput {});
         }
 
         // A code is honoured only while the token it belongs to is still outstanding:
         // inside the lifetime and the attempt budget its own documentation states. Once
         // either bound is past, this contact holds no activation token until a new send
         // mints one, which is the same missing resource as a contact that was never
-        // sent a code — so the attempt changes nothing and the contact stays inactive.
+        // sent a code — so the attempt changes nothing. That is a property of the TOKEN,
+        // so it governs a disagreeing code submitted against an ALREADY-ACTIVE contact
+        // too: the status a caller gets for a code that is not outstanding may not
+        // depend on whether this particular contact happens to be active.
         if !outstanding {
             return Err(
                 ActivateEmailContactErrorModeled::ResourceNotFoundException(
@@ -229,10 +227,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The code was submitted against an outstanding token, so this call is one of
         // the attempts that token admits — spent whether or not the code turns out to
-        // be the right one, because what the budget bounds is attempts.
+        // be the right one, and whatever the contact's status, because what the budget
+        // bounds is attempts made against the token.
         //
         // Activating an already-active contact is a no-op (handled above), so
-        // `updateTime` moves only on the call that actually changes the status.
+        // `updateTime` moves only on the call that actually changes the status; a
+        // matching code reaching here therefore always belongs to an inactive contact.
         let activated_at = code_matches.then(|| store.next_instant_millis());
         if let Some(contact) = store.contact_mut(&input.arn) {
             if let Some(token) = contact.activation_token.as_mut() {

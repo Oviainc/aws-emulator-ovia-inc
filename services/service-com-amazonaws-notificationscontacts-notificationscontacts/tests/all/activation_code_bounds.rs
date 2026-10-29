@@ -43,7 +43,10 @@ const HOUR_MILLIS: i64 = 60 * 60 * 1_000;
 const SLACK_MILLIS: i64 = 5_000;
 
 /// The status the contact `arn` names currently reports.
-async fn status_of(em: &Emulator, arn: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite in this test target reads the status back through
+/// the same wire path rather than growing a second copy of it.
+pub(crate) async fn status_of(em: &Emulator, arn: &str) -> String {
     let contact = get_ok(em, arn).await;
     contact
         .get("status")
@@ -54,7 +57,7 @@ async fn status_of(em: &Emulator, arn: &str) -> String {
 
 /// Move the issue instant of the token `arn` holds `by_millis` into the past, so the
 /// code reads as that much older without the test waiting for it.
-fn age_token(em: &Emulator, arn: &str, by_millis: i64) {
+pub(crate) fn age_token(em: &Emulator, arn: &str, by_millis: i64) {
     let store = state::service_state(&*em.engine)
         .expect("the emulator's own engine must expose this service's store");
     let mut store = store.lock();
@@ -67,7 +70,7 @@ fn age_token(em: &Emulator, arn: &str, by_millis: i64) {
 
 /// How many attempts the token `arn` holds has already taken, or `None` when it holds
 /// no token.
-fn token_attempts(em: &Emulator, arn: &str) -> Option<u32> {
+pub(crate) fn token_attempts(em: &Emulator, arn: &str) -> Option<u32> {
     state::service_state(&*em.engine)
         .expect("the emulator's own engine must expose this service's store")
         .lock()
@@ -80,7 +83,7 @@ fn token_attempts(em: &Emulator, arn: &str) -> Option<u32> {
 ///
 /// Every one is seven ASCII digits, so each satisfies the modelled `Token`
 /// (`len 7..7`, `^[a-z0-9]{7}$`) and only stored state can tell it from the real one.
-fn wrong_codes(issued: &str, count: usize) -> Vec<String> {
+pub(crate) fn wrong_codes(issued: &str, count: usize) -> Vec<String> {
     let codes: Vec<String> = (0..=count)
         .map(|n| format!("{n:07}"))
         .filter(|code| code != issued)
@@ -96,7 +99,7 @@ fn wrong_codes(issued: &str, count: usize) -> Vec<String> {
 
 /// Assert that `body` is the modelled 404 naming the ABSENT activation token rather
 /// than the contact, which exists throughout.
-fn assert_token_missing(case: &str, status: u16, body: &Value) {
+pub(crate) fn assert_token_missing(case: &str, status: u16, body: &Value) {
     assert_eq!(
         status, 404,
         "case {case:?}: the contact holds no outstanding activation token, so the \

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/activation_code_bounds.rs"]
 mod activation_code_bounds;
+#[path = "all/activation_refusal_turns_on_the_token.rs"]
+mod activation_refusal_turns_on_the_token;
 #[path = "all/activation_token_resource.rs"]
 mod activation_token_resource;
 #[path = "all/email_contact_name_pattern.rs"]
