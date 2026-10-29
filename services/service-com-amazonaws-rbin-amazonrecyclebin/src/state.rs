@@ -1046,7 +1046,8 @@ pub struct ComAmazonawsRbinAmazonrecyclebinState {
     /// without scanning the map. An ARN carries its rule's Region, so an entry is
     /// still reached through a Region-scoped resolver.
     pub arn_index: HashMap<String, String>,
-    /// Monotonic counter behind [`Self::mint_identifier`].
+    /// Monotonic counter behind [`Self::mint_identifier`]. A fresh store starts it at
+    /// [`INITIAL_IDENTIFIER_SEED`], the one seed whose rendering is never handed out.
     pub next_identifier_seed: u64,
 }
 
@@ -1183,15 +1184,18 @@ impl ComAmazonawsRbinAmazonrecyclebinState {
 
     /// Whether `identifier` is one this store has already MINTED.
     ///
-    /// [`Self::mint_identifier`] renders a seed that only ever rises, and
+    /// [`Self::mint_identifier`] ADVANCES the seed before rendering it, and the seed only
+    /// ever rises, so the seeds it has rendered are exactly those after
+    /// [`INITIAL_IDENTIFIER_SEED`] up to and including the current one.
     /// [`base62_identifier`] renders every seed as the same number of digits in
-    /// ascending-byte order, so the renderings this store has handed out are exactly the
-    /// identifiers up to and including the rendering of its current seed. An
-    /// identifier-shaped value above that watermark names no position this store has
-    /// ever reached — nothing could have been minted there — whether or not a rule still
-    /// holds it today.
+    /// ascending-byte order and so maps that span of seeds onto exactly the span of
+    /// renderings between the two bounds below. An identifier-shaped value ABOVE the
+    /// upper bound names a position this store has not reached yet, and one AT OR BELOW
+    /// the lower bound names a seed it never rendered at all: nothing could have been
+    /// minted at either, whether or not a rule still holds it today.
     pub fn has_minted_identifier(&self, identifier: &str) -> bool {
         is_rule_identifier(identifier)
+            && identifier > base62_identifier(INITIAL_IDENTIFIER_SEED).as_str()
             && identifier <= base62_identifier(self.next_identifier_seed).as_str()
     }
 
@@ -1233,6 +1237,15 @@ impl ComAmazonawsRbinAmazonrecyclebinState {
             .filter(move |(_, rule)| rule.region == region)
     }
 }
+
+/// The seed a fresh store's counter starts at — what `#[derive(Default)]` leaves in
+/// [`ComAmazonawsRbinAmazonrecyclebinState::next_identifier_seed`].
+///
+/// [`ComAmazonawsRbinAmazonrecyclebinState::mint_identifier`] advances the counter
+/// BEFORE it renders a candidate, so this seed's own rendering is the one
+/// identifier-shaped value no store state can ever have handed out: the first identifier
+/// minted is the rendering of the seed after it.
+const INITIAL_IDENTIFIER_SEED: u64 = 0;
 
 /// Render `seed` as exactly [`IDENTIFIER_LEN`] base62 digits, most significant
 /// first and left-padded with `0`, so the result satisfies `^[0-9a-zA-Z]{11}$` and

@@ -15,6 +15,8 @@
 mod error_reason_fault_classes;
 #[path = "all/error_response_bodies.rs"]
 mod error_response_bodies;
+#[path = "all/list_rules_minted_page_positions.rs"]
+mod list_rules_minted_page_positions;
 #[path = "all/list_rules_page_order.rs"]
 mod list_rules_page_order;
 #[path = "all/list_rules_page_token_authenticity.rs"]

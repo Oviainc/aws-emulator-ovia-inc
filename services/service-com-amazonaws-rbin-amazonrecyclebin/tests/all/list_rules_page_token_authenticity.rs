@@ -35,7 +35,7 @@ use smithy_server_runtime::MultiServiceRouter;
 /// one admitted by `RuleArn`'s Region segment
 /// (`^arn:\S+:rbin:[a-z\-0-9]{0,63}:[0-9]{12}:rule/[0-9a-zA-Z]{11}$`, from
 /// smithy_query(query="shape", shape="RuleArn")).
-const REGIONS: [&str; 3] = ["us-east-1", "eu-central-1", "ap-northeast-1"];
+pub(crate) const REGIONS: [&str; 3] = ["us-east-1", "eu-central-1", "ap-northeast-1"];
 
 /// `RuleIdentifier` is `^[0-9a-zA-Z]{11}$` — 11 characters of the base62 alphabet.
 /// Source: smithy_query(query="shape", shape="RuleIdentifier").
@@ -79,7 +79,7 @@ fn as_token(payload: &str) -> String {
 
 /// Create `total` rules of `resource_type` in `region` and hand back their identifiers
 /// in creation order.
-async fn create_rules_in(
+pub(crate) async fn create_rules_in(
     router: &MultiServiceRouter,
     region: &str,
     resource_type: &str,
@@ -120,7 +120,7 @@ async fn create_rules_in(
 
 /// One page of `resource_type` through `region`'s endpoint: the identifiers it reported
 /// and the cursor it handed back. Fails the case unless the page is an HTTP 200.
-async fn page_in(
+pub(crate) async fn page_in(
     router: &MultiServiceRouter,
     region: &str,
     resource_type: &str,
@@ -154,7 +154,7 @@ async fn page_in(
 /// Assert `ListRules` refuses `token` as a page token: the modelled
 /// `ValidationException`, HTTP 400, `Reason` the page-token fault class, a non-empty
 /// `Message`, and NO page in the body — a refusal is not a truncated success.
-async fn assert_refused(
+pub(crate) async fn assert_refused(
     router: &MultiServiceRouter,
     region: &str,
     resource_type: &str,
