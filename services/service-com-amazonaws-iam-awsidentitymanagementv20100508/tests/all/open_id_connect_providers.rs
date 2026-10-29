@@ -137,7 +137,7 @@ pub(crate) fn expected_arn(url: &str) -> String {
 /// ONE reader of that wording for this crate's test tree, so every suite that drives an
 /// absent provider asserts the same message.
 pub(crate) fn absence_message(arn: &str) -> String {
-    format!("OpenId connect Provider {arn} cannot be found.")
+    format!("OpenIDConnect Provider not found for arn {arn}")
 }
 
 /// The ISSUER form of a URL: the URL with its `https://` scheme removed, which is what a

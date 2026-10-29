@@ -140,9 +140,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only: the properties are account-wide and
-        // IAM is global, so nothing in it selects what is written.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutAccountPropertiesErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -151,6 +148,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A mutation: the lock is held for write from the decision below across the
+        // validation and the insert, so nothing a refused call asked for is written.
+        //
+        // `ConcurrentModificationException` is the refusal for "multiple requests to
+        // change this object … submitted simultaneously"; the store serialises every
+        // write under this lock, so no caller here observes a partial one.
+        let mut store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies
+        // are evaluated before any property is set. This request addresses the
+        // account's own configuration rather than one entity in it, so the decision is
+        // made on the account-wide resource
+        // ([`crate::state::authorization::ACCOUNT_WIDE_RESOURCE`]).
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::PUT_ACCOUNT_PROPERTIES,
+            crate::state::authorization::ACCOUNT_WIDE_RESOURCE,
+        )?;
 
         // The request's pairs in a total key order, so the refusals below name the
         // same key however the request's map happened to be ordered on the wire.
@@ -217,11 +234,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // properties it carries, and a request carries only one namespace, so it can
         // say nothing about any other.
         //
-        // `ConcurrentModificationException` is the refusal for "multiple requests to
-        // change this object … submitted simultaneously"; the store serialises every
-        // write under its own lock, so no caller here observes a partial one.
-        let mut store = state.lock();
-
         // The bound an account's property set is held to
         // (`crate::state::MAX_ACCOUNT_PROPERTIES_PER_ACCOUNT`), taken against what the
         // account would hold AFTER the write, under the same lock the write takes:

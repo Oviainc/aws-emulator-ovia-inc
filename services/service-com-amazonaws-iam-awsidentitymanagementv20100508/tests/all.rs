@@ -29,6 +29,8 @@ mod account_aliases;
 mod account_authorization_details;
 #[path = "all/account_properties.rs"]
 mod account_properties;
+#[path = "all/account_singleton_authorization.rs"]
+mod account_singleton_authorization;
 #[path = "all/aws_managed_policy_attachability.rs"]
 mod aws_managed_policy_attachability;
 #[path = "all/aws_managed_policy_catalog.rs"]

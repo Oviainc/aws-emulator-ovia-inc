@@ -10,15 +10,17 @@
 //! the pointer at the authorization details of that evaluation: the console page, at
 //! IAM's own endpoint Region whichever Region the caller addressed, and the authorization
 //! id of the refused request, named in both of the pointer's slots — whether or not the
-//! caller held any document for the evaluation to read. Where the refusal is explained by
-//! an explicit `Deny` about the request, the message ENDS at the reason: that statement is
-//! the explanation, and the reason already names it.
+//! caller held any document for the evaluation to read — for every action AWS words that
+//! way. Where the refusal is explained by an explicit `Deny` about the request, the
+//! message ENDS at the reason: that statement is the explanation, and the reason already
+//! names it. So does the withheld-grant refusal of an action AWS words without the pointer
+//! at all, which is a fact about that action rather than about the call.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: which
 //! operation is refused, whether the resource is an ARN, a path-scoped collection, the
 //! account-wide `*` or a named entity, which of the two refusals it is (an explicit `Deny`
-//! about the request, or no `Allow` for it), and whether the caller held any document at
-//! all.
+//! about the request, or no `Allow` for it), whether the caller held any document at all,
+//! and whether the action's refusal is one AWS words with the pointer.
 //!
 //! The awsQuery harness is the one `tests/all/user_lifecycle.rs` owns and the other
 //! suites in this crate share, so a request is built and read exactly one way.
@@ -58,7 +60,8 @@ struct Case {
     /// The clause closing the sentence.
     reason: String,
     /// Whether the refusal points at the authorization details of an evaluation: nothing
-    /// in force allowed the call, so the grant was withheld rather than explicitly denied.
+    /// in force allowed the call, so the grant was withheld rather than explicitly denied,
+    /// AND this action's refusal is one AWS words with that pointer.
     details: bool,
 }
 
@@ -235,6 +238,44 @@ fn cases() -> Vec<Case> {
             iam_action: "iam:GetAccountAuthorizationDetails",
             named_as: "*".to_string(),
             reason: EXPLICIT_DENY.to_string(),
+            details: false,
+        },
+        // An action AWS words WITHOUT the pointer: the withheld call's message ends at
+        // the reason even though the evaluation withheld it. A write, naming the policy
+        // the request addressed.
+        Case {
+            case: "withheld tag removal, an action worded without the pointer",
+            policies: Vec::new(),
+            action: "UntagPolicy",
+            params: vec![
+                (
+                    "PolicyArn".to_string(),
+                    format!("arn:aws:iam::{account}:policy/payroll"),
+                ),
+                ("TagKeys.member.1".to_string(), "team".to_string()),
+            ],
+            iam_action: "iam:UntagPolicy",
+            named_as: format!("policy arn:aws:iam::{account}:policy/payroll"),
+            reason: no_allow("iam:UntagPolicy"),
+            details: false,
+        },
+        // The same wording on a READ of another action in that set, whose resource is the
+        // ARN the request addressed: what the message ends at is the action's, not the
+        // resource form's or the operation kind's.
+        Case {
+            case: "withheld policy-grant report, an action worded without the pointer",
+            policies: Vec::new(),
+            action: "ListPoliciesGrantingServiceAccess",
+            params: vec![
+                (
+                    "Arn".to_string(),
+                    format!("arn:aws:iam::{account}:user/payroll"),
+                ),
+                ("ServiceNamespaces.member.1".to_string(), "s3".to_string()),
+            ],
+            iam_action: "iam:ListPoliciesGrantingServiceAccess",
+            named_as: format!("arn:aws:iam::{account}:user/payroll"),
+            reason: no_allow("iam:ListPoliciesGrantingServiceAccess"),
             details: false,
         },
     ]

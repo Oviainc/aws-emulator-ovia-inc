@@ -132,10 +132,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // This operation takes no input, and `ctx` carries request metadata only:
-        // the properties are account-wide and IAM is global, so nothing in either
-        // selects what is reported.
-        let _ = (&input, ctx);
+        // This operation takes no input: the properties are account-wide, so nothing
+        // in the request selects what is reported. `ctx` carries the credential the
+        // decision below is made for.
+        let _ = &input;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetAccountPropertiesErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -145,6 +145,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies
+        // are evaluated before any property is reported. This request addresses the
+        // account's own configuration rather than one entity in it, so the decision is
+        // made on the account-wide resource
+        // ([`crate::state::authorization::ACCOUNT_WIDE_RESOURCE`]).
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::GET_ACCOUNT_PROPERTIES,
+            crate::state::authorization::ACCOUNT_WIDE_RESOURCE,
+        )?;
 
         // A REPORT: this "retrieves the account-level properties for the caller's
         // Amazon Web Services account", so it hands back exactly what

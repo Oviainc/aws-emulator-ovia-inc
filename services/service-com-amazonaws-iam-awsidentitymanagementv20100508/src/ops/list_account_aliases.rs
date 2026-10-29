@@ -149,7 +149,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListAccountAliasesErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -192,6 +191,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account holds at most one ("Note: you can have only one"), so the stored
         // `Option` IS the collection and the alias itself is its key.
         let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies
+        // are evaluated before the alias is reported. This request addresses the
+        // account's own configuration rather than one entity in it, so the decision is
+        // made on the account-wide resource
+        // ([`crate::state::authorization::ACCOUNT_WIDE_RESOURCE`]).
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_ACCOUNT_ALIASES,
+            crate::state::authorization::ACCOUNT_WIDE_RESOURCE,
+        )?;
+
         let mut account_aliases: Vec<String> = store
             .account_alias
             .iter()

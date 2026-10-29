@@ -14,8 +14,9 @@
 //! closed by why the decision went that way. A refusal that WITHHELD the call — nothing
 //! in force allowed it, the implicit deny — reports an evaluation whose details can be
 //! read, so that sentence continues with where to read them and under which authorization
-//! id ([`not_authorized_with_details`]); a refusal explained by an explicit `Deny` is
-//! explained by the statement the reason already names, so it ends there
+//! id ([`not_authorized_with_details`]) for every action AWS words that way
+//! ([`ENDS_AT_THE_REASON`] names the ones it does not); a refusal explained by an explicit
+//! `Deny` is explained by the statement the reason already names, so it ends there
 //! ([`not_authorized`]).
 //!
 //! The four pieces, each held in exactly one place:
@@ -250,6 +251,21 @@ pub const GENERATE_ORGANIZATIONS_ACCESS_REPORT: &str = "iam:GenerateOrganization
 
 /// `iam:ListDelegationRequests`.
 pub const LIST_DELEGATION_REQUESTS: &str = "iam:ListDelegationRequests";
+
+/// `iam:GetAccountProperties`.
+pub const GET_ACCOUNT_PROPERTIES: &str = "iam:GetAccountProperties";
+
+/// `iam:PutAccountProperties`.
+pub const PUT_ACCOUNT_PROPERTIES: &str = "iam:PutAccountProperties";
+
+/// `iam:CreateAccountAlias`.
+pub const CREATE_ACCOUNT_ALIAS: &str = "iam:CreateAccountAlias";
+
+/// `iam:DeleteAccountAlias`.
+pub const DELETE_ACCOUNT_ALIAS: &str = "iam:DeleteAccountAlias";
+
+/// `iam:ListAccountAliases`.
+pub const LIST_ACCOUNT_ALIASES: &str = "iam:ListAccountAliases";
 
 /// The resource an account-WIDE call is decided against.
 ///
@@ -653,8 +669,12 @@ pub fn authorize_written(
     // pointer at those details, whether or not the principal held a document for the
     // evaluation to read: the evaluation ran either way, and it is the one the pointer
     // names. A refusal explained by an explicit `Deny` is explained by that statement,
-    // which the reason already names, so it ends at the reason.
-    if decided == Decision::Denied || capped == Decision::Denied {
+    // which the reason already names, so it ends at the reason — as does one for an
+    // action AWS words without the pointer at all ([`ENDS_AT_THE_REASON`]).
+    if decided == Decision::Denied
+        || capped == Decision::Denied
+        || ENDS_AT_THE_REASON.contains(&action)
+    {
         return Err(not_authorized(&principal, action, named_as, &reason));
     }
     Err(not_authorized_with_details(
@@ -665,6 +685,22 @@ pub fn authorize_written(
         &authorization_id(ctx, &principal, action, resource),
     ))
 }
+
+/// The actions whose refusal of a WITHHELD call ends at the reason, carrying no pointer at
+/// the authorization details of the evaluation.
+///
+/// The pointer is not part of every action's refusal: AWS words the withheld-grant refusal
+/// of the actions named here as the sentence alone, and of the others as that sentence
+/// continued by the pointer ([`not_authorized_with_details`]). Which of the two an action
+/// carries is a fact about THAT action — nothing about the caller, the resource, the
+/// Region or the request selects it — so it is recorded per action here and nowhere else,
+/// and `tests/all/access_denied_message_wording.rs` is the table that reads both wordings
+/// back.
+///
+/// SOURCE, for adding an entry: the message AWS answers that action's withheld call with.
+/// An action nobody has that message for is simply absent from this list, which is why the
+/// list is short rather than one entry per action.
+const ENDS_AT_THE_REASON: &[&str] = &[UNTAG_POLICY, LIST_POLICIES_GRANTING_SERVICE_ACCESS];
 
 /// Where the authorization details of ONE refused request are read: the console page for
 /// an authorization id.

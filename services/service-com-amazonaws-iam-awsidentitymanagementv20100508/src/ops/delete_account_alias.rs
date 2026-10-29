@@ -159,7 +159,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteAccountAliasErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -169,6 +168,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies
+        // are evaluated before the alias is removed. This request addresses the
+        // account's own configuration rather than one entity in it, so the decision is
+        // made on the account-wide resource
+        // ([`crate::state::authorization::ACCOUNT_WIDE_RESOURCE`]).
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::DELETE_ACCOUNT_ALIAS,
+            crate::state::authorization::ACCOUNT_WIDE_RESOURCE,
+        )?;
 
         // This deletes "the SPECIFIED account alias", so an alias the account does
         // not hold — including the case where it holds none at all — references no
