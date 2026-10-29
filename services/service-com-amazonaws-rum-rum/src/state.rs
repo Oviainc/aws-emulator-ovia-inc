@@ -483,6 +483,24 @@ pub struct StoredRumEvent {
 /// optional `DestinationArn` — so it is the key the destinations map is held under.
 pub type MetricDestinationKey = (String, String);
 
+/// The text an optional string member declares, with an absent, empty or whitespace-only
+/// value all read as "nothing declared".
+///
+/// ONE reading of an optional string member of the metrics calls of this service, shared by
+/// the rules that JUDGE a request and by the canonical form the request is STORED in, so the
+/// two cannot disagree about which requests carry the same value: a member a rule read as
+/// naming nothing must not be stored as naming something, or two spellings of "nothing"
+/// become two resources. Surrounding whitespace is not part of a value a request names
+/// something by, and a value with nothing left names nothing at all — exactly what leaving
+/// the member out names.
+///
+/// Used for the optional members a value naming nothing can actually reach a handler
+/// through: `DestinationArn`, `IamRoleArn` ([`declared_arn`]) and
+/// `MetricDefinitionRequest$EventPattern`, which is modelled `@length(min: 0, max: 4000)`.
+pub fn declared_text(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|text| !text.is_empty())
+}
+
 /// The ARN a request declares, with an absent, empty or whitespace-only value all read
 /// as "no ARN".
 ///
@@ -499,9 +517,10 @@ pub type MetricDestinationKey = (String, String);
 /// `IamRoleArn` carries no length bound at all, so a value with whitespace around the ARN
 /// reaches a handler. Whatever spelling arrives, the ARN is what is left once that
 /// whitespace is gone, and a value with nothing left names no experiment and no role: it
-/// is the same input as an absent one, and must not become a second destination.
+/// is the same input as an absent one, and must not become a second destination. That is
+/// [`declared_text`], the one reading this service applies to such a member.
 pub fn declared_arn(arn: Option<&str>) -> Option<&str> {
-    arn.map(str::trim).filter(|arn| !arn.is_empty())
+    declared_text(arn)
 }
 
 /// The [`MetricDestinationKey`] for `destination` and `destination_arn`, with an absent
@@ -601,18 +620,36 @@ impl MetricDefinitionRecord {
     /// a definition written by either carries exactly the same members — and so an update
     /// REPLACES the whole definition under the id it keeps (`UpdateRumMetricDefinition`
     /// takes "the new definition that you want to use for this metric", not a patch).
+    ///
+    /// It is also the CANONICAL form a definition's identity is judged in
+    /// ([`Self::defines`], [`Self::same_definition`]), so a member whose value declares
+    /// NOTHING is held exactly as an absent one: the `EventPattern` through
+    /// [`declared_text`], the reading [`metric_definition_refusal`] judges that member by,
+    /// and a `DimensionKeys` map with no entry as no map, which is what the rules that read
+    /// it already treat it as. Otherwise two spellings of "nothing" that the rules admit as
+    /// the SAME definition would be stored as two, each taking another slot of the
+    /// destination's capacity and needing its own delete.
+    ///
+    /// The remaining optional members are kept exactly as the request carried them: a value
+    /// declaring nothing cannot reach a handler through them, because `ValueKey`,
+    /// `UnitLabel` and `Namespace` are each modelled `@length(min: 1, …)` — a value that
+    /// is left is a value that names something, whatever it spells.
     pub fn from_request(metric_definition_id: &str, request: &MetricDefinitionRequest) -> Self {
         Self {
             metric_definition_id: metric_definition_id.to_string(),
             name: request.name.clone(),
             value_key: request.value_key.clone(),
             unit_label: request.unit_label.clone(),
-            dimension_keys: request.dimension_keys.as_ref().map(|keys| {
-                keys.iter()
-                    .map(|(field, dimension)| (field.clone(), dimension.clone()))
-                    .collect()
-            }),
-            event_pattern: request.event_pattern.clone(),
+            dimension_keys: request
+                .dimension_keys
+                .as_ref()
+                .filter(|keys| !keys.is_empty())
+                .map(|keys| {
+                    keys.iter()
+                        .map(|(field, dimension)| (field.clone(), dimension.clone()))
+                        .collect()
+                }),
+            event_pattern: declared_text(request.event_pattern.as_deref()).map(str::to_string),
             namespace: request.namespace.clone(),
         }
     }
@@ -1855,13 +1892,11 @@ pub fn metric_definition_refusal(definition: &MetricDefinitionRequest) -> Option
         }
     }
 
-    // An empty `EventPattern` is the same input as an absent one: the member is modelled
-    // `@length(min: 0, max: 4000)`, so the empty string reaches here and names no event.
-    let declared = definition
-        .event_pattern
-        .as_deref()
-        .map(str::trim)
-        .filter(|pattern| !pattern.is_empty());
+    // The pattern this definition declares, read through [`declared_text`] — the ONE
+    // reading of the member, which the canonical stored form applies too, so a request
+    // admitted here as naming no event is also STORED as naming none. The member is
+    // modelled `@length(min: 0, max: 4000)`, so a value naming nothing reaches here.
+    let declared = declared_text(definition.event_pattern.as_deref());
     let pattern = match declared {
         Some(text) => match ::serde_json::from_str::<::serde_json::Value>(text) {
             Ok(parsed) if parsed.is_object() => Some(parsed),

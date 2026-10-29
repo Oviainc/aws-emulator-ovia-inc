@@ -384,6 +384,147 @@ pub(crate) async fn all_metric_definitions(
     collected
 }
 
+/// `BatchCreateRumMetricDefinitions`: `POST /rummetrics/{AppMonitorName}/metrics`, naming
+/// one destination and carrying `definitions`.
+pub(crate) async fn batch_create_metric_definitions(
+    router: &MultiServiceRouter,
+    monitor: &str,
+    destination: &str,
+    destination_arn: Option<&str>,
+    definitions: &[Value],
+) -> Reply {
+    let mut body = json!({
+        "Destination": destination,
+        "MetricDefinitions": Value::Array(definitions.to_vec()),
+    });
+    if let Some(arn) = destination_arn {
+        body["DestinationArn"] = json!(arn);
+    }
+    call(
+        router,
+        "POST",
+        &format!("/rummetrics/{monitor}/metrics"),
+        Some(body),
+    )
+    .await
+}
+
+/// The definitions an accepted `BatchCreateRumMetricDefinitions` reported, asserting it
+/// refused none of them: a 200 whose `Errors` is the empty list the `@required` member
+/// carries when nothing was refused.
+pub(crate) async fn created_metric_definitions(
+    router: &MultiServiceRouter,
+    case: &str,
+    monitor: &str,
+    destination: &str,
+    destination_arn: Option<&str>,
+    definitions: &[Value],
+) -> Vec<Value> {
+    let reply =
+        batch_create_metric_definitions(router, monitor, destination, destination_arn, definitions)
+            .await;
+    assert_eq!(
+        reply.status,
+        200,
+        "case {case:?}: expected BatchCreateRumMetricDefinitions to answer 200, got {} {:?}",
+        reply.status,
+        String::from_utf8_lossy(&reply.body)
+    );
+    let answered = reply.json(case);
+    assert_eq!(
+        answered["Errors"],
+        json!([]),
+        "case {case:?}: expected no per-definition errors, got {:?}",
+        answered["Errors"]
+    );
+    reported_metric_definitions(&answered)
+}
+
+/// `UpdateRumMetricDefinition`: `PATCH /rummetrics/{AppMonitorName}/metrics`, asserting the
+/// answer the model declares — a 200 whose body carries no member, since
+/// `UpdateRumMetricDefinitionResponse` models none.
+pub(crate) async fn update_metric_definition(
+    router: &MultiServiceRouter,
+    case: &str,
+    monitor: &str,
+    destination: &str,
+    destination_arn: Option<&str>,
+    metric_definition_id: &str,
+    definition: &Value,
+) {
+    let mut body = json!({
+        "Destination": destination,
+        "MetricDefinitionId": metric_definition_id,
+        "MetricDefinition": definition.clone(),
+    });
+    if let Some(arn) = destination_arn {
+        body["DestinationArn"] = json!(arn);
+    }
+    let reply = call(
+        router,
+        "PATCH",
+        &format!("/rummetrics/{monitor}/metrics"),
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        reply.status,
+        200,
+        "case {case:?}: expected UpdateRumMetricDefinition to answer 200, got {} {:?}",
+        reply.status,
+        String::from_utf8_lossy(&reply.body)
+    );
+    let body = String::from_utf8_lossy(&reply.body).into_owned();
+    assert!(
+        body.is_empty() || body == "{}",
+        "case {case:?}: expected the update's body to carry no member, got {body:?}"
+    );
+}
+
+/// The members a `MetricDefinitionRequest` carries, which are also the members the
+/// `MetricDefinition` a read reports carries beside its id — so a case can assert on the
+/// WHOLE definition rather than on the member it varies.
+/// Source: `smithy_query(query="shape", shape="MetricDefinitionRequest,MetricDefinition")`.
+pub(crate) const METRIC_DEFINITION_MEMBERS: [&str; 6] = [
+    "Name",
+    "ValueKey",
+    "UnitLabel",
+    "DimensionKeys",
+    "EventPattern",
+    "Namespace",
+];
+
+/// Assert `reported` is the definition `expected` spells, under the id `id`: every member
+/// that definition carries reported with its value, and every member it leaves out absent
+/// (restJson1 draws no distinction between an absent member and a null one, so an omitted
+/// member reads as `Null` either way).
+pub(crate) fn assert_metric_definition(case: &str, reported: &Value, expected: &Value, id: &str) {
+    assert_eq!(
+        reported["MetricDefinitionId"].as_str(),
+        Some(id),
+        "case {case:?}: expected the definition to be reported under {id:?}, got {reported}"
+    );
+    for member in METRIC_DEFINITION_MEMBERS {
+        let wanted = expected.get(member).cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            reported[member], wanted,
+            "case {case:?}: expected {member} to be {wanted:?}, got {:?}",
+            reported[member]
+        );
+    }
+}
+
+/// `definition` with `member` left out entirely, for a case whose rows differ in which
+/// member a definition carries at all.
+pub(crate) fn metric_definition_without(definition: &Value, member: &str) -> Value {
+    let mut stripped = definition.clone();
+    stripped
+        .as_object_mut()
+        .expect("a metric definition is a JSON object")
+        .remove(member);
+    stripped
+}
+
 /// The `AppMonitor` structure `GetAppMonitor` reports for `name`.
 pub(crate) async fn get_app_monitor(router: &MultiServiceRouter, case: &str, name: &str) -> Value {
     let reply = call(router, "GET", &format!("/appmonitor/{name}"), None).await;
