@@ -79,7 +79,7 @@ async fn given_transformer(router: &MultiServiceRouter, name: &str) -> (String, 
         json!({ "name": name, "inputConversion": { "fromFormat": "X12" } }),
     )
     .await;
-    assert_eq!(status, 201, "CreateTransformer({name}) failed: {body}");
+    assert_eq!(status, 200, "CreateTransformer({name}) failed: {body}");
     (text(&body, "transformerId"), text(&body, "transformerArn"))
 }
 
@@ -466,7 +466,7 @@ async fn a_create_refused_for_mixing_member_styles_leaves_its_client_token_free(
         accepted[*replacement] = replacement_value.clone();
         let (status, body) = call(&router, "CreateTransformer", accepted).await;
         assert_eq!(
-            status, 201,
+            status, 200,
             "case {case:?}: expected the token to be free after the refusal, got {status} {body}"
         );
         assert!(
@@ -525,7 +525,7 @@ async fn one_client_token_yields_one_transformer_however_many_calls_race() {
     let mut lost = 0usize;
     for (index, (status, body)) in racers.iter().enumerate() {
         match status {
-            201 => minted.push(text(body, "transformerId")),
+            200 => minted.push(text(body, "transformerId")),
             409 => {
                 lost += 1;
                 assert_eq!(
@@ -535,7 +535,7 @@ async fn one_client_token_yields_one_transformer_however_many_calls_race() {
                      ConflictException, got {body}"
                 );
             }
-            other => panic!("case racer {index}: expected 201 or 409, got {other} {body}"),
+            other => panic!("case racer {index}: expected 200 or 409, got {other} {body}"),
         }
     }
     assert_eq!(
@@ -557,7 +557,7 @@ async fn one_client_token_yields_one_transformer_however_many_calls_race() {
     // A replay once that create has settled answers with that same transformer.
     tokio::time::sleep(IDEMPOTENT_CREATE_IN_FLIGHT).await;
     let (status, body) = call(&router, "CreateTransformer", request.clone()).await;
-    assert_eq!(status, 201, "case replay: expected 201, got {status} {body}");
+    assert_eq!(status, 200, "case replay: expected 200, got {status} {body}");
     assert_eq!(
         text(&body, "transformerId"),
         first,
@@ -585,7 +585,7 @@ async fn one_client_token_yields_one_transformer_however_many_calls_race() {
     let mut reordered = request.clone();
     reordered["tags"] = tags_json(&[("team", "edi"), ("env", "test")]);
     let (status, body) = call(&router, "CreateTransformer", reordered).await;
-    assert_eq!(status, 201, "case reordered tags: expected 201, got {status} {body}");
+    assert_eq!(status, 200, "case reordered tags: expected 200, got {status} {body}");
     assert_eq!(
         text(&body, "transformerId"),
         first,
@@ -633,7 +633,7 @@ async fn one_client_token_yields_one_transformer_however_many_calls_race() {
     let mut other_token = request.clone();
     other_token["clientToken"] = json!("another-token");
     let (status, body) = call(&router, "CreateTransformer", other_token).await;
-    assert_eq!(status, 201, "case another token: expected 201, got {status} {body}");
+    assert_eq!(status, 200, "case another token: expected 200, got {status} {body}");
     assert_ne!(
         text(&body, "transformerId"),
         first,
@@ -646,7 +646,7 @@ async fn one_client_token_yields_one_transformer_however_many_calls_race() {
         .expect("the request is an object")
         .remove("clientToken");
     let (status, body) = call(&router, "CreateTransformer", no_token).await;
-    assert_eq!(status, 201, "case no token: expected 201, got {status} {body}");
+    assert_eq!(status, 200, "case no token: expected 200, got {status} {body}");
     assert_ne!(
         text(&body, "transformerId"),
         first,

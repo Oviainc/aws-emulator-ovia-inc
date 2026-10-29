@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(|_| {
             ListCapabilitiesErrorModeled::ValidationException(ValidationException {
-                message: "nextToken is not a valid pagination token".to_string(),
+                message: crate::state::INVALID_PAGE_TOKEN_MESSAGE.to_string(),
             })
         })?;
 

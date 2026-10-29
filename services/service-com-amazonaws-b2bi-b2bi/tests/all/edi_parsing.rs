@@ -219,7 +219,7 @@ async fn one_reader_answers_for_every_operation_that_reads_an_edi_document() {
         match business_value {
             Some(value) => {
                 assert_eq!(
-                    parse_status, 201,
+                    parse_status, 200,
                     "case {case:?}: TestParsing must parse the file, got {parse_status} \
                      {parsed}"
                 );

@@ -29,8 +29,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::onboarding_loop::{b2bi_router, call, error_code};
 
-/// `TestMapping`'s modelled success status (`@http` code 201 on the operation).
-const MAPPED_STATUS: u16 = 201;
+/// `TestMapping`'s success status: awsJson1_0 is an RPC protocol, so the `@http` code the
+/// model puts on the operation (201) is inert on the wire and a success is 200.
+const MAPPED_STATUS: u16 = 200;
 
 /// Serialises the suites below whose requests occupy an evaluation slot for a long time.
 ///
@@ -1021,12 +1022,13 @@ async fn mapping_is_repeatable_and_persists_nothing() {
         first, second,
         "the same request must map to the same document, got {first} then {second}"
     );
-    // Byte-identical, not merely equivalent: the mapped object's members are written in
-    // sorted key order, so the answer does not depend on the interpreter's hash order.
+    // Byte-identical, not merely equivalent: the mapped document is written as text with
+    // every object's members in sorted key order, so the answer does not depend on the
+    // interpreter's hash order.
     assert_eq!(
         first["mappedFileContent"].as_str(),
-        Some(r#"{"count":2,"total":7}"#),
-        "expected the canonical, key-sorted mapping, got {first}"
+        Some("{\n  \"count\": 2,\n  \"total\": 7\n}"),
+        "expected the mapped document as pretty-printed, key-sorted text, got {first}"
     );
     assert!(
         same_json(&mapped_document(&first), &json!({"total": 7, "count": 2})),
@@ -1159,7 +1161,7 @@ async fn an_evaluation_past_the_memory_ceiling_is_refused_by_the_allocator() {
 
 /// Fuzzing the evaluator's two untrusted inputs: whatever bytes arrive as a
 /// `mappingTemplate` or an `inputFileContent`, the operation ANSWERS — a mapped document
-/// (201), a refusal this emulator models (400), or the 501 for a template it reads as
+/// (200), a refusal this emulator models (400), or the 501 for a template it reads as
 /// XSLT or whose construct it will not evaluate — and never a 5xx, never a hang, and
 /// never a process that stops serving.
 ///
@@ -1505,7 +1507,7 @@ async fn the_string_building_constructs_are_evaluated_and_the_unboundable_ones_r
     // This table is also the guard on HOW that decision is made: the handler reads the
     // engine's own parse through its `Debug` rendering, which is not a stability contract,
     // so an interpreter upgrade that reshapes one of those nodes turns a row here from the
-    // 501 into a mapped 201 and fails the build instead of silently evaluating the step
+    // 501 into a mapped 200 and fails the build instead of silently evaluating the step
     // the handler says it cannot bound.
     let refused: &[(&str, &str, &str)] = &[
         (

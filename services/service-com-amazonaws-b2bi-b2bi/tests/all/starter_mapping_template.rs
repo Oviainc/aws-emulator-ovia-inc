@@ -18,9 +18,9 @@
 
 use quick_xml::events::Event;
 use serde_json::{json, Value};
-// `PLACEHOLDER_PREFIX` is the handler's own constant, so this test cannot drift from the
-// wording it asserts on; `MAPPING_TYPE_VALUES` is the model's own member list.
-use service_com_amazonaws_b2bi_b2bi::ops::create_starter_mapping_template::PLACEHOLDER_PREFIX;
+// `PLACEHOLDER` is the handler's own constant, so this test cannot drift from the value
+// it asserts on; `MAPPING_TYPE_VALUES` is the model's own member list.
+use service_com_amazonaws_b2bi_b2bi::ops::create_starter_mapping_template::PLACEHOLDER;
 use service_com_amazonaws_b2bi_b2bi::ops::types::MAPPING_TYPE_VALUES;
 
 // The wire harness this test target shares: one b2bi service on one shared engine, a
@@ -255,8 +255,8 @@ async fn starter_template_carries_the_values_the_request_determines() {
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
-            assert!(
-                sender.starts_with(PLACEHOLDER_PREFIX),
+            assert_eq!(
+                sender, PLACEHOLDER,
                 "case {case:?}: ISA06 must be a placeholder, got {sender:?}"
             );
         } else {
@@ -309,9 +309,9 @@ async fn starter_template_carries_the_values_the_request_determines() {
                 "case {case:?}: ISA11 must be <{isa11}> at this version, got {:?}",
                 elements.iter().map(|(name, _)| name).collect::<Vec<_>>()
             );
-            assert!(
-                xml_text(case, &elements, "ISA_06_InterchangeSenderId")
-                    .starts_with(PLACEHOLDER_PREFIX),
+            assert_eq!(
+                xml_text(case, &elements, "ISA_06_InterchangeSenderId"),
+                PLACEHOLDER,
                 "case {case:?}: ISA06 must be a placeholder, got {:?}",
                 xml_text(case, &elements, "ISA_06_InterchangeSenderId")
             );
@@ -369,15 +369,21 @@ async fn a_template_carries_the_transaction_sets_beginning_segment() {
 
         match segment {
             Some(id) => {
-                let first = format!("{id}_01");
-                assert!(
-                    keys.contains(&first),
-                    "case {case:?}: the template must open the transaction with {id}, got {keys:?}"
+                // The body segments sit in the transaction's `segments` list, each one an
+                // object carrying its `segment_id` and its elements keyed by position —
+                // the shape the X12 reader builds for a parsed document.
+                let body_segment = &transaction["segments"][0];
+                assert_eq!(
+                    body_segment["segment_id"].as_str(),
+                    Some(id),
+                    "case {case:?}: the template must open the transaction's body with {id}, \
+                     got {transaction:?}"
                 );
-                let value = transaction[&first].as_str().unwrap_or_default();
-                assert!(
-                    value.starts_with(PLACEHOLDER_PREFIX),
-                    "case {case:?}: {first} must be a placeholder, got {value:?}"
+                let first = format!("{id}_01");
+                assert_eq!(
+                    body_segment[&first].as_str(),
+                    Some(PLACEHOLDER),
+                    "case {case:?}: {first} must be a placeholder, got {body_segment:?}"
                 );
             }
             None => assert!(
@@ -559,9 +565,9 @@ async fn a_template_generated_from_a_sample_carries_the_samples_own_values() {
             "case {case:?}: the business field {field} must become {marker:?}, got {template}"
         );
         assert!(
-            !template.contains(PLACEHOLDER_PREFIX),
+            !template.contains(&format!("\"{PLACEHOLDER}\"")),
             "case {case:?}: a sample-derived template carries the sample's values, not the \
-             placeholders of a template generated without one, got {template}"
+             bare placeholders of a template generated without one, got {template}"
         );
     }
 }

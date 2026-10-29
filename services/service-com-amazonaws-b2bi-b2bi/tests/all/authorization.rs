@@ -183,9 +183,9 @@ async fn an_explicit_deny_refuses_the_action_and_lifting_it_restores_access() {
     // Each row: the case, the policy the role carries, the expected status, and how many
     // profiles the account must hold afterwards.
     let cases: Vec<(&str, &Value, u16, usize)> = vec![
-        ("an Allow-only policy", &allowed, 201, 1),
+        ("an Allow-only policy", &allowed, 200, 1),
         ("an explicit Deny added", &denied, 403, 1),
-        ("the Deny removed again", &allowed, 201, 2),
+        ("the Deny removed again", &allowed, 200, 2),
     ];
 
     for (case, policy, expected, profiles) in cases {
@@ -244,7 +244,7 @@ async fn a_request_is_authorized_against_the_roles_identity_policies() {
         create_profile(),
     )
     .await;
-    assert_eq!(status, 201, "the profile must be created, got {status} {created}");
+    assert_eq!(status, 200, "the profile must be created, got {status} {created}");
     let profile_id = created["profileId"].as_str().unwrap_or_default().to_string();
     let profile_arn = created["profileArn"].as_str().unwrap_or_default().to_string();
 
@@ -575,7 +575,7 @@ async fn an_attachment_this_emulator_cannot_read_is_served_rather_than_refused()
             "an AWS-managed policy, whose document AWS owns",
             "arn:aws:iam::aws:policy/AmazonB2BIFullAccess",
             None,
-            201,
+            200,
         ),
         (
             "…and an explicit Deny this emulator can read still refuses",
@@ -629,7 +629,7 @@ async fn a_request_that_names_no_session_is_served_as_the_ambient_identity() {
     // …which says nothing about a request that does not speak for that role.
     let (status, created) = call(&emulator.router, "CreateProfile", create_profile()).await;
     assert_eq!(
-        status, 201,
+        status, 200,
         "the ambient identity must be served, got {status} {created}"
     );
 

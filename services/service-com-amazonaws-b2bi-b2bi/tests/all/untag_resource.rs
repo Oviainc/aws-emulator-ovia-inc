@@ -298,7 +298,7 @@ async fn untag_resource_refuses_an_arn_it_cannot_resolve() {
         }),
     )
     .await;
-    assert_eq!(status, 201, "CreateProfile(doomed) failed: {created}");
+    assert_eq!(status, 200, "CreateProfile(doomed) failed: {created}");
     let doomed_arn = text(&created, "profileArn");
     let doomed_id = text(&created, "profileId");
     let (status, body) = call(&router, "DeleteProfile", json!({ "profileId": doomed_id })).await;

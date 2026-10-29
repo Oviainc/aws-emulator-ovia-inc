@@ -407,7 +407,7 @@ async fn a_well_formed_arn_naming_nothing_stored_is_refused_and_writes_nothing()
         }),
     )
     .await;
-    assert_eq!(status, 201, "CreateProfile(doomed) failed: {created}");
+    assert_eq!(status, 200, "CreateProfile(doomed) failed: {created}");
     let doomed_arn = text(&created, "profileArn");
     let doomed_id = text(&created, "profileId");
     let (status, body) = call(&router, "DeleteProfile", json!({ "profileId": doomed_id })).await;
@@ -501,7 +501,7 @@ async fn tags_are_written_to_the_arn_whatever_region_the_write_is_signed_for() {
         }),
     )
     .await;
-    assert_eq!(status, 201, "CreateProfile failed: {created}");
+    assert_eq!(status, 200, "CreateProfile failed: {created}");
     let arn = text(&created, "profileArn");
     assert!(
         arn.contains("eu-central-1"),

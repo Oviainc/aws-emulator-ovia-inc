@@ -186,7 +186,7 @@ async fn a_created_transformer_round_trips_every_persisted_member() {
         let (status, created) =
             call_signed_for(&router, region, "CreateTransformer", request.clone()).await;
         assert_eq!(
-            status, 201,
+            status, 200,
             "case {case:?}: CreateTransformer must succeed, got {status} {created}"
         );
 
@@ -360,7 +360,7 @@ async fn mixing_the_deprecated_and_current_configuration_members_is_refused() {
     )
     .await;
     assert_eq!(
-        status, 201,
+        status, 200,
         "a single-style create reusing the refused token must succeed, got {status} {created}"
     );
     assert!(
@@ -412,7 +412,7 @@ async fn repeating_a_create_with_the_same_client_token_returns_the_same_transfor
 
         let (status, first) = call(&router, "CreateTransformer", request("token-alpha")).await;
         assert_eq!(
-            status, 201,
+            status, 200,
             "case {case:?}: the first create must succeed, got {status} {first}"
         );
         let first_id = text(&first, "transformerId");
@@ -435,7 +435,7 @@ async fn repeating_a_create_with_the_same_client_token_returns_the_same_transfor
         for replay_index in 0..*replays {
             let (status, replay) = call(&router, "CreateTransformer", request("token-alpha")).await;
             assert_eq!(
-                status, 201,
+                status, 200,
                 "case {case:?}: replay #{replay_index} must succeed, got {status} {replay}"
             );
             for member in ["transformerId", "transformerArn", "createdAt", "status"] {
@@ -450,7 +450,7 @@ async fn repeating_a_create_with_the_same_client_token_returns_the_same_transfor
 
         let (status, other) = call(&router, "CreateTransformer", request("token-beta")).await;
         assert_eq!(
-            status, 201,
+            status, 200,
             "case {case:?}: a different token must mint a new transformer, got {status} {other}"
         );
         let other_id = text(&other, "transformerId");
@@ -495,7 +495,7 @@ async fn getting_an_unknown_transformer_is_a_404() {
     )
     .await;
     assert_eq!(
-        status, 201,
+        status, 200,
         "the capability this test borrows an id from must be created, got {status} {created}"
     );
     let capability_id = text(&created, "capabilityId");
@@ -553,7 +553,7 @@ async fn creating_a_transformer_is_refused_once_the_store_is_at_the_residency_bo
     for index in 0..bound {
         let (status, response) = call(&router, "CreateTransformer", request(index)).await;
         assert_eq!(
-            status, 201,
+            status, 200,
             "create #{index} below the {bound}-record bound must succeed, got {status} {response}"
         );
     }

@@ -244,7 +244,10 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
 
 /// The member a parsed body segment carries its X12 segment id in, so a segment that
 /// carries no element at all is still identified by the document.
-const SEGMENT_ID_KEY: &str = "segment_id";
+///
+/// Shared with `CreateStarterMappingTemplate`, whose generated template describes the very
+/// document this reader builds.
+pub(crate) const SEGMENT_ID_KEY: &str = "segment_id";
 
 /// The most split files one request is answered with.
 ///
@@ -367,10 +370,9 @@ pub(crate) const FUNCTIONAL_GROUP_ITEM: &str = "functional_group";
 /// …for the transaction sets inside a functional group.
 pub(crate) const TRANSACTIONS_KEY: &str = "transactions";
 pub(crate) const TRANSACTION_ITEM: &str = "transaction";
-/// …and for the body segments of a transaction set, which only a PARSED document carries
-/// (a starter template generates the beginning segment of its transaction set instead).
-const SEGMENTS_KEY: &str = "segments";
-const SEGMENT_ITEM: &str = "segment";
+/// …and for the body segments of a transaction set.
+pub(crate) const SEGMENTS_KEY: &str = "segments";
+pub(crate) const SEGMENT_ITEM: &str = "segment";
 
 /// [`ISA_ELEMENTS`] with position 11 named for `release`.
 pub(crate) fn isa_element_names(release: u32) -> Vec<&'static str> {
@@ -1476,7 +1478,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TestParsing";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TEST_PARSING_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TEST_PARSING_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 201u16;
+    // awsJson1_0 is an RPC protocol, so the `@http` code the model puts on this operation
+    // (201) is inert on the wire and a success is 200.
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,

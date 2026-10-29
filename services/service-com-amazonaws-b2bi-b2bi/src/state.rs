@@ -838,6 +838,15 @@ const MAX_RANDOM_HEX_DIGITS: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidPageToken;
 
+/// The `ValidationException` message every paginated operation of this service refuses an
+/// unusable `nextToken` with.
+///
+/// Fixed text: it names neither the member nor the token the caller sent, so a client that
+/// tells an expired or garbage cursor apart from another `ValidationException` by the
+/// message reads the same sentence from every one of them. Declared here, beside
+/// [`paginate`], so the paginated operations cannot drift apart in how they word it.
+pub const INVALID_PAGE_TOKEN_MESSAGE: &str = "Invalid pagination token";
+
 /// The opaque `nextToken` that resumes an enumeration at `id`.
 fn encode_page_token(id: &str) -> String {
     ::hex::encode(id)

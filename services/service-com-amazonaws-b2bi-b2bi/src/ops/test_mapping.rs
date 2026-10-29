@@ -142,11 +142,15 @@
 //!   document declared `fileFormat XML` are answered with the 501 that names that missing
 //!   engine — neither of which AWS answers for those inputs. What AWS does there is map
 //!   the document; nothing else about that path is asserted here;
-//! * `mappedFileContent` is canonicalised (every object's members in sorted key order,
-//!   see [`canonical_json`]), because the interpreter's own member order varies between
-//!   evaluations. The real service answers the order its mapping produced, so a test
-//!   written to run against AWS as well should compare `mappedFileContent` as PARSED
-//!   JSON rather than as a byte string;
+//! * `mappedFileContent` is modelled as a plain `String` and carries the mapped DOCUMENT,
+//!   so it is that document rendered to TEXT: pretty-printed with two-space indentation
+//!   (see [`mapped_document_text`]), with every object's members in SORTED key order. That
+//!   last part is a known divergence, not a rule: the real service writes a mapped object's
+//!   members in the order its mapping constructed them, and nothing here can reproduce that
+//!   order — the interpreter holds an object's members in a hash map, so its own order
+//!   varies between evaluations, and it exposes no typed view of the parsed template to
+//!   read the construction order from. A test written to run against AWS as well should
+//!   compare `mappedFileContent` as PARSED JSON rather than as a byte string;
 //! * a template using a regular-expression literal, `$distinct` or `$pad` is answered
 //!   with the 501 that names the construct this emulator does not evaluate instead of
 //!   mapped ([`unbounded_construct`] gives the bound each one lacks, and the measured
@@ -171,12 +175,12 @@
 //!   ([`crate::state::authorize`], against [`crate::state::ANY_RESOURCE`] because a
 //!   mapping dry run addresses no resource ARN), so an explicit `Deny` on
 //!   `b2bi:TestMapping` refuses the call and nothing is evaluated;
-//! * a mapped answer carries HTTP 201, which is the `@http` code the model puts on this
-//!   operation and the status the scaffold generated for it (`SUCCESS_STATUS`), kept so
-//!   every implemented operation in this crate answers the code its model declares. B2BI
-//!   speaks awsJson1_0, where `@http` is inert on the wire, so the real service answers
-//!   200: this is a deliberate, crate-wide convention rather than an oversight, and a
-//!   test that asserts the status is asserting this emulator's choice;
+//! * a mapped answer carries HTTP 200. The model puts an `@http` code of 201 on this
+//!   operation, but B2BI speaks awsJson1_0, an RPC protocol on which the `@http` bindings
+//!   are inert — the model reports them so
+//!   (`smithy_query(query="operation",operation="TestMapping")`: `httpBindingsInert`) —
+//!   and a success on that protocol is 200, which is what every operation of this service
+//!   answers;
 //! * a zero-length `inputFileContent` is mapped as "no input document" (the template is
 //!   evaluated with no context) rather than refused. The model allows `len 0..5000000`,
 //!   but the real service downloads a file and passes its contents in, so what it answers
@@ -767,26 +771,42 @@ fn ceiling_not_implemented(detail: String) -> TestMappingError {
     })
 }
 
-/// `mappedFileContent` for an evaluated result, serialized canonically.
+/// `mappedFileContent` for an evaluated result: the mapped document as the TEXT a caller
+/// reads.
 ///
-/// The interpreter holds an object's members in a hash map, so ITS serialization orders
-/// them differently from one evaluation to the next. The same request has to answer the
-/// same document, so the result is re-serialized with every object's members in sorted
-/// key order. The sort is explicit because `serde_json::Map` keeps insertion order
-/// whenever anything in the build turns on the crate's `preserve_order` feature.
+/// The member is modelled as a plain `String` and what it carries is the mapped DOCUMENT,
+/// so the answer is that document rendered to text — pretty-printed with two-space
+/// indentation and a space after each member's colon, the layout the recorded answer
+/// carries. (The generated mapping TEMPLATE, which `CreateStarterMappingTemplate` writes
+/// with its own generator, is recorded with a space on BOTH sides of that colon instead,
+/// so the two layouts are kept apart in [`crate::state::documents::to_document_text`].)
+///
+/// Every object's members are written in sorted key order. That is NOT the order the real
+/// service answers — it writes the members in the order the mapping constructed them — and
+/// this emulator cannot reproduce that order: the interpreter holds an object's members in
+/// a hash map, so its own order varies between evaluations, and `jsonata-rs` declares the
+/// parsed expression's `mod parser` privately, so there is no typed view of the template's
+/// construction order to take it from either. Sorting is what keeps the same request
+/// answering the same text; the member ORDER is a known divergence rather than a rule this
+/// handler implements.
 ///
 /// Two results are passed through unchanged: the empty string the interpreter writes
 /// for an expression with no value, and anything the JSON reader will not take back
 /// (a result nested past its recursion limit) — answered as the interpreter wrote it
 /// rather than refused.
-fn canonical_json(serialized: String) -> String {
+fn mapped_document_text(serialized: String) -> String {
     match ::serde_json::from_str::<::serde_json::Value>(&serialized) {
-        Ok(parsed) => ::serde_json::to_string(&with_sorted_members(parsed)).unwrap_or(serialized),
+        Ok(parsed) => {
+            ::serde_json::to_string_pretty(&with_sorted_members(parsed)).unwrap_or(serialized)
+        }
         Err(_) => serialized,
     }
 }
 
 /// `value` with every object's members in sorted key order.
+///
+/// The sort is explicit because `serde_json::Map` keeps insertion order whenever anything
+/// in the build turns on the crate's `preserve_order` feature.
 fn with_sorted_members(value: ::serde_json::Value) -> ::serde_json::Value {
     match value {
         ::serde_json::Value::Array(items) => {
@@ -833,16 +853,21 @@ fn server_fault(message: &str) -> TestMappingError {
     .into()
 }
 
-/// Whether serializing `value` fits in `budget` bytes, walking the result and stopping
-/// the moment it would not.
+/// Whether the ANSWERED document for `value` fits in `budget` bytes, walking the result
+/// and stopping the moment it would not.
 ///
 /// The ceiling on the answered document has to be decided BEFORE the document exists:
 /// [`::jsonata_rs::Value::serialize`] builds it as a `String` on the global heap, which
 /// the arena's allocation limit does not govern, and the interpreter holds values behind
 /// arena references — so a template that aliases one value into many places has a small
-/// arena footprint and a large serialization. This charges `budget` the way the
-/// interpreter's serializer writes bytes, so an oversized result is refused before any of
-/// those bytes are allocated.
+/// arena footprint and a large serialization. This charges `budget` the way the answer is
+/// written, so an oversized result is refused before any of those bytes are allocated.
+///
+/// `indent` is the level this value sits at, because the answer is the PRETTY rendering
+/// ([`mapped_document_text`]): each member of a container costs a newline and two spaces
+/// per level on top of what the compact form costs, which is the part of the answer a
+/// deeply nested result grows fastest in and therefore the part that may not go
+/// uncharged.
 ///
 /// The walk is bounded by the ceiling it enforces: every node charges at least one byte,
 /// so it visits at most `budget` nodes, and it refuses past `depth` levels of nesting
@@ -851,6 +876,7 @@ fn fits_mapped_ceiling<'a>(
     value: &'a ::jsonata_rs::Value<'a>,
     budget: &mut usize,
     depth: usize,
+    indent: usize,
 ) -> bool {
     /// Charge `bytes` against the remaining budget.
     fn charge(budget: &mut usize, bytes: usize) -> bool {
@@ -924,30 +950,40 @@ fn fits_mapped_ceiling<'a>(
         return charge(budget, quoted_len(&value.as_str()));
     }
     if value.is_array() {
-        // The brackets, then a comma and the member for each element.
+        // The brackets, then for each element a comma, the newline and the indentation
+        // the answer is written with, and the element itself.
         if !charge(budget, 2) {
             return false;
         }
+        let mut members = 0usize;
         for member in value.members() {
-            if !charge(budget, 1) || !fits_mapped_ceiling(member, budget, depth - 1) {
+            members += 1;
+            if !charge(budget, 1 + 1 + 2 * (indent + 1))
+                || !fits_mapped_ceiling(member, budget, depth - 1, indent + 1)
+            {
                 return false;
             }
         }
-        return true;
+        // The newline and indentation before the closing bracket, which a container with
+        // no members is written without.
+        return members == 0 || charge(budget, 1 + 2 * indent);
     }
     if value.is_object() {
         if !charge(budget, 2) {
             return false;
         }
+        let mut members = 0usize;
         for (key, member) in value.entries() {
-            // The comma, the quoted key and the colon, then the member.
-            if !charge(budget, 1 + quoted_len(key) + 1)
-                || !fits_mapped_ceiling(member, budget, depth - 1)
+            members += 1;
+            // The comma, the newline and indentation, the quoted key and the `: ` after
+            // it, then the member.
+            if !charge(budget, 1 + 1 + 2 * (indent + 1) + quoted_len(key) + 2)
+                || !fits_mapped_ceiling(member, budget, depth - 1, indent + 1)
             {
                 return false;
             }
         }
-        return true;
+        return members == 0 || charge(budget, 1 + 2 * indent);
     }
     // A function value, which the serializer writes as `""`, or a regex value, which it
     // writes as its pattern. Charged a fixed cost rather than measured, because the typed
@@ -1036,7 +1072,7 @@ fn evaluate_jsonata(template: &str, document: Option<&str>) -> Result<String, Te
     // past the depth it is given — so the refusal names both ceilings rather than
     // attributing it to the one the caller may not have met.
     let mut budget = MAX_MAPPED_FILE_BYTES;
-    if !fits_mapped_ceiling(mapped, &mut budget, MAX_EVALUATION_DEPTH) {
+    if !fits_mapped_ceiling(mapped, &mut budget, MAX_EVALUATION_DEPTH, 0) {
         return Err(invalid(format!(
             "the mapping would produce more than the {MAX_MAPPED_FILE_BYTES} bytes this emulator \
              will answer with, or a document nested deeper than its {MAX_EVALUATION_DEPTH} levels"
@@ -1044,9 +1080,10 @@ fn evaluate_jsonata(template: &str, document: Option<&str>) -> Result<String, Te
     }
     let serialized = mapped.serialize(false);
 
-    // The backstop for the walk above: it charges at least what the serializer writes, so
-    // this cannot fire, and it is kept so an accounting slip cannot answer past the
-    // ceiling either.
+    // The backstop for the walk above: it charges at least what the answer is written
+    // with, so this cannot fire, and it is kept so an accounting slip cannot answer past
+    // the ceiling either. Checked on the interpreter's own serialization first, which is
+    // never longer than the answer, so nothing oversized reaches the rendering below.
     if serialized.len() > MAX_MAPPED_FILE_BYTES {
         return Err(invalid(format!(
             "the mapping produced {} bytes, past the {MAX_MAPPED_FILE_BYTES} bytes this emulator \
@@ -1054,7 +1091,15 @@ fn evaluate_jsonata(template: &str, document: Option<&str>) -> Result<String, Te
             serialized.len()
         )));
     }
-    Ok(canonical_json(serialized))
+    let answered = mapped_document_text(serialized);
+    if answered.len() > MAX_MAPPED_FILE_BYTES {
+        return Err(invalid(format!(
+            "the mapping produced {} bytes, past the {MAX_MAPPED_FILE_BYTES} bytes this emulator \
+             will answer with",
+            answered.len()
+        )));
+    }
+    Ok(answered)
 }
 
 /// The whole containment above needs unwinding panics: `catch_unwind` cannot intercept
@@ -1240,7 +1285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TestMapping";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TEST_MAPPING_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TEST_MAPPING_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 201u16;
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,

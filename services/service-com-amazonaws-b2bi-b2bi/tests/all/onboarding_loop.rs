@@ -238,7 +238,7 @@ pub(crate) async fn given_transformer(router: &MultiServiceRouter, name: &str) -
         }),
     )
     .await;
-    assert_eq!(status, 201, "CreateTransformer({name}) failed: {body}");
+    assert_eq!(status, 200, "CreateTransformer({name}) failed: {body}");
     text(&body, "transformerId")
 }
 
@@ -255,7 +255,7 @@ pub(crate) async fn given_profile(router: &MultiServiceRouter, name: &str) -> St
         }),
     )
     .await;
-    assert_eq!(status, 201, "CreateProfile({name}) failed: {body}");
+    assert_eq!(status, 200, "CreateProfile({name}) failed: {body}");
     text(&body, "profileId")
 }
 
@@ -272,7 +272,7 @@ pub(crate) async fn given_capability(router: &MultiServiceRouter, name: &str) ->
         }),
     )
     .await;
-    assert_eq!(status, 201, "CreateCapability({name}) failed: {body}");
+    assert_eq!(status, 200, "CreateCapability({name}) failed: {body}");
     text(&body, "capabilityId")
 }
 
@@ -294,7 +294,7 @@ pub(crate) async fn given_partnership(
         }),
     )
     .await;
-    assert_eq!(status, 201, "CreatePartnership({name}) failed: {body}");
+    assert_eq!(status, 200, "CreatePartnership({name}) failed: {body}");
     text(&body, "partnershipId")
 }
 
@@ -343,7 +343,7 @@ async fn a_created_profile_is_readable_listable_and_carries_its_derived_members(
         }
 
         let (status, created) = call_signed_for(&router, region, "CreateProfile", request).await;
-        assert_eq!(status, 201, "case {case:?}: expected 201, got {status} {created}");
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {status} {created}");
 
         let profile_id = text(&created, "profileId");
         assert!(
@@ -493,7 +493,7 @@ async fn a_created_capability_round_trips_its_configuration_and_instructions_doc
         }
 
         let (status, created) = call(&router, "CreateCapability", request).await;
-        assert_eq!(status, 201, "case {case:?}: expected 201, got {status} {created}");
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {status} {created}");
 
         let capability_id = text(&created, "capabilityId");
         assert!(
@@ -605,7 +605,7 @@ async fn creating_a_partnership_under_an_unknown_profile_is_a_404() {
         }),
     )
     .await;
-    assert_eq!(status, 201, "a known profileId must succeed, got {status} {body}");
+    assert_eq!(status, 200, "a known profileId must succeed, got {status} {body}");
 }
 
 /// RULE: `CreatePartnership` persists `profileId`, `name`, `email`, `phone`,
@@ -669,7 +669,7 @@ async fn a_created_partnership_round_trips_every_persisted_member() {
         }
 
         let (status, created) = call(&router, "CreatePartnership", request).await;
-        assert_eq!(status, 201, "case {case:?}: expected 201, got {status} {created}");
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {status} {created}");
 
         let partnership_id = text(&created, "partnershipId");
         let trading_partner_id = text(&created, "tradingPartnerId");
@@ -1121,7 +1121,7 @@ async fn repeating_a_create_with_the_same_client_token_returns_the_same_resource
         let count_before = before[*items].as_array().map(Vec::len).unwrap_or_default();
 
         let (status, first) = call(&router, operation, request("token-alpha")).await;
-        assert_eq!(status, 201, "case {case:?}: first create failed: {status} {first}");
+        assert_eq!(status, 200, "case {case:?}: first create failed: {status} {first}");
 
         // While that create is still in flight, a duplicate is the racer that lost it.
         let (status, raced) = call(&router, operation, request("token-alpha")).await;
@@ -1139,7 +1139,7 @@ async fn repeating_a_create_with_the_same_client_token_returns_the_same_resource
         // Once it has settled, the same token answers with the resource it minted.
         tokio::time::sleep(IDEMPOTENT_CREATE_IN_FLIGHT).await;
         let (status, replay) = call(&router, operation, request("token-alpha")).await;
-        assert_eq!(status, 201, "case {case:?}: replay failed: {status} {replay}");
+        assert_eq!(status, 200, "case {case:?}: replay failed: {status} {replay}");
         assert_eq!(
             replay[*id_member], first[*id_member],
             "case {case:?}: the replay must answer with the first resource, got {:?} vs {:?}",
@@ -1151,7 +1151,7 @@ async fn repeating_a_create_with_the_same_client_token_returns_the_same_resource
         );
 
         let (status, other) = call(&router, operation, request("token-beta")).await;
-        assert_eq!(status, 201, "case {case:?}: second token failed: {status} {other}");
+        assert_eq!(status, 200, "case {case:?}: second token failed: {status} {other}");
         assert_ne!(
             other[*id_member], first[*id_member],
             "case {case:?}: a different clientToken must mint a different resource"
@@ -1211,7 +1211,7 @@ async fn updating_a_profile_applies_only_the_members_it_names() {
         }),
     )
     .await;
-    assert_eq!(status, 201, "the profile must be created, got {status} {created}");
+    assert_eq!(status, 200, "the profile must be created, got {status} {created}");
     let profile_id = text(&created, "profileId");
 
     // Each row: the case, the update to send, and the (member, value) pairs the stored
@@ -1421,7 +1421,7 @@ async fn a_create_is_refused_once_its_store_is_full() {
             let (operation, body) = request(index);
             let (status, response) = call(&router, operation, body).await;
             assert_eq!(
-                status, 201,
+                status, 200,
                 "case {case:?}: create #{index} below the bound must succeed, got {status} {response}"
             );
         }
@@ -1512,7 +1512,7 @@ async fn the_idempotency_map_is_bounded_and_released() {
     };
 
     let (status, first) = call(&router, "CreatePartnership", partnership("token-gamma")).await;
-    assert_eq!(status, 201, "CreatePartnership failed: {status} {first}");
+    assert_eq!(status, 200, "CreatePartnership failed: {status} {first}");
     let first_id = text(&first, "partnershipId");
 
     let (status, body) = call(
@@ -1524,7 +1524,7 @@ async fn the_idempotency_map_is_bounded_and_released() {
     assert_eq!(status, 200, "DeletePartnership failed: {status} {body}");
 
     let (status, replay) = call(&router, "CreatePartnership", partnership("token-gamma")).await;
-    assert_eq!(status, 201, "the replay after a delete failed: {status} {replay}");
+    assert_eq!(status, 200, "the replay after a delete failed: {status} {replay}");
     assert_ne!(
         text(&replay, "partnershipId"),
         first_id,

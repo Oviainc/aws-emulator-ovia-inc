@@ -146,7 +146,7 @@ async fn creating_a_capability_for_an_unknown_transformer_is_a_404() {
     )
     .await;
     assert_eq!(
-        status, 201,
+        status, 200,
         "a capability naming a created transformer must be accepted, got {status} {created}"
     );
     let capability_id = text(&created, "capabilityId");
@@ -441,7 +441,7 @@ async fn a_logging_enabled_profile_has_a_real_log_group_and_a_disabled_one_has_n
             }),
         )
         .await;
-        assert_eq!(status, 201, "case {case:?}: CreateProfile failed: {created}");
+        assert_eq!(status, 200, "case {case:?}: CreateProfile failed: {created}");
 
         let profile_id = text(&created, "profileId");
         if *logging == "ENABLED" {
@@ -527,13 +527,13 @@ async fn concurrent_creates_past_the_quota_are_refused_not_served() {
         );
         let answers = [a, b, c, d, e, f, g];
 
-        let accepted = answers.iter().filter(|(status, _)| *status == 201).count();
+        let accepted = answers.iter().filter(|(status, _)| *status == 200).count();
         assert_eq!(
             accepted, limit,
             "case logging={logging}: exactly {limit} of {RACERS} racers may be served, \
              got {answers:?}"
         );
-        for (status, body) in answers.iter().filter(|(status, _)| *status != 201) {
+        for (status, body) in answers.iter().filter(|(status, _)| *status != 200) {
             assert_eq!(
                 *status, 402,
                 "case logging={logging}: a refused racer must answer 402, got {status} {body}"
@@ -597,7 +597,7 @@ async fn the_profile_quota_is_enforced_charged_and_released() {
         )
         .await;
         assert_eq!(
-            status, 201,
+            status, 200,
             "profile #{index} of {limit} must be accepted, got {status} {body}"
         );
         created.push(text(&body, "profileId"));
@@ -684,7 +684,7 @@ async fn the_profile_quota_is_enforced_charged_and_released() {
     )
     .await;
     assert_eq!(
-        status, 201,
+        status, 200,
         "a create must be accepted once a slot is released, got {status} {body}"
     );
     let log_group = text(&body, "logGroupName");
@@ -722,7 +722,7 @@ async fn the_profile_quota_is_enforced_charged_and_released() {
         )
         .await;
         assert_eq!(
-            status, 201,
+            status, 200,
             "cycle {cycle}: a create must be accepted while the account is below its \
              limit — a leaked reservation would refuse it, got {status} {body}"
         );

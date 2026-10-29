@@ -39,7 +39,7 @@ async fn given_transformer_with(
     }
     let (status, created) = call(router, "CreateTransformer", body).await;
     assert_eq!(
-        status, 201,
+        status, 200,
         "creating the transformer {name:?} must succeed, got {status} {created}"
     );
     created["transformerId"]

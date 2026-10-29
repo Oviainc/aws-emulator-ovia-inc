@@ -260,8 +260,8 @@ fn interchange(
 /// The `parsedFileContent` of a successful parse, as a JSON document.
 fn parsed_json(case: &str, status: u16, body: &Value) -> Value {
     assert_eq!(
-        status, 201,
-        "case {case:?}: expected HTTP 201, got {status} with body {body:?}"
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} with body {body:?}"
     );
     let content = body["parsedFileContent"]
         .as_str()
@@ -608,8 +608,8 @@ async fn both_document_formats_report_the_same_interchange() {
         )
         .await;
         assert_eq!(
-            status, 201,
-            "case {case:?}: expected HTTP 201 for an XML parse, got {status} with {body:?}"
+            status, 200,
+            "case {case:?}: expected HTTP 200 for an XML parse, got {status} with {body:?}"
         );
         let xml = body["parsedFileContent"].as_str().unwrap_or_default();
         let elements = xml_elements(case, xml);
@@ -691,8 +691,8 @@ async fn splitting_by_transaction_answers_one_parsed_file_per_transaction_set() 
         body["advancedOptions"] = json!({ "x12": { "splitOptions": { "splitBy": "TRANSACTION" } } });
         let (status, response) = call(&router, "TestParsing", body).await;
         assert_eq!(
-            status, 201,
-            "case {case:?}: expected HTTP 201, got {status} with body {response:?}"
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with body {response:?}"
         );
         let contents = response["parsedSplitFileContents"]
             .as_array()
@@ -794,8 +794,8 @@ async fn splitting_by_transaction_answers_one_parsed_file_per_transaction_set() 
             }
             let (status, response) = call(&router, "TestParsing", body).await;
             assert_eq!(
-                status, 201,
-                "case {case:?} / {split_case:?}: expected HTTP 201, got {status} with \
+                status, 200,
+                "case {case:?} / {split_case:?}: expected HTTP 200, got {status} with \
                  body {response:?}"
             );
             assert!(
@@ -1005,7 +1005,7 @@ async fn an_input_file_larger_than_the_documented_limit_is_refused() {
             );
         } else {
             assert_eq!(
-                status, 201,
+                status, 200,
                 "case {case:?}: a document inside the limit must parse, got {status} with \
                  body {response:?}"
             );
@@ -1111,8 +1111,8 @@ async fn a_file_format_that_names_no_document_format_is_refused() {
             );
         } else {
             assert_eq!(
-                status, 201,
-                "case {file_format:?}: expected HTTP 201, got {status} with body {response:?}"
+                status, 200,
+                "case {file_format:?}: expected HTTP 200, got {status} with body {response:?}"
             );
             assert!(
                 response["parsedFileContent"]
@@ -1192,8 +1192,8 @@ async fn configured_element_requirement_rules_report_what_the_document_does_not_
             json!({ "x12": { "validationOptions": { "validationRules": rules } } });
         let (status, response) = call(&router, "TestParsing", body).await;
         assert_eq!(
-            status, 201,
-            "case {case:?}: expected HTTP 201, got {status} with body {response:?}"
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with body {response:?}"
         );
         let messages = response["validationMessages"]
             .as_array()
@@ -1254,8 +1254,8 @@ async fn a_split_file_carries_its_own_envelope_and_not_the_files_loose_segments(
     body["advancedOptions"] = json!({ "x12": { "splitOptions": { "splitBy": "TRANSACTION" } } });
     let (status, response) = call(&router, "TestParsing", body).await;
     assert_eq!(
-        status, 201,
-        "expected HTTP 201, got {status} with body {response:?}"
+        status, 200,
+        "expected HTTP 200, got {status} with body {response:?}"
     );
 
     let whole: Value =
@@ -1366,7 +1366,7 @@ async fn a_split_or_a_rule_list_past_this_emulators_bounds_is_refused() {
             );
         } else {
             assert_eq!(
-                status, 201,
+                status, 200,
                 "case {case:?}: a split at the bound must be answered, got {status}"
             );
             assert_eq!(
@@ -1402,7 +1402,7 @@ async fn a_split_or_a_rule_list_past_this_emulators_bounds_is_refused() {
         body["advancedOptions"] =
             json!({ "x12": { "validationOptions": { "validationRules": rules } } });
         let (status, response) = call(&router, "TestParsing", body).await;
-        let expected = if count > MAX_VALIDATION_RULES { 400 } else { 201 };
+        let expected = if count > MAX_VALIDATION_RULES { 400 } else { 200 };
         assert_eq!(
             status, expected,
             "case {case:?}: expected HTTP {expected}, got {status} with body {response:?}"
@@ -1475,8 +1475,8 @@ async fn element_values_carrying_markup_characters_survive_both_renderings() {
         )
         .await;
         assert_eq!(
-            status, 201,
-            "case {case:?}: expected HTTP 201 for an XML parse, got {status} with {body:?}"
+            status, 200,
+            "case {case:?}: expected HTTP 200 for an XML parse, got {status} with {body:?}"
         );
         let xml = body["parsedFileContent"].as_str().unwrap_or_default();
         // The document is well-formed (`xml_elements` parses it and panics otherwise)...
@@ -1523,7 +1523,7 @@ async fn parsing_a_document_changes_nothing_a_later_caller_sees() {
     let (second_status, second) = call(&router, "TestParsing", body).await;
     assert_eq!(
         (first_status, second_status),
-        (201, 201),
+        (200, 200),
         "a repeated parse must succeed twice, got {first_status} then {second_status}"
     );
     assert_eq!(
@@ -1797,8 +1797,8 @@ async fn every_interchange_a_file_holds_is_parsed_in_file_order() {
         body["advancedOptions"] = json!({ "x12": { "splitOptions": { "splitBy": "TRANSACTION" } } });
         let (status, response) = call(&router, "TestParsing", body).await;
         assert_eq!(
-            status, 201,
-            "case {case:?}: expected HTTP 201 for a split parse, got {status} with body \
+            status, 200,
+            "case {case:?}: expected HTTP 200 for a split parse, got {status} with body \
              {response:?}"
         );
         let contents = response["parsedSplitFileContents"]

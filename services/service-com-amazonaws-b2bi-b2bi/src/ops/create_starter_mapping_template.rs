@@ -14,8 +14,8 @@
 //! ## Two sources for the template
 //!
 //! * WITHOUT `outputSampleLocation` the template comes from `templateDetails`: the X12
-//!   envelope the requested transaction set and version determine, with a
-//!   [`PLACEHOLDER_PREFIX`] value wherever the caller must supply an expression.
+//!   envelope the requested transaction set and version determine, with the
+//!   [`PLACEHOLDER`] value wherever the caller must supply an expression.
 //! * WITH `outputSampleLocation` it is DERIVED FROM THAT SAMPLE — "if you provide a sample
 //!   EDI file with the same structure as the EDI files that you wish to generate, then the
 //!   service can generate a mapping template". The object is read through the emulator's
@@ -33,14 +33,17 @@
 //! ```text
 //! interchanges[0]                      ISA elements, then IEA elements
 //!   functional_groups[0]               GS elements, then GE elements
-//!     transactions[0]                  ST elements, the transaction set's beginning
-//!                                      segment, then SE elements
+//!     transactions[0]                  ST elements, then SE elements
+//!       segments[0]                     the transaction set's beginning segment
 //! ```
 //!
-//! Each segment's elements sit directly in the object that holds the segment. An envelope
-//! element is keyed `<SEGMENT>_<position>_<ElementName>`
-//! (`ST_01_TransactionSetIdentifierCode`); an element of a segment inside the transaction
-//! is keyed `<SEGMENT>_<position>` (`BEG_01`), with the element's name in the placeholder.
+//! An envelope segment's elements sit directly in the object that holds the segment, keyed
+//! `<SEGMENT>_<position>_<ElementName>` (`ST_01_TransactionSetIdentifierCode`). The
+//! segments INSIDE the transaction sit in its `segments` list, one object each, carrying
+//! the segment's id under `segment_id` and its elements keyed `<SEGMENT>_<position>`
+//! (`BEG_01`) — the very shape this service's X12 reader builds for a parsed document
+//! ([`super::test_parsing::parse_x12`]), because a mapping written against this template
+//! is evaluated into a document that reader's own output is compared with.
 //!
 //! ## Shape of an operation
 //!
@@ -196,15 +199,6 @@ impl MappingFormat {
             .collect::<Vec<&str>>()
             .join(", ")
     }
-
-    /// How a placeholder in this format's template names the expression language the
-    /// caller replaces it with.
-    fn language(self) -> &'static str {
-        match self {
-            Self::Jsonata => "JSONata",
-            Self::Xslt => "XSLT",
-        }
-    }
 }
 
 /// The longest template this operation answers with: the modelled `MappingTemplate` bound
@@ -234,13 +228,19 @@ const X12_RESPONSIBLE_AGENCY_CODE: &str = "X";
 /// name of an element or of a member.
 use super::test_parsing::{
     isa_element_names, FUNCTIONAL_GROUPS_KEY, FUNCTIONAL_GROUP_ITEM, GE_ELEMENTS, GS_ELEMENTS,
-    IEA_ELEMENTS, INTERCHANGES_KEY, INTERCHANGE_ITEM, SE_ELEMENTS, ST_ELEMENTS, TRANSACTIONS_KEY,
-    TRANSACTION_ITEM,
+    IEA_ELEMENTS, INTERCHANGES_KEY, INTERCHANGE_ITEM, SEGMENTS_KEY, SEGMENT_ID_KEY, SEGMENT_ITEM,
+    SE_ELEMENTS, ST_ELEMENTS, TRANSACTIONS_KEY, TRANSACTION_ITEM,
 };
 
-/// How every placeholder value begins, so a caller can tell a placeholder from a value
-/// the request determined.
-pub const PLACEHOLDER_PREFIX: &str = "replace with the";
+/// The value a starter template carries wherever the caller must supply the content:
+/// "the starter template contains placeholder values which you can replace with JSONata
+/// or XSLT expressions to take data from your input file".
+///
+/// One fixed word, carrying neither the element's name nor the expression language: it is
+/// what the generated template reads for every such field, and it is the word the
+/// sample-driven path writes the sample's own value after ([`SAMPLE_PLACEHOLDER_PREFIX`]),
+/// so a caller recognises a field it must fill in the same way on both paths.
+pub const PLACEHOLDER: &str = "PLACEHOLDER";
 
 /// One node of a starter template's document tree, rendered to JSON for a `JSONATA`
 /// template and to XML for an `XSLT` one.
@@ -646,59 +646,55 @@ fn beginning_segment(transaction_set_code: &str) -> Option<&'static BeginningSeg
         .map(|(_, segment)| segment)
 }
 
-/// The value a starter template carries wherever the caller must supply the content:
-/// "the starter template contains placeholder values which you can replace with JSONata
-/// or XSLT expressions to take data from your input file", so a placeholder names the
-/// element it stands for and the language the replacement is written in.
-fn placeholder(language: &str, element: &str) -> Node {
-    Node::Text(format!(
-        "{PLACEHOLDER_PREFIX} {language} expression for {element}"
-    ))
+/// The value a starter template carries wherever the caller must supply the content.
+fn placeholder() -> Node {
+    Node::Text(PLACEHOLDER.to_string())
 }
 
 /// `names` as the elements of `segment`, in positional order, each one a placeholder.
-fn placeholder_elements(language: &str, segment: &str, names: &[&str]) -> Vec<(String, Node)> {
+fn placeholder_elements(segment: &str, names: &[&str]) -> Vec<(String, Node)> {
     names
         .iter()
         .enumerate()
-        .map(|(index, name)| {
-            let key = element_key(segment, index + 1, name);
-            let value = placeholder(language, &key);
-            (key, value)
-        })
+        .map(|(index, name)| (element_key(segment, index + 1, name), placeholder()))
         .collect()
 }
 
-/// The elements of a segment INSIDE the transaction — the transaction set's own body,
-/// which the X12 schema of that transaction set defines.
+/// One segment INSIDE the transaction — the transaction set's own body, which the X12
+/// schema of that transaction set defines — as the object a `segments` list holds.
 ///
-/// These are keyed by segment id and position alone (`BEG_01`), not by element name the
-/// way an envelope segment's elements are; the element's name is in the placeholder, so
-/// the caller still reads which element it is replacing.
-fn body_elements(language: &str, segment: &str, names: &[&str]) -> Vec<(String, Node)> {
-    names
-        .iter()
-        .enumerate()
-        .map(|(index, name)| {
-            let key = body_element_key(segment, index + 1);
-            let value = placeholder(language, &format!("{key} ({name})"));
-            (key, value)
-        })
-        .collect()
+/// It carries the segment's id under [`SEGMENT_ID_KEY`] and then one placeholder per
+/// element, keyed by segment id and position alone (`BEG_01`) rather than by element name
+/// the way an envelope segment's elements are: that is how this service's X12 reader keys
+/// a body segment's elements ([`super::test_parsing::parse_x12`]), and the document a
+/// mapping written against this template produces is read as one of those.
+fn body_segment(segment: &BeginningSegment) -> Node {
+    let mut members = vec![(
+        SEGMENT_ID_KEY.to_string(),
+        Node::Text(segment.id.to_string()),
+    )];
+    members.extend(
+        segment
+            .elements
+            .iter()
+            .enumerate()
+            .map(|(index, _)| (body_element_key(segment.id, index + 1), placeholder())),
+    );
+    Node::Map(members)
 }
 
 /// The interchange control header (ISA): sixteen positional elements, all of them the
 /// caller's to supply.
-fn isa_elements(language: &str, release: u32) -> Vec<(String, Node)> {
-    placeholder_elements(language, "ISA", &isa_element_names(release))
+fn isa_elements(release: u32) -> Vec<(String, Node)> {
+    placeholder_elements("ISA", &isa_element_names(release))
 }
 
 /// The functional group header (GS). GS07 is fixed at [`X12_RESPONSIBLE_AGENCY_CODE`] and
 /// GS08 is the version/release/industry identifier code the request determines; the first
 /// six elements are the caller's.
-fn gs_elements(language: &str, version_release_industry_code: &str) -> Vec<(String, Node)> {
+fn gs_elements(version_release_industry_code: &str) -> Vec<(String, Node)> {
     let caller_supplied = GS_ELEMENTS.len() - 2;
-    let mut members = placeholder_elements(language, "GS", &GS_ELEMENTS[..caller_supplied]);
+    let mut members = placeholder_elements("GS", &GS_ELEMENTS[..caller_supplied]);
     members.push((
         element_key("GS", 7, GS_ELEMENTS[6]),
         Node::Text(X12_RESPONSIBLE_AGENCY_CODE.to_string()),
@@ -715,20 +711,15 @@ fn gs_elements(language: &str, version_release_industry_code: &str) -> Vec<(Stri
 /// reference, an optional element — is present only when the requested transaction set
 /// names an implementation guide.
 fn st_elements(
-    language: &str,
     transaction_set_code: &str,
     implementation_convention: Option<&str>,
 ) -> Vec<(String, Node)> {
-    let control_number = element_key("ST", 2, ST_ELEMENTS[1]);
     let mut members = vec![
         (
             element_key("ST", 1, ST_ELEMENTS[0]),
             Node::Text(transaction_set_code.to_string()),
         ),
-        (
-            control_number.clone(),
-            placeholder(language, &control_number),
-        ),
+        (element_key("ST", 2, ST_ELEMENTS[1]), placeholder()),
     ];
     if let Some(convention) = implementation_convention {
         members.push((
@@ -743,24 +734,29 @@ fn st_elements(
 /// holding one transaction, in the X12 envelope the requested transaction set and version
 /// determine.
 ///
-/// The transaction's own segments — the body between ST and SE, which differ with every
-/// transaction set — are what the caller adds to the template; this operation generates
-/// the envelope they sit in, with each element it does not determine left as a
-/// placeholder.
+/// The transaction's body — the segments between ST and SE, which differ with every
+/// transaction set — sits in its `segments` list, carrying the beginning segment of the
+/// requested transaction set; the segments after it are what the caller adds to the
+/// template. Every element this operation does not determine is a placeholder.
 fn starter_document(
-    language: &str,
     transaction_set_code: &str,
     implementation_convention: Option<&str>,
     release: u32,
     version_release_industry_code: &str,
 ) -> Node {
-    let mut transaction = st_elements(language, transaction_set_code, implementation_convention);
+    let mut transaction = st_elements(transaction_set_code, implementation_convention);
     if let Some(segment) = beginning_segment(transaction_set_code) {
-        transaction.extend(body_elements(language, segment.id, segment.elements));
+        transaction.push((
+            SEGMENTS_KEY.to_string(),
+            Node::List {
+                item: SEGMENT_ITEM.to_string(),
+                items: vec![body_segment(segment)],
+            },
+        ));
     }
-    transaction.extend(placeholder_elements(language, "SE", SE_ELEMENTS));
+    transaction.extend(placeholder_elements("SE", SE_ELEMENTS));
 
-    let mut functional_group = gs_elements(language, version_release_industry_code);
+    let mut functional_group = gs_elements(version_release_industry_code);
     functional_group.push((
         TRANSACTIONS_KEY.to_string(),
         Node::List {
@@ -768,9 +764,9 @@ fn starter_document(
             items: vec![Node::Map(transaction)],
         },
     ));
-    functional_group.extend(placeholder_elements(language, "GE", GE_ELEMENTS));
+    functional_group.extend(placeholder_elements("GE", GE_ELEMENTS));
 
-    let mut interchange = isa_elements(language, release);
+    let mut interchange = isa_elements(release);
     interchange.push((
         FUNCTIONAL_GROUPS_KEY.to_string(),
         Node::List {
@@ -778,7 +774,7 @@ fn starter_document(
             items: vec![Node::Map(functional_group)],
         },
     ));
-    interchange.extend(placeholder_elements(language, "IEA", IEA_ELEMENTS));
+    interchange.extend(placeholder_elements("IEA", IEA_ELEMENTS));
 
     Node::Map(vec![(
         INTERCHANGES_KEY.to_string(),
@@ -792,11 +788,13 @@ fn starter_document(
 /// The `JSONATA` rendering: the document tree as a JSON document, whose values the caller
 /// replaces with JSONata expressions.
 ///
-/// The same rendering `TestParsing` answers a parsed document with for `fileFormat` JSON,
-/// over its own copy of the tree — so a template and the document it maps are written in
-/// the same shape.
+/// The document's SHAPE is the one `TestParsing` answers a parsed document with, over its
+/// own copy of the tree — so a template and the document it maps are written in the same
+/// shape — and its LAYOUT is the one the generated template is recorded with: two-space
+/// indentation, a space on both sides of each member's colon, and an array on the line it
+/// opens on ([`crate::state::documents::to_document_text`]).
 fn render_json(document: &Node) -> Result<String, String> {
-    ::serde_json::to_string_pretty(document).map_err(|error| error.to_string())
+    crate::state::documents::to_document_text(document)
 }
 
 /// The `XSLT` rendering: an XSLT 1.0 stylesheet whose single template emits the same
@@ -910,8 +908,7 @@ fn write_xml_node(
 /// This is the recorded form for the sample-driven path (trace
 /// `b2bi.create-starter-mapping-template-with-output-sample`: "each transaction-set
 /// business field becomes a `PLACEHOLDER: <sample value>` marker"); the template generated
-/// WITHOUT a sample has no sample value to name, so it carries
-/// [`PLACEHOLDER_PREFIX`] instead.
+/// WITHOUT a sample has no sample value to name, so it carries [`PLACEHOLDER`] alone.
 pub const SAMPLE_PLACEHOLDER_PREFIX: &str = "PLACEHOLDER: ";
 
 /// Whether `key` names an element of a segment INSIDE the transaction (`BEG_01`) rather
@@ -1107,7 +1104,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 MappingFormat::accepted()
             )));
         };
-        let language = format.language();
 
         // `TemplateDetails` is a union with one member: X12 is the only EDI standard a
         // starter template can be generated for.
@@ -1160,7 +1156,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from `templateDetails`, which is what the operation documents for that case.
         let document = match input.output_sample_location.as_ref() {
             None => starter_document(
-                language,
                 &transaction_set_code,
                 implementation_convention.as_deref(),
                 release,

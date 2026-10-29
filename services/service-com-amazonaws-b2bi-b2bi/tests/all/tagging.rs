@@ -175,7 +175,7 @@ pub(crate) async fn given_tagged_resource(
 
     let (status, created) = call(router, operation, request).await;
     assert_eq!(
-        status, 201,
+        status, 200,
         "case {name:?}: {operation} failed: {status} {created}"
     );
     let arn = text(&created, arn_member);
@@ -417,7 +417,7 @@ async fn a_well_formed_arn_naming_nothing_stored_is_a_404() {
         }),
     )
     .await;
-    assert_eq!(status, 201, "CreateProfile(doomed) failed: {created}");
+    assert_eq!(status, 200, "CreateProfile(doomed) failed: {created}");
     let doomed_arn = text(&created, "profileArn");
     let doomed_id = text(&created, "profileId");
 
@@ -530,7 +530,7 @@ async fn tags_are_read_off_the_arn_whatever_region_the_read_is_signed_for() {
             }),
         )
         .await;
-        assert_eq!(status, 201, "case {case:?}: CreateProfile failed: {created}");
+        assert_eq!(status, 200, "case {case:?}: CreateProfile failed: {created}");
         let arn = text(&created, "profileArn");
         assert!(
             arn.contains(region),

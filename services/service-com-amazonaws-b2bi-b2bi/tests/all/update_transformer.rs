@@ -44,7 +44,7 @@ async fn created_transformer(
 ) -> (String, Value) {
     let (status, created) = call_signed_for(router, region, "CreateTransformer", request).await;
     assert_eq!(
-        status, 201,
+        status, 200,
         "the transformer under test must be created, got {status} {created}"
     );
     (text(&created, "transformerId"), created)

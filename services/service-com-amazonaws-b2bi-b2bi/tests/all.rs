@@ -43,3 +43,5 @@ mod transformer_lifecycle;
 mod untag_resource;
 #[path = "all/update_transformer.rs"]
 mod update_transformer;
+#[path = "all/wire_response_text.rs"]
+mod wire_response_text;

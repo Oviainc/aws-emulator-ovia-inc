@@ -417,7 +417,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "CreateProfile";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_PROFILE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_PROFILE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 201u16;
+    // awsJson1_0 is an RPC protocol, so the `@http` code the model puts on this operation
+    // (201) is inert on the wire and a success is 200.
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,
