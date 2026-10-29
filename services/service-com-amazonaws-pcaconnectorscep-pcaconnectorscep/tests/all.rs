@@ -49,5 +49,7 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
+#[path = "all/tag_updated_at.rs"]
+mod tag_updated_at;
 #[path = "all/tag_validation.rs"]
 mod tag_validation;

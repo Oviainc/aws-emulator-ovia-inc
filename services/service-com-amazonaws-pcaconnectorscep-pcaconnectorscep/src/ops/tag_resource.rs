@@ -6,7 +6,9 @@
 //! into the tag map that record already carries: a key the resource does not have yet is
 //! added, and one it does have takes the request's value. The write lands on the same single
 //! map `ListTagsForResource` reads, so a tag is observable through a later read and
-//! disappears with the resource it sits on.
+//! disappears with the resource it sits on. Writing a tag changes the record, so the merge
+//! also moves the `UpdatedAt` the connector or challenge reports — unless every entry it
+//! writes is one the record already carried, which leaves the record as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -203,19 +205,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let resource_arn = input.resource_arn.clone();
         // ONE lookup, taken mutably: the ceiling below is computed from the very map the
-        // write then lands on, so there is no second lookup that could miss.
-        let Some(tags) = store.tags_of_mut(&region, &resource_arn) else {
+        // write then lands on, so there is no second lookup that could miss. The borrow
+        // carries the record's own change timestamp beside that map, because a tag write
+        // changes the record.
+        let Some(mut target) = store.taggable_mut(&region, &resource_arn) else {
             return Err(not_found(&resource_arn));
         };
 
         // The ceiling is on what the RESOURCE ends up carrying, not on what one call sends:
         // a key the resource already has takes a new value instead of adding an entry, so
         // only the keys it does not have yet grow the map.
-        let total = tags.len()
+        let total = target.tags.len()
             + input
                 .tags
                 .keys()
-                .filter(|key| !tags.contains_key(key.as_str()))
+                .filter(|key| !target.tags.contains_key(key.as_str()))
                 .count();
         if total > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(validation(format!(
@@ -227,9 +231,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // AWS tagging semantics: a tag is a key with ONE value, so a key the resource already
         // carries is overwritten rather than duplicated, and every other tag it carries stays.
-        for (key, value) in input.tags {
-            tags.insert(key, value);
-        }
+        // The merge also maintains the record's `UpdatedAt` — the instant the resource was
+        // last changed, which this write is one of — so the next reader of the connector or
+        // challenge reports when the tagging happened rather than the state before it. A
+        // merge that writes only values the record already had changes nothing, so it leaves
+        // that instant where it is.
+        target.merge_tags(input.tags, now);
 
         // `TagResource` models no output members (its output shape is `Unit`): the modelled
         // 204 and an empty body are the whole answer, and the tags are read back through

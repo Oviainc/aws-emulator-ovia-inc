@@ -505,26 +505,30 @@ impl ComAmazonawsPcaconnectorscepPcaconnectorscepState {
         }
     }
 
-    /// The tags of the connector or challenge `resource_arn` names, to WRITE, or `None` when
-    /// this service holds no resource under that ARN.
+    /// The connector or challenge `resource_arn` names, to WRITE its tags, or `None` when this
+    /// service holds no resource under that ARN.
     ///
     /// The mutable twin of [`tags_of`], reaching the same single map on the same record, so a
     /// tag written through here is the one a listing reads back and is dropped with the
-    /// resource rather than lingering in a second table.
-    pub fn tags_of_mut(
-        &mut self,
-        region: &str,
-        resource_arn: &str,
-    ) -> Option<&mut BTreeMap<String, String>> {
+    /// resource rather than lingering in a second table. It hands back the record's
+    /// `updated_at` beside that map ([`TaggableMut`]), because a tag write changes the record
+    /// and every write path here maintains the instant the record last changed.
+    pub fn taggable_mut(&mut self, region: &str, resource_arn: &str) -> Option<TaggableMut<'_>> {
         match connector_arn_of_challenge(resource_arn) {
             Some(connector_arn) => self
                 .connector_mut(region, connector_arn)?
                 .challenges
                 .get_mut(resource_arn)
-                .map(|challenge| &mut challenge.tags),
+                .map(|challenge| TaggableMut {
+                    tags: &mut challenge.tags,
+                    updated_at: &mut challenge.updated_at,
+                }),
             None => self
                 .connector_mut(region, resource_arn)
-                .map(|connector| &mut connector.tags),
+                .map(|connector| TaggableMut {
+                    tags: &mut connector.tags,
+                    updated_at: &mut connector.updated_at,
+                }),
         }
     }
 
@@ -550,6 +554,56 @@ impl ComAmazonawsPcaconnectorscepPcaconnectorscepState {
         client_token
             .and_then(|token| self.challenge_tokens.get(&token_key(region, token)))
             .cloned()
+    }
+}
+
+/// One of this service's taggable records, borrowed to write its tags: the single tag map the
+/// resource carries, together with the instant that record last changed.
+///
+/// A connector and a challenge each keep their own tag map and their own `updated_at`, so one
+/// borrow carries both halves of a tag write — the map the write lands on, and the timestamp
+/// the write moves. The timestamp is reachable only through [`Self::merge_tags`], so a tag
+/// write cannot change the record and leave the instant it reports behind.
+#[derive(Debug)]
+pub struct TaggableMut<'a> {
+    /// The resource's own tags: the very map [`ComAmazonawsPcaconnectorscepPcaconnectorscepState::tags_of`]
+    /// reads back.
+    pub tags: &'a mut BTreeMap<String, String>,
+    /// The instant the record was last changed, as the resource reports it.
+    updated_at: &'a mut SystemTime,
+}
+
+impl TaggableMut<'_> {
+    /// Merge `tags` into the record's own map and, when that leaves the record different from
+    /// what it was, record `now` as the instant it changed. Answers whether anything changed.
+    ///
+    /// A tag is a key with ONE value, so a key the resource already carries takes the new
+    /// value instead of being duplicated and every other tag it carries stays. A merge that
+    /// writes only values the record already had leaves the record exactly as it was, so there
+    /// is no change for the timestamp to report.
+    pub fn merge_tags(
+        &mut self,
+        tags: impl IntoIterator<Item = (String, String)>,
+        now: SystemTime,
+    ) -> bool {
+        let mut changed = false;
+        for (key, value) in tags {
+            match self.tags.get_mut(&key) {
+                Some(existing) if *existing == value => {}
+                Some(existing) => {
+                    *existing = value;
+                    changed = true;
+                }
+                None => {
+                    self.tags.insert(key, value);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            *self.updated_at = now;
+        }
+        changed
     }
 }
 
