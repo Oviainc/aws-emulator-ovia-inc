@@ -221,7 +221,7 @@ impl Emulator {
     }
 
     /// Set `bucket`'s versioning status.
-    async fn set_versioning(&self, bucket: &str, status: &str) {
+    pub(crate) async fn set_versioning(&self, bucket: &str, status: &str) {
         self.s3()
             .put_bucket_versioning()
             .bucket(bucket)

@@ -209,10 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(DeleteResourceConfigOutput);
         };
         if held.deleted_at.is_some() {
-            // The resource's current configuration item ALREADY records its deletion.
-            // Recording it again would move that item's capture instant without the
-            // resource having gone through another state, so the deletion that is
-            // already recorded stands.
+            // The resource's current configuration item ALREADY records its deletion,
+            // and the resource has not gone through another state since, so there is no
+            // further deletion to record: the item that records it stands, carrying the
+            // instant it was captured at.
             return Ok(DeleteResourceConfigOutput);
         }
 

@@ -168,3 +168,5 @@ mod recorded_inventory_drives_the_read_surface;
 mod recorded_resource_config_history;
 #[path = "all/aggregate_discovered_resources.rs"]
 mod aggregate_discovered_resources;
+#[path = "all/recorded_configuration_item_capture_time.rs"]
+mod recorded_configuration_item_capture_time;

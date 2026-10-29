@@ -2477,9 +2477,16 @@ pub struct DiscoveredResourceEntry {
     /// (`PutResourceConfigRequest$Tags`).
     pub tags: BTreeMap<String, String>,
     /// When Config first recorded a configuration item for this resource, and when it
-    /// last did. The first instant is kept across a re-record of the same resource,
-    /// which only moves the last one. Both are `None` for a resource no configuration
-    /// item has been recorded for.
+    /// captured the configuration item that is its CURRENT one — the instant that item
+    /// reports as its `configurationItemCaptureTime`. Both are `None` for a resource no
+    /// configuration item has been recorded for.
+    ///
+    /// Neither instant moves while the resource stays in the state the current item
+    /// records: observing that same state again records no configuration item, so there
+    /// is no new capture instant to report
+    /// ([`ComAmazonawsConfigserviceStarlingdoveserviceState::record_discovered_resource`]).
+    /// A state the resource LEAVES keeps the instant its own item was captured at in
+    /// [`Self::history`].
     pub first_recorded_at: Option<SystemTime>,
     pub last_recorded_at: Option<SystemTime>,
     /// The configuration items recorded for this resource BEFORE the current one,
@@ -2664,9 +2671,10 @@ impl DiscoveredResourceEntry {
     /// The `configurationStateId` of the current configuration item — "an identifier
     /// that indicates the ordering of the configuration items of a resource" — which
     /// is therefore DERIVED from the instant the item was captured, in milliseconds,
-    /// so recording the resource again moves it forward and two reads of the same
-    /// recorded state report the same id. A resource no configuration item has been
-    /// recorded for has no state to order, so it carries none.
+    /// so each state the resource goes through carries a later id than the one before
+    /// it and every read of ONE recorded state reports the same id. A resource no
+    /// configuration item has been recorded for has no state to order, so it carries
+    /// none.
     pub fn configuration_state_id(&self) -> Option<String> {
         self.last_recorded_at.map(|at| {
             at.duration_since(SystemTime::UNIX_EPOCH)
@@ -2724,8 +2732,8 @@ impl DiscoveredResourceEntry {
     }
 
     /// Whether `other` records a DIFFERENT state of this resource than this entry's
-    /// current item does: a new configuration item is recorded for a state that
-    /// changed, and re-recording the same state only moves the capture instant.
+    /// current item does: a new configuration item is recorded for a state that changed,
+    /// while observing the state that is already recorded records nothing at all.
     fn records_another_state(&self, other: &Self) -> bool {
         self.configuration != other.configuration
             || self.supplementary_configuration != other.supplementary_configuration
@@ -3601,12 +3609,26 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
         // recorded it and the states it has already left; the state it is leaving now
         // joins them when this item records a DIFFERENT state, which is what makes the
         // resource's history the states it went through rather than the writes it
-        // received.
+        // received. An observation of the state that is ALREADY recorded records no item,
+        // so it leaves the held item's capture instant where it is.
         if let Some(held) = self.discovered_resources.get(&key) {
             entry.first_recorded_at = held.first_recorded_at.or(entry.last_recorded_at);
             entry.history = held.history.clone();
-            if held.records_another_state(&entry) && held.last_recorded_at.is_some() {
-                entry.history.push(held.recorded_state());
+            if held.records_another_state(&entry) {
+                if held.last_recorded_at.is_some() {
+                    entry.history.push(held.recorded_state());
+                }
+            } else {
+                // The resource is still in the state the held item records, so this
+                // observation records NO configuration item — and the held one keeps the
+                // instant it was captured at. A configuration item is the state the
+                // resource was in at that instant, so nothing that records no item can
+                // move it: a window or a page a caller built from an instant a read
+                // reported goes on selecting the item it came from, however many times
+                // the same state is observed afterwards. A resource the inventory holds
+                // no captured item for yet takes this observation's instant, which is the
+                // first one it has.
+                entry.last_recorded_at = held.last_recorded_at.or(entry.last_recorded_at);
             }
             while entry.history.len() > CONFIGURATION_ITEMS_KEPT {
                 entry.history.remove(0);
