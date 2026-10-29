@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateVpcEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateVpcEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateVpcEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the add/remove lists this request carries to the STORED managed interface
+//! endpoint its `id` names, reports it in the non-terminal status the change is applied in,
+//! and records when it was modified — so a later `BatchGetVpcEndpoint` answers exactly the
+//! subnets and security groups the endpoint is left carrying.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +152,221 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateVpcEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateVpcEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateVpcEndpoint"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateVpcEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Each list the request names is held to the bound on the member it changes BEFORE
+        // any work is done over it and before the shared store is locked, so no caller can
+        // choose how much work this request costs. `SecurityGroupIds` publishes its own
+        // maximum, which the boundary validator already applies; `SubnetIds` publishes none,
+        // so this is the only place its lists are bounded.
+        for (member, entries, limit) in [
+            (
+                "addSubnetIds",
+                input.add_subnet_ids.as_deref(),
+                crate::state::MAX_SUBNET_IDS,
+            ),
+            (
+                "removeSubnetIds",
+                input.remove_subnet_ids.as_deref(),
+                crate::state::MAX_SUBNET_IDS,
+            ),
+            (
+                "addSecurityGroupIds",
+                input.add_security_group_ids.as_deref(),
+                crate::state::MAX_SECURITY_GROUP_IDS,
+            ),
+            (
+                "removeSecurityGroupIds",
+                input.remove_security_group_ids.as_deref(),
+                crate::state::MAX_SECURITY_GROUP_IDS,
+            ),
+        ] {
+            let named = entries.unwrap_or_default();
+            if named.len() > limit {
+                return Err(UpdateVpcEndpointErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::validation_error_message(
+                            member,
+                            &crate::state::rendered_id_list(named),
+                            &crate::state::max_length_constraint(limit),
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A request that asks for the same member to be added and removed describes no one
+        // resulting set, so it is refused as invalid input rather than resolved by the order
+        // the two lists happen to be applied in.
+        if let Some(id) = crate::state::id_named_in_both(
+            input.add_subnet_ids.as_deref(),
+            input.remove_subnet_ids.as_deref(),
+        ) {
+            return Err(UpdateVpcEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::validation_error_message(
+                        "addSubnetIds",
+                        id,
+                        "Member must not also be named in 'removeSubnetIds'",
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(id) = crate::state::id_named_in_both(
+            input.add_security_group_ids.as_deref(),
+            input.remove_security_group_ids.as_deref(),
+        ) {
+            return Err(UpdateVpcEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::validation_error_message(
+                        "addSecurityGroupIds",
+                        id,
+                        "Member must not also be named in 'removeSecurityGroupIds'",
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // A replayed `clientToken` is a retry of the call that already applied this update,
+        // so it answers the record that call left rather than applying the change twice.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(record) = store.replayed_vpc_endpoint(Self::NAME, token) {
+                return Ok(UpdateVpcEndpointOutput {
+                    update_vpc_endpoint_detail: Some(record.update_detail()),
+                });
+            }
+        }
+
+        // `UpdateVpcEndpoint` models no not-found error (its errors are `ConflictException`,
+        // `InternalServerException` and `ValidationException`), so an id that names no
+        // endpoint is refused as invalid input rather than with an error this operation does
+        // not declare. The record is reached ONCE, mutably: everything below reads it and
+        // then writes it under the same lock.
+        let updated_at = crate::state::now_epoch_millis();
+        let Some(record) = store.vpc_endpoints.get_mut(&input.id) else {
+            return Err(UpdateVpcEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::ERROR_MESSAGE_VPC_ENDPOINT_NOT_FOUND.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An endpoint still being brought up, or already going away, is not in a status it
+        // can be changed from: that is the state conflict `ConflictException` describes, and
+        // it is also what the LOSER of two concurrent updates gets, since the winner leaves
+        // the endpoint in the non-terminal status it settles out of.
+        if !crate::state::VPC_ENDPOINT_UPDATABLE_STATUSES.contains(&record.status.as_str()) {
+            return Err(
+                UpdateVpcEndpointErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "VPC endpoint cannot be updated because it is not in {} status.",
+                        crate::state::statuses_phrase(
+                            &crate::state::VPC_ENDPOINT_UPDATABLE_STATUSES
+                        )
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The lists the update would leave, computed from the stored record and the lists
+        // already held to their bounds above, before anything is written: the stored lists
+        // are the same shapes one request is held to, so the RESULT has to satisfy their
+        // bounds too.
+        let subnet_ids = crate::state::changed_ids(
+            &record.subnet_ids,
+            input.add_subnet_ids.as_deref(),
+            input.remove_subnet_ids.as_deref(),
+        );
+        let security_group_ids = crate::state::changed_ids(
+            &record.security_group_ids,
+            input.add_security_group_ids.as_deref(),
+            input.remove_security_group_ids.as_deref(),
+        );
+        if subnet_ids.len() < crate::state::MIN_SUBNET_IDS {
+            return Err(UpdateVpcEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::validation_error_message(
+                        "removeSubnetIds",
+                        &crate::state::rendered_id_list(
+                            input.remove_subnet_ids.as_deref().unwrap_or_default(),
+                        ),
+                        &format!(
+                            "The endpoint must keep at least {} subnet",
+                            crate::state::MIN_SUBNET_IDS
+                        ),
+                    )),
+                },
+            )
+            .into());
+        }
+        // The list the update leaves is held to the same bound as the lists that changed it,
+        // so the stored endpoint stays within it however many updates add to it.
+        if subnet_ids.len() > crate::state::MAX_SUBNET_IDS {
+            return Err(UpdateVpcEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::validation_error_message(
+                        "addSubnetIds",
+                        &crate::state::rendered_id_list(
+                            input.add_subnet_ids.as_deref().unwrap_or_default(),
+                        ),
+                        &format!(
+                            "The endpoint must not have more than {} subnets",
+                            crate::state::MAX_SUBNET_IDS
+                        ),
+                    )),
+                },
+            )
+            .into());
+        }
+        if security_group_ids.len() > crate::state::MAX_SECURITY_GROUP_IDS {
+            return Err(UpdateVpcEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::validation_error_message(
+                        "addSecurityGroupIds",
+                        &crate::state::rendered_id_list(
+                            input.add_security_group_ids.as_deref().unwrap_or_default(),
+                        ),
+                        &format!(
+                            "The endpoint must not have more than {} security groups",
+                            crate::state::MAX_SECURITY_GROUP_IDS
+                        ),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        record.subnet_ids = subnet_ids;
+        record.security_group_ids = security_group_ids;
+        // The change is ACCEPTED here, not completed: the endpoint is reported in the
+        // non-terminal status the update is applied in and reaches `ACTIVE` on its own a
+        // moment later, with nobody calling.
+        record.begin_update(updated_at);
+        let detail = record.update_detail();
+        if let Some(token) = input.client_token.as_deref() {
+            store.remember_token(Self::NAME, token, &input.id);
+        }
+
+        // Answered from the STORED record, so the update cannot report anything a later
+        // `BatchGetVpcEndpoint` would not.
+        Ok(UpdateVpcEndpointOutput {
+            update_vpc_endpoint_detail: Some(detail),
+        })
     }
 }

@@ -17,7 +17,7 @@
 //! `src/ops/mod.rs` is generated, so a helper more than one operation reaches lives here
 //! rather than in a second module under `src/ops/`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
@@ -30,8 +30,8 @@ use crate::ops::types::{
     IamIdentityCenterConfigOptions, LifecyclePolicyDetail, LifecyclePolicyErrorDetail,
     LifecyclePolicySummary, SamlConfigOptions, SecurityConfigDetail, SecurityConfigSummary, SecurityPolicyDetail,
     SecurityPolicySummary, Tag, UpdateCollectionDetail, UpdateCollectionGroupDetail,
-    UpdateIamIdentityCenterConfigOptions, VectorOptions, VpcEndpointDetail, VpcEndpointErrorDetail,
-    VpcEndpointSummary,
+    UpdateIamIdentityCenterConfigOptions, UpdateVpcEndpointDetail, VectorOptions, VpcEndpointDetail,
+    VpcEndpointErrorDetail, VpcEndpointSummary,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -125,6 +125,40 @@ pub const VPC_ENDPOINT_FAILED: &str = "FAILED";
 /// `VpcEndpointStatus` actually models — it declares `PENDING`, `DELETING`, `ACTIVE` and
 /// `FAILED`, and no `UPDATE_FAILED`.
 pub const VPC_ENDPOINT_DELETABLE_STATUSES: [&str; 2] = [VPC_ENDPOINT_ACTIVE, VPC_ENDPOINT_FAILED];
+
+/// The statuses a managed interface endpoint may be UPDATED from: the SETTLED ones, which
+/// for `VpcEndpointStatus` are the same pair a deletion is accepted in
+/// ([`VPC_ENDPOINT_DELETABLE_STATUSES`]). The other two it models, `PENDING` and
+/// `DELETING`, are the non-terminal statuses an endpoint is on its way through — an
+/// endpoint still being brought up, or already going away, is the state conflict
+/// `ConflictException` describes.
+pub const VPC_ENDPOINT_UPDATABLE_STATUSES: [&str; 2] = VPC_ENDPOINT_DELETABLE_STATUSES;
+
+/// The most security groups an endpoint may carry, from `SecurityGroupIds`' own
+/// `@length(min: 1, max: 5)` (`smithy_query(query="shape", shape="SecurityGroupIds")`).
+///
+/// The boundary validator holds ONE request's list to it; the stored list an update ADDS
+/// to is held to it in the handler, so no sequence of accepted requests leaves an endpoint
+/// carrying more groups than one request could ask for.
+pub const MAX_SECURITY_GROUP_IDS: usize = 5;
+
+/// The fewest subnets an endpoint may carry, from `SubnetIds`' own `@length(min: 1)`
+/// (`smithy_query(query="shape", shape="SubnetIds")`): the endpoint is reached THROUGH its
+/// subnets, and `subnetIds` is `@required` on the create, so an update that would remove
+/// every one of them is refused.
+pub const MIN_SUBNET_IDS: usize = 1;
+
+/// The most subnets an endpoint may carry, and the most one request may name.
+///
+/// `SubnetIds` carries `@length(min: 1)` and NO maximum, so nothing in the model bounds the
+/// list a request names or the list a succession of updates grows: this is what keeps both
+/// finite, which is why it exists at all. The COUNT comes from how an interface endpoint
+/// reaches a service: AWS PrivateLink's "Access an AWS service using an interface VPC
+/// endpoint" has the caller select one subnet per Availability Zone, and the largest number
+/// of Availability Zones an AWS Region has is six (`us-east-1`). It is therefore a bound
+/// this emulator chooses, not one the model publishes, and a refusal against it is worded
+/// as the validation layer words a length violation.
+pub const MAX_SUBNET_IDS: usize = 6;
 
 /// `ServerlessGeneration$CLASSIC`, the generation a collection group carries when its
 /// create request does not name one.
@@ -2155,6 +2189,88 @@ pub fn vpc_endpoint_error_for_id(id: &str) -> VpcEndpointErrorDetail {
     }
 }
 
+/// A refusal worded as this service's validation layer words one: the
+/// `<n> validation error detected: Value '<value>' at '<member>' failed to satisfy
+/// constraint: <constraint>` sentence the framework renders for a modelled constraint
+/// failure, for the single violation a handler refuses. One wording, so a refusal a handler
+/// makes reads exactly as the identical one made at the boundary does.
+pub fn validation_error_message(member: &str, value: &str, constraint: &str) -> String {
+    format!(
+        "1 validation error detected: Value '{value}' at '{member}' failed to satisfy \
+         constraint: {constraint}"
+    )
+}
+
+/// A list of ids as a refusal names the value that failed it.
+pub fn rendered_id_list(entries: &[String]) -> String {
+    format!("[{}]", entries.join(", "))
+}
+
+/// The constraint clause for a list longer than `limit`, as the boundary validator words a
+/// member over its own maximum length.
+pub fn max_length_constraint(limit: usize) -> String {
+    format!("Member must have length less than or equal to {limit}")
+}
+
+/// The first id named by BOTH an update's add list and its remove list, if any.
+///
+/// A request that asks for the same member to be added and removed describes no one
+/// resulting set, so the operation refuses it rather than picking an order; see
+/// [`apply_id_change`], which is what applies a request that names no such id.
+///
+/// The remove list is indexed into a set first, so the comparison is linear in the two
+/// lists rather than in their product.
+pub fn id_named_in_both<'a>(
+    add: Option<&'a [String]>,
+    remove: Option<&[String]>,
+) -> Option<&'a str> {
+    let (add, remove) = (add?, remove?);
+    let removed: HashSet<&str> = remove.iter().map(String::as_str).collect();
+    add.iter()
+        .find(|id| removed.contains(id.as_str()))
+        .map(String::as_str)
+}
+
+/// Apply an update's add and remove lists to one of an endpoint's id lists.
+///
+/// The list is a SET of ids the endpoint carries: an id it already holds is not held twice
+/// when it is added again, and one it does not hold is unaffected by a removal, so the same
+/// update applied twice leaves the same list. The ids the request keeps stay in the order
+/// the endpoint already held them and the ones it adds follow, so what a reader reports is
+/// stable across updates. Removals are applied before additions, which is why
+/// [`id_named_in_both`] refuses a request naming one id in both lists instead of letting
+/// that order decide.
+///
+/// Each membership test goes through a set, so the work is linear in the lists rather than
+/// in their product however long the caller's are.
+fn apply_id_change(current: &mut Vec<String>, add: Option<&[String]>, remove: Option<&[String]>) {
+    if let Some(remove) = remove {
+        let removed: HashSet<&str> = remove.iter().map(String::as_str).collect();
+        current.retain(|id| !removed.contains(id.as_str()));
+    }
+    let Some(add) = add else {
+        return;
+    };
+    let mut held: HashSet<String> = current.iter().cloned().collect();
+    for id in add {
+        if held.insert(id.clone()) {
+            current.push(id.clone());
+        }
+    }
+}
+
+/// The list an update would leave, without touching the stored one: [`apply_id_change`] on
+/// a copy, so a handler can hold the RESULT to the model's bounds before it writes anything.
+pub fn changed_ids(
+    current: &[String],
+    add: Option<&[String]>,
+    remove: Option<&[String]>,
+) -> Vec<String> {
+    let mut changed = current.to_vec();
+    apply_id_change(&mut changed, add, remove);
+    changed
+}
+
 /// One stored OpenSearch Serverless-managed interface VPC endpoint. Every field a reader
 /// reports is held here; nothing is recomputed from a request.
 #[derive(Debug, Clone)]
@@ -2175,6 +2291,10 @@ pub struct VpcEndpointRecord {
     /// The `VpcEndpointStatus` wire value, settled through [`PendingStatus`].
     pub status: String,
     pub created_date: i64,
+    /// When this endpoint was last modified, which is its creation until an update moves
+    /// it. `UpdateVpcEndpointDetail$lastModifiedDate` is the one member that reports it;
+    /// held exactly as [`CollectionRecord::last_modified_date`] is.
+    pub last_modified_date: i64,
     /// The transition the clock owes this endpoint, while one is outstanding.
     pub pending_status: Option<PendingStatus>,
     /// When this endpoint's accepted deletion is due to be PURGED — the instant from which
@@ -2221,6 +2341,36 @@ impl VpcEndpointRecord {
     /// Whether the clock has already made this endpoint's purge due at `now`.
     pub fn is_purge_due(&self, now: Instant) -> bool {
         self.purge_at.is_some_and(|due_at| now >= due_at)
+    }
+
+    /// Accept an UPDATE of this endpoint: report it `PENDING` from now, settling back to
+    /// `ACTIVE` once the clock makes that due, and record the moment it was modified.
+    ///
+    /// `VpcEndpointStatus` models no `UPDATING` — `PENDING`, `ACTIVE`, `DELETING` and
+    /// `FAILED` are all it declares — so `PENDING` is the non-terminal status the change is
+    /// applied in, which is what `UpdateVpcEndpointDetail$status` ("the current status of
+    /// the endpoint update process") reports. Mirrors [`CollectionRecord::begin_update`].
+    pub fn begin_update(&mut self, updated_at: i64) {
+        self.begin_transition(VPC_ENDPOINT_PENDING, VPC_ENDPOINT_ACTIVE);
+        self.last_modified_date = updated_at;
+    }
+
+    /// The `UpdateVpcEndpointDetail` body for this record — the one place this crate renders
+    /// that shape, so an accepted update cannot report an endpoint differently from the
+    /// reads beside it.
+    pub fn update_detail(&self) -> UpdateVpcEndpointDetail {
+        UpdateVpcEndpointDetail {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            status: Some(self.status.clone()),
+            subnet_ids: Some(self.subnet_ids.clone()),
+            // Absent rather than empty for an endpoint carrying no security groups, for the
+            // reason [`Self::detail`] reports it that way: `SecurityGroupIds` is
+            // `@length(min: 1)` on the wire.
+            security_group_ids: (!self.security_group_ids.is_empty())
+                .then(|| self.security_group_ids.clone()),
+            last_modified_date: Some(self.last_modified_date),
+        }
     }
 
     /// The `DeleteVpcEndpointDetail` body for this record — the one place this crate renders

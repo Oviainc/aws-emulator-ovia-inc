@@ -163,6 +163,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `SubnetIds` carries no maximum, so the list this request names is held to the
+        // bound that keeps an endpoint's subnet list finite BEFORE anything is allocated or
+        // the shared store is locked.
+        if input.subnet_ids.len() > crate::state::MAX_SUBNET_IDS {
+            return Err(CreateVpcEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::validation_error_message(
+                        "subnetIds",
+                        &crate::state::rendered_id_list(&input.subnet_ids),
+                        &crate::state::max_length_constraint(crate::state::MAX_SUBNET_IDS),
+                    )),
+                },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
         store.settle_due_transitions();
 
@@ -217,6 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_vpc_endpoint_id();
+        let created_at = crate::state::now_epoch_millis();
         let mut record = crate::state::VpcEndpointRecord {
             id: id.clone(),
             name: input.name,
@@ -226,7 +243,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Overwritten by `begin_transition` below, which is what owes the move to
             // `ACTIVE`.
             status: crate::state::VPC_ENDPOINT_PENDING.to_string(),
-            created_date: crate::state::now_epoch_millis(),
+            created_date: created_at,
+            // An endpoint nothing has updated was last modified when it was created.
+            last_modified_date: created_at,
             pending_status: None,
             // Nothing is owed on a fresh endpoint but the transition below; a purge is owed
             // only once a delete is accepted.
