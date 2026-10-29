@@ -19,6 +19,8 @@ mod application_lifecycle;
 mod application_reference_refusals;
 #[path = "all/application_refresh.rs"]
 mod application_refresh;
+#[path = "all/associated_applications.rs"]
+mod associated_applications;
 #[path = "all/component_arn_resolution.rs"]
 mod component_arn_resolution;
 #[path = "all/component_cross_references.rs"]

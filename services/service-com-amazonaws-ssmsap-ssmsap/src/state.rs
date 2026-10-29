@@ -60,6 +60,17 @@
 //! [`StoredApplication::database_view`], so the database a caller reads one by one is the
 //! database the listing reports.
 //!
+//! Those databases are also what ASSOCIATES two registered applications with one
+//! another: an application whose SAP HANA connection names the database of another
+//! registered application shares that database with it, so each is an associated
+//! application of the other. The relation lives between the two records rather than on
+//! either, so it is derived from the same database sets
+//! ([`RegionState::associated_application_arns`]) at the instant an `Application` is
+//! projected ([`RegionState::application_view`]) — which is what
+//! `Application$AssociatedApplicationArns` reports, whichever call last set that
+//! connection (`RegisterApplication$DatabaseArn`,
+//! `UpdateApplicationSettings$DatabaseArn`).
+//!
 //! The database management system those databases live in is the one thing held BESIDE
 //! that record ([`StoredApplication::dbms`]), because the application and its connected
 //! DBMS are started and stopped separately: `StopApplication` stops the DBMS only when
@@ -660,7 +671,6 @@ pub struct StoredApplication {
     /// component of the SAP system its `Sid` names. The emulator discovers nothing on its
     /// own, so an application whose registration described neither has no components.
     pub components: Vec<StoredComponent>,
-    pub associated_application_arns: Vec<String>,
     pub last_updated: SystemTime,
     pub sid: Option<String>,
     pub sap_instance_number: Option<String>,
@@ -869,7 +879,14 @@ impl StoredApplication {
     }
 
     /// Project the stored application onto the modelled `Application`.
-    pub fn view(&self) -> Application {
+    ///
+    /// `associated_application_arns` are the ARNs of the applications this one is
+    /// associated with. That is a relation BETWEEN registrations rather than anything one
+    /// of them holds, so it is resolved against the partition the application is read out
+    /// of ([`RegionState::associated_application_arns`]) and handed in here — which is why
+    /// handlers project an application through [`RegionState::application_view`] rather
+    /// than calling this directly.
+    pub fn view(&self, associated_application_arns: Vec<String>) -> Application {
         Application {
             id: Some(self.id.clone()),
             r#type: Some(self.app_type.clone()),
@@ -880,10 +897,10 @@ impl StoredApplication {
             components: Some(self.components.iter().map(|c| c.id.clone()).collect()),
             last_updated: Some(::aws_smithy_types::DateTime::from(self.last_updated)),
             status_message: self.status_message.clone(),
-            associated_application_arns: if self.associated_application_arns.is_empty() {
+            associated_application_arns: if associated_application_arns.is_empty() {
                 None
             } else {
-                Some(self.associated_application_arns.clone())
+                Some(associated_application_arns)
             },
         }
     }
@@ -2940,6 +2957,60 @@ impl RegionState {
                 .map(|app| app.id.clone());
         }
         None
+    }
+
+    /// Project `application` onto the modelled `Application` as this partition holds it.
+    ///
+    /// The ONE place an `Application` is assembled, so every call that answers one —
+    /// `RegisterApplication` and `GetApplication` — reports the same thing about the same
+    /// application, including the applications it is associated with
+    /// ([`Self::associated_application_arns`]), which no single record can answer alone.
+    pub fn application_view(&self, application: &StoredApplication) -> Application {
+        application.view(self.associated_application_arns(application))
+    }
+
+    /// The ARNs of the applications of this Region that `application` is ASSOCIATED with,
+    /// in `ApplicationId` order.
+    ///
+    /// Two registered applications are associated when they share an SAP HANA database:
+    /// an SAP_ABAP application's SAP HANA connection names the database of the HANA
+    /// application that runs it (`RegisterApplication$DatabaseArn` names it at
+    /// registration and `UpdateApplicationSettings$DatabaseArn` replaces it later), so
+    /// the database is one of BOTH applications' databases
+    /// ([`StoredApplication::databases`]) and each is an associated application of the
+    /// other. The relation is therefore derived from the same database set every
+    /// `ListDatabases` and `GetDatabase` resolves, matched on the database's own ARN as
+    /// [`Self::resolve_database`] matches one — so it is symmetric, it follows whichever
+    /// call last set that connection, and it ends when either registration does, with
+    /// nothing to keep in step on either record.
+    ///
+    /// An application is never associated with itself, and one sharing no database with
+    /// any other is associated with none.
+    ///
+    /// The work is ONE enumeration of this partition's applications and of the databases
+    /// each registration derives, so what a read costs is bounded by the store's own
+    /// ceilings ([`MAX_APPLICATIONS`], [`MAX_CREDENTIALS_PER_APPLICATION`]) rather than by
+    /// anything a request carries.
+    pub fn associated_application_arns(&self, application: &StoredApplication) -> Vec<String> {
+        let databases: BTreeSet<String> = application
+            .databases(arn_region(&application.arn))
+            .into_iter()
+            .map(|database| database.arn)
+            .collect();
+        if databases.is_empty() {
+            return Vec::new();
+        }
+        self.applications
+            .values()
+            .filter(|other| other.id != application.id)
+            .filter(|other| {
+                other
+                    .databases(arn_region(&other.arn))
+                    .iter()
+                    .any(|database| databases.contains(&database.arn))
+            })
+            .map(|other| other.arn.clone())
+            .collect()
     }
 
     /// The tags held for `arn`, absent when none are.

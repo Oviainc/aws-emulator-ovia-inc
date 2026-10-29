@@ -294,7 +294,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // system is neither started nor stopped and nothing is re-discovered, so the
         // `Status` and `DiscoveryStatus` the application is in are left as they were.
         // `EnsureNoBackupInProcess` asks the service to refuse while a backup of the
-        // database is running; the emulator runs no backup, so none ever is.
+        // database is running; the emulator runs no backup, so none ever is. A
+        // `DatabaseArn` replaces the application's SAP HANA connection, so from the
+        // instant it settles the application shares that database with the application
+        // whose database it is and the two report each other as associated applications
+        // (`crate::state::RegionState::associated_application_arns`).
         application.pending = Some(crate::state::PendingTransition {
             due_at: now + crate::state::TRANSITION_SPAN,
             change: crate::state::PendingChange::Settings(crate::state::PendingSettings {

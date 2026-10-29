@@ -295,9 +295,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // nothing to explain.
             status_message: None,
             components,
-            // Associating applications with one another is `UpdateApplicationSettings`'
-            // business, so a freshly registered application is associated with none.
-            associated_application_arns: Vec::new(),
             last_updated: now,
             sid: input.sid,
             sap_instance_number: input.sap_instance_number,
@@ -372,7 +369,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::std::collections::HashMap::new(),
             now,
         );
-        let view = application.view();
+        // Projected through the partition, because what an `Application` reports about
+        // the applications it is associated with is a relation between registrations
+        // rather than anything this record holds
+        // (`crate::state::RegionState::associated_application_arns`): a registration whose
+        // SAP HANA connection names the database of an application already registered
+        // here is associated with it from this call on, and that application is
+        // associated with this one.
+        let view = region_state.application_view(&application);
         region_state
             .applications
             .insert(input.application_id, application);

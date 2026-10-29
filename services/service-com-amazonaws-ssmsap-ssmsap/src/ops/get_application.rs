@@ -190,7 +190,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .applications
             .get(&id)
             .expect("the resolved id names an application stored in this region");
-        let view = application.view();
+        // Projected through the partition: the applications this one is associated with
+        // are the ones it shares an SAP HANA database with, which is a relation between
+        // registrations rather than anything one record holds
+        // (`crate::state::RegionState::associated_application_arns`).
+        let view = region_state.application_view(application);
         let tags = region_state.tags_for(&application.arn);
 
         Ok(GetApplicationOutput {
