@@ -8,10 +8,13 @@
 //!    `ValidationException` whose `Message` is the AWS constraint envelope —
 //!    `1 validation error detected: Value '<value>' at '<member path>' failed to satisfy
 //!    constraint: <requirement>`, and `N validation errors detected: …; …` for several —
-//!    where a `@pattern` requirement quotes the expression WITHOUT the `^` / `$` anchors
-//!    the model spells it with. A client that lifts the advertised expression out of the
-//!    message to repair its request must receive the expression the service advertises,
-//!    not the model's anchored source.
+//!    where the quoted value is the one the CALLER SUBMITTED (a list-valued member as the
+//!    list it sent, each element in the form an SDK prints a modelled structure in) and a
+//!    `@pattern` requirement quotes the expression WITHOUT the `^` / `$` anchors the model
+//!    spells it with. A client that lifts the advertised expression out of the message to
+//!    repair its request must receive the expression the service advertises, not the
+//!    model's anchored source — and a client that compares the echoed value against what
+//!    it sent must see its own values, not a count of them.
 //!
 //! 2. A `GetTable` naming a table the catalog does not publish is answered
 //!    `ValidationException` whose `Message` is BUILT FROM THE REQUEST: it names the table
@@ -45,6 +48,17 @@ const EXPORT_NAME_PATTERN: &str = r"^[0-9A-Za-z\-_]+$";
 const ARN_PATTERN: &str =
     r"^arn:aws[-a-z0-9]*:(bcm-data-exports):[-a-z0-9]*:[0-9]{12}:[-a-zA-Z0-9/:_]+$";
 
+/// The most a boundary-constraint envelope may run to.
+///
+/// It is NOT `ValidationException$Message`'s modelled `@length(0, 1024)`: recorded AWS
+/// behaviour quotes the submitted value WHOLE in this envelope — a 201-element
+/// `ResourceTags` comes back with every element spelled out, far past that bound — so what
+/// the sentence is held to is the per-message echo ceiling the service states
+/// (`service::validation::ENVELOPE_LENGTH_LIMIT`). The refusals this service words ITSELF
+/// are a different family and stay inside the modelled bound
+/// (`tests/all/refusal_message_bound.rs`).
+const ENVELOPE_MAX_BYTES: usize = 64 * 1024;
+
 /// One refused request: the operation, its body, and the clauses the envelope must carry.
 struct Row {
     label: &'static str,
@@ -57,6 +71,25 @@ struct Row {
 /// The clause for a value that is present but outside its constraint.
 fn clause(value: &str, path: &str, requirement: &str) -> String {
     format!("Value '{value}' at '{path}' failed to satisfy constraint: {requirement}")
+}
+
+/// `tags` as the clause value AWS echoes for a `ResourceTagList` member: the list in
+/// position order, each element the form an AWS SDK prints a modelled structure in.
+///
+/// Spelled here from the MODEL's member names (smithy_query shape `ResourceTag`: `Key`,
+/// `Value`), so the expectation is not computed by the code under test.
+fn rendered_tag_list(tags: &[Value]) -> String {
+    let elements: Vec<String> = tags
+        .iter()
+        .map(|tag| {
+            format!(
+                "ResourceTag(key={}, value={})",
+                tag["Key"].as_str().unwrap_or_default(),
+                tag["Value"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    format!("[{}]", elements.join(", "))
 }
 
 /// A `@pattern` requirement, with the anchors the rule strips removed here the same way:
@@ -144,7 +177,8 @@ fn rows() -> Vec<Row> {
                 "Member must have length greater than or equal to 1",
             )],
         },
-        // @length on a LIST member, which is what the rendered list bound reports.
+        // @length on a LIST member, which AWS echoes as the list the caller submitted —
+        // every element of it, in the form an SDK prints a modelled structure in.
         Row {
             label: "201 resource tags on a create",
             operation: "CreateExport",
@@ -152,7 +186,11 @@ fn rows() -> Vec<Row> {
                 "Export": export_with("tagged_export", valid_query),
                 "ResourceTags": too_many_tags,
             }),
-            clauses: vec![clause("201 items", "resourceTags", &max_length_200)],
+            clauses: vec![clause(
+                &rendered_tag_list(&too_many_tags),
+                "resourceTags",
+                &max_length_200,
+            )],
         },
         // The same list bound on the other operation that takes the tag list, so the
         // renderer is shown to be the service's and not one operation's.
@@ -167,7 +205,11 @@ fn rows() -> Vec<Row> {
                 ),
                 "ResourceTags": too_many_tags,
             }),
-            clauses: vec![clause("201 items", "resourceTags", &max_length_200)],
+            clauses: vec![clause(
+                &rendered_tag_list(&too_many_tags),
+                "resourceTags",
+                &max_length_200,
+            )],
         },
         // @pattern on a TOP-LEVEL member, on a read.
         Row {
@@ -304,8 +346,9 @@ async fn a_boundary_refusal_states_the_aws_envelope_with_an_unanchored_pattern()
             );
         }
         assert!(
-            message.len() <= 1024,
-            "case {case:?}: the Message must satisfy the modelled @length(0, 1024), got {} characters",
+            message.len() <= ENVELOPE_MAX_BYTES,
+            "case {case:?}: the envelope must stay inside the echo bound this service states \
+             ({ENVELOPE_MAX_BYTES} bytes), got {} bytes",
             message.len()
         );
     }

@@ -14,19 +14,21 @@
 //!
 //! * a clause names the offending value, the MEMBER PATH it sits at and the CONSTRAINT
 //!   that member violated — `Value '<value>' at '<path>' failed to satisfy constraint:
-//!   <requirement>`. An absent member has no value to quote and is reported as the `null`
-//!   it was;
+//!   <requirement>`. The value is the one the CALLER SUBMITTED, quoted whole, including
+//!   where the member is a LIST or a STRUCTURE, which the framework's own violation carries
+//!   only a count summary of (`<n> items`) — see [`clause`]. An absent member has no value
+//!   to quote and is reported as the `null` it was;
 //! * a `@pattern` requirement quotes the expression WITHOUT the `^` / `$` anchors a model
 //!   spells it with to demand a whole-string match: a client that lifts the advertised
 //!   expression out of the message to repair its request, or asserts on it, must see the
 //!   expression the service advertises and not the model's anchored source;
 //! * the clauses are counted and joined into the AWS envelope — `1 validation error
 //!   detected: <clause>` for one, `N validation errors detected: <clause>; <clause>` for
-//!   several — in the order the walk found them, and the envelope stays inside
-//!   `ValidationException$Message`'s own modelled bound: the count is of every violation
-//!   the walk found, while the clauses spelled after it are budgeted and whatever does not
-//!   fit is reported as a remainder (`crate::state::clip_list_for_message`), because a
-//!   clause echoes a value the caller sent and one request can be refused for many.
+//!   several — in the order the walk found them: the count is of every violation the walk
+//!   found, while the clauses spelled after it are budgeted
+//!   ([`ENVELOPE_LENGTH_LIMIT`], `crate::state::clip_list_for_message`) and whatever does
+//!   not fit is reported as a remainder, because a clause echoes a value the caller sent
+//!   and one request can be refused for many.
 //!
 //! Nothing here is keyed to an operation, a member name or a value: the rule is applied
 //! to whatever [`Violation`] the walk produces, so it holds for every constrained member
@@ -44,15 +46,17 @@
 //! on `service-common` for the IAM evaluation anyway. What stays here is the envelope and
 //! the requirement wording, which that header calls a service DIALECT.
 //!
-//! That crate's OTHER half — `with_submitted_values`, which restores a value the
-//! framework elided (`… [n bytes]`) to the bytes the caller sent — is NOT reachable from
-//! here: it needs the BUILT INPUT and its operation's schema to re-walk, and
-//! `override_refusal` is handed the violations alone (no operation, no request). It is
-//! callable only from a per-operation wrapper, as `services/common/src/front_door.rs` is;
-//! this service serves its operations unwrapped, so an elided echo stands until the rules
-//! and that wrapper move together.
+//! That crate's OTHER half — the walk that restores the value a violation is about to the
+//! one the caller SUBMITTED (`refusing_violations_with_echoes`, which also renders a
+//! composite member) — needs the BUILT INPUT and its operation's schema, while
+//! `override_refusal` is handed the violations alone (no operation, no request). So it is
+//! called from the per-operation wrapper [`crate::service::WordedRefusals`], which words
+//! every constraint refusal of a modelled operation through the clause builder here; this
+//! seam stays the fallback for a refusal that does not reach that wrapper.
 
 use smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
+
+use ::service_common::validation::SubmittedEcho;
 
 /// The error code this service answers an input-constraint violation with: its own
 /// modelled `ValidationException`, `@error("client")` with `httpError 400`
@@ -65,7 +69,21 @@ pub(crate) const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// so a caller cannot turn a small request into an arbitrarily long refusal. If upstream
 /// ever raises its own cap this one simply stays the tighter of the two, which is the safe
 /// direction.
-const MAX_VIOLATIONS: usize = 100;
+pub(crate) const MAX_VIOLATIONS: usize = 100;
+
+/// How long the envelope of a boundary refusal may run, in bytes.
+///
+/// RECORDED AWS behaviour: the constraint envelope quotes the value the caller SUBMITTED,
+/// and it quotes it WHOLE — a list one element past its `@length` maximum comes back with
+/// every element spelled out, in a sentence far longer than the `@length(0, 1024)` the
+/// member it travels in declares. So this envelope is not held to
+/// [`crate::state::MESSAGE_LENGTH_LIMIT`], which is what every refusal this service WORDS
+/// ITSELF is held to: what bounds it instead is the echo the restoring walk may produce,
+/// per value and over one message (`service_common::validation`, whose own ceilings are 16
+/// KiB and 64 KiB). That number is restated here because that module keeps it private, and
+/// it is what makes this sentence finite without clipping it to a length AWS does not clip
+/// it to.
+const ENVELOPE_LENGTH_LIMIT: usize = 64 * 1024;
 
 /// A `@pattern` expression without the anchors a model spells it with.
 ///
@@ -110,14 +128,22 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
 /// One violation as the clause that goes into the envelope, or `None` for a class this
 /// service has no wording for.
 ///
-/// The value is quoted back as the walk rendered it — AWS's own clause echoes the
-/// offending input, which is the only place the server reports it back — while an absent
-/// member is reported as the `null` it was, a fact of the request's shape rather than a
-/// value the caller sent.
-pub(crate) fn clause(violation: &Violation) -> Option<String> {
+/// The value is quoted as the CALLER SUBMITTED it (`echo`), which is what AWS's own clause
+/// echoes: a composite member — a list, a structure — reaches a service with the
+/// framework's count summary (`<n> items`) in place of its value, which is wire text AWS
+/// never emits, so where the restoring walk rendered the submitted value that rendering is
+/// quoted instead. A value the walk could not render keeps the framework's own text, which
+/// for every scalar member IS the submitted value, and an absent member is reported as the
+/// `null` it was — a fact of the request's shape rather than a value the caller sent.
+pub(crate) fn clause(violation: &Violation, echo: &SubmittedEcho) -> Option<String> {
     let requirement = requirement(&violation.kind)?;
     let path = &violation.path;
-    Some(match &violation.value {
+    let value = match echo {
+        SubmittedEcho::Rendered(rendered) => Some(rendered.as_str()),
+        SubmittedEcho::Absent => None,
+        SubmittedEcho::Unrendered => violation.value.as_deref(),
+    };
+    Some(match value {
         Some(shown) => {
             format!("Value '{shown}' at '{path}' failed to satisfy constraint: {requirement}")
         }
@@ -125,19 +151,35 @@ pub(crate) fn clause(violation: &Violation) -> Option<String> {
     })
 }
 
+/// Each violation paired with the only echo this service can offer when it is handed the
+/// violations WITHOUT the request they came from ([`refused`]): an absent member has no
+/// value, and a present one keeps whatever the framework stored for it.
+fn without_echoes(violations: &[Violation]) -> Vec<(Violation, SubmittedEcho)> {
+    violations
+        .iter()
+        .map(|violation| {
+            let echo = match violation.value {
+                None => SubmittedEcho::Absent,
+                Some(_) => SubmittedEcho::Unrendered,
+            };
+            (violation.clone(), echo)
+        })
+        .collect()
+}
+
 /// The `message` of a refused request: the AWS envelope over one clause per violation, in
 /// the order the walk found them. `None` declines the whole refusal — see [`clause`].
 ///
 /// The count is of every clause the walk produced, while the clauses the sentence SPELLS
 /// are budgeted by `crate::state::clip_list_for_message` for the reason stated there: a
-/// clause echoes a caller-supplied value, a refused request carries up to
-/// [`MAX_VIOLATIONS`] of them, and `ValidationException$Message` admits 1024 characters —
-/// so the count is stated whole and the clauses that do not fit are reported as a
-/// remainder.
-pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
-    let clauses = violations
+/// clause echoes a caller-supplied value and a refused request carries up to
+/// [`MAX_VIOLATIONS`] of them — so the count is stated whole and the clauses that do not
+/// fit are reported as a remainder. The budget is [`ENVELOPE_LENGTH_LIMIT`], the bound this
+/// sentence really carries, rather than the message member's own modelled length.
+pub(crate) fn envelope(refused: &[(Violation, SubmittedEcho)]) -> Option<String> {
+    let clauses = refused
         .iter()
-        .map(clause)
+        .map(|(violation, echo)| clause(violation, echo))
         .collect::<Option<Vec<String>>>()?;
     let opening = match clauses.len() {
         0 => return None,
@@ -148,7 +190,7 @@ pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
     let stated = crate::state::clip_list_for_message(
         &clauses,
         "; ",
-        crate::state::MESSAGE_LENGTH_LIMIT.saturating_sub(opening.len()),
+        ENVELOPE_LENGTH_LIMIT.saturating_sub(opening.len()),
     );
     Some(format!("{opening}{stated}"))
 }
@@ -158,11 +200,19 @@ pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
 /// Only an input-constraint refusal is reworded. An authentication refusal is a different
 /// failure with a different code and status, and nothing about it is this service's to
 /// word.
+///
+/// This is the FALLBACK path: [`crate::service::WordedRefusals`] answers every constraint
+/// refusal of a modelled operation before the centralized walk reaches here, because it is
+/// the only layer that still has the REQUEST and so can quote a composite member's
+/// submitted value. What reaches here is worded by the same clause builder, from the only
+/// echo this seam can offer ([`without_echoes`]).
 pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
     match refusal {
         Refusal::Invalid(violations) => Some(Refused {
             code: VALIDATION_EXCEPTION.to_string(),
-            message: envelope(&violations[..violations.len().min(MAX_VIOLATIONS)])?,
+            message: envelope(&without_echoes(
+                &violations[..violations.len().min(MAX_VIOLATIONS)],
+            ))?,
         }),
         _ => None,
     }
@@ -208,8 +258,9 @@ mod tests {
         }
     }
 
-    /// A clause quotes the value, the member path and the requirement; an absent member
-    /// keeps the `null` the request's shape states.
+    /// A clause quotes the value the CALLER SUBMITTED, the member path and the
+    /// requirement; an absent member keeps the `null` the request's shape states, and a
+    /// value the restoring walk could not render keeps the framework's own text.
     #[test]
     fn a_clause_states_the_value_the_member_and_the_requirement() {
         let cases = [
@@ -219,15 +270,35 @@ mod tests {
                     kind: ViolationKind::Pattern(r"^[0-9A-Za-z\-_]+$".to_string()),
                     value: Some("bad name!".to_string()),
                 },
+                SubmittedEcho::Rendered("bad name!".to_string()),
                 "Value 'bad name!' at 'export.name' failed to satisfy constraint: Member \
                  must satisfy regular expression pattern: [0-9A-Za-z\\-_]+",
             ),
+            // A LIST member: the framework stored its count summary, and the clause quotes
+            // the rendered list the caller sent instead — structure elements and all.
             (
                 Violation {
                     path: "resourceTags".to_string(),
                     kind: ViolationKind::MaxLength(200),
                     value: Some("201 items".to_string()),
                 },
+                SubmittedEcho::Rendered(
+                    "[ResourceTag(key=k0, value=v0), ResourceTag(key=k1, value=v1)]"
+                        .to_string(),
+                ),
+                "Value '[ResourceTag(key=k0, value=v0), ResourceTag(key=k1, value=v1)]' at \
+                 'resourceTags' failed to satisfy constraint: Member must have length less \
+                 than or equal to 200",
+            ),
+            // The same violation where the walk rendered nothing: the framework's own
+            // text stands rather than no value at all.
+            (
+                Violation {
+                    path: "resourceTags".to_string(),
+                    kind: ViolationKind::MaxLength(200),
+                    value: Some("201 items".to_string()),
+                },
+                SubmittedEcho::Unrendered,
                 "Value '201 items' at 'resourceTags' failed to satisfy constraint: Member \
                  must have length less than or equal to 200",
             ),
@@ -237,15 +308,17 @@ mod tests {
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
                 },
+                SubmittedEcho::Absent,
                 "Value null at 'export.name' failed to satisfy constraint: Member must \
                  not be null",
             ),
         ];
-        for (violation, expected) in cases {
-            let actual = clause(&violation).expect("a modelled violation class is worded");
+        for (violation, echo, expected) in cases {
+            let actual =
+                clause(&violation, &echo).expect("a modelled violation class is worded");
             assert_eq!(
                 actual, expected,
-                "case {violation:?}: expected {expected:?}, got {actual:?}"
+                "case {violation:?} with {echo:?}: expected {expected:?}, got {actual:?}"
             );
         }
     }
@@ -280,7 +353,7 @@ mod tests {
                  have length greater than or equal to 20",
             ),
         ] {
-            let actual = envelope(violations).expect("a worded refusal");
+            let actual = envelope(&without_echoes(violations)).expect("a worded refusal");
             assert_eq!(
                 actual, expected,
                 "case {violations:?}: expected {expected:?}, got {actual:?}"

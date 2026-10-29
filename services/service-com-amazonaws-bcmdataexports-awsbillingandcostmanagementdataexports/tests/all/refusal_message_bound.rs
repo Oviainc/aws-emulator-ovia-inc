@@ -4,7 +4,7 @@
 //!
 //! RULE: `ValidationException$Message` is `@length(0, 1024)`
 //! (`smithy_query(query="shape",shape="ValidationException")`), so a refusal this service
-//! builds from a LIST the request carried states as many of that list's values as the
+//! WORDS ITSELF from a LIST the request carried states as many of that list's values as the
 //! bound admits and reports the rest as a count — the message never grows with the size of
 //! the request. The lists are caller-sized: `ResourceTagKeyList` and `ResourceTagList` are
 //! `@length(0, 200)` over values of `@length(1, 128)` characters
@@ -12,13 +12,18 @@
 //! so quoting every value of one would run to tens of thousands of characters, and a
 //! refused request is likewise stated clause by clause, one clause per offending value.
 //!
-//! Both paths that build a message from such a list are asserted here:
+//! Both paths that build a message from such a list are asserted here, and they are held to
+//! DIFFERENT ceilings, because the recordings do:
 //!
 //! * the handler-side refusal of the reserved `aws:` tag-key namespace, which every
 //!   tag-accepting operation reaches — `UntagResource`'s `ResourceTagKeys`,
-//!   `TagResource`'s and `CreateExport`'s `ResourceTags`;
+//!   `TagResource`'s and `CreateExport`'s `ResourceTags` — stays inside the modelled
+//!   message bound;
 //! * the boundary refusal of a request whose values miss their modelled constraints, which
-//!   states one clause per violation.
+//!   states one clause per violation and QUOTES each offending value whole, as the recorded
+//!   constraint envelope does: that sentence is bounded by the echo ceiling the service
+//!   states ([`ENVELOPE_MAX_BYTES`]) rather than by the member's modelled length, and it
+//!   still accounts for every violation it does not spell.
 //!
 //! The rows differ along what the rule generalises over: how many values the list carries
 //! (one, a handful, the published ceiling), how long each is (a few characters, the
@@ -38,6 +43,11 @@ use crate::tagging::{listed_tags, untagged_export};
 /// The most characters `ValidationException$Message` admits (smithy_query shape
 /// `ValidationException`, member `Message`: `@length(min: 0, max: 1024)`).
 const MESSAGE_MAX_CHARS: usize = 1024;
+
+/// The most BYTES a boundary-constraint envelope may run to: the per-message echo ceiling
+/// this service states for the one refusal family that quotes the submitted value whole
+/// (`service::validation::ENVELOPE_LENGTH_LIMIT`; see the module docs above).
+const ENVELOPE_MAX_BYTES: usize = 64 * 1024;
 
 /// The modelled `@length` ceiling of a tag key (smithy_query shape `ResourceTagKey`:
 /// `@length(min: 1, max: 128)`).
@@ -139,6 +149,12 @@ fn unquoted_count(message: &str) -> usize {
 
 /// The `Message` of a refusal, asserted to satisfy the modelled bound.
 fn bounded_message(case: &str, status: u16, body: &Value) -> String {
+    message_within(case, status, body, MESSAGE_MAX_CHARS)
+}
+
+/// The `Message` of a refusal, asserted to satisfy the ceiling the refusal's own family is
+/// held to — `limit` CHARACTERS.
+fn message_within(case: &str, status: u16, body: &Value, limit: usize) -> String {
     assert_eq!(
         (status, error_code(body).as_str()),
         (400, "ValidationException"),
@@ -150,8 +166,8 @@ fn bounded_message(case: &str, status: u16, body: &Value) -> String {
         .unwrap_or_else(|| panic!("case {case:?}: the refusal must carry a Message: {body}"))
         .to_string();
     assert!(
-        !message.is_empty() && message.chars().count() <= MESSAGE_MAX_CHARS,
-        "case {case:?}: Message must satisfy the modelled @length(0, {MESSAGE_MAX_CHARS}), got {} characters: {message:?}",
+        !message.is_empty() && message.chars().count() <= limit,
+        "case {case:?}: Message must stay inside the {limit}-character ceiling its refusal family is held to, got {} characters: {message:?}",
         message.chars().count()
     );
     // Every other string of the refusal carries the same modelled bound.
@@ -298,7 +314,7 @@ fn stated_violations(case: &str, message: &str) -> usize {
 }
 
 #[tokio::test]
-async fn a_boundary_refusal_stays_inside_the_modelled_message_bound() {
+async fn a_boundary_refusal_stays_inside_the_envelope_ceiling() {
     let client = Client::new();
     let arn = untagged_export(&client, "bounded_boundary_refusal").await;
 
@@ -343,7 +359,7 @@ async fn a_boundary_refusal_stays_inside_the_modelled_message_bound() {
                 &json!({ "ResourceArn": arn, "ResourceTagKeys": keys }),
             )
             .await;
-        let message = bounded_message(&case, status, &body);
+        let message = message_within(&case, status, &body, ENVELOPE_MAX_BYTES);
         let stated = stated_violations(&case, &message);
         assert!(
             stated_clauses(&message) >= 1,

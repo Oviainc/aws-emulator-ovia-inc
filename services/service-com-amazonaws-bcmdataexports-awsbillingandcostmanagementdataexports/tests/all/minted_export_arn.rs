@@ -16,7 +16,8 @@
 //! It is asserted over a TABLE whose rows differ along what the rule generalises over: the
 //! name's length (one glyph, several, and the longest the model allows) and its glyph
 //! classes (digits, upper and lower case, `-`, `_`), the region the create is signed for
-//! (differing in length and hyphen count), and how many times the name is created, deleted
+//! (differing in length and hyphen count — none of which the minted ARN carries, because
+//! this control plane is region-pinned), and how many times the name is created, deleted
 //! and created again. The ids themselves are compared ACROSS rows, so no two exports of the
 //! whole table may share one.
 
@@ -24,6 +25,7 @@ use serde_json::{json, Value};
 
 use crate::export_lifecycle::{
     cases, error_code, generated_export_id, is_uuid_shaped, Case, Client, NOT_FOUND_STATUS,
+    PINNED_REGION,
 };
 
 /// `Export.Name` is `length 1..128`, `pattern ^[0-9A-Za-z\-_]+$` (smithy_query shape
@@ -36,7 +38,8 @@ struct Row {
     label: String,
     /// The `Export.Name` the row creates under.
     name: String,
-    /// The region the row's calls are signed for, and therefore the ARN's region segment.
+    /// The region the row's calls are SIGNED for, which the ARN's region segment does not
+    /// follow.
     region: &'static str,
     /// How many times the row creates the name, deletes it and creates it again.
     rounds: usize,
@@ -132,8 +135,9 @@ async fn a_minted_export_arn_carries_a_per_export_generated_id() {
         );
         assert_eq!(
             arn.split(':').nth(3),
-            Some(row.region),
-            "case {label:?}: the ARN must carry the call's region, got {arn:?}"
+            Some(PINNED_REGION),
+            "case {label:?}: the ARN must carry this service's pinned region whatever region \
+             the call was signed for, got {arn:?}"
         );
 
         // Every reader reports the ARN the create minted, unchanged — and reading it twice

@@ -31,12 +31,13 @@
 //! it, an ordinary one, and the shortest this service's ARN pattern can spell), which
 //! operation is refused, which kind of principal asked (an assumed-role session, an IAM
 //! user signing with a long-term key), and which reason clause the refusal carries (no
-//! policy allows the action, versus an explicit deny beside a wildcard allow) — the two
-//! clauses differ in length, so each leaves the echo a different amount of room.
+//! identity-based policy allows the action, versus an explicit deny beside a wildcard
+//! allow) — the two clauses differ in length, so each leaves the echo a different amount of
+//! room.
 
 use serde_json::{json, Value};
 
-use crate::export_lifecycle::{error_code, padded_arn, MAX_ARN_CHARS};
+use crate::export_lifecycle::{error_code, padded_arn, MAX_ARN_CHARS, PINNED_REGION};
 use crate::front_door_authorization::{allow_all_but, create_request, Emulator};
 
 /// The `@length` ceiling of a `GenericString`, which `AccessDeniedException$Message`
@@ -103,7 +104,9 @@ impl Reason {
     /// The clause the refusal must still state whole, for `action`.
     fn clause(self, action: &str) -> String {
         match self {
-            Self::NothingAllows => format!("because no policy allows the {action} action"),
+            Self::NothingAllows => {
+                format!("because no identity-based policy allows the {action} action")
+            }
             Self::ExplicitDeny => {
                 format!("with an explicit deny in a policy for the {action} action")
             }
@@ -229,16 +232,20 @@ async fn a_tagging_refusal_echoing_any_admissible_arn_stays_within_the_bound() {
     }
 }
 
-/// `CreateExport` authorizes on the ARN it MINTS for the export the request names, so the
-/// caller-supplied part of the echoed resource is the export's `Name` — at its own
-/// published ceiling and at the shortest the model admits, the refusal is bounded and still
-/// names the export the decision was about.
+/// `CreateExport` authorizes on the resource the decision is really taken against — the
+/// account's export resource, `export/*` in this service's pinned region, because the
+/// export the call would create does not exist yet — so the echoed resource is the SAME
+/// whatever `Export.Name` the request carried, at that name's published ceiling and at the
+/// shortest the model admits.
 #[tokio::test]
-async fn a_create_refusal_echoing_the_minted_arn_stays_within_the_bound() {
+async fn a_create_refusal_names_the_account_export_resource_within_the_bound() {
     let emulator = Emulator::new();
     let bare = emulator
         .assumed_role_key("bcmde-bounded-message-create", None)
         .await;
+    // The resource an authorization decision about a create is taken against, spelled from
+    // the ARN grammar rather than read out of the code under test.
+    let decided_about = ::engine::emulator_arn("bcm-data-exports", PINNED_REGION, "export/*");
 
     for (label, name) in [
         ("a Name at its published ceiling", "n".repeat(MAX_EXPORT_NAME_CHARS)),
@@ -254,7 +261,13 @@ async fn a_create_refusal_echoing_the_minted_arn_stays_within_the_bound() {
             &body,
             "bcm-data-exports:CreateExport",
             Reason::NothingAllows,
-            &name,
+            &decided_about,
+        );
+        let message = body["Message"].as_str().unwrap_or_default();
+        assert!(
+            !message.contains(&format!("export/{name}")),
+            "case {label:?}: the decision is about the account's export resource, not about \
+             the requested name, got {message:?}"
         );
     }
 }

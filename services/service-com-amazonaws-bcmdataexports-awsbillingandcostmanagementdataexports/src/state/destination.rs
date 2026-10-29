@@ -29,13 +29,14 @@
 //! overwriting all export parameters" and therefore re-judges the replacement destination
 //! exactly as a create's.
 //!
-//! What this module does NOT judge is whether a well-formed destination is one the
-//! caller's credentials may write: the bucket's existence and its bucket policy live in
-//! Amazon S3, not in this service's state, so a destination inside the rules above is
-//! accepted and the delivery it owes is recorded like any other.
+//! What this module does NOT judge is whether a well-formed destination is one the caller
+//! owns: the bucket lives in Amazon S3, not in this service's state. What it DOES judge
+//! there is the one precondition the service evaluates per call before it accepts a
+//! definition at all — the destination bucket's own policy must grant this service's
+//! principal the object write the delivery performs ([`validate_delivery_grant`]).
 
 use super::{clip_for_message, field_validation_failed};
-use crate::ops::types::{DestinationConfigurations, ValidationException};
+use crate::ops::types::{DestinationConfigurations, S3Destination, ValidationException};
 
 /// The input member a refused output encoding names: the compression is the member whose
 /// value does not go with the format the same request states.
@@ -44,6 +45,9 @@ const COMPRESSION_FIELD: &str =
 
 /// The input member a refused destination Region names.
 const S3_REGION_FIELD: &str = "Export.DestinationConfigurations.S3Destination.S3Region";
+
+/// The input member a refused destination BUCKET names.
+const S3_BUCKET_FIELD: &str = "Export.DestinationConfigurations.S3Destination.S3Bucket";
 
 /// The encodings a data export is delivered in: each `FormatOption` the service writes,
 /// with the `CompressionOption` values it writes that format under.
@@ -99,6 +103,140 @@ pub fn validate_destination_configurations(
         return Err(unsupported_output_encoding(&output.format, &output.compression));
     }
     Ok(())
+}
+
+/// The AWS service principal a data export is delivered in the name of, and therefore the
+/// principal a destination bucket's policy has to grant the write to.
+///
+/// The service writes the export into the caller's bucket itself, on the cadence the
+/// definition states, rather than in the caller's name — so the grant that lets the
+/// delivery happen is one the BUCKET's policy carries, naming this service.
+pub const DELIVERY_SERVICE_PRINCIPAL: &str = "bcm-data-exports.amazonaws.com";
+
+/// The Amazon S3 action one delivery performs: it writes the export's file into the
+/// destination bucket.
+pub const DELIVERY_ACTION: &str = "s3:PutObject";
+
+/// The condition key naming the account a delivery is made on behalf of.
+const SOURCE_ACCOUNT_KEY: &str = "aws:SourceAccount";
+
+/// The condition key naming the resource a delivery is made on behalf of: the export being
+/// delivered.
+const SOURCE_ARN_KEY: &str = "aws:SourceArn";
+
+/// The condition keys a delivery carries a value for, so a clause over one of them is
+/// decided rather than left undecided.
+const DELIVERY_CONDITION_KEYS: &[&str] = &[SOURCE_ACCOUNT_KEY, SOURCE_ARN_KEY];
+
+/// The `Message` a creation refused for the destination bucket's missing delivery grant
+/// carries.
+///
+/// RECORDED AWS behaviour: the refusal is entirely fixed text naming neither the bucket,
+/// the action nor the principal — a bucket with no policy at all and one whose policy
+/// grants this service nothing are the same answer to the caller, which is that the
+/// destination's permissions were checked and did not pass.
+pub const BUCKET_PERMISSION_VALIDATION_FAILED: &str = "S3 bucket permission validation failed";
+
+/// Judge the destination bucket's own POLICY, the way the service does before it accepts a
+/// definition: `Ok(())` when the policy grants [`DELIVERY_SERVICE_PRINCIPAL`] the
+/// [`DELIVERY_ACTION`] on the objects a delivery writes, and the modelled
+/// `ValidationException` (HTTP 400) when it does not.
+///
+/// RECORDED AWS behaviour: this precondition is evaluated PER CALL, not once per bucket —
+/// the identical call refused against an unpolicied bucket succeeds as soon as the policy
+/// is put on that same bucket — and a definition it refuses is not persisted, so a client
+/// whose destination could never be written to learns that from the create rather than
+/// from a delivery that silently never happens. The decision is
+/// [`::service_common::iam_authorization`]'s resource-policy evaluation, the same one every
+/// other service judges a bucket policy with, and it carries the condition keys a
+/// cross-service write is made under ([`DELIVERY_CONDITION_KEYS`]), so a policy scoped to
+/// this account and to this service's exports decides as it would in production.
+///
+/// `export_arn` is the export the delivery is for: the ARN the create just minted, or the
+/// ARN of the export an update replaces.
+///
+/// A destination this emulator's object store can say NOTHING about — a bucket it does not
+/// hold, or no object store on this engine at all — is not refused: a refusal has to be
+/// grounded in a policy that was read, and the bucket's absence is a different fact about
+/// a different service, reported by the read that would fail rather than guessed here.
+pub fn validate_delivery_grant<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    destination: &DestinationConfigurations,
+    export_arn: &str,
+) -> Result<(), ValidationException> {
+    let s3 = &destination.s3_destination;
+    let Some(objects) = ::service_com_amazonaws_s3_amazons3::state::service_state(engine) else {
+        return Ok(());
+    };
+    // The object store is read, the one document this decision is about is taken out of it,
+    // and the lock is released before the policy is evaluated: the two services' stores are
+    // never held at once.
+    let policy = {
+        let store = objects.lock();
+        match store.bucket(&s3.s3_bucket) {
+            // A bucket this emulator holds either carries a policy or carries none, and a
+            // bucket with none grants nothing — which is exactly the recorded refusal.
+            Some(bucket) => bucket.policy.clone().unwrap_or_default(),
+            None => return Ok(()),
+        }
+    };
+    let principals = [DELIVERY_SERVICE_PRINCIPAL.to_string()];
+    let context = [
+        (
+            SOURCE_ACCOUNT_KEY.to_string(),
+            ::engine::emulator_account_id().to_string(),
+        ),
+        (SOURCE_ARN_KEY.to_string(), export_arn.to_string()),
+    ];
+    let objects_written = delivery_object_arn(s3);
+    let request = ::service_common::iam_authorization::Request::new(
+        DELIVERY_ACTION,
+        &objects_written,
+        &principals,
+    )
+    .with_context(&context)
+    .with_published_keys(DELIVERY_CONDITION_KEYS);
+    if ::service_common::iam_authorization::resource_decision(&policy, &request)
+        == ::service_common::iam_authorization::Decision::Allowed
+    {
+        return Ok(());
+    }
+    Err(delivery_grant_missing())
+}
+
+/// The ARN of the objects a delivery to `s3` writes: the destination bucket and the prefix
+/// under it the export's files are written below ("The S3 path prefix you want prepended to
+/// the name of your data export" — the modelled doc for `S3Prefix`).
+///
+/// Spelled through Amazon S3's own object-ARN helper, so this service names an object the
+/// way that service names one, and ending in the key separator because what is written
+/// under the prefix is a path and not the prefix itself: a policy that grants the bucket's
+/// objects (`arn:aws:s3:::<bucket>/*`) covers it, while one that grants an unrelated prefix
+/// does not.
+fn delivery_object_arn(s3: &S3Destination) -> String {
+    let prefix = s3.s3_prefix.trim_matches('/');
+    let key = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}/")
+    };
+    ::service_com_amazonaws_s3_amazons3::state::object_arn(&s3.s3_bucket, &key)
+}
+
+/// The modelled 400 for a destination whose bucket policy does not grant this service the
+/// delivery write.
+///
+/// The member at fault is the destination's `S3Bucket`: the bucket named is the one whose
+/// policy has to carry the grant, and it is what the caller changes (either by naming
+/// another bucket or by putting the policy on this one).
+fn delivery_grant_missing() -> ValidationException {
+    field_validation_failed(
+        S3_BUCKET_FIELD,
+        BUCKET_PERMISSION_VALIDATION_FAILED.to_string(),
+        format!(
+            "The bucket policy must grant {DELIVERY_SERVICE_PRINCIPAL} the {DELIVERY_ACTION} action on the destination."
+        ),
+    )
 }
 
 /// The modelled 400 for an `S3Region` that names no Amazon Web Services Region.

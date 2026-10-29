@@ -27,6 +27,8 @@ mod data_query;
 mod data_query_resolution;
 #[path = "all/delivery_executions.rs"]
 mod delivery_executions;
+#[path = "all/delivery_grant.rs"]
+mod delivery_grant;
 #[path = "all/destination_configuration.rs"]
 mod destination_configuration;
 #[path = "all/error_member_bounds.rs"]

@@ -38,9 +38,15 @@ use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports:
 /// request's credential scope to pick the claiming service (`OPERATIONS.md`).
 const SIGNING_NAME: &str = "bcm-data-exports";
 
-/// The region the test signs for, and therefore the region segment of every ARN the
-/// service mints for these requests.
+/// The region the test signs for.
 const REGION: &str = "us-east-1";
+
+/// The region segment EVERY ARN this service mints carries, whatever region a call is
+/// signed for: BCM Data Exports is a region-pinned control plane (recorded behaviour, see
+/// `state::SERVICE_REGION`).
+///
+/// `pub(crate)` so every suite in this target states the pinned region once.
+pub(crate) const PINNED_REGION: &str = "us-east-1";
 
 /// The access-key id these requests present unless a suite varies it: the AWS
 /// documentation's own example id.
@@ -1178,47 +1184,52 @@ async fn a_page_token_is_not_accepted_by_the_other_listing() {
     );
 }
 
-/// An export is identified by its ARN, and the ARN carries the region of the call that
-/// created it — so one name is one export PER REGION, not per account.
+/// An export is identified by its ARN, and that ARN carries THIS SERVICE's pinned Region
+/// whatever Region the call was signed for — so one name is one export per ACCOUNT, and a
+/// client configured anywhere gets the same identity for it.
 ///
-/// Asserted over several regions differing in length and in hyphen count, because the
-/// rule is about the ARN's region segment rather than about any one region.
+/// Asserted over several regions differing in length and in hyphen count, because the rule
+/// is about the ARN's region segment not following the caller rather than about any one
+/// region.
 #[tokio::test]
-async fn one_name_is_a_distinct_export_in_each_region() {
+async fn one_name_is_one_export_whatever_region_the_call_is_signed_for() {
     let client = Client::new();
     let case = Case {
         name: "shared_name".to_string(),
         ..cases().remove(0)
     };
 
-    // Regions differing in length and in how many hyphens they carry; all are legal
-    // region segments of the modelled Arn pattern (`[-a-z0-9]*`).
+    // Regions differing in length and in how many hyphens they carry, none of which the
+    // minted ARN may carry.
     let regions = ["us-east-1", "eu-west-2", "ap-southeast-4", "us-gov-east-1"];
-    let mut arns: Vec<String> = Vec::new();
-    for region in regions {
-        let created = client
-            .ok_in_region(region, "CreateExport", &case.create_request())
-            .await;
-        let arn = created["ExportArn"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {region:?}: CreateExport returns an ExportArn"))
-            .to_string();
-        assert_modelled_arn(region, &arn, &case.name);
-        assert_eq!(
-            arn.split(':').nth(3),
-            Some(region),
-            "case {region:?}: the ARN must carry the call's region, got {arn:?}"
-        );
-        assert!(
-            !arns.contains(&arn),
-            "case {region:?}: the same name in a new region must mint a new ARN, got {arn:?}"
-        );
-        arns.push(arn);
-    }
+    let created = client
+        .ok_in_region(regions[0], "CreateExport", &case.create_request())
+        .await;
+    let arn = created["ExportArn"]
+        .as_str()
+        .expect("CreateExport returns an ExportArn")
+        .to_string();
+    assert_modelled_arn(regions[0], &arn, &case.name);
+    assert_eq!(
+        arn.split(':').nth(3),
+        Some(PINNED_REGION),
+        "the ARN must carry this service's pinned region, got {arn:?}"
+    );
 
-    // Each one is its own export, readable under its own ARN, and all of them are listed.
-    for (region, arn) in regions.iter().zip(&arns) {
-        let fetched = client.ok("GetExport", &json!({ "ExportArn": arn })).await;
+    // The name is taken for the account: a create signed for ANY region is refused, and the
+    // export is readable, and reported with the same ARN, from any of them.
+    for region in regions {
+        let (status, body) = client
+            .call_in_region(region, "CreateExport", &case.create_request())
+            .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationException"),
+            "case {region:?}: the name is already taken for the account, got {body}"
+        );
+        let fetched = client
+            .ok_in_region(region, "GetExport", &json!({ "ExportArn": arn }))
+            .await;
         assert_eq!(
             fetched["Export"]["ExportArn"],
             json!(arn),
@@ -1233,47 +1244,36 @@ async fn one_name_is_a_distinct_export_in_each_region() {
     let listed = client.ok("ListExports", &json!({})).await;
     assert_eq!(
         listed["Exports"].as_array().expect("Exports").len(),
-        regions.len(),
-        "every per-region export must be listed, got {listed}"
+        1,
+        "one name created once is one export, got {listed}"
     );
 
-    // Within ONE region the name is taken, and deleting that one frees it again without
-    // touching the others.
-    let (status, body) = client
-        .call_in_region(regions[0], "CreateExport", &case.create_request())
-        .await;
-    assert_eq!(
-        (status, error_code(&body).as_str()),
-        (400, "ValidationException"),
-        "case {:?}: the name is already taken in this region, got {body}",
-        regions[0]
-    );
+    // Deleting it frees the name again, and the export that takes it is a new one with an
+    // ARN of its own — in the pinned region, whichever region the create was signed for.
     client
-        .ok("DeleteExport", &json!({ "ExportArn": arns[0] }))
+        .ok("DeleteExport", &json!({ "ExportArn": arn }))
         .await;
     let recreated = client
-        .ok_in_region(regions[0], "CreateExport", &case.create_request())
+        .ok_in_region(regions[3], "CreateExport", &case.create_request())
         .await;
     let recreated_arn = recreated["ExportArn"]
         .as_str()
         .expect("CreateExport returns an ExportArn");
-    assert_modelled_arn(regions[0], recreated_arn, &case.name);
+    assert_modelled_arn(regions[3], recreated_arn, &case.name);
     assert_eq!(
         recreated_arn.split(':').nth(3),
-        Some(regions[0]),
-        "after the delete the name is free again in that region, got {recreated}"
+        Some(PINNED_REGION),
+        "after the delete the name is free again, got {recreated}"
     );
     assert_ne!(
-        recreated_arn, arns[0],
+        recreated_arn, arn,
         "the export that takes the freed name is a new one, with an ARN of its own"
     );
-    for (region, arn) in regions.iter().zip(&arns).skip(1) {
-        let (status, _) = client.call("GetExport", &json!({ "ExportArn": arn })).await;
-        assert_eq!(
-            status, 200,
-            "case {region:?}: a delete in another region must not remove this export"
-        );
-    }
+    let (status, _) = client.call("GetExport", &json!({ "ExportArn": arn })).await;
+    assert_eq!(
+        status, NOT_FOUND_STATUS,
+        "the deleted export's ARN must name nothing"
+    );
 }
 
 /// The refusals the lifecycle owes a client, over the inputs that trigger them.

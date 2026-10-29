@@ -240,6 +240,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::validate_destination_configurations(&input.export.destination_configurations)
             .map_err(UpdateExportErrorModeled::ValidationException)?;
 
+        // And the REPLACEMENT destination's delivery grant is judged exactly as a create's
+        // is: the bucket policy of the destination this update states must let this service
+        // write the export's files, since it is this destination the deliveries the update
+        // owes are written to. Judged before anything is written, so the stored definition
+        // survives a replacement that could never be delivered. See
+        // `crate::state::destination`.
+        crate::state::validate_delivery_grant(
+            &*self.engine,
+            &input.export.destination_configurations,
+            &input.export_arn,
+        )
+        .map_err(UpdateExportErrorModeled::ValidationException)?;
+
         // SECOND critical section: the mutation. The export is resolved again, because a
         // `DeleteExport` may have removed it while the definition above was being read.
         let mut store = state.lock();

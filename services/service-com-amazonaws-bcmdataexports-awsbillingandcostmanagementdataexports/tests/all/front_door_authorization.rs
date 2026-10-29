@@ -31,6 +31,11 @@
 //! session), what its policy says (nothing at all, an `Allow` for this action, an `Allow`
 //! for a different action, an `Allow` for a different resource, a wildcard `Allow`, and an
 //! explicit `Deny` beside an `Allow`), and the operation asked for.
+//!
+//! WHICH RESOURCE each operation's decision is taken against is part of the rule: a
+//! tagging operation is decided against the ARN the request names, while a CREATE is
+//! decided against the account's export resource (`export/*`), because the export it would
+//! create does not exist yet and the ARN it will be given carries a server-generated id.
 
 use std::sync::Arc;
 
@@ -372,12 +377,19 @@ pub(crate) fn create_request(name: &str) -> Value {
     request
 }
 
-/// The resource an IAM policy names to cover the export called `name` in [`REGION`].
+/// The resource an IAM policy names to cover the exports of this account in [`REGION`].
 ///
-/// The ARN this service mints for an export carries a per-export generated id after the
-/// name (`export/<name>/<id>`), which no policy author — and no test — can predict before
-/// the create, so a policy scoped to one export names it with the resource wildcard IAM
-/// provides for exactly that.
+/// A CREATE is decided against this resource and not against one export: the export does
+/// not exist when the decision is made, and the ARN this service mints for it carries a
+/// per-export generated id (`export/<name>/<id>`) that no policy author could have written
+/// down — so a policy that is to allow creating an export names the account's export
+/// resource.
+pub(crate) fn any_export_arn_pattern() -> String {
+    ::engine::emulator_arn("bcm-data-exports", REGION, "export/*")
+}
+
+/// The resource an IAM policy names to cover the export called `name` in [`REGION`], with
+/// the resource wildcard IAM provides for the generated id the ARN carries after the name.
 pub(crate) fn export_arn_pattern(name: &str) -> String {
     ::engine::emulator_arn("bcm-data-exports", REGION, &format!("export/{name}/*"))
 }
@@ -402,8 +414,8 @@ async fn a_create_is_served_only_to_a_principal_whose_policy_allows_it() {
             ),
             false,
         ),
-        // The same session shape, with a policy that allows exactly this action on
-        // exactly this export.
+        // The same session shape, with a policy that allows exactly this action on the
+        // resource a create is decided against.
         (
             "an assumed-role session allowed this action",
             Some(
@@ -412,7 +424,7 @@ async fn a_create_is_served_only_to_a_principal_whose_policy_allows_it() {
                         "bcmde-allowed",
                         Some(&allow(
                             "bcm-data-exports:CreateExport",
-                            &export_arn_pattern("role_allowed_export"),
+                            &any_export_arn_pattern(),
                         )),
                     )
                     .await,
@@ -445,7 +457,9 @@ async fn a_create_is_served_only_to_a_principal_whose_policy_allows_it() {
             ),
             false,
         ),
-        // A grant for this action on a DIFFERENT resource.
+        // A grant for this action on a DIFFERENT resource — and a grant scoped to ONE
+        // export is one of those, because the resource a create is decided against is the
+        // account's export resource and not any single export.
         (
             "an assumed-role session allowed another resource",
             Some(
@@ -517,11 +531,7 @@ async fn a_create_is_served_only_to_a_principal_whose_policy_allows_it() {
     let mut created = 0;
     for (index, (label, key, allowed)) in rows.iter().enumerate() {
         let access_key_id = key.clone().unwrap_or_else(|| ACCOUNT_KEY.to_string());
-        let name = if *label == "an assumed-role session allowed this action" {
-            "role_allowed_export".to_string()
-        } else {
-            format!("authorized_export_{index}")
-        };
+        let name = format!("authorized_export_{index}");
         let (status, body) = emulator
             .call(&access_key_id, "CreateExport", &create_request(&name))
             .await;

@@ -116,10 +116,15 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     if iam::is_allowed(identity_said, Decision::NotStated) {
         return Ok(());
     }
+    // RECORDED AWS behaviour: the standard authorization-failure sentence names WHICH KIND
+    // of policy was missing — an identity-based one, the only kind this service's decision
+    // is made from (the module docs above: data exports has no resource-based policy of its
+    // own). A client reads that word to tell an identity-based denial from a
+    // resource-policy or organization denial, and so to know which policy it has to write.
     let reason = if identity_said == Decision::Denied {
         format!("with an explicit deny in a policy for the {action} action")
     } else {
-        format!("because no policy allows the {action} action")
+        format!("because no identity-based policy allows the {action} action")
     };
     // `AccessDeniedException$Message` is the same `GenericString` every refusal of this
     // service is worded into, while the modelled `Arn` the sentence echoes admits twice

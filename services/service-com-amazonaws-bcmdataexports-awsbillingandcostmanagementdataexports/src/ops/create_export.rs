@@ -177,24 +177,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this operation, and AWS refuses a caller whose identity holds no permission for
         // it before anything is read or written — so a refused caller learns nothing about
         // this account's exports, not even whether its request would have been valid. The
-        // resource an export creation acts on is the export the request names.
-        let region = crate::state::request_region(&ctx.parts().headers);
-        // The ARN is minted HERE, carrying the generated id that makes it this export's own
-        // (see `crate::state::export_arn`): it is not a function of the submitted name, so a
-        // name a deleted export once held names a different export with a different ARN.
-        // It is also the resource the authorization decision below is about.
-        let arn = crate::state::export_arn(
-            &region,
-            &input.export.name,
-            &crate::state::new_export_id(),
-        );
+        // resource the decision is taken against is the account's export resource
+        // (`crate::state::any_export_arn`): the export this call would create does not
+        // exist yet, and the ARN it will be given carries a server-generated id, so there
+        // is no specific resource a policy could have named.
         crate::state::authorize(
             &*self.engine,
             ctx,
             crate::state::authorization::CREATE_EXPORT,
-            &arn,
+            &crate::state::any_export_arn(),
         )
         .map_err(CreateExportErrorModeled::AccessDeniedException)?;
+
+        // The ARN is minted HERE, carrying the generated id that makes it this export's own
+        // (see `crate::state::export_arn`): it is not a function of the submitted name, so a
+        // name a deleted export once held names a different export with a different ARN.
+        let arn = crate::state::export_arn(&input.export.name, &crate::state::new_export_id());
 
         // "Each tag consists of a key and a value, and each key must be unique for the
         // resource" (the modelled doc for `ResourceTags`), so a request carrying one key
@@ -243,6 +241,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::validate_destination_configurations(&export.destination_configurations)
             .map_err(CreateExportErrorModeled::ValidationException)?;
 
+        // The destination's DELIVERY GRANT is the last thing judged before anything is
+        // persisted: the bucket policy must let this service write the export's files, and
+        // a create pointed at a destination it could never deliver to is refused rather
+        // than stored. See `crate::state::destination`.
+        crate::state::validate_delivery_grant(
+            &*self.engine,
+            &export.destination_configurations,
+            &arn,
+        )
+        .map_err(CreateExportErrorModeled::ValidationException)?;
+
         // The definition is persisted with the configuration the pass above read in force.
         export.data_query.table_configurations = table_configurations;
         let mut store = state.lock();
@@ -262,10 +271,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The request is validated BEFORE the store bound is applied: a name already in
         // use is owed the 400, not the quota 402, even when the store happens to be full.
         //
-        // A name is unique among the exports the region currently HOLDS, and the minted ARN
-        // carries an id no other export shares, so the refusal is a lookup by region and
-        // name and never by the ARN this call just minted.
-        if store.export_named(&region, &export.name).is_some() {
+        // A name is unique among the exports the account currently HOLDS, and the minted ARN
+        // carries an id no other export shares, so the refusal is a lookup by name and never
+        // by the ARN this call just minted.
+        if store.export_named(&export.name).is_some() {
             return Err(CreateExportErrorModeled::ValidationException(
                 crate::state::field_validation_failed(
                     "Export.Name",

@@ -71,7 +71,12 @@
 //!   cap even for a request whose every value is too large to keep; the walk skips any
 //!   leaf that does not fit the byte budget, so the collection is never a second full copy
 //!   of the request's strings. A rendered composite is bounded the same way, by child
-//!   count and by the bytes its children hold ([`MAX_RENDERED_CHILDREN`]).
+//!   count and by the bytes its children hold ([`MAX_RENDERED_CHILDREN`]). A service whose
+//!   model declares a COLLECTION longer than that count states its own position ceiling
+//!   from that collection's declared maximum ([`refusing_violations_with_echoes_over`]),
+//!   which is a model constant rather than a request-sized one: a composite renders only
+//!   from children the walk reached, so a collection past the count could not be echoed at
+//!   all.
 //!
 //! Beyond any of these the framework's elided text stands: a shortened echo is a
 //! divergence in one message, while an unbounded one is a response sized by the request.
@@ -270,6 +275,34 @@ pub fn refusing_violations_with_echoes<O: Operation>(
         .collect()
 }
 
+/// As [`refusing_violations_with_echoes`], with the member POSITIONS the walk may visit
+/// stated by the SERVICE rather than taken from this module's own [`MAX_RECORDED_LEAVES`].
+///
+/// What it is for, and why it is the same kind of knob as
+/// [`refusing_violations_quoting_up_to`]: the default count is sized for the members most
+/// models declare, and a COMPOSITE renders only when every one of its children was walked
+/// — so a model whose list admits `n` elements of a `m`-member structure needs about
+/// `n * (m + 1)` positions before that list can be echoed at all, which is past the
+/// default for a list of a couple of hundred elements. A service whose model declares such
+/// a list states its own ceiling here, computed from that list's declared maximum, so the
+/// ceiling is a MODEL constant and no response is sized by the request. Everything else is
+/// [`refusing_violations_with_echoes`]'s: the same collecting walk, the same violations,
+/// the same per-value and per-message echo bounds ([`MAX_RESTORED_ECHO`],
+/// [`MAX_RESTORED_TOTAL`]), which still bound what one message carries.
+#[must_use]
+pub fn refusing_violations_with_echoes_over<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+    max_positions: usize,
+) -> Vec<(Violation, SubmittedEcho)> {
+    let refusing = violations_in::<O>(protocol, req, Echoes::RenderingsOver(max_positions));
+    refusing
+        .violations
+        .into_iter()
+        .zip(refusing.echoes)
+        .collect()
+}
+
 /// Whether a collected violation's value echo is restored to the bytes the caller sent.
 ///
 /// A service whose refusal QUOTES the value needs it restored; one whose refusal reports
@@ -290,6 +323,9 @@ pub(crate) enum Echoes {
     /// ([`with_submitted_echoes`]), which renders a composite value instead of leaving the
     /// framework's count summary in place.
     Renderings,
+    /// As [`Self::Renderings`], over as many member positions as the SERVICE states
+    /// ([`with_submitted_echoes_over`]) instead of [`MAX_RECORDED_LEAVES`].
+    RenderingsOver(usize),
 }
 
 /// The ONE collecting walk this crate performs: every violation that refuses `req` before
@@ -339,6 +375,21 @@ pub(crate) fn violations_in<O: Operation>(
                         with_submitted_echoes(violations, &input, O::INPUT_SCHEMA)
                             .into_iter()
                             .unzip();
+                    Refusing {
+                        violations,
+                        lists: HashMap::new(),
+                        echoes,
+                    }
+                }
+                Echoes::RenderingsOver(max_positions) => {
+                    let (violations, echoes) = with_submitted_echoes_over(
+                        violations,
+                        &input,
+                        O::INPUT_SCHEMA,
+                        max_positions,
+                    )
+                    .into_iter()
+                    .unzip();
                     Refusing {
                         violations,
                         lists: HashMap::new(),
@@ -524,6 +575,22 @@ pub fn with_submitted_echoes(
     input: &dyn SerializableStruct,
     schema: &Schema,
 ) -> Vec<(Violation, SubmittedEcho)> {
+    with_submitted_echoes_over(violations, input, schema, MAX_RECORDED_LEAVES)
+}
+
+/// [`with_submitted_echoes`], over as many member positions as the CALLER states rather
+/// than [`MAX_RECORDED_LEAVES`].
+///
+/// `max_positions` is the only difference: the walk, the path spelling and the echo bounds
+/// are the same. See [`refusing_violations_with_echoes_over`] for when a service states its
+/// own.
+#[must_use]
+pub fn with_submitted_echoes_over(
+    violations: Vec<Violation>,
+    input: &dyn SerializableStruct,
+    schema: &Schema,
+    max_positions: usize,
+) -> Vec<(Violation, SubmittedEcho)> {
     // A refusal that states no value at all (an absent `@required` member is the common
     // case) is not worth a walk over the whole input.
     if violations.iter().all(|violation| violation.value.is_none()) {
@@ -532,7 +599,7 @@ pub fn with_submitted_echoes(
             .map(|violation| (violation, SubmittedEcho::Absent))
             .collect();
     }
-    let renderings = submitted_renderings(input, schema);
+    let renderings = submitted_renderings_over(input, schema, max_positions);
     // ONE pass over the renderings builds the lookup, so the cost is O(positions) rather
     // than O(violations x positions).
     let mut by_path: HashMap<&str, Option<&str>> = HashMap::new();
@@ -943,10 +1010,29 @@ pub fn submitted_renderings(
     input: &dyn SerializableStruct,
     schema: &Schema,
 ) -> Vec<(String, Option<String>)> {
+    submitted_renderings_over(input, schema, MAX_RECORDED_LEAVES)
+}
+
+/// [`submitted_renderings`], over as many member positions as the CALLER states rather
+/// than [`MAX_RECORDED_LEAVES`].
+///
+/// The count bounds the positions VISITED and the positions RECORDED alike, because a
+/// composite renders only from children the walk reached: a ceiling that stopped the walk
+/// short, or that dropped the composite's own position, would answer no rendering at all
+/// for the very value the caller asked about. The BYTES this may hold are unchanged
+/// ([`MAX_RECORDED_RENDERED_BYTES`]), so a larger count cannot make the collection
+/// request-sized.
+#[must_use]
+pub fn submitted_renderings_over(
+    input: &dyn SerializableStruct,
+    schema: &Schema,
+    max_positions: usize,
+) -> Vec<(String, Option<String>)> {
     // The ONLY walk that composes renderings: a caller that reads one named leaf
     // ([`submitted_leaves`], [`submitted_lists`]) pays nothing for them.
     let mut walk = SubmittedValues {
         renders: true,
+        max_positions: Some(max_positions),
         ..SubmittedValues::default()
     };
     let _ = walk.write_struct(schema, input);
@@ -1096,6 +1182,12 @@ struct SubmittedValues {
     /// Whether this walk composes renderings at all. Off by default, so a caller that
     /// only reads leaves pays neither the frames nor the owned text for them.
     renders: bool,
+    /// The member positions this walk may visit and record, or `None` for
+    /// [`MAX_RECORDED_LEAVES`], the count this module states. A caller whose model
+    /// declares a collection larger than that count states its own ceiling
+    /// ([`submitted_renderings_over`]), because a composite renders only from children the
+    /// walk reached.
+    max_positions: Option<usize>,
     /// The largest single leaf this walk copies, or `None` for [`MAX_RESTORED_ECHO`], the
     /// bound this module states. A caller that quotes a value up to a ceiling of its own
     /// ([`submitted_leaves_up_to`]) collects to that same ceiling, because a leaf no clause
@@ -1134,9 +1226,22 @@ impl SubmittedValues {
     /// Reaching the cap also means a leaf the walk has not got to will be dropped, so it
     /// records that the collection is incomplete.
     fn done(&mut self) -> bool {
-        let done = self.visited >= MAX_RECORDED_LEAVES;
+        let done = self.visited >= self.position_bound();
         self.skipped |= done;
         done
+    }
+
+    /// The member positions this walk may visit and record; see [`Self::max_positions`].
+    fn position_bound(&self) -> usize {
+        self.max_positions.unwrap_or(MAX_RECORDED_LEAVES)
+    }
+
+    /// The positions this walk may RECORD a rendering for — leaves and the composites they
+    /// are children of alike. The same stated number as [`Self::position_bound`], counted
+    /// separately from it: a composite's own position is recorded after its children's, so
+    /// one request fills this count faster than the leaf count.
+    fn recorded_renderings_bound(&self) -> usize {
+        self.max_positions.unwrap_or(MAX_RECORDED_RENDERINGS)
     }
 
     /// The lowerCamel path segment for `schema`, if it is a member schema.
@@ -1231,7 +1336,7 @@ impl SubmittedValues {
         // nothing, rather than as a value missing a part of itself.
         let rendering = rendering.filter(|rendered| rendered.len() <= MAX_RESTORED_ECHO);
         let bytes = position.len() + rendering.as_ref().map_or(0, String::len);
-        if self.renderings.len() < MAX_RECORDED_RENDERINGS
+        if self.renderings.len() < self.recorded_renderings_bound()
             && self.rendered + bytes <= MAX_RECORDED_RENDERED_BYTES
         {
             self.rendered += bytes;

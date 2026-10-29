@@ -64,8 +64,9 @@ pub use query::{resolve_data_query, QueryRefusal, TableConfigurations};
 // a submitted destination configuration is judged the same way whichever of them
 // accepted it.
 pub use destination::{
-    delivers_output_encoding, supported_compressions, validate_destination_configurations,
-    SUPPORTED_OUTPUT_ENCODINGS,
+    delivers_output_encoding, supported_compressions, validate_delivery_grant,
+    validate_destination_configurations, BUCKET_PERMISSION_VALIDATION_FAILED, DELIVERY_ACTION,
+    DELIVERY_SERVICE_PRINCIPAL, SUPPORTED_OUTPUT_ENCODINGS,
 };
 
 // The authorization decision is reached as `crate::state::…` by every operation whose
@@ -88,10 +89,19 @@ pub use catalog::{
 /// bcm-data-exports").
 pub const SIGNING_NAME: &str = "bcm-data-exports";
 
-/// The region an ARN carries when the request is not signed, so no SigV4 credential
-/// scope names one. Matches the region every generated emulator's shared config
-/// defaults to.
-pub const DEFAULT_REGION: &str = "us-east-1";
+/// The Region every ARN this service mints carries.
+///
+/// RECORDED AWS behaviour: BCM Data Exports is a REGION-PINNED control plane. An export
+/// ARN it answers carries this one Region whatever Region the client is configured for —
+/// a create signed for another Region is answered an ARN in this one, and the resource a
+/// refusal of such a call names is in this one too. That is why the S3 bucket policy a
+/// delivery is granted by conditions `aws:SourceArn` on an ARN in this Region: an ARN
+/// stamped with the caller's Region would match no policy written for the service.
+///
+/// The modelled `Arn` pattern leaves the Region segment unconstrained
+/// (`^arn:aws[-a-z0-9]*:(bcm-data-exports):[-a-z0-9]*:[0-9]{12}:[-a-zA-Z0-9/:_]+$`), so
+/// the pinning is recorded behaviour rather than a model constraint.
+pub const SERVICE_REGION: &str = "us-east-1";
 
 /// The `ResourceType` a `ResourceNotFoundException` reports for an export ARN that
 /// names nothing: the Smithy shape the ARN identifies.
@@ -104,6 +114,11 @@ pub const EXECUTION_RESOURCE_TYPE: &str = "Execution";
 /// The resource-ARN segment every export of this service is named under:
 /// `export/<Export.Name>/<generated id>` (see [`export_arn`]).
 pub const EXPORT_RESOURCE_PREFIX: &str = "export/";
+
+/// The resource segment of the ARN that names EVERY export of this account: the resource
+/// an authorization decision about an export that does not exist yet is taken against
+/// (see [`any_export_arn`]).
+pub const ANY_EXPORT_RESOURCE: &str = "export/*";
 
 /// The `ExportStatusCode` reported for an export that is operating normally. One of
 /// `ExportStatusCode`'s two modelled values (see
@@ -272,10 +287,8 @@ pub struct StoredExport {
 /// Per-service state for com-amazonaws-bcmdataexports-awsbillingandcostmanagementdataexports. A handler reaches it through [`service_state`].
 ///
 /// There is ONE store, and no second index beside it: the ARN [`export_arn`] mints carries
-/// the region and `Export.Name` ahead of the export's generated id, so the key of this map
-/// already IS the name index and [`Self::export_named`] reads it as one. A second map keyed
-/// by the bare name would also refuse a name already used in a DIFFERENT region, which the
-/// ARN says is a different export.
+/// `Export.Name` ahead of the export's generated id, so the key of this map already IS the
+/// name index and [`Self::export_named`] reads it as one.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState {
     /// The primary store, keyed by the minted export ARN. `BTreeMap` so every list
@@ -289,16 +302,17 @@ pub struct ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState
 }
 
 impl ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState {
-    /// The export called `name` in `region`, whatever generated id its ARN carries.
+    /// The export called `name`, whatever generated id its ARN carries.
     ///
-    /// The name a caller chooses is unique among the exports a region HOLDS, while the ARN
-    /// is not a function of it (see [`export_arn`]), so a lookup by name is a walk of the
-    /// ARNs minted under [`export_arn_prefix`] rather than a `get` of one key. `Export.Name`
-    /// cannot carry a `/` (smithy_query shape `Export`, member `Name`: `pattern
-    /// ^[0-9A-Za-z\-_]+$`) and neither can a generated id, so exactly one segment follows
-    /// that prefix for an export of this name and a longer tail belongs to another one.
-    pub fn export_named(&self, region: &str, name: &str) -> Option<&StoredExport> {
-        let prefix = export_arn_prefix(region, name);
+    /// The name a caller chooses is unique among the exports this account HOLDS, while the
+    /// ARN is not a function of it (see [`export_arn`]), so a lookup by name is a walk of
+    /// the ARNs minted under [`export_arn_prefix`] rather than a `get` of one key.
+    /// `Export.Name` cannot carry a `/` (smithy_query shape `Export`, member `Name`:
+    /// `pattern ^[0-9A-Za-z\-_]+$`) and neither can a generated id, so exactly one segment
+    /// follows that prefix for an export of this name and a longer tail belongs to another
+    /// one.
+    pub fn export_named(&self, name: &str) -> Option<&StoredExport> {
+        let prefix = export_arn_prefix(name);
         self.exports
             .range(prefix.clone()..)
             .take_while(|(arn, _)| arn.starts_with(&prefix))
@@ -541,54 +555,48 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs(seconds)
 }
 
-/// The region an ARN minted for this request carries: the region of the request's
-/// SigV4 credential scope, else [`DEFAULT_REGION`].
-///
-/// A scope region that could not appear in the modelled `Arn` pattern's region segment
-/// (`[-a-z0-9]*`) is not used, so a minted ARN always satisfies the pattern the model
-/// declares for it.
-pub fn request_region(headers: &::http::HeaderMap) -> String {
-    ::emulator_server::sigv4_credential_scope(headers)
-        .map(|scope| scope.region)
-        .filter(|region| is_arn_region_segment(region))
-        .unwrap_or_else(|| DEFAULT_REGION.to_string())
-}
-
-/// Whether `value` is a legal region segment of the modelled `Arn` pattern
-/// `^arn:aws[-a-z0-9]*:(bcm-data-exports):[-a-z0-9]*:[0-9]{12}:[-a-zA-Z0-9/:_]+$`.
-fn is_arn_region_segment(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
-/// The ARN of the export called `name` in `region` whose generated id is `export_id`:
-/// `arn:aws:bcm-data-exports:<region>:<account>:export/<name>/<export_id>`.
+/// The ARN of the export called `name` whose generated id is `export_id`:
+/// `arn:aws:bcm-data-exports:<this service's Region>:<account>:export/<name>/<export_id>`.
 ///
 /// An export is identified by the ARN the SERVICE mints for it, and that ARN carries a
-/// server-generated id after the caller's name: the name is only unique among the exports a
-/// region currently holds, so a name alone cannot identify the export it named yesterday as
+/// server-generated id after the caller's name: the name is only unique among the exports the
+/// account currently holds, so a name alone cannot identify the export it named yesterday as
 /// well as the one holding it now. Because the id enters the ARN, a name freed by a delete
 /// and taken again by a later create belongs to a DIFFERENT export with an ARN of its own,
 /// and no ARN this service ever minted names a resource it did not mint it for.
 ///
+/// The Region segment is [`SERVICE_REGION`] and NOT the region the request was signed for:
+/// this is a region-pinned control plane, so the identity it mints does not move with the
+/// caller's configuration.
+///
 /// Built through `engine::emulator_arn`, so the account segment is the one canonical
 /// emulator account id rather than a literal.
-pub fn export_arn(region: &str, name: &str, export_id: &str) -> String {
-    format!("{}{export_id}", export_arn_prefix(region, name))
+pub fn export_arn(name: &str, export_id: &str) -> String {
+    format!("{}{export_id}", export_arn_prefix(name))
 }
 
-/// Everything of an [`export_arn`] in `region` for `name` but the generated id: the prefix
-/// every ARN this service has ever minted for that name in that region starts with, and
-/// which [`ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState::export_named`]
+/// Everything of an [`export_arn`] for `name` but the generated id: the prefix every ARN
+/// this service has ever minted for that name starts with, and which
+/// [`ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState::export_named`]
 /// looks the current one up by.
-pub fn export_arn_prefix(region: &str, name: &str) -> String {
+pub fn export_arn_prefix(name: &str) -> String {
     ::engine::emulator_arn(
         SIGNING_NAME,
-        region,
+        SERVICE_REGION,
         &format!("{EXPORT_RESOURCE_PREFIX}{name}/"),
     )
+}
+
+/// The ARN naming EVERY export of this account:
+/// `arn:aws:bcm-data-exports:<this service's Region>:<account>:export/*`.
+///
+/// RECORDED AWS behaviour: this is the resource an authorization decision about a create is
+/// taken against, and the resource its refusal names. A create's export does not exist when
+/// the decision is made — and the ARN it will be given carries a server-generated id no
+/// policy author could have written down ([`export_arn`]) — so the decision is about the
+/// export resource of this account rather than about one export.
+pub fn any_export_arn() -> String {
+    ::engine::emulator_arn(SIGNING_NAME, SERVICE_REGION, ANY_EXPORT_RESOURCE)
 }
 
 /// Domain separator for a minted export id, so the digest behind one cannot be read as any

@@ -12,7 +12,6 @@ smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
 smithy-server-runtime = { workspace = true }
-emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
@@ -40,6 +39,10 @@ service-common = { path = "../common" }
 # services' OWN state accessors rather than keeping a second copy of either fact.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The destination of an export is an S3 bucket, and the delivery grant a create checks is
+# the POLICY that bucket carries: read through Amazon S3's own state accessor, so this
+# service judges the document that service's `PutBucketPolicy` wrote.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -51,6 +54,9 @@ hex = { workspace = true }
 # operations, so the policies it asserts on are the ones those services wrote.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The delivery-grant suite creates its destination buckets and puts their policies through
+# Amazon S3's own operations.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true
