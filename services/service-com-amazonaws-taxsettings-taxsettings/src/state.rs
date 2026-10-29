@@ -98,6 +98,69 @@ pub fn trn_validation_status(
 /// a terminal status gets one.
 pub const TRN_VALIDATION_DELAY: Duration = Duration::from_millis(500);
 
+/// The status and due instant a write stores a registration with.
+///
+/// The write starts the validation of the submitted TRN, so the registration is
+/// stored in [`STATUS_PENDING`] while that validation is outstanding and its
+/// validation falls due [`TRN_VALIDATION_DELAY`] after the write. One pairing
+/// for every kind of stored registration, so the status a write reports and the
+/// instant the validation behind it falls due cannot drift apart.
+fn outstanding_trn_validation(written_at: Instant) -> (String, Option<Instant>) {
+    (
+        STATUS_PENDING.to_string(),
+        Some(written_at + TRN_VALIDATION_DELAY),
+    )
+}
+
+/// The clock-owed TRN validation a stored registration carries.
+///
+/// The account's own TRN and a supplemental one both have that transition, for
+/// the same reason — a write records the instant the validation of the submitted
+/// number falls due ([`outstanding_trn_validation`]) and the status the record
+/// reports moves to what that validation reached once the clock has made it due —
+/// so the rule lives here once instead of on each stored record: a change to it
+/// (another status that must not move, a further field to clear, a second
+/// clock-owed transition) is made in one place and every kind of registration
+/// moves with it.
+///
+/// An implementor supplies only what the rule reads and writes on its own
+/// record; [`Self::settle`] is the rule itself, and
+/// [`ComAmazonawsTaxsettingsTaxsettingsState::settle_due`] drives it for every
+/// stored registration.
+pub trait TrnValidation {
+    /// The status the validation of this registration's stored number reaches —
+    /// see [`trn_validation_status`].
+    fn validation_outcome(&self) -> &'static str;
+
+    /// When this registration's validation falls due, `None` once it has
+    /// settled.
+    fn validation_due_at(&self) -> Option<Instant>;
+
+    /// The same instant, to clear once the validation has settled.
+    fn validation_due_at_mut(&mut self) -> &mut Option<Instant>;
+
+    /// The registration's `TaxRegistrationStatus`.
+    fn status_mut(&mut self) -> &mut String;
+
+    /// Move this registration to the status its validation reached, if that
+    /// validation was already due at `now`. Answers whether it moved.
+    ///
+    /// Clearing the due instant is what makes settling idempotent: a record that
+    /// has settled never moves again, so a read cannot change what a later
+    /// caller sees.
+    fn settle(&mut self, now: Instant) -> bool {
+        match self.validation_due_at() {
+            Some(due) if due <= now => {
+                let outcome = self.validation_outcome();
+                *self.status_mut() = outcome.to_string();
+                *self.validation_due_at_mut() = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// The `EntityExemptionAccountStatus` values, from the model's enum
 /// (`None | Valid | Expired | Pending`), which is what `TaxExemption$status`
 /// reports for one exemption of an account.
@@ -603,6 +666,10 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     /// called: this settles what is owed, it never starts anything. Every read of
     /// a registration goes through here first, so `GetTaxRegistration` and
     /// `ListTaxRegistrations` cannot report one record in two different states.
+    ///
+    /// Every kind of stored registration settles by the one rule
+    /// ([`TrnValidation::settle`]), so an account's own TRN and a supplemental
+    /// one are materialised the same way.
     pub fn settle_due(&mut self, now: Instant) {
         for stored in self.registrations.values_mut() {
             stored.settle(now);
@@ -956,16 +1023,21 @@ pub struct StoredSupplementalRegistration {
     pub address: Address,
     /// The registration's `TaxRegistrationStatus`.
     pub status: String,
-    /// When the validation of this TRN falls due, after which [`Self::settle`]
-    /// moves [`Self::status`] to what that validation reached
-    /// ([`Self::validation_outcome`]) — the same clock-owed transition a main
-    /// TRN has, for the same reason. `None` once it has been settled.
+    /// When the validation of this TRN falls due, after which
+    /// [`TrnValidation::settle`] moves [`Self::status`] to what that validation
+    /// reached ([`TrnValidation::validation_outcome`]) — the same clock-owed
+    /// transition a main TRN has, for the same reason, served by the same rule.
+    /// `None` once it has been settled.
     pub validation_due_at: Option<Instant>,
 }
 
 impl StoredSupplementalRegistration {
     /// The record `PutSupplementalTaxRegistration` stores for `entry`.
     pub fn from_entry(entry: &SupplementalTaxRegistrationEntry, written_at: Instant) -> Self {
+        // The write starts the validation of the submitted TRN and reports the
+        // status the registration is stored with while that validation is
+        // outstanding.
+        let (status, validation_due_at) = outstanding_trn_validation(written_at);
         Self {
             registration_id: entry.registration_id.clone(),
             registration_type: entry.registration_type.clone(),
@@ -973,35 +1045,8 @@ impl StoredSupplementalRegistration {
             // The address is stored with the defaults the model declares for its
             // members materialised, so every read of this record reports them.
             address: address_with_declared_defaults(entry.address.clone()),
-            // The write starts the validation of the submitted TRN and reports
-            // the status the registration is stored with while that validation
-            // is outstanding.
-            status: STATUS_PENDING.to_string(),
-            validation_due_at: Some(written_at + TRN_VALIDATION_DELAY),
-        }
-    }
-
-    /// What the validation of this supplemental TRN reaches: the number it was
-    /// stored with, judged against the structure the jurisdiction it is held in
-    /// publishes — see [`trn_validation_status`].
-    pub fn validation_outcome(&self) -> &'static str {
-        trn_validation_status(
-            &self.address.country_code,
-            &self.registration_type,
-            &self.registration_id,
-        )
-    }
-
-    /// Move this registration to the status its validation reached, if that
-    /// validation was already due at `now`. Answers whether it moved.
-    pub fn settle(&mut self, now: Instant) -> bool {
-        match self.validation_due_at {
-            Some(due) if due <= now => {
-                self.status = self.validation_outcome().to_string();
-                self.validation_due_at = None;
-                true
-            }
-            _ => false,
+            status,
+            validation_due_at,
         }
     }
 
@@ -1019,6 +1064,31 @@ impl StoredSupplementalRegistration {
             authority_id: authority_id.to_string(),
             status: self.status.clone(),
         }
+    }
+}
+
+impl TrnValidation for StoredSupplementalRegistration {
+    /// What the validation of this supplemental TRN reaches: the number it was
+    /// stored with, judged against the structure the jurisdiction it is held in
+    /// publishes — see [`trn_validation_status`].
+    fn validation_outcome(&self) -> &'static str {
+        trn_validation_status(
+            &self.address.country_code,
+            &self.registration_type,
+            &self.registration_id,
+        )
+    }
+
+    fn validation_due_at(&self) -> Option<Instant> {
+        self.validation_due_at
+    }
+
+    fn validation_due_at_mut(&mut self) -> &mut Option<Instant> {
+        &mut self.validation_due_at
+    }
+
+    fn status_mut(&mut self) -> &mut String {
+        &mut self.status
     }
 }
 
@@ -1055,10 +1125,11 @@ pub struct StoredTaxRegistration {
     pub certified_email_id: Option<String>,
     /// The registration's `TaxRegistrationStatus`.
     pub status: String,
-    /// When the validation of this TRN falls due, after which [`Self::settle`]
-    /// moves [`Self::status`] to what that validation reached
-    /// ([`Self::validation_outcome`]). `None` once it has been settled, so
-    /// settling is idempotent and a settled record never moves again.
+    /// When the validation of this TRN falls due, after which
+    /// [`TrnValidation::settle`] moves [`Self::status`] to what that validation
+    /// reached ([`TrnValidation::validation_outcome`]). `None` once it has been
+    /// settled, so settling is idempotent and a settled record never moves
+    /// again.
     pub validation_due_at: Option<Instant>,
     /// How many times `PutTaxRegistration` has written this account's TRN. The
     /// document access tokens below are derived from it, because the model
@@ -1111,6 +1182,10 @@ impl StoredTaxRegistration {
         // The address is stored with the defaults the model declares for its
         // members materialised, so every read of this record reports them.
         let legal_address = address_with_declared_defaults(given_address);
+        // The write starts the validation of the submitted TRN and reports the
+        // status the registration is stored with while that validation is
+        // outstanding.
+        let (status, validation_due_at) = outstanding_trn_validation(written_at);
         Self {
             registration_id: entry.registration_id.clone(),
             registration_type: entry.registration_type.clone(),
@@ -1122,40 +1197,10 @@ impl StoredTaxRegistration {
                 .as_ref()
                 .map(additional_info_response),
             certified_email_id: entry.certified_email_id.clone(),
-            // The write starts the validation of the submitted TRN and reports
-            // the status the registration is stored with while that validation
-            // is outstanding.
-            status: STATUS_PENDING.to_string(),
-            validation_due_at: Some(written_at + TRN_VALIDATION_DELAY),
+            status,
+            validation_due_at,
             revision,
             tax_document_metadatas: document_metadatas(entry, account_id, revision),
-        }
-    }
-
-    /// What the validation of this TRN reaches: the number it was stored with,
-    /// judged against the structure the jurisdiction it is held in publishes for
-    /// its registration type — see [`trn_validation_status`].
-    ///
-    /// Read from the stored record, so the outcome was fixed by the write and
-    /// every reader of this record settles it identically.
-    pub fn validation_outcome(&self) -> &'static str {
-        trn_validation_status(
-            &self.legal_address.country_code,
-            &self.registration_type,
-            &self.registration_id,
-        )
-    }
-
-    /// Move this registration to the status its validation reached, if that
-    /// validation was already due at `now`. Answers whether it moved.
-    pub fn settle(&mut self, now: Instant) -> bool {
-        match self.validation_due_at {
-            Some(due) if due <= now => {
-                self.status = self.validation_outcome().to_string();
-                self.validation_due_at = None;
-                true
-            }
-            _ => false,
         }
     }
 
@@ -1243,6 +1288,34 @@ impl StoredTaxRegistration {
         } else {
             Some(self.tax_document_metadatas.clone())
         }
+    }
+}
+
+impl TrnValidation for StoredTaxRegistration {
+    /// What the validation of this TRN reaches: the number it was stored with,
+    /// judged against the structure the jurisdiction it is held in publishes for
+    /// its registration type — see [`trn_validation_status`].
+    ///
+    /// Read from the stored record, so the outcome was fixed by the write and
+    /// every reader of this record settles it identically.
+    fn validation_outcome(&self) -> &'static str {
+        trn_validation_status(
+            &self.legal_address.country_code,
+            &self.registration_type,
+            &self.registration_id,
+        )
+    }
+
+    fn validation_due_at(&self) -> Option<Instant> {
+        self.validation_due_at
+    }
+
+    fn validation_due_at_mut(&mut self) -> &mut Option<Instant> {
+        &mut self.validation_due_at
+    }
+
+    fn status_mut(&mut self) -> &mut String {
+        &mut self.status
     }
 }
 

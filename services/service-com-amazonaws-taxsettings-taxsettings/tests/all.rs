@@ -59,6 +59,8 @@ mod sector_registration_types;
 mod shared_distinct_account_ids;
 #[path = "all/shared_page_builder.rs"]
 mod shared_page_builder;
+#[path = "all/shared_trn_settle.rs"]
+mod shared_trn_settle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/supplemental_tax_registrations.rs"]
