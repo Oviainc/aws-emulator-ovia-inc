@@ -2491,6 +2491,32 @@ impl PermissionSetProvisioningRecord {
     }
 }
 
+/// One COPY of a permission set an account holds because a provisioning PUT it there
+/// directly, rather than because an assignment of it was granted on the account.
+///
+/// `ProvisionPermissionSet` provisions the permission set into the accounts its target
+/// names, whether or not those accounts hold an assignment of it, so the copy such a
+/// provisioning delivers has to be recorded somewhere of its own: an account the
+/// provisioning named and no assignment reaches holds the definition the provisioning
+/// carried, and every read of where the permission set is provisioned reports it from
+/// here.
+#[derive(Debug, Clone)]
+pub struct ProvisionedCopyRecord {
+    /// The instance the copy was provisioned under. A copy belongs to one instance,
+    /// like the permission set it is a copy of, so a copy provisioned under another
+    /// instance is as absent as one that was never provisioned.
+    pub instance_arn: String,
+    /// The permission set this is a copy OF.
+    pub permission_set_arn: String,
+    /// The account that holds the copy.
+    pub account_id: String,
+    /// The permission set's definition revision
+    /// ([`PermissionSetRecord::definition_revision`]) this copy carries: what a read
+    /// compares against the permission set's revision now to tell an account holding the
+    /// latest definition from one the permission set has changed since.
+    pub revision: String,
+}
+
 /// Per-service state for com-amazonaws-ssoadmin-swbexternalservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSsoadminSwbexternalserviceState {
@@ -2507,6 +2533,16 @@ pub struct ComAmazonawsSsoadminSwbexternalserviceState {
     /// Account assignments. At most one row per identity tuple, and at most
     /// [`MAX_RECORDS_PER_STORE`] rows in all.
     pub account_assignments: Vec<AccountAssignmentRecord>,
+    /// The copies a `ProvisionPermissionSet` DELIVERED to the accounts it targeted, in
+    /// the order they first landed: at most one row per (instance, permission set,
+    /// account) triple, refreshed in place by a later provisioning of the same triple
+    /// (see [`Self::record_provisioned_copy`]).
+    ///
+    /// A `Vec` in landing order, so the ceiling below evicts the copy provisioned
+    /// longest ago. Like [`Self::assignment_deletions`] it EVICTS rather than refusing
+    /// at [`MAX_RECORDS_PER_STORE`]: a provisioning of a permission set that exists is
+    /// accepted, and `ProvisionPermissionSet` models no quota refusal to answer with.
+    pub provisioned_copies: Vec<ProvisionedCopyRecord>,
     /// Trusted token issuers by `TrustedTokenIssuerArn`. A `BTreeMap` so an
     /// enumeration walks one stable order and can page by key. Holds at most
     /// [`MAX_RECORDS_PER_STORE`] records.
@@ -2697,11 +2733,13 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// however often the store is swept: re-copying it would undo a provisioning that
     /// followed it.
     ///
-    /// An account holds a permission set through the assignments granted on it, and the
-    /// revision recorded on those rows is what every reader compares against the
-    /// permission set's current definition, so this provisioning updates exactly those
-    /// rows. A target account that holds no assignment of this permission set has no copy
-    /// to refresh, so there is nothing to write for it.
+    /// A target account holds the copy whether or not an assignment of the permission set
+    /// was ever granted there — the provisioning is what puts the permission set into the
+    /// account, so a target that holds no assignment is provisioned all the same. The copy
+    /// is recorded in BOTH places a reader looks: on the assignments granted on the
+    /// account, whose revision is what [`Self::provisioned_accounts`] compares for an
+    /// assigned account, and as a [`ProvisionedCopyRecord`], which is what a reader has for
+    /// an account no assignment reaches.
     fn apply_provisioning(&mut self, index: usize) {
         let Some(record) = self.permission_set_provisionings.get_mut(index) else {
             return;
@@ -2723,6 +2761,91 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
             }
             row.provisioned_revision = revision.clone();
         }
+        for account_id in &accounts {
+            self.record_provisioned_copy(&instance_arn, &permission_set_arn, account_id, &revision);
+        }
+    }
+
+    /// Record that `account_id` holds the copy of `permission_set_arn` a provisioning
+    /// delivered at `revision`, REPLACING the copy that account held before: an account
+    /// holds one copy of a permission set, the one the last provisioning put there.
+    ///
+    /// Evicts the copies that landed longest ago while the store is over
+    /// [`MAX_RECORDS_PER_STORE`], for the reason given on [`Self::provisioned_copies`].
+    fn record_provisioned_copy(
+        &mut self,
+        instance_arn: &str,
+        permission_set_arn: &str,
+        account_id: &str,
+        revision: &str,
+    ) {
+        if let Some(copy) =
+            self.provisioned_copy_mut(instance_arn, permission_set_arn, account_id)
+        {
+            copy.revision = revision.to_string();
+            return;
+        }
+        self.provisioned_copies.push(ProvisionedCopyRecord {
+            instance_arn: instance_arn.to_string(),
+            permission_set_arn: permission_set_arn.to_string(),
+            account_id: account_id.to_string(),
+            revision: revision.to_string(),
+        });
+        let excess = self
+            .provisioned_copies
+            .len()
+            .saturating_sub(MAX_RECORDS_PER_STORE);
+        self.provisioned_copies.drain(..excess);
+    }
+
+    /// The copy `account_id` holds of `permission_set_arn` under `instance_arn`, for a
+    /// caller that updates it. The ONE place the triple that identifies a copy is
+    /// compared.
+    fn provisioned_copy_mut(
+        &mut self,
+        instance_arn: &str,
+        permission_set_arn: &str,
+        account_id: &str,
+    ) -> Option<&mut ProvisionedCopyRecord> {
+        self.provisioned_copies.iter_mut().find(|copy| {
+            copy.instance_arn == instance_arn
+                && copy.permission_set_arn == permission_set_arn
+                && copy.account_id == account_id
+        })
+    }
+
+    /// Carry the copy a WITHDRAWN assignment recorded into the copy its account keeps,
+    /// when a provisioning had delivered one there.
+    ///
+    /// An account holds the LAST copy delivered to it, and a grant delivers one too, so an
+    /// account that was provisioned before the assignment was granted holds what the grant
+    /// put there rather than the older definition the provisioning carried: withdrawing
+    /// that assignment removes the row recording it, and the copy the account keeps has to
+    /// go on reporting the same definition. Nothing is recorded for an account no
+    /// provisioning ever targeted, so withdrawing its last assignment deprovisions it as
+    /// before.
+    pub fn keep_withdrawn_copy(
+        &mut self,
+        instance_arn: &str,
+        permission_set_arn: &str,
+        account_id: &str,
+        revision: &str,
+    ) {
+        if let Some(copy) =
+            self.provisioned_copy_mut(instance_arn, permission_set_arn, account_id)
+        {
+            copy.revision = revision.to_string();
+        }
+    }
+
+    /// Forget every copy of `permission_set_arn` under `instance_arn`: a permission set
+    /// that no longer exists is provisioned nowhere, and leaving its copies behind would
+    /// let a later permission set minted under the same ARN inherit accounts nothing
+    /// provisioned it into.
+    pub fn forget_provisioned_copies(&mut self, instance_arn: &str, permission_set_arn: &str) {
+        self.provisioned_copies.retain(|copy| {
+            copy.instance_arn != instance_arn || copy.permission_set_arn != permission_set_arn
+        });
     }
 
     /// Store the status of one permission-set provisioning, evicting the OLDEST records
@@ -2819,6 +2942,8 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         self.permission_sets
             .retain(|_, record| record.instance_arn != instance_arn);
         self.account_assignments
+            .retain(|record| record.instance_arn != instance_arn);
+        self.provisioned_copies
             .retain(|record| record.instance_arn != instance_arn);
         self.trusted_token_issuers
             .retain(|_, record| record.instance_arn != instance_arn);
@@ -3209,16 +3334,22 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// Every account the permission set `permission_set_arn` names is PROVISIONED into,
     /// with the provisioning status each of them is in, keyed by account id.
     ///
-    /// An account holds a permission set once it has been provisioned there — which is
-    /// what granting an account assignment on that account does — however many principals
-    /// were assigned through it, so an account appears at most once. The copy in place is
-    /// the one the LAST provisioning put there, so a provisioning that followed a change
-    /// to the permission set brings the account back up to date, whether that provisioning
-    /// was a grant or a `ProvisionPermissionSet` call.
+    /// An account holds a permission set once it has been provisioned there — which both
+    /// granting an account assignment on that account and provisioning the permission set
+    /// into it do — however many principals were assigned through it, so an account
+    /// appears at most once. The copy in place is the one the LAST provisioning put there,
+    /// so a provisioning that followed a change to the permission set brings the account
+    /// back up to date.
     ///
-    /// The status is COMPUTED, by comparing the revision each provisioning recorded
-    /// ([`AccountAssignmentRecord::provisioned_revision`]) against the permission set's
-    /// revision now: equal means the account holds the latest definition
+    /// Both ways a copy reaches an account are read here: the copies a provisioning
+    /// delivered to the accounts it targeted ([`Self::provisioned_copies`]) and the
+    /// revision each assignment granted on an account recorded
+    /// ([`AccountAssignmentRecord::provisioned_revision`]), which a provisioning of that
+    /// account refreshes too — so an assigned account's row carries the later of the two
+    /// and is the one that counts.
+    ///
+    /// The status is COMPUTED, by comparing the revision the copy carries against the
+    /// permission set's revision now: equal means the account holds the latest definition
     /// ([`PROVISIONING_STATUS_LATEST_PROVISIONED`]), and anything else means the
     /// permission set has changed since
     /// ([`PROVISIONING_STATUS_LATEST_NOT_PROVISIONED`]). A permission set no instance
@@ -3233,6 +3364,13 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         };
         let revision = permission_set.definition_revision();
         let mut provisioned: BTreeMap<String, &'static str> = BTreeMap::new();
+        for copy in &self.provisioned_copies {
+            if copy.instance_arn != instance_arn || copy.permission_set_arn != permission_set_arn {
+                continue;
+            }
+            let status = provisioning_status_of(&copy.revision, &revision);
+            provisioned.insert(copy.account_id.clone(), status);
+        }
         for row in &self.account_assignments {
             if row.instance_arn != instance_arn || row.permission_set_arn != permission_set_arn {
                 continue;
@@ -3248,11 +3386,12 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// `instance_arn`, with the provisioning status each of them is in, keyed by the
     /// permission set's ARN.
     ///
-    /// The MIRROR of [`Self::provisioned_accounts`], over the same rows and with the same
-    /// rule: an account holds a permission set once that permission set has been
-    /// provisioned there — which is what granting an account assignment on the account
-    /// does — however many principals were assigned through it, so a permission set
-    /// appears at most once. The copy in place is the one the LAST provisioning put there.
+    /// The MIRROR of [`Self::provisioned_accounts`], over the same records and with the
+    /// same rule: an account holds a permission set once that permission set has been
+    /// provisioned there — which both granting an account assignment on the account and
+    /// provisioning the permission set into it do — however many principals were assigned
+    /// through it, so a permission set appears at most once. The copy in place is the one
+    /// the LAST provisioning put there.
     ///
     /// The status is COMPUTED the same way, against the revision of EACH permission set as
     /// it stands now: equal to the revision the provisioning recorded means the account
@@ -3270,6 +3409,29 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         // Each permission set's current revision, derived at most once however many rows
         // provisioned it into the account.
         let mut revisions: BTreeMap<&str, String> = BTreeMap::new();
+        for copy in &self.provisioned_copies {
+            if copy.instance_arn != instance_arn || copy.account_id != account_id {
+                continue;
+            }
+            if !revisions.contains_key(copy.permission_set_arn.as_str()) {
+                // A copy of a permission set this instance no longer holds is a copy of
+                // nothing, so it is left out.
+                let Some(permission_set) =
+                    self.permission_set(instance_arn, &copy.permission_set_arn)
+                else {
+                    continue;
+                };
+                revisions.insert(
+                    copy.permission_set_arn.as_str(),
+                    permission_set.definition_revision(),
+                );
+            }
+            let Some(revision) = revisions.get(copy.permission_set_arn.as_str()) else {
+                continue;
+            };
+            let status = provisioning_status_of(&copy.revision, revision);
+            provisioned.insert(copy.permission_set_arn.clone(), status);
+        }
         for row in &self.account_assignments {
             if row.instance_arn != instance_arn || row.account_id != account_id {
                 continue;

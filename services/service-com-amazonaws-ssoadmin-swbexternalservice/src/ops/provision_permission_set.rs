@@ -24,17 +24,17 @@
 //! later: both are derived from a stored due instant, so nothing sleeps and a caller
 //! polling straight after the call still sees the workflow in flight.
 //!
-//! A COPY is what an account holds of the permission set, and in this emulator an account
-//! holds one through the assignments granted on it: `CreateAccountAssignment` records the
-//! definition it put there and `DeleteAccountAssignment` takes the account's copy away
-//! with the last assignment on it. A provisioning therefore REFRESHES the copies of the
-//! accounts it targets, and a target account that holds no assignment of this permission
-//! set has no copy to refresh — the call is still accepted and tracked (AWS refuses it on
-//! neither the request nor the account), and nothing about that account changes, rather
-//! than this operation inventing an account holding a permission set no principal is
-//! assigned to there. Whether AWS makes such an account report the permission set is not
-//! documented; what IS documented is the reprovisioning of assigned accounts above, so
-//! that is what this implements.
+//! A COPY is what an account holds of the permission set. A provisioning PUTS one into
+//! every account its target names, whether or not an assignment of the permission set was
+//! ever granted there — the model says the permission set "is provisioned to the specified
+//! target", and `ListAccountsForProvisionedPermissionSet` "lists all the Amazon Web
+//! Services accounts where the specified permission set is provisioned" — so a target
+//! account that holds no assignment of it is provisioned all the same and is reported from
+//! then on. Granting an account assignment provisions the permission set into its account
+//! too (`CreateAccountAssignment` records the definition it put there), so a provisioning
+//! of an account that already holds assignments REFRESHES the copy they carry, and both
+//! copies are recorded where `crate::state::ComAmazonawsSsoadminSwbexternalserviceState::provisioned_accounts`
+//! reads them.
 //!
 //! ## Shape of an operation
 //!

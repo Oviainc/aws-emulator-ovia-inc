@@ -214,6 +214,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         store.permission_sets.remove(&input.permission_set_arn);
+        // A permission set that no longer exists is provisioned nowhere, so the copies
+        // its provisionings delivered go with it.
+        store.forget_provisioned_copies(&input.instance_arn, &input.permission_set_arn);
         // The assignments that referenced the deleted permission set go with it, and so
         // do their creation-status records: a status record exists to report on one
         // assignment, so keeping it after that assignment is gone would both report

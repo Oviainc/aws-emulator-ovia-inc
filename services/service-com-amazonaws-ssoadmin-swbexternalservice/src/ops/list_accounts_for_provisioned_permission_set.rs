@@ -6,8 +6,9 @@
 //! PROVISIONED into, read from this service's state.
 //!
 //! An account holds a permission set once the permission set has been provisioned there,
-//! which is what granting an account assignment on that account does, so each such
-//! account is reported exactly once however many principals were assigned through it. The
+//! which both granting an account assignment on that account and provisioning the
+//! permission set into it do, so each such account is reported exactly once however many
+//! principals were assigned through it. The
 //! `ProvisioningStatus` filter selects by the status each of those accounts is in
 //! ([`crate::state::ComAmazonawsSsoadminSwbexternalserviceState::provisioned_accounts`]):
 //! the account holds the permission set's current definition, or a copy the permission set

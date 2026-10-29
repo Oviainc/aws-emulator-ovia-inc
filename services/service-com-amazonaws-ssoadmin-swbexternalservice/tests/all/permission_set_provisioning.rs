@@ -7,8 +7,9 @@
 //! definition, as it stands when the call is accepted, into the accounts the request's
 //! target names — the one account an `AWS_ACCOUNT` target names, or every account that
 //! already holds the permission set for an `ALL_PROVISIONED_ACCOUNTS` one — so each of
-//! those accounts then holds the permission set's current definition and the accounts
-//! outside the target keep the copy they had. The work is ASYNCHRONOUS: the call answers
+//! those accounts then holds the permission set's current definition, whether or not it
+//! holds an assignment of the permission set, and the accounts outside the target keep the
+//! copy they had. The work is ASYNCHRONOUS: the call answers
 //! with the tracking record of the workflow it started (a minted `RequestId`, the
 //! non-terminal `IN_PROGRESS` status and the date it was accepted), that record is stored
 //! under its `RequestId` for `DescribePermissionSetProvisioningStatus` to read ("The
@@ -462,12 +463,13 @@ async fn provisioning_copies_the_current_definition_into_the_accounts_the_target
     }
 }
 
-/// A provisioning of a permission set the target account does not hold has no copy to
-/// refresh there: an account holds a permission set through the assignments granted on it,
-/// so the call is accepted and tracked, and the accounts reported as holding the permission
-/// set are unchanged.
+/// A target account that holds no assignment of the permission set is provisioned all the
+/// same: the call is accepted and tracked to `SUCCEEDED`, and the copy it carries makes
+/// that account one of the accounts the permission set is provisioned into, beside the
+/// accounts that already held it. The whole class this generalises over is asserted in
+/// `permission_set_provisioning_targets.rs`.
 #[tokio::test]
-async fn provisioning_an_account_that_holds_no_assignment_adds_no_account() {
+async fn provisioning_an_account_that_holds_no_assignment_provisions_it() {
     let case = "an unassigned target account";
     let (router, instance_arn, engine) = organization_fixture();
     let permission_set_arn = create_permission_set(&router, &instance_arn, "Unassigned").await;
@@ -496,7 +498,11 @@ async fn provisioning_an_account_that_holds_no_assignment_adds_no_account() {
         "case {case:?}: a completed workflow is SUCCEEDED, got {described}"
     );
     let all = list_accounts(&router, &instance_arn, &permission_set_arn, None, case).await;
-    assert_accounts(&all, &[ACCOUNT_MID], &format!("{case}: unfiltered"));
+    assert_accounts(
+        &all,
+        &[ACCOUNT_MID, ACCOUNT_UNASSIGNED],
+        &format!("{case}: unfiltered"),
+    );
 }
 
 /// THE TRACKING RULE: the call answers the record of the workflow it started, stored under
