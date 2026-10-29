@@ -4,9 +4,8 @@
 //!
 //! Reports the tag set stored on the resource its `Arn` names, beside that resource's
 //! ARN in the region of the reading request — the same derivation every other ARN this
-//! service reports goes through (see `state::QueueRecord`). Reporting only: the one
-//! write on this path is `settle`, materialising the job status changes the clock had
-//! already made due.
+//! service reports goes through (see `state::QueueRecord`). Reporting only: a tag set is
+//! nothing the clock owes, so this path reads the store and writes nothing at all.
 //!
 //! ## Shape of an operation
 //!
@@ -188,11 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
-        let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        // Reporting only: the one write is materialising the status changes the clock had
-        // already made due at `now`, which were owed whether or not anybody polled.
-        state.settle(now);
+        // Reporting only, and nothing about a tag set is owed by the clock — `settle` moves
+        // job statuses, queries, share attempts and hops, never a record's tags — so this
+        // handler takes the store to read it and writes nothing at all.
+        let state = state.lock();
 
         let Some(tags) = state.tags(&resource) else {
             return Err(ListTagsForResourceErrorModeled::NotFoundException(

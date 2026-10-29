@@ -154,11 +154,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
-        let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        // Reporting only: the one write is materialising the job status changes the clock
-        // had already made due at `now`, which were owed whether or not anybody called.
-        state.settle(now);
+        // Reporting only, and nothing about a preset is owed by the clock — as `ListPresets`
+        // states for the same resource — so this handler takes the store to read it and
+        // writes nothing at all.
+        let state = state.lock();
 
         // `{Name}` is a preset name; the member is not documented to accept an ARN.
         let name = input.name;

@@ -29,6 +29,8 @@ mod caller_sent_key_identity;
 mod cancel_job_idempotence;
 #[path = "all/certificate_association.rs"]
 mod certificate_association;
+#[path = "all/clock_sweep_scope.rs"]
+mod clock_sweep_scope;
 #[path = "all/create_job_validation.rs"]
 mod create_job_validation;
 #[path = "all/created_resource_defaults.rs"]

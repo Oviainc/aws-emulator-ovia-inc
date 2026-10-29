@@ -184,11 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
-        // The status changes the clock had already made due at `now`, as every other
-        // handler in this service materialises them before it reads the store.
-        state.settle(now);
+        // No `settle` here: the only state this path reads or writes is the record's tag
+        // set, which the job lifecycle's clock never owes anything — settling is that
+        // lifecycle's business.
 
         let Some(tags) = state.tags_mut(&resource) else {
             return Err(UntagResourceErrorModeled::NotFoundException(NotFoundException {

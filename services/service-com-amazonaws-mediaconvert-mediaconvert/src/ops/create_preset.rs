@@ -207,8 +207,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+        // No `settle` here, for the reason `CreateJobTemplate` gives on the sibling create:
+        // this path neither reads nor writes job state — the record it stores and the
+        // `Preset` it projects carry no job-derived member — and settling is the job
+        // lifecycle's business.
         let mut state = state.lock();
-        state.settle(now);
 
         // `Name`: "Each name must be unique within your account." A create under a name
         // that is already in use does NOT conflict: see the match below.

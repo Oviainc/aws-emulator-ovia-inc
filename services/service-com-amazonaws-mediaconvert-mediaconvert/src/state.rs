@@ -50,7 +50,8 @@
 //!   job, so it is bounded by `MAX_JOBS` exactly as `pending_shares` is.
 //! * Every lookup is an O(log n) `BTreeMap` probe; no handler clones the whole store.
 //! * [`ComAmazonawsMediaconvertMediaconvertState::settle`] — the only work a reporting
-//!   operation does — touches ONLY the records whose due instant has already passed, by
+//!   operation onto job state does — touches ONLY the records whose due instant has
+//!   already passed, by
 //!   draining the `pending`, `pending_queries`, `pending_shares` and `pending_hops`
 //!   indexes that are
 //!   ordered by that instant, and does a CONSTANT amount of work per record it drains. It
@@ -4386,6 +4387,13 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// one call is the number of records that came due and nothing else; no kind re-reads
     /// the store. It is the only write a reporting operation makes, and every change it
     /// applies was owed at `now` whether or not anybody called.
+    ///
+    /// WHICH handlers call it: only those whose own request path reads or writes the state
+    /// this drains — a job's status or timing, a queue projection's job counts, a jobs
+    /// query, a share attempt or a hop. A door onto a resource the clock owes nothing
+    /// (a preset, a job template, a policy, a record's tag set, the version catalogue)
+    /// does not settle: the job lifecycle is not its business, and nothing it reports or
+    /// stores could differ either way.
     ///
     /// Whether a job may leave `SUBMITTED` at all is its QUEUE's decision, not the
     /// clock's: `QueueStatus` says "If you pause a queue, jobs in that queue won't
