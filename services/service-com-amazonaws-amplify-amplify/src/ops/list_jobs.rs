@@ -210,14 +210,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stored.settle();
         }
 
-        // One page of this branch's job history, in the stable order the branch stores
-        // it in, with the `nextToken` being the `jobId` of the first job the page did
-        // not return.
-        let (job_summaries, next_token) = crate::state::page(
-            branch
-                .jobs
-                .iter()
-                .map(|(job_id, stored)| (job_id.clone(), stored.job.summary.clone())),
+        // One page of this branch's job history, NEWEST JOB FIRST — a branch's jobs are
+        // reported most recent first, so a client polling the deployment it just started
+        // reads it at the head of the listing — with the `nextToken` being the `jobId` of
+        // the first job the page did not return.
+        let mut history: Vec<(String, JobSummary)> = branch
+            .jobs
+            .iter()
+            .map(|(job_id, stored)| (job_id.clone(), stored.job.summary.clone()))
+            .collect();
+        history.sort_by(|(left, _), (right, _)| crate::state::newest_job_first(left, right));
+        let (job_summaries, next_token) = crate::state::page_jobs(
+            history,
             input.next_token.as_deref(),
             crate::state::page_size(input.max_results, MAX_RESULTS),
         );

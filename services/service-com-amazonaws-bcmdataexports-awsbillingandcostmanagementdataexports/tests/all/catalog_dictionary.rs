@@ -304,7 +304,7 @@ fn every_included_column(table: &str) -> Option<Value> {
         .filter(|(_, valid_values, _)| valid_values.contains(&"TRUE"))
         .map(|(name, _, _)| ((*name).to_string(), json!("TRUE")))
         .collect();
-    (!configured.is_empty()).then(|| Value::Object(configured))
+    (!configured.is_empty()).then_some(Value::Object(configured))
 }
 
 /// The reported schema as `(Name, Type, Description)` triples, in response order.

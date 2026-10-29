@@ -124,9 +124,22 @@ const SOURCE_ACCOUNT_KEY: &str = "aws:SourceAccount";
 /// delivered.
 const SOURCE_ARN_KEY: &str = "aws:SourceArn";
 
+/// The condition key saying whether the request was sent over a secure transport.
+///
+/// A delivery this service performs answers it rather than leaving it open: the emulator
+/// serves every endpoint over TLS, and the write goes through one of them. A bucket whose
+/// policy carries the usual clause refusing everything that did NOT arrive that way
+/// therefore refuses nothing here — where a key with no value would leave that clause
+/// undecided, and an undecided refusal still refuses.
+const SECURE_TRANSPORT_KEY: &str = "aws:SecureTransport";
+
+/// The value that key carries, as IAM's boolean literals spell it.
+const SECURE_TRANSPORT_VALUE: &str = "true";
+
 /// The condition keys a delivery carries a value for, so a clause over one of them is
 /// decided rather than left undecided.
-const DELIVERY_CONDITION_KEYS: &[&str] = &[SOURCE_ACCOUNT_KEY, SOURCE_ARN_KEY];
+const DELIVERY_CONDITION_KEYS: &[&str] =
+    &[SOURCE_ACCOUNT_KEY, SOURCE_ARN_KEY, SECURE_TRANSPORT_KEY];
 
 /// The `Message` a creation refused for the destination bucket's missing delivery grant
 /// carries.
@@ -187,6 +200,10 @@ pub fn validate_delivery_grant<Eng: Send + Sync + 'static>(
             ::engine::emulator_account_id().to_string(),
         ),
         (SOURCE_ARN_KEY.to_string(), export_arn.to_string()),
+        (
+            SECURE_TRANSPORT_KEY.to_string(),
+            SECURE_TRANSPORT_VALUE.to_string(),
+        ),
     ];
     let objects_written = delivery_object_arn(s3);
     let request = ::service_common::iam_authorization::Request::new(

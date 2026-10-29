@@ -390,11 +390,7 @@ fn source_of(
     }
 
     let Some(source_url) = source_url else {
-        return Err(StartDeploymentErrorModeled::BadRequestException(
-            BadRequestException {
-                message: Some(NO_SOURCE_MESSAGE.to_string()),
-            },
-        ));
+        return Err(bad_request(NO_SOURCE_MESSAGE));
     };
 
     // "If no value is specified, the default is ZIP"
@@ -480,14 +476,16 @@ impl Deployment {
 }
 
 /// Read `source`, refusing the deployment when the source's own policy grants Amplify
-/// no read of it.
+/// no read of it, or when the source URL resolves to no content to deploy.
 ///
-/// The REFUSAL and the job's outcome are different answers to different questions. A
-/// source Amplify may not read at all is refused before any job exists: the deployment
-/// never started. A source Amplify MAY read but could not — a prefix nothing may list,
-/// an object that is not there, a URL outside this emulator — starts the deployment,
-/// which then ends FAILED, because whether the content is actually usable is not known
-/// until it has been read.
+/// The REFUSAL and the job's outcome are different answers to different questions. What
+/// the source URL RESOLVES TO is settled while the caller waits, so it is answered with a
+/// modelled refusal and no job: a source Amplify may not read at all takes the 401, and a
+/// source URL that addresses nothing deployable — an archive object the bucket does not
+/// hold, a prefix carrying no root document — takes the 400. Only what reading the
+/// resolved source then PRODUCED is the job's business: a prefix nothing may list, an
+/// archive that is not an archive, a URL outside this emulator start the deployment, whose
+/// job ends FAILED carrying the reason.
 async fn read_source(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -513,6 +511,16 @@ async fn read_source(
             if !grants(&policy, GET_OBJECT_ACTION, &object_arn(bucket, prefix), app_arn) {
                 return Err(unauthorized());
             }
+            // A hosted branch answers a request for its root with `ROOT_DOCUMENT`, so a
+            // prefix that carries none addresses no site: the one object a prefix source
+            // is resolved by is asked for while the caller waits, and a prefix the bucket
+            // holds no root document under is refused rather than started.
+            if matches!(
+                source_object(ctx, region, bucket, &format!("{prefix}{ROOT_DOCUMENT}")).await,
+                SourceObject::Absent
+            ) {
+                return Err(bad_request(PREFIX_WITHOUT_ROOT_DOCUMENT));
+            }
             // Enumerating the files under a prefix is a second permission on a second
             // resource — the bucket itself — and a policy that grants the read of the
             // objects without it leaves Amplify unable to find out WHICH objects to
@@ -531,6 +539,15 @@ async fn read_source(
             if !grants(&policy, GET_OBJECT_ACTION, &object_arn(bucket, key), app_arn) {
                 return Err(unauthorized());
             }
+            // The archive the URL names is resolved while the caller waits: a URL naming
+            // an object the bucket does not hold addresses no archive at all, which is the
+            // caller's own mistake and is refused rather than deployed.
+            if matches!(
+                source_object(ctx, region, bucket, key).await,
+                SourceObject::Absent
+            ) {
+                return Err(bad_request(SOURCE_URL_WITHOUT_OBJECT));
+            }
             Ok(archive_deployment(ctx, region, bucket, key, &label).await)
         }
     }
@@ -543,6 +560,73 @@ fn unauthorized() -> StartDeploymentErrorModeled {
     StartDeploymentErrorModeled::UnauthorizedException(UnauthorizedException {
         message: Some(BUCKET_POLICY_WITHOUT_AMPLIFY_ACCESS.to_string()),
     })
+}
+
+/// The modelled refusal of a source URL that resolves to nothing to deploy: HTTP 400
+/// `BadRequestException` ("A request contains unexpected data"), carrying `why`.
+fn bad_request(why: &str) -> StartDeploymentErrorModeled {
+    StartDeploymentErrorModeled::BadRequestException(BadRequestException {
+        message: Some(why.to_string()),
+    })
+}
+
+/// What asking Amazon S3 about ONE object of a deployment source answered.
+enum SourceObject {
+    /// S3 holds it.
+    Present,
+    /// S3 answered that it holds no such object — including because it holds no such
+    /// bucket: either way the source URL addresses nothing.
+    Absent,
+    /// S3 could not be ASKED — an emulator assembled without object storage, or a
+    /// transport failure. Nothing is then known about the object, so no refusal can be
+    /// grounded in it.
+    Unreadable,
+}
+
+/// Whether the deployment source's object `bucket`/`key` is there, as S3 answered.
+///
+/// Only the object's PRESENCE is asked for, so resolving a source costs no body: the
+/// content is read by the deployment that was accepted, not by the resolution that
+/// accepts it. A key that is empty addresses no object at all, which is the same answer
+/// without asking.
+async fn source_object(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+    key: &str,
+) -> SourceObject {
+    if key.is_empty() {
+        return SourceObject::Absent;
+    }
+    let answer = s3_client(ctx, region)
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await;
+    let failure = match answer {
+        Ok(_) => return SourceObject::Present,
+        Err(failure) => failure,
+    };
+    // S3 answering NOT FOUND is its answer that it holds no such object — including
+    // because it holds no such bucket, which `HeadBucket`/`HeadObject` answer the same
+    // way. Every OTHER answer says something else (a refusal, a fault, or no response at
+    // all) and settles nothing about whether the object is there, so none of them is read
+    // as its absence.
+    let status = failure
+        .raw_response()
+        .map(|response| response.status().as_u16());
+    if status == Some(OBJECT_NOT_FOUND_STATUS) {
+        return SourceObject::Absent;
+    }
+    ::tracing::warn!(
+        bucket,
+        key,
+        status = ?status,
+        error = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+        "the deployment source's object could not be asked about"
+    );
+    SourceObject::Unreadable
 }
 
 /// Every asset of the Amazon S3 source `bucket`/`prefix`, as a deployment.
@@ -561,8 +645,20 @@ async fn prefix_deployment(
     let client = s3_client(ctx, region);
     let mut assets = BTreeSet::new();
     let mut examined = 0usize;
+    let mut pages = 0usize;
     let mut continuation: Option<String> = None;
     loop {
+        // The walk over the source's objects is bounded in PAGES as well as in keys: a
+        // listing that keeps handing back a continuation token without reporting a key
+        // would otherwise be awaited without end, and one call of this operation has to
+        // reach an answer.
+        pages = pages.saturating_add(1);
+        if pages > MAX_SOURCE_LISTING_PAGES {
+            return Deployment::failed(format!(
+                "The files of the deployment source {label} were still not listed after \
+                 {MAX_SOURCE_LISTING_PAGES} pages of the bucket's listing."
+            ));
+        }
         let mut listing = client.list_objects_v2().bucket(bucket).prefix(prefix);
         if let Some(token) = continuation {
             listing = listing.continuation_token(token);
@@ -815,6 +911,10 @@ fn grants(policy: &BucketPolicy, action: &str, resource: &str, app_arn: &str) ->
                     ::emulator_server::emulator_account_id().to_string(),
                 ),
                 (SOURCE_ARN_KEY.to_string(), app_arn.to_string()),
+                (
+                    SECURE_TRANSPORT_KEY.to_string(),
+                    SECURE_TRANSPORT_VALUE.to_string(),
+                ),
             ];
             let request =
                 ::service_common::iam_authorization::Request::new(action, resource, &principals)
@@ -925,6 +1025,20 @@ pub const BUCKET_POLICY_WITHOUT_AMPLIFY_ACCESS: &str =
 pub const NO_SOURCE_MESSAGE: &str =
     "A deployment requires either the jobId of a CreateDeployment request or a sourceUrl.";
 
+/// What a `BUCKET_PREFIX` deployment is refused with when the bucket holds no
+/// [`ROOT_DOCUMENT`] under the prefix the request named.
+///
+/// The ONE sentence recorded behaviour words this modelled 400 with: fixed text naming
+/// neither the bucket nor the prefix, because what the caller is told is which file the
+/// path they sent has to hold.
+pub const PREFIX_WITHOUT_ROOT_DOCUMENT: &str =
+    "The bucket must have an index.html file at the path provided in the sourceUrl";
+
+/// What a `ZIP` deployment is refused with when the source URL names an object the bucket
+/// does not hold, as recorded behaviour words this modelled 400.
+pub const SOURCE_URL_WITHOUT_OBJECT: &str =
+    "The provided S3 source URL is not valid, please make sure the specified bucket and object exists.";
+
 /// The AWS service principal a source bucket's policy grants deployment access to.
 ///
 /// Amplify reads a manual deployment's source in its own name rather than in the
@@ -945,9 +1059,22 @@ const SOURCE_ACCOUNT_KEY: &str = "aws:SourceAccount";
 /// the Amplify app whose deployment is reading.
 const SOURCE_ARN_KEY: &str = "aws:SourceArn";
 
+/// The condition key saying whether the request was sent over a secure transport.
+///
+/// This read answers it rather than leaving it open: the emulator serves every endpoint
+/// over TLS, and the source is read through one of them. A bucket whose policy carries the
+/// usual clause refusing everything that did NOT arrive that way therefore refuses nothing
+/// here — where a key with no value would leave that clause undecided, and an undecided
+/// refusal still refuses.
+const SECURE_TRANSPORT_KEY: &str = "aws:SecureTransport";
+
+/// The value that key carries, as IAM's boolean literals spell it.
+const SECURE_TRANSPORT_VALUE: &str = "true";
+
 /// The condition keys this read carries a value for, so a clause over one of them is
 /// decided rather than left undecided.
-const DEPLOYMENT_CONDITION_KEYS: &[&str] = &[SOURCE_ACCOUNT_KEY, SOURCE_ARN_KEY];
+const DEPLOYMENT_CONDITION_KEYS: &[&str] =
+    &[SOURCE_ACCOUNT_KEY, SOURCE_ARN_KEY, SECURE_TRANSPORT_KEY];
 
 /// `SourceUrlType`'s two modelled values
 /// (`smithy_query(query="shape",shape="SourceUrlType")`): the source is a `.zip` file,
@@ -957,6 +1084,10 @@ const SOURCE_URL_TYPE_BUCKET_PREFIX: &str = "BUCKET_PREFIX";
 
 /// The scheme of a source URL that names an Amazon S3 location.
 const S3_SCHEME: &str = "s3://";
+
+/// The status Amazon S3 answers a `HeadObject` for an object it does not hold: a HEAD
+/// carries no body, so the status is the whole answer (`NoSuchKey` / `NoSuchBucket`).
+const OBJECT_NOT_FOUND_STATUS: u16 = 404;
 
 /// The `jobType` of a job this operation starts: "If the value is MANUAL, the job is for
 /// a manually deployed app" (`smithy_query(query="shape",shape="JobType")`).
@@ -985,3 +1116,12 @@ pub const MAX_DEPLOYMENT_ASSETS: usize = 1000;
 /// memory. 64 MiB is generous for the built output of a web app, which is what a manual
 /// deployment carries.
 pub const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+
+/// How many pages of a bucket's listing the walk over a prefix source reads.
+///
+/// CHOSEN, not a published quota: one listing page carries up to
+/// [`MAX_DEPLOYMENT_ASSETS`] keys, so a source this emulator deploys is listed in one
+/// page and a handful of pages is already past what a deployable source needs. The bound
+/// is what keeps the walk — and so this operation's answer — finite whatever the listing
+/// hands back.
+pub const MAX_SOURCE_LISTING_PAGES: usize = 8;

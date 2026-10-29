@@ -19,8 +19,9 @@
 //! the policy grants (the action, the principal, the resource), what it conditions the grant
 //! on (nothing, the account and the export ARN, an ARN in another Region), what form the
 //! grant takes (a service principal, a wildcard principal, a wildcard action), whether a
-//! `Deny` sits beside it, which prefix of the bucket the export is delivered under, and the
-//! Region the call is signed for — never along the identity of a bucket.
+//! `Deny` sits beside it and what that `Deny` is conditioned on (including the transport the
+//! delivery itself is made over), which prefix of the bucket the export is delivered under,
+//! and the Region the call is signed for — never along the identity of a bucket.
 
 use std::sync::Arc;
 
@@ -217,6 +218,26 @@ fn published_grant(bucket: &str) -> Value {
     ))
 }
 
+/// A document carrying SEVERAL statements, for a row that puts one beside the grant.
+fn document(statements: Vec<Value>) -> Value {
+    json!({ "Version": "2012-10-17", "Statement": statements })
+}
+
+/// The statement a hardened bucket carries beside its grants: a `Deny` of every request
+/// whose `aws:SecureTransport` is `secure` — "false" in AWS's own published idiom, which
+/// refuses everything that did not arrive over TLS, and "true" for the row that states the
+/// clause the delivery's own transport DOES satisfy.
+fn deny_on_secure_transport(bucket: &str, secure: &str) -> Value {
+    json!({
+        "Sid": "DenyUnencryptedTransport",
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "s3:*",
+        "Resource": [format!("arn:aws:s3:::{bucket}"), objects_of(bucket)],
+        "Condition": { "Bool": { "aws:SecureTransport": secure } },
+    })
+}
+
 /// One row of the table.
 struct Row {
     label: &'static str,
@@ -333,6 +354,44 @@ fn rows() -> Vec<Row> {
             prefix: "",
             signed_for: PINNED_REGION,
             served: true,
+        },
+        // The published grant on a HARDENED bucket: the delivery is made over a secure
+        // transport, so the statement refusing everything that was not refuses nothing.
+        Row {
+            label: "the published grant beside a deny of what did not arrive over TLS",
+            policy: |bucket| {
+                Some(document(vec![
+                    grant(
+                        json!({ "Service": [DELIVERY_SERVICE_PRINCIPAL] }),
+                        json!([DELIVERY_ACTION]),
+                        json!([objects_of(bucket)]),
+                        Some(source_condition(PINNED_REGION)),
+                    ),
+                    deny_on_secure_transport(bucket, "false"),
+                ]))
+            },
+            prefix: "exports/daily",
+            signed_for: PINNED_REGION,
+            served: true,
+        },
+        // The same statement stating the clause the delivery's transport DOES satisfy:
+        // that deny is about this write, so it refuses it.
+        Row {
+            label: "the published grant beside a deny of what DID arrive over TLS",
+            policy: |bucket| {
+                Some(document(vec![
+                    grant(
+                        json!({ "Service": [DELIVERY_SERVICE_PRINCIPAL] }),
+                        json!([DELIVERY_ACTION]),
+                        json!([objects_of(bucket)]),
+                        Some(source_condition(PINNED_REGION)),
+                    ),
+                    deny_on_secure_transport(bucket, "true"),
+                ]))
+            },
+            prefix: "exports/daily",
+            signed_for: PINNED_REGION,
+            served: false,
         },
         // A bucket created WITHOUT a policy: the recorded refusal.
         Row {

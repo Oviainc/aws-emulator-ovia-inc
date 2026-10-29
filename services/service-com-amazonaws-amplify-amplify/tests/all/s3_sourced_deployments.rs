@@ -23,14 +23,22 @@
 //! 3. That job's terminal status is computed from what the read FOUND: it settles to
 //!    `SUCCEED` when the source's files were read and carry the root document, and to
 //!    `FAILED` — with the reason on its one execution step — when they could not be
-//!    (nothing to list, nothing under the prefix, no root document, an archive that is
-//!    not there, a source outside this emulator).
+//!    (nothing to list, an archive that carries no root document, a source outside this
+//!    emulator).
 //! 4. A deployment `CreateDeployment` reserved runs under the `jobId` it reserved, from
 //!    the uploads that reservation's destinations hold, and the reservation is SPENT by
 //!    the call that starts it.
 //! 5. A request that names neither a reservation nor a source URL names nothing to
 //!    deploy and is refused with the modelled 400; an app, branch or reservation that
 //!    names nothing is refused with the modelled 404.
+//! 6. A source URL is RESOLVED while the caller waits, so a URL that addresses nothing
+//!    deployable — a prefix the bucket holds no root document under, an archive object the
+//!    bucket does not hold — takes the modelled 400 and starts no job.
+//! 7. The decision about the source bucket's policy carries a value for every global
+//!    condition key the read itself fixes, so a clause over one of them is decided rather
+//!    than left undecided: the usual statement refusing everything not sent over a secure
+//!    transport refuses nothing here, and one refusing what IS sent over one refuses the
+//!    read.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -40,7 +48,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use service_com_amazonaws_amplify_amplify::ops::start_deployment::{
-    BUCKET_POLICY_WITHOUT_AMPLIFY_ACCESS, NO_SOURCE_MESSAGE, ROOT_DOCUMENT,
+    BUCKET_POLICY_WITHOUT_AMPLIFY_ACCESS, NO_SOURCE_MESSAGE, PREFIX_WITHOUT_ROOT_DOCUMENT,
+    ROOT_DOCUMENT, SOURCE_URL_WITHOUT_OBJECT,
 };
 use service_com_amazonaws_amplify_amplify::state::{
     ComAmazonawsAmplifyAmplifyState, JOB_SETTLE_MILLIS,
@@ -477,8 +486,10 @@ async fn an_authorized_source_starts_a_job_whose_outcome_is_what_was_read() {
 
     // The rows differ along what the rule generalises over: the source type, where under
     // the bucket the source sits, whether the prefix was written with its separator,
-    // whether the files carry a root document, whether the object is there at all,
-    // whether the listing is permitted, and whether the source is in this emulator.
+    // whether the archive's files carry a root document, whether the listing is
+    // permitted, and whether the source is in this emulator. (A source URL that addresses
+    // nothing deployable at all is refused before a job exists, which
+    // `a_source_url_addressing_nothing_deployable_is_refused` covers.)
     let rows = vec![
         AcceptedRow {
             case: "a prefix holding the built site",
@@ -499,36 +510,6 @@ async fn an_authorized_source_starts_a_job_whose_outcome_is_what_was_read() {
             status: SUCCEED,
             assets: vec!["assets/app.js", "assets/styles/main.css", "index.html"],
             reason_names: None,
-        },
-        AcceptedRow {
-            case: "the bucket root, whose files sit one folder down",
-            request: json!({
-                "sourceUrl": format!("s3://{granted}/"),
-                "sourceUrlType": "BUCKET_PREFIX",
-            }),
-            status: FAILED,
-            assets: vec![],
-            reason_names: Some(ROOT_DOCUMENT),
-        },
-        AcceptedRow {
-            case: "a prefix holding a file but no root document",
-            request: json!({
-                "sourceUrl": format!("s3://{granted}/other/"),
-                "sourceUrlType": "BUCKET_PREFIX",
-            }),
-            status: FAILED,
-            assets: vec![],
-            reason_names: Some(ROOT_DOCUMENT),
-        },
-        AcceptedRow {
-            case: "a prefix holding no object at all",
-            request: json!({
-                "sourceUrl": format!("s3://{granted}/nothing-here/"),
-                "sourceUrlType": "BUCKET_PREFIX",
-            }),
-            status: FAILED,
-            assets: vec![],
-            reason_names: Some("no file"),
         },
         AcceptedRow {
             case: "an archive carrying the built site",
@@ -556,16 +537,6 @@ async fn an_authorized_source_starts_a_job_whose_outcome_is_what_was_read() {
             status: FAILED,
             assets: vec![],
             reason_names: Some(ROOT_DOCUMENT),
-        },
-        AcceptedRow {
-            case: "an archive object that is not there",
-            request: json!({
-                "sourceUrl": format!("s3://{granted}/archives/absent.zip"),
-                "sourceUrlType": "ZIP",
-            }),
-            status: FAILED,
-            assets: vec![],
-            reason_names: Some("could not be read"),
         },
         AcceptedRow {
             case: "a prefix whose bucket policy permits no listing",
@@ -941,4 +912,323 @@ async fn a_request_naming_nothing_to_deploy_is_refused() {
             reply.message()
         );
     }
+}
+
+/// The documented grant, with the statements a row adds BESIDE it: a bucket policy is a
+/// list of statements, and what is under test is how one more statement beside the grant
+/// decides.
+fn grant_beside(bucket: &str, extra: &[Value]) -> Value {
+    let mut policy = full_grant(bucket);
+    let statements = policy
+        .get_mut("Statement")
+        .and_then(Value::as_array_mut)
+        .expect("the documented grant carries a statement list");
+    statements.extend(extra.iter().cloned());
+    policy
+}
+
+/// One statement about the whole bucket, conditioned on a single clause: the shape of
+/// AWS's own "refuse everything that did not arrive over a secure transport" idiom, with
+/// the effect and the clause the row varies.
+fn conditioned_statement(bucket: &str, effect: &str, condition: Value) -> Value {
+    json!({
+        "Effect": effect,
+        "Principal": { "Service": AMPLIFY },
+        "Action": ["s3:GetObject", "s3:ListBucket"],
+        "Resource": [
+            format!("arn:aws:s3:::{bucket}"),
+            format!("arn:aws:s3:::{bucket}/*"),
+        ],
+        "Condition": condition,
+    })
+}
+
+/// Rule 7: the decision about the source bucket's policy carries a value for every global
+/// condition key the read itself fixes.
+///
+/// The rows differ along what that generalises over: the effect the conditioned statement
+/// states, the value its clause demands of the key, whether the clause is the grant's own
+/// or a statement beside it, and whether the key is one this read models at all — the last
+/// of which pins the fail-closed reading that stays in force for everything the read
+/// cannot answer.
+/// (`aws:SecureTransport` — "whether the request was sent using SSL" — and
+/// `aws:PrincipalOrgID` are IAM's global condition keys.)
+/// One row of the condition table: the case, the policy the source bucket carries (built
+/// from the bucket's own name), and the status `StartDeployment` must answer.
+struct ConditionRow {
+    case: &'static str,
+    policy: fn(&str) -> Value,
+    status: u16,
+}
+
+#[tokio::test]
+async fn a_global_condition_the_source_read_answers_is_decided() {
+    let deployments = Deployments::new();
+    let app_id = deployments
+        .app_with_branch("deploy-conditions", "main")
+        .await;
+
+    let rows = vec![
+        ConditionRow {
+            case: "the documented grant beside a deny of what did not arrive over a secure \
+                   transport",
+            policy: |bucket| {
+                grant_beside(
+                    bucket,
+                    &[conditioned_statement(
+                        bucket,
+                        "Deny",
+                        json!({ "Bool": { "aws:SecureTransport": "false" } }),
+                    )],
+                )
+            },
+            status: 200,
+        },
+        ConditionRow {
+            case: "a grant that holds only for a read over a secure transport",
+            policy: |bucket| {
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [conditioned_statement(
+                        bucket,
+                        "Allow",
+                        json!({ "Bool": { "aws:SecureTransport": "true" } }),
+                    )],
+                })
+            },
+            status: 200,
+        },
+        ConditionRow {
+            case: "the documented grant beside a deny of what DID arrive over a secure \
+                   transport",
+            policy: |bucket| {
+                grant_beside(
+                    bucket,
+                    &[conditioned_statement(
+                        bucket,
+                        "Deny",
+                        json!({ "Bool": { "aws:SecureTransport": "true" } }),
+                    )],
+                )
+            },
+            status: 401,
+        },
+        ConditionRow {
+            case: "a grant that holds only for a read that was NOT over a secure transport",
+            policy: |bucket| {
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [conditioned_statement(
+                        bucket,
+                        "Allow",
+                        json!({ "Bool": { "aws:SecureTransport": "false" } }),
+                    )],
+                })
+            },
+            status: 401,
+        },
+        ConditionRow {
+            case: "the documented grant beside a deny over a key this read does not answer",
+            policy: |bucket| {
+                grant_beside(
+                    bucket,
+                    &[conditioned_statement(
+                        bucket,
+                        "Deny",
+                        json!({ "StringEquals": { "aws:PrincipalOrgID": "o-abc123" } }),
+                    )],
+                )
+            },
+            status: 401,
+        },
+    ];
+
+    let mut accepted: Vec<(&str, String)> = Vec::new();
+    for (index, row) in rows.into_iter().enumerate() {
+        let ConditionRow {
+            case,
+            policy: policy_of,
+            status,
+        } = row;
+        let bucket = format!("deploy-condition-{index}");
+        deployments.seed_site(&bucket).await;
+        deployments
+            .put_bucket_policy(&bucket, &policy_of(&bucket))
+            .await;
+
+        let reply = deployments
+            .start_deployment(
+                &app_id,
+                "main",
+                &json!({
+                    "sourceUrl": format!("s3://{bucket}/src/"),
+                    "sourceUrlType": "BUCKET_PREFIX",
+                }),
+            )
+            .await;
+        assert_eq!(
+            reply.status, status,
+            "case {case:?}: expected HTTP {status}, got {reply:?}"
+        );
+        if status == 200 {
+            let summary = job_summary(&reply);
+            assert_eq!(
+                string_member(&summary, "status"),
+                PENDING,
+                "case {case:?}: a started deployment has deployed nothing yet, got {summary:?}"
+            );
+            accepted.push((case, string_member(&summary, "jobId")));
+        } else {
+            assert_eq!(
+                reply.error_code.as_deref(),
+                Some("UnauthorizedException"),
+                "case {case:?}: expected the modelled UnauthorizedException, got {:?}",
+                reply.error_code
+            );
+            assert_eq!(
+                reply.message().as_deref(),
+                Some(BUCKET_POLICY_WITHOUT_AMPLIFY_ACCESS),
+                "case {case:?}: expected the recorded refusal text, got {:?}",
+                reply.message()
+            );
+        }
+    }
+
+    // A deployment the policy DID grant is one the read then carried out: the files under
+    // the prefix are published and the job settles to SUCCEED, read back through GetJob.
+    sleep(past_the_settle_span());
+    for (case, job_id) in &accepted {
+        let reply = deployments.get_job(&app_id, "main", job_id).await;
+        let summary = reply.member("job").get("summary").cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            string_member(&summary, "status"),
+            SUCCEED,
+            "case {case:?}: expected the granted deployment's job to succeed, got {reply:?}"
+        );
+        let published = deployments.deployed_assets(&app_id, "main", job_id);
+        let expected: BTreeSet<String> = ["assets/app.js", "assets/styles/main.css", "index.html"]
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect();
+        assert_eq!(
+            published, expected,
+            "case {case:?}: expected the deployment to publish {expected:?}, got {published:?}"
+        );
+    }
+}
+
+/// Rule 6: a source URL that addresses nothing deployable is refused while the caller
+/// waits, with the modelled 400 for that source type, and starts no job.
+///
+/// The rows differ along what the rule generalises over: the source type, whether the
+/// addressed path holds anything at all, whether what it holds carries the root document,
+/// whether the prefix was written with its separator, and whether the URL names a key at
+/// all.
+#[tokio::test]
+async fn a_source_url_addressing_nothing_deployable_is_refused() {
+    let deployments = Deployments::new();
+    let app_id = deployments
+        .app_with_branch("deploy-resolution", "main")
+        .await;
+    let bucket = "deploy-resolution-site";
+    deployments.seed_site(bucket).await;
+    deployments
+        .put_bucket_policy(bucket, &full_grant(bucket))
+        .await;
+
+    // Each row: the case, the request, and either the refusal it takes or `None` for a
+    // source that does resolve.
+    let rows: Vec<(&str, Value, Option<&str>)> = vec![
+        (
+            "a prefix at the bucket root, whose files sit one folder down",
+            json!({ "sourceUrl": format!("s3://{bucket}/"), "sourceUrlType": "BUCKET_PREFIX" }),
+            Some(PREFIX_WITHOUT_ROOT_DOCUMENT),
+        ),
+        (
+            "a prefix holding a file but no root document",
+            json!({ "sourceUrl": format!("s3://{bucket}/other/"), "sourceUrlType": "BUCKET_PREFIX" }),
+            Some(PREFIX_WITHOUT_ROOT_DOCUMENT),
+        ),
+        (
+            "a prefix holding no object at all",
+            json!({ "sourceUrl": format!("s3://{bucket}/nothing-here/"), "sourceUrlType": "BUCKET_PREFIX" }),
+            Some(PREFIX_WITHOUT_ROOT_DOCUMENT),
+        ),
+        (
+            "a prefix whose root document sits under a deeper folder still",
+            json!({ "sourceUrl": format!("s3://{bucket}/src/assets/"), "sourceUrlType": "BUCKET_PREFIX" }),
+            Some(PREFIX_WITHOUT_ROOT_DOCUMENT),
+        ),
+        (
+            "the prefix that does hold the root document",
+            json!({ "sourceUrl": format!("s3://{bucket}/src/"), "sourceUrlType": "BUCKET_PREFIX" }),
+            None,
+        ),
+        (
+            "that same prefix written without its separator",
+            json!({ "sourceUrl": format!("s3://{bucket}/src"), "sourceUrlType": "BUCKET_PREFIX" }),
+            None,
+        ),
+        (
+            "an archive object the bucket does not hold",
+            json!({ "sourceUrl": format!("s3://{bucket}/archives/absent.zip"), "sourceUrlType": "ZIP" }),
+            Some(SOURCE_URL_WITHOUT_OBJECT),
+        ),
+        (
+            "an archive URL naming a folder rather than an object",
+            json!({ "sourceUrl": format!("s3://{bucket}/archives/"), "sourceUrlType": "ZIP" }),
+            Some(SOURCE_URL_WITHOUT_OBJECT),
+        ),
+        (
+            "an archive URL naming no key at all",
+            json!({ "sourceUrl": format!("s3://{bucket}"), "sourceUrlType": "ZIP" }),
+            Some(SOURCE_URL_WITHOUT_OBJECT),
+        ),
+        (
+            "the archive object the bucket does hold",
+            json!({ "sourceUrl": format!("s3://{bucket}/archives/site.zip"), "sourceUrlType": "ZIP" }),
+            None,
+        ),
+    ];
+
+    let mut started = 0usize;
+    for (case, request, refusal) in rows {
+        let reply = deployments.start_deployment(&app_id, "main", &request).await;
+        match refusal {
+            Some(message) => {
+                assert_eq!(
+                    reply.status, 400,
+                    "case {case:?}: expected the modelled HTTP 400, got {reply:?}"
+                );
+                assert_eq!(
+                    reply.error_code.as_deref(),
+                    Some("BadRequestException"),
+                    "case {case:?}: expected the modelled BadRequestException, got {:?}",
+                    reply.error_code
+                );
+                assert_eq!(
+                    reply.message().as_deref(),
+                    Some(message),
+                    "case {case:?}: expected the recorded refusal text, got {:?}",
+                    reply.message()
+                );
+            }
+            None => {
+                assert_eq!(
+                    reply.status, 200,
+                    "case {case:?}: expected HTTP 200 from StartDeployment, got {reply:?}"
+                );
+                started += 1;
+            }
+        }
+    }
+
+    // A refused source started nothing: the branch ran exactly the deployments that were
+    // accepted.
+    let listing = deployments.list_jobs(&app_id, "main").await;
+    assert_eq!(
+        list_member(&listing.body, "jobSummaries").len(),
+        started,
+        "case \"a refused source starts nothing\": expected {started} jobs, got {listing:?}"
+    );
 }

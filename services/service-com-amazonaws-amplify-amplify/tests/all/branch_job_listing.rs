@@ -10,9 +10,9 @@
 //! rather than over one recorded request:
 //!
 //! 1. `ListJobs` reports a page of the jobs the branch it names HOLDS, each summary
-//!    being the record `GetJob` answers for that job, in the branch's stable `jobId`
-//!    order, with `nextToken` the id of the first job the page did not return and
-//!    absent on the last page. A branch that has run nothing lists nothing.
+//!    being the record `GetJob` answers for that job, NEWEST JOB FIRST, with `nextToken`
+//!    the id of the first job the page did not return and absent on the last page. A
+//!    branch that has run nothing lists nothing.
 //! 2. The page bound is `maxResults`: a page holds `min(bound, remaining)` jobs, a
 //!    caller that set no bound (member absent, or its modelled default of 0) gets the
 //!    modelled maximum, and a bound past the modelled range maximum is refused rather
@@ -114,10 +114,9 @@ async fn list_jobs(emulator: &Emulator, app_id: &str, branch: &str, query: &str)
 /// Start `count` jobs on `branch`, cycling the `jobType`s, and answer the ids the
 /// branch minted for them in the order a listing reports them.
 ///
-/// A branch mints decimal ids counting its own jobs, and the history is stored in
-/// `jobId` order, so the expected order is those ids sorted — which is NOT the order
-/// they were started in once a branch has run more than nine jobs, and so is worth
-/// spanning.
+/// A branch mints decimal ids counting its own jobs and reports its history newest job
+/// first, so the expected order is the ids reversed — which once a branch has run more
+/// than nine jobs is NOT their text order either way, and so is worth spanning.
 async fn history_of(emulator: &Emulator, app_id: &str, branch: &str, count: usize) -> Vec<String> {
     let mut ids = Vec::new();
     for index in 0..count {
@@ -129,7 +128,7 @@ async fn history_of(emulator: &Emulator, app_id: &str, branch: &str, count: usiz
         );
         ids.push(string_member(&started.member("jobSummary"), "jobId"));
     }
-    ids.sort();
+    ids.reverse();
     ids
 }
 
@@ -156,7 +155,7 @@ async fn list_jobs_answers_the_jobs_the_branch_holds_for_every_history_size() {
 
     // The sizes span a branch that has run nothing, one job, a handful, and enough
     // jobs that the ids are no longer single digits (so the reported order is the
-    // branch's stored order rather than an accident of one-character ids).
+    // branch's own job order rather than an accident of one-character ids).
     for count in [0_usize, 1, 5, 12] {
         let branch = "main";
         let (app_id, branch_arn) =
@@ -171,8 +170,8 @@ async fn list_jobs_answers_the_jobs_the_branch_holds_for_every_history_size() {
         assert_eq!(
             listed_ids(&reply),
             expected,
-            "case \"{count} jobs\": ListJobs must report the branch's whole history in \
-             its stored order, got {:?}",
+            "case \"{count} jobs\": ListJobs must report the branch's whole history \
+             newest job first, got {:?}",
             reply.body
         );
         assert!(
@@ -330,14 +329,15 @@ async fn list_jobs_refuses_a_token_it_never_issued_and_resumes_at_one_it_did() {
     }
 
     // A token the service could have issued resumes the scan at the first id at or
-    // after it in the branch's stored order — including an id the branch does not
-    // hold, which is how a page boundary survives a history that shrank between two
-    // calls.
+    // after it IN THE REPORTED ORDER, which runs downwards from the newest job —
+    // including an id the branch does not hold, which is how a page boundary survives a
+    // history that shrank between two calls.
     for (label, token, want) in [
-        ("token naming the first job", "1", 0),
-        ("token naming the last job", "4", 3),
-        ("token naming no job of the branch", "25", 2),
-        ("token past the whole history", "99", 4),
+        ("token naming the newest job", "4", 0),
+        ("token naming a job in the middle", "3", 1),
+        ("token naming the oldest job", "1", 3),
+        ("token naming no job, above the whole history", "25", 0),
+        ("token naming no job, below the whole history", "0", 4),
     ] {
         let reply = list_jobs(&emulator, &app_id, branch, &format!("?nextToken={token}")).await;
         assert_eq!(

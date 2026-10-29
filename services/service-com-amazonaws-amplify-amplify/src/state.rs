@@ -946,9 +946,39 @@ pub fn page<T>(
     next_token: Option<&str>,
     page_size: usize,
 ) -> (Vec<T>, Option<String>) {
+    // The keys of these collections are names and ids compared as text, so "before the
+    // token" is text order.
+    page_in_order(ordered, next_token, page_size, |key, token| key < token)
+}
+
+/// One page of a JOB history, which is ordered NEWEST JOB FIRST.
+///
+/// The same contract as [`page`] — the token is the key of the first record not returned,
+/// and a resumed call starts at the first key at or after the token IN THE REPORTED
+/// ORDER — read in that order instead of in text order, so a resumed call carries on
+/// downwards through the history rather than restarting at its newest job. `ordered` is
+/// the history already in reported order (see [`newest_job_first`]).
+pub fn page_jobs<T>(
+    ordered: impl IntoIterator<Item = (String, T)>,
+    next_token: Option<&str>,
+    page_size: usize,
+) -> (Vec<T>, Option<String>) {
+    page_in_order(ordered, next_token, page_size, |key, token| {
+        newest_job_first(key, token) == ::std::cmp::Ordering::Less
+    })
+}
+
+/// The walk both pagers perform, over a sequence already in its reported order:
+/// `before` is what "earlier in that order than the token" means for these keys.
+fn page_in_order<T>(
+    ordered: impl IntoIterator<Item = (String, T)>,
+    next_token: Option<&str>,
+    page_size: usize,
+    before: impl Fn(&str, &str) -> bool,
+) -> (Vec<T>, Option<String>) {
     let mut records = Vec::new();
     for (key, record) in ordered {
-        if next_token.is_some_and(|token| key.as_str() < token) {
+        if next_token.is_some_and(|token| before(key.as_str(), token)) {
             continue;
         }
         if records.len() == page_size {
@@ -957,6 +987,26 @@ pub fn page<T>(
         records.push(record);
     }
     (records, None)
+}
+
+/// Which of two `jobId`s a job listing reports FIRST: the newer job, which is the one
+/// whose id is numerically greater.
+///
+/// Every `jobId` is a decimal run this branch minted from its own counter
+/// ([`AmplifyBranch::mint_job_id`]), so the greater id is the later job — and for digits
+/// carrying no leading zero, the numerically greater id is the LONGER one, or the
+/// lexicographically greater one among ids of equal length. Comparing the ids as plain
+/// text instead would order job 10 before job 2.
+///
+/// The comparison reads the DIGITS rather than a parsed integer for a reason: one side of
+/// it can be a `nextToken`, which is a `JobId` and so may carry up to 255 digits
+/// (`smithy_query(query="shape",shape="JobSummary")`) — a decimal run no integer type
+/// holds, which still has a well-defined place in this order.
+pub fn newest_job_first(left: &str, right: &str) -> ::std::cmp::Ordering {
+    right
+        .len()
+        .cmp(&left.len())
+        .then_with(|| right.cmp(left))
 }
 
 /// Replace a stored @required member when the request supplied one.
