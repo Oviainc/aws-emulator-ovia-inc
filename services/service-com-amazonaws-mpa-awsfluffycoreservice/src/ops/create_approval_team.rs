@@ -25,6 +25,12 @@
 //!   at `min: 1` but cannot relate it to the approver count.
 //! * `Approvers` naming one identity twice earns `ValidationException` (400): a repeat
 //!   inflates N without adding anyone who can approve.
+//! * An approver whose `PrimaryIdentitySourceArn` is not an identity source's ARN
+//!   ([`crate::state::malformed_approver_identity_source`]) earns the malformed-ARN
+//!   refusal this service states once ([`crate::state::invalid_arn`],
+//!   `ValidationException` 400): the member carries no ARN `@pattern`, so this is where
+//!   that class is refused, and no team is ever stored carrying an approver whose
+//!   identity source reference addresses nothing.
 //! * The store holds at most [`crate::state::MAX_APPROVAL_TEAMS`] teams; past that the
 //!   call earns the modelled `ServiceQuotaExceededException` (402), so a caller looping
 //!   on create cannot grow this process's memory without end.
@@ -333,6 +339,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
         let approver_count = i32::try_from(input.approvers.len()).unwrap_or(i32::MAX);
+        // `PrimaryIdentitySourceArn` is documented to carry the identity source's ARN and
+        // the model gives it no pattern, so the boundary validator passes a value that
+        // addresses no identity source: this service's own ARN rule refuses it here,
+        // before any approver is invited, so a stored approver's identity source is always
+        // one this service could have minted.
+        if let Some(malformed) = crate::state::malformed_approver_identity_source(
+            input
+                .approvers
+                .iter()
+                .map(|a| a.primary_identity_source_arn.as_str()),
+        ) {
+            return Err(CreateApprovalTeamErrorModeled::ValidationException(malformed).into());
+        }
         if let Some(repeated) = crate::state::repeated_identity(
             input
                 .approvers

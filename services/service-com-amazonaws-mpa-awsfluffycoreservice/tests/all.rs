@@ -19,6 +19,8 @@ mod active_team_deletion_approval;
 mod approval_sessions;
 #[path = "all/approval_team_lifecycle.rs"]
 mod approval_team_lifecycle;
+#[path = "all/approver_identity_source_arn.rs"]
+mod approver_identity_source_arn;
 #[path = "all/approver_mfa_synchronization.rs"]
 mod approver_mfa_synchronization;
 #[path = "all/authorization_gate.rs"]

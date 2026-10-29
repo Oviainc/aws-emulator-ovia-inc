@@ -198,6 +198,9 @@
 //!   ([`ComAmazonawsMpaAwsfluffycoreserviceState::unattachable_policy_reference`]).
 //! * [`repeated_identity`] — the one message either write path that takes an approver
 //!   list refuses a repeated identity with.
+//! * [`malformed_approver_identity_source`] — the malformed-ARN refusal either write path
+//!   that takes an approver list answers a `PrimaryIdentitySourceArn` that is not an
+//!   identity source's ARN with.
 //!
 //! Whatever the sentence, a refusal is a modelled response shape: every `Message` this
 //! service declares is `@length(max: 1000)` while the members a refusal quotes back run
@@ -3374,6 +3377,33 @@ where
         }
     }
     None
+}
+
+/// The refusal an `Approvers` list earns when an approver's `PrimaryIdentitySourceArn` is
+/// not the ARN of an identity source ([`is_identity_source_arn`]), or `None` when every
+/// entry of the list names one.
+///
+/// The member is documented to carry the Amazon Resource Name of the identity source an
+/// approver authenticates through, and the model gives it no ARN `@pattern`
+/// (`String`, `@length(max: 1000)`), so the framework's constraint boundary cannot decide
+/// it and the handler that takes it has to: a value that is not an ARN this service could
+/// have minted for an identity source addresses no identity source at all, and the store
+/// would otherwise keep — and later report, from `GetApprovalTeam` and `GetSession` — an
+/// identity source reference that resolves to nothing and that
+/// [`ComAmazonawsMpaAwsfluffycoreserviceState::team_arn_using_identity_source`] can never
+/// match. It is therefore refused with the one sentence this service answers the
+/// malformed-ARN class with ([`invalid_arn`], 400), which names neither the member nor the
+/// grammar. Both write paths that take an approver list raise this one refusal, so neither
+/// can word it differently.
+#[must_use]
+pub fn malformed_approver_identity_source<'a, I>(source_arns: I) -> Option<ValidationException>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    source_arns
+        .into_iter()
+        .any(|arn| !is_identity_source_arn(arn))
+        .then(invalid_arn)
 }
 
 /// ARN of an approval team, in the form `ApprovalTeamArn`'s pattern fixes:
