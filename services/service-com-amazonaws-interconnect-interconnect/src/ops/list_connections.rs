@@ -170,6 +170,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The `provider` filter is the other union on this input, and the same rule
+        // decides it: its members are constrained in the model too, so a value the
+        // member cannot hold is refused by the one rule every reader of a `Provider`
+        // applies (`crate::state::provider_violation`) rather than compared against
+        // every stored connection.
+        if let Some(message) = input
+            .provider
+            .as_ref()
+            .and_then(crate::state::provider_violation)
+        {
+            return Err(ListConnectionsErrorModeled::InterconnectValidationException(
+                InterconnectValidationException { message },
+            )
+            .into());
+        }
+
         // "Only Connection objects matching all filters will be returned": every
         // supplied filter is an exact-match conjunct, and an absent one constrains
         // nothing. Each summary is PROJECTED from the stored connection, so the list

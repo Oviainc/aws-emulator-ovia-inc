@@ -55,6 +55,8 @@ mod emulator;
 mod list_tags_for_resource;
 #[path = "all/proposal_parameters_are_captured.rs"]
 mod proposal_parameters_are_captured;
+#[path = "all/provider_member_constraints.rs"]
+mod provider_member_constraints;
 #[path = "all/refusals_and_gateway_attach_points.rs"]
 mod refusals_and_gateway_attach_points;
 #[path = "all/region_scoped_connections.rs"]

@@ -147,6 +147,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The `provider` filter carries a union whose members are constrained in the
+        // model, and nothing before the handler holds a member one level down to those
+        // constraints: a value the member cannot hold is a fault in the REQUEST, refused
+        // as invalid input by the one rule every reader of a `Provider` applies
+        // (`crate::state::provider_violation`), rather than compared against every
+        // seeded environment and answered with the empty page it can never match.
+        if let Some(message) = input
+            .provider
+            .as_ref()
+            .and_then(crate::state::provider_violation)
+        {
+            return Err(ListEnvironmentsErrorModeled::InterconnectValidationException(
+                InterconnectValidationException { message },
+            )
+            .into());
+        }
+
         // Read the SEEDED catalog. Environments are AWS-managed — the model binds no
         // CreateEnvironment — so this store is the only source, and GetEnvironment
         // answers from the same records.

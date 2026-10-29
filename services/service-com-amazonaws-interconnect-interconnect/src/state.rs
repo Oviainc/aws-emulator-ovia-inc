@@ -582,6 +582,41 @@ pub fn provider_eq(left: &Provider, right: &Provider) -> bool {
     }
 }
 
+/// The `@length` the model gives the target of BOTH `Provider` members
+/// (`CloudServiceProvider` and `LastMileProvider` are each `@length(max: 32)`): a
+/// ceiling, and no floor at all, so a partner name is held to its length and to nothing
+/// else — neither member carries a `@pattern`.
+pub const PROVIDER_NAME_MAX_LENGTH: usize = 32;
+
+/// Why the value a `Provider` carries is not one the member it arrived in may hold — or
+/// `None` when it is inside that member's own modelled `@length`.
+///
+/// Hand-checked for the reason the crate's other two unions are
+/// ([`attach_point_violation`], [`remote_account_violation`]): the boundary validator
+/// holds a top-level member to its target's constraints but not a member one level down,
+/// inside a union. So every reader of a `Provider` judges the value here first, and a
+/// value outside the member's constraints is a fault in the REQUEST, reported as invalid
+/// input, rather than compared against stored records and answered as a page the caller
+/// cannot tell from "nothing matched".
+///
+/// The wording is the crate's own sentence for a value whose LENGTH its member cannot
+/// hold (the one [`remote_account_violation`] words), naming the member and the length
+/// rather than echoing the value back.
+pub fn provider_violation(provider: &Provider) -> Option<String> {
+    let (member, name) = match provider {
+        Provider::cloudServiceProvider(name) => ("cloudServiceProvider", name),
+        Provider::lastMileProvider(name) => ("lastMileProvider", name),
+    };
+    // `@length` on a string counts characters, not bytes, so the name is measured the
+    // way the model measures it.
+    let length = name.chars().count();
+    (length > PROVIDER_NAME_MAX_LENGTH).then(|| {
+        format!(
+            "{REFUSAL_ENVELOPE}provider.{member} must be at most {PROVIDER_NAME_MAX_LENGTH} characters long, and one of length {length} is not"
+        )
+    })
+}
+
 /// Two `AttachPoint` values identify the same attach point, which is what the
 /// `ListConnections` `attachPoint` filter compares.
 pub fn attach_point_eq(left: &AttachPoint, right: &AttachPoint) -> bool {
