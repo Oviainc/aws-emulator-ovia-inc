@@ -197,7 +197,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
         // Answered from the STORED record the deletion wrote: a `RequestId` no deletion
         // of this instance ran under names no operation, which is the same 404 an id
-        // belonging to another instance gets.
+        // belonging to another instance gets — and so does one whose permission set has
+        // since gone, since the store resolves a tracked id by the ONE rule every status
+        // reader of this crate shares
+        // (`crate::state::...::assignment_deletion`).
         let stored = store
             .assignment_deletion(
                 &input.instance_arn,

@@ -2632,7 +2632,9 @@ pub struct ComAmazonawsSsoadminSwbexternalserviceState {
     /// cannot be held beside that assignment. A `Vec` in insertion order, so the history
     /// is chronological; it holds at most [`MAX_RECORDS_PER_STORE`] records and the oldest
     /// is evicted beyond that (see [`Self::record_assignment_deletion`]) rather than a
-    /// delete being refused for history nobody can grow.
+    /// delete being refused for history nobody can grow. A record whose permission set has
+    /// gone is not reported, for the reason given on [`Self::assignment_deletion`], which
+    /// is the ONE place a reader of this history resolves an id.
     pub assignment_deletions: Vec<AssignmentOperationRecord>,
     /// Permission-set PROVISIONING statuses, newest last — the history
     /// `DescribePermissionSetProvisioningStatus` reads by `RequestId`, and the record of
@@ -3445,7 +3447,11 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// `instance_arn`.
     ///
     /// Scoped to the instance exactly as [`Self::assignment_operation`] is: a `RequestId`
-    /// of another instance's deletion is as absent here as one that never ran.
+    /// of another instance's deletion is as absent here as one that never ran. And absent
+    /// once the permission set it reports on has gone, exactly as
+    /// [`Self::permission_set_provisioning`] is: a status exists to report work on one
+    /// permission set, so an id whose permission set no reader can see is as absent as one
+    /// that was never minted.
     pub fn assignment_deletion(
         &self,
         instance_arn: &str,
@@ -3454,6 +3460,30 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         self.assignment_deletions
             .iter()
             .find(|record| record.instance_arn == instance_arn && record.request_id == request_id)
+            .filter(|record| {
+                self.permission_set(instance_arn, &record.permission_set_arn)
+                    .is_some()
+            })
+    }
+
+    /// Every assignment deletion this instance TRACKS, in the order the history happened
+    /// ([`AssignmentOperationRecord::page_key`] is that same order).
+    ///
+    /// A record is tracked under exactly the condition [`Self::assignment_deletion`]
+    /// resolves one under — it is delegated to, so there is ONE rule — hence an
+    /// enumeration of this history and a describe of one of its ids cannot disagree about
+    /// which ids exist.
+    pub fn tracked_assignment_deletions(
+        &self,
+        instance_arn: &str,
+    ) -> Vec<&AssignmentOperationRecord> {
+        self.assignment_deletions
+            .iter()
+            .filter(|record| {
+                self.assignment_deletion(instance_arn, &record.request_id)
+                    .is_some()
+            })
+            .collect()
     }
 
     /// Whether any stored assignment operation — a creation status or a deletion status —

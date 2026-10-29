@@ -248,13 +248,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         )
                     }
                 })?;
-            // The stored deletion history of THIS instance, in the chronological order its
+            // The deletion history THIS instance tracks, in the chronological order its
             // page key imposes, keeping only the rows whose status as of `now` is the one
-            // the filter asked for.
+            // the filter asked for. Which ids are tracked is the store's rule
+            // (`crate::state::...::tracked_assignment_deletions`), the same one
+            // `DescribeAccountAssignmentDeletionStatus` resolves one id by, so this
+            // enumeration and that describe cannot disagree about which ids exist.
             let mut rows: Vec<(String, AccountAssignmentOperationStatusMetadata)> = store
-                .assignment_deletions
-                .iter()
-                .filter(|record| record.instance_arn == input.instance_arn)
+                .tracked_assignment_deletions(&input.instance_arn)
+                .into_iter()
                 .filter(|record| filter.is_none_or(|status| record.status(now) == status))
                 .map(|record| (record.page_key(), record.to_metadata_shape(now)))
                 .collect();
