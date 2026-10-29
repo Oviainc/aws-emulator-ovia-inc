@@ -23,6 +23,8 @@ mod account_sending_attributes;
 mod account_suppression_attributes;
 #[path = "all/account_vdm_attributes.rs"]
 mod account_vdm_attributes;
+#[path = "all/blacklist_reports.rs"]
+mod blacklist_reports;
 #[path = "all/boundary_validation_message.rs"]
 mod boundary_validation_message;
 #[path = "all/cloud_watch_dimension_source.rs"]

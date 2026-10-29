@@ -1149,6 +1149,14 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// the only identity a dedicated IP has. Ordered, so `GetDedicatedIps`
     /// enumerates and pages deterministically.
     pub dedicated_ips: BTreeMap<String, DedicatedIpRecord>,
+    /// The blocklist listings observed for the account's dedicated IP addresses,
+    /// keyed by the `BlacklistItemName` they were observed for — the address itself,
+    /// the only name a listing is looked up by. Ordered, so a report of several
+    /// addresses is assembled deterministically. No request mints a listing: a
+    /// third-party blocklist operator lists an address and SES observes that listing
+    /// out of band, exactly as a dedicated IP itself is allocated out of band
+    /// ([`Self::dedicated_ips`]), so `GetBlacklistReports` only reads this table.
+    pub blacklist_listings: BTreeMap<String, Vec<BlacklistListingRecord>>,
     /// Export jobs, keyed by the `JobId` minted for them — the only name an export
     /// job has, and the one every export-job operation addresses it by. Ordered, so
     /// the table enumerates deterministically whatever order the jobs were created
@@ -1269,6 +1277,42 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
             .collect();
         recommendations.sort_by_cached_key(recommendation_key);
         recommendations
+    }
+
+    /// The blocklist listings observed for the blacklist item `item_name` names, as
+    /// the modelled `BlacklistEntry` list a report answers with; `None` when none has
+    /// been observed for it.
+    ///
+    /// A value nothing has been observed for is not an error of any kind: the item
+    /// name is a plain string the caller supplies and a report says what was found
+    /// for it, so a name that is not one of the account's listed addresses — one of
+    /// its dedicated IPs that no blocklist lists, an address it does not hold, or a
+    /// value that is no address at all — simply has nothing to report.
+    ///
+    /// Ordered by when the listing happened and then by the blocklist's name, so one
+    /// address's listings are reported in the same order on every read whatever order
+    /// the observations arrived in. Reporting only: the derivation reads the table and
+    /// writes nothing.
+    pub fn blacklist_entries(
+        &self,
+        item_name: &str,
+    ) -> Option<Vec<crate::ops::types::BlacklistEntry>> {
+        let listings = self.blacklist_listings.get(item_name)?;
+        if listings.is_empty() {
+            return None;
+        }
+        let mut ordered: Vec<&BlacklistListingRecord> = listings.iter().collect();
+        ordered.sort_by(|left, right| {
+            left.listing_time
+                .cmp(&right.listing_time)
+                .then_with(|| left.rbl_name.cmp(&right.rbl_name))
+        });
+        Some(
+            ordered
+                .into_iter()
+                .map(BlacklistListingRecord::entry)
+                .collect(),
+        )
     }
 
     /// The tenant a reputation entity reference names, for a write that has to
@@ -3874,6 +3918,43 @@ pub fn invalid_ip(ip: &str) -> String {
 /// to the account that holds it.
 pub fn dedicated_ip_not_found(ip: &str) -> String {
     format!("Could not find dedicated IP <{ip}> under this account.")
+}
+
+/// One listing of one address on one third-party blocklist, as SES observed it.
+///
+/// A blocklist (an RBL) is run by somebody else: it lists an address, and SES reports
+/// what it found when it looked. Nothing in this API creates or clears a listing, so
+/// the record is written where the observation arrives and the report only reads it.
+#[derive(Debug, Clone)]
+pub struct BlacklistListingRecord {
+    /// `BlacklistEntry$RblName`: "the name of the blacklist that the IP address
+    /// appears on".
+    pub rbl_name: String,
+    /// `BlacklistEntry$ListingTime`: "the time when the blacklisting event occurred".
+    pub listing_time: SystemTime,
+    /// `BlacklistEntry$Description`: "additional information about the blacklisting
+    /// event, as provided by the blacklist maintainer".
+    pub description: String,
+}
+
+impl BlacklistListingRecord {
+    /// One observed listing of an address on a blocklist.
+    pub fn new(rbl_name: &str, listing_time: SystemTime, description: &str) -> Self {
+        Self {
+            rbl_name: rbl_name.to_string(),
+            listing_time,
+            description: description.to_string(),
+        }
+    }
+
+    /// This record as the modelled `BlacklistEntry` a report answers with.
+    pub fn entry(&self) -> crate::ops::types::BlacklistEntry {
+        crate::ops::types::BlacklistEntry {
+            rbl_name: Some(self.rbl_name.clone()),
+            listing_time: Some(::aws_smithy_types::DateTime::from(self.listing_time)),
+            description: Some(self.description.clone()),
+        }
+    }
 }
 
 /// One address on a suppression list.

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBlacklistReports
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBlacklistReports`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBlacklistReports::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the blocklist listings the account's records hold for the blacklist items the
+//! request names: one map entry per named item something has been observed for, and no
+//! entry at all for one that has nothing to report, so a request naming only such items
+//! answers an empty report. Reporting only — nothing here writes. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +138,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBlacklistReports` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBlacklistReportsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBlacklistReports"))
+        // Request metadata is not needed: a blacklist item is named by the address
+        // itself, inside the one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetBlacklistReports without the shared emulator state",
+            ));
+        };
+
+        // Reporting only: a listing is observed out of band and nothing about one falls
+        // due with the clock, so this read leaves the store exactly as a later caller
+        // finds it.
+        let store = state.lock();
+        // One entry per named item the account's records hold a listing for. An item
+        // with nothing to report is absent from the map rather than present and empty,
+        // and is never a refusal: the names are values the caller supplies and a report
+        // of them says what was found for each. Duplicates in the request name one
+        // item, so the map carries it once.
+        let blacklist_report = input
+            .blacklist_item_names
+            .iter()
+            .filter_map(|item_name| {
+                store
+                    .blacklist_entries(item_name)
+                    .map(|entries| (item_name.clone(), entries))
+            })
+            .collect();
+
+        Ok(GetBlacklistReportsOutput { blacklist_report })
     }
 }
