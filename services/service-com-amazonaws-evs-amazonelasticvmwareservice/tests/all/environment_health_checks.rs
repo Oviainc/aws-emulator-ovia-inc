@@ -151,7 +151,7 @@ async fn add_host(router: &Emulator, case: &str, environment_id: &str, name: &st
 }
 
 /// The `Check` of one type an environment reports, or `Value::Null` when it reports none.
-fn check_of(environment: &Value, check_type: &str) -> Value {
+pub(crate) fn check_of(environment: &Value, check_type: &str) -> Value {
     environment["checks"]
         .as_array()
         .unwrap_or(&Vec::new())

@@ -1376,6 +1376,39 @@ impl StoredVlan {
     }
 }
 
+/// One live environment of the store that carries a VCF license key, and the instant it
+/// began to carry it.
+///
+/// Half of what an environment health check reads that the environment it runs on does
+/// not carry: `KEY_REUSE` is about reuse "by another Amazon EVS environment"
+/// (`Check$type` doc), so it reads the OTHER environments' keys. The instant is the
+/// carrier's `createdAt`, because an environment's `licenseInfo` is given at creation and
+/// no operation of this service changes it: that is when the key became used by that
+/// environment, and so the instant that fact last changed.
+#[derive(Debug, Clone)]
+pub struct KeyCarrier {
+    /// The `environmentId` of the environment carrying the key, so a check can tell its
+    /// own record apart from another environment's.
+    pub environment_id: String,
+    /// Epoch milliseconds that environment began to carry the key.
+    pub carried_since_ms: i64,
+}
+
+/// The VCF license cores the account has ported to Amazon EVS in one Region, and the
+/// instant it stated that number.
+///
+/// The other half of what a check reads off something other than the environment:
+/// `KEY_COVERAGE` judges the environment's deployed cores against the account's own
+/// [`VCF_PORTED_CORE_COUNT`] setting, which lives in the account's settings and not in
+/// any environment's record.
+#[derive(Debug, Clone, Copy)]
+pub struct PortedCoreCount {
+    /// The number of cores the account's VCF licenses allocate in the Region.
+    pub cores: u64,
+    /// Epoch milliseconds the account last changed that number.
+    pub stated_at_ms: i64,
+}
+
 /// One Amazon EVS environment, as `CreateEnvironment` stored it.
 #[derive(Debug, Clone)]
 pub struct StoredEnvironment {
@@ -1434,8 +1467,8 @@ pub struct StoredEnvironment {
     /// The one part of a check a recomputation cannot read off the store, because it is
     /// about WHEN the check started failing: it is written by the recomputation that
     /// first finds the check failing and dropped as soon as the check stops failing. The
-    /// instant written is the one the facts that check reads last changed at
-    /// ([`Self::health_changed_at_ms`]) and never the instant of the read, so two reads
+    /// instant written is the one the facts THAT check reads last changed at
+    /// ([`Self::check_impaired_at_ms`]) and never the instant of the read, so two reads
     /// of an unchanged environment report one `impairedSince`.
     pub impaired_since_ms: BTreeMap<String, i64>,
     /// The Windows Server License entitlements created in this environment, keyed by
@@ -1828,14 +1861,14 @@ impl StoredEnvironment {
             })
     }
 
-    /// The latest instant a fact the environment health checks read was changed: this
-    /// environment's own `modifiedAt`, and that of every host and every connector it
+    /// The latest instant a fact held in this environment's OWN records was changed:
+    /// this environment's own `modifiedAt`, and that of every host and every connector it
     /// holds.
     ///
-    /// A check that has started failing has been failing since no earlier than this, so
-    /// it is the instant [`Self::refresh_checks`] dates an impairment from. A STORED
-    /// instant, so `impairedSince` does not depend on when anybody read the environment.
-    fn health_changed_at_ms(&self) -> i64 {
+    /// Every check reads some of these, so it is where [`Self::check_impaired_at_ms`]
+    /// starts from. A STORED instant, so `impairedSince` does not depend on when anybody
+    /// read the environment.
+    fn own_records_changed_at_ms(&self) -> i64 {
         self.hosts
             .values()
             .map(|host| host.modified_at_ms)
@@ -1849,14 +1882,34 @@ impl StoredEnvironment {
             .unwrap_or(self.modified_at_ms)
     }
 
+    /// The instant an impairment of ONE check is dated from: the latest instant a fact
+    /// THAT check reads was changed — this environment's own records
+    /// ([`Self::own_records_changed_at_ms`]) together with the instants the facts the
+    /// check reads from OUTSIDE this environment changed at.
+    ///
+    /// A check cannot have begun failing before the fact that makes it fail was written,
+    /// so the onset is the LATEST instant any input of that check changed at: a check
+    /// whose every input is one of the environment's own records is dated from those
+    /// alone, and a check that also reads the account's settings or another
+    /// environment's record is dated no earlier than the instant that fact changed.
+    fn check_impaired_at_ms(own_records_changed_at_ms: i64, external_changed_at_ms: &[i64]) -> i64 {
+        external_changed_at_ms
+            .iter()
+            .copied()
+            .fold(own_records_changed_at_ms, i64::max)
+    }
+
     /// Run this environment's health checks and store their results, so every operation
     /// that reports the environment reports the checks that hold at that instant.
     ///
-    /// `key_users` counts, per license key, how many live environments of the store
-    /// carry it, and `ported_core_count` is the VCF license cores the account has ported
-    /// to Amazon EVS in this environment's Region: the two facts a check of ONE
-    /// environment cannot read off that environment, gathered once per recomputation by
+    /// `key_carriers` lists, per license key, the live environments of the store that
+    /// carry it and since when, and `ported_core_count` is the VCF license cores the
+    /// account has ported to Amazon EVS in this environment's Region and when it stated
+    /// them: the two facts a check of ONE environment cannot read off that environment,
+    /// gathered once per recomputation by
     /// [`ComAmazonawsEvsAmazonelasticvmwareserviceState::recompute_environment_checks`].
+    /// Each carries the instant it last changed at, because that is what dates an
+    /// impairment the fact caused ([`Self::check_impaired_at_ms`]).
     ///
     /// A check whose facts the environment does not carry reports `UNKNOWN` — "the check
     /// result" of a check that could not be decided — rather than `PASSED`, which would
@@ -1867,8 +1920,8 @@ impl StoredEnvironment {
     /// connectors the environment holds.
     pub fn refresh_checks(
         &mut self,
-        key_users: &BTreeMap<String, usize>,
-        ported_core_count: Option<u64>,
+        key_carriers: &BTreeMap<String, Vec<KeyCarrier>>,
+        ported_core_count: Option<PortedCoreCount>,
     ) {
         // A check runs on a SETTLED environment: while one is still being created, or is
         // being or has been deleted, no check of it has run, so it reports none and
@@ -1882,23 +1935,32 @@ impl StoredEnvironment {
         // "Verifies that the VCF license key is not used by another Amazon EVS
         // environment": a key this environment carries that another live environment
         // carries too is used twice over. An environment carrying no key leaves nothing
-        // to verify.
+        // to verify. Each such other carrier is also WHEN this check's input changed, so
+        // the instants they took the key are kept.
+        let reused_since_ms: Vec<i64> = keys
+            .iter()
+            .filter_map(|key| key_carriers.get(key))
+            .flatten()
+            .filter(|carrier| carrier.environment_id != self.environment_id)
+            .map(|carrier| carrier.carried_since_ms)
+            .collect();
         let key_reuse = if keys.is_empty() {
             CHECK_UNKNOWN
-        } else if keys
-            .iter()
-            .any(|key| key_users.get(key).copied().unwrap_or_default() > 1)
-        {
-            CHECK_FAILED
-        } else {
+        } else if reused_since_ms.is_empty() {
             CHECK_PASSED
+        } else {
+            CHECK_FAILED
         };
         // "Verifies that the VCF license key allocates sufficient vCPU cores for all
         // deployed hosts": the cores the deployed hosts run on, against the cores the
         // account's VCF licenses allocate. Undecidable — so UNKNOWN — when the
         // environment carries no key, when the account has not stated how many cores its
         // licenses allocate, or when a host's cores are not known.
-        let key_coverage = match (keys.is_empty(), ported_core_count, self.deployed_core_count()) {
+        let key_coverage = match (
+            keys.is_empty(),
+            ported_core_count.map(|ported| ported.cores),
+            self.deployed_core_count(),
+        ) {
             (false, Some(allocated), Some(required)) if required <= allocated => CHECK_PASSED,
             (false, Some(_), Some(_)) => CHECK_FAILED,
             _ => CHECK_UNKNOWN,
@@ -1921,16 +1983,39 @@ impl StoredEnvironment {
                 .filter_map(|connector| connector.decided_result()),
         );
 
-        let impaired_at_ms = self.health_changed_at_ms();
+        let own_changed_at_ms = self.own_records_changed_at_ms();
+        // Each check is dated from the facts IT reads: the two that read something this
+        // environment does not carry are dated from that fact's own instant as well, so
+        // an impairment an account setting or another environment caused is never dated
+        // from before the instant that fact changed.
+        let ported_stated_at_ms: Vec<i64> = ported_core_count
+            .map(|ported| vec![ported.stated_at_ms])
+            .unwrap_or_default();
         let environment_id = self.environment_id.clone();
         let results = [
-            (CHECK_TYPE_KEY_REUSE, key_reuse),
-            (CHECK_TYPE_KEY_COVERAGE, key_coverage),
-            (CHECK_TYPE_HOST_COUNT, host_count),
-            (CHECK_TYPE_CONNECTOR_HEALTH, connector_health),
+            (
+                CHECK_TYPE_KEY_REUSE,
+                key_reuse,
+                Self::check_impaired_at_ms(own_changed_at_ms, &reused_since_ms),
+            ),
+            (
+                CHECK_TYPE_KEY_COVERAGE,
+                key_coverage,
+                Self::check_impaired_at_ms(own_changed_at_ms, &ported_stated_at_ms),
+            ),
+            (
+                CHECK_TYPE_HOST_COUNT,
+                host_count,
+                Self::check_impaired_at_ms(own_changed_at_ms, &[]),
+            ),
+            (
+                CHECK_TYPE_CONNECTOR_HEALTH,
+                connector_health,
+                Self::check_impaired_at_ms(own_changed_at_ms, &[]),
+            ),
         ];
         let mut checks = Vec::with_capacity(results.len());
-        for (check_type, result) in results {
+        for (check_type, result, impaired_at_ms) in results {
             // `impairedSince` is "the time when environment health began to be
             // impaired", so only a FAILING check carries one, and it is the instant
             // already remembered for this check type if it was failing before.
@@ -2205,6 +2290,22 @@ const _: () = assert!(
 /// Regions Amazon EVS is available in.
 pub const MAX_ACCOUNT_SETTING_REGIONS: usize = 64;
 
+/// One account-level EVS setting as this service holds it: the value last written, and
+/// the instant it was last given that value.
+///
+/// The instant is stored because a setting is an INPUT of the environment health checks —
+/// [`VCF_PORTED_CORE_COUNT`] is what `KEY_COVERAGE` judges an environment's deployed
+/// cores against — and a check impaired by the account's setting began to be impaired
+/// when the setting took the value that impairs it, which is a fact no environment's own
+/// record carries ([`StoredEnvironment::check_impaired_at_ms`]).
+#[derive(Debug, Clone)]
+pub struct StoredAccountSetting {
+    /// The setting's value, as `AccountSetting$value` reports it.
+    pub value: String,
+    /// Epoch milliseconds the setting was last given that value.
+    pub changed_at_ms: i64,
+}
+
 /// One account-level EVS setting this service accepts: its name, and the domain its own
 /// documentation gives its value.
 #[derive(Debug, Clone, Copy)]
@@ -2473,7 +2574,7 @@ pub struct ComAmazonawsEvsAmazonelasticvmwareserviceState {
     /// [`MAX_ENVIRONMENTS`], which counts every record, `DELETED` ones included.
     pub environments: BTreeMap<String, StoredEnvironment>,
     /// The account-level EVS settings that have been EXPLICITLY SET, as `<region> ->
-    /// <setting name> -> value`.
+    /// <setting name> -> ` [`StoredAccountSetting`].
     ///
     /// Account settings are regional ("for your Amazon Web Services account in the
     /// specified Amazon Web Services Region", `Get`/`PutAccountSettings` docs), so the
@@ -2484,7 +2585,7 @@ pub struct ComAmazonawsEvsAmazonelasticvmwareserviceState {
     /// so the reported list has one stable order; one Region's settings are bounded by
     /// the names [`ACCOUNT_SETTINGS`] documents, and the number of Regions by
     /// [`MAX_ACCOUNT_SETTING_REGIONS`].
-    pub account_settings: BTreeMap<String, BTreeMap<String, String>>,
+    pub account_settings: BTreeMap<String, BTreeMap<String, StoredAccountSetting>>,
     /// The earliest instant at which any stored environment has a transition due, or
     /// `None` when none has. [`Self::materialise_due_transitions`] returns without
     /// looking at a single record until that instant arrives, so a request pays O(1)
@@ -2596,14 +2697,17 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
     /// recomputation to the next is when a failing check started failing
     /// ([`StoredEnvironment::impaired_since_ms`]).
     ///
-    /// The two facts no single environment carries are gathered once here: how many live
-    /// environments carry each VCF license key (`KEY_REUSE` is about reuse "by another
-    /// Amazon EVS environment", so its scope is the whole store, exactly as a host name
-    /// is unique across environments) and the VCF license cores the account has ported
-    /// in each Region (`KEY_COVERAGE`). Bounded by [`MAX_ENVIRONMENTS`] and the hosts
-    /// those environments hold.
+    /// The two facts no single environment carries are gathered once here: which live
+    /// environments carry each VCF license key and since when (`KEY_REUSE` is about reuse
+    /// "by another Amazon EVS environment", so its scope is the whole store, exactly as a
+    /// host name is unique across environments) and the VCF license cores the account has
+    /// ported in each Region, with the instant it stated them (`KEY_COVERAGE`). Each
+    /// carries that instant because a check impaired by one of these facts began to be
+    /// impaired no earlier than the instant the fact changed
+    /// ([`StoredEnvironment::check_impaired_at_ms`]). Bounded by [`MAX_ENVIRONMENTS`] and
+    /// the hosts those environments hold.
     pub fn recompute_environment_checks(&mut self) {
-        let mut key_users: BTreeMap<String, usize> = BTreeMap::new();
+        let mut key_carriers: BTreeMap<String, Vec<KeyCarrier>> = BTreeMap::new();
         for environment in self.environments.values() {
             // A DELETED environment carries its license key no longer, exactly as it
             // carries its name no longer ([`Self::name_is_taken`]): the key is free for
@@ -2612,23 +2716,34 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
                 continue;
             }
             for key in environment.license_keys() {
-                *key_users.entry(key).or_default() += 1;
+                key_carriers.entry(key).or_default().push(KeyCarrier {
+                    environment_id: environment.environment_id.clone(),
+                    carried_since_ms: environment.created_at_ms,
+                });
             }
         }
         // The cores the account's VCF licenses allocate, per Region: the value of the
-        // `vcfPortedCoreCount` setting where the account has set one. Read from the
-        // settings map directly, so the environments can be walked mutably below.
-        let ported_cores: BTreeMap<&str, u64> = self
+        // `vcfPortedCoreCount` setting where the account has set one, with the instant it
+        // was last given that value. Read from the settings map directly, so the
+        // environments can be walked mutably below.
+        let ported_cores: BTreeMap<&str, PortedCoreCount> = self
             .account_settings
             .iter()
             .filter_map(|(region, settings)| {
-                let cores = settings.get(VCF_PORTED_CORE_COUNT)?.parse().ok()?;
-                Some((region.as_str(), cores))
+                let setting = settings.get(VCF_PORTED_CORE_COUNT)?;
+                let cores = setting.value.parse().ok()?;
+                Some((
+                    region.as_str(),
+                    PortedCoreCount {
+                        cores,
+                        stated_at_ms: setting.changed_at_ms,
+                    },
+                ))
             })
             .collect();
         for environment in self.environments.values_mut() {
             let ported = ported_cores.get(environment.region.as_str()).copied();
-            environment.refresh_checks(&key_users, ported);
+            environment.refresh_checks(&key_carriers, ported);
         }
     }
 
@@ -2821,9 +2936,9 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
             .get(region)
             .map(|held| {
                 held.iter()
-                    .map(|(name, value)| AccountSetting {
+                    .map(|(name, setting)| AccountSetting {
                         name: name.clone(),
-                        value: value.clone(),
+                        value: setting.value.clone(),
                     })
                     .collect()
             })
@@ -2848,6 +2963,11 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
     /// carried, in the order the request first named it, carrying the value now stored —
     /// which for a name given twice in one request is the LAST value given, since that
     /// is the one the overwrite left behind.
+    ///
+    /// A setting whose stored value the request does not change keeps the instant it was
+    /// last given that value ([`StoredAccountSetting::changed_at_ms`]): a put that writes
+    /// the value already held changes no fact, and a check that reads the setting has
+    /// been reading this value since the earlier put.
     pub fn put_account_settings(
         &mut self,
         region: &str,
@@ -2858,19 +2978,29 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
             // does not even bring this Region's map into existence.
             return Vec::new();
         }
+        let at_ms = now_ms();
         let held = self.account_settings.entry(region.to_string()).or_default();
         for setting in requested {
-            held.insert(setting.name.clone(), setting.value.clone());
+            let stored = held
+                .entry(setting.name.clone())
+                .or_insert_with(|| StoredAccountSetting {
+                    value: setting.value.clone(),
+                    changed_at_ms: at_ms,
+                });
+            if stored.value != setting.value {
+                stored.value = setting.value.clone();
+                note_modified_at(&mut stored.changed_at_ms, at_ms);
+            }
         }
         let mut reported: Vec<AccountSetting> = Vec::with_capacity(requested.len());
         for setting in requested {
             if reported.iter().any(|already| already.name == setting.name) {
                 continue;
             }
-            if let Some(value) = held.get(&setting.name) {
+            if let Some(stored) = held.get(&setting.name) {
                 reported.push(AccountSetting {
                     name: setting.name.clone(),
-                    value: value.clone(),
+                    value: stored.value.clone(),
                 });
             }
         }
