@@ -35,6 +35,8 @@ mod enum_membership_refusals;
 mod job_definition_deregistration;
 #[path = "all/job_definition_registry.rs"]
 mod job_definition_registry;
+#[path = "all/job_definition_response_request_id.rs"]
+mod job_definition_response_request_id;
 #[path = "all/job_definition_validation.rs"]
 mod job_definition_validation;
 #[path = "all/job_lifecycle.rs"]
