@@ -23,6 +23,10 @@
 //!   `InvalidRequestException` and starts NO job, and one naming a workspace, or
 //!   a dataset that workspace does not contain, is the modelled not-found
 //!   refusal;
+//! * a job ingests into a SESSION dataset, the kind `datasetId` documents, so a
+//!   destination dataset whose stored kind is present and is another one is the
+//!   modelled `InvalidRequestException` and starts NO job, while one the store
+//!   holds no kind for is accepted;
 //! * a create that ingests into time series OUTSIDE a workspace needs the
 //!   account's warm or cold tier enabled, while one that ingests into a session
 //!   dataset does not;
@@ -908,5 +912,141 @@ async fn ingesting_outside_a_workspace_needs_the_account_s_warm_or_cold_tier() {
             status, 202,
             "case {label:?}: a job into a session dataset needs no tier, got {status} {answer}"
         );
+    }
+}
+
+/// Every value `DatasetTypeEnum` admits. Source: `smithy_query(query="shape",
+/// shape="DatasetTypeEnum")` — SESSION | CURATED | EXTERNAL — written out here as
+/// an oracle independent of the crate under test, so no kind the enum carries is
+/// left out of the table below.
+const DATASET_TYPES: [&str; 3] = ["SESSION", "CURATED", "EXTERNAL"];
+
+#[tokio::test]
+async fn the_destination_dataset_is_held_to_the_kind_the_member_documents() {
+    let (router, engine) = router_with_engine();
+    create_workspace(&router, WORKSPACE).await;
+
+    // (case, the `datasetType` the destination dataset carries, whether the
+    // dataset is created INSIDE the workspace the job names, the status the create
+    // is answered with, the error code it carries when refused).
+    //
+    // Every kind `DATASET_TYPES` lists has a row: an EXTERNAL dataset is one that
+    // "connects to an external datasource", so `CreateDataset` refuses to put one
+    // in a workspace at all and the only EXTERNAL destination a store can hold is
+    // one no workspace contains — which the workspace-scoped lookup reports as the
+    // absence it is, ahead of the kind. A dataset with no stored kind states
+    // nothing about which side of the rule it falls on, so it is not refused.
+    let rows: Vec<(&str, Option<&str>, bool, u16, &str)> = vec![
+        (
+            "the SESSION kind the member documents",
+            Some(DATASET_TYPES[0]),
+            true,
+            202,
+            "",
+        ),
+        (
+            "a CURATED dataset of the workspace the job names",
+            Some(DATASET_TYPES[1]),
+            true,
+            400,
+            "InvalidRequestException",
+        ),
+        (
+            "an EXTERNAL dataset, which no workspace contains",
+            Some(DATASET_TYPES[2]),
+            false,
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "a dataset the store holds no kind for",
+            None,
+            true,
+            202,
+            "",
+        ),
+    ];
+
+    for (index, (label, dataset_type, in_workspace, expected_status, expected_code)) in
+        rows.into_iter().enumerate()
+    {
+        let dataset_id = super::dataset_data_segments::create_dataset(
+            &router,
+            &format!("Destination {index}"),
+            dataset_type,
+            in_workspace.then_some(WORKSPACE),
+        )
+        .await;
+
+        let held = jobs_held(&engine);
+        let (status, answer) = create(
+            &router,
+            json!({
+                "jobName": format!("Kind import {index}"),
+                "jobRoleArn": JOB_ROLE_ARN,
+                "files": [file("sitewise-import", "turbines/01.csv", json!({}))],
+                "errorReportLocation": { "bucket": "sitewise-errors", "prefix": "imports/" },
+                "workspaceName": WORKSPACE,
+                "datasetId": dataset_id,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "case {label:?}: expected {expected_status}, got {status} {answer}"
+        );
+
+        if expected_status == 202 {
+            // A served create starts exactly one job, and the destination it was
+            // started for reads back through `DescribeBulkImportJob`.
+            assert_eq!(
+                jobs_held(&engine),
+                held + 1,
+                "case {label:?}: a served create starts exactly one job"
+            );
+            let job_id = answer["jobId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {label:?}: no jobId in {answer}"));
+            let (status, described) = describe(&router, job_id, Some(WORKSPACE)).await;
+            assert_eq!(
+                status, 200,
+                "case {label:?}: the read back got {status} {described}"
+            );
+            assert_eq!(
+                described["datasetId"].as_str().unwrap_or(""),
+                dataset_id,
+                "case {label:?}: unexpected datasetId in {described}"
+            );
+            assert_eq!(
+                described["workspaceName"].as_str().unwrap_or(""),
+                WORKSPACE,
+                "case {label:?}: unexpected workspaceName in {described}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            error_code(&answer),
+            expected_code,
+            "case {label:?}: unexpected error code in {answer}"
+        );
+        assert_eq!(
+            jobs_held(&engine),
+            held,
+            "case {label:?}: a refused create must start no job"
+        );
+        let message = answer["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains(&dataset_id),
+            "case {label:?}: the refusal must name the dataset it addressed, got {answer}"
+        );
+        if expected_status == 400 {
+            let held_kind = dataset_type.unwrap_or_default();
+            assert!(
+                message.contains(DATASET_TYPES[0]) && message.contains(held_kind),
+                "case {label:?}: the refusal must name the kind required and the kind held, \
+                 got {answer}"
+            );
+        }
     }
 }

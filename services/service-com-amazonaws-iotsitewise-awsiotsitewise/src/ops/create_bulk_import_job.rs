@@ -240,12 +240,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // another workspace, and one that belongs to no workspace at all,
                 // is not the dataset this request names — the same narrowing every
                 // other workspace-scoped lookup in this service applies.
-                if store
+                let dataset_type = store
                     .datasets
                     .get(dataset_id)
-                    .is_none_or(|dataset| dataset.workspace_name.as_deref() != Some(workspace))
+                    .filter(|dataset| dataset.workspace_name.as_deref() == Some(workspace))
+                    .ok_or_else(|| not_found(crate::state::RESOURCE_DATASET, dataset_id))?
+                    .dataset_type
+                    .clone();
+
+                // The destination member names "the ID of the SESSION dataset to
+                // ingest data into", and a session dataset is the one that holds its
+                // own ingested data: a curated dataset only references segments
+                // selected from source session datasets, and an external one connects
+                // to a datasource outside this service, so neither is a dataset data
+                // can be ingested INTO. A dataset the store holds no type for states
+                // which side of that rule it falls on, so it is not refused here —
+                // `CreateDataset` keeps `datasetType` absent rather than guessing one.
+                if let Some(dataset_type) =
+                    dataset_type.filter(|held| held != DATASET_TYPE_SESSION)
                 {
-                    return Err(not_found(crate::state::RESOURCE_DATASET, dataset_id));
+                    return Err(invalid_request(format!(
+                        "Data can be ingested only into a {DATASET_TYPE_SESSION} dataset, but \
+                         the dataset {dataset_id} is a {dataset_type} dataset."
+                    )));
                 }
             }
             None => {
@@ -323,6 +340,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(output)
     }
 }
+
+/// The `DatasetTypeEnum` value a bulk import's destination dataset must carry,
+/// if it carries one at all. Source: `smithy_query(query="shape",
+/// shape="DatasetTypeEnum")` — SESSION, CURATED, EXTERNAL.
+const DATASET_TYPE_SESSION: &str = "SESSION";
 
 /// HTTP 400 `InvalidRequestException` carrying `message`.
 fn invalid_request(message: String) -> CreateBulkImportJobError {
