@@ -182,12 +182,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         // The cross-member rules inside a schedule, which `UpdateLifecyclePolicy`
-        // inherits from the shapes it carries: a `CreateRule` states when to
-        // create in exactly one of its two documented forms, a `RetainRule`
-        // retains by exactly one of its two documented modes, and it retains at
-        // least as much as the schedule's other rules require. They run BEFORE
-        // the store is touched, so a refused update leaves the stored policy
-        // exactly as it was.
+        // inherits from the shapes it carries: every nested rule the
+        // documentation gives two alternative forms — the `CreateRule`, the
+        // `RetainRule`, the `FastRestoreRule`, the `DeprecateRule` and the
+        // `ArchiveRule`'s archive-tier retention — states exactly one of them
+        // and states it completely, and the retention is at least as much as
+        // the schedule's other rules require. They run BEFORE the store is
+        // touched, so a refused update leaves the stored policy exactly as it
+        // was.
         if let Some(refusal) =
             crate::state::schedule_rule_violation(input.policy_details.as_ref())
         {

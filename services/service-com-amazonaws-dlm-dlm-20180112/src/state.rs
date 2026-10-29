@@ -15,8 +15,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    CreateRule, CrossRegionCopyTarget, Exclusions, InvalidRequestException, LifecyclePolicy,
-    LifecyclePolicySummary, PolicyDetails, ResourceNotFoundException, Schedule, Tag,
+    CreateRule, CrossRegionCopyTarget, DeprecateRule, Exclusions, FastRestoreRule,
+    InvalidRequestException, LifecyclePolicy, LifecyclePolicySummary, PolicyDetails,
+    ResourceNotFoundException, RetainRule, RetentionArchiveTier, Schedule, Tag,
 };
 
 /// The region a request belongs to — the policies it reaches, and the region a
@@ -1628,13 +1629,13 @@ fn plural(count: usize) -> (&'static str, &'static str) {
 }
 
 /// Why Amazon Data Lifecycle Manager refuses one of the schedules `details`
-/// carries, or `None` when every one of them states its creation and retention
-/// rules in a form the documentation admits.
+/// carries, or `None` when every one of them states each of its nested rules in
+/// a form the documentation admits.
 ///
-/// The documented cross-member rules a schedule's creation and retention rules
-/// obey, none of them expressible in the model, judged on EVERY element of
-/// `Schedules` (`@length(min: 1, max: 4)`) so a policy is refused for whichever
-/// of its schedules carries the fault:
+/// The documented cross-member rules a schedule's nested rules obey, none of
+/// them expressible in the model, judged on EVERY element of `Schedules`
+/// (`@length(min: 1, max: 4)`) so a policy is refused for whichever of its
+/// schedules carries the fault:
 ///
 /// * `CreateRule` — "You must specify either CronExpression, or Interval,
 ///   IntervalUnit, and Times." A schedule states when to create in exactly one
@@ -1650,6 +1651,33 @@ fn plural(count: usize) -> (&'static str, &'static str) {
 ///   ShareRule, or a CrossRegionCopyRule, then you must specify a retention
 ///   count of `1` or more"), so a schedule carrying one of them and no
 ///   `RetainRule` is refused too — see [`retention_required_violation`].
+/// * `FastRestoreRule` — "You can enable fast snapshot restore based on either a
+///   count or a time interval." The same either/or, so the same three refusals:
+///   a rule that enables fast restore on neither a count nor an interval of
+///   snapshots says nothing about what it enables, and one that states both
+///   states two answers to the same question. This is also what makes the rule a
+///   SPECIFIED one for [`rules_requiring_retention`] honest: a rule that raises
+///   the schedule's retention floor has itself said how much it acts on.
+/// * `DeprecateRule` — "For age-based schedules, you must specify Interval and
+///   IntervalUnit. For count-based schedules, you must specify Count." The same
+///   either/or, except that the schedule's own retention mode decides WHICH of
+///   the two forms the rule states, so a form the other mode's sentence names is
+///   refused as the form the schedule's mode requires being omitted.
+/// * `ArchiveRule`'s `RetentionArchiveTier` — "For count-based schedules, you
+///   must specify Count. For age-based schedules, you must specify Interval and
+///   IntervalUnit." The same sentence as the deprecation rule's, judged the same
+///   way, on the archive-tier retention nested inside the schedule's
+///   `ArchiveRule` (`ArchiveRule$RetainRule` and
+///   `ArchiveRetainRule$RetentionArchiveTier` are both `@required`, so a
+///   schedule carrying an `ArchiveRule` carries the tier).
+///
+/// Every one of them is the one rule — state exactly one of the two documented
+/// forms, and state it completely. The three whose two forms are a COUNT and a
+/// time interval are judged by [`EitherOrRule`]; `CreateRule`, whose two forms
+/// are a cron expression and an interval, is judged by the same rule over its
+/// own pair of forms. A schedule rule the documentation gives no alternative
+/// forms (a `ShareRule`, a `CrossRegionCopyRule`'s own retention and deprecation
+/// rules) has no form for either of them to judge.
 pub fn schedule_rule_violation(details: Option<&PolicyDetails>) -> Option<InvalidRequestException> {
     details?
         .schedules
@@ -1661,6 +1689,9 @@ pub fn schedule_rule_violation(details: Option<&PolicyDetails>) -> Option<Invali
             let path = schedule_path(position);
             create_rule_violation(&label, &path, schedule.create_rule.as_ref())
                 .or_else(|| retain_rule_violation(&label, &path, schedule))
+                .or_else(|| fast_restore_rule_violation(&label, &path, schedule))
+                .or_else(|| deprecate_rule_violation(&label, &path, schedule))
+                .or_else(|| archive_tier_violation(&label, &path, schedule))
         })
 }
 
@@ -1723,14 +1754,178 @@ fn create_rule_violation(
     }
 }
 
+/// Which of the two alternative forms a schedule rule states what it does in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleForm {
+    /// A number of snapshots or AMIs: the rule's `Count`.
+    Count,
+    /// A span of time: the rule's `Interval` and `IntervalUnit`.
+    Interval,
+}
+
+/// Which of the two forms a rule's documentation requires of it, and the
+/// documented sentence a refusal of each cites.
+enum RequiredForm {
+    /// Either form says what the rule does and the caller chooses between them.
+    /// `neither` is why a rule stating neither of them is refused, and
+    /// `interval` why an interval form missing one of its two members is.
+    Either {
+        neither: &'static str,
+        interval: &'static str,
+    },
+    /// The rule's documentation names one form per retention mode of the
+    /// schedule carrying it, and that schedule retains by a COUNT: the count
+    /// form is the one required, and `.0` is the sentence requiring it.
+    Count(&'static str),
+    /// The same, for a schedule that retains by a time INTERVAL.
+    Interval(&'static str),
+}
+
+/// One rule nested in a schedule whose documentation offers two alternative
+/// forms — a count of resources, or a time interval stated as an `Interval` and
+/// an `IntervalUnit` — exactly one of which says what the rule does.
+///
+/// A rule stating NEITHER form says nothing about what it does, one stating BOTH
+/// gives two answers to the one question, and one stating the interval form
+/// without both of its members states it incompletely: each is refused, and
+/// which of the two forms a rule may state is either the caller's choice or the
+/// schedule's retention mode's ([`RequiredForm`]).
+struct EitherOrRule<'a> {
+    /// How a refusal names the schedule carrying the rule.
+    label: &'a str,
+    /// The wire path of the rule itself, which a refusal names it and its
+    /// members by.
+    path: String,
+    /// The two forms, as [`both_forms_stated`] names them.
+    forms: &'static str,
+    /// The members the rule states its form in.
+    count: Option<i32>,
+    interval: Option<i32>,
+    interval_unit: Option<&'a str>,
+    /// Which form the documentation requires, and why.
+    required: RequiredForm,
+}
+
+impl EitherOrRule<'_> {
+    /// Why this rule's form is refused, or `None` when it states exactly one of
+    /// the two forms, completely, and that form is the one required of it.
+    fn violation(&self) -> Option<InvalidRequestException> {
+        if self.count.is_some() && self.states_interval_form() {
+            return Some(both_forms_stated(self.label, self.forms));
+        }
+        match self.required {
+            RequiredForm::Either { neither, interval } => match self.stated() {
+                None => Some(required_in_schedule(
+                    self.label,
+                    vec![self.path.clone()],
+                    neither,
+                )),
+                Some(RuleForm::Interval) => self.incomplete_interval_form(interval),
+                Some(RuleForm::Count) => None,
+            },
+            RequiredForm::Count(reason) => self.count.is_none().then(|| {
+                required_in_schedule(self.label, vec![format!("{}.Count", self.path)], reason)
+            }),
+            // A rule required to state the interval form and stating the count
+            // form instead has omitted BOTH of the interval form's members, so
+            // the one check covers the wrong form and the incomplete one alike.
+            RequiredForm::Interval(reason) => self.incomplete_interval_form(reason),
+        }
+    }
+
+    /// Whether the rule states the interval form at all.
+    ///
+    /// An interval of [`UNSET_RULE_INTERVAL`] is the value this service itself
+    /// materializes for a rule that stated none, and every read of such a policy
+    /// reports it, so it is not an interval the request asked for: a unit, or any
+    /// other interval, is what states the form.
+    fn states_interval_form(&self) -> bool {
+        self.interval_unit.is_some()
+            || self
+                .interval
+                .is_some_and(|value| value != UNSET_RULE_INTERVAL)
+    }
+
+    /// Which form the rule STATED, or `None` when it states neither. A rule
+    /// stating both answers the count form, which is why the callers refuse that
+    /// pair before asking.
+    fn stated(&self) -> Option<RuleForm> {
+        if self.count.is_some() {
+            Some(RuleForm::Count)
+        } else if self.states_interval_form() {
+            Some(RuleForm::Interval)
+        } else {
+            None
+        }
+    }
+
+    /// Why the interval form as this rule states it is refused, naming the
+    /// members of it the rule omitted, or `None` when it states both of them.
+    fn incomplete_interval_form(&self, reason: &str) -> Option<InvalidRequestException> {
+        let omitted = omitted_members(
+            &self.path,
+            [
+                ("Interval", self.interval.is_some()),
+                ("IntervalUnit", self.interval_unit.is_some()),
+            ],
+        );
+        (!omitted.is_empty()).then(|| required_in_schedule(self.label, omitted, reason))
+    }
+}
+
+/// The form rule a schedule's `RetainRule` obeys: "You can retain snapshots
+/// based on either a count or a time interval", with "Count-based retention: You
+/// must specify Count" and "Age-based retention: You must specify Interval and
+/// IntervalUnit" stating each form completely.
+fn retain_rule_form<'a>(label: &'a str, path: &str, rule: &'a RetainRule) -> EitherOrRule<'a> {
+    EitherOrRule {
+        label,
+        path: format!("{path}.RetainRule"),
+        forms: "Count based RetainRule and interval based RetainRule",
+        count: rule.count,
+        interval: rule.interval,
+        interval_unit: rule.interval_unit.as_deref(),
+        required: RequiredForm::Either {
+            neither: "a RetainRule retains either based on a Count or based on an Interval and \
+                      IntervalUnit",
+            interval: "age based retention states both Interval and IntervalUnit",
+        },
+    }
+}
+
+/// Which retention mode the schedule's `RetainRule` states, or `None` when the
+/// schedule states no retention at all.
+///
+/// It is read only after [`retain_rule_violation`] has judged that rule, so a
+/// schedule reaching the rules whose form follows the mode states at most one of
+/// the two modes.
+fn schedule_retention_mode(label: &str, path: &str, schedule: &Schedule) -> Option<RuleForm> {
+    retain_rule_form(label, path, schedule.retain_rule.as_ref()?).stated()
+}
+
+/// Which form a rule whose documentation names one per retention mode must
+/// state, for the schedule's mode, and why.
+///
+/// A schedule that states no retention mode is held to neither sentence — there
+/// is no mode for the rule's form to follow — so the rule is judged by the
+/// either/or alone, which is what both sentences together say: state one of the
+/// two forms, completely.
+fn form_for_retention_mode(
+    mode: Option<RuleForm>,
+    count: &'static str,
+    interval: &'static str,
+    neither: &'static str,
+) -> RequiredForm {
+    match mode {
+        Some(RuleForm::Count) => RequiredForm::Count(count),
+        Some(RuleForm::Interval) => RequiredForm::Interval(interval),
+        None => RequiredForm::Either { neither, interval },
+    }
+}
+
 /// Why a schedule's retention rule is refused, or `None` when it states exactly
 /// one of the two documented retention modes and retains at least as much as the
 /// schedule's other rules require.
-///
-/// A retention interval of [`UNSET_RULE_INTERVAL`] is the value this service
-/// itself materializes for a rule that stated none, so it is not a time interval
-/// the request asked for: a unit, or any other interval, is what states the
-/// age-based mode.
 ///
 /// The whole `schedule` is judged, not the retention rule alone: the rules the
 /// schedule carries beside it decide both whether a retention must be stated at
@@ -1744,36 +1939,15 @@ fn retain_rule_violation(
     let Some(rule) = schedule.retain_rule.as_ref() else {
         return retention_required_violation(label, path, schedule);
     };
-    let count_based = rule.count.is_some();
-    let age_based = rule.interval_unit.is_some()
-        || rule.interval.is_some_and(|value| value != UNSET_RULE_INTERVAL);
+    let form = retain_rule_form(label, path, rule);
+    if let Some(refusal) = form.violation() {
+        return Some(refusal);
+    }
 
-    match (count_based, age_based) {
-        (true, true) => Some(both_forms_stated(
-            label,
-            "Count based RetainRule and interval based RetainRule",
-        )),
-        (false, false) => Some(required_in_schedule(
-            label,
-            vec![format!("{path}.RetainRule")],
-            "a RetainRule retains either based on a Count or based on an Interval and \
-             IntervalUnit",
-        )),
-        (false, true) => {
-            let omitted = omitted_members(
-                &format!("{path}.RetainRule"),
-                [
-                    ("Interval", rule.interval.is_some()),
-                    ("IntervalUnit", rule.interval_unit.is_some()),
-                ],
-            );
-            if !omitted.is_empty() {
-                return Some(required_in_schedule(
-                    label,
-                    omitted,
-                    "age based retention states both Interval and IntervalUnit",
-                ));
-            }
+    // The form check refuses a rule that states neither mode, so the retention
+    // judged against the floor is the one the mode it DID state retains by.
+    match form.stated()? {
+        RuleForm::Interval => {
             // The floor is stated in DAYS ("a retention interval of 1 day or
             // more"), and every `RetentionIntervalUnitValues` member is at least
             // a day long, so an interval of 1 or more in ANY unit meets it and
@@ -1789,7 +1963,7 @@ fn retain_rule_violation(
                 &requirement,
             )
         }
-        (true, false) => {
+        RuleForm::Count => {
             let requirement =
                 format!("a retention count of {RETENTION_FLOOR_WITH_DEPENDENT_RULE} or more");
             retention_floor_violation(
@@ -1801,6 +1975,107 @@ fn retain_rule_violation(
             )
         }
     }
+}
+
+/// Why a schedule's fast-restore rule is refused, or `None` when the schedule
+/// carries none or states it in exactly one of the two documented forms.
+///
+/// "You can enable fast snapshot restore based on either a count or a time
+/// interval" — the same either/or as the retention rule's, and the caller's
+/// choice between the two forms, since nothing ties this rule to how the
+/// schedule retains. The Availability Zones the rule also names say WHERE fast
+/// restore is enabled, not how much of it, so a rule naming them alone states
+/// neither form.
+fn fast_restore_rule_violation(
+    label: &str,
+    path: &str,
+    schedule: &Schedule,
+) -> Option<InvalidRequestException> {
+    let rule: &FastRestoreRule = schedule.fast_restore_rule.as_ref()?;
+    EitherOrRule {
+        label,
+        path: format!("{path}.FastRestoreRule"),
+        forms: "Count based FastRestoreRule and interval based FastRestoreRule",
+        count: rule.count,
+        interval: rule.interval,
+        interval_unit: rule.interval_unit.as_deref(),
+        required: RequiredForm::Either {
+            neither: "a FastRestoreRule enables fast snapshot restore either based on a Count or \
+                      based on an Interval and IntervalUnit",
+            interval: "an interval based FastRestoreRule states both Interval and IntervalUnit",
+        },
+    }
+    .violation()
+}
+
+/// Why a schedule's AMI deprecation rule is refused, or `None` when the schedule
+/// carries none or states it in the form its retention mode requires.
+///
+/// "For age-based schedules, you must specify Interval and IntervalUnit. For
+/// count-based schedules, you must specify Count" — the same either/or as the
+/// retention rule's, with the schedule's own retention mode deciding which of
+/// the two forms the rule states, so a rule deprecating by the other mode's form
+/// is refused for omitting the one its schedule's mode requires.
+fn deprecate_rule_violation(
+    label: &str,
+    path: &str,
+    schedule: &Schedule,
+) -> Option<InvalidRequestException> {
+    let rule: &DeprecateRule = schedule.deprecate_rule.as_ref()?;
+    EitherOrRule {
+        label,
+        path: format!("{path}.DeprecateRule"),
+        forms: "Count based DeprecateRule and interval based DeprecateRule",
+        count: rule.count,
+        interval: rule.interval,
+        interval_unit: rule.interval_unit.as_deref(),
+        required: form_for_retention_mode(
+            schedule_retention_mode(label, path, schedule),
+            "a count based schedule deprecates based on a Count",
+            "an age based schedule deprecates based on an Interval and IntervalUnit",
+            "a DeprecateRule deprecates based on a Count for a count based schedule and based on \
+             an Interval and IntervalUnit for an age based schedule",
+        ),
+    }
+    .violation()
+}
+
+/// Why the archive-tier retention of a schedule's `ArchiveRule` is refused, or
+/// `None` when the schedule carries no such rule or states the tier in the form
+/// its retention mode requires.
+///
+/// `RetentionArchiveTier` carries the deprecation rule's sentence word for word
+/// ("For count-based schedules, you must specify Count. For age-based schedules,
+/// you must specify Interval and IntervalUnit"), so it is judged the same way.
+/// `ArchiveRule$RetainRule` and `ArchiveRetainRule$RetentionArchiveTier` are
+/// both `@required`, so the tier is there to judge whenever the rule is.
+fn archive_tier_violation(
+    label: &str,
+    path: &str,
+    schedule: &Schedule,
+) -> Option<InvalidRequestException> {
+    let tier: &RetentionArchiveTier = &schedule
+        .archive_rule
+        .as_ref()?
+        .retain_rule
+        .retention_archive_tier;
+    EitherOrRule {
+        label,
+        path: format!("{path}.ArchiveRule.RetainRule.RetentionArchiveTier"),
+        forms: "Count based RetentionArchiveTier and interval based RetentionArchiveTier",
+        count: tier.count,
+        interval: tier.interval,
+        interval_unit: tier.interval_unit.as_deref(),
+        required: form_for_retention_mode(
+            schedule_retention_mode(label, path, schedule),
+            "a count based schedule retains archived snapshots based on a Count",
+            "an age based schedule retains archived snapshots based on an Interval and \
+             IntervalUnit",
+            "a RetentionArchiveTier retains based on a Count for a count based schedule and based \
+             on an Interval and IntervalUnit for an age based schedule",
+        ),
+    }
+    .violation()
 }
 
 /// Why a schedule that states NO retention at all is refused, or `None` when

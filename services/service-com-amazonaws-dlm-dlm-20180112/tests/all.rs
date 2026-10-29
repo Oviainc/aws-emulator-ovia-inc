@@ -51,6 +51,8 @@ mod region_isolation;
 mod schedule_retention_floor;
 #[path = "all/schedule_retention_required.rs"]
 mod schedule_retention_required;
+#[path = "all/schedule_rule_forms.rs"]
+mod schedule_rule_forms;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_arn_resolution.rs"]

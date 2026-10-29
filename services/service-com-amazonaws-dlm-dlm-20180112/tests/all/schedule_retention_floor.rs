@@ -282,6 +282,31 @@ struct DependentRule {
     names: &'static [&'static str],
 }
 
+impl DependentRule {
+    /// These members as a schedule retaining by `retain_rule` states them.
+    ///
+    /// An `ArchiveRule`'s `RetentionArchiveTier` retains in the mode the
+    /// schedule's own retention rule states ("For count-based schedules, you
+    /// must specify Count. For age-based schedules, you must specify Interval
+    /// and IntervalUnit", `smithy_query(query="doc",
+    /// shape="RetentionArchiveTier")`), so beside an age-based retention the
+    /// archive tier states its own age-based form: this file is about the
+    /// standard-tier floor, and the form each rule is stated in is
+    /// `tests/all/schedule_rule_forms.rs`'s.
+    fn members_beside(&self, retain_rule: &Value) -> Value {
+        let mut members = self.members.clone();
+        let age_based = retain_rule.get("IntervalUnit").is_some();
+        if members.get("ArchiveRule").is_some() && age_based {
+            members["ArchiveRule"] = json!({
+                "RetainRule": {
+                    "RetentionArchiveTier": {"Interval": 90, "IntervalUnit": "DAYS"},
+                },
+            });
+        }
+        members
+    }
+}
+
 /// Every way a schedule can specify a rule acting on the snapshots it retains,
 /// one row per rule the documented sentence names, all three at once, the empty
 /// lists that specify none of them, and a schedule carrying none.
@@ -511,9 +536,10 @@ async fn a_rule_acting_on_retained_snapshots_requires_a_retention_of_one_or_more
         for retention in retentions() {
             let case = format!("{} beside {}", retention.case, rule.case);
             let schedule_name = "under-test";
+            let members = rule.members_beside(&retention.rule);
             let details = snapshot_details(vec![schedule_with(
                 schedule_name,
-                &rule.members,
+                &members,
                 &retention.rule,
             )]);
             let refused = rule.raises_floor && retention.retained < RETENTION_FLOOR;
@@ -553,10 +579,10 @@ async fn a_rule_acting_on_retained_snapshots_requires_a_retention_of_one_or_more
                 at(&stored, &retention.stored_at)
             );
             assert!(
-                carries(&stored, &rule.members),
+                carries(&stored, &members),
                 "case {case:?}: the stored schedule must carry the rule it stated ({:?}), got \
                  {stored:?}",
-                rule.members
+                members
             );
         }
     }
@@ -658,7 +684,7 @@ async fn an_update_cannot_patch_a_policy_below_the_floor() {
             let case = format!("{} beside {} (update)", retention.case, rule.case);
             let details = snapshot_details(vec![schedule_with(
                 "under-test",
-                &rule.members,
+                &rule.members_beside(&retention.rule),
                 &retention.rule,
             )]);
             let refused = rule.raises_floor && retention.retained < RETENTION_FLOOR;
