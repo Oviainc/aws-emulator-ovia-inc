@@ -213,5 +213,7 @@ mod create_bridge_references;
 mod bridge_retirement_refuses_state_changes;
 #[path = "all/retired_bridge_reconfiguration.rs"]
 mod retired_bridge_reconfiguration;
+#[path = "all/bridge_source_removal_failover_integrity.rs"]
+mod bridge_source_removal_failover_integrity;
 #[path = "all/bridge_deletion_flow_source_integrity.rs"]
 mod bridge_deletion_flow_source_integrity;

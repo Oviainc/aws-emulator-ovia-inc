@@ -19,7 +19,14 @@
 //! The tables span what the rule generalises over: WHICH position of the pair the priority
 //! names and which one the request removes (so the refusal follows the reference rather than
 //! the position), the shape of the source names, whether a priority is stored at all, and —
-//! on the bridge side — the other resource whose sources one `SourceFailoverConfig` governs.
+//! on the bridge side — the other resource whose sources one `SourceFailoverConfig` governs,
+//! crossed with the KIND of source the bridge's direction admits, which is the shape the
+//! reference is held in: `BridgeFlowSource$Name` on a cloud-to-ground bridge,
+//! `BridgeNetworkSource$Name` on a ground-to-cloud one.
+//!
+//! Which CALL wrote the stored priority is an axis the rule is indifferent to and these tables
+//! hold fixed (the create writes it): the sibling suite
+//! `crate::bridge_source_removal_failover_integrity` varies it.
 //!
 //! Every case drives the real request path (routing, restJson1 deserialization, constraint
 //! validation, handler, serialization) through the harness
@@ -30,14 +37,14 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
-use crate::bridge_lifecycle::{create_bridge, describe_bridge, gateway_with_networks};
+use crate::bridge_lifecycle::{cloud_flow, create_bridge, describe_bridge, gateway_with_networks};
 use crate::flow_lifecycle::Emulator;
 use crate::flow_sources::{described_sources, remove_flow_source};
 
 /// The failover setting a resource needs to hold a PAIR of sources — "if the state is
 /// inactive, [it] can have only one source. If the state is active, [it] can have one or two
 /// sources" (`FailoverConfig$State`) — naming `primary` where a row stores a priority.
-fn failover(primary: Option<&str>) -> Value {
+pub(crate) fn failover(primary: Option<&str>) -> Value {
     let mut config = json!({ "state": mc::STATE_ENABLED, "failoverMode": "MERGE" });
     if let Some(primary) = primary {
         config["sourcePriority"] = json!({ "primarySource": primary });
@@ -125,7 +132,13 @@ fn rows() -> Vec<Row> {
 
 /// Assert one refusal: the modelled error, this service's validation envelope, and a message
 /// that states which source could not be removed and why.
-fn assert_refused(case: &str, target: &str, status: u16, code: Option<&str>, answered: &Value) {
+pub(crate) fn assert_refused(
+    case: &str,
+    target: &str,
+    status: u16,
+    code: Option<&str>,
+    answered: &Value,
+) {
     assert_eq!(
         (status, code),
         (400, Some("BadRequestException")),
@@ -161,7 +174,7 @@ fn source_names(described: &[Value]) -> Vec<String> {
 }
 
 /// The primary source `config` names, if it names one.
-fn primary_of(config: &Value) -> Option<String> {
+pub(crate) fn primary_of(config: &Value) -> Option<String> {
     config["sourcePriority"]["primarySource"]
         .as_str()
         .map(str::to_string)
@@ -169,7 +182,7 @@ fn primary_of(config: &Value) -> Option<String> {
 
 /// Assert the invariant the whole rule exists for: the failover setting the resource reports
 /// names one of the sources it reports, and the update path accepts that setting unchanged.
-async fn assert_failover_is_resolvable(
+pub(crate) async fn assert_failover_is_resolvable(
     emulator: &Emulator,
     case: &str,
     uri: &str,
@@ -371,9 +384,66 @@ async fn re_pointing_the_priority_makes_the_refused_removal_succeed() {
     .await;
 }
 
+/// The kind of source a bridge holds, which its DIRECTION decides: a cloud-to-ground (egress)
+/// bridge takes its content from cloud flows, a ground-to-cloud (ingress) bridge from the
+/// networks of the gateway it is placed on. The reference this rule is about is held in either
+/// shape's `Name`, so the bridge table below runs every row of [`rows`] over both kinds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Kind {
+    /// `BridgeFlowSource`, on an `egressGatewayBridge`.
+    Flow,
+    /// `BridgeNetworkSource`, on an `ingressGatewayBridge`.
+    Network,
+}
+
+impl Kind {
+    /// The bridge-type member a bridge ingesting this kind of source is created with, and the
+    /// configuration of it: the direction decides the kind, so the two go together.
+    pub(crate) fn bridge_type(self) -> (&'static str, Value) {
+        match self {
+            Kind::Flow => ("egressGatewayBridge", json!({ "maxBitrate": 20_000_000i64 })),
+            Kind::Network => (
+                "ingressGatewayBridge",
+                json!({ "maxBitrate": 20_000_000i64, "maxOutputs": 2 }),
+            ),
+        }
+    }
+
+    /// One source entry of this kind named `name`, distinct from every other source of the
+    /// run in what the kind makes a source distinct by: the cloud flow it originates in, or
+    /// the port it listens on.
+    pub(crate) async fn source(
+        self,
+        emulator: &Emulator,
+        index: usize,
+        position: usize,
+        name: &str,
+    ) -> Value {
+        match self {
+            Kind::Flow => {
+                let flow_arn =
+                    cloud_flow(emulator, &format!("flow-failover-removal-{index}-{position}"))
+                        .await;
+                json!({ "flowSource": { "flowArn": flow_arn, "name": name }})
+            }
+            Kind::Network => json!({ "networkSource": {
+                "multicastIp": "224.0.1.1",
+                "name": name,
+                "networkName": "net-1",
+                "port": 5_000 + (index * 2 + position) as i64,
+                "protocol": "rtp",
+            }}),
+        }
+    }
+}
+
 /// The `SourceFailoverConfig` the bridge reports, as DescribeBridge answers it, with the
 /// names of the sources it holds.
-async fn bridge_state(emulator: &Emulator, case: &str, arn: &str) -> (Value, Vec<String>) {
+pub(crate) async fn bridge_state(
+    emulator: &Emulator,
+    case: &str,
+    arn: &str,
+) -> (Value, Vec<String>) {
     let (status, code, described) = describe_bridge(emulator, arn).await;
     assert_eq!(
         (status, code.as_deref()),
@@ -386,8 +456,11 @@ async fn bridge_state(emulator: &Emulator, case: &str, arn: &str) -> (Value, Vec
         .unwrap_or_default()
         .iter()
         .map(|source| {
-            source["networkSource"]["name"]
+            // A bridge source is reported in the shape its kind is held in, and either shape
+            // carries the `Name` the bridge addresses it by.
+            source["flowSource"]["name"]
                 .as_str()
+                .or_else(|| source["networkSource"]["name"].as_str())
                 .unwrap_or_default()
                 .to_string()
         })
@@ -397,39 +470,35 @@ async fn bridge_state(emulator: &Emulator, case: &str, arn: &str) -> (Value, Vec
 
 /// The bridge side of the same rule: a bridge's sources are named too and one
 /// `SourceFailoverConfig` governs them, so RemoveBridgeSource refuses to take away the
-/// source the stored priority names and removes any other.
+/// source the stored priority names and removes any other — whichever KIND of source the
+/// bridge's direction has it holding the reference in, and with the same way out of the
+/// refusal the flow side has.
 #[tokio::test]
 async fn remove_bridge_source_refuses_to_strand_the_failover_primary_source() {
     let emulator = Emulator::new();
     let placement = gateway_with_networks(&emulator, "gw-failover-removal", &["net-1"]).await;
 
-    for (index, row) in rows().into_iter().enumerate() {
-        let case = row.case;
-        let sources: Vec<Value> = row
-            .names
-            .iter()
-            .enumerate()
-            .map(|(position, name)| {
-                json!({ "networkSource": {
-                    "multicastIp": "224.0.1.1",
-                    "name": name,
-                    "networkName": "net-1",
-                    "port": 5_000 + (index * 2 + position) as i64,
-                    "protocol": "rtp",
-                }})
-            })
-            .collect();
-        let (status, code, created) = create_bridge(
-            &emulator,
-            json!({
-                "name": format!("bridge-failover-removal-{index}"),
-                "placementArn": placement,
-                "ingressGatewayBridge": { "maxBitrate": 20_000_000, "maxOutputs": 2 },
-                "sources": sources,
-                "sourceFailoverConfig": failover(row.primary),
-            }),
-        )
-        .await;
+    let table: Vec<(Kind, Row)> = [Kind::Network, Kind::Flow]
+        .into_iter()
+        .flat_map(|kind| rows().into_iter().map(move |row| (kind, row)))
+        .collect();
+
+    for (index, (kind, row)) in table.into_iter().enumerate() {
+        let case = format!("{kind:?} sources, {}", row.case);
+        let case = case.as_str();
+        let mut sources = Vec::with_capacity(row.names.len());
+        for (position, name) in row.names.iter().enumerate() {
+            sources.push(kind.source(&emulator, index, position, name).await);
+        }
+        let (type_member, type_configuration) = kind.bridge_type();
+        let mut request = json!({
+            "name": format!("bridge-failover-removal-{index}"),
+            "placementArn": placement,
+            "sources": sources,
+            "sourceFailoverConfig": failover(row.primary),
+        });
+        request[type_member] = type_configuration;
+        let (status, code, created) = create_bridge(&emulator, request).await;
         assert_eq!(
             (status, code.as_deref()),
             (201, None),
@@ -464,6 +533,11 @@ async fn remove_bridge_source_refuses_to_strand_the_failover_primary_source() {
                 "case {case:?}: a bridge source no failover priority names is removable, got \
                  {status} {code:?}: {answered}"
             );
+            assert_eq!(
+                answered["sourceName"].as_str(),
+                Some(row.target()),
+                "case {case:?}: the answer names the source that was removed, got {answered}"
+            );
             let expected: Vec<String> = row
                 .names
                 .iter()
@@ -489,5 +563,54 @@ async fn remove_bridge_source_refuses_to_strand_the_failover_primary_source() {
             &after,
         )
         .await;
+
+        // The way out of the refusal on this side of the rule, the counterpart of
+        // [`re_pointing_the_priority_makes_the_refused_removal_succeed`]: the caller points
+        // the priority at another source of the bridge through the update path that writes
+        // one, and the same removal is then served.
+        if row.refused() {
+            let other = row.names[1 - row.removed];
+            let (status, code, updated) = emulator
+                .send(
+                    "PUT",
+                    &format!("/v1/bridges/{bridge_arn}"),
+                    Some(json!({ "sourceFailoverConfig": failover(Some(other)) })),
+                )
+                .await;
+            assert_eq!(
+                (status, code.as_deref()),
+                (202, None),
+                "case {case:?}: the priority may be pointed at another source of the bridge, \
+                 got {status} {code:?}: {updated}"
+            );
+            let (status, code, removed) = emulator
+                .send(
+                    "DELETE",
+                    &format!("/v1/bridges/{bridge_arn}/sources/{}", row.target()),
+                    None,
+                )
+                .await;
+            assert_eq!(
+                (status, code.as_deref()),
+                (202, None),
+                "case {case:?}: the bridge source no priority names any more is removable, got \
+                 {status} {code:?}: {removed}"
+            );
+            let (config, remaining) = bridge_state(&emulator, case, &bridge_arn).await;
+            assert_eq!(
+                (remaining.clone(), primary_of(&config)),
+                (vec![other.to_string()], Some(other.to_string())),
+                "case {case:?}: the bridge keeps the source the priority now names, got \
+                 {remaining:?} and {config}"
+            );
+            assert_failover_is_resolvable(
+                &emulator,
+                case,
+                &format!("/v1/bridges/{bridge_arn}"),
+                &config,
+                &remaining,
+            )
+            .await;
+        }
     }
 }
