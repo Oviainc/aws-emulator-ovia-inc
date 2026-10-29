@@ -51,6 +51,8 @@ mod core_network_change_events;
 mod core_network_change_set;
 #[path = "all/core_network_change_set_execution.rs"]
 mod core_network_change_set_execution;
+#[path = "all/core_network_change_set_segment_actions.rs"]
+mod core_network_change_set_segment_actions;
 #[path = "all/core_network_lifecycle.rs"]
 mod core_network_lifecycle;
 #[path = "all/core_network_policy_version_listing.rs"]

@@ -57,6 +57,7 @@
 //! echoes its input back without storing it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 // The two shapes a core network change event is reported through, and the two a change of
@@ -64,6 +65,9 @@ use std::time::{Duration, SystemTime};
 // stays exactly as the rest of the service shares it.
 use crate::ops::types::{CoreNetworkChange, CoreNetworkChangeValues};
 use crate::ops::types::{CoreNetworkChangeEvent, CoreNetworkChangeEventValues};
+// The shapes one change reports a segment's service insertion actions through, imported
+// beside them for the same reason.
+use crate::ops::types::{NetworkFunctionGroup, ServiceInsertionAction, Via};
 use crate::ops::types::{
     AWSLocation, AccountStatus, Attachment, AttachmentRoutingPolicyAssociationSummary, Bandwidth,
     ConnectAttachment, ConnectAttachmentOptions,
@@ -1041,22 +1045,28 @@ pub const CHANGE_ACTION_REMOVE: &str = "REMOVE";
 /// (`smithy_query shape=ChangeType`, mirrored in `ops::types::CHANGE_TYPE_VALUES`): the
 /// kinds of object a policy document configures and [`policy_topology`] therefore derives
 /// — an edge, a segment at one edge location, a network function group at one edge
-/// location, and the `attachment-policies` block as a whole.
+/// location, one static route a segment holds at one edge location, and the
+/// `attachment-policies` block as a whole.
 ///
 /// The members this list leaves out are the ones no difference between two STORED documents
-/// can be seen in here. `ATTACHMENT_MAPPING`, the two attachment-route kinds and the
+/// can be seen in here. `ATTACHMENT_MAPPING`, the route-propagation kind and the
 /// routing-policy kinds describe objects that are not part of a document at all. The
 /// remaining configuration kinds (`CORE_NETWORK_CONFIGURATION`, `SEGMENTS_CONFIGURATION`,
-/// `SEGMENT_ACTIONS_CONFIGURATION`) name blocks a document does carry, but the derived
-/// topology keeps only what the operations of this slice act on — an edge's location, ASN
-/// and inside CIDR blocks, and a segment's or group's name and edge locations — so two
-/// documents differing ONLY in a part of those blocks the topology does not model (segment
-/// actions, a segment's other attributes) are not yet reported as a change.
+/// `SEGMENT_ACTIONS_CONFIGURATION`) name blocks a document does carry, but every object
+/// those blocks configure is reported under the kind that names that object — the edge, the
+/// segment with what the `segment-actions` acting on it declare, the group, the static route
+/// — so reporting the block as well would report one difference twice.
+/// `attachment-policies` is the one block reported as a block, because it configures no
+/// object of its own ([`policy_changes`]).
 pub const CHANGE_TYPE_CORE_NETWORK_EDGE: &str = "CORE_NETWORK_EDGE";
 /// See [`CHANGE_TYPE_CORE_NETWORK_EDGE`].
 pub const CHANGE_TYPE_CORE_NETWORK_SEGMENT: &str = "CORE_NETWORK_SEGMENT";
 /// See [`CHANGE_TYPE_CORE_NETWORK_EDGE`].
 pub const CHANGE_TYPE_NETWORK_FUNCTION_GROUP: &str = "NETWORK_FUNCTION_GROUP";
+/// See [`CHANGE_TYPE_CORE_NETWORK_EDGE`]: the kind of ONE static route a `create-route`
+/// entry of `segment-actions` declares for a segment, which is reached through the
+/// attachment its destination names.
+pub const CHANGE_TYPE_ATTACHMENT_ROUTE_STATIC: &str = "ATTACHMENT_ROUTE_STATIC";
 /// See [`CHANGE_TYPE_CORE_NETWORK_EDGE`].
 pub const CHANGE_TYPE_ATTACHMENT_POLICIES_CONFIGURATION: &str =
     "ATTACHMENT_POLICIES_CONFIGURATION";
@@ -7414,6 +7424,99 @@ impl PolicyTopology {
             .map(str::to_string)
             .collect()
     }
+
+    /// The distinct service insertion actions the `send-via` / `send-to` entries acting on
+    /// the segment `name` declare.
+    ///
+    /// Bounded by [`MAX_POLICY_SEGMENT_ACTIONS`] entries, each naming at most
+    /// [`MAX_POLICY_NETWORK_FUNCTION_GROUPS`] groups.
+    fn insertions_of(&self, name: &str) -> BTreeSet<SegmentInsertion> {
+        self.service_insertions
+            .iter()
+            .filter(|insertion| insertion.segment == name)
+            .map(|insertion| SegmentInsertion {
+                send_via: insertion.send_via,
+                network_function_groups: insertion
+                    .network_function_groups
+                    .iter()
+                    .cloned()
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// What this policy states about each of its SEGMENTS at each edge location that segment
+    /// is present in: the objects a change set compares to decide what a version does to one
+    /// segment ([`policy_changes`]).
+    ///
+    /// The key is the placement [`Self::placements`] derives and the value is everything else
+    /// the document states about that segment — what the `segment-actions` acting on it
+    /// declare — so two documents placing one segment at the same edge location but sharing
+    /// its routes with other segments, or serving it through other network function groups,
+    /// configure it differently.
+    ///
+    /// What those actions declare is a property of the SEGMENT and not of one of its
+    /// placements, so it is derived once per declared segment and SHARED by that segment's
+    /// placements: a segment present in every edge location of the core network holds one
+    /// copy rather than one per location, which keeps this linear in the document it came
+    /// from however many edge locations [`MAX_POLICY_EDGE_LOCATIONS`] allows.
+    fn segment_placements(&self) -> BTreeMap<(String, String), Arc<SegmentConfiguration>> {
+        let declared = self.declared_segments();
+        let configurations: BTreeMap<&str, Arc<SegmentConfiguration>> = declared
+            .iter()
+            .map(|name| {
+                (
+                    *name,
+                    Arc::new(SegmentConfiguration {
+                        shared_segments: self.shared_segments_of(name, &declared),
+                        service_insertions: self.insertions_of(name),
+                    }),
+                )
+            })
+            .collect();
+        self.placements(&self.segments)
+            .into_iter()
+            .map(|(location, name)| {
+                let configuration = configurations
+                    .get(name.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                ((location, name), configuration)
+            })
+            .collect()
+    }
+
+    /// Every STATIC ROUTE this policy declares, as (segment, route).
+    ///
+    /// A `create-route` entry declares one route per prefix and destination it names — the
+    /// routes [`Self::static_routes_of`] hands the listing of a segment's routing
+    /// information. The entry declares them for the SEGMENT rather than for one edge
+    /// location: the segment holds them in its route table wherever it is present, so one
+    /// declaration is one route here and is not multiplied over the segment's edge
+    /// locations. Held as a SET, so an entry declaring one prefix twice, or two entries
+    /// declaring the same route, keep it once.
+    ///
+    /// Bounded by the caps, and so linear in the document: at most
+    /// [`MAX_POLICY_SEGMENT_ACTIONS`] entries, each declaring at most
+    /// [`MAX_POLICY_ROUTE_PREFIXES`] prefixes through at most
+    /// [`MAX_POLICY_ROUTE_DESTINATIONS`] destinations.
+    fn static_route_placements(&self) -> BTreeSet<(String, StaticRouteIdentity)> {
+        let mut declared = BTreeSet::new();
+        for route in &self.static_routes {
+            for prefix in &route.destination_cidr_blocks {
+                for destination in &route.destinations {
+                    declared.insert((
+                        route.segment.clone(),
+                        StaticRouteIdentity {
+                            prefix: prefix.clone(),
+                            destination: destination.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+        declared
+    }
 }
 
 /// One change of a policy version's change set: what the difference between two policy
@@ -7431,16 +7534,121 @@ pub struct PolicyChange {
     pub action: &'static str,
     /// The edge location the changed object sits at, for a kind that sits at one.
     pub edge_location: Option<String>,
-    /// The changed segment's or network function group's name, for a kind that has one.
+    /// The changed segment's or network function group's name, for a kind that has one —
+    /// and, for a change to one static route, the segment whose route tables hold it.
     pub name: Option<String>,
-    /// How the policy in force configured the EDGE this change acts on, for a change that
-    /// replaces or removes one and `None` for every other change: the only values a
-    /// reported change carries that its own identity does not already name, so the only
-    /// ones the diff has to keep.
-    pub previous_edge: Option<EdgeConfiguration>,
-    /// How the submitted policy configures that edge, for a change that adds or replaces
-    /// one. See [`Self::previous_edge`].
-    pub new_edge: Option<EdgeConfiguration>,
+    /// Which static route this change acts on, for a change to one and `None` for every
+    /// other change: a segment's route table holds one route per prefix and destination, so
+    /// the pair is what identifies the route inside the segment [`Self::name`] gives.
+    pub route: Option<StaticRouteIdentity>,
+    /// What the policy IN FORCE states about the object this change acts on beyond the
+    /// identity above, for a change that modifies or removes an object of a kind that
+    /// carries any such values — `None` for every other change: these are the only values a
+    /// reported change carries that its own identity does not already name, so the only ones
+    /// the diff has to keep.
+    pub previous: Option<ChangedObject>,
+    /// What the SUBMITTED policy states about that object, for a change that adds or
+    /// modifies it. See [`Self::previous`].
+    pub new: Option<ChangedObject>,
+}
+
+/// What one of the two compared policies states about the object a change acts on, beyond
+/// the identity that change already names.
+///
+/// A kind whose identity is everything a document states about it carries none of these — a
+/// network function group at an edge location, one static route, the `attachment-policies`
+/// block — so a change to one holds `None` on both sides and reports only that identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangedObject {
+    /// One edge of `core-network-configuration`: see [`EdgeConfiguration`].
+    Edge(EdgeConfiguration),
+    /// One segment of `segments` at one edge location: see [`SegmentConfiguration`]. Shared
+    /// between that segment's placements, which a document states the same thing about.
+    Segment(Arc<SegmentConfiguration>),
+}
+
+/// Which ONE static route of a segment's route table a change acts on: the prefix it
+/// carries, and what that prefix is reached through.
+///
+/// A `create-route` entry declares one route per prefix and destination it names — the
+/// routes [`PolicyTopology::static_routes_of`] hands the listing of a segment's routing
+/// information — so the pair identifies one route, and is what a change to it reports as
+/// `Cidr` and `DestinationIdentifier`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StaticRouteIdentity {
+    /// The route's prefix: one `destination-cidr-blocks` entry of the `create-route` entry
+    /// that declared it.
+    pub prefix: String,
+    /// What that prefix is reached through: one `destinations` entry of the same entry — an
+    /// attachment of the segment, or [`POLICY_DESTINATION_BLACKHOLE`].
+    pub destination: String,
+}
+
+/// What a policy document states about one segment beyond its name and the edge locations
+/// it is present in: what the `segment-actions` acting on that segment declare.
+///
+/// These are the values a read of the core network reports for the segment and for the
+/// groups that serve it (`CoreNetworkSegment$SharedSegments` through
+/// [`PolicyTopology::to_segments`], and `ServiceInsertionSegments` through
+/// [`PolicyTopology::to_network_function_groups`]), so two documents giving one segment
+/// different ones configure it differently and a version that moves them modifies it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SegmentConfiguration {
+    /// The segments this segment's routes are shared with, in the order the document
+    /// declares the segments ([`PolicyTopology::shared_segments_of`]).
+    pub shared_segments: Vec<String>,
+    /// The distinct service insertion actions acting on this segment
+    /// ([`PolicyTopology::insertions_of`]), held as a SET: what a document sends a segment
+    /// through does not depend on the order it lists the entries in, nor on one entry being
+    /// listed twice, so neither makes two documents configure the segment differently.
+    pub service_insertions: BTreeSet<SegmentInsertion>,
+}
+
+/// ONE service insertion action acting on a segment: which of the two actions it is, and the
+/// network function groups it sends that segment's traffic through.
+///
+/// Ordered by the action and then by the groups it names, which is the order a change reports
+/// them in.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SegmentInsertion {
+    /// Whether the action is `send-via`; `send-to` otherwise.
+    pub send_via: bool,
+    /// The declared network function groups the action names, in name order.
+    pub network_function_groups: Vec<String>,
+}
+
+impl SegmentInsertion {
+    /// The modelled `ServiceInsertionAction` for this action: the action it takes, and the
+    /// groups it names through `Via$NetworkFunctionGroups`.
+    ///
+    /// A `mode` and a `when-sent-to` are parts of the entry the derived topology does not
+    /// keep — no operation of this slice acts on either — so neither is reported rather than
+    /// being reported as a value the document did not state.
+    fn to_shape(&self) -> ServiceInsertionAction {
+        ServiceInsertionAction {
+            action: Some(
+                if self.send_via {
+                    POLICY_ACTION_SEND_VIA
+                } else {
+                    POLICY_ACTION_SEND_TO
+                }
+                .to_string(),
+            ),
+            mode: None,
+            when_sent_to: None,
+            via: Some(Via {
+                network_function_groups: Some(
+                    self.network_function_groups
+                        .iter()
+                        .map(|name| NetworkFunctionGroup {
+                            name: Some(name.clone()),
+                        })
+                        .collect(),
+                ),
+                with_edge_overrides: None,
+            }),
+        }
+    }
 }
 
 /// How one policy document configures one edge, beyond the edge location that identifies
@@ -7484,45 +7692,83 @@ impl PolicyChange {
     /// This change's `IdentifierPath`: the type, then the edge location and the name where
     /// the kind carries them — "the `IdentifierPath` for a core network segment change
     /// might be `CORE_NETWORK_SEGMENT/us-east-1/devsegment`" (`smithy_query shape=
-    /// CoreNetworkChangeEvent member=IdentifierPath`).
+    /// CoreNetworkChangeEvent member=IdentifierPath`) — and then, for a change to one static
+    /// route, the prefix that route carries and what it is reached through, which is what
+    /// tells two routes of one segment apart.
     ///
     /// It "uniquely identifies the path for a change within the changeset" (same doc), so
     /// it is also the key one page of a listing resumes after.
     pub fn identifier_path(&self) -> String {
         let mut path = self.change_type.to_string();
-        for segment in [self.edge_location.as_deref(), self.name.as_deref()]
-            .into_iter()
-            .flatten()
+        let route = self.route.as_ref();
+        for component in [
+            self.edge_location.as_deref(),
+            self.name.as_deref(),
+            route.map(|route| route.prefix.as_str()),
+            route.map(|route| route.destination.as_str()),
+        ]
+        .into_iter()
+        .flatten()
         {
             path.push('/');
-            path.push_str(segment);
+            path.push_str(component);
         }
         path
     }
 
-    /// The resource this change acts on: the changed segment's or network function group's
-    /// own name, the edge location for an edge, and nothing for a change to an object none
-    /// of a policy's named entries identifies (the `attachment-policies` block as a whole).
+    /// The resource this change acts on: the prefix for a change to one static route, which
+    /// is what names a route in its segment's route table, the changed segment's or network
+    /// function group's own name, the edge location for an edge, and nothing for a change to
+    /// an object none of a policy's named entries identifies (the `attachment-policies`
+    /// block as a whole).
     fn identifier(&self) -> Option<String> {
-        self.name.clone().or_else(|| self.edge_location.clone())
+        self.route
+            .as_ref()
+            .map(|route| route.prefix.clone())
+            .or_else(|| self.name.clone())
+            .or_else(|| self.edge_location.clone())
     }
 
-    /// The values the object this change acts on holds under one of the two policies: the
-    /// edge configuration `edge` describes where this change acts on an edge, and the
-    /// identity of the named entry otherwise. `None` for a change to an object no member of
-    /// the shape names, as [`Self::to_change_event`] reports no values for one.
-    fn to_change_values(&self, edge: Option<&EdgeConfiguration>) -> Option<CoreNetworkChangeValues> {
+    /// The values the object this change acts on holds under one of the two policies: its
+    /// identity, plus what `configured` says that policy states about it. `None` for a
+    /// change to an object no member of the shape names, as [`Self::to_change_event`]
+    /// reports no values for one.
+    fn to_change_values(
+        &self,
+        configured: Option<&ChangedObject>,
+    ) -> Option<CoreNetworkChangeValues> {
         match (self.change_type, self.edge_location.as_deref(), self.name.as_deref()) {
             (CHANGE_TYPE_CORE_NETWORK_EDGE, Some(location), _) => {
                 // An edge change always carries the configuration of the side it reports —
                 // the policy that configured the edge is the side that has one — so a side
                 // with none reports no values rather than an edge configured with nothing.
-                edge.map(|held| held.to_change_values(location))
+                match configured {
+                    Some(ChangedObject::Edge(edge)) => Some(edge.to_change_values(location)),
+                    _ => None,
+                }
             }
             (CHANGE_TYPE_CORE_NETWORK_SEGMENT, Some(location), Some(name)) => {
+                // What the `segment-actions` of that side's document declare for this
+                // segment. A segment no such action acts on is shared with nothing and
+                // served by nothing, so each list is absent rather than empty.
+                let segment = match configured {
+                    Some(ChangedObject::Segment(held)) => Some(held),
+                    _ => None,
+                };
                 Some(CoreNetworkChangeValues {
                     segment_name: Some(name.to_string()),
                     edge_locations: Some(vec![location.to_string()]),
+                    shared_segments: segment
+                        .map(|held| held.shared_segments.clone())
+                        .filter(|shared| !shared.is_empty()),
+                    service_insertion_actions: segment
+                        .map(|held| {
+                            held.service_insertions
+                                .iter()
+                                .map(SegmentInsertion::to_shape)
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|actions| !actions.is_empty()),
                     ..CoreNetworkChangeValues::default()
                 })
             }
@@ -7530,6 +7776,17 @@ impl PolicyChange {
                 Some(CoreNetworkChangeValues {
                     network_function_group_name: Some(name.to_string()),
                     edge_locations: Some(vec![location.to_string()]),
+                    ..CoreNetworkChangeValues::default()
+                })
+            }
+            (CHANGE_TYPE_ATTACHMENT_ROUTE_STATIC, _, Some(segment)) => {
+                // A static route is identified completely by the segment whose route tables
+                // hold it, its prefix and what that prefix is reached through, so its
+                // identity is also everything the document states about it.
+                self.route.as_ref().map(|route| CoreNetworkChangeValues {
+                    segment_name: Some(segment.to_string()),
+                    cidr: Some(route.prefix.clone()),
+                    destination_identifier: Some(route.destination.clone()),
                     ..CoreNetworkChangeValues::default()
                 })
             }
@@ -7550,10 +7807,10 @@ impl PolicyChange {
             action: Some(self.action.to_string()),
             identifier: self.identifier(),
             previous_values: (self.action != CHANGE_ACTION_ADD)
-                .then(|| self.to_change_values(self.previous_edge.as_ref()))
+                .then(|| self.to_change_values(self.previous.as_ref()))
                 .flatten(),
             new_values: (self.action != CHANGE_ACTION_REMOVE)
-                .then(|| self.to_change_values(self.new_edge.as_ref()))
+                .then(|| self.to_change_values(self.new.as_ref()))
                 .flatten(),
             identifier_path: Some(self.identifier_path()),
         }
@@ -7570,22 +7827,31 @@ impl PolicyChange {
         // members names (the `attachment-policies` block as a whole) carries none rather
         // than an empty structure.
         let values = (self.edge_location.is_some() || self.name.is_some()).then(|| {
+            // A static route sits in the route table of the segment it was declared for, so
+            // its event names that segment too — "the segment name if the change event is
+            // associated with a segment" (`smithy_query shape=CoreNetworkChangeEventValues
+            // member=SegmentName`).
+            let names_segment = self.change_type == CHANGE_TYPE_CORE_NETWORK_SEGMENT
+                || self.change_type == CHANGE_TYPE_ATTACHMENT_ROUTE_STATIC;
             CoreNetworkChangeEventValues {
                 edge_location: self.edge_location.clone(),
-                segment_name: (self.change_type == CHANGE_TYPE_CORE_NETWORK_SEGMENT)
-                    .then(|| self.name.clone())
-                    .flatten(),
+                segment_name: names_segment.then(|| self.name.clone()).flatten(),
                 network_function_group_name: (self.change_type
                     == CHANGE_TYPE_NETWORK_FUNCTION_GROUP)
                     .then(|| self.name.clone())
                     .flatten(),
-                // The remaining members describe objects no policy document configures —
-                // a peer edge, an attachment, a route's CIDR, a routing policy
-                // association — so a change derived from two documents fills none.
+                // The prefix of the static route this change acts on, which is what the
+                // member reports for a static-route event.
+                cidr: self.route.as_ref().map(|route| route.prefix.clone()),
+                // The remaining members describe objects no policy document configures — a
+                // peer edge and a routing policy association — so a change derived from two
+                // documents fills none. `AttachmentId` is left out too: a route's
+                // destination is whatever the document spelled, which names no attachment at
+                // all for a blackholed route, so the destination travels in the change's own
+                // `DestinationIdentifier` rather than as an attachment id.
                 peer_edge_location: None,
                 routing_policy_direction: None,
                 attachment_id: None,
-                cidr: None,
                 routing_policy_association_details: None,
             }
         });
@@ -7608,11 +7874,23 @@ impl PolicyChange {
 /// policy in force configures is [`CHANGE_ACTION_REMOVE`]d, and one both configure
 /// differently is [`CHANGE_ACTION_MODIFY`]ed; an object both configure the same way is no
 /// change at all and produces no entry, so two identical documents differ in nothing. The
-/// objects compared are the ones a document configures and [`policy_topology`] therefore
-/// derives: each edge of `core-network-configuration` (its ASN and inside CIDR blocks are
-/// what a modification is), each named `segments` entry at each edge location it is present
-/// in, the same for each `network-function-groups` entry, and the `attachment-policies`
-/// block as a whole, which configures no object of its own.
+/// objects compared are every one a document configures and [`policy_topology`] therefore
+/// derives, with everything the document states about it:
+///
+/// * each edge of `core-network-configuration`, whose ASN and inside CIDR blocks are what a
+///   modification of it is;
+/// * each named `segments` entry at each edge location it is present in, carrying what the
+///   `segment-actions` acting on that segment declare — the segments its routes are shared
+///   with and the service insertion actions that serve it — so a document differing ONLY in
+///   those modifies the segment rather than changing nothing;
+/// * each named `network-function-groups` entry at each edge location it is present in,
+///   which its placement describes completely: which segments it serves is stated on those
+///   segments, through the `segment-actions` entries that act on them;
+/// * each static route a `create-route` entry declares for a segment, identified by that
+///   segment, its prefix and what that prefix reaches — one route per declaration, since a
+///   segment holds its route table wherever it is present;
+/// * the `attachment-policies` block as a whole, the one block that configures no object of
+///   its own.
 ///
 /// Both lists are bounded by the caps [`validate_policy_document`] enforces before a
 /// document is stored, so the comparison and its result are bounded too.
@@ -7637,39 +7915,80 @@ pub fn policy_changes(in_force: &PolicyTopology, submitted: &PolicyTopology) -> 
             action,
             edge_location: Some((*location).to_string()),
             name: None,
-            previous_edge,
-            new_edge,
+            route: None,
+            previous: previous_edge.map(ChangedObject::Edge),
+            new: new_edge.map(ChangedObject::Edge),
         });
     }
 
-    for (change_type, before, after) in [
-        (
-            CHANGE_TYPE_CORE_NETWORK_SEGMENT,
-            in_force.placements(&in_force.segments),
-            submitted.placements(&submitted.segments),
-        ),
-        (
-            CHANGE_TYPE_NETWORK_FUNCTION_GROUP,
-            in_force.placements(&in_force.network_function_groups),
-            submitted.placements(&submitted.network_function_groups),
-        ),
+    // A segment's placement carries what the `segment-actions` acting on it declare, so a
+    // placement both policies make is a MODIFY exactly where those differ — which is what a
+    // version changing only the sharing or the service insertion of a segment does to it.
+    let segments_before = in_force.segment_placements();
+    let segments_after = submitted.segment_placements();
+    for placement in segments_before
+        .keys()
+        .chain(segments_after.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        let previous = segments_before.get(placement);
+        let new = segments_after.get(placement);
+        let action = match (previous, new) {
+            (None, Some(_)) => CHANGE_ACTION_ADD,
+            (Some(_), None) => CHANGE_ACTION_REMOVE,
+            (Some(held), Some(given)) if held != given => CHANGE_ACTION_MODIFY,
+            _ => continue,
+        };
+        let (location, name) = placement;
+        changes.push(PolicyChange {
+            change_type: CHANGE_TYPE_CORE_NETWORK_SEGMENT,
+            action,
+            edge_location: Some(location.clone()),
+            name: Some(name.clone()),
+            route: None,
+            previous: previous.cloned().map(ChangedObject::Segment),
+            new: new.cloned().map(ChangedObject::Segment),
+        });
+    }
+
+    // A network function group's placement, and one static route, carry nothing beyond what
+    // identifies them, so one both policies make is never a MODIFY: it is the same object,
+    // unchanged.
+    let groups_before = in_force.placements(&in_force.network_function_groups);
+    let groups_after = submitted.placements(&submitted.network_function_groups);
+    for (placements, action) in [
+        (groups_after.difference(&groups_before), CHANGE_ACTION_ADD),
+        (groups_before.difference(&groups_after), CHANGE_ACTION_REMOVE),
     ] {
-        // A placement carries nothing beyond the pair that identifies it, so one both
-        // policies make is never a MODIFY: it is the same object, unchanged.
-        for (placements, action) in [
-            (after.difference(&before), CHANGE_ACTION_ADD),
-            (before.difference(&after), CHANGE_ACTION_REMOVE),
-        ] {
-            for (location, name) in placements {
-                changes.push(PolicyChange {
-                    change_type,
-                    action,
-                    edge_location: Some(location.clone()),
-                    name: Some(name.clone()),
-                    previous_edge: None,
-                    new_edge: None,
-                });
-            }
+        for (location, name) in placements {
+            changes.push(PolicyChange {
+                change_type: CHANGE_TYPE_NETWORK_FUNCTION_GROUP,
+                action,
+                edge_location: Some(location.clone()),
+                name: Some(name.clone()),
+                route: None,
+                previous: None,
+                new: None,
+            });
+        }
+    }
+
+    let routes_before = in_force.static_route_placements();
+    let routes_after = submitted.static_route_placements();
+    for (routes, action) in [
+        (routes_after.difference(&routes_before), CHANGE_ACTION_ADD),
+        (routes_before.difference(&routes_after), CHANGE_ACTION_REMOVE),
+    ] {
+        for (segment, route) in routes {
+            changes.push(PolicyChange {
+                change_type: CHANGE_TYPE_ATTACHMENT_ROUTE_STATIC,
+                action,
+                edge_location: None,
+                name: Some(segment.clone()),
+                route: Some(route.clone()),
+                previous: None,
+                new: None,
+            });
         }
     }
 
@@ -7686,8 +8005,9 @@ pub fn policy_changes(in_force: &PolicyTopology, submitted: &PolicyTopology) -> 
             },
             edge_location: None,
             name: None,
-            previous_edge: None,
-            new_edge: None,
+            route: None,
+            previous: None,
+            new: None,
         });
     }
 

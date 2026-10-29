@@ -3,8 +3,10 @@
 //! @op GetCoreNetworkChangeSet
 //! Reports the change set generated with one policy version of a core network: the
 //! differences between the policy that was in force when the version was stored and the
-//! version's own document, object by object of the core network's topology (its edges, and
-//! its segments and network function groups per edge location), as
+//! version's own document, object by object of the core network's topology (its edges, its
+//! segments and network function groups per edge location — a segment carrying what the
+//! document's `segment-actions` share its routes with and send it through — and the static
+//! routes those actions declare), as
 //! [`crate::state::policy_changes`] derived them where the version was stored and
 //! [`crate::state::CoreNetworkPolicyRecord::change_set`] reports them, paginated by
 //! `MaxResults`/`NextToken`. The SAME changes `GetCoreNetworkChangeEvents` reports as the
