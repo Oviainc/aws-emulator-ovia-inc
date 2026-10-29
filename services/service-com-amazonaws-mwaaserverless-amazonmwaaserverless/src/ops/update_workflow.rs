@@ -341,8 +341,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // every earlier version keeps the configuration it froze and stops being
         // scheduled. The promotion — the flag, what the workflow reports as its current
         // configuration and the trigger in force — is
-        // `crate::state::Workflow::promote_newest_version`, so an update and a
-        // version-scoped delete settle the active version the same single way.
+        // `crate::state::Workflow::promote_newest_version`, so a create, an update and
+        // a version-scoped delete settle the active version the same single way.
         workflow.promote_newest_version(now);
         workflow.modified_at = now;
 

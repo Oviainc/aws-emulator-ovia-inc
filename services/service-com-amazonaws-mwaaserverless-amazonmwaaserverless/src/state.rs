@@ -763,8 +763,9 @@ impl Workflow {
     /// decides, because two records can carry the same `created_at` instant while
     /// their sequence is unique and only ever grows.
     ///
-    /// Called wherever the set of versions changes the active one — a version
-    /// appended by an update, or the latest version removed by a delete — so
+    /// Called wherever the set of versions changes the active one — the first
+    /// version appended by a create, a further version appended by an update, or
+    /// the latest version removed by a delete — so
     /// [`Workflow::current_version`], [`Workflow::revision_id`],
     /// [`Workflow::code_snapshotted_at`] and the automated trigger
     /// ([`Self::configure_trigger`]) always describe the one version

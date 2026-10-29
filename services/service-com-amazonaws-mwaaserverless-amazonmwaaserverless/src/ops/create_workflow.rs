@@ -363,7 +363,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let nonce = store.next_nonce(now);
         let arn = crate::state::mint_workflow_arn(&region, &input.name, &nonce);
         let version = crate::state::mint_workflow_version(&arn, &fingerprint, &nonce);
-        let revision_id = crate::state::mint_revision_id(&arn, &version);
         // The append position this version keeps: the mint counter the nonce above
         // just advanced, which is what a version listing pages over.
         let sequence = store.mint_seq;
@@ -402,13 +401,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::WORKFLOW_STATUS_READY.to_string(),
             created_at: now,
             modified_at: now,
+            // What the workflow reports as its ACTIVE version — the flag on the
+            // record, the current version, the revision identifier and the instant
+            // that version snapshotted its code — is derived by
+            // `crate::state::Workflow::promote_newest_version` below, so these start
+            // unset rather than being written a second time here.
             code_snapshotted_at: now,
-            current_version: version.clone(),
-            revision_id,
+            current_version: String::new(),
+            revision_id: String::new(),
             versions: vec![crate::state::WorkflowVersionRecord {
                 version,
                 created_at: now,
-                is_latest: true,
+                is_latest: false,
                 snapshot,
                 sequence,
             }],
@@ -422,18 +426,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing is deleting a workflow this call just created, so the clock
             // owes it no removal.
             deletion_due_at: None,
-            // Set from the schedule the version's definition declares just below, so
-            // the trigger a created workflow carries is the one its definition asks
-            // for.
+            // Set from the schedule the active version's definition declares by the
+            // promotion just below, so the trigger a created workflow carries is the
+            // one its definition asks for.
             next_scheduled_run_at: None,
         };
 
         // "Amazon Managed Workflows for Apache Airflow Serverless automatically creates
         // the first version of the workflow and sets up the necessary execution
-        // environment": a workflow whose definition declares a schedule gets its trigger
-        // configured here, so its first automated run falls due without anybody calling
+        // environment": the version just appended becomes the workflow's active one, and
+        // the promotion — the flag, what the workflow reports as its current
+        // configuration and revision, and the trigger in force — is
+        // `crate::state::Workflow::promote_newest_version`, so a create, an update and a
+        // version-scoped delete settle the active version the same single way. That is
+        // also what gives a workflow whose definition declares a schedule its trigger,
+        // so its first automated run falls due without anybody calling
         // `StartWorkflowRun`.
-        workflow.configure_trigger(now);
+        workflow.promote_newest_version(now);
 
         store.claim_workflow_name(&region, &input.name, &arn);
         store.workflows.insert(arn.clone(), workflow);
