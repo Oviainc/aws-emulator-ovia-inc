@@ -10,7 +10,7 @@
 //! success 201) mints a fresh `LogConfigurationId` for the target, stores the submitted
 //! level against it and answers with that id, and `GetEventLogConfiguration` (GET
 //! `/event-log-configurations/{Id}`, `@readonly`) reports back exactly the target and level
-//! that were stored. A target holds at most one configuration, so a SECOND create for the
+//! that were stored, reporting `unknown` on `ResourceId` when the target names no resource. A target holds at most one configuration, so a SECOND create for the
 //! same target is refused with the modelled `ConflictException` (HTTP 409) and leaves the
 //! stored configuration untouched, while a retry carrying the `ClientToken`
 //! (`@idempotencyToken`) of a create that already succeeded answers with that create's id
@@ -36,9 +36,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::state::{
-    EVENT_LOG_CONFIGURATION_RESOURCE_TYPE, LOG_LEVEL_VALUES,
-};
+use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::state::LOG_LEVEL_VALUES;
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -72,6 +70,15 @@ const RESOURCE_TYPES: &[&str] = &[
 /// The `@length` maximum of `SmartHomeResourceId`, in characters
 /// (`smithy_query(query="shape",shape="SmartHomeResourceId")` -> length 1..200).
 const RESOURCE_ID_MAX_LENGTH: usize = 200;
+
+/// What a read reports on `ResourceId` for a configuration whose target names no resource,
+/// written out here rather than imported so the test pins the value a client reads and not
+/// the implementation's own constant.
+const UNSCOPED_RESOURCE_ID: &str = "unknown";
+
+/// The one sentence this service states for an absent event log configuration, written out
+/// here for the same reason. It quotes nothing from the request.
+const ABSENT_REASON: &str = "Event log configuration doesn't exist";
 
 /// The `@length` bounds of `LogConfigurationId`, in characters
 /// (`smithy_query(query="shape",shape="LogConfigurationId")` -> length 1..200, pattern
@@ -242,10 +249,12 @@ fn assert_reports(
         reply.string("ResourceType"),
         reply.body
     );
+    // A target that names no resource is reported through the placeholder.
+    let expected_resource_id = resource_id.unwrap_or(UNSCOPED_RESOURCE_ID);
     assert_eq!(
         reply.string("ResourceId"),
-        resource_id,
-        "case {case:?}: expected ResourceId {resource_id:?}, got {:?} in body {:?}",
+        Some(expected_resource_id),
+        "case {case:?}: expected ResourceId {expected_resource_id:?}, got {:?} in body {:?}",
         reply.string("ResourceId"),
         reply.body
     );
@@ -467,7 +476,7 @@ async fn a_replayed_client_token_answers_with_the_first_configuration() {
 
 /// RULE: a get answers the modelled 404 for an `Id` the caller's region holds no
 /// configuration under — an identifier nothing minted, and one minted by another region's
-/// endpoint — reporting the resource type and the identifier the request carried.
+/// endpoint — stating one fixed sentence that quotes nothing from the request.
 #[tokio::test]
 async fn a_get_of_an_unknown_id_is_the_modelled_not_found() {
     let router = emulator();
@@ -499,19 +508,22 @@ async fn a_get_of_an_unknown_id_is_the_modelled_not_found() {
         let read = get(&router, &id).await;
         assert_refused(why, &read, 404, NOT_FOUND);
         assert_eq!(
-            read.string("ResourceType"),
-            Some(EVENT_LOG_CONFIGURATION_RESOURCE_TYPE),
-            "case {why:?}: expected the 404 to name the resource type \
-             {EVENT_LOG_CONFIGURATION_RESOURCE_TYPE:?}, got {:?}",
-            read.string("ResourceType")
+            read.message(),
+            ABSENT_REASON,
+            "case {why:?}: expected the reason {ABSENT_REASON:?}, got {:?}",
+            read.message()
         );
-        assert_eq!(
-            read.string("ResourceId"),
-            Some(id.as_str()),
-            "case {why:?}: expected the 404 to report the identifier the request carried, \
-             got {:?}",
-            read.string("ResourceId")
-        );
+        // The reason is the whole body: this resource's 404 fills neither optional member
+        // of the error shape.
+        for member in ["ResourceId", "ResourceType"] {
+            assert_eq!(
+                read.string(member),
+                None,
+                "case {why:?}: expected the 404 to carry no {member}, got {:?} in body {:?}",
+                read.string(member),
+                read.body
+            );
+        }
     }
 
     // The configuration is still there for the region that minted it: a refused read in

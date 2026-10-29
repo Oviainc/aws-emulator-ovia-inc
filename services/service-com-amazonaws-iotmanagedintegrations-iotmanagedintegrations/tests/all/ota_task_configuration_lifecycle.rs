@@ -28,7 +28,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::state::OTA_TASK_CONFIGURATION_RESOURCE_TYPE;
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::{
     ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState as ServiceState, EmulatedService,
 };
@@ -370,8 +369,8 @@ async fn a_read_projects_what_the_create_stored() {
 }
 
 /// RULE: an `Identifier` the store does not hold is answered with the modelled
-/// `ResourceNotFoundException` — HTTP 404, the identifier on `ResourceId` and the
-/// resource's type on `ResourceType` — and the read persists nothing.
+/// `ResourceNotFoundException` — HTTP 404, whose reason quotes the identifier the request
+/// carried — and the read persists nothing.
 #[tokio::test]
 async fn a_read_of_an_unknown_identifier_is_the_modelled_not_found() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -405,18 +404,24 @@ async fn a_read_of_an_unknown_identifier_is_the_modelled_not_found() {
             "case {case:?}: expected the modelled ResourceNotFoundException code, got {:?}",
             reply.error_type
         );
+        let expected = format!("OTA task configuration not found for id: {identifier}");
         assert_eq!(
-            reply.string("ResourceId"),
-            Some(identifier.as_str()),
-            "case {case:?}: ResourceId must report the identifier the request carried, got {:?}",
-            reply.member("ResourceId")
+            reply.string("Message"),
+            Some(expected.as_str()),
+            "case {case:?}: the reason must quote the identifier the request carried, got {:?}",
+            reply.member("Message")
         );
-        assert_eq!(
-            reply.string("ResourceType"),
-            Some(OTA_TASK_CONFIGURATION_RESOURCE_TYPE),
-            "case {case:?}: ResourceType must report the resource's type, got {:?}",
-            reply.member("ResourceType")
-        );
+        // The reason is the whole body: this resource's 404 fills neither optional member
+        // of the error shape.
+        for member in ["ResourceId", "ResourceType"] {
+            assert_eq!(
+                reply.member(member),
+                None,
+                "case {case:?}: expected the 404 to carry no {member}, got {:?} in body {:?}",
+                reply.member(member),
+                reply.body
+            );
+        }
     }
 
     assert_eq!(

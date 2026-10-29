@@ -17,6 +17,8 @@ mod account_association_lifecycle;
 mod bare_not_found_bodies;
 #[path = "all/cloud_connector_lifecycle.rs"]
 mod cloud_connector_lifecycle;
+#[path = "all/configuration_write_operations_apply_to_state.rs"]
+mod configuration_write_operations_apply_to_state;
 #[path = "all/connector_destination_lifecycle.rs"]
 mod connector_destination_lifecycle;
 #[path = "all/credential_locker_lifecycle.rs"]

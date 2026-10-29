@@ -5,8 +5,9 @@
 //! Reports the event log configuration `crate::state`'s `event_log_configurations` store
 //! holds under the `Id` the request names, projected onto this operation's output shape. A
 //! pure read (`@readonly`): the store is only read, so what a later caller sees is
-//! unchanged. An `Id` this region's endpoint holds no configuration under is the modelled
-//! `ResourceNotFoundException`.
+//! unchanged. A configuration whose target names no resource reports
+//! `crate::state::UNSCOPED_RESOURCE_ID` on `ResourceId`. An `Id` this region's endpoint
+//! holds no configuration under is the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -165,17 +166,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let configuration = store
             .event_log_configuration_in(&region, &input.id)
             .ok_or_else(|| {
-                // A read reports WHICH KIND of resource was not found; the identifier the
-                // request carried is reported on `ResourceId`.
+                // One fixed sentence states an absent configuration, whatever operation
+                // resolved it and whatever made it absent.
                 GetEventLogConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::event_log_configuration_not_found_on_read(&input.id),
+                    crate::state::event_log_configuration_not_found(),
                 )
             })?;
 
         Ok(GetEventLogConfigurationOutput {
             id: Some(configuration.id.clone()),
             resource_type: Some(configuration.resource_type.clone()),
-            resource_id: configuration.resource_id.clone(),
+            // A target that names no resource is reported through the placeholder, not by
+            // leaving the member out.
+            resource_id: Some(configuration.reported_resource_id().to_string()),
             event_log_level: Some(configuration.event_log_level.clone()),
         })
     }

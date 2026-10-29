@@ -429,6 +429,12 @@ impl EventLogConfiguration {
     pub fn target(&self) -> (&str, Option<&str>) {
         (self.resource_type.as_str(), self.resource_id.as_deref())
     }
+
+    /// The `ResourceId` a read of this configuration reports: the resource its target
+    /// names, or [`UNSCOPED_RESOURCE_ID`] when the target names none.
+    pub fn reported_resource_id(&self) -> &str {
+        self.resource_id.as_deref().unwrap_or(UNSCOPED_RESOURCE_ID)
+    }
 }
 
 /// The `ResourceType` this service reports an event log configuration under — the Smithy
@@ -436,10 +442,23 @@ impl EventLogConfiguration {
 /// carries, as [`MANAGED_THING_RESOURCE_TYPE`] does for a managed thing.
 pub const EVENT_LOG_CONFIGURATION_RESOURCE_TYPE: &str = "EventLogConfiguration";
 
-/// The event-log-configuration resource as a READ's reason names it — the resource's name
-/// in words ([`resource_not_found_message`]), as [`MANAGED_THING_RESOURCE_NAME`] is for a
-/// managed thing.
-pub const EVENT_LOG_CONFIGURATION_RESOURCE_NAME: &str = "Event Log Configuration";
+/// The one sentence this service states for an event log configuration it holds none of
+/// under the `Id` a request named, whatever operation resolved it.
+///
+/// It is FIXED text: it quotes no identifier and no other request value, so every absent
+/// configuration — never created, deleted, or created in another region — is stated the
+/// same way, the way the recorded 404 of a get after a delete words it.
+pub const EVENT_LOG_CONFIGURATION_ABSENT_REASON: &str = "Event log configuration doesn't exist";
+
+/// What `ResourceId` reports for a configuration whose target names no resource of its
+/// [`EventLogConfiguration::resource_type`] — the account wildcard, or a resource type as a
+/// whole.
+///
+/// The member is reported for every configuration, so a target that names no resource is
+/// reported through this placeholder rather than by leaving the member out: a read of a
+/// wildcard-scoped configuration is recorded carrying it. It satisfies
+/// `SmartHomeResourceId` (`^[a-zA-Z0-9+*]*$`, len 1..200), as any reported value must.
+pub const UNSCOPED_RESOURCE_ID: &str = "unknown";
 
 /// The most event log configurations one store holds. A create past it is refused rather
 /// than grown into, so a caller cannot make this emulator's memory grow without end. A
@@ -1322,6 +1341,19 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
             .filter(|configuration| configuration.region == region)
     }
 
+    /// [`Self::event_log_configuration_in`] for a caller that CHANGES the record — the
+    /// update path — so a mutation resolves a configuration on exactly the terms a read
+    /// does: another region's endpoint holds none under this id.
+    pub fn event_log_configuration_in_mut(
+        &mut self,
+        region: &str,
+        id: &str,
+    ) -> Option<&mut EventLogConfiguration> {
+        self.event_log_configurations
+            .get_mut(id)
+            .filter(|configuration| configuration.region == region)
+    }
+
     /// The configuration `region` already holds for the log target `resource_type` and
     /// `resource_id` name, if any.
     ///
@@ -2001,9 +2033,10 @@ pub const MANAGED_THING_RESOURCE_NAME: &str = "Managed Thing";
 /// the resource kind an [`IdempotencyKey`] of a `CreateOtaTaskConfiguration` carries.
 pub const OTA_TASK_CONFIGURATION_RESOURCE_TYPE: &str = "OtaTaskConfiguration";
 
-/// The OTA-task-configuration resource as a READ's reason names it: the resource's name
-/// in words, the way [`MANAGED_THING_RESOURCE_NAME`] is for a managed thing.
-pub const OTA_TASK_CONFIGURATION_RESOURCE_NAME: &str = "Ota Task Configuration";
+/// The OTA-task-configuration resource as the subject of its own 404 sentence
+/// ([`not_found_for_id_message`]), the way [`MANAGED_THING_RESOURCE_NAME`] is the subject of
+/// a managed thing's.
+pub const OTA_TASK_CONFIGURATION_RESOURCE_SUBJECT: &str = "OTA task configuration";
 
 /// How a MUTATION of this service states that the resource its `Identifier` named does
 /// not exist: the resource's type, the identifier the request carried, and that it was
@@ -2056,16 +2089,20 @@ pub fn managed_thing_not_found_on_mutation(identifier: &str) -> ResourceNotFound
     }
 }
 
-/// The modelled `ResourceNotFoundException` a READ answers for an event log configuration
-/// the store does not hold under the `Id` the request named: the read path's reason
-/// ([`resource_not_found_message`]) plus the `ResourceId` and `ResourceType` members, worded
-/// through the same two helpers every other resource of this service uses.
-pub fn event_log_configuration_not_found_on_read(id: &str) -> ResourceNotFoundException {
+/// The modelled `ResourceNotFoundException` every operation that resolves an event log
+/// configuration by the `Id` its request carries answers when this region holds none:
+/// [`EVENT_LOG_CONFIGURATION_ABSENT_REASON`] and nothing else.
+///
+/// The `ResourceId` and `ResourceType` members the shape declares stay ABSENT: the
+/// recorded 404 of a get whose configuration a delete had just removed carries the reason
+/// alone, so this resource's backend fills neither — unlike a managed thing's 404, which
+/// reports both ([`managed_thing_not_found_on_read`]). The reason names no identifier
+/// either, so this takes none — the same shape as [`custom_endpoint_not_found_on_read`].
+pub fn event_log_configuration_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(resource_not_found_message(
-            EVENT_LOG_CONFIGURATION_RESOURCE_NAME,
-        )),
-        ..resource_not_found(EVENT_LOG_CONFIGURATION_RESOURCE_TYPE, id)
+        message: Some(EVENT_LOG_CONFIGURATION_ABSENT_REASON.to_string()),
+        resource_id: None,
+        resource_type: None,
     }
 }
 
@@ -2207,17 +2244,31 @@ pub fn unknown_reference_message(member: &str) -> String {
     format!("The provided {member} does not exist.")
 }
 
-/// The modelled `ResourceNotFoundException` a READ answers for an OTA task configuration
-/// the store does not hold under the identifier a request named: the read path's reason
-/// ([`resource_not_found_message`]) plus the `ResourceId` and `ResourceType` members the
-/// shape declares, reported exactly as a managed thing's read 404 reports them.
-pub fn ota_task_configuration_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
+/// How a resource whose 404 QUOTES the identifier states it: the resource as the
+/// sentence's subject, that it was not found, and the identifier the request carried.
+///
+/// The text is BUILT FROM THE REQUEST, so it is part of the contract and not just an
+/// example: the recorded 404 of a `GetOtaTaskConfiguration` whose configuration a delete had
+/// just removed reads `OTA task configuration not found for id: <the Identifier sent>`.
+pub fn not_found_for_id_message(resource_subject: &str, identifier: &str) -> String {
+    format!("{resource_subject} not found for id: {identifier}")
+}
+
+/// The modelled `ResourceNotFoundException` every operation that resolves an OTA task
+/// configuration by the `Identifier` its request carries answers when this region holds
+/// none: the identifier-quoting reason above, and nothing else.
+///
+/// The `ResourceId` and `ResourceType` members stay ABSENT, as they do for an event log
+/// configuration ([`event_log_configuration_not_found`]): the identifier is already in the
+/// reason, and the recorded body carries no other member.
+pub fn ota_task_configuration_not_found(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(resource_not_found_message(
-            OTA_TASK_CONFIGURATION_RESOURCE_NAME,
+        message: Some(not_found_for_id_message(
+            OTA_TASK_CONFIGURATION_RESOURCE_SUBJECT,
+            identifier,
         )),
-        resource_id: Some(identifier.to_string()),
-        resource_type: Some(OTA_TASK_CONFIGURATION_RESOURCE_TYPE.to_string()),
+        resource_id: None,
+        resource_type: None,
     }
 }
 
