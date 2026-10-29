@@ -41,16 +41,21 @@ for the password in force (`state::PasswordVerifier`, set by `CreateLoginProfile
 `UpdateLoginProfile` and this operation alike), replaces it, clears the password-reset
 demand and leaves `CreateDate` where the create put it. A request that does not present
 the password in force is refused HTTP 403 `AccessDenied` — the recorded status and error
-code — worded with the clause AWS uses for a refused `iam:ChangePassword`, built from
-the caller's ARN and the user name the account holds. Covered by
-`tests/all/change_password.rs`.
+code — carrying the ONE fixed sentence AWS words this refusal with, which covers both a
+stale `OldPassword` and a `NewPassword` an account password policy would not admit and
+interpolates nothing of the request or of the account. A caller whose credential belongs
+to no IAM user is refused `InvalidUserTypeException`, and one holding no console password
+at all `NoSuchEntityException`. Covered by `tests/all/change_password.rs`, whose rows span
+the password class and both published `passwordType` bounds, the name alphabet, the reset
+demand, and which write left the password in force — the create, the administrative
+update, an earlier change, or none because `DeleteLoginProfile` removed it.
 
-Residual: `iam.change-password-updates-login-profile` passes; the exact-match assertion
-`iam.change-password-requires-valid-old-password` makes on that refusal's message text
-is still unsatisfied. The recorded string it compares against is not disclosed by the
-replay tool (`expected` is withheld for a check step and the assertion's source is
-truncated), and nine candidate wordings were probed against it without a match, so the
-refusal is worded by the service's single `AccessDenied` formatter
-(`state::authorization::not_authorized`) rather than from the recording: the principal
-and the resource come from the user the account holds, and the reason clause states what
-the request did not present.
+Residual: none. Both recorded units — `iam.change-password-updates-login-profile` and
+`iam.change-password-requires-valid-old-password`, whose check compares the refusal's
+message text — replay as passed against the wording above, so the operation is served
+from persisted state on both the accepting and the refusing path. The refusal is worded
+by this operation's own fixed sentence rather than by the service's identity-denial
+formatter (`state::authorization::not_authorized`), because the refusal is about the
+credential material the request carried and not about what its caller is permitted to do,
+and it interpolates nothing, so it discloses neither which of the two conditions failed
+nor anything the account holds.

@@ -23,8 +23,9 @@
 //! Each test is a TABLE whose rows differ along what the rule generalises over: the
 //! password's length (including both published `passwordType` bounds) and alphabet, the
 //! owning user's name alphabet and case, the reset demand the profile carried, which
-//! write set the password in force (the create, the administrative update, or an earlier
-//! change), and the way a presented password differs from the one in force.
+//! write set the password in force (the create, the administrative update, an earlier
+//! change, or none because a delete removed it), and the way a presented password
+//! differs from the one in force.
 //!
 //! The awsQuery harness (router, call, element) is the one `tests/all/user_lifecycle.rs`
 //! owns, so every suite in this crate builds and reads a request the same way.
@@ -608,6 +609,235 @@ async fn the_password_in_force_is_the_one_the_last_write_set() {
         "expected the password the change set to be in force, got {status}: {body}"
     );
     assert_no_password("writes", &body, &[created, updated, changed]);
+}
+
+/// One console password a write REMOVED: the user that held it, the write that set the
+/// password the removal took away, and the password set for the user afresh afterwards.
+struct Removal {
+    case: &'static str,
+    /// The name the user is created with, spanning the `^[\w+=,.@-]+$` alphabet and
+    /// both cases.
+    user: &'static str,
+    /// The password `CreateLoginProfile` sets first.
+    created: String,
+    /// The password `UpdateLoginProfile` replaces it with before the removal, when the
+    /// row exercises that write — so the removed password is the one the LAST write set
+    /// rather than always the create's.
+    updated: Option<String>,
+    /// The password a fresh `CreateLoginProfile` sets after the removal.
+    recreated: String,
+}
+
+impl Removal {
+    /// The password in force when the removal happens: whatever the last write left.
+    fn in_force(&self) -> &str {
+        self.updated.as_deref().unwrap_or(&self.created)
+    }
+
+    /// The row's passwords as needles a search over a response body can actually
+    /// decide. A one-character password is a substring of too much ordinary body text —
+    /// a timestamp, a name, the XML punctuation itself — for its absence to mean
+    /// anything, so a row that carries one at a published length bound is searched on
+    /// its distinctive passwords instead; every row has at least one, which the caller
+    /// asserts.
+    fn leak_needles(&self) -> Vec<&str> {
+        let mut needles = vec![self.created.as_str(), self.recreated.as_str()];
+        if let Some(updated) = &self.updated {
+            needles.push(updated.as_str());
+        }
+        needles.retain(|password| password.chars().count() > 1);
+        needles
+    }
+}
+
+/// RULE: the password in force is whatever the last write LEFT, the removal of a console
+/// password included — so once the password is gone the caller has none to change, which
+/// is the not-found refusal the login-profile reads answer with and NOT the refusal a
+/// wrong password earns, and a password set for the user afresh is the one a change must
+/// present from then on, the removed one having no standing at all.
+#[tokio::test]
+async fn a_password_a_write_removed_is_no_longer_in_force() {
+    let router = router();
+
+    // Rows differing along the write that set the removed password, the name alphabet
+    // and case, and the password class (the published bounds and the admitted alphabet).
+    let rows = vec![
+        Removal {
+            case: "the create's password removed",
+            user: "Removed",
+            created: "S3cret-removed".to_string(),
+            updated: None,
+            recreated: "N3w-removed-password".to_string(),
+        },
+        Removal {
+            case: "the administrative update's password removed",
+            user: "eng_removed",
+            created: "S3cret-created".to_string(),
+            updated: Some("S3cret-updated-\u{00FF}".to_string()),
+            recreated: "N3w-\u{00E9}ng-password".to_string(),
+        },
+        Removal {
+            case: "the published minimum and maximum lengths",
+            user: "tiny.max@3",
+            // The published minimum length, 1.
+            created: "~".to_string(),
+            // The published maximum length, 128.
+            updated: Some("Z".repeat(128)),
+            recreated: "N3w-tiny-max-password".to_string(),
+        },
+        Removal {
+            case: "the whitespace the password alphabet admits",
+            user: "white+1",
+            created: "S3cret\u{0009}white\u{000A}x\u{000D}!".to_string(),
+            updated: None,
+            recreated: "N3w\u{0009}white".to_string(),
+        },
+    ];
+
+    for row in &rows {
+        let needles = row.leak_needles();
+        assert!(
+            !needles.is_empty(),
+            "case {:?}: the row must carry a password distinctive enough to search a \
+             response body for",
+            row.case
+        );
+        let akid = user_with_password(
+            &router,
+            row.case,
+            row.user,
+            &row.created,
+            // The demand the re-create clears below has to come from the RE-create, so
+            // the first profile carries none.
+            false,
+        )
+        .await;
+        if let Some(updated) = &row.updated {
+            let (status, body) = call(
+                &router,
+                "UpdateLoginProfile",
+                &[("UserName", row.user), ("Password", updated.as_str())],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {:?}: the fixture UpdateLoginProfile must succeed, got {status}: {body}",
+                row.case
+            );
+        }
+
+        let (status, body) = call(&router, "DeleteLoginProfile", &[("UserName", row.user)]).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the fixture DeleteLoginProfile must succeed, got {status}: {body}",
+            row.case
+        );
+
+        // The password that WAS in force earns the not-found refusal now, not the
+        // wrong-password one: whether a console password exists at all is decided before
+        // anything the request presented is looked at, so no caller learns from this
+        // refusal that the value it presented was once the right one.
+        let (status, refused) = change(&router, Some(&akid), row.in_force(), "N3w-password").await;
+        assert_eq!(
+            status, 404,
+            "case {:?}: expected 404 once the password was removed, got {status}: {refused}",
+            row.case
+        );
+        assert_eq!(
+            error_code(&refused),
+            NOT_FOUND_CODE,
+            "case {:?}: expected {NOT_FOUND_CODE}, got {:?}",
+            row.case,
+            error_code(&refused)
+        );
+        assert_eq!(
+            element(&refused, "Message"),
+            format!("Login Profile for User {} cannot be found.", row.user),
+            "case {:?}: expected the login-profile not-found sentence naming the stored \
+             user name, got {:?}",
+            row.case,
+            element(&refused, "Message")
+        );
+        assert_no_password(row.case, &refused, &needles);
+
+        // A password set for the user afresh is the one in force from then on, and the
+        // removed one has no standing: presenting it is refused the fixed sentence.
+        let (status, body) = call(
+            &router,
+            "CreateLoginProfile",
+            &[
+                ("UserName", row.user),
+                ("Password", row.recreated.as_str()),
+                ("PasswordResetRequired", "true"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the fixture CreateLoginProfile must succeed, got {status}: {body}",
+            row.case
+        );
+        let (_, recreated) = profile(&router, row.user).await;
+        let recreated_date = element(&recreated, "CreateDate");
+
+        let arn = user_arn(&router, row.case, row.user).await;
+        let (status, refused) = change(&router, Some(&akid), row.in_force(), "N3w-password").await;
+        assert_eq!(
+            status, 403,
+            "case {:?}: expected the removed password to have no standing, got {status}: \
+             {refused}",
+            row.case
+        );
+        assert_eq!(
+            error_code(&refused),
+            REFUSED_CODE,
+            "case {:?}: expected {REFUSED_CODE}, got {:?}",
+            row.case,
+            error_code(&refused)
+        );
+        assert_password_refusal_message(
+            row.case,
+            &element(&refused, "Message"),
+            &[
+                arn.as_str(),
+                account_id(),
+                row.user,
+                "iam:ChangePassword",
+                "is not authorized to perform",
+            ],
+        );
+
+        let (status, changed) = change(
+            &router,
+            Some(&akid),
+            &row.recreated,
+            "N3w-password-in-force",
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected the password set afresh to be in force, got {status}: \
+             {changed}",
+            row.case
+        );
+        // The change clears the demand the RE-create asked for and leaves the create
+        // date that re-create minted, which is the one every later read reports.
+        let (status, read) = profile(&router, row.user).await;
+        assert_eq!(
+            (status, element(&read, "PasswordResetRequired")),
+            (200, "false".to_string()),
+            "case {:?}: expected the change to clear the reset demand: {read}",
+            row.case
+        );
+        assert_eq!(
+            element(&read, "CreateDate"),
+            recreated_date,
+            "case {:?}: the change moved the create date the re-create minted, got {:?}",
+            row.case,
+            element(&read, "CreateDate")
+        );
+        assert_no_password(row.case, &read, &needles);
+    }
 }
 
 /// One refused change: a caller the account holds under its own name and path, the
