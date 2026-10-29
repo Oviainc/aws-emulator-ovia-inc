@@ -41,6 +41,8 @@ mod delete_resource_permission;
 mod deregistration_window;
 #[path = "all/ec2_instance_shutdown.rs"]
 mod ec2_instance_shutdown;
+#[path = "all/filter_length_bounds.rs"]
+mod filter_length_bounds;
 #[path = "all/filter_validation.rs"]
 mod filter_validation;
 #[path = "all/get_database.rs"]

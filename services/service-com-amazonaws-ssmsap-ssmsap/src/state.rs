@@ -4102,6 +4102,13 @@ pub const MAX_FILTER_VALUES_PER_FILTER: usize = FILTER_VALUE_MAX_LENGTH + 1;
 /// `Ok(())` when every filter is within them. The boundary validator enforces the same
 /// bounds from the model, so this cannot normally fire; it is here so the cost of
 /// [`filter_matches`] over the whole store is bounded by a check in this crate.
+///
+/// A string `@length` is declared in CHARACTERS, so the two length bounds are measured
+/// with [`str::chars`] — the unit the constraint is declared in, as
+/// [`MAX_RULE_RESULT_METADATA_VALUE_LENGTH`] and [`MAX_DATABASE_ID_LENGTH`] are
+/// elsewhere in this crate. Counting bytes instead would refuse a multi-byte value the
+/// model admits and the boundary validator has already accepted, and would report that
+/// byte count as though it were a character count.
 pub fn filters_within_bounds(filters: &[Filter]) -> Result<(), ValidationException> {
     if filters.len() > MAX_FILTERS {
         return Err(validation(format!(
@@ -4110,16 +4117,16 @@ pub fn filters_within_bounds(filters: &[Filter]) -> Result<(), ValidationExcepti
         )));
     }
     for filter in filters {
-        if filter.name.len() > FILTER_NAME_MAX_LENGTH {
+        let name_length = filter.name.chars().count();
+        if name_length > FILTER_NAME_MAX_LENGTH {
             return Err(validation(format!(
-                "Filter Name is at most {FILTER_NAME_MAX_LENGTH} characters, but {} were given",
-                filter.name.len()
+                "Filter Name is at most {FILTER_NAME_MAX_LENGTH} characters, but {name_length} were given"
             )));
         }
-        if filter.value.len() > FILTER_VALUE_MAX_LENGTH {
+        let value_length = filter.value.chars().count();
+        if value_length > FILTER_VALUE_MAX_LENGTH {
             return Err(validation(format!(
-                "Filter Value is at most {FILTER_VALUE_MAX_LENGTH} characters, but {} were given",
-                filter.value.len()
+                "Filter Value is at most {FILTER_VALUE_MAX_LENGTH} characters, but {value_length} were given"
             )));
         }
     }

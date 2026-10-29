@@ -34,7 +34,10 @@ use crate::application_lifecycle::{settle, valid_registration, Emulator, Reply};
 use crate::validation_message_rendering::{message, VALIDATION_EXCEPTION};
 
 /// The application every listing here is scoped to.
-const APPLICATION: &str = "HDB-FILTER-RULE";
+///
+/// `pub(crate)` so the suite that drives the shared length bounds over the same
+/// listings (`tests/all/filter_length_bounds.rs`) filters by the id this registers.
+pub(crate) const APPLICATION: &str = "HDB-FILTER-RULE";
 
 /// A `Filter$Value` inside the modelled length bound; what a filter selects is another
 /// suite's rule, so every row here carries the same value.
@@ -50,13 +53,13 @@ const UNKNOWN_NAME: &str = "NotAMember";
 
 /// One filtered listing: where a request to it goes, what it is scoped to, and which
 /// filters it offers.
-struct FilteredListing {
-    label: &'static str,
-    path: &'static str,
+pub(crate) struct FilteredListing {
+    pub(crate) label: &'static str,
+    pub(crate) path: &'static str,
     /// The `Name`s it filters by, read off this crate's own catalogue for it rather than
     /// written out here, so a name added to either catalogue is exercised instead of
     /// going untested.
-    names: &'static [&'static str],
+    pub(crate) names: &'static [&'static str],
     /// The operators it offers.
     operators: FilterOperators<'static>,
     /// The members that say WHAT is being listed, carried by every request to it.
@@ -65,7 +68,7 @@ struct FilteredListing {
 
 impl FilteredListing {
     /// A request to this listing carrying `filters`.
-    fn body(&self, filters: Vec<Value>) -> Value {
+    pub(crate) fn body(&self, filters: Vec<Value>) -> Value {
         let mut body = self.scope.clone();
         body.as_object_mut()
             .expect("the scope is a JSON object")
@@ -105,7 +108,7 @@ impl FilteredListing {
     }
 
     /// How this listing words a refusal of a name it does not filter by.
-    fn name_refusal(&self, name: &str) -> String {
+    pub(crate) fn name_refusal(&self, name: &str) -> String {
         format!(
             "Filter Name must be one of {}, but was {name}",
             self.names.join(", ")
@@ -145,7 +148,7 @@ fn filter(name: &str, operator: &str) -> Value {
 
 /// Every filtered listing of this service, scoped to records this account and Region
 /// holds: an application registered here, and the operation its registration filed.
-async fn listings(emulator: &Emulator) -> Vec<FilteredListing> {
+pub(crate) async fn listings(emulator: &Emulator) -> Vec<FilteredListing> {
     let reply = emulator
         .send(
             "/register-application",
