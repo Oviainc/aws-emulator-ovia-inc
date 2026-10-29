@@ -275,7 +275,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `resolve_landing_zone_arn` only answers with a key this map holds, so the lookup
         // cannot miss; the modelled server error stands in for a panic.
-        let Some(landing_zone) = store.landing_zones.get_mut(&arn) else {
+        let Some(landing_zone) = store.landing_zones.get(&arn) else {
             return Err(UpdateLandingZoneErrorModeled::InternalServerException(
                 InternalServerException {
                     message: format!("landing zone {arn} resolved to no stored record"),
@@ -289,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reporting the deployed configuration until the clock makes the operation due,
         // when `settle` deploys this. A member the request omits is not a change, so it
         // carries the deployed value forward.
-        landing_zone.pending_configuration = Some(crate::state::PendingLandingZoneConfiguration {
+        let configuration = crate::state::LandingZoneConfiguration {
             version: input.version,
             // The deployed configuration will be exactly the manifest this call supplied,
             // so it will be in sync with it; an update that supplies no manifest changes
@@ -305,14 +305,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             remediation_types: input
                 .remediation_types
                 .or_else(|| landing_zone.remediation_types.clone()),
-            due_at: now + crate::state::OPERATION_SETTLE_AFTER,
-        });
-        // The landing zone is PROCESSING until the operation recorded below is due; the
-        // status is derived from the log by `settle`, and seeded to match here.
-        landing_zone.status = crate::state::LandingZoneStatus::Processing;
+        };
 
-        let operation_identifier =
-            store.record_operation(crate::state::LandingZoneOperationType::Update, &arn, now);
+        // Recording the operation is what parks the deployment, so the parked deployment
+        // carries that operation's identifier and `settle` deploys it only if the operation
+        // did not fail.
+        let operation_identifier = store.record_landing_zone_configuration(
+            crate::state::LandingZoneOperationType::Update,
+            &arn,
+            configuration,
+            now,
+        );
 
         Ok(UpdateLandingZoneOutput {
             operation_identifier,

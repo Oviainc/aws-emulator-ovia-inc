@@ -607,20 +607,41 @@ impl LandingZoneDriftStatus {
 /// (model docs) and `LandingZoneDetail$version` is "the landing zone's CURRENT DEPLOYED
 /// version", so the configuration a caller asked for is NOT what a reporting call reports
 /// while that operation is in flight: it is held here and deployed by [`settle`] at
-/// `due_at`, the same instant the operation record reaches its terminal status.
+/// `due_at`, the same instant the operation record reaches its terminal status — unless
+/// that status is FAILED, since an operation that failed deployed nothing.
 ///
 /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
 #[derive(Debug, Clone)]
 pub struct PendingLandingZoneConfiguration {
+    /// The `UPDATE`/`RESET` operation whose completion deploys this configuration.
+    pub operation_identifier: String,
     pub version: String,
     pub manifest: ::aws_smithy_types::Document,
     pub remediation_types: Option<Vec<String>>,
     /// The drift status the deployed landing zone will carry once this configuration is
     /// deployed.
     pub drift_status: Option<LandingZoneDriftStatus>,
-    /// The instant the clock owes this deployment. Stored, never slept on: a reader
-    /// materialises the transition once it is due.
+    /// The instant the clock owes this deployment — the same instant that operation
+    /// becomes due, held here so applying it never depends on the operation's record still
+    /// being in the (bounded) log. Stored, never slept on: a reader materialises the
+    /// transition once it is due.
     pub due_at: SystemTime,
+}
+
+/// The configuration a call asks a landing zone to deploy, as its handler worked it out:
+/// everything a [`PendingLandingZoneConfiguration`] holds except the identifier of the
+/// operation that deploys it and the instant the clock owes it, both of which belong to
+/// the call that parks it ([`record_landing_zone_configuration`]).
+///
+/// [`record_landing_zone_configuration`]: ComAmazonawsControltowerAwscontroltowerapisState::record_landing_zone_configuration
+#[derive(Debug, Clone)]
+pub struct LandingZoneConfiguration {
+    pub version: String,
+    pub manifest: ::aws_smithy_types::Document,
+    pub remediation_types: Option<Vec<String>>,
+    /// The drift status the deployed landing zone will carry once this configuration is
+    /// deployed.
+    pub drift_status: Option<LandingZoneDriftStatus>,
 }
 
 /// A landing zone decommissioning a `DELETE` has started and the clock has not yet made
@@ -629,7 +650,8 @@ pub struct PendingLandingZoneConfiguration {
 /// `DeleteLandingZone` "starts an asynchronous operation" that decommissions the landing
 /// zone, so the resource does not disappear when that call returns: it stays a reportable
 /// resource, `PROCESSING`, until [`settle`] removes it at `due_at` — the same instant the
-/// `DELETE` record reaches its terminal status.
+/// `DELETE` record reaches its terminal status — unless that status is FAILED, since a
+/// teardown that failed removed nothing.
 ///
 /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
 #[derive(Debug, Clone)]
@@ -819,14 +841,16 @@ pub struct LandingZone {
     /// `LandingZoneDriftStatusSummary$status`, absent when the service has not assessed
     /// drift for this landing zone.
     pub drift_status: Option<LandingZoneDriftStatus>,
-    /// The configuration an in-flight `UPDATE` will deploy, `None` when the deployed
-    /// configuration is the only one. Deployed by [`settle`] once the clock makes it due.
+    /// The configuration an in-flight `UPDATE`/`RESET` will deploy, `None` when the
+    /// deployed configuration is the only one. Deployed by [`settle`] once the clock makes
+    /// it due, unless the operation it carries FAILED.
     ///
     /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
     pub pending_configuration: Option<PendingLandingZoneConfiguration>,
     /// The decommissioning an in-flight `DELETE` will complete, `None` while no delete is
-    /// running. [`settle`] removes the landing zone once the clock makes it due, so the
-    /// resource stops existing when the asynchronous delete completes and not when the
+    /// running. [`settle`] removes the landing zone once the clock makes it due — unless
+    /// the operation it carries FAILED, since a teardown that failed removed nothing — so
+    /// the resource stops existing when the asynchronous delete completes and not when the
     /// call that asked for it returned.
     ///
     /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
@@ -1184,7 +1208,8 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
     /// An operation whose `due_at` has passed is terminal whether or not anybody called,
     /// so settling it here is not a read-triggered mutation; a landing zone's status is
     /// then derived from whether any operation against it is still in flight, and a
-    /// configuration an `UPDATE` queued is deployed once its own `due_at` has passed.
+    /// configuration an `UPDATE` queued is deployed once its own `due_at` has passed,
+    /// unless the operation that queued it FAILED, in which case it deployed nothing.
     /// Call this first in every handler so reporting and mutating operations agree on the
     /// clock.
     pub fn settle(&mut self, now: SystemTime) {
@@ -1199,21 +1224,31 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
 
         // A DELETE the clock has made due has finished decommissioning its landing zone,
         // so the resource is gone whether or not anybody called; its operation record
-        // stays, and still resolves. The due instant is the pending deletion's OWN, not
+        // stays, and still resolves. The due instant is the parked removal's OWN, not
         // read back off the operation log: `enforce_log_bound` evicts the oldest in-flight
         // record when every record is in flight, and a missing record must not be read as
-        // "due" and remove a resource the clock does not owe yet.
-        let decommissioned: Vec<String> = self
-            .landing_zones
-            .iter()
-            .filter(|(_, landing_zone)| {
-                landing_zone
-                    .pending_deletion
-                    .as_ref()
-                    .is_some_and(|pending| now >= pending.due_at)
-            })
-            .map(|(arn, _)| arn.clone())
-            .collect();
+        // "due" and remove a resource the clock does not owe yet. A teardown whose own
+        // record FAILED decommissioned nothing, so the landing zone stays — the same
+        // reading the parked configuration below gives a failed operation.
+        let operations = &self.landing_zone_operations;
+        let mut decommissioned: Vec<String> = Vec::new();
+        for (arn, landing_zone) in self.landing_zones.iter_mut() {
+            let due = landing_zone
+                .pending_deletion
+                .take_if(|pending| now >= pending.due_at);
+            let Some(pending) = due else {
+                // Not due yet leaves the parked removal where it is, unchanged.
+                continue;
+            };
+            if operations
+                .get(&pending.operation_identifier)
+                .is_some_and(|operation| operation.status == LandingZoneOperationStatus::Failed)
+            {
+                // A failed teardown removed nothing, so the landing zone stays.
+                continue;
+            }
+            decommissioned.push(arn.clone());
+        }
         for arn in decommissioned {
             self.landing_zones.remove(&arn);
             // A tag entry never outlives the resource it tags, which is what keeps the tag
@@ -1221,22 +1256,36 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             self.tags.remove(&arn);
         }
 
-        // A configuration an UPDATE started deploying becomes the deployed one once the
-        // clock has made that deployment due — the same instant the operation record
-        // reaches its terminal status — whether or not anybody called. Until then a
-        // reporting call reports what is actually deployed.
+        // A configuration an UPDATE or a RESET started deploying becomes the deployed one
+        // once the clock has made that deployment due — the same instant the operation
+        // record reaches its terminal status — whether or not anybody called. Until then a
+        // reporting call reports what is actually deployed. The due instant is the parked
+        // deployment's OWN, for the reason the removal above states, and a deployment whose
+        // own record FAILED deployed nothing, so the landing zone keeps the configuration
+        // it had.
+        let operations = &self.landing_zone_operations;
         for landing_zone in self.landing_zones.values_mut() {
             let due = landing_zone
                 .pending_configuration
                 .take_if(|pending| now >= pending.due_at);
-            if let Some(pending) = due {
-                landing_zone.version = pending.version;
-                landing_zone.latest_available_version =
-                    latest_available_version(&landing_zone.version, CATALOG_LANDING_ZONE_VERSION);
-                landing_zone.manifest = pending.manifest;
-                landing_zone.remediation_types = pending.remediation_types;
-                landing_zone.drift_status = pending.drift_status;
+            let Some(pending) = due else {
+                // Not due yet leaves the parked deployment where it is, unchanged.
+                continue;
+            };
+            if operations
+                .get(&pending.operation_identifier)
+                .is_some_and(|operation| operation.status == LandingZoneOperationStatus::Failed)
+            {
+                // A failed deployment deployed nothing, so the landing zone keeps the
+                // version, manifest, remediation types and drift status it had.
+                continue;
             }
+            landing_zone.version = pending.version;
+            landing_zone.latest_available_version =
+                latest_available_version(&landing_zone.version, CATALOG_LANDING_ZONE_VERSION);
+            landing_zone.manifest = pending.manifest;
+            landing_zone.remediation_types = pending.remediation_types;
+            landing_zone.drift_status = pending.drift_status;
         }
 
         let operations = &self.landing_zone_operations;
@@ -1248,12 +1297,13 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             if landing_zone.status == LandingZoneStatus::Failed {
                 continue;
             }
-            // A landing zone still being decommissioned is PROCESSING whether or not its
-            // DELETE record is still in the (bounded) log: the parked removal is what the
-            // clock owes, so the reported status and that pending transition cannot
-            // diverge.
+            // A landing zone still being decommissioned, or still having a configuration
+            // deployed, is PROCESSING whether or not that call's record is still in the
+            // (bounded) log: the parked transition is what the clock owes, so the reported
+            // status and the transitions parked on the resource cannot diverge.
             let in_flight = any_operation_in_flight(operations, arn)
-                || landing_zone.pending_deletion.is_some();
+                || landing_zone.pending_deletion.is_some()
+                || landing_zone.pending_configuration.is_some();
             landing_zone.status = if in_flight {
                 LandingZoneStatus::Processing
             } else {
@@ -1469,11 +1519,24 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             .map(|(arn, _)| arn.clone())
     }
 
-    /// Whether any operation against `arn` is still `IN_PROGRESS`. Call [`settle`] first.
+    /// Whether the landing zone `arn` names is still being changed by an operation of its
+    /// own. Call [`settle`] first.
+    ///
+    /// Read off the transitions parked on the RESOURCE as well as off the operation log,
+    /// for the same reason [`deletion_in_flight_on`] reads a landing zone's parked removal:
+    /// [`enforce_log_bound`] can evict a record while the transition it started is still
+    /// owed, and a change in flight must not stop being reported because its record was
+    /// dropped. Derived from those facts rather than from the status [`settle`] wrote, which
+    /// a landing zone left FAILED keeps rather than having re-derived.
     ///
     /// [`settle`]: Self::settle
+    /// [`deletion_in_flight_on`]: Self::deletion_in_flight_on
     pub fn has_operation_in_flight(&self, arn: &str) -> bool {
         any_operation_in_flight(&self.landing_zone_operations, arn)
+            || self.landing_zones.get(arn).is_some_and(|landing_zone| {
+                landing_zone.pending_configuration.is_some()
+                    || landing_zone.pending_deletion.is_some()
+            })
     }
 
     /// The control already enabled for `control` on `target_identifier`, or
@@ -1611,6 +1674,44 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             landing_zone.status = LandingZoneStatus::Processing;
             landing_zone.pending_deletion = Some(PendingLandingZoneDeletion {
                 operation_identifier: operation_identifier.clone(),
+                due_at: now + OPERATION_SETTLE_AFTER,
+            });
+        }
+        operation_identifier
+    }
+
+    /// Start an `UPDATE`/`RESET` against the landing zone `arn` names, parking the
+    /// configuration it deploys for [`settle`] to deploy once the clock makes it due, and
+    /// return the operation's `operationIdentifier`.
+    ///
+    /// The identifier is minted FIRST and carried on the parked deployment, so [`settle`]
+    /// can tell a deployment whose operation succeeded from one whose operation failed —
+    /// the single place this crate ties a landing zone's parked configuration to the
+    /// operation that started it, as it ties every other parked transition to its own.
+    /// The landing zone keeps reporting the configuration it has deployed until that
+    /// instant: the deployment is asynchronous. Only the operation record is written when
+    /// `arn` names nothing, which a caller rules out first by resolving it.
+    ///
+    /// [`settle`]: Self::settle
+    pub fn record_landing_zone_configuration(
+        &mut self,
+        operation_type: LandingZoneOperationType,
+        arn: &str,
+        configuration: LandingZoneConfiguration,
+        now: SystemTime,
+    ) -> String {
+        let operation_identifier = self.record_operation(operation_type, arn, now);
+        if let Some(landing_zone) = self.landing_zones.get_mut(arn) {
+            // The landing zone is PROCESSING while the deployment runs. `settle` derives
+            // the status, from the parked deployment below as well as from the log, so this
+            // only covers the gap until the next settle rather than owning the status.
+            landing_zone.status = LandingZoneStatus::Processing;
+            landing_zone.pending_configuration = Some(PendingLandingZoneConfiguration {
+                operation_identifier: operation_identifier.clone(),
+                version: configuration.version,
+                manifest: configuration.manifest,
+                remediation_types: configuration.remediation_types,
+                drift_status: configuration.drift_status,
                 due_at: now + OPERATION_SETTLE_AFTER,
             });
         }

@@ -214,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `resolve_landing_zone_arn` only answers with a key this map holds, so the lookup
         // cannot miss; the modelled server error stands in for a panic.
-        let Some(landing_zone) = store.landing_zones.get_mut(&arn) else {
+        let Some(landing_zone) = store.landing_zones.get(&arn) else {
             return Err(ResetLandingZoneErrorModeled::InternalServerException(
                 InternalServerException {
                     message: format!("landing zone {arn} resolved to no stored record"),
@@ -230,19 +230,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the manifest describes is deployed again, the landing zone matches it — and the
         // deployment is asynchronous, so that is due only when the clock makes it due,
         // exactly as the configuration an update queues is.
-        landing_zone.pending_configuration = Some(crate::state::PendingLandingZoneConfiguration {
+        let configuration = crate::state::LandingZoneConfiguration {
             version: landing_zone.version.clone(),
             manifest: landing_zone.manifest.clone(),
             remediation_types: landing_zone.remediation_types.clone(),
             drift_status: Some(crate::state::LandingZoneDriftStatus::InSync),
-            due_at: now + crate::state::OPERATION_SETTLE_AFTER,
-        });
-        // The landing zone is PROCESSING until the operation recorded below is due; the
-        // status is derived from the log by `settle`, and seeded to match here.
-        landing_zone.status = crate::state::LandingZoneStatus::Processing;
+        };
 
-        let operation_identifier =
-            store.record_operation(crate::state::LandingZoneOperationType::Reset, &arn, now);
+        // Recording the operation is what parks the deployment, so the parked deployment
+        // carries that operation's identifier and `settle` deploys it only if the operation
+        // did not fail.
+        let operation_identifier = store.record_landing_zone_configuration(
+            crate::state::LandingZoneOperationType::Reset,
+            &arn,
+            configuration,
+            now,
+        );
 
         Ok(ResetLandingZoneOutput {
             operation_identifier,

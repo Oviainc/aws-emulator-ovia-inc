@@ -77,6 +77,8 @@ mod landing_zone_identifier;
 mod landing_zone_lifecycle;
 #[path = "all/landing_zone_operations.rs"]
 mod landing_zone_operations;
+#[path = "all/landing_zone_pending_transitions.rs"]
+mod landing_zone_pending_transitions;
 #[path = "all/landing_zone_reset.rs"]
 mod landing_zone_reset;
 #[path = "all/landing_zone_update.rs"]
