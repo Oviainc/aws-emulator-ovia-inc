@@ -19,8 +19,9 @@
 //!
 //! The rows span the class the rule generalises over: no resources, one, several, a
 //! count at the quota's limit and a count ABOVE it, two different quotas (a resource
-//! count and a vCPU count), two purchase models of one vCPU group, and a group whose
-//! value in force is zero.
+//! count and a vCPU count), two purchase models of one vCPU group, a group whose
+//! value in force is zero, a group running more instance types than one read of the
+//! facts behind them can carry, and an account whose instances cannot be read at all.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -72,6 +73,17 @@ struct Emulator {
 
 impl Emulator {
     fn new() -> Self {
+        Self::build(true)
+    }
+
+    /// Service Quotas with NOTHING mounted that owns the resources its quotas are
+    /// counted in: no usage source for the account's instances can be reached, so no
+    /// count of them can be made.
+    fn without_ec2() -> Self {
+        Self::build(false)
+    }
+
+    fn build(with_ec2: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These callers sign nothing, so they must not be refused for it.
@@ -81,9 +93,11 @@ impl Emulator {
                 Arc::clone(&engine),
             ),
         );
-        router.register_service(
-            service_com_amazonaws_ec2_amazonec2::EmulatedService::new(Arc::clone(&engine)),
-        );
+        if with_ec2 {
+            router.register_service(
+                service_com_amazonaws_ec2_amazonec2::EmulatedService::new(Arc::clone(&engine)),
+            );
+        }
         let callback = EmbeddedEmulator::from_router(router.clone());
         Self { router, callback }
     }
@@ -255,6 +269,13 @@ async fn create_vpcs(emulator: &Emulator, region: &str, count: usize, cidr_prefi
 /// Launch `count` instances of `instance_type` in `region` and wait for every instance
 /// of the account to be running, which is the state the vCPU quotas count.
 async fn launch_running(emulator: &Emulator, region: &str, instance_type: &str, count: i32) {
+    launch(emulator, region, instance_type, count).await;
+    wait_until_all_running(emulator, region).await;
+}
+
+/// Launch `count` instances of `instance_type` in `region`, without waiting for them —
+/// so a set of launches can be started before anything waits on the clock.
+async fn launch(emulator: &Emulator, region: &str, instance_type: &str, count: i32) {
     let ec2 = emulator.ec2(region);
     ec2.run_instances()
         .image_id(AMI)
@@ -266,7 +287,12 @@ async fn launch_running(emulator: &Emulator, region: &str, instance_type: &str, 
         .unwrap_or_else(|error| {
             panic!("setup: EC2 must launch {count} x {instance_type}: {error:?}")
         });
+}
 
+/// Wait for every instance of the account to be running, which is the state the vCPU
+/// quotas count.
+async fn wait_until_all_running(emulator: &Emulator, region: &str) {
+    let ec2 = emulator.ec2(region);
     let deadline = Instant::now() + LAUNCH_BUDGET;
     loop {
         let described = ec2
@@ -556,4 +582,184 @@ async fn a_quota_with_no_usage_source_reports_no_utilization() {
         expected,
         "case {case}: expected the {held} VPCs the account holds as {expected}, got {vpcs}"
     );
+}
+
+/// The instance families the Standard vCPU group meters, as its own published quota
+/// name spells them out: "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z)
+/// instances" (and the same letters in `All Standard (A, C, D, H, I, M, R, T, Z) Spot
+/// Instance Requests`). Which TYPES those families hold, and how many vCPUs each has,
+/// is read from EC2 rather than written down here.
+const STANDARD_FAMILY_LETTERS: &[&str] = &["a", "c", "d", "h", "i", "m", "r", "t", "z"];
+
+/// The most instance types one `DescribeInstanceTypes` request may name: the modelled
+/// `@length 0..100` on `DescribeInstanceTypesRequest$InstanceTypes`
+/// (`smithy_query(query="shape",shape="RequestInstanceTypeList")`). An account running
+/// more types than this cannot have its vCPUs read in one call.
+const MAX_INSTANCE_TYPES_PER_CALL: usize = 100;
+
+/// The first `count` instance types of the Standard vCPU group, in name order, each with
+/// the vCPUs EC2 publishes for it (`VCpuInfo$DefaultVCpus`) — walked over EC2's own
+/// pages, so the list is the catalog's and not one asserted here.
+async fn standard_types(emulator: &Emulator, region: &str, count: usize) -> Vec<(String, f64)> {
+    let ec2 = emulator.ec2(region);
+    let mut types: Vec<(String, f64)> = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..64 {
+        let page = ec2
+            .describe_instance_types()
+            .max_results(100)
+            .set_next_token(token.clone())
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("setup: EC2 must describe its instance types: {error:?}")
+            });
+        for info in page.instance_types() {
+            let Some(name) = info.instance_type().map(|name| name.as_str().to_string()) else {
+                continue;
+            };
+            let Some(vcpus) = info.v_cpu_info().and_then(|cpus| cpus.default_v_cpus()) else {
+                continue;
+            };
+            // An instance type is `<family><generation and attributes>.<size>`, so the
+            // family's own letters are the leading alphabetic run of the part before
+            // the size.
+            let family: String = name
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take_while(char::is_ascii_alphabetic)
+                .collect();
+            if STANDARD_FAMILY_LETTERS.contains(&family.as_str()) {
+                types.push((name, f64::from(vcpus)));
+            }
+        }
+        token = page.next_token().map(str::to_string);
+        if token.is_none() || types.len() >= count {
+            break;
+        }
+    }
+    types.truncate(count);
+    assert_eq!(
+        types.len(),
+        count,
+        "setup: EC2 must publish at least {count} Standard instance types, got {}",
+        types.len()
+    );
+    types
+}
+
+/// A vCPU quota's utilization is the sum over EVERY running instance of its group,
+/// however many calls and pages the facts behind them take to read: a
+/// `DescribeInstanceTypes` request names at most 100 types and answers one page at a
+/// time, so an account running more types than that still reports the whole sum —
+/// never a partial one, and never the 0 % that would say the group is idle.
+#[tokio::test]
+async fn a_vcpu_quota_counts_every_running_type_however_many_reads_the_facts_take() {
+    let emulator = Emulator::new();
+
+    // Rows: how many DISTINCT instance types the account runs, growing past the most
+    // one read of their vCPUs can carry — one, a few, and more than
+    // `MAX_INSTANCE_TYPES_PER_CALL`, which takes a second call (and, where the answer
+    // pages, a second page) before the group's count is complete.
+    //
+    // EC2 answers for the whole account, so the launches accumulate; each row reports
+    // in a Region of its own because a start reuses the live report of its Region.
+    let rows: &[(&str, usize)] = &[
+        ("us-west-1", 1),
+        ("ap-northeast-1", 4),
+        ("sa-east-1", MAX_INSTANCE_TYPES_PER_CALL + 4),
+    ];
+    let largest = rows
+        .iter()
+        .map(|(_, distinct)| *distinct)
+        .max()
+        .expect("the rows are not empty");
+    let types = standard_types(&emulator, "us-west-1", largest).await;
+
+    let mut launched = 0usize;
+    for (region, distinct) in rows {
+        let case = format!("{distinct} distinct Standard instance types running");
+        for (instance_type, _) in &types[launched..*distinct] {
+            launch(&emulator, region, instance_type, 1).await;
+        }
+        wait_until_all_running(&emulator, region).await;
+        launched = *distinct;
+
+        let expected_vcpus: f64 = types[..*distinct].iter().map(|(_, vcpus)| vcpus).sum();
+        let records = report_records(&emulator, region).await;
+        let record = record_for(&records, EC2_SERVICE, STANDARD_ON_DEMAND_VCPUS);
+        let applied = applied_value(record, &case);
+        let expected = expected_vcpus / applied * 100.0;
+        let reported = utilization(record, &case);
+        assert_eq!(
+            reported, expected,
+            "case {case}: expected the {expected_vcpus} running vCPUs over the applied \
+             value {applied} as {expected}, got {reported} in {record}"
+        );
+        assert!(
+            reported > 0.0,
+            "case {case}: a group with instances running must not read as idle, got \
+             {reported} in {record}"
+        );
+    }
+}
+
+/// A count that could NOT be made is published as no `Utilization` at all rather than
+/// as 0 %: zero is a measurement saying the account holds none of what the quota
+/// permits, so it is reported exactly when the group really was counted.
+#[tokio::test]
+async fn a_vcpu_quota_reports_no_utilization_when_its_count_could_not_be_made() {
+    // Rows: the same quotas, read in an account whose instances EC2 answers for and in
+    // one where no source for them can be reached at all.
+    let rows: &[(&str, bool)] = &[
+        ("EC2 answers for the account's instances", true),
+        ("no source for the account's instances", false),
+    ];
+    // Both purchase models of one group, and a group whose value in force is zero: a
+    // reading covers a group whatever its limit, and the two models are counted apart.
+    let quotas: &[&str] = &[STANDARD_ON_DEMAND_VCPUS, STANDARD_SPOT_VCPUS];
+
+    for (row, counted) in rows {
+        let emulator = if *counted {
+            Emulator::new()
+        } else {
+            Emulator::without_ec2()
+        };
+        let records = report_records(&emulator, "eu-west-2").await;
+        for quota_code in quotas {
+            let case = format!("{quota_code} with {row}");
+            let record = record_for(&records, EC2_SERVICE, quota_code);
+            // Counted or not, the quota is still published with the usage metric it
+            // meters; what changes is whether a reading was made for it.
+            assert!(
+                !record["Namespace"].is_null(),
+                "case {case}: the quota must publish its usage metric, got {record}"
+            );
+            if *counted {
+                assert_eq!(
+                    utilization(record, &case),
+                    0.0,
+                    "case {case}: a counted group with nothing running reads 0 %, got \
+                     {record}"
+                );
+            } else {
+                assert!(
+                    record["Utilization"].is_null(),
+                    "case {case}: a count that could not be made is no utilization at \
+                     all, got {record}"
+                );
+            }
+        }
+
+        let case = format!("{X_ON_DEMAND_QUOTA_NAME} with {row}");
+        let idle_group = record_named(&records, EC2_SERVICE, X_ON_DEMAND_QUOTA_NAME);
+        assert_eq!(
+            idle_group["Utilization"].is_null(),
+            !*counted,
+            "case {case}: a utilization is published exactly when the group was \
+             counted, got {idle_group}"
+        );
+    }
 }

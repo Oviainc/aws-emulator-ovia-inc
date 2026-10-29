@@ -43,6 +43,60 @@ use crate::ops::types::MetricInfo;
 /// kept handing out tokens.
 const MAX_LISTING_PAGES: usize = 64;
 
+/// The walk over the pages of ONE listing: it holds the token the next read asks with,
+/// spends the page bound, and says afterwards whether the listing was read to its LAST
+/// page.
+///
+/// Every reader here walks a listing, so the bound and "was the answer whole" live once
+/// rather than once per reader — and the two ways a walk can stop are kept apart. A
+/// walk that ran out of permitted pages with a token still outstanding read only part
+/// of the listing, which is not a count: a reading is recorded from a listing read to
+/// its end, the same way it is recorded only when the read answered at all.
+#[derive(Debug)]
+struct PageWalk {
+    /// The token the next read asks with; `None` asks for the listing's first page.
+    next_token: Option<String>,
+    /// How many further pages this walk may still read.
+    pages_left: usize,
+    /// Whether the page just read was the listing's last.
+    complete: bool,
+}
+
+impl PageWalk {
+    /// A walk at the first page of a listing, with the whole page bound to spend.
+    fn new() -> Self {
+        Self {
+            next_token: None,
+            pages_left: MAX_LISTING_PAGES,
+            complete: false,
+        }
+    }
+
+    /// Whether a further page may be read: no once the last page was read, and no once
+    /// the page bound is spent.
+    fn wants_page(&self) -> bool {
+        !self.complete && self.pages_left > 0
+    }
+
+    /// The token the next read asks with.
+    fn token(&self) -> Option<String> {
+        self.next_token.clone()
+    }
+
+    /// Record that a page was read, answering `next_token` — none meaning it was the
+    /// listing's last page.
+    fn page_read(&mut self, next_token: Option<&str>) {
+        self.pages_left = self.pages_left.saturating_sub(1);
+        self.next_token = next_token.map(str::to_string);
+        self.complete = self.next_token.is_none();
+    }
+
+    /// Whether the whole listing was read.
+    fn is_complete(&self) -> bool {
+        self.complete
+    }
+}
+
 /// The most instance types one `DescribeInstanceTypes` call is asked about: the bound
 /// the EC2 model declares on `DescribeInstanceTypesRequest$InstanceTypes` (`@length
 /// 0..100`), so a batch is never refused for its size.
@@ -178,15 +232,14 @@ async fn measure_ec2(
 }
 
 /// The account's VPC count, as EC2 reports it for this Region.
+///
+/// Nothing is recorded unless the listing was read to its last page: a tally of the
+/// pages that fitted is not the account's count.
 async fn measure_vpcs(ec2: &::aws_sdk_ec2::Client, usage: &mut QuotaUsage) {
     let mut vpcs = 0usize;
-    let mut next_token: Option<String> = None;
-    for _ in 0..MAX_LISTING_PAGES {
-        let answer = ec2
-            .describe_vpcs()
-            .set_next_token(next_token.clone())
-            .send()
-            .await;
+    let mut walk = PageWalk::new();
+    while walk.wants_page() {
+        let answer = ec2.describe_vpcs().set_next_token(walk.token()).send().await;
         let page = match answer {
             Ok(page) => page,
             Err(error) => {
@@ -198,10 +251,14 @@ async fn measure_vpcs(ec2: &::aws_sdk_ec2::Client, usage: &mut QuotaUsage) {
             }
         };
         vpcs += page.vpcs().len();
-        next_token = page.next_token().map(str::to_string);
-        if next_token.is_none() {
-            break;
-        }
+        walk.page_read(page.next_token());
+    }
+    if !walk.is_complete() {
+        ::tracing::debug!(
+            pages = MAX_LISTING_PAGES,
+            "the account's VPCs are listed over more pages than one measurement walks"
+        );
+        return;
     }
     #[allow(clippy::cast_precision_loss)]
     usage.set(&super::vpcs_per_region_usage_metric(), vpcs as f64);
@@ -222,7 +279,9 @@ struct RunningInstance {
 /// Both halves come from EC2: which instances are running and what they are, and how
 /// many vCPUs an instance type has (`DescribeInstanceTypes`, `VCpuInfo$DefaultVCpus`).
 /// Nothing is recorded unless BOTH reads answered — a count taken from half the facts
-/// would report a usage of zero for a group that has instances running.
+/// would report a usage of zero for a group that has instances running. A read that
+/// answered only in PART is half the facts too: a metric is recorded only when every
+/// instance it counts was accounted for, and left uncounted otherwise.
 async fn measure_running_vcpus(ec2: &::aws_sdk_ec2::Client, usage: &mut QuotaUsage) {
     let Some(running) = running_instances(ec2).await else {
         return;
@@ -237,22 +296,46 @@ async fn measure_running_vcpus(ec2: &::aws_sdk_ec2::Client, usage: &mut QuotaUsa
         return;
     };
 
-    // EC2 answered, so every vCPU group IS counted — a group with no instance running
-    // in it reads zero, which is a measurement and not a placeholder.
-    for class in super::vcpu_group_classes() {
-        for purchase_model in [
-            super::PURCHASE_MODEL_ON_DEMAND,
-            super::PURCHASE_MODEL_SPOT,
-        ] {
-            usage.set(&super::vcpu_usage_metric_for(class, purchase_model), 0.0);
+    for ((class, purchase_model), reading) in vcpu_readings(&running, &vcpus) {
+        // A metric a fact was missing for stays OUT of the reading: absent is the
+        // honest answer for a count that could not be made, and a zero would say the
+        // group holds nothing.
+        if let Some(total) = reading {
+            usage.set(&super::vcpu_usage_metric_for(class, purchase_model), total);
         }
     }
+}
 
-    for instance in &running {
+/// What each vCPU quota group and purchase model reads, from the instances that are
+/// running and the vCPUs EC2 publishes for their types: `Some(total)` for a metric
+/// every fact feeding it was answered for, and `None` for one an answer left short.
+///
+/// A metric is counted or it is absent, so the two cases are kept apart here rather
+/// than collapsed into a total: an instance whose type the vCPU answer did not carry
+/// means the metric it feeds cannot be totalled at all, while the groups whose
+/// instances were all accounted for are still measured — including a group with
+/// nothing running in it, which reads zero.
+fn vcpu_readings(
+    running: &[RunningInstance],
+    vcpus: &BTreeMap<String, i32>,
+) -> BTreeMap<(&'static str, &'static str), Option<f64>> {
+    // EC2 answered, so every vCPU group starts out counted — a group with no instance
+    // running in it reads zero, which is a measurement and not a placeholder.
+    let mut readings: BTreeMap<(&'static str, &'static str), Option<f64>> =
+        super::vcpu_group_classes()
+            .flat_map(|class| {
+                [
+                    super::PURCHASE_MODEL_ON_DEMAND,
+                    super::PURCHASE_MODEL_SPOT,
+                ]
+                .map(|purchase_model| ((class, purchase_model), Some(0.0)))
+            })
+            .collect();
+
+    for instance in running {
+        // A family no vCPU quota of this catalog meters is counted against no metric at
+        // all, so nothing it is missing can leave one short.
         let Some(class) = vcpu_group_class(&instance.instance_type) else {
-            continue;
-        };
-        let Some(instance_vcpus) = vcpus.get(&instance.instance_type) else {
             continue;
         };
         let purchase_model = if instance.spot {
@@ -260,21 +343,34 @@ async fn measure_running_vcpus(ec2: &::aws_sdk_ec2::Client, usage: &mut QuotaUsa
         } else {
             super::PURCHASE_MODEL_ON_DEMAND
         };
-        usage.add(
-            &super::vcpu_usage_metric_for(class, purchase_model),
-            f64::from(*instance_vcpus),
-        );
+        let reading = readings
+            .entry((class, purchase_model))
+            .or_insert(Some(0.0));
+        match vcpus.get(&instance.instance_type) {
+            Some(instance_vcpus) => {
+                if let Some(total) = reading {
+                    *total += f64::from(*instance_vcpus);
+                }
+            }
+            // The instance is running and how many vCPUs it has is not known, so its
+            // group's total is unknown too.
+            None => *reading = None,
+        }
     }
+
+    readings
 }
 
-/// The account's running instances, or `None` when EC2 could not be asked.
+/// The account's running instances, or `None` when EC2 could not be asked or the
+/// listing could not be read to its last page — part of it names part of the account's
+/// instances, which is no accounting of them.
 async fn running_instances(ec2: &::aws_sdk_ec2::Client) -> Option<Vec<RunningInstance>> {
     let mut running = Vec::new();
-    let mut next_token: Option<String> = None;
-    for _ in 0..MAX_LISTING_PAGES {
+    let mut walk = PageWalk::new();
+    while walk.wants_page() {
         let answer = ec2
             .describe_instances()
-            .set_next_token(next_token.clone())
+            .set_next_token(walk.token())
             .send()
             .await;
         let page = match answer {
@@ -306,16 +402,32 @@ async fn running_instances(ec2: &::aws_sdk_ec2::Client) -> Option<Vec<RunningIns
                 });
             }
         }
-        next_token = page.next_token().map(str::to_string);
-        if next_token.is_none() {
-            break;
-        }
+        walk.page_read(page.next_token());
+    }
+    if !walk.is_complete() {
+        ::tracing::debug!(
+            pages = MAX_LISTING_PAGES,
+            "the account's instances are listed over more pages than one measurement \
+             walks"
+        );
+        return None;
     }
     Some(running)
 }
 
 /// How many vCPUs each of `types` has, as EC2 publishes it, or `None` when EC2 could
 /// not be asked.
+///
+/// The types are asked about in batches the operation's own `@length` bound permits,
+/// and each batch's answer is walked to its last page the way every other listing here
+/// is: a `DescribeInstanceTypes` answer carries the types of ONE page plus a
+/// `NextToken` when more follow, so reading only the first response would hand back a
+/// map missing the types of every page after it. A batch whose pages run past the page
+/// bound is no answer either.
+///
+/// The map still says nothing about a type EC2 published no vCPU count for, which is
+/// why [`vcpu_readings`] totals a metric only when every instance feeding it is in
+/// here.
 async fn instance_type_vcpus(
     ec2: &::aws_sdk_ec2::Client,
     types: &[String],
@@ -326,32 +438,45 @@ async fn instance_type_vcpus(
             .iter()
             .map(|instance_type| ::aws_sdk_ec2::types::InstanceType::from(instance_type.as_str()))
             .collect();
-        let answer = ec2
-            .describe_instance_types()
-            .set_instance_types(Some(named))
-            .send()
-            .await;
-        let described = match answer {
-            Ok(described) => described,
-            Err(error) => {
-                ::tracing::debug!(
-                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                    "the vCPUs of the account's instance types could not be read from EC2"
-                );
-                return None;
+        let mut walk = PageWalk::new();
+        while walk.wants_page() {
+            let answer = ec2
+                .describe_instance_types()
+                .set_instance_types(Some(named.clone()))
+                .set_next_token(walk.token())
+                .send()
+                .await;
+            let described = match answer {
+                Ok(described) => described,
+                Err(error) => {
+                    ::tracing::debug!(
+                        error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                        "the vCPUs of the account's instance types could not be read from EC2"
+                    );
+                    return None;
+                }
+            };
+            for info in described.instance_types() {
+                let Some(instance_type) = info.instance_type() else {
+                    continue;
+                };
+                let Some(default_vcpus) = info
+                    .v_cpu_info()
+                    .and_then(::aws_sdk_ec2::types::VCpuInfo::default_v_cpus)
+                else {
+                    continue;
+                };
+                vcpus.insert(instance_type.as_str().to_string(), default_vcpus);
             }
-        };
-        for info in described.instance_types() {
-            let Some(instance_type) = info.instance_type() else {
-                continue;
-            };
-            let Some(default_vcpus) = info
-                .v_cpu_info()
-                .and_then(::aws_sdk_ec2::types::VCpuInfo::default_v_cpus)
-            else {
-                continue;
-            };
-            vcpus.insert(instance_type.as_str().to_string(), default_vcpus);
+            walk.page_read(described.next_token());
+        }
+        if !walk.is_complete() {
+            ::tracing::debug!(
+                pages = MAX_LISTING_PAGES,
+                "the vCPUs of the account's instance types are listed over more pages \
+                 than one measurement walks"
+            );
+            return None;
         }
     }
     Some(vcpus)
@@ -413,6 +538,51 @@ fn vcpu_group_class(instance_type: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// A walk stops either because the listing's last page was read or because the page
+    /// bound is spent, and only the first is a WHOLE answer: the second has a token
+    /// still outstanding, so the pages it did read are part of the listing and not a
+    /// count of it.
+    #[test]
+    fn a_walk_is_whole_only_when_the_listings_last_page_was_read() {
+        // Rows: how many pages the listing answers before it stops handing out tokens,
+        // spanning one page, a few, exactly the bound, and one page more than the bound.
+        let rows: &[(usize, usize, bool)] = &[
+            (1, 1, true),
+            (3, 3, true),
+            (MAX_LISTING_PAGES, MAX_LISTING_PAGES, true),
+            (MAX_LISTING_PAGES + 1, MAX_LISTING_PAGES, false),
+            (MAX_LISTING_PAGES * 4, MAX_LISTING_PAGES, false),
+        ];
+
+        for (listing_pages, expected_read, expected_whole) in rows {
+            let case = format!("a listing of {listing_pages} pages");
+            let mut walk = PageWalk::new();
+            let mut read = 0usize;
+            while walk.wants_page() {
+                assert_eq!(
+                    walk.token().is_none(),
+                    read == 0,
+                    "case {case}: only the first read asks without a token, at page \
+                     {read}"
+                );
+                read += 1;
+                // The listing's own last page answers no token; every earlier one does.
+                let next_token = (read < *listing_pages).then(|| format!("page-{read}"));
+                walk.page_read(next_token.as_deref());
+            }
+            assert_eq!(
+                read, *expected_read,
+                "case {case}: expected {expected_read} pages read, got {read}"
+            );
+            assert_eq!(
+                walk.is_complete(),
+                *expected_whole,
+                "case {case}: expected the walk to be whole: {expected_whole}, got {:?}",
+                walk
+            );
+        }
+    }
+
     /// The group an instance type is metered in is read off its FAMILY, so every size
     /// and generation of one family lands in the same group, and a family no vCPU quota
     /// covers lands in none.
@@ -447,6 +617,148 @@ mod tests {
             assert_eq!(
                 class, *expected,
                 "case {instance_type:?}: expected group {expected:?}, got {class:?}"
+            );
+        }
+    }
+
+    /// A vCPU metric is TOTALLED only when every instance it counts was accounted for:
+    /// a group whose instances were all read reads their vCPUs (and zero when none of
+    /// them is running), while a group holding an instance whose vCPUs the answer did
+    /// not carry reads nothing at all, because a total missing that instance would say
+    /// the group holds less than it does.
+    #[test]
+    fn a_vcpu_group_is_totalled_only_when_every_instance_it_counts_was_read() {
+        /// One running instance of `instance_type`, bought on the Spot market or not.
+        fn instance(instance_type: &str, spot: bool) -> RunningInstance {
+            RunningInstance {
+                instance_type: instance_type.to_string(),
+                spot,
+            }
+        }
+
+        // The vCPUs the answer carried: two Standard types and one of another group,
+        // with a further Standard type and an unmetered family left OUT of it.
+        let vcpus: BTreeMap<String, i32> = [
+            ("m5.large".to_string(), 2),
+            ("c6g.xlarge".to_string(), 4),
+            ("p5.48xlarge".to_string(), 192),
+        ]
+        .into_iter()
+        .collect();
+
+        /// One case: the instances running, the metric read back out of the fold, and
+        /// what that metric must then read.
+        struct Case {
+            case: &'static str,
+            running: Vec<RunningInstance>,
+            class: &'static str,
+            purchase_model: &'static str,
+            expected: Option<f64>,
+        }
+
+        // The rows differ in how many instances and types one group holds, in which
+        // purchase model they were bought under, and in whether the answer carried
+        // every type the group holds.
+        let rows = vec![
+            Case {
+                case: "nothing running",
+                running: vec![],
+                class: "Standard",
+                purchase_model: super::super::PURCHASE_MODEL_ON_DEMAND,
+                expected: Some(0.0),
+            },
+            Case {
+                case: "one instance, every fact answered",
+                running: vec![instance("m5.large", false)],
+                class: "Standard",
+                purchase_model: super::super::PURCHASE_MODEL_ON_DEMAND,
+                expected: Some(2.0),
+            },
+            Case {
+                case: "several instances of several types, every fact answered",
+                running: vec![
+                    instance("m5.large", false),
+                    instance("m5.large", false),
+                    instance("c6g.xlarge", false),
+                ],
+                class: "Standard",
+                purchase_model: super::super::PURCHASE_MODEL_ON_DEMAND,
+                expected: Some(8.0),
+            },
+            Case {
+                case: "the Spot market, counted apart from On-Demand",
+                running: vec![instance("m5.large", false), instance("c6g.xlarge", true)],
+                class: "Standard",
+                purchase_model: super::super::PURCHASE_MODEL_SPOT,
+                expected: Some(4.0),
+            },
+            Case {
+                case: "a type the answer did not carry",
+                running: vec![
+                    instance("m5.large", false),
+                    instance("r7iz.metal-32xl", false),
+                ],
+                class: "Standard",
+                purchase_model: super::super::PURCHASE_MODEL_ON_DEMAND,
+                expected: None,
+            },
+            Case {
+                case: "the OTHER purchase model of a group an On-Demand type was missing from",
+                running: vec![
+                    instance("m5.large", false),
+                    instance("r7iz.metal-32xl", false),
+                ],
+                class: "Standard",
+                purchase_model: super::super::PURCHASE_MODEL_SPOT,
+                expected: Some(0.0),
+            },
+            Case {
+                case: "a type the answer did not carry, under the other purchase model",
+                running: vec![
+                    instance("m5.large", false),
+                    instance("r7iz.metal-32xl", true),
+                ],
+                class: "Standard",
+                purchase_model: super::super::PURCHASE_MODEL_ON_DEMAND,
+                expected: Some(2.0),
+            },
+            Case {
+                case: "the purchase model a missing Spot type belongs to",
+                running: vec![
+                    instance("m5.large", false),
+                    instance("r7iz.metal-32xl", true),
+                ],
+                class: "Standard",
+                purchase_model: super::super::PURCHASE_MODEL_SPOT,
+                expected: None,
+            },
+            Case {
+                case: "a group whose own instances were all read, beside one that was not",
+                running: vec![
+                    instance("r7iz.metal-32xl", false),
+                    instance("p5.48xlarge", false),
+                ],
+                class: "P",
+                purchase_model: super::super::PURCHASE_MODEL_ON_DEMAND,
+                expected: Some(192.0),
+            },
+            Case {
+                case: "an instance of a family no vCPU quota meters",
+                running: vec![instance("mac2.metal", false)],
+                class: "Standard",
+                purchase_model: super::super::PURCHASE_MODEL_ON_DEMAND,
+                expected: Some(0.0),
+            },
+        ];
+
+        for row in rows {
+            let readings = vcpu_readings(&row.running, &vcpus);
+            let metric = (row.class, row.purchase_model);
+            let reading = readings.get(&metric).copied().flatten();
+            assert_eq!(
+                reading, row.expected,
+                "case {}: expected {metric:?} to read {:?}, got {reading:?}",
+                row.case, row.expected
             );
         }
     }
