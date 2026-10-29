@@ -245,15 +245,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `policyVersion` is `@required` on the request and names "the version of the
         // policy being updated", so it is the precondition of the write: a version that is
-        // not the stored one means another writer has moved the policy on, which is the
-        // conflict `ConflictException` reports. Nothing is written when it fails.
+        // not the stored one is a version already consumed — another writer has moved the
+        // policy on — which the caller recovers from by reading the policy again and
+        // rebuilding the request, so it is the modelled `ValidationException` (400) rather
+        // than a conflict a retry of the same request could clear. Nothing is written when
+        // it fails.
         if stored_version != input.policy_version {
-            return Err(UpdateSecurityPolicyErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "Policy with name {} and type {} is at version {}, not {}",
-                        input.name, input.r#type, stored_version, input.policy_version
-                    )),
+            return Err(UpdateSecurityPolicyErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::STALE_POLICY_VERSION_MESSAGE.to_string()),
                 },
             )
             .into());

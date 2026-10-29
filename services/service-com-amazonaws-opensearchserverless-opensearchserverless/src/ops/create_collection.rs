@@ -277,11 +277,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if requested_key.is_none() && !requested_aws_owned_key && policy_encryption.is_none() {
             return Err(CreateCollectionErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "No encryption policy or encryption configuration exists for the \
-                         collection {}: specify encryptionConfig in the request, or create an \
-                         encryption security policy whose rules cover collection/{}",
-                        input.name, input.name
+                    message: Some(crate::state::missing_encryption_policy_message(
+                        &input.name,
                     )),
                 },
             )

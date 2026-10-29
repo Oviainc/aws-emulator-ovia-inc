@@ -225,6 +225,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        // A data access policy's own CONTENT has rules the document text cannot carry: a
+        // statement grants permissions to the principals it names, so a statement whose
+        // `Principal` list is present and empty grants nothing to nobody and is not a
+        // policy the service stores. Checked here as the create checks it, by
+        // `crate::state::validate_access_policy_document`, so a document this update would
+        // store is one the create would have accepted.
+        if let Some(document) = &policy {
+            if let Err(message) = crate::state::validate_access_policy_document(document) {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    AuditOutcome::ValidationRefused,
+                    Some(&resource),
+                );
+                return Err(UpdateAccessPolicyErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
         let key = (input.r#type.clone(), input.name.clone());
         let mut store = state.lock();
 
@@ -269,8 +292,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `policyVersion` is `@required` on the request and names "the version of the
         // policy being updated", so it is the precondition of the write: a version that is
-        // not the stored one means another writer has moved the policy on, which is the
-        // conflict `ConflictException` reports. Nothing is written when it fails.
+        // not the stored one is a version already consumed — another writer has moved the
+        // policy on — which the caller recovers from by reading the policy again and
+        // rebuilding the request, so it is the modelled `ValidationException` (400) rather
+        // than a conflict a retry of the same request could clear. Nothing is written when
+        // it fails.
         if stored_version != input.policy_version {
             crate::state::audit(
                 Self::NAME,
@@ -278,12 +304,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 AuditOutcome::VersionMismatch,
                 Some(&resource),
             );
-            return Err(UpdateAccessPolicyErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "Policy with name {} and type {} is at version {}, not {}",
-                        input.name, input.r#type, stored_version, input.policy_version
-                    )),
+            return Err(UpdateAccessPolicyErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::STALE_POLICY_VERSION_MESSAGE.to_string()),
                 },
             )
             .into());

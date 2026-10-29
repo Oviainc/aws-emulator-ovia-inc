@@ -15,11 +15,12 @@
 //!
 //! The tables below span what the rule generalises over: both `CapacityLimits` members,
 //! each named alone, named together and omitted, values from the published minimum up to
-//! the largest the modelled `integer` carries, the published bound and one past it on each
+//! the account's own OCU quota ceiling, the published bound and one past it on each
 //! member, and the Region the call is signed for (the settings belong to the account, not
 //! to one Region).
 
 use serde_json::{json, Value};
+use service_com_amazonaws_opensearchserverless_opensearchserverless::state::MAX_ACCOUNT_CAPACITY_IN_OCU;
 
 use crate::collection_lifecycle::{at, call, call_in, emulator};
 
@@ -170,8 +171,8 @@ async fn update_account_settings_stores_each_named_limit_exactly() {
     // (case, capacityLimits the request names, expected stored pair afterwards). The rows
     // differ along what the rule generalises over: which members are named, and the value
     // each carries — the published minimum, an asymmetric pair, a four-digit value, and
-    // the largest value the modelled `integer` holds, whose digits must survive the round
-    // trip unrounded.
+    // the account's own OCU quota ceiling, the largest value an update may name, whose
+    // digits must survive the round trip unrounded.
     let cases: Vec<(&str, Value, (i64, i64))> = vec![
         (
             "both members at the published minimum",
@@ -197,12 +198,15 @@ async fn update_account_settings_stores_each_named_limit_exactly() {
             (100, 1_000),
         ),
         (
-            "the largest value the modelled integer carries",
+            "both members at the account's OCU quota ceiling",
             json!({
-                "maxIndexingCapacityInOCU": i64::from(i32::MAX),
-                "maxSearchCapacityInOCU": i64::from(i32::MAX) - 1,
+                "maxIndexingCapacityInOCU": i64::from(MAX_ACCOUNT_CAPACITY_IN_OCU),
+                "maxSearchCapacityInOCU": i64::from(MAX_ACCOUNT_CAPACITY_IN_OCU) - 1,
             }),
-            (i64::from(i32::MAX), i64::from(i32::MAX) - 1),
+            (
+                i64::from(MAX_ACCOUNT_CAPACITY_IN_OCU),
+                i64::from(MAX_ACCOUNT_CAPACITY_IN_OCU) - 1,
+            ),
         ),
         (
             "back to the defaults",

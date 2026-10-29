@@ -332,6 +332,16 @@ pub const DEFAULT_MAX_INDEXING_CAPACITY_IN_OCU: i32 = 10;
 /// The `maxSearchCapacityInOCU` default; see [`DEFAULT_MAX_INDEXING_CAPACITY_IN_OCU`].
 pub const DEFAULT_MAX_SEARCH_CAPACITY_IN_OCU: i32 = 10;
 
+/// The account's non-adjustable maximum capacity, in OCUs, for ONE capacity type.
+///
+/// `CapacityLimits`' members carry only a `@range(min: 2)`, so the model states no ceiling;
+/// the live service refuses a request above this figure with its own quota message ("your
+/// maximum indexing capacity service quota limit of 1700 OCUs"), which is where the value
+/// comes from. The quota is stated PER capacity type — indexing and search are counted and
+/// refused separately — and neither the model nor the refusal distinguishes the two
+/// figures, so the same ceiling bounds both.
+pub const MAX_ACCOUNT_CAPACITY_IN_OCU: i32 = 1700;
+
 /// The `CollectionGroupCapacityLimits$maxIndexingCapacityInOCU` a COLLECTION GROUP
 /// carries when its create request named no indexing ceiling of its own.
 ///
@@ -1030,6 +1040,31 @@ pub fn effective_capacity_limits(
     }
 }
 
+/// An OCU figure as the refusals that name one render it.
+///
+/// Both the collection-group capacity members and the account-wide totals computed from
+/// them are modelled `float` (`smithy_query(query="shape",
+/// shape="CollectionGroupCapacityLimits")`), and a float is rendered with a fractional
+/// part, so a whole number of OCUs reads `32.0` rather than `32`.
+pub fn rendered_ocu(value: f32) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.1}")
+    } else {
+        format!("{value}")
+    }
+}
+
+/// [`rendered_ocu`] for a figure computed ACROSS members — a request's ceiling plus the
+/// capacity already committed — carried as `f64` so a whole number of OCUs past a `f32`'s
+/// exact range is still rendered digit for digit.
+pub fn rendered_ocu_total(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.1}")
+    } else {
+        format!("{value}")
+    }
+}
+
 /// Refuse `limits` whose floor exceeds its own ceiling, naming the two members and their
 /// values.
 ///
@@ -1056,8 +1091,9 @@ pub fn validate_capacity_limits(limits: &CollectionGroupCapacityLimits) -> Resul
         if let (Some(floor), Some(ceiling)) = (floor, ceiling) {
             if floor > ceiling {
                 return Err(format!(
-                    "capacityLimits.{floor_member} ({floor}) must not exceed \
-                     capacityLimits.{ceiling_member} ({ceiling})"
+                    "Invalid capacity range: {floor_member} ({}) exceeds {ceiling_member} ({})",
+                    rendered_ocu(floor),
+                    rendered_ocu(ceiling)
                 ));
             }
         }
@@ -1116,6 +1152,59 @@ impl AccountSettingsRecord {
         }
         if let Some(value) = limits.max_search_capacity_in_ocu {
             self.max_search_capacity_in_ocu = value;
+        }
+    }
+
+    /// The limit this record holds for `kind`.
+    pub fn limit(&self, kind: CapacityKind) -> i32 {
+        match kind {
+            CapacityKind::Indexing => self.max_indexing_capacity_in_ocu,
+            CapacityKind::Search => self.max_search_capacity_in_ocu,
+        }
+    }
+}
+
+/// The capacity an account-wide limit, and the quota that bounds it, is about.
+///
+/// `CapacityLimits` carries one maximum per type and the service's quota is stated per
+/// type, so every figure a capacity refusal names — the ceiling asked for, the capacity the
+/// collection groups already account for, the quota itself — is read off this one pair
+/// rather than spelled twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityKind {
+    /// `CapacityLimits$maxIndexingCapacityInOCU`.
+    Indexing,
+    /// `CapacityLimits$maxSearchCapacityInOCU`.
+    Search,
+}
+
+impl CapacityKind {
+    /// Both capacity types, in the order a refusal checks them.
+    pub const ALL: [Self; 2] = [Self::Indexing, Self::Search];
+
+    /// How a quota refusal words this capacity.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Indexing => "indexing",
+            Self::Search => "search",
+        }
+    }
+
+    /// The `CapacityLimits` member this capacity is named by, or `None` when the request
+    /// named none.
+    pub fn requested(self, limits: &CapacityLimits) -> Option<i32> {
+        match self {
+            Self::Indexing => limits.max_indexing_capacity_in_ocu,
+            Self::Search => limits.max_search_capacity_in_ocu,
+        }
+    }
+
+    /// The `CollectionGroupCapacityLimits` ceiling a collection group commits for this
+    /// capacity.
+    pub fn group_ceiling(self, limits: &CollectionGroupCapacityLimits) -> Option<f32> {
+        match self {
+            Self::Indexing => limits.max_indexing_capacity_in_ocu,
+            Self::Search => limits.max_search_capacity_in_ocu,
         }
     }
 }
@@ -1967,6 +2056,10 @@ pub const TAGGED_RESOURCE_TYPE: &str = "collection";
 /// resource noun in lower case, hyphenated).
 pub const VPC_ENDPOINT_RESOURCE_TYPE: &str = "vpc-endpoint";
 
+/// The `resourceType` a quota refusal names for the ACCOUNT's own settings: the resource
+/// `UpdateAccountSettings` writes, spelled the way the resource types above are.
+pub const ACCOUNT_SETTINGS_RESOURCE_TYPE: &str = "account-settings";
+
 /// The `ResourceType` a security-policy rule carries for a rule about collections, and the
 /// prefix its `Resource` patterns are written with: AWS's security-policy documentation
 /// spells those patterns `collection/<name>`.
@@ -2058,6 +2151,119 @@ pub fn statuses_phrase(statuses: &[&str]) -> String {
 /// How this service words a collection that is not there, from its id.
 pub fn collection_not_found_message(id: &str) -> String {
     format!("Collection with ID {id} is not found")
+}
+
+/// How this service words a security configuration that is not there, from the `id` the
+/// request addressed it by.
+///
+/// One wording for every operation that takes a `SecurityConfigId`, so a read, a write and
+/// a delete of an id nothing is stored under cannot disagree about the refusal a client
+/// keys on.
+pub fn security_config_not_found_message(id: &str) -> String {
+    format!("Security config with id: {id} does not exist")
+}
+
+/// How this service words a collection whose `deletionProtection` is `ENABLED`, from the
+/// collection's own NAME.
+///
+/// `DeleteCollection` addresses the collection by id, but the refusal names the collection
+/// the way a caller does when creating it; the name is read from the stored record.
+pub fn deletion_protection_message(name: &str) -> String {
+    format!(
+        "Collection {name} cannot be deleted because deletion protection is enabled. Disable \
+         deletion protection before deleting the collection."
+    )
+}
+
+/// How this service words a collection group that still holds collections, from the group
+/// id the request addressed.
+pub fn collection_group_not_empty_message(id: &str) -> String {
+    format!("CollectionGroup with ID {id}, has collections associated and cannot be deleted")
+}
+
+/// How this service words a create whose collection has no encryption setting at all —
+/// neither an `encryptionConfig` in the request nor an `encryption` security policy
+/// covering the name — from the `name` the request carried.
+pub fn missing_encryption_policy_message(name: &str) -> String {
+    format!(
+        "No matching security policy of encryption type found for collection name: {name}. \
+         Please create security policy of encryption type for this collection."
+    )
+}
+
+/// How every optimistic-lock refusal in this service is worded: the version the request
+/// carried is not the stored one, so the resource has been written since the caller read
+/// it.
+///
+/// Entirely fixed text, and ONE text for all four policy/configuration update operations,
+/// since the condition a client recovers from is the same — refetch the resource, rebuild
+/// the request — whichever resource moved on.
+pub const STALE_POLICY_VERSION_MESSAGE: &str =
+    "Policy version specified in the request refers to an older version and policy has since \
+     changed";
+
+/// How a policy document whose member is present but EMPTY is refused, from the JSON path
+/// of that member.
+///
+/// What the model cannot express: `PolicyDocument` is text with a character class, so the
+/// boundary validator says nothing about the document's content. AWS's "Data access
+/// policies for Amazon OpenSearch Serverless" documents a statement's `Principal` as a
+/// required list of principals, and the live service refuses a document that breaks a
+/// list's minimum with this one sentence, naming the offending member's JSON path.
+pub fn policy_json_invalid_message(violations: &[String]) -> String {
+    format!("Policy json is invalid, error: [{}]", violations.join(", "))
+}
+
+/// The violation clause [`policy_json_invalid_message`] carries for the member at `path`
+/// being an empty array.
+pub fn empty_array_violation(path: &str) -> String {
+    format!("{path}: there must be a minimum of 1 items in the array")
+}
+
+/// The statements of a DATA ACCESS policy document whose `Principal` list is present and
+/// empty, as the JSON paths the refusal names them by (`$[<statement index>].Principal`).
+///
+/// A statement that grants nothing to nobody is not a policy the service stores: the
+/// `Principal` list is required to name at least one principal. The document is either one
+/// statement object or a list of them — the two spellings [`policy_document_entries`]
+/// reads alike — and the index a path carries is the statement's position in that list, so
+/// a single-statement document reports `$[0]`.
+pub fn empty_principal_paths(document: &::aws_smithy_types::Document) -> Vec<String> {
+    use ::aws_smithy_types::Document;
+
+    let mut paths: Vec<String> = Vec::new();
+    for (index, statement) in policy_document_entries(Some(document))
+        .into_iter()
+        .enumerate()
+    {
+        let Document::Object(members) = statement else {
+            continue;
+        };
+        if let Some(Document::Array(principals)) = members.get("Principal") {
+            if principals.is_empty() {
+                paths.push(format!("$[{index}].Principal"));
+            }
+        }
+    }
+    paths
+}
+
+/// Refuse a data access policy document that breaks a list minimum, answering the
+/// `ValidationException` message for it. `Ok(())` for a document that breaks none.
+///
+/// `CreateAccessPolicy` and `UpdateAccessPolicy` both store one, so the check lives here
+/// and the two cannot disagree about which documents are stored.
+pub fn validate_access_policy_document(
+    document: &::aws_smithy_types::Document,
+) -> Result<(), String> {
+    let violations: Vec<String> = empty_principal_paths(document)
+        .iter()
+        .map(|path| empty_array_violation(path))
+        .collect();
+    if violations.is_empty() {
+        return Ok(());
+    }
+    Err(policy_json_invalid_message(&violations))
 }
 
 /// How the index operations word a collection id that names no collection. `CreateIndex`,
@@ -2162,16 +2368,68 @@ pub fn repeated_tag_key_message(member: &str, key: &str) -> String {
     envelope(::std::slice::from_ref(&violation)).unwrap_or_else(|| violation.message())
 }
 
-/// How this service words a RESOURCE ARN that names no collection this account holds: by
-/// the collection id the ARN carries where it carries one (`…:collection/<id>`), and by
-/// the ARN itself otherwise, since there is no id in it to name.
+/// The kind of resource a `resourceArn` addresses — the tag-bearing resources this slice
+/// holds.
+///
+/// A resource ARN's last colon-separated field is `<resource kind>/<id>`, which is the
+/// template each resource carries in the model (`collection/{id}` and
+/// `collection-group/{id}`), so the kind and the id are read out of the ARN itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArnResourceKind {
+    /// `…:collection/<CollectionId>`.
+    Collection,
+    /// `…:collection-group/<CollectionGroupId>`.
+    CollectionGroup,
+}
+
+impl ArnResourceKind {
+    /// Every kind an ARN may address, in the order [`parse_resource_arn`] tries them.
+    const ALL: [Self; 2] = [Self::CollectionGroup, Self::Collection];
+
+    /// The resource half's prefix for this kind, from the resource's own ARN template.
+    fn arn_prefix(self) -> &'static str {
+        match self {
+            Self::Collection => "collection/",
+            Self::CollectionGroup => "collection-group/",
+        }
+    }
+
+    /// How a refusal NAMES this kind, before the id of the resource it was looking for.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Collection => "Collection",
+            Self::CollectionGroup => "Collection Group",
+        }
+    }
+
+    /// The `resourceType` a quota refusal names for this kind: the segment the ARN carries.
+    pub fn resource_type(self) -> &'static str {
+        match self {
+            Self::Collection => TAGGED_RESOURCE_TYPE,
+            Self::CollectionGroup => "collection-group",
+        }
+    }
+}
+
+/// The resource a `resourceArn` addresses: its kind and the id the ARN carries, or `None`
+/// for an ARN whose resource half names neither of this service's addressable resources.
+pub fn parse_resource_arn(arn: &str) -> Option<(ArnResourceKind, &str)> {
+    let (_, resource) = arn.rsplit_once(':')?;
+    ArnResourceKind::ALL.into_iter().find_map(|kind| {
+        resource
+            .strip_prefix(kind.arn_prefix())
+            .filter(|id| !id.is_empty())
+            .map(|id| (kind, id))
+    })
+}
+
+/// How this service words a RESOURCE ARN that names no resource this account holds: by the
+/// KIND of resource the ARN addresses and the id it carries, and by the ARN itself when its
+/// resource half names no addressable resource, since there is no id in it to name.
 pub fn resource_not_found_message(arn: &str) -> String {
-    match arn
-        .rsplit_once(':')
-        .and_then(|(_, resource)| resource.strip_prefix("collection/"))
-    {
-        Some(id) if !id.is_empty() => collection_not_found_message(id),
-        _ => format!("Resource {arn} is not found"),
+    match parse_resource_arn(arn) {
+        Some((kind, id)) => format!("{} ID {id} is not found", kind.label()),
+        None => format!("Resource {arn} is not found"),
     }
 }
 
@@ -2596,6 +2854,115 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
                     kms_key_arn: statement_kms_key(statement),
                 })
             })
+    }
+
+    /// The collection group whose ARN is `arn`, if one is stored under it. Matched on the
+    /// STORED ARN, exactly as [`Self::collection_by_arn`] is.
+    pub fn collection_group_by_arn(&self, arn: &str) -> Option<&CollectionGroupRecord> {
+        self.collection_groups
+            .values()
+            .find(|record| record.arn == arn)
+    }
+
+    /// [`Self::collection_group_by_arn`], mutably.
+    pub fn collection_group_by_arn_mut(&mut self, arn: &str) -> Option<&mut CollectionGroupRecord> {
+        self.collection_groups
+            .values_mut()
+            .find(|record| record.arn == arn)
+    }
+
+    /// The tags the resource `arn` addresses carries, whichever KIND of resource that is,
+    /// or `None` when this account holds no resource under that ARN.
+    ///
+    /// The tagging plane takes a `resourceArn` — "the ARN of the resource", not of a
+    /// collection — so every resource this slice stores tags on is resolved here, by the
+    /// kind the ARN names ([`parse_resource_arn`]). One resolver, so a tag write and a tag
+    /// read can never resolve the same ARN differently.
+    pub fn tags_by_arn(&self, arn: &str) -> Option<&Vec<Tag>> {
+        match parse_resource_arn(arn)? {
+            (ArnResourceKind::Collection, _) => {
+                self.collection_by_arn(arn).map(|record| &record.tags)
+            }
+            (ArnResourceKind::CollectionGroup, _) => self
+                .collection_group_by_arn(arn)
+                .map(|record| &record.tags),
+        }
+    }
+
+    /// [`Self::tags_by_arn`], mutably — what a tag write stores through.
+    pub fn tags_by_arn_mut(&mut self, arn: &str) -> Option<&mut Vec<Tag>> {
+        match parse_resource_arn(arn)? {
+            (ArnResourceKind::Collection, _) => self
+                .collection_by_arn_mut(arn)
+                .map(|record| &mut record.tags),
+            (ArnResourceKind::CollectionGroup, _) => self
+                .collection_group_by_arn_mut(arn)
+                .map(|record| &mut record.tags),
+        }
+    }
+
+    /// Whether the resource `arn` addresses may be TAGGED: a resource this account holds
+    /// that is not on its way out.
+    ///
+    /// A tag belongs to a LIVE resource, so a collection whose deletion has been accepted
+    /// is no longer taggable; a collection group has no accepted-deletion state of its own
+    /// (its delete removes the record), so holding one is enough.
+    pub fn is_taggable(&self, arn: &str) -> bool {
+        match parse_resource_arn(arn) {
+            Some((ArnResourceKind::Collection, _)) => self
+                .collection_by_arn(arn)
+                .is_some_and(|record| !record.is_deleting()),
+            Some((ArnResourceKind::CollectionGroup, _)) => {
+                self.collection_group_by_arn(arn).is_some()
+            }
+            None => false,
+        }
+    }
+
+    /// The OCUs this account's collection GROUPS already account for, for one capacity
+    /// type: the sum of each stored group's own ceiling.
+    ///
+    /// Counted over the stored groups rather than from a running total, so it is the
+    /// capacity the groups really carry.
+    pub fn collection_group_capacity_in_ocu(&self, kind: CapacityKind) -> f32 {
+        // Folded from a positive zero rather than summed, so an account with no collection
+        // group reports `0` and not the negative zero the standard float sum's identity
+        // would render.
+        self.collection_groups
+            .values()
+            .filter_map(|record| kind.group_ceiling(&record.capacity_limits))
+            .fold(0.0, |total, ceiling| total + ceiling)
+    }
+
+    /// Hold an `UpdateAccountSettings` request to the account's non-adjustable OCU quota,
+    /// answering the `ServiceQuotaExceededException` message for the first capacity type it
+    /// takes past [`MAX_ACCOUNT_CAPACITY_IN_OCU`].
+    ///
+    /// A ceiling this account may not reach is not a setting the service stores: the quota
+    /// bounds the TOTAL for a capacity type — what the request asks for, for collections
+    /// outside any group, plus what the account's collection groups already commit — so the
+    /// figures the refusal names are the stored settings, the groups' committed capacity and
+    /// that total. `None` for a request every capacity type's quota admits.
+    pub fn account_capacity_quota_refusal(&self, requested: &CapacityLimits) -> Option<String> {
+        CapacityKind::ALL.into_iter().find_map(|kind| {
+            let asked = kind.requested(requested)?;
+            let committed = self.collection_group_capacity_in_ocu(kind);
+            let total = f64::from(asked) + f64::from(committed);
+            if total <= f64::from(MAX_ACCOUNT_CAPACITY_IN_OCU) {
+                return None;
+            }
+            let word = kind.word();
+            Some(format!(
+                "The requested total {word} capacity of {} OCUs exceeds your maximum {word} \
+                 capacity service quota limit of {MAX_ACCOUNT_CAPACITY_IN_OCU} OCUs. Current \
+                 settings: {} OCUs for collections that are not part of any collection group, \
+                 {committed} OCUs for collection groups. New request of {asked} OCUs would bring \
+                 total to {} OCUs.",
+                rendered_ocu_total(f64::from(asked)),
+                self.account_settings.limit(kind),
+                rendered_ocu_total(total),
+            ))
+        })
     }
 
     /// Mint a fresh `CollectionId`: [`ID_LEN`] lowercase alphanumeric characters, the

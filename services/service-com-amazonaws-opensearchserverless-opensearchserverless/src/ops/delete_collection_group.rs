@@ -7,7 +7,7 @@
 //! name) as the modelled `NOT_FOUND` error detail rather than as a detail, and the freed
 //! name may be created again. An `id` that names no stored group is a
 //! `ResourceNotFoundException`; a group that still holds collections is a
-//! `ConflictException`, because "You can only delete empty collection groups that contain
+//! `ValidationException`, because "You can only delete empty collection groups that contain
 //! no collections". The model declares no output members, so a successful delete is an
 //! empty 200 body. This operation writes ONLY the removal it is asked for.
 //!
@@ -182,18 +182,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // From this operation's own documentation: "You can only delete empty collection
         // groups that contain no collections." A group that still holds collections is
-        // refused with `ConflictException` — the state-conflict error the model declares
-        // for a delete — and nothing is removed.
+        // refused as the invalid input it is — `ValidationException` (400), not the
+        // `ConflictException` (409) a client may retry, because this condition never
+        // clears on its own: the member collections have to be deleted first. Nothing is
+        // removed.
         let group_name = record.name.clone();
-        let held = store.collections_in_group(&group_name);
-        if held > 0 {
-            return Err(DeleteCollectionGroupErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "Collection group with ID {} still contains {held} collection(s) and \
-                         cannot be deleted; only empty collection groups can be deleted",
-                        input.id
-                    )),
+        if store.collections_in_group(&group_name) > 0 {
+            return Err(DeleteCollectionGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::collection_group_not_empty_message(&input.id)),
                 },
             )
             .into());

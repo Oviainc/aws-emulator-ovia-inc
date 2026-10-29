@@ -389,8 +389,8 @@ async fn an_update_lifecycle_policy_chains_the_version_and_refuses_a_stale_one()
             .await;
             assert_eq!(
                 (status, code.as_str()),
-                (CLIENT_ERROR, "ConflictException"),
-                "case UpdateLifecyclePolicy({kind}/{name}, {what}): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
+                (CLIENT_ERROR, "ValidationException"),
+                "case UpdateLifecyclePolicy({kind}/{name}, {what}): expected {CLIENT_ERROR} ValidationException, got {status} {code} with {answer}"
             );
         }
 

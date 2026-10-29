@@ -419,9 +419,16 @@ async fn delete_collection_group_refuses_an_unknown_id_and_a_non_empty_group() {
         let (status, code, body) = delete_group(&router, "us-east-1", json!({ "id": &id })).await;
         assert_eq!(
             (status, code.as_str()),
-            (CLIENT_ERROR, "ConflictException"),
-            "case DeleteCollectionGroup({group}) holding {} collection(s): expected {CLIENT_ERROR}, got \
-             {status} {code} with {body}",
+            (CLIENT_ERROR, "ValidationException"),
+            "case DeleteCollectionGroup({group}) holding {} collection(s): expected {CLIENT_ERROR} \
+             ValidationException, got {status} {code} with {body}",
+            collections.len()
+        );
+        assert_eq!(
+            text(&body, "message"),
+            format!("CollectionGroup with ID {id}, has collections associated and cannot be deleted"),
+            "case DeleteCollectionGroup({group}) holding {} collection(s): the refusal names the \
+             group id, got {body}",
             collections.len()
         );
 

@@ -190,7 +190,7 @@ async fn every_modeled_client_error_answers_the_single_client_error_status() {
             what: "a collection group that still holds a collection",
             operation: "DeleteCollectionGroup",
             request: json!({ "id": group_id.clone() }),
-            code: "ConflictException",
+            code: "ValidationException",
         },
         Row {
             what: "a write carrying a policyVersion nothing minted",
@@ -201,7 +201,7 @@ async fn every_modeled_client_error_answers_the_single_client_error_status() {
                 "policyVersion": UNMINTED_VERSION,
                 "description": "this write must not land",
             }),
-            code: "ConflictException",
+            code: "ValidationException",
         },
         Row {
             what: "a read of an access policy pair never created",

@@ -155,10 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = store.security_configs.get(&input.id).ok_or_else(|| {
             GetSecurityConfigError::from(GetSecurityConfigErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Security config with id {} is not found",
-                        input.id
-                    )),
+                    message: Some(crate::state::security_config_not_found_message(&input.id)),
                 },
             ))
         })?;

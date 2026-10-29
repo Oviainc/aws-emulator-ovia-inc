@@ -219,6 +219,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // A data access policy's own CONTENT has rules the document text cannot carry: a
+        // statement grants permissions to the principals it names, so a statement whose
+        // `Principal` list is present and empty grants nothing to nobody and is not a
+        // policy the service stores. The check and its wording live in
+        // `crate::state::validate_access_policy_document`, so this create and
+        // `UpdateAccessPolicy` cannot store different documents.
+        if let Err(message) = crate::state::validate_access_policy_document(&policy) {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::ValidationRefused,
+                Some(&resource),
+            );
+            return Err(CreateAccessPolicyErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
 
         // A replayed `clientToken` is a retry of the call that created the policy, so it

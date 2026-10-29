@@ -158,9 +158,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteSecurityConfigErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Security config with id {} is not found",
-                            input.id
+                        message: Some(crate::state::security_config_not_found_message(
+                            &input.id,
                         )),
                     },
                 )

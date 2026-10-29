@@ -4,7 +4,9 @@
 //! IMPLEMENTED: writes the account's OCU capacity limits into
 //! [`crate::state::ComAmazonawsOpensearchserverlessOpensearchserverlessState::account_settings`]
 //! — each limit the request names, leaving one it omits at its stored value — and answers
-//! from the stored settings, which is what a later `GetAccountSettings` reports. Every
+//! from the stored settings, which is what a later `GetAccountSettings` reports. A limit
+//! that would take a capacity type past the account's non-adjustable OCU quota is refused
+//! with `ServiceQuotaExceededException` and stores nothing. Every
 //! exit leaves one structured `emulator::audit` record for the call.
 //!
 //! ## Shape of an operation
@@ -166,11 +168,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         // Both `CapacityLimits` members carry `@range(min: 2)`, so the boundary validator
-        // has already refused anything below that floor; the model states no ceiling and
-        // no increment, so this handler adds neither and stores the value as given. A
-        // request that names no `capacityLimits` at all changes nothing and reports the
-        // settings as they stand.
+        // has already refused anything below that floor; the model states no ceiling, but
+        // the account's own OCU quota does — see
+        // `crate::state::account_capacity_quota_refusal`, which words the refusal and names
+        // the figures it is computed from. A request past it stores nothing, so
+        // `GetAccountSettings` still reports the limits the account really has. A request
+        // that names no `capacityLimits` at all changes nothing and reports the settings as
+        // they stand.
         if let Some(limits) = &input.capacity_limits {
+            if let Some(message) = store.account_capacity_quota_refusal(limits) {
+                crate::state::audit(Self::NAME, ctx, AuditOutcome::QuotaExceeded, Some(resource));
+                return Err(
+                    UpdateAccountSettingsErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message,
+                            resource_id: None,
+                            resource_type: Some(
+                                crate::state::ACCOUNT_SETTINGS_RESOURCE_TYPE.to_string(),
+                            ),
+                            service_code: crate::state::ARN_NAMESPACE.to_string(),
+                            quota_code: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
             store.account_settings.apply(limits);
         }
         crate::state::audit(

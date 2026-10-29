@@ -181,14 +181,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ENABLED, the collection cannot be deleted." That refusal is the collection's own
         // CONFIGURATION, not a transient state of it — nothing changes it but a request
         // that turns the setting off — so it is the modelled `ValidationException` (400)
-        // rather than the `ConflictException` (409) a retry could clear.
+        // rather than the `ConflictException` (409) a retry could clear. The refusal names
+        // the collection the way a caller names one, by the NAME the stored record carries,
+        // not by the id the request addressed it with.
         if record.deletion_protection == crate::state::DELETION_PROTECTION_ENABLED {
             return Err(DeleteCollectionErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "Collection with ID {} has deletion protection enabled and cannot be deleted",
-                        input.id
-                    )),
+                    message: Some(crate::state::deletion_protection_message(&record.name)),
                 },
             )
             .into());

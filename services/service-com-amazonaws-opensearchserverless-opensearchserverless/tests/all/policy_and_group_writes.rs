@@ -316,19 +316,19 @@ async fn a_policy_update_chains_the_version_and_refuses_a_stale_one() {
                 "the creation version, long since superseded",
                 versions[0].clone(),
                 CLIENT_ERROR,
-                "ConflictException",
+                "ValidationException",
             ),
             (
                 "the version before the last write",
                 versions[versions.len() - 2].clone(),
                 CLIENT_ERROR,
-                "ConflictException",
+                "ValidationException",
             ),
             (
                 "a well-formed version nothing ever minted",
                 STALE_VERSION.to_string(),
                 CLIENT_ERROR,
-                "ConflictException",
+                "ValidationException",
             ),
         ];
         for (what, version, expected_status, expected_code) in refusals {

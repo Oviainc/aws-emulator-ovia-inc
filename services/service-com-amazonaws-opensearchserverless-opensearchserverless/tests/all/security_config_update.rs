@@ -370,7 +370,7 @@ async fn an_update_is_refused_unless_its_version_and_options_fit_the_stored_conf
     .await;
 
     // The optimistic lock: the first update succeeds, and the version it consumed is stale
-    // afterwards, so replaying it is the conflict and the stored record is untouched.
+    // afterwards, so replaying it is refused and the stored record is untouched.
     let id = text(&saml, "id");
     let stale = text(&saml, "configVersion");
     let (status, code, answer) =
@@ -389,8 +389,8 @@ async fn an_update_is_refused_unless_its_version_and_options_fit_the_stored_conf
             update(&router, &id, version, &json!({ "description": "the loser" })).await;
         assert_eq!(
             (status, code.as_str()),
-            (CLIENT_ERROR, "ConflictException"),
-            "case update with {case}: expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
+            (CLIENT_ERROR, "ValidationException"),
+            "case update with {case}: expected {CLIENT_ERROR} ValidationException, got {status} {code} with {answer}"
         );
         assert_eq!(
             read_config(&router, &id).await,
@@ -631,7 +631,7 @@ async fn a_replayed_client_token_answers_the_write_it_already_performed() {
     );
 
     // A different token is a different write, so it is held to the version precondition
-    // like any other: the stale version conflicts and the current one succeeds.
+    // like any other: the stale version is refused and the current one succeeds.
     let (status, code, answer) = update(
         &router,
         &id,
@@ -641,8 +641,8 @@ async fn a_replayed_client_token_answers_the_write_it_already_performed() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (CLIENT_ERROR, "ConflictException"),
-        "case fresh token, stale version: expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
+        (CLIENT_ERROR, "ValidationException"),
+        "case fresh token, stale version: expected {CLIENT_ERROR} ValidationException, got {status} {code} with {answer}"
     );
     let current = text(&first, "configVersion");
     let (status, code, answer) = update(

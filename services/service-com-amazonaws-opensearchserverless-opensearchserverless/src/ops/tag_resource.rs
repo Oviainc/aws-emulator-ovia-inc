@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! IMPLEMENTED: adds the tags the request carries to the `CollectionRecord` whose stored
-//! ARN is `resourceArn`, replacing the value of a key the resource already carries, so
-//! `ListTagsForResource` reports them. A `resourceArn` that names no collection this
-//! account holds — including one whose deletion has been accepted — is refused with
+//! IMPLEMENTED: adds the tags the request carries to the resource whose stored ARN is
+//! `resourceArn` — a collection or a collection group, whichever kind the ARN addresses —
+//! replacing the value of a key the resource already carries, so
+//! `ListTagsForResource` reports them. A `resourceArn` that names no resource this
+//! account holds — including a collection whose deletion has been accepted — is refused with
 //! `ResourceNotFoundException`, a write that would take the resource past the
 //! documented 50-tag quota with `ServiceQuotaExceededException`, and a `tags` that names
 //! one key twice with `ValidationException`.
@@ -175,13 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_due_transitions();
 
-        // A tag belongs to a LIVE resource: a collection whose deletion has been accepted
-        // is on its way out and its tags are no longer addressable, so it answers the same
-        // not-found refusal as one that was never there.
-        let taggable = store
-            .collection_by_arn(&input.resource_arn)
-            .is_some_and(|record| !record.is_deleting());
-        if !taggable {
+        // A tag belongs to a LIVE resource this account holds, whichever KIND of resource
+        // the `resourceArn` addresses: a collection whose deletion has been accepted is on
+        // its way out and its tags are no longer addressable, so it answers the same
+        // not-found refusal as a resource that was never there.
+        if !store.is_taggable(&input.resource_arn) {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_message(
@@ -196,8 +195,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already carries takes the new value (a tag set is a map keyed by `key`), and a
         // key it does not is added.
         let mut tags = store
-            .collection_by_arn(&input.resource_arn)
-            .map(|record| record.tags.clone())
+            .tags_by_arn(&input.resource_arn)
+            .cloned()
             .unwrap_or_default();
         for tag in input.tags {
             match tags.iter_mut().find(|stored| stored.key == tag.key) {
@@ -206,6 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            let resource_type = crate::state::parse_resource_arn(&input.resource_arn)
+                .map(|(kind, _)| kind.resource_type())
+                .unwrap_or(crate::state::TAGGED_RESOURCE_TYPE);
             return Err(
                 TagResourceErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
@@ -214,9 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             crate::state::MAX_TAGS_PER_RESOURCE
                         ),
                         resource_id: Some(input.resource_arn.clone()),
-                        resource_type: Some(
-                            crate::state::TAGGED_RESOURCE_TYPE.to_string(),
-                        ),
+                        resource_type: Some(resource_type.to_string()),
                         service_code: crate::state::ARN_NAMESPACE.to_string(),
                         quota_code: None,
                     },
@@ -225,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let Some(record) = store.collection_by_arn_mut(&input.resource_arn) else {
+        let Some(stored) = store.tags_by_arn_mut(&input.resource_arn) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_message(
@@ -235,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        record.tags = tags;
+        *stored = tags;
 
         // `TagResourceResponse` models no members: what the call produced is the stored
         // tag set, which `ListTagsForResource` reports.

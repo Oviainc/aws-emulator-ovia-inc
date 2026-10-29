@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! IMPLEMENTED: removes the tag keys the request names from the `CollectionRecord` whose
-//! stored ARN is `resourceArn`, so `ListTagsForResource` no longer reports them. A
-//! `resourceArn` that names no collection this account holds — including one whose
+//! IMPLEMENTED: removes the tag keys the request names from the resource whose
+//! stored ARN is `resourceArn` — a collection or a collection group, whichever kind the
+//! ARN addresses — so `ListTagsForResource` no longer reports them. A
+//! `resourceArn` that names no resource this account holds — including a collection whose
 //! deletion has been accepted — is refused with `ResourceNotFoundException`, and a
 //! `tagKeys` that names one key twice with `ValidationException`.
 //!
@@ -172,13 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_due_transitions();
 
-        // A tag belongs to a LIVE resource: a collection whose deletion has been accepted
-        // is on its way out and its tags are no longer addressable, so it answers the same
-        // not-found refusal as one that was never there.
-        let taggable = store
-            .collection_by_arn(&input.resource_arn)
-            .is_some_and(|record| !record.is_deleting());
-        if !taggable {
+        // A tag belongs to a LIVE resource this account holds, whichever KIND of resource
+        // the `resourceArn` addresses: a collection whose deletion has been accepted is on
+        // its way out and its tags are no longer addressable, so it answers the same
+        // not-found refusal as a resource that was never there.
+        if !store.is_taggable(&input.resource_arn) {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_message(
@@ -188,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let Some(record) = store.collection_by_arn_mut(&input.resource_arn) else {
+        let Some(stored) = store.tags_by_arn_mut(&input.resource_arn) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_message(
@@ -201,9 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Removing a key the resource does not carry removes nothing: the request asks for
         // a state (these keys absent) rather than for an event, so it is not a failure.
-        record
-            .tags
-            .retain(|tag| !input.tag_keys.contains(&tag.key));
+        stored.retain(|tag| !input.tag_keys.contains(&tag.key));
 
         // `UntagResourceResponse` models no members: what the call produced is the stored
         // tag set, which `ListTagsForResource` reports.

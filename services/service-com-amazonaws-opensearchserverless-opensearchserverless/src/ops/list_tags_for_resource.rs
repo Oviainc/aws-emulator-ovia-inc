@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! IMPLEMENTED: reports the tags stored on the `CollectionRecord` whose stored ARN is
-//! `resourceArn`. A `resourceArn` that names no collection this account holds is refused
+//! IMPLEMENTED: reports the tags stored on the resource whose stored ARN is
+//! `resourceArn` — a collection or a collection group, whichever kind the ARN addresses.
+//! A `resourceArn` that names no resource this account holds is refused
 //! with `ResourceNotFoundException`; a collection whose deletion has been accepted is
 //! still read, as every other read of it is, until its purge.
 //!
@@ -155,9 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A collection whose deletion has been accepted is still a collection every read
         // reports (`BatchGetCollection` answers it in `DELETING` until the purge), so its
         // stored tags are still readable: only the tag WRITES are refused while it is on
-        // its way out. A `resourceArn` that names no collection this account holds is the
-        // modelled not-found.
-        let Some(record) = store.collection_by_arn(&input.resource_arn) else {
+        // its way out. A `resourceArn` that names no resource this account holds — of
+        // whichever kind the ARN addresses — is the modelled not-found.
+        let Some(tags) = store.tags_by_arn(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_message(
@@ -171,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answered from the STORED record: the tags a read reports are the ones the create
         // and the tag writes left on it.
         Ok(ListTagsForResourceOutput {
-            tags: Some(record.tags.clone()),
+            tags: Some(tags.clone()),
         })
     }
 }
