@@ -3466,8 +3466,23 @@ const OPENSEARCH_DOMAIN_URI: &str = "/2021-01-01/opensearch/domain";
 /// `EngineVersion`, `IPAddressType`, `IdentityCenterOptions`, `LogPublishingOptions`,
 /// `NodeToNodeEncryptionOptions`, `OffPeakWindowOptions`, `SnapshotOptions`,
 /// `SoftwareUpdateOptions` and `VPCOptions` — so the evaluated property document IS the
-/// request.
+/// request, each property carried as the TYPE its member is modelled with
+/// ([`DOMAIN_DOCUMENT_PROPERTIES`]).
 const DOMAIN_NON_CREATE_PROPERTIES: &[&str] = &["DomainName", "Tags", "SkipShardMigrationWait"];
+
+/// The properties of an `AWS::OpenSearchService::Domain` whose `CreateDomain` member is
+/// modelled a STRING carrying a JSON document, so the property's value is sent as that
+/// document's TEXT and not as the JSON the template spelled it with
+/// ([`render_document_members`]).
+///
+/// `AccessPolicies` is the one such property of this type: it targets
+/// `com.amazonaws.opensearch#PolicyDocument`, a string of 0..102400 characters
+/// (`smithy_query(query="operation", operation="CreateDomain")`), while a template declares
+/// an access policy the way every policy-document property is declared — as the policy
+/// object itself, with its intrinsics resolved by the time this runs. Every other member
+/// this arm forwards is a structure, a map or a list on both sides, or a string the template
+/// also writes as a string, so none of them is rendered.
+const DOMAIN_DOCUMENT_PROPERTIES: &[&str] = &["AccessPolicies"];
 
 /// Create the domain an `AWS::OpenSearchService::Domain` declares.
 ///
@@ -3475,7 +3490,11 @@ const DOMAIN_NON_CREATE_PROPERTIES: &[&str] = &["DomainName", "Tags", "SkipShard
 /// template declared reach that service as declared, and ITS validation is what judges them
 /// — an instance type the requested engine release does not offer is its own
 /// `InvalidTypeException`, and that refusal is what fails this resource and rolls the stack
-/// back, rather than a domain recorded as created on a cluster nothing could provision.
+/// back, rather than a domain recorded as created on a cluster nothing could provision. What
+/// a property is SPELLED as is the one thing that changes: a property whose member is
+/// modelled a string carrying a JSON document is sent as that document's text
+/// ([`DOMAIN_DOCUMENT_PROPERTIES`]), so the request carries the same value under the type
+/// the member declares.
 ///
 /// "Ref returns the domain name", so the physical resource id the stack reports IS the
 /// domain a client addresses and the service assigns no identity this record has to take
@@ -3493,6 +3512,7 @@ async fn create_domain(
     for property in DOMAIN_NON_CREATE_PROPERTIES {
         request.remove(*property);
     }
+    render_document_members(&mut request, DOMAIN_DOCUMENT_PROPERTIES);
     request.insert(
         "DomainName".to_string(),
         Value::String(resource.physical_resource_id.clone()),
@@ -6597,6 +6617,26 @@ fn document_text(value: &Value) -> Option<String> {
         Value::String(text) => Some(text.clone()),
         Value::Object(_) | Value::Array(_) => serde_json::to_string(value).ok(),
         _ => None,
+    }
+}
+
+/// Render the named members of a forwarded request as the TEXT of the document each one
+/// carries, in place.
+///
+/// An arm that forwards the evaluated property document as the request body sends each
+/// property under the type its API member is modelled with, and a member modelled a STRING
+/// that carries a JSON document (a policy, a pattern, a dashboard body) is one a template
+/// may spell either as the document itself or as the text of one. So a member named here is
+/// rendered with the one JSON-to-text rule this module has ([`document_text`]): text stays
+/// itself, and a document becomes its own compact JSON. A member the declaration does not
+/// carry, or one carrying a value that is no document at all, is left exactly as declared —
+/// the owning service's own validation is what judges it.
+fn render_document_members(request: &mut Map<String, Value>, members: &[&str]) {
+    for member in members {
+        let Some(rendered) = request.get(*member).and_then(document_text) else {
+            continue;
+        };
+        request.insert((*member).to_string(), Value::String(rendered));
     }
 }
 

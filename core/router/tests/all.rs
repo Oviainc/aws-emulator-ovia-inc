@@ -22,6 +22,11 @@ mod kinesisvideo_signing_name_routing;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `c…` span (where every cloudformation suite lands) are both regions
 // concurrently landing suites add their line to.
+#[path = "all/cloudformation_opensearch_domain_access_policies.rs"]
+mod cloudformation_opensearch_domain_access_policies;
+// Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `c…` span (where every cloudformation suite lands) are both regions
+// concurrently landing suites add their line to.
 #[path = "all/cloudformation_ec2_ebs_instance_estate.rs"]
 mod cloudformation_ec2_ebs_instance_estate;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
