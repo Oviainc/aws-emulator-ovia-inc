@@ -179,8 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        // A reporting operation, so it writes only what the CLOCK already made due.
-        store.purge_due_deletions(now);
+        // A reporting operation, so the one write is the preamble every handler shares:
+        // everything the CLOCK already made due.
+        store.materialise_due(now);
 
         // The SAME liveness rule the single-subscription readers use, so a
         // subscription a caller can enumerate here is one it can also read.

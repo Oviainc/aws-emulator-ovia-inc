@@ -207,11 +207,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
-        // What the CLOCK already made due, before anything is resolved or written: a
-        // domain whose DELETING span has elapsed is purged, and every job whose next
-        // status transition has fallen due is moved on.
-        store.purge_due_deletions(now);
-        store.advance_due_patient_insights_jobs(now);
+        // The one preamble every handler shares, before anything is resolved or written:
+        // everything the CLOCK already made due — the purge of a domain whose DELETING
+        // span has elapsed, and the transition of every job whose next status has fallen
+        // due.
+        store.materialise_due(now);
 
         // A job can only be started in a domain that is live: one already being deleted
         // is on its way out, so it is reported as not found.

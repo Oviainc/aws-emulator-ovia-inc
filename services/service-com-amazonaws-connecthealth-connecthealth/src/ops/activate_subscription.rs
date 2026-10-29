@@ -161,7 +161,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
-        store.purge_due_deletions(now);
+        // The one preamble every handler shares: everything the CLOCK already made due.
+        store.materialise_due(now);
 
         let Some(subscription) =
             store.live_subscription_mut(&region, &input.domain_id, &input.subscription_id)

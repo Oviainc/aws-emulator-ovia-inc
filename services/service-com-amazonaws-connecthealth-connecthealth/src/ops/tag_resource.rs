@@ -209,9 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         let mut store = state.lock();
-        // Every handler materialises the deletions the CLOCK already made due first, so
-        // the ARN of a resource whose deletion has fallen due no longer resolves here.
-        store.purge_due_deletions(now);
+        // The preamble every handler shares materialises what the CLOCK already made due
+        // first, so the ARN of a resource whose deletion has fallen due no longer
+        // resolves here.
+        store.materialise_due(now);
 
         // The ARN has to name a resource this service HOLDS, in THIS REGION: tags live
         // beside the resource, so there is nothing to attach them to otherwise, and a

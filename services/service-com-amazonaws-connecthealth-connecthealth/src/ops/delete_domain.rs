@@ -324,7 +324,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
-        store.purge_due_deletions(now);
+        // The one preamble every handler shares: everything the CLOCK already made due.
+        store.materialise_due(now);
 
         let Some(domain) = store.held_domain_mut(&region, &input.domain_id) else {
             // Which failure this is depends on whether the id was ever ALLOCATED, and
@@ -399,8 +400,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
         };
         // A deletion that is already due — the one this call completed — is materialised
-        // here, so the record is gone before the next caller reads it.
-        store.purge_due_deletions(now);
+        // through the same shared preamble, so the record is gone before the next caller
+        // reads it.
+        store.materialise_due(now);
         Ok(response)
     }
 }

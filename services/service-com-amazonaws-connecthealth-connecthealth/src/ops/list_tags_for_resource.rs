@@ -162,10 +162,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
-        // `@readonly`: the only write is materialising what the CLOCK already made due,
-        // so the ARN of a resource whose deletion has fallen due stops resolving here
-        // exactly as it does for every other handler.
-        store.purge_due_deletions(now);
+        // `@readonly`: the only write is the preamble every handler shares, which
+        // materialises what the CLOCK already made due, so the ARN of a resource whose
+        // deletion has fallen due stops resolving here exactly as it does for every
+        // other handler.
+        store.materialise_due(now);
 
         // The ARN has to name a resource this service HOLDS, in THIS REGION — the same
         // resolution and Region scope `TagResource` applies to the same label. Reporting

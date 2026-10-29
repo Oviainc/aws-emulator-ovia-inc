@@ -286,7 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let account_id = crate::state::owning_account_id();
 
         let mut store = state.lock();
-        store.purge_due_deletions(now);
+        // The one preamble every handler shares: everything the CLOCK already made due,
+        // so a domain whose purge has fallen due frees its slot under the account's cap.
+        store.materialise_due(now);
 
         // The digest of this request's parameters is the identity of the REQUEST — what
         // tells a repeat from a different request. The tag set it is taken over is the one

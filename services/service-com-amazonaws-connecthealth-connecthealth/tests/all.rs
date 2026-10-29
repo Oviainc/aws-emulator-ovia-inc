@@ -49,6 +49,8 @@ mod reserved_tag_key_prefix;
 mod resource_tag_removal;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/shared_due_materialisation.rs"]
+mod shared_due_materialisation;
 #[path = "all/shared_pagination_policy.rs"]
 mod shared_pagination_policy;
 #[path = "all/start_patient_insights_job_write_discipline.rs"]

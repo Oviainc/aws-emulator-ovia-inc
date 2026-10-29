@@ -369,8 +369,8 @@ impl Domain {
     /// [`ComAmazonawsConnecthealthConnecthealthState::domain_created_by`]), so two of them
     /// cannot disagree about whether a domain is still live. The domain RECORD itself
     /// outlives its liveness — a reporting operation reads it through
-    /// [`ComAmazonawsConnecthealthConnecthealthState::held_domain`] until
-    /// [`ComAmazonawsConnecthealthConnecthealthState::purge_due_deletions`] drops it.
+    /// [`ComAmazonawsConnecthealthConnecthealthState::held_domain`] until the purge
+    /// [`ComAmazonawsConnecthealthConnecthealthState::materialise_due`] owes it drops it.
     pub fn is_live(&self) -> bool {
         self.status == DomainStatus::Active
     }
@@ -951,13 +951,35 @@ impl ComAmazonawsConnecthealthConnecthealthState {
         mint_scoped_id("apl-", 16, seq, idc_instance_id)
     }
 
+    /// Materialise EVERYTHING the clock has already made due, whatever class of owed
+    /// work it is — the one preamble every handler in this crate runs before it reads or
+    /// writes anything else.
+    ///
+    /// Stated once HERE rather than per handler, so no handler can materialise one class
+    /// of owed work and leave another standing: a `Domain` whose `DELETING` span has
+    /// elapsed is purged (`purge_due_deletions`), and a patient insights job whose next
+    /// status transition has fallen due is moved on
+    /// (`advance_due_patient_insights_jobs`). The purge runs first, so no transition is
+    /// applied to a record this same instant already owed the removal of.
+    ///
+    /// It writes only what was owed at THIS instant whether or not anybody called, which
+    /// is why the reporting operations run it too: a deletion is applied at the instant
+    /// its span elapsed and each job transition is stamped with the instant it FELL DUE
+    /// (`PatientInsightsJob::apply_due_transitions`) rather than the instant somebody
+    /// looked, so running it in one handler cannot change a value another handler
+    /// reports.
+    pub fn materialise_due(&mut self, now: SystemTime) {
+        self.purge_due_deletions(now);
+        self.advance_due_patient_insights_jobs(now);
+    }
+
     /// Materialise every deletion the CLOCK has already made due: a `Domain` whose
     /// `DELETING` span has elapsed is purged, with its subscriptions and every tag
     /// entry keyed by one of their ARNs.
     ///
-    /// Called at the top of every handler, including the reporting ones: it writes only
-    /// what was owed at this instant whether or not anybody called.
-    pub fn purge_due_deletions(&mut self, now: SystemTime) {
+    /// One half of [`Self::materialise_due`], which is the only caller: a handler reaches
+    /// the owed work through that one entry point rather than naming the halves itself.
+    fn purge_due_deletions(&mut self, now: SystemTime) {
         let due: Vec<String> = self
             .domains
             .values()
@@ -977,11 +999,11 @@ impl ComAmazonawsConnecthealthConnecthealthState {
     /// Materialise every patient-insights-job status transition the CLOCK has already
     /// made due, in every domain.
     ///
-    /// Called at the top of every handler beside [`Self::purge_due_deletions`], including
-    /// the reporting ones: it writes only what was owed at this instant whether or not
-    /// anybody called, so a job observed late reads exactly as it would have at the
-    /// moment its transition fell due.
-    pub fn advance_due_patient_insights_jobs(&mut self, now: SystemTime) {
+    /// The other half of [`Self::materialise_due`], which is the only caller: it writes
+    /// only what was owed at this instant whether or not anybody called, so a job
+    /// observed late reads exactly as it would have at the moment its transition fell
+    /// due.
+    fn advance_due_patient_insights_jobs(&mut self, now: SystemTime) {
         for domain in self.domains.values_mut() {
             for job in domain.patient_insights_jobs.values_mut() {
                 job.apply_due_transitions(now);
@@ -1032,8 +1054,8 @@ impl ComAmazonawsConnecthealthConnecthealthState {
     /// service still holds — its own reader answers it ([`Self::held_domain`] is what
     /// `GetDomain` looks it up through, and `ListDomains` lists it under its non-terminal
     /// status) — so its ARN resolves for exactly as long as the record does. The one
-    /// place an ARN stops resolving is [`Self::purge_due_deletions`], which drops the
-    /// record together with the tag entries keyed by its ARN. An ARN this resolves is
+    /// place an ARN stops resolving is the purge [`Self::materialise_due`] owes, which
+    /// drops the record together with the tag entries keyed by its ARN. An ARN this resolves is
     /// therefore always one some reader resolves too, and the ARN-addressed operations
     /// and the resource's own reader never disagree about whether it exists.
     ///

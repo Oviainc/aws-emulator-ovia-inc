@@ -94,11 +94,11 @@
 //! Nothing is echoed from the request but the two identifiers the record was resolved
 //! against.
 //!
-//! The one thing it writes is what the CLOCK already made due: a domain whose `DELETING`
-//! span has elapsed is purged, and a job whose next status transition has fallen due is
-//! moved on (`advance_due_patient_insights_jobs`). Both were owed at this instant
-//! whether or not anybody called, so reading changes nothing a later caller would not
-//! have seen anyway.
+//! The one thing it writes is what the CLOCK already made due, through the single
+//! preamble every handler in this crate runs (`materialise_due`): a domain whose
+//! `DELETING` span has elapsed is purged, and a job whose next status transition has
+//! fallen due is moved on. Both were owed at this instant whether or not anybody called,
+//! so reading changes nothing a later caller would not have seen anyway.
 //!
 //! A `domainId` that names no live domain, and a `jobId` that names no job under it, are
 //! both the modelled `ResourceNotFoundException`: a job started in one domain is not
@@ -199,11 +199,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
-        // A reporting operation, so it writes only what the CLOCK already made due: a
-        // domain whose DELETING span has elapsed is purged, and a job whose next status
-        // transition has fallen due is moved on.
-        store.purge_due_deletions(now);
-        store.advance_due_patient_insights_jobs(now);
+        // A reporting operation, so the one write is the preamble every handler shares:
+        // everything the CLOCK already made due, which for this reader is the purge of a
+        // domain whose DELETING span has elapsed and the transition of a job whose next
+        // status has fallen due.
+        store.materialise_due(now);
 
         // One miss, one answer. The domain and the job are resolved as a single scoped
         // chain, so a job started in one domain cannot be read through another: the

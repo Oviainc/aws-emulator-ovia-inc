@@ -182,10 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
-        // A reporting operation, so it writes only what the CLOCK already made due: a
-        // domain whose DELETING span has elapsed is purged here, and its subscriptions
-        // and their sessions go with it.
-        store.purge_due_deletions(now);
+        // A reporting operation, so the one write is the preamble every handler shares:
+        // everything the CLOCK already made due, which for this reader means a domain
+        // whose DELETING span has elapsed is purged here, and its subscriptions and
+        // their sessions go with it.
+        store.materialise_due(now);
 
         // One miss, one answer. The domain, the subscription and the session are
         // resolved as a single scoped chain, so a session started under one subscription

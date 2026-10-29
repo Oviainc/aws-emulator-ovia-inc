@@ -176,9 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        // A reporting operation, so it writes only what the CLOCK already made due: a
-        // domain whose DELETING span has elapsed is purged and so is not listed.
-        store.purge_due_deletions(now);
+        // A reporting operation, so the one write is the preamble every handler shares:
+        // everything the CLOCK already made due, which for this listing means a domain
+        // whose DELETING span has elapsed is purged and so is not listed.
+        store.materialise_due(now);
 
         let mut matching = store
             .domains_owned_by(&region, &account_id)
