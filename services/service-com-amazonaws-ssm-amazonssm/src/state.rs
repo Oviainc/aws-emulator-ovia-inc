@@ -46,6 +46,10 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
+/// Whether a read may have a `SecureString`'s value decrypted for its caller, which is a
+/// decision the KMS key the value is sealed under makes rather than this service.
+pub mod secure_string;
+
 use crate::ops::types::{
     AttachmentInformation, DocumentDescription, DocumentParameter, DocumentRequires,
     InstanceInformation, InstanceProperty, Parameter, ParameterHistory, ParameterInlinePolicy,

@@ -102,6 +102,10 @@
 //! * `ParameterNotFound` (HTTP 400) — The parameter couldn't be found. Verify the name and
 //!   try again. For the DeleteParameter and GetParameter actions, if the specified parameter
 //!   doesn't exist, the ParameterNotFound exception is not recorded in CloudTrail event logs.
+//! * `AccessDeniedException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   "The requester doesn't have permissions to perform the requested operation", which is
+//!   what a `WithDecryption` read of a version whose KMS key does not permit the caller
+//!   `kms:Decrypt` is refused with (see [`crate::state::secure_string`]).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -117,9 +121,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssm-amazonssm.json");
 // here — hence the `GetParameterHistoryError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssm#GetParameterHistory")]
+//
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models it
+// ("The requester doesn't have permissions to perform the requested operation") and other
+// operations declare it, and it is the refusal a decrypt the version's KMS key does not
+// permit this caller answers with.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssm#GetParameterHistory",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum GetParameterHistoryErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerError(InternalServerError),
     InvalidKeyId(InvalidKeyId),
     InvalidNextToken(InvalidNextToken),
@@ -253,46 +266,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        let store = state.lock();
-        let Some(record) = store.parameter(&region, query.name) else {
-            return Err(not_found().into());
-        };
-        // A token this service issued names a version that was waiting when the previous
-        // page was served, so one naming a version past the newest this parameter has
-        // could start no page of its history and was not issued here. (A version
-        // retention has since displaced is not refused: the walk below resumes at the
-        // oldest version still retained at or after the token, so paging keeps making
-        // forward progress across a put that trimmed one.)
-        if resume_from.is_some_and(|from| record.latest().is_none_or(|last| from > last.version)) {
-            return Err(GetParameterHistoryErrorModeled::InvalidNextToken(InvalidNextToken {
-                message: Some(INVALID_NEXT_TOKEN.to_string()),
-            })
-            .into());
-        }
-
         // The retained versions, oldest first: that sequence IS the history of changes
         // to the parameter, and a version the store no longer retains is in no page of
         // it.
         //
         // `WithDecryption` asks for "decrypted values for secure string parameters". The
-        // store holds the value a put supplied, under the key alias that put recorded,
-        // and every parameter read in this crate reports that one stored value, so the
-        // flag changes nothing about which value this read reports.
-        let mut parameters = Vec::new();
-        let mut next_token = None;
-        for version in &record.versions {
-            if resume_from.is_some_and(|from| version.version < from) {
-                continue;
+        // store holds the value a put supplied, under the key that put recorded, and
+        // every parameter read in this crate reports that one stored value, so the flag
+        // changes nothing about WHICH value this read reports — what it selects is
+        // whether each reported `SecureString` version is opened under its own key, which
+        // that key's policy decides below.
+        //
+        // The store guard is released before the keys are asked, so no state of this
+        // service is held while KMS's decision is made.
+        let (parameters, next_token, decrypted) = {
+            let store = state.lock();
+            let Some(record) = store.parameter(&region, query.name) else {
+                return Err(not_found().into());
+            };
+            // A token this service issued names a version that was waiting when the
+            // previous page was served, so one naming a version past the newest this
+            // parameter has could start no page of its history and was not issued here.
+            // (A version retention has since displaced is not refused: the walk below
+            // resumes at the oldest version still retained at or after the token, so
+            // paging keeps making forward progress across a put that trimmed one.)
+            if resume_from
+                .is_some_and(|from| record.latest().is_none_or(|last| from > last.version))
+            {
+                return Err(GetParameterHistoryErrorModeled::InvalidNextToken(
+                    InvalidNextToken {
+                        message: Some(INVALID_NEXT_TOKEN.to_string()),
+                    },
+                )
+                .into());
             }
-            if parameters.len() == page_size {
-                // The page is full and a version is still waiting: hand the caller the
-                // version it resumes at, so the next request continues where this
-                // stopped.
-                next_token = Some(version.version.to_string());
-                break;
+
+            let mut parameters = Vec::new();
+            let mut decrypted = Vec::new();
+            let mut next_token = None;
+            for version in &record.versions {
+                if resume_from.is_some_and(|from| version.version < from) {
+                    continue;
+                }
+                if parameters.len() == page_size {
+                    // The page is full and a version is still waiting: hand the caller the
+                    // version it resumes at, so the next request continues where this
+                    // stopped.
+                    next_token = Some(version.version.to_string());
+                    break;
+                }
+                parameters.push(version.to_parameter_history(record));
+                decrypted.extend(crate::state::secure_string::decrypted_value(
+                    input.with_decryption,
+                    record,
+                    version,
+                ));
             }
-            parameters.push(version.to_parameter_history(record));
-        }
+            (parameters, next_token, decrypted)
+        };
+
+        crate::state::secure_string::authorize_decryption(&*self.engine, ctx, &region, &decrypted)
+            .map_err(|message| {
+                GetParameterHistoryErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message,
+                })
+            })?;
 
         Ok(GetParameterHistoryOutput {
             parameters: Some(parameters),

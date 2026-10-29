@@ -27,6 +27,10 @@ regex = "1.12"
 # `arn::parse_of`: the one parse a service reads a caller-supplied resource ARN with,
 # which `DescribeDocument`'s `DocumentARN` name may be.
 service-common = { path = "../common" }
+# A `SecureString`'s value is sealed under a key the KMS service holds: whether a read may
+# have it decrypted for its caller is that key's own policy decision, read through KMS's
+# own state accessors rather than from a second copy of them here.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 # `CreateDocument`'s content is "in JSON or YAML format", and the document's schema
 # version, description and parameters are read out of it. yaml-rust2 is a pure-Rust
 # YAML 1.2 implementation, and YAML 1.2 is a superset of JSON, so one parser reads

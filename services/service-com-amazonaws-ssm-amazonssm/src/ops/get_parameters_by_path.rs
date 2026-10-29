@@ -125,6 +125,10 @@
 //!   again.
 //! * `InvalidKeyId` (HTTP 400) — The query key ID isn't valid.
 //! * `InvalidNextToken` (HTTP 400) — The specified token isn't valid.
+//! * `AccessDeniedException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   "The requester doesn't have permissions to perform the requested operation", which is
+//!   what a `WithDecryption` read of a parameter whose KMS key does not permit the caller
+//!   `kms:Decrypt` is refused with (see [`crate::state::secure_string`]).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -140,9 +144,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssm-amazonssm.json");
 // here — hence the `GetParametersByPathError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssm#GetParametersByPath")]
+//
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models it
+// ("The requester doesn't have permissions to perform the requested operation") and other
+// operations declare it, and it is the refusal a decrypt the parameter's KMS key does not
+// permit this caller answers with.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssm#GetParametersByPath",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum GetParametersByPathErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerError(InternalServerError),
     InvalidFilterKey(InvalidFilterKey),
     InvalidFilterOption(InvalidFilterOption),
@@ -298,33 +311,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is what makes the resume cursor total.
         let recursive = input.recursive.unwrap_or(false);
         let region = request_region(ctx.parts());
-        let store = state.lock();
-        let mut parameters = Vec::new();
-        let mut next_token = None;
-        for (name, record) in store.parameters_of_region(&region) {
-            if resume_from.is_some_and(|from| name < from) {
-                continue;
+        // The store guard is released before the keys are asked, so no state of this
+        // service is held while KMS's decision is made.
+        let (parameters, next_token, decrypted) = {
+            let store = state.lock();
+            let mut parameters = Vec::new();
+            let mut decrypted = Vec::new();
+            let mut next_token = None;
+            for (name, record) in store.parameters_of_region(&region) {
+                if resume_from.is_some_and(|from| name < from) {
+                    continue;
+                }
+                if !is_under_path(name, path, recursive) {
+                    continue;
+                }
+                let Some(version) = select_version(record, filters) else {
+                    continue;
+                };
+                if !filters.iter().all(|filter| version_matches(version, filter)) {
+                    continue;
+                }
+                if parameters.len() == page_size {
+                    // The page is full and a parameter is still waiting: hand the caller
+                    // the name it resumes at, so the next request continues where this
+                    // stopped.
+                    next_token = Some(record.name.clone());
+                    break;
+                }
+                // The request named no `name:selector`, so the reported parameter carries
+                // none: a selector is "either the version number or the label used to
+                // retrieve the parameter value" (`Parameter$Selector`).
+                parameters.push(version.to_parameter(record, None));
+                decrypted.extend(crate::state::secure_string::decrypted_value(
+                    input.with_decryption,
+                    record,
+                    version,
+                ));
             }
-            if !is_under_path(name, path, recursive) {
-                continue;
-            }
-            let Some(version) = select_version(record, filters) else {
-                continue;
-            };
-            if !filters.iter().all(|filter| version_matches(version, filter)) {
-                continue;
-            }
-            if parameters.len() == page_size {
-                // The page is full and a parameter is still waiting: hand the caller the
-                // name it resumes at, so the next request continues where this stopped.
-                next_token = Some(record.name.clone());
-                break;
-            }
-            // The request named no `name:selector`, so the reported parameter carries
-            // none: a selector is "either the version number or the label used to
-            // retrieve the parameter value" (`Parameter$Selector`).
-            parameters.push(version.to_parameter(record, None));
-        }
+            (parameters, next_token, decrypted)
+        };
+
+        // A `WithDecryption` read has each reported `SecureString` opened under that
+        // parameter's own KMS key, so every one of those keys decides the read before any
+        // value is reported.
+        crate::state::secure_string::authorize_decryption(&*self.engine, ctx, &region, &decrypted)
+            .map_err(|message| {
+                GetParametersByPathErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message,
+                })
+            })?;
 
         Ok(GetParametersByPathOutput {
             parameters: Some(parameters),

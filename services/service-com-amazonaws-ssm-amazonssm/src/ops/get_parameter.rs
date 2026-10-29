@@ -12,11 +12,18 @@
 //! ## `WithDecryption` and `SecureString`
 //!
 //! This emulator holds no key material and encrypts nothing, so a `SecureString`'s value
-//! is reported exactly as `PutParameter` persisted it and `WithDecryption` selects
-//! nothing. The alternative — answering an undecrypted read with a ciphertext-shaped
-//! blob — would be inventing a value nothing computed, which is worse than reporting what
-//! is stored. For `String` and `StringList` the flag is ignored by the service too
-//! ("This flag is ignored for String and StringList parameter types").
+//! is reported exactly as `PutParameter` persisted it. What `WithDecryption` DOES select is
+//! whether this read has the value opened under the parameter's KMS key: a read that asks
+//! for the decrypted value of a `SecureString` is served only if that key's policy permits
+//! the caller `kms:Decrypt` under the encryption context binding the value to this
+//! parameter, and is otherwise refused with `AccessDeniedException` (HTTP 400) carrying
+//! KMS's own sentence — see [`crate::state::secure_string`]. For `String` and `StringList`
+//! the flag selects nothing, as it does for the service too ("This flag is ignored for
+//! String and StringList parameter types").
+//!
+//! Reporting an undecrypted read as a ciphertext-shaped blob would be inventing a value
+//! nothing computed, which is worse than reporting what is stored, so such a read reports
+//! the stored value.
 //!
 //! ## Parameters nobody created
 //!
@@ -109,6 +116,10 @@
 //!   doesn't exist, the ParameterNotFound exception is not recorded in CloudTrail event logs.
 //! * `ParameterVersionNotFound` (HTTP 400) — The specified parameter version wasn't found.
 //!   Verify the parameter name and version, and try again.
+//! * `AccessDeniedException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   "The requester doesn't have permissions to perform the requested operation", which is
+//!   what a `WithDecryption` read of a value whose KMS key does not permit the caller
+//!   `kms:Decrypt` is refused with.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -124,9 +135,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssm-amazonssm.json");
 // here — hence the `GetParameterError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssm#GetParameter")]
+//
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models it
+// ("The requester doesn't have permissions to perform the requested operation") and other
+// operations declare it, and it is the refusal a decrypt the parameter's KMS key does not
+// permit this caller answers with.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssm#GetParameter",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum GetParameterErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerError(InternalServerError),
     InvalidKeyId(InvalidKeyId),
     ParameterNotFound(ParameterNotFound),
@@ -230,27 +250,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found().into());
         }
 
-        let store = state.lock();
-        let Some(record) = store.parameter(&region, query.name) else {
-            return Err(not_found().into());
-        };
-        let Some(version) = record.select(query.selector) else {
-            // The parameter exists, so what the request named is a version or a label
-            // this parameter does not carry.
-            return Err(GetParameterErrorModeled::ParameterVersionNotFound(
-                ParameterVersionNotFound {
-                    message: Some(format!(
-                        "Parameter {} has no version or label '{}'",
-                        record.name,
-                        query.selector.unwrap_or_default()
-                    )),
-                },
+        // The store guard is released before the key is asked, so no state of this
+        // service is held while KMS's decision is made.
+        let (parameter, decrypted) = {
+            let store = state.lock();
+            let Some(record) = store.parameter(&region, query.name) else {
+                return Err(not_found().into());
+            };
+            let Some(version) = record.select(query.selector) else {
+                // The parameter exists, so what the request named is a version or a label
+                // this parameter does not carry.
+                return Err(GetParameterErrorModeled::ParameterVersionNotFound(
+                    ParameterVersionNotFound {
+                        message: Some(format!(
+                            "Parameter {} has no version or label '{}'",
+                            record.name,
+                            query.selector.unwrap_or_default()
+                        )),
+                    },
+                )
+                .into());
+            };
+            (
+                version.to_parameter(record, query.selector),
+                crate::state::secure_string::decrypted_value(
+                    input.with_decryption,
+                    record,
+                    version,
+                ),
             )
-            .into());
         };
 
+        // A `WithDecryption` read of a `SecureString` has its value opened under the
+        // parameter's own KMS key, so that key's policy decides the read before the value
+        // is reported.
+        crate::state::secure_string::authorize_decryption(
+            &*self.engine,
+            ctx,
+            &region,
+            decrypted.iter(),
+        )
+        .map_err(|message| {
+            GetParameterErrorModeled::AccessDeniedException(AccessDeniedException { message })
+        })?;
+
         Ok(GetParameterOutput {
-            parameter: Some(version.to_parameter(record, query.selector)),
+            parameter: Some(parameter),
         })
     }
 }

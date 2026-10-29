@@ -76,10 +76,12 @@
 //! account it belongs to, and one key per entry of the request's encryption context, beside
 //! the multi-valued key naming those entries. The encryption-context family is answered for
 //! as a WHOLE, so a clause over an entry the request does not carry is decided as absent
-//! rather than left undecided. Every other key is left unpublished, so a statement naming
-//! one stays undecided and the shared evaluator reads it fail-closed; `kms:ViaService` is
-//! one of those, because a request this emulator serves directly is made on no other
-//! service's behalf.
+//! rather than left undecided. `kms:ViaService` is answered for the requests that have a
+//! value for it — the ones another service makes on the caller's behalf, which name
+//! themselves through [`RequestedUse::through_service`] — and for a request a caller makes
+//! directly to this service there is no such value, so it is left unpublished there. Every
+//! other key is left unpublished too, so a statement naming one stays undecided and the
+//! shared evaluator reads it fail-closed.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
@@ -108,6 +110,12 @@ const ENCRYPTION_CONTEXT_KEY_FAMILY: &str = "kms:EncryptionContext:";
 /// with those specified in the policy" (KMS's own condition keys). A multi-valued key, so a
 /// statement decides it under one of IAM's set qualifiers.
 const ENCRYPTION_CONTEXT_KEYS_KEY: &str = "kms:EncryptionContextKeys";
+
+/// The condition key naming the service a request was made THROUGH: "kms:ViaService …
+/// limits use of a KMS key to requests from particular Amazon Web Services services" (KMS's
+/// own condition keys). Its value is that service's regional endpoint name, and only a
+/// request another service makes on a caller's behalf has one.
+const VIA_SERVICE_KEY: &str = "kms:ViaService";
 
 /// The most entries of a request's encryption context this gate copies out of the request
 /// to decide a condition over.
@@ -176,6 +184,10 @@ impl Caller {
 /// `EncryptionContextEquals` / `EncryptionContextSubset` constraint is judged against, which
 /// the `kms:` condition keys of a conditioned policy statement are decided against, and
 /// which an operation that takes none passes as `None`.
+///
+/// This is the decision for a request a caller made to this service DIRECTLY;
+/// [`authorize_use`] is the same decision for one another service makes on the caller's
+/// behalf.
 pub fn authorize(
     caller: &Caller,
     state: &super::ComAmazonawsKmsTrentserviceState,
@@ -185,6 +197,70 @@ pub fn authorize(
     context: Option<&HashMap<String, String>>,
     presented: Option<&[&super::Grant]>,
 ) -> Result<(), String> {
+    authorize_use(
+        caller,
+        state,
+        region,
+        key,
+        RequestedUse::direct(operation),
+        context,
+        presented,
+    )
+}
+
+/// What a request asks of a key: the KMS operation, and the AWS service the request
+/// arrived THROUGH, for one another service performs on the caller's behalf.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestedUse<'a> {
+    /// The KMS operation, without this service's `kms:` namespace.
+    operation: &'a str,
+    /// The regional endpoint name of the service the request arrived through, which is
+    /// the value of [`VIA_SERVICE_KEY`]; `None` for a request made to this service
+    /// directly, which has no value for that key.
+    via_service: Option<&'a str>,
+}
+
+impl<'a> RequestedUse<'a> {
+    /// `operation`, as a caller asked it of this service directly.
+    #[must_use]
+    pub fn direct(operation: &'a str) -> Self {
+        Self {
+            operation,
+            via_service: None,
+        }
+    }
+
+    /// `operation`, as another service performs it on the caller's behalf. `via_service`
+    /// is that service's regional endpoint name.
+    #[must_use]
+    pub fn through_service(operation: &'a str, via_service: &'a str) -> Self {
+        Self {
+            operation,
+            via_service: Some(via_service),
+        }
+    }
+}
+
+/// [`authorize`] for a use of the key that a request may have reached THROUGH another AWS
+/// service, which performs the cryptographic operation on the caller's behalf.
+///
+/// A statement scoped by `kms:ViaService` governs exactly the requests that arrive through
+/// the service it names, so the decision is made with the value
+/// [`RequestedUse::through_service`] carries; a request made to this service directly has
+/// no value for that key and is the whole of [`authorize`].
+pub fn authorize_use(
+    caller: &Caller,
+    state: &super::ComAmazonawsKmsTrentserviceState,
+    region: &str,
+    key: &super::Cmk,
+    requested: RequestedUse<'_>,
+    context: Option<&HashMap<String, String>>,
+    presented: Option<&[&super::Grant]>,
+) -> Result<(), String> {
+    let RequestedUse {
+        operation,
+        via_service,
+    } = requested;
     let action = format!("{}:{operation}", super::ARN_SERVICE);
 
     // The condition keys this request answers for: the values it carries, and the names it
@@ -192,7 +268,7 @@ pub fn authorize(
     // decided at all, and the evaluator's fail-closed reading would apply a `Deny` to
     // requests it does not cover — which is what a conditioned statement is written to
     // exclude.
-    let conditions = request_conditions(caller, context);
+    let conditions = request_conditions(caller, context, via_service);
     let request_context = conditions.carried.as_slice();
     let published = conditions.published.as_slice();
 
@@ -309,7 +385,7 @@ pub fn authorize_account_action(
     // scoped to a principal is read the same way whichever operation asks. An operation
     // that names no key takes no encryption context either, so the request carries no
     // entry of that family.
-    let conditions = request_conditions(caller, None);
+    let conditions = request_conditions(caller, None, None);
     let request = iam::Request::new(&action, &resource, &caller.principals)
         .with_context(&conditions.carried)
         .with_published_keys(&conditions.published);
@@ -394,9 +470,16 @@ struct RequestConditions {
 /// what this gate copies out of a request is bounded by that constant rather than by a
 /// count the caller chooses, and a statement conditioned on an encryption context stays
 /// undecided for such a request, which the shared evaluator reads fail-closed.
+///
+/// `via_service` is the service a request arrived THROUGH, `None` for one made to this
+/// service directly: a request that reaches the key through another service carries that
+/// service's endpoint name as the value of [`VIA_SERVICE_KEY`], and one made directly
+/// carries no value for it at all, so the key is not declared and a clause over it stays
+/// undecided rather than being decided as absent.
 fn request_conditions(
     caller: &Caller,
     context: Option<&HashMap<String, String>>,
+    via_service: Option<&str>,
 ) -> RequestConditions {
     let mut carried = Vec::new();
     let mut published = Vec::new();
@@ -423,6 +506,10 @@ fn request_conditions(
         }
         published.push(ENCRYPTION_CONTEXT_KEY_FAMILY);
         published.push(ENCRYPTION_CONTEXT_KEYS_KEY);
+    }
+    if let Some(via_service) = via_service {
+        carried.push((VIA_SERVICE_KEY.to_string(), via_service.to_string()));
+        published.push(VIA_SERVICE_KEY);
     }
     RequestConditions { carried, published }
 }
