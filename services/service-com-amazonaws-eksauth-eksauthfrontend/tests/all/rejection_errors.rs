@@ -9,8 +9,9 @@
 //! 1. whether the presented value is a JSON Web Token at all is decided from the VALUE,
 //!    before any state is read — so a value that is not a JWT is the modeled
 //!    `InvalidTokenException` (400) whether or not the cluster the URI names exists,
-//!    while a well-formed token against an unregistered cluster is still the modeled
-//!    `ResourceNotFoundException` (404);
+//!    and the key id a readable header names is then resolved through the OIDC provider
+//!    of the cluster the request names, which a cluster that is not registered does not
+//!    have — so that request too is answered on its token;
 //! 2. every refusal of a value against a constraint the MODEL declares is this service's
 //!    own `InvalidParameterException` (400) — the shape the model lists — and not the
 //!    framework's `ValidationException`, which this service's model does not declare;
@@ -27,7 +28,7 @@
 
 use service_com_amazonaws_eksauth_eksauthfrontend::state::{
     decode_jwt_segment, encode_jwt_segment, parse_service_account_token, JwtSegment,
-    TokenMalformation, REQUIRED_JOSE_HEADERS, TOKEN_SIGNING_ALGORITHM,
+    TokenMalformation, TOKEN_SIGNING_ALGORITHM,
 };
 
 use crate::assume_role_for_pod_identity::{Harness, SEEDS};
@@ -228,6 +229,8 @@ fn only_three_json_segments_with_the_required_headers_parse_as_a_token() {
             TokenMalformation::NotJson(JwtSegment::Claims),
         ),
         (
+            // Absent, `null`, empty and blank all name no key, so all four are the same
+            // report: the header is missing.
             "no kid header",
             token_with_header(serde_json::json!({ "alg": "RS256", "typ": "JWT" })),
             TokenMalformation::MissingHeader("kid"),
@@ -235,22 +238,24 @@ fn only_three_json_segments_with_the_required_headers_parse_as_a_token() {
         (
             "an empty kid header",
             token_with_header(serde_json::json!({ "alg": "RS256", "kid": "" })),
-            TokenMalformation::InvalidHeader("kid"),
-        ),
-        (
-            "a kid header that is not a string",
-            token_with_header(serde_json::json!({ "alg": "RS256", "kid": 42 })),
-            TokenMalformation::InvalidHeader("kid"),
+            TokenMalformation::MissingHeader("kid"),
         ),
         (
             "a kid header that is JSON null",
             token_with_header(serde_json::json!({ "alg": "RS256", "kid": null })),
-            TokenMalformation::InvalidHeader("kid"),
+            TokenMalformation::MissingHeader("kid"),
         ),
         (
             "a blank kid header",
             token_with_header(serde_json::json!({ "alg": "RS256", "kid": "   " })),
-            TokenMalformation::InvalidHeader("kid"),
+            TokenMalformation::MissingHeader("kid"),
+        ),
+        (
+            // A member no key id could ever be: the header object does not read as a
+            // JOSE header at all, so the value did not parse.
+            "a kid header that is not a string",
+            token_with_header(serde_json::json!({ "alg": "RS256", "kid": 42 })),
+            TokenMalformation::NotJoseHeader,
         ),
         (
             "a kid that is one character short of a key id",
@@ -282,22 +287,31 @@ fn only_three_json_segments_with_the_required_headers_parse_as_a_token() {
             TokenMalformation::InvalidHeader("kid"),
         ),
         (
+            // A JOSE header names its algorithm as a string, so one holding anything
+            // else is not a JOSE header: the value did not parse.
             "an alg header that is a JSON object",
             token_with_header(serde_json::json!({
                 "alg": { "name": "RS256" },
                 "kid": key_id(1),
             })),
-            TokenMalformation::InvalidHeader("alg"),
+            TokenMalformation::NotJoseHeader,
         ),
         (
             "no alg header",
             token_with_header(serde_json::json!({ "kid": key_id(1), "typ": "JWT" })),
-            TokenMalformation::MissingHeader("alg"),
+            TokenMalformation::NotJoseHeader,
         ),
         (
-            "neither required header",
+            "neither header",
             token_with_header(serde_json::json!({ "typ": "JWT" })),
-            TokenMalformation::MissingHeader("alg"),
+            TokenMalformation::NotJoseHeader,
+        ),
+        (
+            // A readable header naming an algorithm no cluster signs with: the shallower
+            // layers are past, so this one is reported.
+            "an alg header naming another algorithm",
+            token_with_header(serde_json::json!({ "alg": "HS256", "kid": key_id(1) })),
+            TokenMalformation::InvalidHeader("alg"),
         ),
     ];
 
@@ -332,13 +346,6 @@ fn only_three_json_segments_with_the_required_headers_parse_as_a_token() {
         parse_service_account_token(&padded).is_ok(),
         "a padded token must parse, got {:?}",
         parse_service_account_token(&padded)
-    );
-    // The parse is about form only: it says nothing about audience, lifetime or who
-    // issued the token, so a token no cluster ever issued still parses.
-    assert_eq!(
-        REQUIRED_JOSE_HEADERS,
-        ["alg", "kid"],
-        "the required JOSE headers are the ones JWS mandates"
     );
 }
 
@@ -424,9 +431,10 @@ async fn a_token_that_is_not_a_jwt_is_invalid_for_every_cluster_name() {
         }
     }
 
-    // A token that is MISSING A NAMED HEADER says which one, and one whose named header
-    // holds something that is not a value for it says that instead — because those are
-    // different things for the caller to fix.
+    // Each layer of reading the header has its own message, because each names a
+    // different thing for the caller to fix: a header that does not read as a JOSE
+    // header did not parse, a header naming an algorithm or a key this service cannot
+    // use is invalid, and one naming nothing at all is missing.
     let header_cases: &[(&str, serde_json::Value, &str)] = &[
         (
             "kid absent",
@@ -436,27 +444,27 @@ async fn a_token_that_is_not_a_jwt_is_invalid_for_every_cluster_name() {
         (
             "alg absent",
             serde_json::json!({ "kid": key_id(1), "typ": "JWT" }),
-            "has missing header - alg.",
+            "Failed to parse the token included in the request.",
         ),
         (
             "kid empty",
             serde_json::json!({ "alg": "RS256", "kid": "" }),
-            "has invalid header - kid.",
+            "has missing header - kid.",
         ),
         (
             "kid not a string",
             serde_json::json!({ "alg": "RS256", "kid": 42 }),
-            "has invalid header - kid.",
+            "Failed to parse the token included in the request.",
         ),
         (
             "kid blank",
             serde_json::json!({ "alg": "RS256", "kid": "  " }),
-            "has invalid header - kid.",
+            "has missing header - kid.",
         ),
         (
             "kid null",
             serde_json::json!({ "alg": "RS256", "kid": null }),
-            "has invalid header - kid.",
+            "has missing header - kid.",
         ),
         (
             "kid not a key id",
@@ -466,6 +474,11 @@ async fn a_token_that_is_not_a_jwt_is_invalid_for_every_cluster_name() {
         (
             "alg not a string",
             serde_json::json!({ "alg": false, "kid": key_id(1) }),
+            "Failed to parse the token included in the request.",
+        ),
+        (
+            "alg naming another algorithm",
+            serde_json::json!({ "alg": "HS256", "kid": key_id(1) }),
             "has invalid header - alg.",
         ),
     ];
@@ -486,12 +499,14 @@ async fn a_token_that_is_not_a_jwt_is_invalid_for_every_cluster_name() {
     }
 }
 
-/// The OTHER half of rule 1: deciding the token's form first does not swallow the
-/// cluster lookup. A well-formed token against an unregistered cluster is still the
-/// modeled 404, and against the registered cluster it is judged on what that cluster
-/// issued.
+/// The OTHER half of rule 1: deciding the token's form first does not swallow the state
+/// the request is judged against. A readable header's `kid` is resolved through the OIDC
+/// provider of the cluster the request NAMES, so a key id that cluster does not publish
+/// — including every key id against a cluster that is not registered, which publishes
+/// none — is the invalid-`kid` refusal, and the cluster the key DOES resolve against then
+/// judges the token on its own record of what it issued.
 #[tokio::test]
-async fn a_well_formed_token_still_resolves_the_cluster() {
+async fn a_readable_header_is_resolved_against_the_named_cluster() {
     let harness = Harness::seeded();
     let cluster_key_id = harness.signing_key_id(CLUSTER);
 
@@ -499,26 +514,53 @@ async fn a_well_formed_token_still_resolves_the_cluster() {
         let reply = assume(&harness, cluster, &token_for_key(&cluster_key_id)).await;
         assert_eq!(
             reply.verdict(),
-            "404 ResourceNotFoundException",
-            "case {cluster:?}: an unregistered cluster is still not found, got {reply:?}"
+            "400 InvalidTokenException",
+            "case {cluster:?}: an unregistered cluster publishes no key the header could \
+             name, got {reply:?}"
         );
+        assert!(
+            reply.message.contains("has invalid header - kid."),
+            "case {cluster:?}: the refusal must name the header that resolves to no key, \
+             got {:?}",
+            reply.message
+        );
+        // Whether that cluster exists is not reported to a caller holding none of its
+        // key material. (Checked on the names long enough that the comparison is about
+        // the name rather than about one of its characters.)
+        if cluster.len() > 1 {
+            assert!(
+                !reply.body.contains(cluster),
+                "case {cluster:?}: the cluster name reached the response {}",
+                reply.body
+            );
+        }
     }
 
-    // Registered: the token's form is fine, so the verdict comes from the cluster's
-    // record of what it issued.
+    // Registered, and the header names the key it publishes: the token's form is fine, so
+    // the verdict comes from the cluster's record of what it issued.
     let reply = assume(&harness, CLUSTER, &token_for_key(&cluster_key_id)).await;
     assert_eq!(
         reply.verdict(),
         "400 InvalidTokenException",
         "a token this cluster did not issue is invalid, got {reply:?}"
     );
-    // A token whose `kid` is a key id this cluster does not publish is refused as
-    // invalid, not reported as a missing cluster.
+    assert!(
+        !reply.message.contains("header"),
+        "a token whose header reads and resolves is not refused on its header, got {:?}",
+        reply.message
+    );
+    // A token whose `kid` is a key id this cluster does not publish is refused on that
+    // header, not reported as a missing cluster.
     let reply = assume(&harness, CLUSTER, &token_for_key(&key_id(9))).await;
     assert_eq!(
         reply.verdict(),
         "400 InvalidTokenException",
         "a token naming an unknown signing key is invalid, got {reply:?}"
+    );
+    assert!(
+        reply.message.contains("has invalid header - kid."),
+        "a key id the cluster does not publish is the invalid-kid refusal, got {:?}",
+        reply.message
     );
     // And the token the cluster DID issue is exchanged.
     let token = harness.token(&SEEDS[0]);
@@ -744,8 +786,9 @@ async fn a_constraint_refusal_is_the_modeled_invalid_parameter_failure() {
     }
 
     // The published bounds of the cluster-name length: 1 and 100 characters are inside
-    // the constraint, so they are answered from state (the cluster is not registered)
-    // rather than refused as parameters.
+    // the constraint, so they are answered from state (no cluster is registered under
+    // either name, so neither publishes the key the token's header names) rather than
+    // refused as parameters.
     for characters in [1_usize, 100] {
         let cluster = "c".repeat(characters);
         let reply = post(
@@ -756,7 +799,7 @@ async fn a_constraint_refusal_is_the_modeled_invalid_parameter_failure() {
         .await;
         assert_eq!(
             reply.verdict(),
-            "404 ResourceNotFoundException",
+            "400 InvalidTokenException",
             "case {characters} characters: a name inside the bound is looked up, got {reply:?}"
         );
     }

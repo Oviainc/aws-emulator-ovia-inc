@@ -475,20 +475,28 @@ async fn the_worker_node_members_are_recorded_on_the_session() {
     }
 }
 
-/// An unregistered cluster is not found — the label is looked up in state, whatever it
-/// says.
+/// An unregistered cluster publishes no signing key, so a token presented against one is
+/// answered on the key its header names and never on whether that cluster exists — the
+/// label is looked up in state, and a caller holding none of that cluster's key material
+/// is told about its token.
 #[tokio::test]
-async fn an_unregistered_cluster_is_not_found() {
+async fn an_unregistered_cluster_is_answered_on_the_token() {
     let harness = Harness::seeded();
     let token = harness.token(&SEEDS[0]);
     // Every name here satisfies the modeled `clusterName` pattern and length, so the
-    // 404 comes from state, not from the boundary validator.
+    // refusal comes from state, not from the boundary validator.
     for cluster in ["no-such-cluster", "demo-cluster2", "DEMO-CLUSTER", "0", "prod2"] {
         let (status, body) = harness.assume(cluster, &token).await;
         assert_eq!(
             error_code(status, &body),
-            "404 ResourceNotFoundException",
-            "case {cluster:?}: expected the modeled 404, got {status} {body}"
+            "400 InvalidTokenException",
+            "case {cluster:?}: expected the modeled token refusal, got {status} {body}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some("The token included in the request has invalid header - kid."),
+            "case {cluster:?}: the refusal must name the header that resolves to no key, \
+             got {status} {body}"
         );
     }
 }

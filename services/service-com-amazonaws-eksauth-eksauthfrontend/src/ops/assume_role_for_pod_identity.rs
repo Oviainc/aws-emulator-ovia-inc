@@ -10,12 +10,17 @@
 //! Every output member is computed from state (see [`crate::state`]):
 //!
 //! 1. the `token` must be a JSON Web Token — three base64url segments, a JOSE header
-//!    that is a JSON object carrying the headers JWS requires, and a claim set —
-//!    otherwise `InvalidTokenException` (400). This is a question about the VALUE, so it
-//!    is answered BEFORE any state is read: a token that is not a JWT is refused as such
-//!    whether or not the cluster the URI names exists;
-//! 2. the cluster named by the `clusterName` label must be registered — otherwise
-//!    `ResourceNotFoundException` (404);
+//!    that is a JSON object naming the algorithm and the key the token was signed with,
+//!    and a claim set — otherwise `InvalidTokenException` (400). This is a question about
+//!    the VALUE, so it is answered BEFORE any state is read: a token that is not a JWT is
+//!    refused as such whether or not the cluster the URI names exists;
+//! 2. the `kid` the header names must resolve to a key the OIDC provider of the cluster
+//!    named by the `clusterName` label publishes — otherwise the header names no key and
+//!    the answer is `InvalidTokenException` (400) again. Resolving the key id is the last
+//!    layer of reading the header, so it is answered before anything is reported about
+//!    the cluster itself; a cluster that is not registered publishes no keys, so a caller
+//!    holding no key material of that cluster learns nothing about whether it exists, and
+//!    the modelled `ResourceNotFoundException` (404) is reachable by no request;
 //! 3. the token must be one that cluster issued for the pod identity audience and still
 //!    within its lifetime — otherwise `ExpiredTokenException` or `InvalidTokenException`
 //!    (400), decided by the cluster's own record of what it issued, never by inspecting
@@ -119,7 +124,7 @@ use super::types::*;
 
 use crate::state::{
     parse_service_account_token, PodIdentitySession, ServiceAccountIdentity, TokenMalformation,
-    TokenRejection, PODS_AUDIENCE, SESSION_DURATION,
+    TokenRejection, KEY_ID_HEADER, PODS_AUDIENCE, SESSION_DURATION,
 };
 use emulator_server::aws_credentials::{AWS_SESSION, SECRET_ACCESS_KEY, SESSION_TOKEN};
 use std::time::SystemTime;
@@ -247,21 +252,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // key, and its associations.
         let (association, identity) = {
             let guard = state.lock();
-            let cluster = guard.cluster(&input.cluster_name).ok_or_else(|| {
-                refused(
-                    &caller_akid,
-                    &input.cluster_name,
-                    "ResourceNotFoundException",
-                );
-                AssumeRoleForPodIdentityErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "The cluster {} does not exist.",
-                            input.cluster_name
-                        )),
-                    },
-                )
-            })?;
+            // RESOLVING THE KEY THE HEADER NAMES is the last layer of reading that
+            // header: a `kid` is resolved through the OIDC provider of the cluster the
+            // request names, and a cluster that is not registered publishes no keys at
+            // all, so no key id resolves there. Either way the answer is about the
+            // token's header — never a report of whether that cluster exists, which a
+            // caller holding none of its key material has not shown it may learn.
+            let cluster = guard
+                .cluster(&input.cluster_name)
+                .filter(|cluster| cluster.publishes_signing_key(&token_headers.key_id))
+                .ok_or_else(|| {
+                    refused(&caller_akid, &input.cluster_name, "InvalidTokenException");
+                    malformed_token(TokenMalformation::InvalidHeader(KEY_ID_HEADER))
+                })?;
             let identity = cluster
                 .verify_service_account_token(&input.token, &token_headers, now)
                 .map_err(|rejection| {
@@ -395,25 +398,27 @@ fn refused(caller_akid: &str, cluster_name: &str, error_code: &str) {
     );
 }
 
-/// How a value that is not a JSON Web Token is reported: the modeled invalid-token
-/// failure.
+/// How a token this service cannot read is reported: the modeled invalid-token failure.
 ///
-/// The caller is told WHICH JOSE header it left out, and which one it filled in with
-/// something that is not a value for that header, because those name the one thing it
-/// has to change; every other way a value can fail to be a token is one answer, "it
-/// could not be parsed", since the caller's fix is the same and the segment that failed
-/// is a detail of the parse. Which part it was goes to the log instead.
+/// Each layer of the read has its own message, so two tokens that are wrong in different
+/// ways are told apart by the one thing each has to change. The caller is told WHICH JOSE
+/// header names nothing, and which one names something this service cannot use; every way
+/// a value fails to be a readable JWT at all — its length, its segments, their encoding,
+/// a segment that is not a JSON object, a header object that is not a JOSE header — is
+/// one answer, "it could not be parsed", since the caller's fix is the same and the part
+/// that failed is a detail of the parse. Which part it was goes to the log instead.
 ///
 /// NO PART OF THE TOKEN IS INTERPOLATED. `token` is `@sensitive` and carries a
 /// credential, and an error body is logged by the clients that read it, so the message
-/// states the rule the value broke and never the value.
+/// states the rule the value broke and never the value: the only thing interpolated is
+/// the name of a header member.
 fn malformed_token(malformation: TokenMalformation) -> AssumeRoleForPodIdentityError {
     // The malformation is derived from the token's FORM, not from its characters, so it
     // carries no part of the value.
     ::tracing::info!(
         operation = "AssumeRoleForPodIdentity",
         malformation = ?malformation,
-        "refused a service account token that is not a JSON Web Token"
+        "refused a service account token this service cannot read"
     );
     let message = match malformation {
         TokenMalformation::MissingHeader(name) => {
@@ -425,7 +430,8 @@ fn malformed_token(malformation: TokenMalformation) -> AssumeRoleForPodIdentityE
         TokenMalformation::Length
         | TokenMalformation::Segments
         | TokenMalformation::Encoding(_)
-        | TokenMalformation::NotJson(_) => {
+        | TokenMalformation::NotJson(_)
+        | TokenMalformation::NotJoseHeader => {
             "Failed to parse the token included in the request.".to_string()
         }
     };

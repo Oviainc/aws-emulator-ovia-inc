@@ -80,14 +80,20 @@ pub fn decode_jwt_segment(segment: &str) -> Option<Vec<u8>> {
     ::aws_smithy_types::base64::decode(&standard).ok()
 }
 
-/// The JOSE header parameters a service account token must carry, in the order they are
-/// reported absent: `alg` names the signature algorithm (RFC 7515 §4.1.1, the one header
-/// JWS makes mandatory) and `kid` names the key it was signed with (§4.1.4), which a
-/// Kubernetes API server always sets because its OIDC provider publishes several.
-pub const REQUIRED_JOSE_HEADERS: &[&str] = &["alg", "kid"];
+/// The JOSE header parameter JWS makes mandatory (RFC 7515 §4.1.1): `alg` names the
+/// algorithm the signature was produced with. A header object that does not carry it as a
+/// string is not a JOSE header at all, so it cannot be read rather than being a header
+/// with something to fix.
+pub const ALGORITHM_HEADER: &str = "alg";
+
+/// The JOSE header parameter naming the key a token was signed with (RFC 7515 §4.1.4),
+/// which a Kubernetes API server always sets so a verifier can select the key out of the
+/// set its OIDC provider publishes.
+pub const KEY_ID_HEADER: &str = "kid";
 
 /// The algorithm a cluster's Kubernetes API server signs projected service account
-/// tokens with, as the `alg` header of the tokens this module mints.
+/// tokens with, as the `alg` header of the tokens this module mints — and the only value
+/// a presented token's `alg` may name, since no cluster publishes a key for any other.
 pub const TOKEN_SIGNING_ALGORITHM: &str = "RS256";
 
 /// Bytes in the signature segment of a minted token.
@@ -459,6 +465,20 @@ impl Cluster {
         Some(token)
     }
 
+    /// Whether `key_id` names a key this cluster's OIDC provider publishes — resolving a
+    /// presented token's `kid` through this cluster's JWKS.
+    ///
+    /// This cluster publishes exactly one key, [`Self::signing_key_id`], the one its
+    /// Kubernetes API server signs projected tokens with, so resolution is that one
+    /// comparison. A key id is resolved against the provider of the cluster the request
+    /// names, so a key id this cluster does not publish names no key for that request
+    /// even when another cluster publishes it. It identifies a key; it does not
+    /// authenticate the token, which [`Self::verify_service_account_token`] does from
+    /// this cluster's record.
+    pub fn publishes_signing_key(&self, key_id: &str) -> bool {
+        self.signing_key_id == key_id
+    }
+
     /// Report whose service account `token` names, as of `now`.
     ///
     /// A token is accepted only when it names this cluster's signing key, THIS cluster
@@ -478,7 +498,7 @@ impl Cluster {
         headers: &JoseHeaders,
         now: SystemTime,
     ) -> Result<ServiceAccountIdentity, TokenRejection> {
-        if headers.key_id != self.signing_key_id {
+        if !self.publishes_signing_key(&headers.key_id) {
             return Err(TokenRejection::Invalid);
         }
         let issued = self
@@ -676,22 +696,47 @@ pub enum TokenMalformation {
     Encoding(JwtSegment),
     /// A segment that must be JSON does not decode to a JSON object.
     NotJson(JwtSegment),
-    /// A JOSE header JWS requires is not a member of the header object at all.
+    /// The header segment IS a JSON object, but not a JOSE header: the one parameter JWS
+    /// makes mandatory ([`ALGORITHM_HEADER`]) is absent or is not a string, or the
+    /// [`KEY_ID_HEADER`] the object does carry holds a JSON value that could never be a
+    /// key id (anything other than a string or `null`).
+    ///
+    /// A value whose header cannot be read as a JOSE header at all is not a token whose
+    /// header has something to fix: it did not parse, so it is reported as the parse
+    /// failure the other structural variants are.
+    NotJoseHeader,
+    /// A JOSE header this service requires names nothing: it is absent from the header
+    /// object, or it is there holding `null`, the empty string or whitespace only, each
+    /// of which selects nothing and is therefore the same as absent.
     MissingHeader(&'static str),
-    /// A JOSE header JWS requires is a member of the header object but holds nothing it
-    /// could name: a header naming an algorithm or a key is a non-blank string, so every
-    /// other JSON value — a number, a boolean, `null`, an array, an object, the empty or
-    /// blank string — names neither; and a `kid` outside the form every key id takes
-    /// ([`is_signing_key_id`]) names no key either.
+    /// A JOSE header is there and names something, but not something this service can
+    /// use: an `alg` other than [`TOKEN_SIGNING_ALGORITHM`], or a `kid` that resolves to
+    /// no key — one outside the form every key id takes ([`is_signing_key_id`]), or one
+    /// no cluster's OIDC provider publishes.
     InvalidHeader(&'static str),
 }
 
 /// Read `token` as a JSON Web Token and report its JOSE header.
 ///
 /// A JWT is three base64url segments joined by `.`: a header and a claim set, each
-/// base64url-encoded JSON, and a signature. This checks exactly that form and the header
-/// parameters JWS requires ([`REQUIRED_JOSE_HEADERS`]) — never who the token names, which
-/// is [`Cluster::verify_service_account_token`]'s question and is answered from state.
+/// base64url-encoded JSON, and a signature. This checks exactly that form and then the
+/// JOSE header, layer by layer, from the shallowest defect to the deepest, so a header
+/// that is wrong in several ways is always reported on the shallowest one:
+///
+/// 1. the header segment must read as a JOSE header at all — a JSON object whose `alg` is
+///    there and is a string, and whose `kid`, if it carries one, is a string or `null` —
+///    otherwise it did not parse ([`TokenMalformation::NotJoseHeader`]);
+/// 2. `alg` must name the algorithm clusters sign projected tokens with
+///    ([`TOKEN_SIGNING_ALGORITHM`]), otherwise it names a signature nothing here produces;
+/// 3. `kid` must name something — absent, `null`, empty and blank all name nothing, so all
+///    four are the missing header;
+/// 4. `kid` must have the form every key id in a JWKS takes ([`is_signing_key_id`]); a
+///    value outside it resolves to no key under any provider, which is the part of
+///    resolving a key id that needs no state.
+///
+/// Never who the token names, which is [`Cluster::verify_service_account_token`]'s
+/// question, and never WHICH provider publishes the key it names, which is
+/// [`Cluster::publishes_signing_key`]'s.
 ///
 /// Reads NOTHING from state and nothing about any cluster, so the answer is the same for
 /// every cluster name a request could carry, registered or not.
@@ -718,40 +763,48 @@ pub fn parse_service_account_token(token: &str) -> Result<JoseHeaders, TokenMalf
     let _ = json_segment(claims, JwtSegment::Claims)?;
     decode_jwt_segment(signature).ok_or(TokenMalformation::Encoding(JwtSegment::Signature))?;
 
-    // Reported in the order `REQUIRED_JOSE_HEADERS` lists them, so a token missing
-    // several is always reported on the same one. A header that is not there at all is a
-    // different report from one that is there holding something it cannot be: the first
-    // tells the caller to add it, the second to fix it.
-    for name in REQUIRED_JOSE_HEADERS {
-        match header.get(*name) {
-            None => return Err(TokenMalformation::MissingHeader(name)),
-            Some(_)
-                if !string_header(&header, name)
-                    .is_some_and(|value| header_value_is_usable(name, value)) =>
-            {
-                return Err(TokenMalformation::InvalidHeader(name))
-            }
-            Some(_) => {}
-        }
+    // LAYER 1, the structural parse of the header itself: a JOSE header names the
+    // algorithm its signature was produced with, so an object that does not carry `alg`
+    // as a string is not one, and the value is reported as unparseable rather than as a
+    // header with a member to fix.
+    let Some(algorithm) = header
+        .get(ALGORITHM_HEADER)
+        .and_then(::serde_json::Value::as_str)
+    else {
+        return Err(TokenMalformation::NotJoseHeader);
+    };
+    // `kid` is read the same way, one value apart: `null` names nothing, which is what an
+    // absent member names too, so it falls to the missing-header layer below; any other
+    // non-string value is a member no key id could ever be, so the header does not read.
+    match header.get(KEY_ID_HEADER) {
+        None | Some(::serde_json::Value::Null) | Some(::serde_json::Value::String(_)) => {}
+        Some(_) => return Err(TokenMalformation::NotJoseHeader),
     }
-    Ok(JoseHeaders {
-        algorithm: string_header(&header, "alg").unwrap_or_default().to_string(),
-        key_id: string_header(&header, "kid").unwrap_or_default().to_string(),
-    })
-}
 
-/// Whether `value` is something the JOSE header `name` can hold.
-///
-/// `kid` names a key, and a key id has a form every Kubernetes API server derives the
-/// same way ([`is_signing_key_id`]), so a value outside it names no key anywhere and is
-/// not a key id. `alg` only has to name an algorithm: WHICH algorithms a cluster signs
-/// with is a property of that cluster's keys rather than of the presented value, so it is
-/// not judged here.
-fn header_value_is_usable(name: &str, value: &str) -> bool {
-    match name {
-        "kid" => is_signing_key_id(value),
-        _ => true,
+    // LAYER 2: a cluster's Kubernetes API server signs projected service account tokens
+    // with exactly one algorithm, so a header naming any other names a signature no
+    // cluster's OIDC provider publishes a key for.
+    if algorithm != TOKEN_SIGNING_ALGORITHM {
+        return Err(TokenMalformation::InvalidHeader(ALGORITHM_HEADER));
     }
+
+    // LAYER 3: the header has to name a key. Absent, `null`, empty and blank all name
+    // nothing — no key is selected by blank space — so each is the same report: add it.
+    let Some(key_id) = string_header(&header, KEY_ID_HEADER) else {
+        return Err(TokenMalformation::MissingHeader(KEY_ID_HEADER));
+    };
+
+    // LAYER 4, the part of resolving a key id that needs no state: a value outside the
+    // form every key id in a JWKS takes names no key under any OIDC provider, so it is a
+    // `kid` to fix. WHICH provider publishes a well-formed one is state's answer.
+    if !is_signing_key_id(key_id) {
+        return Err(TokenMalformation::InvalidHeader(KEY_ID_HEADER));
+    }
+
+    Ok(JoseHeaders {
+        algorithm: algorithm.to_string(),
+        key_id: key_id.to_string(),
+    })
 }
 
 /// A JOSE header parameter that has to be a non-blank string. A parameter of any other
