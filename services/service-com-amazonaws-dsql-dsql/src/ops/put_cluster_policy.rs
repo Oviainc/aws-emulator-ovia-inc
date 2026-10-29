@@ -194,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.identifier.clone(),
             input.policy.clone(),
             input.bypass_policy_lockout_safety_check.to_string(),
-            input.expected_policy_version.clone().unwrap_or_default(),
+            crate::state::fingerprint_optional(input.expected_policy_version.as_deref()),
         ]);
         if let Some(token) = input.client_token.as_deref() {
             match state

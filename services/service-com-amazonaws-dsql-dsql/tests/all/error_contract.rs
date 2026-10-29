@@ -29,7 +29,10 @@ fn arn_not_found_message(arn: &str) -> String {
 const TAG_MAP_MAX_ENTRIES: usize = TAG_MAP_MAX;
 
 /// The message a token reused for a different request is refused with.
-const CLIENT_TOKEN_MISMATCH: &str =
+///
+/// Shared with `tests/all/client_token_parameter_distinctness.rs`, which refuses
+/// the same reuse over the members a fingerprint renders.
+pub(crate) const CLIENT_TOKEN_MISMATCH: &str =
     "Requests using a client token should supply identical request parameters";
 
 /// A `targetDefinition` naming a Kinesis stream and a role in `account`.

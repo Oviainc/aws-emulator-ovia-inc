@@ -668,18 +668,60 @@ impl TokenLedger {
 /// lists sorted) and this hashes them into one comparable value. Hashed rather
 /// than stored verbatim so a ledger entry's size does not grow with the request
 /// it describes.
+///
+/// Two requests that differ in ANY member they carry must hash differently, so
+/// the parts are rendered by [`fingerprint_sequence`] — and so is every part that
+/// stands for more than one value ([`fingerprint_tags`],
+/// [`fingerprint_multi_region`], [`fingerprint_target`]) or for a member that may
+/// be absent ([`fingerprint_optional`]).
 pub fn request_fingerprint(parts: &[String]) -> String {
+    fingerprint_sequence(parts)
+}
+
+/// Render a SEQUENCE of values into one fingerprint value that no other sequence
+/// of values renders to.
+///
+/// This is the rule [`request_fingerprint`] states for a request's parts, and it
+/// holds one level down too: a member whose value is composite — a map, a list, a
+/// structure, a union — is itself a sequence of values, and joining those values
+/// with a separator character the values themselves may carry renders two
+/// DIFFERENT composites alike. Each value is length-prefixed instead, so the
+/// rendering is decided by the values and nothing else, and the digest that comes
+/// out is fixed-width, so it can be handed back in as one value of an enclosing
+/// sequence.
+pub fn fingerprint_sequence<I>(values: I) -> String
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
     let mut hasher = Sha256::new();
-    for part in parts {
-        // The length prefix keeps the parts unambiguous: without it
+    for value in values {
+        let value = value.as_ref();
+        // The length prefix keeps the values unambiguous: without it
         // ["a", "bc"] and ["ab", "c"] hash alike.
-        hasher.update((part.len() as u64).to_be_bytes());
-        hasher.update(part.as_bytes());
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
     }
     ::hex::encode(hasher.finalize())
 }
 
+/// Render an OPTIONAL value into one fingerprint value, so a request that omits
+/// the member and a request that carries it empty are not read as one request:
+/// the empty rendering is reserved for the absent member, and a member that IS
+/// there renders as a digest, which is never empty.
+pub fn fingerprint_optional<S: AsRef<str>>(value: Option<S>) -> String {
+    match value {
+        None => String::new(),
+        Some(value) => fingerprint_sequence([value]),
+    }
+}
+
 /// Render a tag map into one fingerprint part, in key order.
+///
+/// A key and its value are two values of the sequence rather than one joined
+/// string: `TagKey` and `TagValue` both admit `=` (`smithy_query(query="shape",
+/// shape="TagKey,TagValue")`), so a joined rendering would read two different
+/// maps as the same one.
 pub fn fingerprint_tags(tags: Option<&std::collections::HashMap<String, String>>) -> String {
     let sorted: BTreeMap<&str, &str> = tags
         .map(|tags| {
@@ -688,33 +730,31 @@ pub fn fingerprint_tags(tags: Option<&std::collections::HashMap<String, String>>
                 .collect()
         })
         .unwrap_or_default();
-    sorted
-        .into_iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join(",")
+    fingerprint_sequence(sorted.into_iter().flat_map(|(key, value)| [key, value]))
 }
 
 /// Render `multiRegionProperties` into one fingerprint part, peer clusters in
 /// sorted order (the member is a set of peers, so the order a caller sends them
 /// in is not part of the request's meaning).
+///
+/// The witness Region and the peer list are values of one sequence, each rendered
+/// for whether it is there at all: the configuration is persisted and reported
+/// back as the request spelled it, so a member the request omits and a member it
+/// carries empty are different requests, and `Region` constrains no character a
+/// joined rendering could be split on.
 pub fn fingerprint_multi_region(properties: Option<&MultiRegionProperties>) -> String {
     match properties {
         None => String::new(),
         Some(properties) => {
-            let mut clusters: Vec<&str> = properties
-                .clusters
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .map(String::as_str)
-                .collect();
-            clusters.sort_unstable();
-            format!(
-                "witness={};clusters={}",
-                properties.witness_region.as_deref().unwrap_or_default(),
-                clusters.join(",")
-            )
+            let clusters = properties.clusters.as_ref().map(|clusters| {
+                let mut sorted: Vec<&str> = clusters.iter().map(String::as_str).collect();
+                sorted.sort_unstable();
+                fingerprint_sequence(sorted)
+            });
+            fingerprint_sequence([
+                fingerprint_optional(properties.witness_region.as_deref()),
+                fingerprint_optional(clusters),
+            ])
         }
     }
 }
@@ -724,9 +764,11 @@ pub fn fingerprint_multi_region(properties: Option<&MultiRegionProperties>) -> S
 /// when they name the same destination with the same values.
 pub fn fingerprint_target(target: &TargetDefinition) -> String {
     match target {
-        TargetDefinition::Kinesis(kinesis) => {
-            format!("kinesis:{}:{}", kinesis.stream_arn, kinesis.role_arn)
-        }
+        TargetDefinition::Kinesis(kinesis) => fingerprint_sequence([
+            "kinesis",
+            kinesis.stream_arn.as_str(),
+            kinesis.role_arn.as_str(),
+        ]),
     }
 }
 

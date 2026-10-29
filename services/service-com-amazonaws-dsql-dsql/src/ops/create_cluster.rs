@@ -424,9 +424,9 @@ const QUOTA_CODE_CLUSTERS_PER_ACCOUNT: &str = "clusters-per-account";
 fn create_fingerprint(input: &CreateClusterInput) -> String {
     crate::state::request_fingerprint(&[
         input.deletion_protection_enabled.to_string(),
-        input.kms_encryption_key.clone().unwrap_or_default(),
+        crate::state::fingerprint_optional(input.kms_encryption_key.as_deref()),
         crate::state::fingerprint_multi_region(input.multi_region_properties.as_ref()),
-        input.policy.clone().unwrap_or_default(),
+        crate::state::fingerprint_optional(input.policy.as_deref()),
         input.bypass_policy_lockout_safety_check.to_string(),
         crate::state::fingerprint_tags(input.tags.as_ref()),
     ])

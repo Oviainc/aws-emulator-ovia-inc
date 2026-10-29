@@ -27,10 +27,10 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use service_com_amazonaws_dsql_dsql::ops::types::{KinesisTargetDefinition, TargetDefinition};
 use service_com_amazonaws_dsql_dsql::state::{
-    fingerprint_multi_region, fingerprint_tags, fingerprint_target, request_fingerprint,
-    ComAmazonawsDsqlDsqlState, RecordedCall, RecordedClusterCreation, TokenScope,
-    POLICY_VERSION_MEMBER, RECORDED_RESULT_UNAVAILABLE_MESSAGE, STATUS_ACTIVE, STATUS_CREATING,
-    STATUS_MEMBER, STATUS_UPDATING, STREAM_STATUS_CREATING,
+    fingerprint_multi_region, fingerprint_optional, fingerprint_tags, fingerprint_target,
+    request_fingerprint, ComAmazonawsDsqlDsqlState, RecordedCall, RecordedClusterCreation,
+    TokenScope, POLICY_VERSION_MEMBER, RECORDED_RESULT_UNAVAILABLE_MESSAGE, STATUS_ACTIVE,
+    STATUS_CREATING, STATUS_MEMBER, STATUS_UPDATING, STREAM_STATUS_CREATING,
 };
 
 use crate::harness::{wait_for_the_clock, Answer, Dsql};
@@ -241,9 +241,9 @@ fn fingerprint(which: Replay, target: &Target) -> String {
         // `bypassPolicyLockoutSafetyCheck`, `tags`.
         Replay::CreateCluster => request_fingerprint(&[
             false.to_string(),
-            String::new(),
+            fingerprint_optional(None::<&str>),
             fingerprint_multi_region(None),
-            String::new(),
+            fingerprint_optional(None::<&str>),
             false.to_string(),
             fingerprint_tags(None),
         ]),
@@ -252,7 +252,7 @@ fn fingerprint(which: Replay, target: &Target) -> String {
         Replay::UpdateCluster => request_fingerprint(&[
             target.cluster.clone(),
             true.to_string(),
-            String::new(),
+            fingerprint_optional(None::<&str>),
             fingerprint_multi_region(None),
         ]),
         // `clusterIdentifier`, `ordering`, `format`, `targetDefinition`, `tags`.
@@ -269,12 +269,13 @@ fn fingerprint(which: Replay, target: &Target) -> String {
             target.cluster.clone(),
             benign_document(0),
             false.to_string(),
-            String::new(),
+            fingerprint_optional(None::<&str>),
         ]),
         // `identifier`, `expectedPolicyVersion`.
-        Replay::DeleteClusterPolicy => {
-            request_fingerprint(&[target.cluster.clone(), String::new()])
-        }
+        Replay::DeleteClusterPolicy => request_fingerprint(&[
+            target.cluster.clone(),
+            fingerprint_optional(None::<&str>),
+        ]),
     }
 }
 

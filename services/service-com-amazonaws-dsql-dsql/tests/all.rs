@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/boundary_validation_exception.rs"]
 mod boundary_validation_exception;
+#[path = "all/client_token_parameter_distinctness.rs"]
+mod client_token_parameter_distinctness;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
 #[path = "all/cluster_mutation_status_gate.rs"]

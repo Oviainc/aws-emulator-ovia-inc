@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // gets; the same token for a different delete is a conflict.
         let fingerprint = crate::state::request_fingerprint(&[
             input.identifier.clone(),
-            input.expected_policy_version.clone().unwrap_or_default(),
+            crate::state::fingerprint_optional(input.expected_policy_version.as_deref()),
         ]);
         if let Some(token) = input.client_token.as_deref() {
             match state

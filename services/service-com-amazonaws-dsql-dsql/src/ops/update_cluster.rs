@@ -411,7 +411,7 @@ fn update_fingerprint(input: &UpdateClusterInput) -> String {
             .deletion_protection_enabled
             .map(|enabled| enabled.to_string())
             .unwrap_or_default(),
-        input.kms_encryption_key.clone().unwrap_or_default(),
+        crate::state::fingerprint_optional(input.kms_encryption_key.as_deref()),
         crate::state::fingerprint_multi_region(input.multi_region_properties.as_ref()),
     ])
 }
