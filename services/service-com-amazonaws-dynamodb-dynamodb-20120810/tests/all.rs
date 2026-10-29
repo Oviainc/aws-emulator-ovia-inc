@@ -113,6 +113,9 @@ mod restore_table_to_point_in_time;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/stream_checkpoint_resume.rs"]
+mod stream_checkpoint_resume;
+
 #[path = "all/stream_enabled_table_round_trip.rs"]
 mod stream_enabled_table_round_trip;
 
