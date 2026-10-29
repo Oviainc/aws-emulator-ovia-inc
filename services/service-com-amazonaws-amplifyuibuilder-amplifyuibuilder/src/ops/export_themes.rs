@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExportThemes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExportThemes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the FULL `Theme` record of every theme stored for the app environment the
+//! request names, in creation order — the same records `GetTheme` serves.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExportThemes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation is `@readonly` and `@paginated(items: entities)` with no page-size
+//! member, so one page carries at most [`crate::state::EXPORT_PAGE_LIMIT`] themes and
+//! `nextToken` resumes the same creation order. A token this operation never issued for
+//! that app environment is refused with the modelled `InvalidParameterException`.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +143,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExportThemes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExportThemesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExportThemes"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ExportThemesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the amplifyuibuilder theme store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let key = (input.app_id.clone(), input.environment_name.clone());
+        let store = state.lock();
+
+        // The token carries the app environment it was issued for and the cursor
+        // the next page starts at. A malformed token, one issued for another app
+        // environment, or a cursor past everything handed out names no page of
+        // this export, so it is refused rather than served as an empty page.
+        let cursor = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                match crate::state::parse_page_token(token, &key, store.cursor_seq) {
+                    Some(cursor) => cursor,
+                    None => {
+                        return Err(ExportThemesErrorModeled::InvalidParameterException(
+                            InvalidParameterException {
+                                message: Some(format!(
+                                    "nextToken {token:?} is not a token returned by \
+                                     ExportThemes for this app environment"
+                                )),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        let mut entities = Vec::new();
+        let mut next_token = None;
+        for theme in store.themes_in(&input.app_id, &input.environment_name) {
+            // Resume at the first theme at or after the cursor, so a page is
+            // still served when the theme the token named was deleted meanwhile.
+            if theme.cursor < cursor {
+                continue;
+            }
+            if entities.len() == crate::state::EXPORT_PAGE_LIMIT {
+                next_token = Some(crate::state::page_token(&key, theme.cursor));
+                break;
+            }
+            entities.push(theme.to_theme());
+        }
+
+        Ok(ExportThemesOutput {
+            entities,
+            next_token,
+        })
     }
 }

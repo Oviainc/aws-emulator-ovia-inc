@@ -193,6 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_theme_id(&key);
+        // The position this theme takes in its environment's creation order,
+        // which is the order `ExportThemes` pages over.
+        let cursor = store.next_cursor();
         let theme = crate::state::StoredTheme {
             app_id: input.app_id,
             environment_name: input.environment_name,
@@ -206,6 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is the change that first set it: the service reports the two at the
             // same instant for a theme nothing has updated yet.
             modified_at: now,
+            cursor,
         };
 
         let entity = theme.to_theme();
