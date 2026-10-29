@@ -291,3 +291,6 @@ mod rest_api_import_integrations;
 // Appended for the reason the note above gives.
 #[path = "all/stage_refusal_error_class.rs"]
 mod stage_refusal_error_class;
+// Appended for the reason the note above gives.
+#[path = "all/stage_variable_integration_target.rs"]
+mod stage_variable_integration_target;

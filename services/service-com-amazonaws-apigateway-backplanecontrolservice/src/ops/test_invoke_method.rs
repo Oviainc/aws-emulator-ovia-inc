@@ -128,7 +128,8 @@ use super::types::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::service::invoke::{
-    perform_integration, refusal_rendering, MethodRequest, JSON_CONTENT_TYPE,
+    perform_integration, refusal_rendering, with_stage_variables, MethodRequest,
+    JSON_CONTENT_TYPE,
 };
 
 /// The request this operation's execution log is a log of. A simulated invocation never
@@ -410,7 +411,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             simulated_header(&input, CONTENT_TYPE),
             simulated_header(&input, ACCEPT),
         );
-        let (status, body, headers) = match perform_integration(Some(method), &call) {
+        // The stage variables the caller asked to simulate are what the integration's
+        // configuration is read against: `stageVariables` is "a key-value map of stage
+        // variables to simulate an invocation on a deployed Stage", so a configuration
+        // naming one is resolved exactly as the data plane resolves it at a stage whose
+        // own map carries those entries.
+        let simulated_variables: BTreeMap<String, String> = input
+            .stage_variables
+            .iter()
+            .flatten()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        let performed = with_stage_variables(method, &simulated_variables)
+            .and_then(|resolved| perform_integration(Some(&resolved), &call));
+        let (status, body, headers) = match performed {
             Ok(served) => {
                 let mut headers = served.headers;
                 headers.insert(CONTENT_TYPE_HEADER.to_string(), served.content_type);

@@ -59,7 +59,10 @@
 //!    before the integration is reached;
 //! 8. the usage plan metering the presented API key admits the request at the plan's
 //!    throttle, or the request is shed ([`metered_refusal`]);
-//! 9. the method's integration decides the response.
+//! 9. the method's integration decides the response, read with the STAGE's own variables
+//!    resolved into its configuration ([`with_stage_variables`]): a reference to one
+//!    stands where the configuration carries an address, a connection or a role, so one
+//!    deployment reached through two stages addresses each stage's own backend.
 //!
 //! A step that resolves nothing is answered the way API Gateway answers it: through the
 //! API's GATEWAY RESPONSE for the matching response type ([`GatewayRefusal`]), so a
@@ -287,6 +290,19 @@ const SIGNED_QUERY_PARAMETERS: &[&str] = &[
     "x-amz-security-token",
     "x-amz-content-sha256",
 ];
+
+/// How a STAGE VARIABLE is referenced where an integration's configuration carries a
+/// value: `${stageVariables.<name>}`, whose `<name>` is a key of the stage's own map —
+/// "a map that defines the stage variables for a Stage resource. Variable names can have
+/// alphanumeric and underscore characters" (`Stage$variables`).
+///
+/// A reference is replaced by that key's value before anything reads the configuration
+/// ([`with_stage_variables`]), which is what lets ONE deployment address a different
+/// backend per stage.
+const STAGE_VARIABLE_REFERENCE_PREFIX: &str = "${stageVariables.";
+
+/// The character that closes a [`STAGE_VARIABLE_REFERENCE_PREFIX`] reference.
+const STAGE_VARIABLE_REFERENCE_CLOSE: char = '}';
 
 /// How many passed-through integrations one invoke may follow.
 ///
@@ -1131,6 +1147,27 @@ fn serve_resolved<Eng: Send + Sync + 'static>(
         // refused with the integration never performed at all. Performing it is the half
         // this module shares with `TestInvokeMethod`, so the SAME records decide a
         // simulated invocation and a real one.
+        // The STAGE's own variables are part of what the integration addresses: a
+        // reference to one in its configuration resolves against the stage this call
+        // arrived at, so one deployment reached through two stages addresses each stage's
+        // own backend ([`with_stage_variables`]).
+        let performed_method = match live_method {
+            Some(method) => match with_stage_variables(method, &stage.variables) {
+                Ok(resolved) => Some(resolved),
+                Err(unserved) => {
+                    tracing::warn!(
+                        api_id = %api.id,
+                        stage = %stage.stage_name,
+                        path = %matched_path,
+                        verb = %verb,
+                        reason = %unserved.reason,
+                        "the stage cannot serve this call through the method's integration"
+                    );
+                    return refusal_response(Some(api), unserved.refusal);
+                }
+            },
+            None => None,
+        };
         let integration = ResolvedIntegration {
             api_id: api.id.clone(),
             stage: stage.stage_name.clone(),
@@ -1138,11 +1175,14 @@ fn serve_resolved<Eng: Send + Sync + 'static>(
             verb: verb.to_string(),
             // The private connection a passed-through integration is carried over is this
             // service's own record, so it is resolved here, under the one lock that read
-            // the integration itself.
-            unusable_connection: live_method
+            // the integration itself — off the configuration the stage's variables have
+            // already been resolved into, so a `connectionId` that named one names the
+            // link that variable's value names.
+            unusable_connection: performed_method
+                .as_ref()
                 .and_then(|method| method.integration.as_ref())
                 .and_then(|integration| unusable_vpc_link(&store, integration)),
-            method: live_method.cloned(),
+            method: performed_method,
             call,
         };
         // The 429 this call earns if the plans metering it have no request left for it,
@@ -2052,6 +2092,108 @@ pub struct UnservedIntegration {
     pub reason: String,
 }
 
+/// The method's own records with every STAGE VARIABLE the integration's configuration
+/// names replaced by the value `variables` gives it, or the integration this call cannot
+/// be performed through because no such variable is defined.
+///
+/// A stage variable is one entry of "a map that defines the stage variables for a Stage
+/// resource" (`Stage$variables`), and a reference to one
+/// ([`STAGE_VARIABLE_REFERENCE_PREFIX`]) stands where the integration's configuration
+/// carries a value a stage may differ in: the endpoint the integration addresses (`uri`),
+/// the VPC link a private connection runs over (`connectionId`), and the role the call is
+/// made under (`credentials`). The map is THE STAGE'S, so the reference resolves per
+/// stage: two stages of one deployment address two different backends, which is what a
+/// configuration written this way is for. It is resolved here, once, before anything
+/// reads the configuration, so no reader downstream has to know a variable was involved.
+///
+/// A name the map holds no entry for resolves to nothing: the configuration has a hole in
+/// it, so the integration cannot be performed, rather than being addressed at whatever
+/// text is left behind.
+///
+/// `requestParameters` is NOT substituted. Its value is modelled as "a method request
+/// parameter value or static value that must be enclosed within single quotes", the
+/// former matching "the pattern of `method.request.{location}.{name}`"
+/// (`Integration$requestParameters`), so a stage variable is not one of the forms that
+/// member takes — and a value outside them is already stated as a mapping this emulator
+/// does not read ([`mapped_request_parameter`]). `requestTemplates` and
+/// `responseTemplates` are not substituted either: a template that references anything is
+/// a Velocity template, which this emulator states rather than evaluates
+/// ([`is_velocity_template`]).
+pub fn with_stage_variables(
+    method: &MethodEntry,
+    variables: &BTreeMap<String, String>,
+) -> Result<MethodEntry, UnservedIntegration> {
+    let mut resolved = method.clone();
+    let Some(integration) = resolved.integration.as_mut() else {
+        return Ok(resolved);
+    };
+    // The three members of `Integration` whose value a stage may differ in, each named as
+    // the model names it: the reason the integration cannot be performed has to say which
+    // part of the configuration has the hole.
+    let configured: [(&str, &mut Option<String>); 3] = [
+        ("uri", &mut integration.uri),
+        ("connectionId", &mut integration.connection_id),
+        ("credentials", &mut integration.credentials),
+    ];
+    for (member, value) in configured {
+        let Some(carried) = value.as_deref() else {
+            continue;
+        };
+        match resolved_references(carried, variables) {
+            // The value names no stage variable at all, so it is the configuration
+            // itself: left exactly as it was stored.
+            Ok(None) => {}
+            Ok(Some(substituted)) => *value = Some(substituted),
+            Err(name) => {
+                return Err(UnservedIntegration {
+                    refusal: API_CONFIGURATION_ERROR,
+                    reason: format!(
+                        "the integration's {member} names the stage variable {name}, which \
+                         this stage defines no value for"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// `value` with every stage-variable reference in it replaced by the value `variables`
+/// gives that name — `None` when it carries no reference at all, so an untouched value is
+/// never rewritten — or `Err(name)` for the FIRST reference the map holds no entry for.
+///
+/// Text that opens a reference and never closes it is not one: it stands as the
+/// configuration carries it, and whatever reads the value decides what to make of it (a
+/// `uri` still carrying a brace is an address this emulator will not guess at —
+/// [`passed_through`]).
+///
+/// A substituted value is NOT rescanned: scanning continues after the reference it
+/// replaced, so a variable whose own value spells a reference cannot expand again, and the
+/// result is bounded by the stored configuration and one value per reference in it.
+fn resolved_references(
+    value: &str,
+    variables: &BTreeMap<String, String>,
+) -> Result<Option<String>, String> {
+    if !value.contains(STAGE_VARIABLE_REFERENCE_PREFIX) {
+        return Ok(None);
+    }
+    let mut resolved = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some((before, referenced)) = rest.split_once(STAGE_VARIABLE_REFERENCE_PREFIX) {
+        let Some((name, after)) = referenced.split_once(STAGE_VARIABLE_REFERENCE_CLOSE) else {
+            break;
+        };
+        let Some(carried) = variables.get(name) else {
+            return Err(name.to_string());
+        };
+        resolved.push_str(before);
+        resolved.push_str(carried);
+        rest = after;
+    }
+    resolved.push_str(rest);
+    Ok(Some(resolved))
+}
+
 /// What a PASSED-THROUGH integration makes of this request.
 #[derive(Debug)]
 enum PassedThrough {
@@ -2081,7 +2223,10 @@ enum PassedThrough {
 ///
 /// A `uri` naming any other host is a backend over the network, and an `HTTP` integration's
 /// response is chosen by a mapping this emulator does not evaluate: both are left to
-/// [`perform_integration`]'s refusal. A `uri` carrying a mapping placeholder, and a
+/// [`perform_integration`]'s refusal. A `uri` carrying a mapping placeholder — the stage's
+/// own variables are resolved into the configuration before this
+/// ([`with_stage_variables`]), so what is left is a placeholder this emulator does not
+/// expand — and a
 /// `requestParameters` entry outside the two forms that member documents (a static value in
 /// single quotes, or a `method.request.{header|querystring}.{name}` source) onto a header of
 /// the integration request, are stated as integrations this call cannot perform rather than
@@ -2330,14 +2475,15 @@ fn unusable_vpc_link(
              connectionId, so it reaches no network load balancer"
         ));
     };
-    // "Specify this value only if you specify VPC_LINK as the connection type": the value
-    // may also be a stage variable, which names the link indirectly.
+    // The stage's own variables have already been resolved into the configuration
+    // ([`with_stage_variables`]), so a `connectionId` written as a stage-variable
+    // reference names the link that variable's value names. A value still carrying `${`
+    // is an expression this emulator does not evaluate, so it names no link at all.
     if connection_id.contains("${") {
-        return Some(
-            "the integration's connectionId is a stage variable, which this emulator does \
-             not resolve to a VPC link"
-                .to_string(),
-        );
+        return Some(format!(
+            "the integration's connectionId is {connection_id}, which is an expression this \
+             emulator does not resolve to a VPC link"
+        ));
     }
     match store.vpc_links.get(connection_id) {
         None => Some(format!(

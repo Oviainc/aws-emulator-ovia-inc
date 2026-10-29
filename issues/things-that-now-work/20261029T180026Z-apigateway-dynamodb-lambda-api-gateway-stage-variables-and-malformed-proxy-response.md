@@ -10,6 +10,27 @@ Issue-Commit: f4e5251e6df88363d8e23ace2ff5bff3be31b423
 
 > _Note: this issue was identified against the code base at commit `f4e5251e6df88363d8e23ace2ff5bff3be31b423`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+_Status update:_ cause 2's rule is implemented. `src/service/invoke.rs::with_stage_variables`
+resolves every `${stageVariables.<name>}` reference in an integration's configuration — its
+`uri`, its `connectionId` and its `credentials` — against the INVOKED stage's own `variables`
+map before the integration is read, so one deployment served by two stages addresses each
+stage's own backend, and a name the invoked stage defines no variable for is answered through
+the api's `API_CONFIGURATION_ERROR` gateway response instead of being addressed at the text
+left behind. `TestInvokeMethod` resolves the same configuration against the `stageVariables`
+map its caller asks it to simulate. The suite
+`tests/all/stage_variable_integration_target.rs` asserts that over a table of reference
+positions, members and per-stage maps, end to end on the invoke host.
+
+Both replay keys above STILL FAIL, for one remaining reason that is not the substitution: each
+recorded check's per-stage target is a LAMBDA PROXY integration, so both need the function's
+deployment package to actually run — cause 1 needs the malformed proxy response a function
+returns, and the recorded cause 2 needs the per-stage function's DynamoDB write. Nothing in
+this emulator runs a deployment package (`Invoke` answers 501 for `RequestResponse`:
+`services/service-com-amazonaws-lambda-awsgirapiservice/src/ops/invoke.rs`), so there is no
+backend proxy response to validate and no 502 is emitted for work nothing ran. That cause is
+owned by the open issue
+`issues/things-that-do-not-work/20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md`.
+
 ## Operation
 TestInvokeMethod
 
