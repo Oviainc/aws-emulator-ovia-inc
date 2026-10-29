@@ -66,8 +66,10 @@ struct GroupCase {
     inbound: ExpectedRules,
     /// The outbound rules the declaration asks for. They are asserted as a SUBSET: a new
     /// group carries the all-traffic outbound rule Amazon EC2 gives it ("by default, a
-    /// security group includes an outbound rule that allows all outbound traffic"), and a
-    /// declared rule is authorized beside it.
+    /// security group includes an outbound rule that allows all outbound traffic"), which a
+    /// declaration stating outbound rules of its own replaces with exactly those
+    /// (`core/router/tests/all/cloudformation_ec2_ebs_instance_estate.rs` holds that half),
+    /// so a row asserts the rules it declared are there rather than which others are not.
     outbound: ExpectedRules,
 }
 

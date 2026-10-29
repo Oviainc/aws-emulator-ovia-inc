@@ -443,7 +443,8 @@ use super::template::{
     BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, CLOUDWATCH_DASHBOARD,
     CLOUDWATCH_METRIC_STREAM, CODECOMMIT_REPOSITORY, CODEDEPLOY_APPLICATION,
     CODEDEPLOY_DEPLOYMENT_CONFIG, CODEDEPLOY_DEPLOYMENT_GROUP,
-    COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, EC2_SECURITY_GROUP, EC2_SUBNET, EC2_VPC,
+    COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, EC2_SECURITY_GROUP, EC2_SUBNET,
+    EC2_VOLUME, EC2_VPC,
     ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
@@ -472,6 +473,13 @@ const S3_BUCKET: &str = "AWS::S3::Bucket";
 
 /// `AWS::IAM::Role`: "Ref returns the role name".
 const IAM_ROLE: &str = "AWS::IAM::Role";
+
+/// `AWS::IAM::InstanceProfile`: "Ref returns the instance profile name" — the handle every
+/// IAM call on one takes (`GetInstanceProfile$InstanceProfileName`) and the name an
+/// instance's `IamInstanceProfile` references, which is the physical id the naming rules
+/// already compute for the type (its `InstanceProfileName` property), so the type needs no
+/// entry in [`super::template::identity_is_service_assigned`].
+const IAM_INSTANCE_PROFILE: &str = "AWS::IAM::InstanceProfile";
 
 /// `AWS::IAM::User`: "Ref returns the user name", so a resource of this type is an IAM
 /// user addressed by its physical resource id.
@@ -546,6 +554,10 @@ pub(super) enum Provisioner {
     /// identifier is EC2's to assign the same way, with the inline rules its declaration
     /// asks for authorized on it.
     Ec2SecurityGroup,
+    /// `AWS::EC2::Volume`: an Amazon EBS volume, whose `vol-…` identifier EC2 assigns the
+    /// same way. `CreateVolume` answers the volume `creating`, so its creation is held open
+    /// until that service reports it `available`.
+    Ec2Volume,
     OpenSearchServerlessCollection,
     OpenSearchServerlessSecurityPolicy,
     /// `AWS::OpenSearchService::Domain`: a domain of Amazon OpenSearch Service, which is a
@@ -557,6 +569,10 @@ pub(super) enum Provisioner {
     S3VectorsIndex,
     EmrCluster,
     IamRole,
+    /// `AWS::IAM::InstanceProfile`: the container that lets an Amazon EC2 instance assume
+    /// the role it holds. `CreateInstanceProfile` creates it and
+    /// `AddRoleToInstanceProfile` puts the declared role in it.
+    IamInstanceProfile,
     IamUser,
     IamManagedPolicy,
     CodePipelinePipeline,
@@ -656,6 +672,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         EC2_VPC => Some(Provisioner::Ec2Vpc),
         EC2_SUBNET => Some(Provisioner::Ec2Subnet),
         EC2_SECURITY_GROUP => Some(Provisioner::Ec2SecurityGroup),
+        EC2_VOLUME => Some(Provisioner::Ec2Volume),
         AOSS_COLLECTION => Some(Provisioner::OpenSearchServerlessCollection),
         AOSS_SECURITY_POLICY => Some(Provisioner::OpenSearchServerlessSecurityPolicy),
         OPENSEARCH_DOMAIN => Some(Provisioner::OpenSearchServiceDomain),
@@ -664,6 +681,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         S3VECTORS_INDEX => Some(Provisioner::S3VectorsIndex),
         EMR_CLUSTER => Some(Provisioner::EmrCluster),
         IAM_ROLE => Some(Provisioner::IamRole),
+        IAM_INSTANCE_PROFILE => Some(Provisioner::IamInstanceProfile),
         IAM_USER => Some(Provisioner::IamUser),
         IAM_MANAGED_POLICY => Some(Provisioner::IamManagedPolicy),
         CODEPIPELINE_PIPELINE => Some(Provisioner::CodePipelinePipeline),
@@ -789,12 +807,17 @@ impl Provisioner {
             Self::Ec2SecurityGroup => {
                 create_ec2_security_group(ctx, region, resource, propagated).await
             }
+            Self::Ec2Volume => create_ec2_volume(ctx, region, resource, propagated).await,
             Self::S3Bucket => create_bucket(ctx, region, resource, propagated).await,
             Self::S3VectorsVectorBucket => {
                 create_vector_bucket(ctx, region, resource, propagated).await
             }
             Self::S3VectorsIndex => create_index(ctx, region, resource, propagated).await,
             Self::IamRole => create_role(ctx, region, resource, propagated).await,
+            // `AWS::IAM::InstanceProfile` publishes no `Tags` property and
+            // `CreateInstanceProfile` takes none from this arm, so no tags are propagated to
+            // a profile.
+            Self::IamInstanceProfile => create_instance_profile(ctx, region, resource).await,
             Self::IamUser => create_iam_user(ctx, region, resource, propagated).await,
             // `AWS::IAM::ManagedPolicy` publishes no `Tags` property and `CreatePolicy`
             // takes none from this arm, so no tags are propagated to a policy.
@@ -1216,6 +1239,10 @@ impl Provisioner {
             Self::OpenSearchServiceDomain => {
                 domain_readiness(ctx, region, physical_resource_id).await
             }
+            // "The volume state" a created EBS volume is reported in is `creating`
+            // (`Volume$State`), and a volume cannot be attached until it is `available`, so
+            // the resource's creation is finished once Amazon EC2 reports it there.
+            Self::Ec2Volume => volume_readiness(ctx, region, physical_resource_id).await,
             // `CreateDeliveryStream` "is an asynchronous operation that immediately
             // returns. The initial status of the Firehose stream is CREATING. After the
             // Firehose stream is created, its status is ACTIVE and it now accepts data …
@@ -1483,6 +1510,7 @@ impl Provisioner {
             Self::Ec2SecurityGroup => {
                 delete_ec2_security_group(ctx, region, physical_resource_id).await
             }
+            Self::Ec2Volume => delete_ec2_volume(ctx, region, physical_resource_id).await,
             Self::OpenSearchServerlessSecurityPolicy => {
                 delete_security_policy(ctx, region, resource).await
             }
@@ -1501,6 +1529,9 @@ impl Provisioner {
             // The role's policies have to go first, and only the resource's own record
             // says which ones there are.
             Self::IamRole => delete_role(ctx, region, resource).await,
+            // The roles the profile holds have to be taken out of it first, and only the
+            // resource's own record says which ones there are.
+            Self::IamInstanceProfile => delete_instance_profile(ctx, region, resource).await,
             // The user's password, policies and memberships have to go first, and only the
             // resource's own record says which ones there are.
             Self::IamUser => delete_iam_user(ctx, region, resource).await,
@@ -1762,6 +1793,7 @@ impl Provisioner {
             Self::Ec2SecurityGroup => {
                 describe_ec2_security_group(ctx, region, physical_resource_id).await
             }
+            Self::Ec2Volume => describe_ec2_volume(ctx, region, physical_resource_id).await,
             Self::S3Bucket => describe_bucket(ctx, region, physical_resource_id).await,
             Self::S3VectorsVectorBucket => {
                 describe_vector_bucket(ctx, region, physical_resource_id).await
@@ -1769,6 +1801,9 @@ impl Provisioner {
             Self::S3VectorsIndex => describe_index(ctx, region, physical_resource_id).await,
             Self::EmrCluster => describe_job_flow(ctx, region, physical_resource_id).await,
             Self::IamRole => describe_role(ctx, region, physical_resource_id).await,
+            Self::IamInstanceProfile => {
+                describe_instance_profile(ctx, region, physical_resource_id).await
+            }
             Self::IamUser => describe_iam_user(ctx, region, physical_resource_id).await,
             Self::IamManagedPolicy => {
                 describe_managed_policy(ctx, region, physical_resource_id).await
@@ -4595,6 +4630,163 @@ async fn describe_role(
         if let Some(duration) = role.max_session_duration() {
             actual.insert("MaxSessionDuration".to_string(), Value::from(duration));
         }
+    }
+    Ok(Some(Value::Object(actual)))
+}
+
+/// The roles an `AWS::IAM::InstanceProfile` declaration lists, each the role NAME
+/// `AddRoleToInstanceProfile` takes — a `Ref` to a role of the same template resolves to
+/// that role's name ([`super::provisioning::reconcile`]).
+///
+/// The property DOCUMENT is what is read, not the stored record, so the create and the
+/// delete walk the same list.
+fn instance_profile_roles(properties: &Value) -> Vec<String> {
+    declared_list(properties, "Roles")
+        .iter()
+        .filter_map(scalar_text)
+        .filter(|role| !role.is_empty())
+        .collect()
+}
+
+/// Create the instance profile an `AWS::IAM::InstanceProfile` declares, and put the role it
+/// names in it.
+///
+/// "Ref returns the instance profile name", which is the name CloudFormation created the
+/// profile under — the resource's physical id — so the stack publishes a name every IAM call
+/// on a profile and every `IamInstanceProfile` reference accepts.
+///
+/// `Roles` is REQUIRED on this resource type ("the name of the role to associate with the
+/// instance profile; only one role can be assigned"), so a declaration carrying none
+/// describes no profile an instance could use: the resource is refused here, naming the
+/// property, rather than a profile being created that holds no role. `Path` is spelled the
+/// same on the type and on `CreateInstanceProfile`; a property the template leaves out is
+/// not sent. The type publishes no `Tags` property, so no tags are propagated to a profile.
+async fn create_instance_profile(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let roles = instance_profile_roles(&resource.properties);
+    if roles.is_empty() {
+        return Err(Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!(
+                "Property Roles cannot be empty for resource of type {}",
+                resource.resource_type
+            ),
+        });
+    }
+    let client = iam_client(ctx, region);
+    let profile_name = &resource.physical_resource_id;
+    let created = client
+        .create_instance_profile()
+        .instance_profile_name(profile_name)
+        .set_path(resource.properties.get("Path").and_then(scalar_text))
+        .send()
+        .await
+        .map_err(|error| refusal_of(&error))?;
+    let mut attributes = BTreeMap::new();
+    // What IAM answered wins over the computed ARN: it carries the account and the path IAM
+    // built the profile under, which is what a client reads back off the profile.
+    if let Some(profile) = created.instance_profile() {
+        attributes.insert("Arn".to_string(), profile.arn().to_string());
+    }
+    // "AddRoleToInstanceProfile — adds the specified IAM role to the specified instance
+    // profile": the role is not a member of the create, so each declared one is its own
+    // call, and a role IAM refuses to add fails the resource rather than leaving the stack
+    // complete over a profile that grants nothing.
+    for role in roles {
+        client
+            .add_role_to_instance_profile()
+            .instance_profile_name(profile_name)
+            .role_name(role)
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the instance profile a stack created. "You must remove the role from the instance
+/// profile" first, so each role the declaration named is taken out before the profile goes;
+/// a role or a profile IAM no longer holds is already in the state the delete asks for.
+async fn delete_instance_profile(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let client = iam_client(ctx, region);
+    let profile_name = &resource.physical_resource_id;
+    for role in instance_profile_roles(&resource.properties) {
+        if let Err(error) = client
+            .remove_role_from_instance_profile()
+            .instance_profile_name(profile_name)
+            .role_name(role)
+            .send()
+            .await
+        {
+            let refusal = refusal_of(&error);
+            if refusal.code != NO_SUCH_ENTITY {
+                return Err(refusal);
+            }
+        }
+    }
+    match client
+        .delete_instance_profile()
+        .instance_profile_name(profile_name)
+        .send()
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let refusal = refusal_of(&error);
+            if refusal.code == NO_SUCH_ENTITY {
+                return Ok(());
+            }
+            Err(refusal)
+        }
+    }
+}
+
+/// The instance profile's configuration as IAM reports it, for drift detection.
+///
+/// A profile IAM no longer holds (`NoSuchEntity`) was deleted. The members compared are the
+/// ones the resource type and `GetInstanceProfile` spell identically and the create applies:
+/// `Path`, and the `Roles` the profile holds — read as the role NAMES the declaration lists
+/// them by, so a role removed from the profile outside the stack is MODIFIED.
+async fn describe_instance_profile(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let answer = match iam_client(ctx, region)
+        .get_instance_profile()
+        .instance_profile_name(physical_resource_id)
+        .send()
+        .await
+    {
+        Ok(answer) => answer,
+        Err(error) => {
+            let refusal = refusal_of(&error);
+            if refusal.code == NO_SUCH_ENTITY {
+                return Ok(None);
+            }
+            return Err(refusal);
+        }
+    };
+    let mut actual = Map::new();
+    if let Some(profile) = answer.instance_profile() {
+        actual.insert("Path".to_string(), Value::String(profile.path().to_string()));
+        actual.insert(
+            "Roles".to_string(),
+            Value::Array(
+                profile
+                    .roles()
+                    .iter()
+                    .map(|role| Value::String(role.role_name().to_string()))
+                    .collect(),
+            ),
+        );
     }
     Ok(Some(Value::Object(actual)))
 }
@@ -11720,6 +11912,34 @@ fn security_group_rule_parameters(
     Ok(parameters)
 }
 
+/// Amazon EC2's error code for a rule a revoke named that the group does not hold, which is
+/// the answer to a revoke of the default outbound rule a group no longer carries — the state
+/// that revoke asks for.
+const INVALID_PERMISSION_NOT_FOUND: &str = "InvalidPermission.NotFound";
+
+/// The all-protocols value of a security group rule's protocol, which the outbound rule
+/// Amazon EC2 gives every new group carries.
+const EC2_ALL_IP_PROTOCOLS: &str = "-1";
+
+/// The destination that same rule carries: every IPv4 address.
+const EC2_ALL_IPV4_ADDRESSES: &str = "0.0.0.0/0";
+
+/// The one permission of the default outbound rule a new security group carries — "a
+/// security group has an outbound rule that allows all outbound traffic" — as the
+/// `IpPermissions.1.…` parameters a revoke of it names it by.
+fn allow_all_egress_parameters() -> Vec<(String, String)> {
+    vec![
+        (
+            "IpPermissions.1.IpProtocol".to_string(),
+            EC2_ALL_IP_PROTOCOLS.to_string(),
+        ),
+        (
+            "IpPermissions.1.IpRanges.1.CidrIp".to_string(),
+            EC2_ALL_IPV4_ADDRESSES.to_string(),
+        ),
+    ]
+}
+
 /// Create the security group an `AWS::EC2::SecurityGroup` declares, in Amazon EC2, and
 /// authorize the inline rules its declaration asks for.
 ///
@@ -11730,10 +11950,13 @@ fn security_group_rule_parameters(
 ///
 /// The rules are not members of the create: "when you create a security group, it has no
 /// inbound rules", and each entry of either rule property is one permission of
-/// `AuthorizeSecurityGroupIngress` / `AuthorizeSecurityGroupEgress`. An outbound rule is
-/// authorized BESIDE the all-traffic rule EC2 gives a new group, since the call that would
-/// remove that rule is one this emulator does not serve yet — so a declaration's own
-/// outbound rules are added rather than left unasked for.
+/// `AuthorizeSecurityGroupIngress` / `AuthorizeSecurityGroupEgress`. A new group does carry
+/// one OUTBOUND rule of EC2's own — the one that allows all outbound traffic — and a
+/// declaration that states outbound rules of its own REPLACES it: CloudFormation removes
+/// that default rule, so the group ends up carrying exactly the rules the template declared
+/// in each direction. The revoke comes FIRST, because EC2 refuses a second rule identical to
+/// one the group already holds (`InvalidPermission.Duplicate`), which a declaration
+/// restating the all-traffic rule would otherwise run into.
 async fn create_ec2_security_group(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -11767,19 +11990,47 @@ async fn create_ec2_security_group(
             code: UNIDENTIFIED_FAILURE.to_string(),
             message: "CreateSecurityGroup answered no groupId".to_string(),
         })?;
-    for (property, members, action) in [
+    for (property, members, action, is_egress) in [
         (
             "SecurityGroupIngress",
             EC2_SECURITY_GROUP_INGRESS_MEMBERS,
             "AuthorizeSecurityGroupIngress",
+            false,
         ),
         (
             "SecurityGroupEgress",
             EC2_SECURITY_GROUP_EGRESS_MEMBERS,
             "AuthorizeSecurityGroupEgress",
+            true,
         ),
     ] {
-        for rule in declared_security_group_rules(&resource.properties, property) {
+        let declared = declared_security_group_rules(&resource.properties, property);
+        if declared.is_empty() {
+            continue;
+        }
+        // A declaration that states OUTBOUND rules replaces the one EC2 gives a new group:
+        // the all-traffic rule is removed, so what the group carries outbound is what the
+        // template declared and nothing else. A group EC2 no longer holds that rule for is
+        // already in the state this asks for, which is what its own not-found answer says.
+        if is_egress {
+            let mut parameters = vec![("GroupId".to_string(), group_id.clone())];
+            parameters.extend(allow_all_egress_parameters());
+            match call_query(
+                ctx,
+                EC2_SIGNING_NAME,
+                region,
+                EC2_API_VERSION,
+                "RevokeSecurityGroupEgress",
+                &parameters,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(refusal) if refusal.code == INVALID_PERMISSION_NOT_FOUND => {}
+                Err(refusal) => return Err(refusal),
+            }
+        }
+        for rule in declared {
             let mut parameters = vec![("GroupId".to_string(), group_id.clone())];
             parameters.extend(security_group_rule_parameters(rule, members)?);
             call_query(
@@ -11878,6 +12129,218 @@ async fn describe_ec2_security_group(
             "securityGroupInfo",
         )))),
         Err(refusal) if refusal.code == INVALID_GROUP_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The `AWS::EC2::Volume` properties `CreateVolume` takes under the SAME member name, each a
+/// scalar for the reason [`EC2_VPC_CREATE_MEMBERS`] records.
+///
+/// Source: AWS's CloudFormation resource reference for the type against
+/// `smithy_query(query="operation",operation="CreateVolume")` — every property of the type
+/// but the two below is a member of that call spelled identically. EC2 takes no name for a
+/// volume and assigns the `vol-…` id itself, which is why this type's identity is the owning
+/// service's ([`super::template::identity_is_service_assigned`]).
+const EC2_VOLUME_CREATE_MEMBERS: &[(&str, QueryMember)] = &[
+    ("AvailabilityZone", QueryMember::Scalar),
+    ("Encrypted", QueryMember::Scalar),
+    ("Iops", QueryMember::Scalar),
+    ("KmsKeyId", QueryMember::Scalar),
+    ("MultiAttachEnabled", QueryMember::Scalar),
+    ("OutpostArn", QueryMember::Scalar),
+    ("Size", QueryMember::Scalar),
+    ("SnapshotId", QueryMember::Scalar),
+    ("Throughput", QueryMember::Scalar),
+    ("VolumeInitializationRate", QueryMember::Scalar),
+    ("VolumeType", QueryMember::Scalar),
+];
+
+/// The `AWS::EC2::Volume` properties another call carries: `AutoEnableIO`, which is a volume
+/// ATTRIBUTE rather than a member of the create ([`MODIFY_VOLUME_ATTRIBUTE`]), and the tags,
+/// which reach EC2 through the one call that tags a resource that exists
+/// ([`tag_ec2_resource`]).
+const EC2_VOLUME_PROPERTIES_NOT_SENT: &[&str] = &["AutoEnableIO", "Tags"];
+
+/// The one attribute of a volume a declaration can state, as the `ModifyVolumeAttribute`
+/// member that writes it — named identically on both sides, and an `AttributeBooleanValue`.
+const EC2_VOLUME_ATTRIBUTES: &[&str] = &["AutoEnableIO"];
+
+/// The `Modify…Attribute` call that writes a volume's one attribute.
+const MODIFY_VOLUME_ATTRIBUTE: Ec2AttributeCall = Ec2AttributeCall {
+    action: "ModifyVolumeAttribute",
+    id_member: "VolumeId",
+};
+
+/// Amazon EC2's error code for a volume it does not hold (`InvalidVolume.NotFound`, EC2 API
+/// error codes), which is a delete asking for a state that service is already in.
+const INVALID_VOLUME_NOT_FOUND: &str = "InvalidVolume.NotFound";
+
+/// The state Amazon EC2 reports a volume it has created and not finished creating in, and
+/// the one it reports a usable volume in (`Volume$State`).
+const VOLUME_STATE_CREATING: &str = "creating";
+const VOLUME_STATE_AVAILABLE: &str = "available";
+const VOLUME_STATE_IN_USE: &str = "in-use";
+
+/// Create the Amazon EBS volume an `AWS::EC2::Volume` declares, in Amazon EC2.
+///
+/// "Ref returns the volume ID" — an id EC2 ASSIGNS (`vol-` and 17 hexadecimal characters),
+/// which is what this answers as the resource's physical id, so the stack's `Ref`, its
+/// outputs and its per-resource reads report an id EC2 really holds a volume for and every
+/// call that takes a volume id accepts it.
+async fn create_ec2_volume(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let parameters = query_members(
+        &resource.properties,
+        EC2_VOLUME_CREATE_MEMBERS,
+        &[],
+        EC2_VOLUME_PROPERTIES_NOT_SENT,
+        EC2_VOLUME,
+    )?;
+    let answered = call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "CreateVolume",
+        &parameters,
+    )
+    .await?;
+    // `CreateVolume`'s answer IS the volume (its output shape is `Volume`), so the id it
+    // assigned travels as the answer's own `volumeId` element rather than inside a wrapper
+    // of its own.
+    let volume_id = xml_element(&answered, "volumeId")
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "CreateVolume answered no volumeId".to_string(),
+        })?;
+    for attribute in EC2_VOLUME_ATTRIBUTES {
+        if let Some(value) = resource.properties.get(*attribute) {
+            modify_ec2_attribute(
+                ctx,
+                region,
+                MODIFY_VOLUME_ATTRIBUTE,
+                &volume_id,
+                attribute,
+                value,
+                true,
+            )
+            .await?;
+        }
+    }
+    tag_ec2_resource(
+        ctx,
+        region,
+        &volume_id,
+        &tags_of(&resource.properties, propagated),
+    )
+    .await?;
+    // The one attribute this type publishes is the id EC2 assigned.
+    let mut attributes = BTreeMap::new();
+    attributes.insert("VolumeId".to_string(), volume_id.clone());
+    Ok(Created {
+        physical_resource_id: Some(volume_id),
+        attributes,
+    })
+}
+
+/// Whether the volume a stack created is usable yet: `creating` is the state EC2 answers the
+/// create in and the one a volume is still coming up in, `available` is a volume nothing has
+/// attached and `in-use` one something has, and every other state
+/// (`deleting`/`deleted`/`error`) is one no wait brings a new volume out of. A volume EC2 no
+/// longer holds is in the same position: nothing is going to create it.
+async fn volume_readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    volume_id: &str,
+) -> Result<Readiness, Refusal> {
+    let parameters = vec![("VolumeId.1".to_string(), volume_id.to_string())];
+    let answered = match call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "DescribeVolumes",
+        &parameters,
+    )
+    .await
+    {
+        Ok(answered) => answered,
+        Err(refusal) if refusal.code == INVALID_VOLUME_NOT_FOUND => {
+            return Ok(Readiness::Failed(format!(
+                "Amazon EC2 holds no volume for {volume_id}"
+            )))
+        }
+        Err(refusal) => return Err(refusal),
+    };
+    let reported = ec2_reported_entry(&answered, "volumeSet");
+    // The state travels under the answer's own `status` element, which `ec2_reported` reads
+    // as `Status` — `Volume$State`'s `@xmlName`.
+    let state = reported
+        .get("Status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match state {
+        VOLUME_STATE_AVAILABLE | VOLUME_STATE_IN_USE => Ok(Readiness::Ready),
+        VOLUME_STATE_CREATING => Ok(Readiness::Pending(VOLUME_STATE_CREATING.to_string())),
+        other => Ok(Readiness::Failed(format!(
+            "Amazon EC2 reports volume {volume_id} in state {other}"
+        ))),
+    }
+}
+
+/// Delete the volume a stack created, addressed by the id EC2 assigned it. A volume EC2 no
+/// longer holds (`InvalidVolume.NotFound`) is already in the state the delete asks for; one
+/// still attached to an instance is that service's own refusal, which the stack reports as
+/// the failure it is.
+async fn delete_ec2_volume(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    volume_id: &str,
+) -> Result<(), Refusal> {
+    let parameters = vec![("VolumeId".to_string(), volume_id.to_string())];
+    match call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "DeleteVolume",
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == INVALID_VOLUME_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The volume's configuration as Amazon EC2 reports it, for drift detection. A volume it no
+/// longer holds (`InvalidVolume.NotFound`) was deleted.
+async fn describe_ec2_volume(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    volume_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![("VolumeId.1".to_string(), volume_id.to_string())];
+    match call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "DescribeVolumes",
+        &parameters,
+    )
+    .await
+    {
+        Ok(answered) => Ok(Some(Value::Object(ec2_reported_entry(
+            &answered, "volumeSet",
+        )))),
+        Err(refusal) if refusal.code == INVALID_VOLUME_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
 }

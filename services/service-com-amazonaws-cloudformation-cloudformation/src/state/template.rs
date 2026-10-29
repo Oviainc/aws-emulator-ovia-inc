@@ -3663,6 +3663,12 @@ fn return_values(
             let id = ec2_network_identity("vpce", "Id", name, &mut attributes);
             (id, attributes)
         }
+        // An Amazon EBS volume, whose identity Amazon EC2 assigns the same way: "Ref returns
+        // the volume ID", and the type's one `Fn::GetAtt` attribute IS that id.
+        EC2_VOLUME => {
+            let id = ec2_network_identity("vol", "VolumeId", name, &mut attributes);
+            (id, attributes)
+        }
         // "Ref returns the Amazon Resource Name (ARN)"; Fn::GetAtt: Name. A service ARN
         // carries the CLUSTER that hosts it (`service/<cluster>/<name>`), which the
         // declaration names by short name or by cluster ARN and which defaults to the
@@ -4136,6 +4142,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         EC2_DHCP_OPTIONS => &["DhcpOptionsId"],
         EC2_VPN_GATEWAY => &["VPNGatewayId"],
         EC2_NETWORK_ACL | EC2_NETWORK_INTERFACE | EC2_VPC_ENDPOINT => &["Id"],
+        EC2_VOLUME => &["VolumeId"],
         ECS_SERVICE => &["Name"],
         ELB_LISTENER => &["ListenerArn"],
         ELB_LISTENER_RULE => &["IsDefault", "RuleArn"],
@@ -4321,6 +4328,11 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == EC2_VPC
         || resource_type == EC2_SUBNET
         || resource_type == EC2_SECURITY_GROUP
+        // An Amazon EBS volume is a fourth: `CreateVolume` takes no identifier either — the
+        // declaration states the volume's zone, size and type — Amazon EC2 assigns the
+        // `vol-` id, and "Ref returns the volume ID", so the identifier in force is the one
+        // that service answered.
+        || resource_type == EC2_VOLUME
         // An Amazon SES receipt rule is one more, for the same reason read from the other
         // side: "Ref returns the receipt rule name", and a declaration states that name
         // inside the type's `Rule` property rather than through a name property of its own,
@@ -5305,6 +5317,14 @@ pub const EC2_NAT_GATEWAY: &str = "AWS::EC2::NatGateway";
 pub const EC2_VPC_ENDPOINT: &str = "AWS::EC2::VPCEndpoint";
 pub const EC2_DHCP_OPTIONS: &str = "AWS::EC2::DHCPOptions";
 pub const EC2_VPN_GATEWAY: &str = "AWS::EC2::VPNGateway";
+
+/// `AWS::EC2::Volume`: an Amazon EBS volume. It is not a VPC-network type, but its identity
+/// is read exactly the same way — `CreateVolume` takes no name, Amazon EC2 assigns the
+/// `vol-…` identifier and "Ref returns the volume ID" — so a declaration of one carries an
+/// identifier of that form rather than a generated name, and
+/// [`identity_is_service_assigned`] names the type because the identifier in force is the
+/// one that service answered its create with.
+pub const EC2_VOLUME: &str = "AWS::EC2::Volume";
 
 /// The identifier Amazon EC2 assigns a declared resource of one of the VPC-network types
 /// above: `<prefix>-` plus [`EC2_ID_HEX_DIGITS`] lowercase hexadecimal characters, derived
