@@ -140,6 +140,14 @@ pub(crate) fn is_uuid(value: &str) -> bool {
             .all(|group| group.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// The textual form CodeCommit mints a `commentId` as: a pair of UUIDs joined by
+/// a colon, so a single UUID is only HALF a comment id.
+pub(crate) fn is_comment_id(value: &str) -> bool {
+    value
+        .split_once(':')
+        .is_some_and(|(first, second)| is_uuid(first) && is_uuid(second))
+}
+
 /// One row of the lifecycle table: a repository and the single file written into it.
 #[derive(Debug, Clone)]
 struct Case {

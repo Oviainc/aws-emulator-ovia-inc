@@ -32,7 +32,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_codecommit_codecommit_20150413::state::ComAmazonawsCodecommitCodecommit20150413State as CodeCommitState;
 
 use crate::compared_commit_comments::{refused, reported_location};
-use crate::repository_lifecycle::{base64, emulator_with_engine, is_uuid, ok, string_at};
+use crate::repository_lifecycle::{base64, emulator_with_engine, is_comment_id, ok, string_at};
 use crate::wire::{caller_arn, DEFAULT_ACCESS_KEY_ID};
 
 /// The file the pull request changes, and the two versions of it the destination
@@ -339,8 +339,8 @@ async fn a_comment_posted_on_a_pull_request_is_read_back_from_stored_state() {
             .clone();
         let comment_id = string_at(&comment, "/commentId");
         assert!(
-            is_uuid(&comment_id),
-            "case {label:?}: commentId must be a uuid, got {comment_id:?}"
+            is_comment_id(&comment_id),
+            "case {label:?}: commentId must be a colon-joined pair of uuids, got {comment_id:?}"
         );
         assert!(
             comment_ids.insert(comment_id.clone()),

@@ -63,6 +63,8 @@ mod comment_content_deletion;
 mod comment_deleted_refusal_templates;
 #[path = "all/comment_deleted_refusals.rs"]
 mod comment_deleted_refusals;
+#[path = "all/comment_id_form.rs"]
+mod comment_id_form;
 #[path = "all/comment_lifecycle.rs"]
 mod comment_lifecycle;
 #[path = "all/comment_reactions_read.rs"]

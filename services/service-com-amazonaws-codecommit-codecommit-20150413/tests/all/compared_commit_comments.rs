@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use crate::repository_lifecycle::{base64, call, emulator_with_engine, is_uuid, ok, string_at};
+use crate::repository_lifecycle::{base64, call, emulator_with_engine, is_comment_id, ok, string_at};
 
 /// The file every comparison in this suite is built around.
 const FILE_PATH: &str = "docs/notes.md";
@@ -322,8 +322,8 @@ async fn a_posted_comment_is_read_back_from_the_comparison_it_was_filed_under() 
             .clone();
         let comment_id = string_at(&comment, "/commentId");
         assert!(
-            is_uuid(&comment_id),
-            "case {label:?}: commentId must be a uuid, got {comment_id:?}"
+            is_comment_id(&comment_id),
+            "case {label:?}: commentId must be a colon-joined pair of uuids, got {comment_id:?}"
         );
         assert!(
             comment_ids.insert(comment_id.clone()),

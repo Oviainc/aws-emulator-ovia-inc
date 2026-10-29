@@ -3848,17 +3848,39 @@ fn approval_rule_template_id(name: &str, created: SystemTime) -> String {
     ))
 }
 
-/// Is this a syntactically valid comment id — the canonical 8-4-4-4-12 textual
-/// form of the UUID this service mints a comment id as?
-pub fn is_comment_id(candidate: &str) -> bool {
+/// The widths of the dash-separated groups of a UUID in its canonical textual
+/// form, 8-4-4-4-12.
+const UUID_GROUP_WIDTHS: &[usize] = &[8, 4, 4, 4, 12];
+
+/// Is this a UUID in its canonical textual form — [`UUID_GROUP_WIDTHS`] groups of
+/// hexadecimal digits joined by dashes?
+fn is_uuid(candidate: &str) -> bool {
     let groups: Vec<&str> = candidate.split('-').collect();
-    groups.len() == 5
+    groups.len() == UUID_GROUP_WIDTHS.len()
         && groups
             .iter()
-            .zip([8usize, 4, 4, 4, 12])
+            .zip(UUID_GROUP_WIDTHS)
             .all(|(group, width)| {
-                group.len() == width && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+                group.len() == *width && group.bytes().all(|byte| byte.is_ascii_hexdigit())
             })
+}
+
+/// The separator between the two halves of a comment id.
+const COMMENT_ID_SEPARATOR: char = ':';
+
+/// Is this a syntactically valid comment id — the FORM CodeCommit mints a comment
+/// id as, a pair of UUIDs joined by [`COMMENT_ID_SEPARATOR`]?
+///
+/// Only the form is judged here: whether an id of this form names a comment this
+/// service holds is a separate question, answered by looking the comment up, which
+/// is what keeps `InvalidCommentIdException` ("Make sure that you have provided the
+/// full comment ID" — the half of an id, or something that is no id at all) apart
+/// from `CommentDoesNotExistException` (a full id naming no comment). An id missing
+/// one of the two halves is therefore malformed rather than absent.
+pub fn is_comment_id(candidate: &str) -> bool {
+    candidate
+        .split_once(COMMENT_ID_SEPARATOR)
+        .is_some_and(|(first, second)| is_uuid(first) && is_uuid(second))
 }
 
 /// Why a `commentId` cannot name a comment.
@@ -3942,16 +3964,33 @@ pub fn comment_deleted_message(refusal: CommentDeletedRefusal) -> &'static str {
     }
 }
 
-/// A comment's opaque `commentId`: the same kind of version-8 UUID, over the
-/// account, the repository, the comment's post order and the instant it was
-/// posted. It is therefore stable for the life of the comment and distinct from
-/// every other comment's.
+/// A comment's opaque `commentId`: the form [`is_comment_id`] judges, a pair of
+/// version-8 UUIDs joined by [`COMMENT_ID_SEPARATOR`], each over the account, the
+/// repository, the comment's post order and the instant it was posted. It is
+/// therefore stable for the life of the comment and distinct from every other
+/// comment's, and the minter and the validator agree about the form by
+/// construction. The two halves are two digests of the SAME comment's seed (the
+/// suffixes only keep them apart), since nothing about a comment is recorded as
+/// living in one half rather than the other.
 pub fn comment_id(repository: &str, sequence: u64, created: SystemTime) -> String {
     let nanos = nanos_since_epoch(created);
-    uuid_v8(&format!(
+    let seed = format!(
         "codecommit/{}/{repository}/comment/{sequence}/{nanos}",
         ::engine::emulator_account_id()
-    ))
+    );
+    let first = uuid_v8(&format!("{seed}/first"));
+    let second = uuid_v8(&format!("{seed}/second"));
+    format!("{first}{COMMENT_ID_SEPARATOR}{second}")
+}
+
+/// The message `CommentDoesNotExistException` carries about `comment_id`: the
+/// FIXED sentence "The following comment ID does not exist: " and then the id the
+/// request named, which is the only variable part.
+///
+/// Every operation that looks a comment up refuses a full id naming no comment
+/// with this template, so none of them can word it differently.
+pub fn comment_does_not_exist_message(comment_id: &str) -> String {
+    format!("The following comment ID does not exist: {comment_id}")
 }
 
 fn nanos_since_epoch(time: SystemTime) -> u128 {
@@ -3993,33 +4032,23 @@ pub fn has_prohibited_git_suffix(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".git")
 }
 
-/// The widths of the dash-separated groups in the id KMS mints for a
-/// single-region key: a UUID, written 8-4-4-4-12, as every KMS `KeyId` example
-/// is (`1234abcd-12ab-34cd-56ef-1234567890ab`).
-const KEY_ID_GROUP_WIDTHS: &[usize] = &[8, 4, 4, 4, 12];
-
 /// The number of hexadecimal digits after the `mrk-` prefix of the id KMS mints
 /// for a multi-region key.
 const MULTI_REGION_KEY_ID_DIGITS: usize = 32;
 
-/// Is this a KMS key id — hexadecimal digits grouped [`KEY_ID_GROUP_WIDTHS`] for
-/// a single-region key, or `mrk-` and [`MULTI_REGION_KEY_ID_DIGITS`] of them for
-/// a multi-region key?
+/// Is this a KMS key id — a UUID for a single-region key, as every KMS `KeyId`
+/// example is (`1234abcd-12ab-34cd-56ef-1234567890ab`), or `mrk-` and
+/// [`MULTI_REGION_KEY_ID_DIGITS`] hexadecimal digits for a multi-region key?
 ///
 /// This emulator resolves no KMS key, so only the FORM of the selector is
-/// judged — but that form is the id's two shapes exactly, the same way
-/// [`is_comment_id`] judges the UUID this service mints a comment id as.
+/// judged — but that form is the id's two shapes exactly, read through the same
+/// [`is_uuid`] every other UUID-shaped selector in this module is read through.
 fn is_kms_key_id(candidate: &str) -> bool {
-    let hexadecimal = |group: &str| group.bytes().all(|byte| byte.is_ascii_hexdigit());
     if let Some(digits) = candidate.strip_prefix("mrk-") {
-        return digits.len() == MULTI_REGION_KEY_ID_DIGITS && hexadecimal(digits);
+        return digits.len() == MULTI_REGION_KEY_ID_DIGITS
+            && digits.bytes().all(|byte| byte.is_ascii_hexdigit());
     }
-    let groups: Vec<&str> = candidate.split('-').collect();
-    groups.len() == KEY_ID_GROUP_WIDTHS.len()
-        && KEY_ID_GROUP_WIDTHS
-            .iter()
-            .zip(&groups)
-            .all(|(width, group)| group.len() == *width && hexadecimal(group))
+    is_uuid(candidate)
 }
 
 /// Is this a KMS alias path — `alias/` followed by a non-empty name of the

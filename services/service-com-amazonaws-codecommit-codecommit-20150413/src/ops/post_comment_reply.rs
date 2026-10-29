@@ -263,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PostCommentReplyErrorModeled::CommentDoesNotExistException(
                     CommentDoesNotExistException {
-                        message: Some(format!("no comment exists with the ID {in_reply_to}")),
+                        message: Some(crate::state::comment_does_not_exist_message(&in_reply_to)),
                     },
                 )
                 .into(),

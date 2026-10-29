@@ -35,12 +35,13 @@ use service_com_amazonaws_codecommit_codecommit_20150413::state::{
 use crate::comment_lifecycle::OTHER_ACCESS_KEY_ID;
 use crate::compared_commit_comments::refused;
 use crate::pull_request_comments::{pull_request_on, PullRequest, AFTER_LINES, PATH};
-use crate::repository_lifecycle::{emulator_with_engine, is_uuid, ok, string_at};
+use crate::repository_lifecycle::{emulator_with_engine, is_comment_id, ok, string_at};
 use crate::wire::{caller_arn, emulator_with_callers, ok_as, DEFAULT_ACCESS_KEY_ID};
 
 /// A comment id of the form the service mints ids in that no comment was minted
 /// as: what a reply to a comment the service does not hold names.
-const UNMINTED_COMMENT_ID: &str = "00000000-0000-8000-8000-000000000000";
+const UNMINTED_COMMENT_ID: &str =
+    "00000000-0000-8000-8000-000000000000:00000000-0000-8000-8000-000000000000";
 
 /// What kind of comment the row's reply replies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,8 +261,8 @@ async fn a_reply_is_stored_in_the_thread_of_the_comment_it_replies_to() {
             .clone();
         let reply_id = string_at(&comment, "/commentId");
         assert!(
-            is_uuid(&reply_id),
-            "case {label:?}: commentId must be a uuid, got {reply_id:?}"
+            is_comment_id(&reply_id),
+            "case {label:?}: commentId must be a colon-joined pair of uuids, got {reply_id:?}"
         );
         assert!(
             comment_ids.insert(reply_id.clone()),
@@ -605,6 +606,11 @@ async fn a_reply_the_service_cannot_file_is_refused_with_the_modeled_error() {
         (
             "a comment id that is not of the form the service mints",
             reply(json!({ "inReplyTo": "not-a-comment-id" })),
+            "InvalidCommentIdException",
+        ),
+        (
+            "half a comment id: one uuid with no second half",
+            reply(json!({ "inReplyTo": "00000000-0000-8000-8000-000000000000" })),
             "InvalidCommentIdException",
         ),
         (

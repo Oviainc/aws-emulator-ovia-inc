@@ -450,8 +450,13 @@ async fn a_read_is_refused_for_a_comment_or_user_the_service_does_not_hold() {
         ("blank", "", "CommentIdRequiredException"),
         ("not a comment id", "not-a-comment-id", "InvalidCommentIdException"),
         (
-            "an id no comment carries",
+            "half a comment id",
             "11111111-2222-3333-4444-555555555555",
+            "InvalidCommentIdException",
+        ),
+        (
+            "an id no comment carries",
+            "11111111-2222-3333-4444-555555555555:66666666-7777-8888-9999-aaaaaaaaaaaa",
             "CommentDoesNotExistException",
         ),
     ] {

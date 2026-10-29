@@ -19,7 +19,7 @@
 
 use serde_json::{json, Value};
 
-use crate::repository_lifecycle::{base64, error, is_uuid, ok, string_at};
+use crate::repository_lifecycle::{base64, error, is_comment_id, ok, string_at};
 use crate::wire::{
     caller_arn, emulator_with_callers, error_as, hold_long_term_key, ok_as, DEFAULT_ACCESS_KEY_ID,
 };
@@ -259,8 +259,8 @@ async fn a_posted_comment_is_read_back_from_state() {
 
         let comment_id = string_at(&posted, "/comment/commentId");
         assert!(
-            is_uuid(&comment_id),
-            "case {label:?}: expected a UUID comment id, got {comment_id:?}"
+            is_comment_id(&comment_id),
+            "case {label:?}: expected a comment id of the form <uuid>:<uuid>, got {comment_id:?}"
         );
         assert!(
             !ids.contains(&comment_id),
@@ -573,13 +573,21 @@ async fn a_comment_id_that_names_no_comment_is_refused() {
             "CommentIdRequiredException",
         ),
         (
-            "a comment id that is not a UUID",
+            "a comment id that is not a UUID pair",
             json!({ "commentId": "comment-1" }),
             "InvalidCommentIdException",
         ),
         (
-            "a UUID the service never minted",
+            "half a comment id: a single UUID",
             json!({ "commentId": "0e8b4f1a-1c2d-4e5f-8a9b-0c1d2e3f4a5b" }),
+            "InvalidCommentIdException",
+        ),
+        (
+            "a well-formed comment id the service never minted",
+            json!({
+                "commentId":
+                    "0e8b4f1a-1c2d-4e5f-8a9b-0c1d2e3f4a5b:1f9c5a2b-2d3e-4f50-9b0c-1d2e3f4a5b6c",
+            }),
             "CommentDoesNotExistException",
         ),
     ];

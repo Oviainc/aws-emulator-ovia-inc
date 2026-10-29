@@ -229,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let comment = store.comment_mut(&comment_id).ok_or_else(|| {
             PutCommentReactionErrorModeled::CommentDoesNotExistException(
                 CommentDoesNotExistException {
-                    message: Some(format!("no comment exists with the ID {comment_id}")),
+                    message: Some(crate::state::comment_does_not_exist_message(&comment_id)),
                 },
             )
         })?;
