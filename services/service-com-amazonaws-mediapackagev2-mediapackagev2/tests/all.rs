@@ -128,3 +128,5 @@ mod tagging_arn_refusal_parity;
 mod channel_reset_removes_ingested_content;
 #[path = "all/origin_endpoint_reset_content_scope.rs"]
 mod origin_endpoint_reset_content_scope;
+#[path = "all/harvest_job_modification_instant.rs"]
+mod harvest_job_modification_instant;

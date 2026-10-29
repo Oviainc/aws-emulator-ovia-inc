@@ -1420,19 +1420,21 @@ impl HarvestJobRecord {
     /// `FAILED` when it ends ([`HarvestJobRecord::terminal_at`], and see
     /// [`HARVESTER_UNAVAILABLE_MESSAGE`]), each no sooner than one
     /// [`HARVEST_JOB_TRANSITION_MILLIS`] span after the job entered the status it leaves.
+    ///
+    /// `at` decides only WHETHER each transition has fallen due; the change is committed
+    /// with the instant it fell DUE, so `ModifiedAt` and the version the job reports are a
+    /// function of its own schedule rather than of when a client happened to look.
     pub fn materialise_due_transitions(&mut self, at: ::aws_smithy_types::DateTime) {
-        if self.status == HARVEST_JOB_QUEUED
-            && at.as_secs_f64() >= self.in_progress_at.as_secs_f64()
-        {
+        let in_progress_at = self.in_progress_at;
+        if self.status == HARVEST_JOB_QUEUED && at.as_secs_f64() >= in_progress_at.as_secs_f64() {
             self.status = HARVEST_JOB_IN_PROGRESS.to_string();
-            self.commit(at);
+            self.commit(in_progress_at);
         }
-        if self.status == HARVEST_JOB_IN_PROGRESS
-            && at.as_secs_f64() >= self.terminal_at().as_secs_f64()
-        {
+        let terminal_at = self.terminal_at();
+        if self.status == HARVEST_JOB_IN_PROGRESS && at.as_secs_f64() >= terminal_at.as_secs_f64() {
             self.status = HARVEST_JOB_FAILED.to_string();
             self.error_message = Some(HARVESTER_UNAVAILABLE_MESSAGE.to_string());
-            self.commit(at);
+            self.commit(terminal_at);
         }
     }
 }
