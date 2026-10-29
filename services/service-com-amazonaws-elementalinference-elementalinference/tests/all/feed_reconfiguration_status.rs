@@ -17,7 +17,8 @@
 //! (`smithy_query(query="shape",shape="FeedStatus")`: `CREATING | AVAILABLE | ACTIVE |
 //! UPDATING | DELETING | DELETED | ARCHIVED`), so
 //!
-//! * `UpdateFeed` answers HTTP 200 reporting `UPDATING`, and every reader of the feed
+//! * `UpdateFeed` answers HTTP 200 — not 202 — so the write is COMPLETE when it answers
+//!   and its own body reports the feed's SETTLED status, while every reader of the feed
 //!   (`GetFeed`, `ListFeeds`) reports `UPDATING` while the reconfiguration is in flight,
 //!   which is what a client polling after an update waits on;
 //! * once the span falls due the feed is back in the status it was reconfigured from —
@@ -231,11 +232,11 @@ fn output_count(payload: &Value) -> Option<usize> {
     payload["outputs"].as_array().map(Vec::len)
 }
 
-/// An update reports `UPDATING` and so does every reader of the feed, until the clock
-/// settles the feed back into the status the reconfiguration suspended — with the
-/// payload the update stored.
+/// An update answers with the feed's settled status — the write is complete when it
+/// answers — while every reader reports `UPDATING` until the clock settles the feed back
+/// into the status the reconfiguration suspended, with the payload the update stored.
 #[tokio::test]
-async fn an_update_reports_updating_and_settles_back_into_the_status_it_suspended() {
+async fn an_update_answers_the_settled_status_and_the_reads_report_updating() {
     for case in reconfiguration_cases() {
         let label = case.label;
         let router = router();
@@ -249,8 +250,8 @@ async fn an_update_reports_updating_and_settles_back_into_the_status_it_suspende
         );
         assert_eq!(
             status_of(&updated),
-            "UPDATING",
-            "case {label:?}: expected the reconfiguration to report UPDATING, got {updated}"
+            case.held,
+            "case {label:?}: the 200 reports the feed's settled status, got {updated}"
         );
         // The overwrite itself is in the response: the transient status is about the work
         // the service then carries out, not about the payload being unstored.
@@ -351,8 +352,9 @@ async fn a_second_update_in_flight_still_settles_back_into_the_suspended_status(
             let (status, updated) = update_feed(&router, &id, payload).await;
             assert_eq!(
                 (status, status_of(&updated)),
-                (200, "UPDATING"),
-                "case {case:?}: the {pass} update reports UPDATING, got {status} with {updated}"
+                (200, held),
+                "case {case:?}: the {pass} update answers the settled status, got {status} \
+                 with {updated}"
             );
         }
 
@@ -401,8 +403,8 @@ async fn a_feed_being_reconfigured_takes_no_association_until_it_has_settled() {
         .await;
         assert_eq!(
             (status, status_of(&updated)),
-            (200, "UPDATING"),
-            "case {case:?}: the update reports UPDATING, got {status} with {updated}"
+            (200, held),
+            "case {case:?}: the update answers the settled status, got {status} with {updated}"
         );
 
         let (status, refused) = associate(&router, &id, resource).await;
@@ -462,8 +464,8 @@ async fn a_removal_accepted_during_a_reconfiguration_is_what_the_clock_carries_o
         .await;
         assert_eq!(
             (status, status_of(&updated)),
-            (200, "UPDATING"),
-            "case {case:?}: the update reports UPDATING, got {status} with {updated}"
+            (200, held),
+            "case {case:?}: the update answers the settled status, got {status} with {updated}"
         );
 
         let (status, deleted) = call(&router, "DELETE", &format!("/v1/feed/{id}"), None).await;
@@ -510,8 +512,8 @@ async fn attaching_a_policy_to_a_feed_being_reconfigured_moves_no_status() {
         .await;
         assert_eq!(
             (status, status_of(&updated)),
-            (200, "UPDATING"),
-            "case {case:?}: the update reports UPDATING, got {status} with {updated}"
+            (200, held),
+            "case {case:?}: the update answers the settled status, got {status} with {updated}"
         );
 
         let document = json!({"Sid": "attached-while-reconfigured"}).to_string();

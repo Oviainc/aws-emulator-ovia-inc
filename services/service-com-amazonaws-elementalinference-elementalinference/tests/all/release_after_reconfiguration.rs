@@ -363,8 +363,16 @@ async fn a_reconfigured_feed_that_stores_no_resource_is_still_refused() {
         .await;
         assert_eq!(
             (status, status_of(&updated)),
-            (200, "UPDATING"),
-            "case {label:?}: the update answers 200, got {status} with {updated}"
+            (
+                200,
+                if already_released {
+                    "ARCHIVED"
+                } else {
+                    "AVAILABLE"
+                }
+            ),
+            "case {label:?}: the update answers 200 with the feed's settled status, got \
+             {status} with {updated}"
         );
 
         let (status, refused) = disassociate(&router, &id, asked_for, false).await;
@@ -427,8 +435,9 @@ async fn a_release_under_the_wrong_name_during_a_reconfiguration_is_refused() {
         .await;
         assert_eq!(
             (status, status_of(&updated)),
-            (200, "UPDATING"),
-            "case {case:?}: the update answers 200, got {status} with {updated}"
+            (200, "ACTIVE"),
+            "case {case:?}: the update answers 200 with the feed's settled status, got \
+             {status} with {updated}"
         );
 
         let (status, refused) = disassociate(&router, &id, other, false).await;
@@ -502,8 +511,9 @@ async fn a_release_does_not_discard_a_removal_the_clock_already_owes() {
             .await;
             assert_eq!(
                 (status, status_of(&updated)),
-                (200, "UPDATING"),
-                "case {label:?}: the update answers 200, got {status} with {updated}"
+                (200, "ACTIVE"),
+                "case {label:?}: the update answers 200 with the feed's settled status, got \
+                 {status} with {updated}"
             );
         }
 

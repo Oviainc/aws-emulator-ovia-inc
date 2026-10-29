@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! A created feed is USABLE at once, end to end over the wire.
+//! A created feed is USABLE as soon as the create has answered, end to end over the
+//! wire.
 //!
 //! Every case here drives the real request path — the router picks the service from the
 //! SigV4 credential scope, the framework deserializes and validates the body, the
 //! handler runs, and the response is serialized as `restJson1` — so what these tests
 //! assert is what a client sees.
 //!
-//! THE RULE under test: a resource the service hands back READY is ready, so nothing
-//! about it is waiting on a clock. `CreateFeed` answers with a feed in the settled
-//! `AVAILABLE` status ("After creation of the feed has succeeded, the status will be
-//! AVAILABLE", `CreateFeedResponse$status`), and therefore
+//! THE RULE under test: a create that is ACCEPTED (HTTP 202) answers with the status its
+//! resource was accepted in — `CREATING`, since "after creation of the feed has
+//! succeeded, the status will be AVAILABLE" (`CreateFeedResponse$status`) — and the
+//! creation it accepted is complete by the time the caller's next request arrives, so
+//! nothing about the feed is left waiting on a clock. Therefore
 //!
-//! * a `GetFeed` issued in the very next request reports `AVAILABLE`, not a transient
-//!   status, and reports it however long the caller waits;
+//! * a `GetFeed` issued in the very next request reports the settled `AVAILABLE`, not a
+//!   transient status, and reports it however long the caller waits;
 //! * the `AssociateFeed` a caller issues in the very next request is ACCEPTED (HTTP 200)
 //!   and claims the feed, so the whole lifecycle — create, associate, read, release —
 //!   runs with no wait anywhere in it;
@@ -129,8 +131,8 @@ async fn a_created_feed_runs_the_whole_lifecycle_without_any_wait() {
         );
         assert_eq!(
             status_of(&created),
-            "AVAILABLE",
-            "case {label:?}: the created feed is AVAILABLE, got {created}"
+            "CREATING",
+            "case {label:?}: the create is ACCEPTED, so it answers CREATING, got {created}"
         );
         let id = created["id"]
             .as_str()
@@ -224,8 +226,8 @@ async fn a_created_feed_runs_the_whole_lifecycle_without_any_wait() {
     }
 }
 
-/// A created feed reports `AVAILABLE` however long the caller waits: the status is the
-/// settled one, so no clock-owed move can change it afterwards.
+/// A created feed reports `AVAILABLE` from the next request on, however long the caller
+/// waits: the creation is complete, so no clock-owed move can change it afterwards.
 #[tokio::test]
 async fn a_created_feed_reports_the_same_status_before_and_after_any_transition_span() {
     let router = router();
@@ -234,8 +236,8 @@ async fn a_created_feed_reports_the_same_status_before_and_after_any_transition_
         let (_, created) = call(&router, "POST", "/v1/feed", Some(case.create.clone())).await;
         assert_eq!(
             status_of(&created),
-            "AVAILABLE",
-            "case {:?}: the create answers AVAILABLE, got {created}",
+            "CREATING",
+            "case {:?}: the create answers CREATING, got {created}",
             case.label
         );
         ids.push(created["id"].as_str().unwrap_or_default().to_string());

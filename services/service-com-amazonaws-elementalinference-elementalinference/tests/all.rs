@@ -33,6 +33,8 @@ mod error_message_rule;
 mod feed_association;
 #[path = "all/feed_association_retry.rs"]
 mod feed_association_retry;
+#[path = "all/feed_audio_binding.rs"]
+mod feed_audio_binding;
 #[path = "all/feed_lifecycle.rs"]
 mod feed_lifecycle;
 #[path = "all/feed_output_validation.rs"]
@@ -45,6 +47,8 @@ mod feed_reconfiguration_status;
 mod feed_release_retry;
 #[path = "all/feed_usable_on_create.rs"]
 mod feed_usable_on_create;
+#[path = "all/feed_write_status_rule.rs"]
+mod feed_write_status_rule;
 #[path = "all/fixture_catalog.rs"]
 mod fixture_catalog;
 #[path = "all/fixture_data_source.rs"]

@@ -98,6 +98,7 @@ pub enum OutputConfig {
 #[smithy_macros::smithy(shape = "com.amazonaws.elementalinference#CroppingConfig")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CroppingConfig {
+    pub audio_input: Option<String>,
     pub template_groups: Option<Vec<TemplateGroup>>,
 }
 
@@ -111,6 +112,7 @@ pub struct TemplateGroup {
 #[smithy_macros::smithy(shape = "com.amazonaws.elementalinference#ClippingConfig")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClippingConfig {
+    pub audio_input: Option<String>,
     pub callback_metadata: Option<String>,
     pub data_source_configuration: Option<DataSourceConfiguration>,
 }
@@ -124,6 +126,7 @@ pub struct DataSourceConfiguration {
 #[smithy_macros::smithy(shape = "com.amazonaws.elementalinference#SubtitlingConfig")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SubtitlingConfig {
+    pub audio_input: Option<String>,
     pub language: String,
     pub aspect_ratio: Option<AspectRatio>,
     pub dictionary: Option<String>,
@@ -140,6 +143,7 @@ pub struct AspectRatio {
 #[smithy_macros::smithy(shape = "com.amazonaws.elementalinference#ContextualMetadataConfig")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextualMetadataConfig {
+    pub audio_input: Option<String>,
     pub summary_generation: Option<String>,
     pub extended_analysis: Option<String>,
 }

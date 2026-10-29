@@ -325,6 +325,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // above; the stored length is what every writer of the list is held to). The
         // index borrows the stored feed, so it is scoped to end before the write below.
         let outputs = {
+            // The audio input an output of THIS feed is bound to when the request names
+            // none: the feed's own default input, read from the record rather than
+            // assumed, so a replacement output keeps the feed's audio wiring instead of
+            // losing it to a full-replacement PUT.
+            let default_audio_input = feed.default_audio_input().to_string();
             let held_provenance: std::collections::HashMap<&str, bool> = feed
                 .outputs
                 .iter()
@@ -356,10 +361,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     output.status,
                     output.description,
                     from_association,
+                    &default_audio_input,
                 ));
             }
             outputs
         };
+
+        // An output's audio binding must name an audio input THIS feed exposes: a name
+        // that is not one of them names nothing the feed has to offer, so the
+        // replacement list is refused with the modelled `ValidationException` (HTTP 400)
+        // rather than stored with a binding that dangles — the same rule, through the
+        // same scan, that every operation writing outputs into a feed applies. Refused
+        // before anything is written, so the feed is left as it was.
+        if let Some(unresolved) = crate::state::unresolved_audio_input(
+            outputs.iter().map(|output| &output.output_config),
+            &feed.audio_inputs,
+        ) {
+            return Err(UpdateFeedErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::cannot_find_audio_input_message(unresolved),
+                },
+            )
+            .into());
+        }
 
         // PUT: the payload completely overwrites the existing one, so the new list
         // replaces the stored outputs and an omitted access role clears it.
@@ -389,7 +413,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             data_endpoints: feed.data_endpoints.clone(),
             outputs: feed.get_outputs(),
             access_role_arn: feed.access_role_arn.clone(),
-            status: feed.status.as_wire().to_string(),
+            // HTTP 200, not 202: the update is COMPLETE when this call answers, so the
+            // status it reports is the feed's settled lifecycle status — `AVAILABLE`
+            // with no resource associated, `ACTIVE` while one holds it, `ARCHIVED` once
+            // its resource has been released — and not the value that exists for the
+            // span of the work the service then carries out
+            // (`crate::state::Feed::settled_status`). The reconfiguration itself is what
+            // a client polling the READ path observes; the answer to the write says the
+            // write is done.
+            status: feed.settled_status().as_wire().to_string(),
             association: feed.association.clone(),
             tags: Some(feed.tag_map()),
         };

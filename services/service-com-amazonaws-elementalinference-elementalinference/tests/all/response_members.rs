@@ -19,11 +19,15 @@
 //!   (not the feed id) yet stable per feed and distinct between feeds;
 //! * an optional output-config member the service resolves itself is MATERIALISED on
 //!   the stored output, so every later read reports the configuration the service
-//!   applied and a `GetFeed` -> `UpdateFeed` round trip cannot drop it;
+//!   applied and a `GetFeed` -> `UpdateFeed` round trip cannot drop it (the audio
+//!   binding every output config carries is one of them);
 //! * a minted id identifies exactly ONE resource: two creates that differ in any
 //!   member never report the same id.
 
-use crate::harness::{call, output_config, past_the_transition_span, router, REGION, SIGNING_NAME};
+use crate::harness::{
+    call, config_with_resolved_audio_input, output_config, past_the_transition_span, router,
+    REGION, SIGNING_NAME,
+};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -292,9 +296,11 @@ struct ConfigCase {
 /// The rows span every member of the `OutputConfig` union
 /// (`smithy_query(query="shape",shape="OutputConfig")`: cropping, clipping,
 /// subtitling, contextualMetadata) and, for those carrying a service-resolved
-/// member, both the omitted and the supplied case.
+/// member, both the omitted and the supplied case. Every row expects the audio binding
+/// the service resolves as well ([`config_with_resolved_audio_input`]), which is the one
+/// resolved member EVERY member of the union carries.
 fn config_cases() -> Vec<ConfigCase> {
-    vec![
+    let cases = vec![
         ConfigCase {
             label: "subtitling without an aspect ratio or a profanity filter",
             submitted: json!({"subtitling": {"language": "eng"}}),
@@ -352,7 +358,14 @@ fn config_cases() -> Vec<ConfigCase> {
                 "extendedAnalysis": "ENABLED"
             }}),
         },
-    ]
+    ];
+    cases
+        .into_iter()
+        .map(|case| ConfigCase {
+            expected: config_with_resolved_audio_input(case.expected),
+            ..case
+        })
+        .collect()
 }
 
 /// CreateFeed stores the output with the service's defaults applied, so the create

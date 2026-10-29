@@ -266,6 +266,38 @@ pub fn output(name: &str, kind: &str, status: &str) -> Value {
     json!({"name": name, "outputConfig": output_config(kind), "status": status})
 }
 
+/// The audio input an output is bound to when the request names none: the single input a
+/// feed created with no explicit input exposes, which `GetFeed` reports under
+/// `inputs.audio[*].name`.
+pub const DEFAULT_AUDIO_INPUT: &str = "default-audio";
+
+/// `config` with the audio binding the service resolves for an output that names none
+/// written into it.
+///
+/// EVERY member of the `OutputConfig` union carries `audioInput` — an output of any
+/// feature consumes the audio of one of the feed's inputs — so a suite that expects the
+/// configuration IN FORCE expects the member whichever feature the config is for, and an
+/// expectation built from a submitted config goes through this one place.
+pub fn config_with_resolved_audio_input(config: Value) -> Value {
+    let Value::Object(members) = config else {
+        panic!("an outputConfig is a union object, got {config}");
+    };
+    let resolved = members
+        .into_iter()
+        .map(|(kind, settings)| {
+            let mut settings = match settings {
+                Value::Object(settings) => settings,
+                other => panic!("the {kind} config is an object, got {other}"),
+            };
+            settings
+                .entry("audioInput".to_string())
+                .or_insert_with(|| json!(DEFAULT_AUDIO_INPUT));
+            (kind, Value::Object(settings))
+        })
+        .collect();
+    Value::Object(resolved)
+}
+
 /// One ENABLED output named `name`, carrying the `kind` config — the output a suite
 /// builds when the output's own `status` is not what it is testing.
 pub fn enabled_output(name: &str, kind: &str) -> Value {

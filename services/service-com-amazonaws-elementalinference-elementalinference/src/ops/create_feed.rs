@@ -296,6 +296,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // did not come from `AssociateFeed`) — which is also the form they are compared
         // in below. Built BEFORE the lock, so the store is not held while a request's
         // own members are normalised.
+        //
+        // The audio inputs the feed is about to be minted with are what an output's
+        // audio binding resolves against: a feed exposes its inputs and each output
+        // names the one it consumes, so an output that names none is bound to the feed's
+        // default input (`crate::state::output_config_with_defaults`) and the stored
+        // output reports the binding the service applied rather than only what the
+        // request carried.
+        let audio_inputs = crate::state::minted_audio_inputs();
+        let default_audio_input = audio_inputs
+            .first()
+            .map_or(crate::state::DEFAULT_AUDIO_INPUT_NAME, String::as_str)
+            .to_string();
         let outputs: Vec<crate::state::Output> = input
             .outputs
             .into_iter()
@@ -306,9 +318,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     output.status,
                     output.description,
                     false,
+                    &default_audio_input,
                 )
             })
             .collect();
+
+        // An output's audio binding must name an audio input the feed EXPOSES: a name
+        // that is not one of them names nothing the feed has to offer, so it is refused
+        // with the modelled `ValidationException` (HTTP 400) rather than minting a feed
+        // whose binding dangles — the same rule, through the same scan, that every
+        // operation writing outputs into a feed applies.
+        if let Some(unresolved) = crate::state::unresolved_audio_input(
+            outputs.iter().map(|output| &output.output_config),
+            &audio_inputs,
+        ) {
+            return Err(CreateFeedErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::cannot_find_audio_input_message(unresolved),
+                },
+            )
+            .into());
+        }
         let tags: std::collections::BTreeMap<String, String> =
             input.tags.unwrap_or_default().into_iter().collect();
 
@@ -378,6 +408,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = state.mint_feed_id();
+        // When the `CREATING` -> `AVAILABLE` move this accept owes falls due.
+        let due = now + crate::state::FEED_CREATION_SPAN;
         let feed = crate::state::Feed {
             arn: crate::state::feed_arn(&region, &id),
             data_endpoints: crate::state::feed_data_endpoints(&region, &id),
@@ -388,18 +420,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // its ARN carries. Every later read and mutation resolves its id within that
             // Region, so no other Region's endpoint lists, reports or changes it.
             region: region.clone(),
+            // The media inputs the feed exposes, minted WITH the feed: a client learns
+            // them from a read of the feed (`GetFeedResponse$inputs`), which is how it
+            // knows what an output's `audioInput` may name.
+            audio_inputs,
             // Outputs supplied to CreateFeed did not come from AssociateFeed, so
             // `fromAssociation` is false for every one of them.
             outputs,
             access_role_arn: input.access_role_arn,
-            // "After creation of the feed has succeeded, the status will be AVAILABLE"
-            // (`CreateFeedResponse$status`), and creation HAS succeeded by the time this
-            // call answers: the recorded service hands back a feed that the caller's
-            // next request can associate, and reports AVAILABLE for a GetFeed taken
-            // immediately after. So there is no CREATING window to wait out and no
-            // transition owed — the 202 records that the feed was ACCEPTED, not that it
-            // is still being built.
-            status: crate::state::FeedStatus::Available,
+            // A create is ACCEPTED, not completed: the operation answers HTTP 202 and
+            // the feed is accepted in `CREATING`, since "after creation of the feed has
+            // succeeded, the status will be AVAILABLE" (`CreateFeedResponse$status`) —
+            // AVAILABLE is what the feed becomes once the accepted work is done, so it
+            // is not what the accept itself reports.
+            status: crate::state::FeedStatus::Creating,
             // "When you create the feed, this property is empty": a resource is
             // associated later, with AssociateFeed or UpdateFeed.
             association: None,
@@ -411,9 +445,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // runs.
             policy: None,
             tags,
-            transition_due_at: None,
-            // Nothing is in flight on a feed that has just been created, so there is no
-            // status for the clock to settle it back into.
+            // The move out of `CREATING` is owed from the accept instant on
+            // (`crate::state::FEED_CREATION_SPAN`): the recorded service has the feed
+            // built by the time the caller's next request arrives, so the next call's
+            // settle pass materialises it and every read reports the settled status.
+            transition_due_at: Some(due),
+            // Nothing else is in flight on a feed that has just been created, so there
+            // is no status for the clock to settle it back into.
             settles_into: None,
         };
 
@@ -431,6 +469,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: Some(feed.tag_map()),
         };
         state.feeds.insert(feed.id.clone(), feed);
+        // The `CREATING` -> `AVAILABLE` move this accept owes, so the settle pass does
+        // not skip the store while it is outstanding.
+        state.note_due(due);
         Ok(output)
     }
 }

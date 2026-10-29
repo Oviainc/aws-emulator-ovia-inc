@@ -12,8 +12,9 @@
 //! case:
 //!
 //! * a feed is MINTED and PERSISTED: the create response is built from the stored
-//!   record, and `GetFeed` returns that same record member for member — status included,
-//!   because a created feed is settled and `AVAILABLE` at once;
+//!   record, and `GetFeed` returns that same record member for member — with the
+//!   lifecycle status the accepted creation has since settled into, and the feed's
+//!   inputs, which only a read reports;
 //! * `ListFeeds` enumerates the persisted feeds in one stable order, at most
 //!   `maxResults` per page (10 when the request omits it), resuming from `nextToken`;
 //! * `UpdateFeed` overwrites the stored feed, so later reads report the new values,
@@ -29,8 +30,8 @@
 //! * a feed whose deletion has been accepted cannot be updated (`ConflictException`).
 
 use crate::harness::{
-    call, create_feed, message_of, output_config, past_the_transition_span, router, REGION,
-    SIGNING_NAME,
+    call, config_with_resolved_audio_input, create_feed, message_of, output_config,
+    past_the_transition_span, router, REGION, SIGNING_NAME,
 };
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
@@ -55,7 +56,9 @@ fn expected_arn(id: &str) -> String {
 }
 
 /// The `GetOutput` list a feed reports for outputs that entered it through CreateFeed
-/// or UpdateFeed: the submitted outputs, each carrying `fromAssociation`.
+/// or UpdateFeed: the submitted outputs, each carrying `fromAssociation` and the audio
+/// binding the service resolves for an output that names none
+/// ([`config_with_resolved_audio_input`]).
 fn expected_outputs(submitted: &Value) -> Value {
     Value::Array(
         submitted
@@ -70,6 +73,14 @@ fn expected_outputs(submitted: &Value) -> Value {
                     .cloned()
                     .unwrap_or(Value::Bool(false));
                 members.insert("fromAssociation".to_string(), from_association);
+                let config = members
+                    .get("outputConfig")
+                    .cloned()
+                    .expect("an output carries its outputConfig");
+                members.insert(
+                    "outputConfig".to_string(),
+                    config_with_resolved_audio_input(config),
+                );
                 output
             })
             .collect(),
@@ -175,8 +186,9 @@ async fn create_feed_persists_a_feed_that_get_feed_reports_member_for_member() {
         );
         assert_eq!(
             created["status"],
-            json!("AVAILABLE"),
-            "case {label:?}: the created feed is AVAILABLE straight away, got {:?}",
+            json!("CREATING"),
+            "case {label:?}: the create is ACCEPTED, so its own answer reports CREATING, \
+             got {:?}",
             created["status"]
         );
         let endpoints = created["dataEndpoints"]
@@ -220,18 +232,36 @@ async fn create_feed_persists_a_feed_that_get_feed_reports_member_for_member() {
             created.get("association")
         );
 
-        // The round trip: every member comes back from storage unchanged, the status
-        // included — the create answers out of the record it stored, so there is nothing
-        // for a later read to settle.
+        // The round trip: every member the accept reported comes back from storage
+        // unchanged, except the lifecycle status — the accepted creation has settled, so
+        // the read reports AVAILABLE — and the feed's inputs, which only a read reports.
         let (status, fetched) = call(&router, "GET", &format!("/v1/feed/{id}"), None).await;
         assert_eq!(
             status, 200,
             "case {label:?}: GetFeed on the created id answers 200, got {status} with {fetched}"
         );
         assert_eq!(
-            fetched, created,
-            "case {label:?}: GetFeed reports the stored feed, got {fetched}"
+            fetched["status"],
+            json!("AVAILABLE"),
+            "case {label:?}: the created feed has settled by the next request, got {:?}",
+            fetched["status"]
         );
+        for member in [
+            "arn",
+            "name",
+            "id",
+            "dataEndpoints",
+            "outputs",
+            "accessRoleArn",
+            "association",
+            "tags",
+        ] {
+            assert_eq!(
+                fetched.get(member),
+                created.get(member),
+                "case {label:?}: GetFeed reports the stored {member}, got {fetched}"
+            );
+        }
     }
 
     // Every feed created above is still there, and no other.
@@ -510,9 +540,9 @@ async fn update_feed_overwrites_the_stored_feed() {
         );
         assert_eq!(
             updated["status"],
-            json!("UPDATING"),
-            "case {label:?}: the reconfiguration is in flight, so the update reports \
-             UPDATING, got {:?}",
+            json!("AVAILABLE"),
+            "case {label:?}: the update is COMPLETE when it answers 200, so it reports the \
+             feed's settled status, got {:?}",
             updated["status"]
         );
         assert_eq!(

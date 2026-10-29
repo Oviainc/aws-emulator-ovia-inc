@@ -63,6 +63,8 @@
 //!   the feed. It's possible that there is no associated resource. This is not an error.
 //! * `dataEndpoints` (StringList) **required** — The dataEndpoints of the feed.
 //! * `id` (FeedId, pattern ^[a-z0-9]{19}$) **required** — The ID of the feed.
+//! * `inputs` (FeedInputs) — The media inputs that the feed exposes. Each output's
+//!   `audioInput` names one of the audio inputs reported here.
 //! * `name` (ResourceName, pattern ^[a-zA-Z0-9]([a-zA-Z0-9-_]{0,126}[a-zA-Z0-9])?$)
 //!   **required** — The name of the feed.
 //! * `outputs` (GetOutputList) **required** — An array of the outputs in the feed.
@@ -191,6 +193,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: feed.name.clone(),
             id: feed.id.clone(),
             data_endpoints: feed.data_endpoints.clone(),
+            // The media inputs the feed exposes, built from the stored input set: a
+            // client reading a feed learns the names an output's `audioInput` may carry
+            // and where it pushes media, from the one copy of that fact
+            // (`crate::state::Feed::inputs`).
+            inputs: Some(feed.inputs()),
             outputs: feed.get_outputs(),
             access_role_arn: feed.access_role_arn.clone(),
             status: feed.status.as_wire().to_string(),

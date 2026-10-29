@@ -71,8 +71,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    AspectRatio, Competitor, DictionarySummary, FeedAssociation, FeedSummary, FixtureSummary,
-    GetOutput, OutputConfig,
+    AspectRatio, AudioInput, Competitor, DictionarySummary, FeedAssociation, FeedInputs,
+    FeedSummary, FixtureSummary, GetOutput, OutputConfig,
 };
 
 /// This service's SigV4 signing name and ARN namespace (`OPERATIONS.md`, "Wire
@@ -111,11 +111,25 @@ const DICTIONARY_ID_ALPHABET: &[u8; 62] =
 /// state. The due instant is stored on the record and materialised on the next
 /// call — nothing ever sleeps for it.
 ///
-/// A CREATED FEED owes no such transition: the recorded service answers `CreateFeed`
-/// with a feed that is already usable — a `GetFeed` taken immediately after reports
-/// `AVAILABLE`, and the association the caller makes in its very next request
-/// succeeds — so a feed is stored settled and this span never applies to it.
+/// A CREATED FEED's `CREATING` -> `AVAILABLE` move is NOT one of them, and this span
+/// does not apply to it: see [`FEED_CREATION_SPAN`].
 pub const TRANSITION_SPAN: Duration = Duration::from_millis(400);
+
+/// How long a feed's `CREATING` -> `AVAILABLE` move takes: no time at all, so the move
+/// is already owed the instant `CreateFeed` has answered.
+///
+/// `CreateFeed` is accepted (HTTP 202) with the feed in `CREATING` — creation has been
+/// ACCEPTED, not completed — and the recorded service then has the feed built by the
+/// time the caller's NEXT request arrives: a `GetFeed` taken immediately after the
+/// accept reports `AVAILABLE`, the `AssociateFeed` a caller issues in its very next
+/// request succeeds, and a `DisassociateFeed` refused right after a create reports the
+/// status it observed as `AVAILABLE`. So the span a caller could observe `CREATING` for
+/// is empty: the record passes through it, and the move to `AVAILABLE` falls due at the
+/// accept instant rather than at a later one this emulator would have to invent.
+/// Nothing sleeps for it either — the due instant is stored on the record and
+/// materialised by the next call's settle pass ([`Feed::transition_due_at`],
+/// [`ComAmazonawsElementalinferenceElementalinferenceState::settle_due_transitions`]).
+pub const FEED_CREATION_SPAN: Duration = Duration::ZERO;
 
 /// The most feeds this emulator keeps in ONE Region at once.
 ///
@@ -154,15 +168,17 @@ pub const MAX_REGIONS: usize = 32;
 
 /// The `FeedStatus` values this slice of the service produces.
 ///
-/// The model's enum also carries `CREATING`, and it is never reported: the recorded
-/// service hands back a feed that is immediately usable, so `CreateFeed` stores it
-/// `AVAILABLE` and there is no window in which a caller is told to wait ("After creation
-/// of the feed has succeeded, the status will be AVAILABLE",
-/// `CreateFeedResponse$status`). Nor is `DELETED` a value a feed record holds: a
-/// deletion that completes REMOVES the feed, so there is no feed left to report it (see
-/// the module docs).
+/// `DELETED` is not a value a feed record holds: a deletion that completes REMOVES the
+/// feed, so there is no feed left to report it (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedStatus {
+    /// The feed's creation has been ACCEPTED and is not complete yet: the status
+    /// `CreateFeed`'s own 202 answer reports, since "after creation of the feed has
+    /// succeeded, the status will be AVAILABLE" (`CreateFeedResponse$status`) — that is,
+    /// AVAILABLE is what the feed becomes once the accepted work is done. Transient: the
+    /// clock moves the feed to [`Self::Available`], and it owes that move already when
+    /// the accept answers ([`FEED_CREATION_SPAN`]).
+    Creating,
     /// The feed is settled and serviceable, with no resource associated.
     Available,
     /// A resource (the source media) is associated with the feed: `AssociateFeed`
@@ -183,6 +199,7 @@ impl FeedStatus {
     /// The value this status takes on the wire, as spelled by the `FeedStatus` enum.
     pub fn as_wire(self) -> &'static str {
         match self {
+            Self::Creating => "CREATING",
             Self::Available => "AVAILABLE",
             Self::Active => "ACTIVE",
             Self::Updating => "UPDATING",
@@ -546,6 +563,18 @@ pub fn cannot_find_dictionary_message(dictionary_id: &str) -> String {
     format!("Can't find dictionary {dictionary_id}. Use a different dictionary and try again.")
 }
 
+/// An audio input name the feed does not expose, named by an output's config — the
+/// audio input's counterpart of [`cannot_find_dictionary_message`], and likewise built
+/// from the name the request supplied.
+///
+/// An output consumes ONE of the feed's audio inputs ([`Feed::audio_inputs`]), so a name
+/// that is not one of them names nothing the feed has to offer and the request is
+/// refused rather than stored, exactly as a dictionary or fixture reference that
+/// resolves to nothing is.
+pub fn cannot_find_audio_input_message(audio_input: &str) -> String {
+    format!("Can't find audio input {audio_input} in the feed. Use a different audioInput and try again.")
+}
+
 /// The id of the dictionary an output config references, if it references one.
 ///
 /// Only a subtitling output can: `SubtitlingConfig$dictionary` is "The ID of a custom
@@ -576,6 +605,44 @@ pub fn fixture_reference(config: &OutputConfig) -> Option<&str> {
         | OutputConfig::Subtitling(_)
         | OutputConfig::contextualMetadata(_) => None,
     }
+}
+
+/// The audio input an output config names, if it names one.
+///
+/// EVERY member of the `OutputConfig` union carries the member: an output of any feature
+/// consumes the audio of one of the feed's inputs, so which input that is, is a property
+/// of the output's configuration whatever the feature is
+/// (`smithy_query(query="shape",shape="OutputConfig")` lists cropping, clipping,
+/// subtitling and contextualMetadata). `None` is a config that left the member unsaid,
+/// which the service resolves for itself ([`output_config_with_defaults`]).
+pub fn audio_input_reference(config: &OutputConfig) -> Option<&str> {
+    match config {
+        OutputConfig::Cropping(cropping) => cropping.audio_input.as_deref(),
+        OutputConfig::Clipping(clipping) => clipping.audio_input.as_deref(),
+        OutputConfig::Subtitling(subtitling) => subtitling.audio_input.as_deref(),
+        OutputConfig::contextualMetadata(contextual_metadata) => {
+            contextual_metadata.audio_input.as_deref()
+        }
+    }
+}
+
+/// The audio input an output config names that is not one of `audio_inputs`, if any —
+/// the one scan every operation that writes outputs into a feed resolves the supplied
+/// configs' audio bindings with (`CreateFeed`, `UpdateFeed`, `AssociateFeed`), so none
+/// of them can disagree about which bindings a stored feed may carry.
+///
+/// Walks the supplied list once, which every writer of the list bounds by
+/// [`MAX_OUTPUTS_PER_FEED`]; `audio_inputs` is the input set of the feed the outputs are
+/// written into ([`Feed::audio_inputs`], or the set a create is about to mint the feed
+/// with).
+pub fn unresolved_audio_input<'a>(
+    configs: impl IntoIterator<Item = &'a OutputConfig>,
+    audio_inputs: &[String],
+) -> Option<&'a str> {
+    configs.into_iter().find_map(|config| {
+        audio_input_reference(config)
+            .filter(|named| !audio_inputs.iter().any(|held| held == named))
+    })
 }
 
 /// The `DictionaryStatus` values this slice of the service produces.
@@ -739,17 +806,20 @@ impl Output {
     /// The config is stored with the service's own defaults already materialised
     /// ([`output_config_with_defaults`]), so every later read of the feed reports the
     /// configuration the service actually applied rather than only the members the
-    /// request happened to carry.
+    /// request happened to carry. `default_audio_input` is the audio input of the feed
+    /// this output is written into that the service binds an output to when the request
+    /// names none ([`Feed::default_audio_input`]).
     pub fn new(
         name: String,
         output_config: OutputConfig,
         status: String,
         description: Option<String>,
         from_association: bool,
+        default_audio_input: &str,
     ) -> Self {
         Self {
             name,
-            output_config: output_config_with_defaults(output_config),
+            output_config: output_config_with_defaults(output_config, default_audio_input),
             status,
             description,
             from_association,
@@ -779,6 +849,14 @@ pub struct Feed {
     /// is also the Region field of [`Self::arn`].
     pub region: String,
     pub data_endpoints: Vec<String>,
+    /// The media inputs this feed exposes, by name: the calling application sends media
+    /// to them and each output names the one it consumes
+    /// ([`audio_input_reference`]). Minted WITH the feed
+    /// ([`minted_audio_inputs`]) — a feed always exposes at least one, so there is
+    /// always an input for an output to be bound to — and reported by `GetFeed`
+    /// ([`Self::inputs`]), which is how a client learns what it may put in an output's
+    /// `audioInput`.
+    pub audio_inputs: Vec<String>,
     pub outputs: Vec<Output>,
     pub access_role_arn: Option<String>,
     pub status: FeedStatus,
@@ -874,6 +952,39 @@ impl Feed {
         self.settles_into = None;
     }
 
+    /// The audio input of this feed that an output naming none is bound to: the feed's
+    /// FIRST input, which for a feed created with no explicit input is the default one
+    /// it was minted with ([`minted_audio_inputs`]).
+    pub fn default_audio_input(&self) -> &str {
+        self.audio_inputs
+            .first()
+            .map_or(DEFAULT_AUDIO_INPUT_NAME, String::as_str)
+    }
+
+    /// The `FeedInputs` projection `GetFeed` reports — the media inputs this feed
+    /// exposes, built from the stored input set so a read reports exactly the names an
+    /// output's `audioInput` may carry.
+    pub fn inputs(&self) -> FeedInputs {
+        FeedInputs {
+            audio: self
+                .audio_inputs
+                .iter()
+                .map(|name| AudioInput { name: name.clone() })
+                .collect(),
+        }
+    }
+
+    /// This feed's SETTLED lifecycle status: the status the clock settles it into while
+    /// a transition it owes is still in flight ([`Self::settles_into`]), and the stored
+    /// status otherwise.
+    ///
+    /// What an operation that COMPLETES when it answers reports: a reconfiguration
+    /// suspends the feed's lifecycle status without changing it, so the status such a
+    /// call hands back is the one the feed is in once the work it answered for is done.
+    pub fn settled_status(&self) -> FeedStatus {
+        self.settles_into.unwrap_or(self.status)
+    }
+
     /// Whether any of this feed's outputs references `dictionary_id`, i.e. names it in
     /// its subtitling config ([`Output::referenced_dictionary`]).
     pub fn references_dictionary(&self, dictionary_id: &str) -> bool {
@@ -950,9 +1061,9 @@ impl Feed {
     }
 
     /// Whether this feed is still EXACTLY what a `CreateFeed` left behind, in every
-    /// respect a create does not state: settled in the status a create produces, with
-    /// no resource associated, no release served, no policy attached, nothing owed to
-    /// the clock and no deletion accepted.
+    /// respect a create does not state: in a lifecycle status a create produces, with
+    /// no resource associated, no release served, no policy attached, nothing else owed
+    /// to the clock and no deletion accepted.
     ///
     /// A feed some later call has moved on is not a record a repeated create can answer
     /// with ([`ComAmazonawsElementalinferenceElementalinferenceState::feed_created_from`]):
@@ -961,11 +1072,20 @@ impl Feed {
     /// the record's CURRENT content, not its history, so a feed an update changed and
     /// then changed back is once more a feed that create would have produced.
     pub fn is_as_created(&self) -> bool {
-        self.status == FeedStatus::Available
+        // A create mints the feed in `CREATING` and the clock settles it into
+        // `AVAILABLE` ([`FEED_CREATION_SPAN`]), so either of those lifecycle statuses is
+        // one a create produces — as the dictionary's counterpart also holds
+        // ([`Dictionary::is_as_created`]). Every other status is some later call's.
+        let lifecycle_a_create_produces = match self.status {
+            FeedStatus::Creating => true,
+            FeedStatus::Available => self.transition_due_at.is_none(),
+            FeedStatus::Active | FeedStatus::Updating | FeedStatus::Deleting
+            | FeedStatus::Archived => false,
+        };
+        lifecycle_a_create_produces
             && self.association.is_none()
             && self.released_resource_name.is_none()
             && self.policy.is_none()
-            && self.transition_due_at.is_none()
     }
 
     /// The `FeedSummary` projection `ListFeeds` reports.
@@ -1492,6 +1612,13 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
                 // resource this store holds: nothing `GetFeed` reports, `ListFeeds`
                 // lists, a tagging call reaches or a repeated `DeleteFeed` resolves.
                 FeedStatus::Deleting => return false,
+                // "After creation of the feed has succeeded, the status will be
+                // AVAILABLE" (`CreateFeedResponse$status`): the accepted creation is
+                // done, so the feed is serviceable from here on.
+                FeedStatus::Creating => {
+                    feed.status = FeedStatus::Available;
+                    feed.transition_due_at = None;
+                }
                 // A feed whose reconfiguration has completed goes back into the status
                 // it was reconfigured from ([`Feed::settles_into`]): the work suspended
                 // that status, it did not replace it.
@@ -1871,6 +1998,26 @@ fn data_endpoint_label(id: &str) -> String {
     label
 }
 
+/// The name of the audio input a feed is minted with.
+///
+/// A feed created with no explicit input exposes exactly ONE audio input — the service's
+/// default — so that is the input every output of a fresh feed consumes, and the name a
+/// `GetFeed` reports under `inputs.audio[*].name`. It is the input's NAME rather than an
+/// identity: every feed exposes an input of this name, and which input an output is
+/// bound to is read from the feed ([`Feed::default_audio_input`]) rather than assumed.
+pub const DEFAULT_AUDIO_INPUT_NAME: &str = "default-audio";
+
+/// The audio inputs a feed is minted with: the one default input
+/// ([`DEFAULT_AUDIO_INPUT_NAME`]).
+///
+/// `CreateFeedRequest` declares no inputs member
+/// (`smithy_query(query="operation",operation="CreateFeed")`), so a caller cannot ask
+/// for any: the input set is the service's to mint, and it mints the default one with
+/// the feed, which is why a feed is readable with an input from the moment it exists.
+pub fn minted_audio_inputs() -> Vec<String> {
+    vec![DEFAULT_AUDIO_INPUT_NAME.to_string()]
+}
+
 /// The aspect ratio a subtitling output is configured with when the request that
 /// created it carried none.
 ///
@@ -1917,18 +2064,33 @@ pub const DEFAULT_PROFANITY_FILTER: &str = "DISABLED";
 /// configuration back instead of dropping it.
 ///
 /// Only members this service's model declares can be reported, so the defaults are
-/// exactly the modelled optional members the service resolves itself: the ones whose
-/// documentation names the value the service applies when the request omits them —
-/// [`DEFAULT_SUMMARY_GENERATION`], [`DEFAULT_EXTENDED_ANALYSIS`] and
-/// [`DEFAULT_PROFANITY_FILTER`] — plus a subtitling output's
-/// [`DEFAULT_SUBTITLING_ASPECT_RATIO`]. The cropping and clipping configs declare no
-/// member the service resolves
-/// (`smithy_query(query="shape",shape="CroppingConfig,ClippingConfig")`), so they are
-/// stored as the request carried them. A member the request DID carry is never
+/// exactly the modelled optional members the service resolves itself: the audio input
+/// EVERY output config is bound to (`default_audio_input`, the input of the feed the
+/// output is written into that the service picks when the request names none — see
+/// [`Feed::default_audio_input`]), the ones whose documentation names the value the
+/// service applies when the request omits them — [`DEFAULT_SUMMARY_GENERATION`],
+/// [`DEFAULT_EXTENDED_ANALYSIS`] and [`DEFAULT_PROFANITY_FILTER`] — plus a subtitling
+/// output's [`DEFAULT_SUBTITLING_ASPECT_RATIO`]. A member the request DID carry is never
 /// rewritten: the stored config is the request's, widened with what it left unsaid.
-pub fn output_config_with_defaults(mut config: OutputConfig) -> OutputConfig {
+pub fn output_config_with_defaults(
+    mut config: OutputConfig,
+    default_audio_input: &str,
+) -> OutputConfig {
     match &mut config {
+        OutputConfig::Cropping(cropping) => {
+            cropping
+                .audio_input
+                .get_or_insert_with(|| default_audio_input.to_string());
+        }
+        OutputConfig::Clipping(clipping) => {
+            clipping
+                .audio_input
+                .get_or_insert_with(|| default_audio_input.to_string());
+        }
         OutputConfig::Subtitling(subtitling) => {
+            subtitling
+                .audio_input
+                .get_or_insert_with(|| default_audio_input.to_string());
             subtitling
                 .aspect_ratio
                 .get_or_insert(DEFAULT_SUBTITLING_ASPECT_RATIO);
@@ -1938,13 +2100,15 @@ pub fn output_config_with_defaults(mut config: OutputConfig) -> OutputConfig {
         }
         OutputConfig::contextualMetadata(contextual_metadata) => {
             contextual_metadata
+                .audio_input
+                .get_or_insert_with(|| default_audio_input.to_string());
+            contextual_metadata
                 .summary_generation
                 .get_or_insert_with(|| DEFAULT_SUMMARY_GENERATION.to_string());
             contextual_metadata
                 .extended_analysis
                 .get_or_insert_with(|| DEFAULT_EXTENDED_ANALYSIS.to_string());
         }
-        OutputConfig::Cropping(_) | OutputConfig::Clipping(_) => {}
     }
     config
 }

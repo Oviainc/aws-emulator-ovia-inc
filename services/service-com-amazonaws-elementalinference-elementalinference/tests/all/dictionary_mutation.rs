@@ -23,7 +23,8 @@
 //!   exactly while some feed output's subtitling config names it, whichever call put it
 //!   there; and "you cannot delete a dictionary that is referenced by a feed", which is
 //!   the modelled `ConflictException` (HTTP 409);
-//! * `UpdateFeed` reports the transient `UPDATING` for the span of the reconfiguration
+//! * `UpdateFeed` answers the feed's settled status and reports the transient
+//!   `UPDATING` on the read path for the span of the reconfiguration
 //!   it starts, and the feed then settles back into the status that span suspended.
 
 use crate::harness::{
@@ -838,11 +839,13 @@ async fn delete_dictionary_is_refused_while_a_feed_references_it() {
 }
 
 /// `UpdateFeed` reconfigures the feed's payload, which is work the service carries out
-/// after the call: the feed reports the transient `UPDATING` while that is in flight and
-/// the clock then settles it back into the status the reconfiguration suspended — it
-/// neither cancels nor accelerates a transition the clock already owes.
+/// after the call: the 200 answer reports the feed's SETTLED status — the write is
+/// complete when it answers — the reads report the transient `UPDATING` while the
+/// reconfiguration is in flight, and the clock then settles the feed back into the
+/// status the reconfiguration suspended — it neither cancels nor accelerates a
+/// transition the clock already owes.
 #[tokio::test]
-async fn update_feed_reports_updating_and_settles_back_into_the_status_it_suspended() {
+async fn update_feed_answers_the_settled_status_and_settles_back_into_it() {
     // One row per status a feed can be in when the update arrives — every settled
     // status the service produces — with rows differing in how many outputs the payload
     // carries. `expected_later` is what the clock leaves once the reconfiguration has
@@ -919,8 +922,8 @@ async fn update_feed_reports_updating_and_settles_back_into_the_status_it_suspen
         );
         assert_eq!(
             updated["status"],
-            json!("UPDATING"),
-            "case {label:?}: the update reports the reconfiguration in flight, got {:?}",
+            json!(expected_later),
+            "case {label:?}: the 200 reports the feed's settled status, got {:?}",
             updated["status"]
         );
         assert_eq!(
@@ -930,15 +933,15 @@ async fn update_feed_reports_updating_and_settles_back_into_the_status_it_suspen
             updated["name"]
         );
 
-        // The status in the response is the stored one: a read straight after reports
-        // it, and the clock then settles the feed back into the status it suspended — no
-        // more than that.
+        // The reconfiguration itself is on the READ path: a read straight after the
+        // update reports the transient status, and the clock then settles the feed back
+        // into the status it suspended — no more than that.
         let (status, immediately) = call(&router, "GET", &format!("/v1/feed/{feed_id}"), None).await;
         assert_eq!(
             (status, &immediately["status"]),
             (200, &json!("UPDATING")),
-            "case {label:?}: GetFeed straight after the update reports the same status, got \
-             {status} with {immediately}"
+            "case {label:?}: GetFeed straight after the update reports the reconfiguration \
+             in flight, got {status} with {immediately}"
         );
         past_the_transition_span();
         let (_, later) = call(&router, "GET", &format!("/v1/feed/{feed_id}"), None).await;
