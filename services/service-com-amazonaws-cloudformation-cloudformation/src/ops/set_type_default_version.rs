@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetTypeDefaultVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetTypeDefaultVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetTypeDefaultVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The version of one private extension this account and Region uses where a request names
+//! none: the `DefaultVersionId` the registry record carries.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +139,191 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetTypeDefaultVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetTypeDefaultVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetTypeDefaultVersion"))
+        // What the request identifies, and which version of it it names. A combination of
+        // members that cannot hold together is refused with the registry's own modelled 400
+        // before any state is touched.
+        let (identifier, named_version) = read_request(&input).map_err(registry_exception)?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no registry whose record could carry
+            // a default version, so this answers 501 rather than a write nothing recorded.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SetTypeDefaultVersion",
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // The settle walk every operation makes first, so this call reads and writes a
+        // registry in which every transition the clock had already made due is installed.
+        store.settle(::std::time::SystemTime::now());
+
+        // The REGISTRATION the request names, in the Region the request was served in.
+        // `DefaultVersionId` "applies only to private extensions you have registered in your
+        // account", and a record holding no version in active use is one a deregistration or
+        // a deactivation has taken out of use, so both predicates are part of resolving the
+        // record rather than a second refusal after it: anything else is not an extension
+        // this operation can name.
+        let arn = match identifier {
+            Identifier::Arn { extension, .. } => store.extension_by_arn(&region, extension),
+            Identifier::Name {
+                type_kind,
+                type_name,
+            } => store.registered_extension_by_name(&region, type_kind, type_name),
+        }
+        .filter(|extension| extension.is_private() && extension.is_live())
+        .map(|extension| extension.arn.clone())
+        .ok_or_else(|| type_not_found(identifier.named()))?;
+
+        // "The ID of a specific version of the extension": the call says WHICH version of the
+        // extension the operations that name none are to use, so a request naming no version
+        // specifies nothing to make default.
+        let version_id =
+            named_version.ok_or_else(|| registry_exception(NO_VERSION.to_string()))?;
+
+        let Some(extension) = store.extension_by_arn_mut(&region, &arn) else {
+            // Unreachable: the record was resolved just above, under the same lock. Answered
+            // as the modelled 404 rather than with a panic, which would leave the shared
+            // store poisoned for every other caller.
+            return Err(type_not_found(identifier.named()));
+        };
+        // The version has to be one the record holds in ACTIVE USE: "the default version of
+        // an extension will be used in CloudFormation operations", and a `DEPRECATED` version
+        // "can no longer be used" in them, so a version the record does not hold in active
+        // use is no version this operation can name.
+        if extension
+            .version(version_id)
+            .is_none_or(|version| !version.is_live())
+        {
+            return Err(type_not_found(&version_under(
+                identifier.named(),
+                version_id,
+            )));
+        }
+        extension.set_default_version(version_id);
+
+        Ok(SetTypeDefaultVersionOutput {})
     }
+}
+
+/// How a request identifies the extension whose default version it sets.
+///
+/// The model states the constraint across three members at once — "Conditional: You must
+/// specify either TypeName and Type, or Arn" — so a request carries one form or the other,
+/// never a mix and never neither.
+#[derive(Debug, Clone, Copy)]
+enum Identifier<'a> {
+    /// `Arn`, "the Amazon Resource Name (ARN) of the extension", which addresses the record
+    /// on its own; an extension-version ARN pins the version too, since "the version ID is
+    /// the value at the end of the ARN assigned to the extension version".
+    Arn {
+        extension: &'a str,
+        version_id: Option<&'a str>,
+    },
+    /// `Type` and `TypeName`, resolved in the Region the request was served in.
+    Name {
+        type_kind: &'a str,
+        type_name: &'a str,
+    },
+}
+
+impl Identifier<'_> {
+    /// What the request named the extension by, for the not-found message.
+    fn named(&self) -> &str {
+        match self {
+            Self::Arn { extension, .. } => extension,
+            Self::Name { type_name, .. } => type_name,
+        }
+    }
+}
+
+/// What the not-found message names when the extension was found but the version the request
+/// named was not: the version, under the extension the request named.
+fn version_under(extension: &str, version_id: &str) -> String {
+    format!("{extension}/{version_id}")
+}
+
+/// The message answered a request that identifies an extension but names no version of it, so
+/// there is nothing for it to make the record's default.
+const NO_VERSION: &str = "A VersionId must be specified to name the version of the extension \
+                          to use as its default version";
+
+/// Read what the request identifies and which version it names, or `Err(message)` for a
+/// combination of members that cannot hold together.
+///
+/// Every modelled constraint (each member's length and pattern, and `Type`'s enum) is
+/// already enforced before the handler runs; what is left are the CONDITIONAL rules the
+/// model states in prose — the same ones `DeregisterType` reads, since the two identify an
+/// extension and select a version of it by the same members.
+fn read_request(
+    input: &SetTypeDefaultVersionInput,
+) -> Result<(Identifier<'_>, Option<&str>), String> {
+    let identifier = match (
+        input.arn.as_deref(),
+        input.r#type.as_deref(),
+        input.type_name.as_deref(),
+    ) {
+        (Some(arn), None, None) => {
+            let (extension, version_id) = crate::state::registry::split_version_arn(arn);
+            Identifier::Arn {
+                extension,
+                version_id,
+            }
+        }
+        (None, Some(type_kind), Some(type_name)) => Identifier::Name {
+            type_kind,
+            type_name,
+        },
+        // Both forms at once: the two identify the extension independently, so a request
+        // carrying both states two identities for one call.
+        (Some(_), _, _) => {
+            return Err(
+                "Specify either Arn, or Type and TypeName, but not both: an extension is \
+                 identified by its ARN or by its kind and name"
+                    .to_string(),
+            )
+        }
+        // Neither form, or half of the name form.
+        (None, _, _) => {
+            return Err(
+                "Either Arn, or both Type and TypeName, must be specified to identify an \
+                 extension"
+                    .to_string(),
+            )
+        }
+    };
+
+    let pinned_by_arn = match identifier {
+        Identifier::Arn { version_id, .. } => version_id,
+        Identifier::Name { .. } => None,
+    };
+    // A version ARN already names a version, so a `VersionId` beside it must be that same
+    // version: two different ones name two different versions for one call.
+    let named_version = match (input.version_id.as_deref(), pinned_by_arn) {
+        (Some(named), Some(pinned)) if named != pinned => {
+            return Err(format!(
+                "VersionId {named} does not name the extension version the Arn does \
+                 ({pinned})"
+            ))
+        }
+        (named, pinned) => named.or(pinned),
+    };
+    Ok((identifier, named_version))
+}
+
+/// The registry's own modelled refusal: HTTP 400 `CFNRegistryException`, "an error occurred
+/// during a CloudFormation registry operation".
+fn registry_exception(message: String) -> SetTypeDefaultVersionError {
+    SetTypeDefaultVersionErrorModeled::CFNRegistryException(CFNRegistryException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 404: "The specified extension doesn't exist in the CloudFormation
+/// registry."
+fn type_not_found(identifier: &str) -> SetTypeDefaultVersionError {
+    SetTypeDefaultVersionErrorModeled::TypeNotFoundException(TypeNotFoundException {
+        message: Some(crate::state::extension_does_not_exist(identifier)),
+    })
+    .into()
 }

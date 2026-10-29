@@ -28,8 +28,8 @@
 //! ONE row of the first table: a publication addressed by a version ARN, of an extension the
 //! registry does not hold.
 //!
-//! The registry's other WRITERS (`RegisterType`, `ActivateType`, `SetTypeDefaultVersion`) are
-//! still scaffold stubs with their own issues, so the records published here are the ones
+//! `RegisterType`, the registry's one WRITER still a scaffold stub, has an issue of its own,
+//! so the records published here are the ones
 //! `extension_registry.rs` seeds straight into the store — this crate's one registry fixture,
 //! so what `PublishType` writes and what `DescribeType` reports back are held to the same
 //! records. Every call goes through the real request path (form-encoded body in, XML envelope

@@ -269,6 +269,8 @@ mod third_party_extensions;
 mod type_configurations;
 #[path = "all/type_deactivation.rs"]
 mod type_deactivation;
+#[path = "all/type_default_version.rs"]
+mod type_default_version;
 #[path = "all/type_deregistration.rs"]
 mod type_deregistration;
 #[path = "all/type_testing.rs"]

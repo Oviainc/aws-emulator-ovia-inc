@@ -19,9 +19,8 @@
 //! row of the published-extension table: a read of `AWS::S3::Bucket`, one of the public
 //! extensions every account's registry holds without anybody registering it.
 //!
-//! The registry's WRITERS (`RegisterType`, `ActivateType`, `SetTypeConfiguration`,
-//! `SetTypeDefaultVersion`, `TestType`) are still scaffold stubs with their own issues, so
-//! the records below are seeded straight into the store — the same device
+//! `RegisterType`, the registry's one WRITER still a scaffold stub, has an issue of its own,
+//! so the records below are seeded straight into the store — the same device
 //! `stack_lifecycle.rs` uses for records a bound's worth of wire calls could not create.
 //! Every READ goes through the real request path (form-encoded body in, XML envelope out),
 //! so what is asserted is what a client sees.

@@ -25,8 +25,8 @@
 //! over both conclusions the tests can reach — the version whose stored schema declares the
 //! extension it defines and the version the registry holds no schema for.
 //!
-//! The registry's other WRITERS (`RegisterType`, `ActivateType`, `SetTypeDefaultVersion`)
-//! are still scaffold stubs with their own issues, so the records tested here are the ones
+//! `RegisterType`, the registry's one WRITER still a scaffold stub, has an issue of its
+//! own, so the records tested here are the ones
 //! `extension_registry.rs` seeds straight into the store — this crate's one registry
 //! fixture, so what `TestType` writes and what `DescribeType` reports back are held to the
 //! same records. Every call goes through the real request path (form-encoded body in, XML

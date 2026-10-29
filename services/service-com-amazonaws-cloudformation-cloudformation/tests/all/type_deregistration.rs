@@ -29,9 +29,9 @@
 //! broken. The recorded trace this suite was written for is ONE row of the refusal table: a
 //! deregistration of a type name the registry holds nothing for.
 //!
-//! The registry's other WRITERS (`RegisterType`, `ActivateType`, `SetTypeDefaultVersion`) are
-//! still scaffold stubs with their own issues, so the registrations below are seeded straight
-//! into the store — the same device `extension_registry.rs` and `type_deactivation.rs` use.
+//! `RegisterType`, the registry's one WRITER still a scaffold stub, has an issue of its own,
+//! so the registrations below are seeded straight into the store — the same device
+//! `extension_registry.rs` and `type_deactivation.rs` use.
 //! Every call goes through the real request path (form-encoded body in, XML envelope out), so
 //! what is asserted is what a client sees, and what a deregistration wrote is read BACK
 //! through `DescribeType` ("to view the deprecation status of an extension or extension

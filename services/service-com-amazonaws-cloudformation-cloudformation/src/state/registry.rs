@@ -27,10 +27,10 @@
 //! [`StoredExtension::deactivate`]), `TestType` (`TypeTestsStatus`) and `PublishType` (which
 //! publishes one version of a private record as the PUBLIC extension record
 //! [`published_record`] is).
-//! `TestType`, `PublishType`, `DeactivateType` and `DeregisterType` are implemented; the
-//! others are still scaffold stubs with
-//! their own issues, so the only record `src/` adds to this registry is a publication's
-//! public one. A publication adds at most one RECORD per private record it publishes, and
+//! `RegisterType` is the one writer above still a scaffold stub with an issue of its own;
+//! every other one is implemented, so the records `src/` adds to this registry are an
+//! activation's and a publication's public one. A publication adds at most one RECORD per
+//! private record it publishes, and
 //! the versions it then adds to that record are bounded at [`MAX_PUBLISHED_VERSIONS`],
 //! oldest reclaimed first — the registry's one caller-counted growth site (the writer that
 //! adds a REGISTRATION is where RegisterType's documented "maximum of 50 resource extension
@@ -837,6 +837,17 @@ impl StoredExtension {
             Some(version_id) => self.version(version_id),
             None => self.versions.last(),
         }
+    }
+
+    /// Make `version_id` the version a request that names none resolves to — "the default
+    /// version of an extension will be used in CloudFormation operations" — which is what
+    /// `SetTypeDefaultVersion` writes.
+    ///
+    /// A record carries ONE default version, so this replaces whichever version was the
+    /// default before; the versions themselves are untouched, since which one is the default
+    /// is a property of the record rather than of a version.
+    pub fn set_default_version(&mut self, version_id: &str) {
+        self.default_version_id = Some(version_id.to_string());
     }
 
     /// Whether this version is the record's default version (`IsDefaultVersion`).
