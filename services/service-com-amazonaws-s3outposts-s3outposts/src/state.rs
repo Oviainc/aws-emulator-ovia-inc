@@ -1218,16 +1218,26 @@ pub fn decode_endpoint_cursor(token: &str) -> Option<(String, String)> {
 /// refusal for a token this listing never issued — which a token naming a place
 /// outside the set this walk orders at all is.
 ///
-/// A cursor is a position in ONE walk, so it is read in the scope that walk
-/// serves and not just checked for its form. The walk these listings share
-/// reports only endpoints whose parent Outpost the `inventory` holds in `region`
-/// ([`endpoint_page`]), and its key order is dominated by the `OutpostId` half
-/// ([`ComAmazonawsS3outpostsS3outpostsState::endpoints`]), so a token whose
-/// Outpost half names an Outpost of another Region — or none the inventory holds
-/// — names no place in this Region's order: resuming there would answer a page of
-/// whatever happens to sort after it (often an empty one, reporting that the
-/// account has no endpoints here) or ignore the cursor altogether and re-serve the
-/// first page. It is refused instead, exactly as a token of the wrong form is.
+/// A cursor is a position in ONE walk, so it is read in the whole scope that walk
+/// serves and not just checked for its form: the only keys a listing can mint a
+/// cursor for are the ones its own walk passes over. The key order these listings
+/// share is dominated by the `OutpostId` half
+/// ([`ComAmazonawsS3outpostsS3outpostsState::endpoints`]), so that half is what
+/// the scope is read off, and it has to name an Outpost this walk orders on both
+/// counts the scope has:
+///
+/// * the Region — the walk reports only endpoints whose parent Outpost the
+///   `inventory` holds in `region` ([`endpoint_page`]), so an Outpost of another
+///   Region, or none the inventory holds at all, names no place in it;
+/// * `outpost_scope`, the Outpost a listing scoped to ONE named Outpost walks the
+///   endpoints of — its walk passes over that Outpost's keys alone, so no other
+///   Outpost's key is a position in it. `None` for a listing scoped to no single
+///   Outpost, whose walk spans every Outpost of the Region.
+///
+/// Resuming at a key outside that scope would answer a page of whatever happens
+/// to sort after it (often an empty one, reporting that a scope which has
+/// endpoints has none) or ignore the cursor altogether and re-serve the first
+/// page. It is refused instead, exactly as a token of the wrong form is.
 ///
 /// The ENDPOINT half is deliberately not resolved: the walk resumes at the first
 /// key at or after the cursor, so a page is still served when the endpoint the
@@ -1237,10 +1247,13 @@ pub fn endpoint_cursor(
     operation: &str,
     inventory: &OutpostInventory,
     region: &str,
+    outpost_scope: Option<&str>,
 ) -> Result<Option<(String, String)>, ValidationException> {
     list_cursor(next_token, operation, |token| {
-        decode_endpoint_cursor(token)
-            .filter(|(outpost_id, _)| outpost_region(inventory, outpost_id) == Some(region))
+        decode_endpoint_cursor(token).filter(|(outpost_id, _)| {
+            outpost_region(inventory, outpost_id) == Some(region)
+                && outpost_scope.is_none_or(|scoped| outpost_id == scoped)
+        })
     })
 }
 

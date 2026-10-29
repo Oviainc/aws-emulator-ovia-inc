@@ -139,12 +139,12 @@ async fn both_endpoint_listings_page_over_one_stable_order() {
 async fn both_endpoint_listings_refuse_a_token_they_never_issued() {
     let (router, engine, listings) = endpoint_listings().await;
 
-    // The one valid cursor these cases are perturbations of: a real pair of this fixture.
-    let valid = cursor_of(&Listing::OwnEndpoints.stored_arns(&engine)[1]);
-
     for listing in &listings {
-        // The pair the perturbations are built from IS served, so the rows below are
-        // refused for their form and not because the fixture has nothing to serve.
+        // The valid cursor the rows below are perturbations of: a real pair of this
+        // listing's OWN set, since a cursor is a position in one walk and this one has to
+        // be served. The rows are then refused for their form and not because the fixture
+        // has nothing to serve.
+        let valid = cursor_of(&listing.stored_arns(&engine)[1]);
         let accepted = listing.page(&router, Some(1), Some(&valid)).await;
         assert_eq!(
             accepted.status, 200,

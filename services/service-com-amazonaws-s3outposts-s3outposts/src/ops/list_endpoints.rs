@@ -160,14 +160,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let inventory = crate::state::settled_inventory(&*self.engine, &mut store, now);
 
         // The cursor is the (Outpost, endpoint) pair the next page starts at, read
-        // in the Region this listing walks: a token this listing never issued —
-        // one of another form, or one naming an Outpost this Region's walk has no
-        // order over — is refused rather than served as an arbitrary page.
+        // in the scope this listing walks — this Region, across every Outpost in
+        // it, since the set is scoped by the caller's account and not by any one
+        // Outpost. A token this listing never issued — one of another form, or one
+        // naming an Outpost this Region's walk has no order over — is refused
+        // rather than served as an arbitrary page.
         let resume = crate::state::endpoint_cursor(
             input.next_token.as_deref(),
             Self::NAME,
             &inventory,
             &region,
+            None,
         )
         .map_err(ListEndpointsErrorModeled::ValidationException)?;
 

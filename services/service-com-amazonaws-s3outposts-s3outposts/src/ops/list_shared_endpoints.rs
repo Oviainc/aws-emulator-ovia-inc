@@ -162,24 +162,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whose Outpost has left that inventory, is one this page does not report.
         let inventory = crate::state::settled_inventory(&*self.engine, &mut store, now);
 
+        // The Outpost this listing is scoped to: the model states `OutpostId` as
+        // its only scoping member, so this is both the one Outpost whose endpoints
+        // the walk below reports and the one a cursor of that walk can name.
+        let scope = input.outpost_id.as_str();
+
         // The cursor is the (Outpost, endpoint) pair the next page starts at, read
-        // in the Region this listing walks: a token this listing never issued —
-        // one of another form, or one naming an Outpost this Region's walk has no
-        // order over — is refused rather than served as an arbitrary page. It is
-        // read before the Outpost the request named is resolved, so such a token is
-        // refused whatever the request named.
+        // in the scope this listing walks — this Region, and within it the one
+        // Outpost the request named. A token this listing never issued — one of
+        // another form, or one whose Outpost half names a place outside that scope
+        // (another Region's Outpost, one the inventory holds nowhere, or another
+        // Outpost of this Region) — is refused rather than served as an arbitrary
+        // page. It is read before the Outpost the request named is resolved, so
+        // such a token is refused whatever the request named.
         let resume = crate::state::endpoint_cursor(
             input.next_token.as_deref(),
             Self::NAME,
             &inventory,
             &region,
+            Some(scope),
         )
         .map_err(ListSharedEndpointsErrorModeled::ValidationException)?;
 
         // The Outpost the request named, as this Region reaches it: an Outpost
         // installed in another Region is not one this Region's endpoint serves,
         // so it resolves to the modelled 404 like one that does not exist.
-        crate::state::resolve_outpost(&inventory, &region, &input.outpost_id)
+        crate::state::resolve_outpost(&inventory, &region, scope)
             .map_err(ListSharedEndpointsErrorModeled::ResourceNotFoundException)?;
 
         // The walk, the page bound and the cursor are the one listing rule this
@@ -197,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             input.max_results,
             resume,
-            |endpoint| endpoint.outpost_id == input.outpost_id,
+            |endpoint| endpoint.outpost_id == scope,
         );
 
         Ok(ListSharedEndpointsOutput {
