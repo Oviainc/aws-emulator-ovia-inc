@@ -198,12 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Ownership of the instance is established above, so there is nothing left to
         // withhold: the modelled not-found says so, exactly as `AssociateUser` does for the
         // same resolution.
-        if !state.provider_key_is_registered(&key) {
-            // Mapped through `into_error`, the ONE place this operation words a directory
-            // with no live registration, so this branch and any lookup that reports the
-            // same fact cannot word one refusal two ways.
-            return Err(into_error(crate::state::StateError::ProviderNotRegistered));
-        }
+        // Asked through the state layer's own rule for this one fact
+        // (`require_registered_provider_key`), the ONE place a directory with no live
+        // registration is established and classified, so this handler and `AssociateUser` —
+        // which resolves the same directory the same way — cannot word one refusal two
+        // ways.
+        state
+            .require_registered_provider_key(&key)
+            .map_err(into_error)?;
 
         let mut matching = Vec::new();
         // Scoped to the `(IdentityProvider, InstanceId)` pair the model requires, and taken

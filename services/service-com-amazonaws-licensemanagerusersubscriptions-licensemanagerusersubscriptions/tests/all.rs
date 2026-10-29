@@ -75,6 +75,8 @@ mod tag_validation;
 mod update_settings_network_propagation;
 #[path = "all/user_association_plane_states_one_refusal.rs"]
 mod user_association_plane_states_one_refusal;
+#[path = "all/user_association_registration_rule_is_shared.rs"]
+mod user_association_registration_rule_is_shared;
 #[path = "all/user_associations.rs"]
 mod user_associations;
 #[path = "all/user_disassociation.rs"]

@@ -208,13 +208,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialise_due(now);
 
         let key = crate::state::provider_key(&input.identity_provider).map_err(into_error)?;
-        if !state.provider_key_is_registered(&key) {
-            // Mapped through `into_error`, the ONE place this operation words a
-            // directory with no live registration, so this branch, any lookup that
-            // reports the same fact and `ListUserAssociations` — which resolves the same
-            // directory the same way — cannot word one refusal two ways.
-            return Err(into_error(crate::state::StateError::ProviderNotRegistered));
-        }
+        // Asked through the state layer's own rule for this one fact
+        // (`require_registered_provider_key`), the ONE place a directory with no live
+        // registration is established and classified, so this handler and
+        // `ListUserAssociations` — which resolves the same directory the same way — cannot
+        // word one refusal two ways.
+        state
+            .require_registered_provider_key(&key)
+            .map_err(into_error)?;
 
         // Whether a tag is a legal AWS tag is a fact about the request, asked once the
         // identifiers it names have been resolved: a payload carrying an illegal key or

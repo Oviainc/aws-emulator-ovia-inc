@@ -356,7 +356,7 @@ pub const IDENTITY_PROVIDER_NOT_VALID: &str = "Identity provider is not valid";
 /// One sentence in one place, because it is one resolution: `AssociateUser` creates an
 /// association through the registration of the directory it names and
 /// `ListUserAssociations` reports the associations of that same directory, so both resolve
-/// it with [`ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::provider_key_is_registered`]
+/// it with [`ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::require_registered_provider_key`]
 /// and both answer their modelled `ResourceNotFoundException` carrying this.
 pub const IDENTITY_PROVIDER_NOT_REGISTERED: &str =
     "the identity provider is not registered for user-based subscriptions";
@@ -1063,6 +1063,24 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .filter_map(|arn| self.identity_providers.get(arn))
             .filter(|record| !deregistration_started(&record.status))
             .any(|record| provider_key(&record.identity_provider).is_ok_and(|k| k == key))
+    }
+
+    /// Require that some LIVE registration of this account is for the directory `key`
+    /// names — the resolution every operation of the USER-ASSOCIATION plane makes before it
+    /// creates or reports an association through that registration.
+    ///
+    /// The rule and the refusal it carries live here together, once: the predicate is
+    /// [`Self::provider_key_is_registered`] and the refusal is
+    /// [`StateError::ProviderNotRegistered`], which each handler's own `into_error` words
+    /// with its plane's sentence (the enums are per-operation types, so the mapping cannot
+    /// move here). `AssociateUser` and `ListUserAssociations` both ask through this, so
+    /// neither can decide this one fact its own way.
+    pub fn require_registered_provider_key(&self, key: &str) -> Result<(), StateError> {
+        if self.provider_key_is_registered(key) {
+            Ok(())
+        } else {
+            Err(StateError::ProviderNotRegistered)
+        }
     }
 
     /// The registration `arn` names, when it names one this account can still act on: a
