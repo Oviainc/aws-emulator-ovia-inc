@@ -21,13 +21,23 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Derives a terminology's ARN revision and its presigned data location from the
+# imported file's bytes (src/state.rs).
+sha2 = { workspace = true }
+# Hex-codes those digests (src/state.rs).
+hex = { workspace = true }
+# Parses the CSV and TSV custom-terminology input files ImportTerminology
+# accepts (src/ops/import_terminology.rs).
+csv = "1"
+# Parses the TMX custom-terminology input files ImportTerminology accepts
+# (src/ops/import_terminology.rs).
+quick-xml = "0.41"
+# Determines the source language of the text when TranslateText is asked for
+# `auto` (src/ops/translate_text.rs).
+whatlang = "0.18"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
