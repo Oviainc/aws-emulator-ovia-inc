@@ -15,6 +15,8 @@
 mod account_allocated_concurrency;
 #[path = "all/account_concurrency_floor_message.rs"]
 mod account_concurrency_floor_message;
+#[path = "all/account_concurrency_metering.rs"]
+mod account_concurrency_metering;
 #[path = "all/account_settings.rs"]
 mod account_settings;
 #[path = "all/alias_deletion.rs"]

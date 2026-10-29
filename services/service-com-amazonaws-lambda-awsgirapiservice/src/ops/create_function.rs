@@ -596,6 +596,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into_iter()
                 .collect(),
             reserved_concurrent_executions: None,
+            // ... and no execution running on it: an invocation is charged to the function
+            // it runs on, and nothing has been handed to this one yet.
+            concurrent_executions: 0,
             // The code signing configuration this function deploys under, when the
             // request named one; a function created without one is associated with none
             // until `PutFunctionCodeSigningConfig` associates one.
@@ -668,7 +671,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The create's subject is the FUNCTION, so what it reports as `FunctionArn` is the
         // function's own unqualified ARN; a version this call published is named by
         // `Version` alone (see `FunctionRecord::unqualified_configuration`).
-        Ok(stored.unqualified_configuration(&reported_version, &config))
+        let created = stored.unqualified_configuration(&reported_version, &config);
+
+        // The account now holds a function, so its concurrency is metered from here on —
+        // armed after the store's lock is released, and publishing nothing a caller is told
+        // (see `crate::state::concurrency_metering`).
+        drop(store);
+        crate::state::drive_concurrency_metering(&self.engine);
+        Ok(created)
     }
 }
 

@@ -111,6 +111,15 @@
 //! Managed Instances function is scaled from the moment it exists (see
 //! [`FunctionRecord::reported_function_scaling_config`]).
 //!
+//! What those same records come to at the account level is also METERED, with no client
+//! action at all: Lambda publishes how much of the Region's concurrency the account has
+//! claimed and how much of its unreserved pool is in use, which is what an operator alarms
+//! on the account's remaining headroom from. An execution of a function that reserves
+//! concurrency is charged to that reservation and never to the unreserved pool, so the
+//! difference between the two series is exactly the concurrency the account has allocated;
+//! see [`concurrency_metering`], which samples these records and publishes into the
+//! CloudWatch store [`metrics`] publishes the per-function series into.
+//!
 //! `GetAccountSettings` reports on the same records at the account level:
 //! "Retrieves details about your account's limits and usage in an Amazon Web Services
 //! Region", so its usage is what the store holds and its unreserved concurrency is what
@@ -218,6 +227,17 @@ pub mod event_source_poller;
 pub mod metrics;
 pub mod sqs_poller;
 pub use sqs_poller::{drive_sqs_pollers, poll_due, BATCH_NOT_PROCESSED_RESULT, POLL_INTERVAL};
+
+/// What the account's CONCURRENCY does with no client action at all — the series Lambda
+/// publishes about how much of the Region's capacity the account has claimed, and how much
+/// of its unreserved pool is in use — lives in [`concurrency_metering`], beside the
+/// per-function series in [`metrics`] it shares the CloudWatch store with. It is re-exported
+/// here for the same reason as [`capacity_provider`]: the records it reads, and the store
+/// that holds them, stay in this module.
+pub mod concurrency_metering;
+pub use concurrency_metering::{
+    drive_concurrency_metering, publish_account_concurrency, AccountConcurrency,
+};
 
 /// The region an ARN carries when the request is unsigned and therefore names no
 /// SigV4 credential scope to read a region from.
@@ -2221,6 +2241,17 @@ pub struct FunctionRecord {
     pub tags: BTreeMap<String, String>,
     /// The reserved concurrency, when `PutFunctionConcurrency` has set one.
     pub reserved_concurrent_executions: Option<i32>,
+    /// How many executions of this function are being processed at this instant: an
+    /// invocation counts from the moment Lambda hands it to an instance of this function
+    /// until that run ends.
+    ///
+    /// It is what the account's concurrency metering charges to this function's reservation,
+    /// or to the account's unreserved pool when it reserves nothing (see
+    /// [`concurrency_metering`]). No invocation in this emulator runs a deployment package —
+    /// `Invoke` refuses the run ([`crate::ops::invoke`]) — so a function whose runs were all
+    /// refused is processing none of them, and the metering reports that rather than a
+    /// concurrency nothing was using.
+    pub concurrent_executions: i32,
     /// The ARN of the code signing configuration this function deploys under, when one
     /// has been associated with it. It is a function-level setting — the association is
     /// addressed by a `FunctionName` alone, with no qualifier member anywhere on
@@ -4225,6 +4256,17 @@ pub struct ComAmazonawsLambdaAwsgirapiserviceState {
     /// The running poll loop's task handle, kept so the loop it replaces is aborted rather
     /// than merely forgotten.
     pub sqs_poller: Option<::tokio::task::JoinHandle<()>>,
+    /// Whether a concurrency sampler is already running over this account; see
+    /// [`concurrency_metering::drive_concurrency_metering`], which is the only thing that
+    /// sets it.
+    pub concurrency_metering_running: bool,
+    /// Which claim on that sampler is the current one, so a sampler standing down because
+    /// the account holds no function releases only its OWN claim and never one a later call
+    /// is holding.
+    pub concurrency_metering_generation: u64,
+    /// The running sampler's task handle, kept so the sampler it replaces is aborted rather
+    /// than merely forgotten.
+    pub concurrency_metering: Option<::tokio::task::JoinHandle<()>>,
 }
 
 /// One code-signing configuration.

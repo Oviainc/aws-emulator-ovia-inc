@@ -19,6 +19,14 @@
 //! regular storage resolution — so a reader laying one-minute periods over the series sees
 //! the batches read in each minute, and `Maximum` over a minute is the oldest data any
 //! batch of that minute carried.
+//!
+//! What a series is identified by and what one observation of it is are this module's
+//! ([`series`], [`observation`], [`append`]), so every metric this service publishes —
+//! the per-function ones here and the account-level concurrency metering in
+//! [`super::concurrency_metering`] — reaches the store the same way and carries the same
+//! resolution. An account-level series carries NO dimension: "a metric is uniquely defined
+//! by a name, a namespace, and zero or more dimensions", and the quantity such a series
+//! measures belongs to the Region rather than to one function.
 
 use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as cloudwatch;
 
@@ -55,7 +63,73 @@ pub const ITERATOR_AGE_UNIT: &str = "Milliseconds";
 /// The `StorageResolution` these datapoints are published at, in seconds: regular
 /// resolution, "which CloudWatch stores at 1-minute resolution"
 /// (`MetricDatum$StorageResolution`).
-const STANDARD_STORAGE_RESOLUTION_SECONDS: i32 = 60;
+pub const STANDARD_STORAGE_RESOLUTION_SECONDS: i32 = 60;
+
+/// The `StandardUnit` a bare count of things carries: `Count`.
+pub const COUNT_UNIT: &str = "Count";
+
+/// The series one of Lambda's own metrics lives in: the [`METRIC_NAMESPACE`] namespace, the
+/// metric's name, and the dimension set that identifies it — empty for a series measuring
+/// something that belongs to the Region rather than to one function.
+#[must_use]
+pub fn series(metric: &str, dimensions: cloudwatch::DimensionSet) -> cloudwatch::MetricKey {
+    cloudwatch::MetricKey {
+        namespace: METRIC_NAMESPACE.to_string(),
+        metric_name: metric.to_string(),
+        dimensions,
+    }
+}
+
+/// The dimension set of a series reported per function: the function the work was done for.
+#[must_use]
+pub fn function_dimensions(function_name: &str) -> cloudwatch::DimensionSet {
+    [(
+        FUNCTION_NAME_DIMENSION.to_string(),
+        function_name.to_string(),
+    )]
+    .into_iter()
+    .collect()
+}
+
+/// ONE measurement of a series, taken at `at_secs` (epoch seconds), published at the
+/// regular storage resolution so it is aggregated in the minute it was taken in.
+#[must_use]
+pub fn observation(value: f64, unit: &str, at_secs: f64) -> cloudwatch::StoredDatum {
+    cloudwatch::StoredDatum {
+        timestamp_secs: at_secs,
+        sample_count: 1.0,
+        sum: value,
+        minimum: value,
+        maximum: value,
+        unit: Some(unit.to_string()),
+        storage_resolution: STANDARD_STORAGE_RESOLUTION_SECONDS,
+    }
+}
+
+/// Store one observation of the series `key` names, and make every alarm watching that
+/// series due for evaluation — exactly as an ingested `PutMetricData` datapoint does, so an
+/// alarm cannot tell a service's own metric from a client's.
+///
+/// Answers whether it was stored: a store already holding its full complement of series
+/// drops the observation rather than failing the work it is about, because a metric is
+/// published off the response path.
+pub fn append(
+    store: &::engine::ServiceState<CloudWatchState>,
+    key: cloudwatch::MetricKey,
+    datum: cloudwatch::StoredDatum,
+) -> bool {
+    let watched = cloudwatch::WrittenSeries {
+        key: key.clone(),
+        units: vec![datum.unit().to_string()],
+    };
+    let at_secs = datum.timestamp_secs;
+    let mut store = store.lock();
+    if store.append_datapoints(key, vec![datum]).is_err() {
+        return false;
+    }
+    store.make_alarms_due(&[watched], at_secs);
+    true
+}
 
 /// The publisher of ONE function's metrics, held by the poller that moves batches to it.
 ///
@@ -97,26 +171,8 @@ impl FunctionMetrics {
         let Some(store) = self.store.as_ref() else {
             return;
         };
-        let key = cloudwatch::MetricKey {
-            namespace: METRIC_NAMESPACE.to_string(),
-            metric_name: metric.to_string(),
-            dimensions: [(
-                FUNCTION_NAME_DIMENSION.to_string(),
-                function_name.to_string(),
-            )]
-            .into_iter()
-            .collect(),
-        };
-        let datum = cloudwatch::StoredDatum {
-            timestamp_secs: cloudwatch::now_secs(),
-            sample_count: 1.0,
-            sum: value,
-            minimum: value,
-            maximum: value,
-            unit: Some(unit.to_string()),
-            storage_resolution: STANDARD_STORAGE_RESOLUTION_SECONDS,
-        };
-        if store.lock().append_datapoints(key, vec![datum]).is_err() {
+        let key = series(metric, function_dimensions(function_name));
+        if !append(store, key, observation(value, unit, cloudwatch::now_secs())) {
             ::tracing::warn!(
                 function = %function_name,
                 metric = %metric,
