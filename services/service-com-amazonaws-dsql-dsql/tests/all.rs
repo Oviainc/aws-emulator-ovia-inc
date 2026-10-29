@@ -59,6 +59,8 @@ mod pagination_token_refusal;
 mod peering_unwound_by_deletion;
 #[path = "all/policy_document_class.rs"]
 mod policy_document_class;
+#[path = "all/policy_token_optional_claim_distinctness.rs"]
+mod policy_token_optional_claim_distinctness;
 #[path = "all/policy_version_conflict_and_lockout.rs"]
 mod policy_version_conflict_and_lockout;
 #[path = "all/quota_refusal_identity.rs"]

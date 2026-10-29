@@ -75,7 +75,10 @@ async fn attach(dsql: &Dsql, identifier: &str, round: usize) -> String {
 /// The one sentence this service words a claim about a policy version the cluster
 /// does not hold with — built from the request, naming the claimed version and the
 /// cluster the call addressed.
-fn version_message(identifier: &str, claimed: &str) -> String {
+///
+/// Shared with `tests/all/policy_token_optional_claim_distinctness.rs`, which
+/// reads the same refusal for a claim a reused `clientToken` must not hide.
+pub(crate) fn version_message(identifier: &str, claimed: &str) -> String {
     format!(
         "Aurora DSQL can't find policy version {claimed} for resource {identifier}. \
          Verify that the policy exists and that the version is correct."

@@ -128,7 +128,10 @@ fn cluster_body(member: &str, value: &Value) -> Value {
 }
 
 /// Assert `answer` is the refusal a token reused for a different request gets.
-fn assert_token_conflict(case: &str, answer: &crate::harness::Answer) {
+///
+/// Shared with `tests/all/policy_token_optional_claim_distinctness.rs`, which
+/// reads the same refusal over the policy writers' optional claim.
+pub(crate) fn assert_token_conflict(case: &str, answer: &crate::harness::Answer) {
     assert_eq!(
         answer.status, 409,
         "case {case:?}: a different request wearing the used token must answer 409, got {} {:?}",
