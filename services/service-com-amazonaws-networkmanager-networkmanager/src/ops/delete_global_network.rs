@@ -2,7 +2,8 @@
 
 //! @op DeleteGlobalNetwork
 //! Deletes an existing global network, refusing with `ValidationException` (400) while it
-//! still owns child resources, and reporting the removed record as `DELETING`. This is
+//! still owns child resources, taking the records held only BY it (its route analyses)
+//! with it, and reporting the removed record as `DELETING`. This is
 //! the ONLY file to touch for this operation.
 //!
 //! ## Reaching this service's state
@@ -195,6 +196,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
             })?;
+
+        // A route analysis is not a resource of its own: it is a record held BY this global
+        // network (`state::RouteAnalysisRecord::global_network_id`), read back only through
+        // it, and no operation of this service removes one — so the analyses go WITH the
+        // record, the way the ties a core network holds go with the core network, rather
+        // than outliving the global network they were started on. Unlike the registration
+        // counted above they cannot block the delete instead: no call of this service would
+        // empty them first, and the operation's documentation names only the children it
+        // does.
+        store.untie_global_network(&input.global_network_id);
 
         Ok(DeleteGlobalNetworkOutput {
             global_network: Some(removed.to_shape_with_state(crate::state::STATE_DELETING)),

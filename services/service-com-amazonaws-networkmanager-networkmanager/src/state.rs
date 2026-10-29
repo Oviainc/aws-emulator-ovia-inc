@@ -3887,7 +3887,10 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// `BTreeMap`, so the store has one stable order like every other map here.
     ///
     /// Bounded by [`MAX_ROUTE_ANALYSES_PER_GLOBAL_NETWORK`] per global network, so
-    /// repeated `StartRouteAnalysis` calls cannot grow it without end.
+    /// repeated `StartRouteAnalysis` calls cannot grow it without end: an analysis is
+    /// addressed only through the global network it was started on, so deleting that global
+    /// network takes its analyses with it ([`Self::untie_global_network`]) and the bound
+    /// keeps holding across repeated create/delete rounds.
     pub route_analyses: BTreeMap<String, RouteAnalysisRecord>,
     /// The metadata one network resource of a global network's inventory carries, by the
     /// ARN of that resource — the one store `UpdateNetworkResourceMetadata` writes and
@@ -5008,6 +5011,28 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             &Self::resource_arn(CONNECT_PEER_KIND, connect_peer_id),
         );
         Some(removed)
+    }
+
+    /// Drop every record the store holds that exists only as a record OF the global network
+    /// `global_network_id`, answering how many were dropped.
+    ///
+    /// Today that is its route analyses ([`Self::route_analyses`]): an analysis carries no
+    /// identity outside the global network it was started on
+    /// ([`RouteAnalysisRecord::global_network_id`], the only one `GetRouteAnalysis` resolves
+    /// it through) and this service models no operation that removes one, so the analyses go
+    /// with the global network the way the ties a core network holds go with the core
+    /// network. Were they left behind, each would be keyed to a global network no call can
+    /// address: unreadable, unremovable, and no longer counted by the per-global-network
+    /// bound on the map.
+    ///
+    /// Unlike a dependent the caller can remove itself — a child resource, or a transit
+    /// gateway registration — these cannot block the delete: there is no call that would
+    /// empty them first.
+    pub fn untie_global_network(&mut self, global_network_id: &str) -> usize {
+        let held = self.route_analysis_count_of(global_network_id);
+        self.route_analyses
+            .retain(|_, analysis| analysis.global_network_id != global_network_id);
+        held
     }
 
     /// How many route analyses the global network `global_network_id` holds, for the

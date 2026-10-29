@@ -87,6 +87,8 @@ mod delete_dependency_refusal;
 mod delete_dependent_resource_refusal;
 #[path = "all/delete_device.rs"]
 mod delete_device;
+#[path = "all/delete_global_network_route_analyses.rs"]
+mod delete_global_network_route_analyses;
 #[path = "all/delete_global_network_transit_gateway_precondition.rs"]
 mod delete_global_network_transit_gateway_precondition;
 #[path = "all/delete_link.rs"]
