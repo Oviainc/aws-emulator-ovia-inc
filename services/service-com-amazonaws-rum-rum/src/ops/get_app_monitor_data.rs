@@ -256,8 +256,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .events
             .iter()
             .filter(|stored| match parsed_event(&stored.event_json) {
+                // The instant is read through the ONE codec the data-plane write stored
+                // it with ([`crate::state::event_instant_seconds`]) rather than
+                // re-derived from anything else, so an event is placed in the window at
+                // the instant it was delivered at — whichever form that codec had to
+                // carry it in.
                 Some(document) => {
-                    window.covers(event_seconds(&document))
+                    window.covers(crate::state::event_instant_seconds(&document))
                         && matches_filters(&document, &selections)
                 }
                 // An event whose stored document does not parse cannot be placed in the
@@ -382,17 +387,6 @@ fn now_seconds() -> i64 {
 fn parsed_event(event_json: &str) -> Option<::serde_json::Value> {
     let document: ::serde_json::Value = ::serde_json::from_str(event_json).ok()?;
     document.is_object().then_some(document)
-}
-
-/// The instant a stored event carries, in seconds since the epoch.
-///
-/// The stored document renders `RumEvent$timestamp` as an RFC 3339 instant, so it is read
-/// back through the same codec rather than re-derived from anything else.
-fn event_seconds(document: &::serde_json::Value) -> Option<i64> {
-    let rendered = document.get("timestamp")?.as_str()?;
-    ::aws_smithy_types::DateTime::from_str(rendered, ::aws_smithy_types::date_time::Format::DateTime)
-        .ok()
-        .map(|instant| instant.secs())
 }
 
 /// The event attribute each `QueryFilter$Name` key searches.

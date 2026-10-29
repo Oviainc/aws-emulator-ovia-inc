@@ -296,18 +296,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// `metadata` and `details` are `@mediaType("application/json")` strings, so they are
 /// re-parsed into the document rather than nested as escaped text; a value that is not
-/// valid JSON is kept verbatim as a string, since the model constrains neither.
+/// valid JSON is kept verbatim as a string, since the model constrains neither. The
+/// instant goes in through [`crate::state::event_instant_value`], so a `timestamp` RFC
+/// 3339 cannot render is still carried — the document is what the monitor's buffer, the
+/// query that reads it back and the CloudWatch Logs copy all carry the event as, so an
+/// instant dropped here is an instant nothing holds.
 fn event_json(event: &RumEvent) -> String {
     let mut document = ::serde_json::Map::new();
     document.insert("id".to_string(), ::serde_json::Value::String(event.id.clone()));
     document.insert(
-        "timestamp".to_string(),
-        ::serde_json::Value::String(
-            event
-                .timestamp
-                .fmt(::aws_smithy_types::date_time::Format::DateTime)
-                .unwrap_or_default(),
-        ),
+        crate::state::EVENT_INSTANT_MEMBER.to_string(),
+        crate::state::event_instant_value(&event.timestamp),
     );
     document.insert(
         "type".to_string(),

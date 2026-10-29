@@ -39,6 +39,8 @@ mod cw_log_event_copies;
 mod deobfuscation_source_maps;
 #[path = "all/dimension_keys_constraints.rs"]
 mod dimension_keys_constraints;
+#[path = "all/event_instant_round_trip.rs"]
+mod event_instant_round_trip;
 #[path = "all/extended_metric_dimension_entries.rs"]
 mod extended_metric_dimension_entries;
 #[path = "all/list_app_monitors_page_size.rs"]
