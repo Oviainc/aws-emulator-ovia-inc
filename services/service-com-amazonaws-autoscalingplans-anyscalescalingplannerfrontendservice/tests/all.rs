@@ -31,6 +31,8 @@ mod error_message_wording;
 mod forecast_data;
 #[path = "all/forecast_datapoints.rs"]
 mod forecast_datapoints;
+#[path = "all/forecast_window_point_membership.rs"]
+mod forecast_window_point_membership;
 #[path = "all/forecast_window_precision.rs"]
 mod forecast_window_precision;
 #[path = "all/identity_key_separators.rs"]

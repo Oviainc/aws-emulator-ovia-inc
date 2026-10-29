@@ -433,7 +433,10 @@ fn settled_window() -> (i64, i64) {
 
 /// `window`, given in whole epoch seconds, as the epoch MILLISECONDS the membership rule
 /// below is measured in.
-fn in_millis(window: (i64, i64)) -> (i64, i64) {
+///
+/// `pub(crate)` so every suite driving that rule with a whole-second window converts the
+/// same way.
+pub(crate) fn in_millis(window: (i64, i64)) -> (i64, i64) {
     (
         window.0 * MILLIS_PER_SECOND,
         window.1 * MILLIS_PER_SECOND,
@@ -443,18 +446,39 @@ fn in_millis(window: (i64, i64)) -> (i64, i64) {
 /// Every forecast interval instant inside the half-open window `[start, end)`, the window
 /// given in epoch MILLISECONDS so either endpoint may sit inside a second.
 ///
+/// A quantity OF a forecast interval is reported at the interval itself, so these are the
+/// reported instants of no shift.
+pub(crate) fn expected_instants(window_millis: (i64, i64)) -> Vec<i64> {
+    expected_reported_instants(window_millis, 0)
+}
+
+/// Every instant a data point reported `shift_secs` BEFORE the forecast interval it belongs
+/// to falls on inside the half-open window `[start, end)`, the window given in epoch
+/// MILLISECONDS so either endpoint may sit inside a second.
+///
 /// THE MEMBERSHIP RULE, written from the documented window and nothing else: forecast data
-/// exists at one point per forecast interval, `StartTime` is "the inclusive start time"
-/// and `EndTime` "the exclusive end time", so an interval's instant is reported exactly
-/// when it is at or after the start and strictly before the end.
+/// exists at one point per forecast interval and a point is stamped with the instant it is
+/// reported at (`Datapoint$Timestamp`, "The time stamp for the data point in UTC format"),
+/// `StartTime` is "the inclusive start time" and `EndTime` "the exclusive end time" of the
+/// range asked for — so a point is reported exactly when the instant it carries is at or
+/// after the start and strictly before the end. The instants of one shift are the
+/// progression `k * FORECAST_INTERVAL_SECONDS - shift_secs`, so a shift moves which of them
+/// a window holds, not only where inside its interval each sits.
 ///
 /// `pub(crate)` and measured in milliseconds so ONE place owns the rule for every suite
 /// that asserts which data points a window carries — [`crate::forecast_window_precision`]
-/// drives it with endpoints inside a second, this suite with whole-second ones.
-pub(crate) fn expected_instants(window_millis: (i64, i64)) -> Vec<i64> {
+/// drives it with endpoints inside a second, this suite with whole-second ones,
+/// [`crate::scheduled_action_buffer_time`] and
+/// [`crate::forecast_window_point_membership`] with the buffered shift of a scheduled
+/// scaling action.
+pub(crate) fn expected_reported_instants(window_millis: (i64, i64), shift_secs: i64) -> Vec<i64> {
     let (start, end) = window_millis;
     let period_millis = FORECAST_INTERVAL_SECONDS * MILLIS_PER_SECOND;
-    let mut at = start.div_euclid(period_millis) * FORECAST_INTERVAL_SECONDS;
+    let shift_millis = shift_secs * MILLIS_PER_SECOND;
+    // The member of the progression at or before the start of the window: its interval
+    // boundary is the last one at or before the shifted start.
+    let mut at = (start + shift_millis).div_euclid(period_millis) * FORECAST_INTERVAL_SECONDS
+        - shift_secs;
     let mut instants = Vec::new();
     while at * MILLIS_PER_SECOND < end {
         if at * MILLIS_PER_SECOND >= start {

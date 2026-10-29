@@ -33,7 +33,9 @@ use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice
     FORECAST_SCALABLE_DIMENSION, FORECAST_SERVICE_NAMESPACE,
 };
 
-use crate::forecast_datapoints::{assert_close, points};
+use crate::forecast_datapoints::{
+    assert_close, expected_instants, expected_reported_instants, in_millis, points,
+};
 use crate::scaling_plan_lifecycle::{instruction, now_secs, stack_source, Emulator};
 
 /// The Auto Scaling group every plan here scales. `ResourceId` "consists of a prefix
@@ -82,34 +84,16 @@ fn covering_window(window: (i64, i64)) -> (i64, i64) {
 /// The forecast interval boundaries inside the half-open window `[start, end)`: where the
 /// quantities OF an interval — the load and capacity forecasts — are reported.
 fn interval_boundaries(window: (i64, i64)) -> Vec<i64> {
-    let (start, end) = window;
-    let mut at = start.div_euclid(FORECAST_INTERVAL_SECONDS) * FORECAST_INTERVAL_SECONDS;
-    if at < start {
-        at += FORECAST_INTERVAL_SECONDS;
-    }
-    let mut boundaries = Vec::new();
-    while at < end {
-        boundaries.push(at);
-        at += FORECAST_INTERVAL_SECONDS;
-    }
-    boundaries
+    expected_instants(in_millis(window))
 }
 
 /// THE RULE, written from the documented sentence and nothing else: the scheduled scaling
 /// action of a forecast interval runs `buffer` seconds before that interval, so the run
-/// times reported inside the half-open window `[start, end)` are the ones that land in it.
+/// times reported inside the half-open window `[start, end)` are the ones that land in it —
+/// which is the membership rule [`crate::forecast_datapoints::expected_reported_instants`]
+/// owns, driven with that buffer as the shift.
 fn expected_run_times(window: (i64, i64), buffer: i64) -> Vec<i64> {
-    let (start, end) = window;
-    let mut at = start.div_euclid(FORECAST_INTERVAL_SECONDS) * FORECAST_INTERVAL_SECONDS - buffer;
-    while at < start {
-        at += FORECAST_INTERVAL_SECONDS;
-    }
-    let mut runs = Vec::new();
-    while at < end {
-        runs.push(at);
-        at += FORECAST_INTERVAL_SECONDS;
-    }
-    runs
+    expected_reported_instants(in_millis(window), buffer)
 }
 
 /// The buffer times driven, spanning the whole range the member accepts: the member absent,
@@ -295,8 +279,9 @@ async fn the_buffer_time_moves_every_scheduled_action_run_time_ahead_of_its_inte
             assert_eq!(
                 expected_runs.len(),
                 boundaries.len(),
-                "case {case:?}: a window carries one scheduled scaling action per forecast \
-                 interval whatever the buffer, expected {} run times, got {expected_runs:?}",
+                "case {case:?}: an INTERVAL-ALIGNED window carries one scheduled scaling \
+                 action per forecast interval whatever the buffer, expected {} run times, \
+                 got {expected_runs:?}",
                 boundaries.len()
             );
 

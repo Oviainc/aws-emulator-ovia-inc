@@ -521,8 +521,19 @@ fn ceil_secs(at: ::aws_smithy_types::DateTime) -> i64 {
 /// `[StartTime, EndTime)` — the start is "inclusive" and the end "exclusive" — and inside
 /// the span over which the service has forecast data at all, no further back than
 /// [`MAX_FORECAST_HISTORY_DAYS`] ("Data points are available for up to 56 days") and no
-/// further ahead than [`FORECAST_HORIZON_DAYS`]. A window therefore carries the same NUMBER
-/// of data points whatever the shift; only where inside each interval they sit moves.
+/// further ahead than [`FORECAST_HORIZON_DAYS`].
+///
+/// Selecting by the carried instant is what keeps every reported `Timestamp` ("The time
+/// stamp for the data point in UTC format") inside the range the caller asked for, which is
+/// what the two window members name. A shift therefore moves WHICH reported instants a
+/// window holds and not only where inside their intervals they sit: the instants of one
+/// shift are the progression `k * FORECAST_INTERVAL_SECONDS - shift_secs`, and how many of
+/// its members a window holds depends on the phase of the window against that progression
+/// unless the window's width is a whole multiple of [`FORECAST_INTERVAL_SECONDS`]. So a
+/// window of whole forecast intervals carries one data point per interval whatever the
+/// shift, while a narrower or wider one may carry one point more or one point fewer under
+/// one shift than under another — the alternative, selecting by the interval a point
+/// belongs to, would answer with a `Timestamp` outside the requested range.
 fn forecast_instants(
     start_time: ::aws_smithy_types::DateTime,
     end_time: ::aws_smithy_types::DateTime,
@@ -538,21 +549,27 @@ fn forecast_instants(
     // second before an `EndTime` inside a second — strictly earlier than it — stays in.
     let end = ceil_secs(end_time);
 
-    // The first interval boundary whose reported instant (boundary - shift) is at or after
-    // the start of the served span.
-    let first_boundary = first.saturating_add(shift_secs);
-    let mut boundary =
-        first_boundary.div_euclid(FORECAST_INTERVAL_SECONDS) * FORECAST_INTERVAL_SECONDS;
-    if boundary < first_boundary {
-        boundary = boundary.saturating_add(FORECAST_INTERVAL_SECONDS);
-    }
-    let mut at = boundary.saturating_sub(shift_secs);
+    let mut at = first_reported_instant(first, shift_secs);
     let mut instants = Vec::new();
     while at < end && at <= latest {
         instants.push(at);
         at = at.saturating_add(FORECAST_INTERVAL_SECONDS);
     }
     instants
+}
+
+/// The first instant of the progression a data point of this shift is reported at —
+/// `k * FORECAST_INTERVAL_SECONDS - shift_secs` — that is at or after `from`.
+fn first_reported_instant(from: i64, shift_secs: i64) -> i64 {
+    // The interval boundary of that first member: the first boundary at or after the
+    // shifted instant, which `div_euclid` reaches by flooring and then stepping on where
+    // the shifted instant is not a boundary itself.
+    let shifted = from.saturating_add(shift_secs);
+    let mut boundary = shifted.div_euclid(FORECAST_INTERVAL_SECONDS) * FORECAST_INTERVAL_SECONDS;
+    if boundary < shifted {
+        boundary = boundary.saturating_add(FORECAST_INTERVAL_SECONDS);
+    }
+    boundary.saturating_sub(shift_secs)
 }
 
 /// The stored scaling instruction a forecast for the requested resource is issued from.
