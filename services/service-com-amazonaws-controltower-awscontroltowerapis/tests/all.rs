@@ -51,6 +51,8 @@ mod enabled_control_reset;
 mod enabled_control_target_regions;
 #[path = "all/enabled_control_update.rs"]
 mod enabled_control_update;
+#[path = "all/first_deployment_drift.rs"]
+mod first_deployment_drift;
 #[path = "all/front_door_validation.rs"]
 mod front_door_validation;
 #[path = "all/get_control_operation.rs"]

@@ -12,6 +12,12 @@
 //! modelled `ValidationException` (400) and nothing — landing zone, operation or tag — is
 //! written.
 //!
+//! The create starts deploying the manifest it was given rather than completing it, so the
+//! configuration is queued on the landing zone the same way `UpdateLandingZone` queues the
+//! one IT was given: a reporting call reports the landing zone as `PROCESSING` and reports
+//! no drift assessment at all until the clock makes that deployment due, because a drift
+//! assessment is a property of a DEPLOYED configuration.
+//!
 //! Implemented: this operation no longer answers HTTP 501.
 //!
 //! ## Shape of an operation
@@ -274,16 +280,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &input.version,
                     crate::state::CATALOG_LANDING_ZONE_VERSION,
                 ),
-                manifest,
+                manifest: manifest.clone(),
                 remediation_types: input.remediation_types.clone(),
                 // The landing zone is PROCESSING until its CREATE operation is due; the
                 // status is derived from the log by `settle`, and seeded to match here.
                 status: crate::state::LandingZoneStatus::Processing,
-                // Nothing has diverged from a manifest the service has only just been
-                // given, so a new landing zone is in sync.
-                drift_status: Some(crate::state::LandingZoneDriftStatus::InSync),
-                // A create deploys the configuration it was given; nothing else is
-                // queued behind it.
+                // Drift is a property of a DEPLOYED configuration, so nothing is assessed
+                // while the CREATE operation that deploys this landing zone's first one is
+                // still in flight; the assessment that configuration earns is parked below
+                // and `settle` materialises it once that deployment is due.
+                drift_status: None,
+                // Parked below, by the same call that records the CREATE operation.
                 pending_configuration: None,
                 // A landing zone is not being decommissioned the moment it is created.
                 pending_deletion: None,
@@ -295,8 +302,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.tags.insert(arn.clone(), tags.into_iter().collect());
         }
 
-        let operation_identifier =
-            store.record_operation(crate::state::LandingZoneOperationType::Create, &arn, now);
+        // The create is what starts deploying the manifest it was given, exactly as an
+        // update starts deploying the one IT was given, so the configuration is QUEUED
+        // rather than deployed: the assessment it earns — nothing has diverged from a
+        // configuration at the instant it is deployed — is published by `settle` when the
+        // clock makes the deployment due, and only if the operation did not fail. Recording
+        // the operation is what parks it, so the parked deployment carries that operation's
+        // identifier.
+        let configuration = crate::state::LandingZoneConfiguration {
+            version: input.version,
+            manifest,
+            remediation_types: input.remediation_types,
+            drift_status: Some(crate::state::LandingZoneDriftStatus::InSync),
+        };
+        let operation_identifier = store.record_landing_zone_configuration(
+            crate::state::LandingZoneOperationType::Create,
+            &arn,
+            configuration,
+            now,
+        );
 
         Ok(CreateLandingZoneOutput {
             arn,

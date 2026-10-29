@@ -608,12 +608,16 @@ impl LandingZoneDriftStatus {
 /// version", so the configuration a caller asked for is NOT what a reporting call reports
 /// while that operation is in flight: it is held here and deployed by [`settle`] at
 /// `due_at`, the same instant the operation record reaches its terminal status — unless
-/// that status is FAILED, since an operation that failed deployed nothing.
+/// that status is FAILED, since an operation that failed deployed nothing. The same holds
+/// for the configuration a `CREATE` and a `RESET` start deploying, which is why those two
+/// park theirs here too: what a deployment in flight has not deployed yet — above all the
+/// drift assessment the deployed configuration earns — is not reported until the clock
+/// makes that deployment due.
 ///
 /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
 #[derive(Debug, Clone)]
 pub struct PendingLandingZoneConfiguration {
-    /// The `UPDATE`/`RESET` operation whose completion deploys this configuration.
+    /// The `CREATE`/`UPDATE`/`RESET` operation whose completion deploys this configuration.
     pub operation_identifier: String,
     pub version: String,
     pub manifest: ::aws_smithy_types::Document,
@@ -1256,13 +1260,13 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             self.tags.remove(&arn);
         }
 
-        // A configuration an UPDATE or a RESET started deploying becomes the deployed one
-        // once the clock has made that deployment due — the same instant the operation
-        // record reaches its terminal status — whether or not anybody called. Until then a
-        // reporting call reports what is actually deployed. The due instant is the parked
-        // deployment's OWN, for the reason the removal above states, and a deployment whose
-        // own record FAILED deployed nothing, so the landing zone keeps the configuration
-        // it had.
+        // A configuration a CREATE, an UPDATE or a RESET started deploying becomes the
+        // deployed one once the clock has made that deployment due — the same instant the
+        // operation record reaches its terminal status — whether or not anybody called.
+        // Until then a reporting call reports what is actually deployed. The due instant is
+        // the parked deployment's OWN, for the reason the removal above states, and a
+        // deployment whose own record FAILED deployed nothing, so the landing zone keeps
+        // the configuration it had.
         let operations = &self.landing_zone_operations;
         for landing_zone in self.landing_zones.values_mut() {
             let due = landing_zone
@@ -1680,7 +1684,7 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
         operation_identifier
     }
 
-    /// Start an `UPDATE`/`RESET` against the landing zone `arn` names, parking the
+    /// Start a `CREATE`/`UPDATE`/`RESET` against the landing zone `arn` names, parking the
     /// configuration it deploys for [`settle`] to deploy once the clock makes it due, and
     /// return the operation's `operationIdentifier`.
     ///
