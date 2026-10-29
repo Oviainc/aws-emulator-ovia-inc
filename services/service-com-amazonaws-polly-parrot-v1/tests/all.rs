@@ -66,6 +66,8 @@ mod voice_catalog_is_not_paged;
 mod voice_engine_compatibility;
 #[path = "all/xml_document_well_formedness.rs"]
 mod xml_document_well_formedness;
+#[path = "all/xml_reference_resolution.rs"]
+mod xml_reference_resolution;
 #[path = "all/xml_well_formedness.rs"]
 mod xml_well_formedness;
 #[path = "all/xml_whitespace_outside_the_document.rs"]

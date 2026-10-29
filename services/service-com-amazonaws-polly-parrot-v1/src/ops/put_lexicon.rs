@@ -303,9 +303,7 @@ fn read_document_element(
     for attribute in element.attributes() {
         let attribute = attribute.map_err(|e| PlsRejection::NotALexicon(e.to_string()))?;
         let raw = String::from_utf8_lossy(attribute.value.as_ref()).to_string();
-        let value = quick_xml::escape::unescape(&raw)
-            .map_err(|e| PlsRejection::NotALexicon(e.to_string()))?
-            .to_string();
+        let value = resolve_character_data(&raw)?;
         match attribute.key.as_ref() {
             b"alphabet" => alphabet = Some(value),
             b"version" => version = Some(value),
@@ -347,6 +345,48 @@ fn character_data_outside_the_document() -> PlsRejection {
     )
 }
 
+/// Resolve one run of character data — the text of an element, or an attribute value —
+/// to the characters it stands for, refusing the whole document when it stands for
+/// nothing.
+///
+/// XML 1.0 declares exactly five general entities and admits no reference to an entity
+/// nothing declares, and a character reference denotes one code point, so character
+/// data naming an entity that does not exist or a code point that does not is not
+/// well-formed XML and the content is not a document at all. This is the check, so it
+/// is independent of whether anything about the data is being MEASURED: the
+/// well-formedness of a document is a property of the whole document, not of the
+/// elements the lexicon quota happens to be read inside.
+fn resolve_character_data(raw: &str) -> Result<String, PlsRejection> {
+    quick_xml::escape::unescape(raw)
+        .map(|resolved| resolved.into_owned())
+        .map_err(|e| PlsRejection::NotALexicon(e.to_string()))
+}
+
+/// Resolve one entity or character reference the reader emitted on its own.
+///
+/// The reference arrives as its NAME, so it is reconstructed before being resolved
+/// through [`resolve_character_data`]: a predefined entity and a numeric character
+/// reference then resolve the same way, and one that stands for nothing refuses the
+/// document wherever in it the reference sits.
+fn resolve_reference(name: &str) -> Result<String, PlsRejection> {
+    resolve_character_data(&format!("&{name};"))
+}
+
+/// Check every attribute value of one element.
+///
+/// An attribute value is character data too, so a reference in one is resolved — and
+/// refuses the document when it stands for nothing — exactly as a reference in element
+/// content is.
+fn check_attribute_values(
+    element: &quick_xml::events::BytesStart<'_>,
+) -> Result<(), PlsRejection> {
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|e| PlsRejection::NotALexicon(e.to_string()))?;
+        resolve_character_data(&String::from_utf8_lossy(attribute.value.as_ref()))?;
+    }
+    Ok(())
+}
+
 /// Read a PLS lexicon document.
 ///
 /// The reader is a real, NAMESPACE-AWARE XML parser, so any well-formed PLS document
@@ -362,6 +402,13 @@ fn character_data_outside_the_document() -> PlsRejection {
 /// a second root element, character data before or after the lexicon, or an element
 /// the content never closes, is refused however well-formed the lexicon element
 /// itself is.
+///
+/// Resolving references is part of that whole-document rule rather than part of the
+/// measuring: XML admits no reference that stands for nothing, so an entity nothing
+/// declares or a character reference denoting no code point refuses the document
+/// WHEREVER it sits in it — in a replacement, in any other element's content or in an
+/// attribute value ([`resolve_character_data`]) — and not only where a replacement is
+/// open to count its characters.
 ///
 /// Each `<lexeme>`'s replacement elements are measured as they
 /// close, so an oversized one is refused without the document being stored; what is
@@ -434,6 +481,9 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
                     )?);
                     continue;
                 }
+                // Whatever the element is to PLS, its attribute values are character
+                // data of this document and have to resolve for it to be one.
+                check_attribute_values(element)?;
                 // PLS's vocabulary is the one bound to its namespace, so an element
                 // borrowed from another vocabulary is not a lexeme and is not
                 // counted or measured as one.
@@ -494,14 +544,15 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
                 }
             }
             Event::Text(ref text) => {
+                // Entities stand for the character they name, so the raw bytes are
+                // resolved — wherever in the document this text sits, because text
+                // that resolves to nothing is not well-formed whether or not a
+                // replacement is open to measure it.
+                let raw = String::from_utf8_lossy(text.as_ref()).to_string();
+                let unescaped = resolve_character_data(&raw)?;
                 // The innermost open replacement counts the text; the elements around
                 // it count it when that one closes.
                 if let Some(open) = replacements.last_mut() {
-                    // Entities stand for the character they name, so the raw bytes
-                    // are unescaped before the replacement is measured.
-                    let raw = String::from_utf8_lossy(text.as_ref()).to_string();
-                    let unescaped = quick_xml::escape::unescape(&raw)
-                        .map_err(|e| PlsRejection::NotALexicon(e.to_string()))?;
                     *open = open.saturating_add(unescaped.chars().count());
                 }
             }
@@ -523,16 +574,14 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
             // so a loop reading only text events would measure none of the characters a
             // replacement spells with `&amp;` or `&#NN;`.
             Event::GeneralRef(ref reference) => {
+                let name = reference
+                    .decode()
+                    .map_err(|e| PlsRejection::NotALexicon(e.to_string()))?;
+                // Resolved first and counted second: a reference standing for nothing
+                // refuses the document anywhere in it, and only a replacement that is
+                // open measures the characters it does stand for.
+                let resolved = resolve_reference(&name)?;
                 if let Some(open) = replacements.last_mut() {
-                    let name = reference
-                        .decode()
-                        .map_err(|e| PlsRejection::NotALexicon(e.to_string()))?;
-                    // Reconstructed and unescaped so a predefined entity and a numeric
-                    // character reference resolve the same way, and an undefined entity
-                    // stays an error rather than silently measuring as nothing.
-                    let reconstructed = format!("&{name};");
-                    let resolved = quick_xml::escape::unescape(&reconstructed)
-                        .map_err(|e| PlsRejection::NotALexicon(e.to_string()))?;
                     *open = open.saturating_add(resolved.chars().count());
                 }
             }
