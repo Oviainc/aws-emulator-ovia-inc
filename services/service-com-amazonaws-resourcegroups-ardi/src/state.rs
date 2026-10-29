@@ -1100,14 +1100,19 @@ impl GroupRecord {
     }
 
     /// Record `resource_arn` as a member, keeping [`GroupRecord::members`] sorted
-    /// by ARN. Adding an ARN that is already a member changes nothing, so
-    /// repeating a `GroupResources` call does not duplicate a membership.
-    pub fn add_member(&mut self, resource_arn: &str) {
+    /// by ARN, and report whether the group GAINED the membership.
+    ///
+    /// Adding an ARN that is already a member changes no membership and reports
+    /// `false`, so repeating a `GroupResources` call does not duplicate a
+    /// membership and reports no addition — the mirror of
+    /// [`GroupRecord::remove_member`], which reports whether the group LOST one.
+    pub fn add_member(&mut self, resource_arn: &str) -> bool {
         // A membership recorded here is the outcome of a GROUP action that
         // succeeded, so the same call records the grouping status
         // `ListGroupingStatuses` reports. It is recorded for an ARN that is
-        // already a member too: that call is the resource's LAST grouping
-        // action, and it is the one `GroupResources` reports in `Succeeded`.
+        // already a member too: that grouping is the resource's LAST grouping
+        // action whether or not it is the one that first made it a member, and
+        // the operation reports each resource's last action.
         self.record_grouping_status(
             resource_arn,
             GROUPING_ACTION_GROUP,
@@ -1122,7 +1127,7 @@ impl GroupRecord {
             .get(at)
             .is_some_and(|m| m.resource_arn == resource_arn)
         {
-            return;
+            return false;
         }
         self.members.insert(
             at,
@@ -1131,11 +1136,12 @@ impl GroupRecord {
                 resource_type: resource_type_of_arn(resource_arn).map(str::to_string),
                 // The modelled `ResourceStatusValue` has one value, `PENDING`,
                 // and the model documents it as "the process isn't completed
-                // yet". A member this emulator reports in `Succeeded` is already
-                // part of the group, so it carries no status.
+                // yet". A membership this emulator records is in place as soon
+                // as the call that recorded it returns, so it carries no status.
                 status: None,
             },
         );
+        true
     }
 
     /// Drop `resource_arn` from this group's static members, and report whether

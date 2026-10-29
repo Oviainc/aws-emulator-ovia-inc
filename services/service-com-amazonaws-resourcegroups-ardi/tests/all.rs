@@ -29,6 +29,8 @@ mod get_tags_identity_forms;
 mod group_owner_configuration_and_update;
 #[path = "all/group_query.rs"]
 mod group_query;
+#[path = "all/group_reported_additions.rs"]
+mod group_reported_additions;
 #[path = "all/group_resources_supported_configuration.rs"]
 mod group_resources_supported_configuration;
 #[path = "all/group_tags.rs"]

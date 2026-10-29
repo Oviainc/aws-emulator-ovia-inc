@@ -3,8 +3,9 @@
 //! @op GroupResources
 //!
 //! Records each ARN in `ResourceArns` as a static member of the group `Group` names, in
-//! [`crate::state`], and reports the memberships that now hold in `Succeeded`. Adding an
-//! ARN that is already a member is a no-op, so a repeated call does not duplicate it.
+//! [`crate::state`], and reports in `Succeeded` the memberships THIS call added. Adding an
+//! ARN that is already a member is a no-op, so a repeated call neither duplicates the
+//! membership nor reports an addition for it.
 //!
 //! Only a group whose stored service configuration declares one of the supported
 //! configuration types ([`crate::state::STATIC_MEMBERSHIP_CONFIGURATION_TYPES`]) accepts a
@@ -229,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // constants and nothing else: at most `crate::state::MAX_RESOURCE_ARNS`
         // request entries, each looked up by BINARY SEARCH over the group's
         // memberships, which `add_member` keeps sorted by ARN.
-        let added: std::collections::BTreeSet<&str> = input
+        let new_memberships: std::collections::BTreeSet<&str> = input
             .resource_arns
             .iter()
             .map(String::as_str)
@@ -240,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .is_err()
             })
             .collect();
-        if group.members.len() + added.len() > crate::state::MAX_MEMBERS_PER_GROUP {
+        if group.members.len() + new_memberships.len() > crate::state::MAX_MEMBERS_PER_GROUP {
             return Err(GroupResourcesErrorModeled::BadRequestException(BadRequestException {
                 message: Some(format!(
                     "this emulator holds at most {} resources per group; ungroup some \
@@ -250,25 +251,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-        let added_count = added.len();
+        // Reported from what this call DID, not from the state it left behind: an
+        // ARN comes back in `Succeeded` because the group GAINED it here, which is
+        // what `add_member` reports. An ARN the group already held adds no
+        // membership, so it is reported in neither list, exactly as the sibling
+        // removal reports only the memberships the group LOST. A grouping stays
+        // idempotent: repeating the call leaves the same group behind and reports
+        // no addition, and an ARN one request repeats is reported once, by the
+        // single call that recorded it.
+        let mut succeeded: Vec<String> = Vec::new();
         for arn in &input.resource_arns {
-            group.add_member(arn);
+            if group.add_member(arn) {
+                succeeded.push(arn.clone());
+            }
         }
-        // Reported from the memberships the group now holds, not from the request:
-        // an ARN appears in `Succeeded` because it IS a member. Looked up by binary
-        // search over the sorted memberships, so this too is bounded by
-        // `crate::state::MAX_RESOURCE_ARNS` lookups.
-        let succeeded: Vec<String> = input
-            .resource_arns
-            .iter()
-            .filter(|arn| {
-                group
-                    .members
-                    .binary_search_by(|member| member.resource_arn.as_str().cmp(arn))
-                    .is_ok()
-            })
-            .cloned()
-            .collect();
+        let members_present = group.members.len();
         // Everything below is owned, so the store lock is released before the record
         // is formatted: the critical section covers the state change only.
         drop(store);
@@ -282,15 +279,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region = ?region,
             group = ?key.name,
             members_requested = input.resource_arns.len(),
-            members_added = added_count,
-            members_now_present = succeeded.len(),
+            members_added = succeeded.len(),
+            members_now_present = members_present,
             outcome = "grouped",
             "resources added to a resource group",
         );
         Ok(GroupResourcesOutput {
             succeeded: Some(succeeded),
             // Nothing was refused, and a static membership this emulator accepts is
-            // immediate — so neither list has an entry.
+            // immediate — so neither list has an entry: an ARN the group already
+            // held did not FAIL to be added, and none is left half-added.
             failed: Some(Vec::new()),
             pending: Some(Vec::new()),
         })
