@@ -149,6 +149,8 @@ mod region_list;
 mod resource_tags;
 #[path = "all/resource_untagging.rs"]
 mod resource_untagging;
+#[path = "all/singleton_child_delete.rs"]
+mod singleton_child_delete;
 #[path = "all/ssoadmin_permission_sets.rs"]
 mod ssoadmin_permission_sets;
 #[path = "all/state_roundtrip.rs"]

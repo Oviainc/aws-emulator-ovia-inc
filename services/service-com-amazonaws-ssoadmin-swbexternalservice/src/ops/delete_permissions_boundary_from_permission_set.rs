@@ -3,9 +3,11 @@
 //! @op DeletePermissionsBoundaryFromPermissionSet
 //!
 //! Removes the ONE permissions boundary a permission set carries, so a later
-//! `GetPermissionsBoundaryForPermissionSet` reports none. A permission set that carries no
-//! boundary has nothing for the request to name, which is the modelled
-//! `ResourceNotFoundException`.
+//! `GetPermissionsBoundaryForPermissionSet` reports none. That reader reports a permission
+//! set carrying no boundary as a plain 200 with the optional output member absent, so
+//! carrying none is a STATE of the permission set rather than a missing resource, and this
+//! delete is IDEMPOTENT. The modelled `ResourceNotFoundException` is for the resources the
+//! request NAMES — the instance and the permission set.
 //!
 //! ## Shape of an operation
 //!
@@ -198,7 +200,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let permission_set_arn = input.permission_set_arn.clone();
         // Absent, or belonging to another instance, or already deleted — all the same
         // answer: there is no such permission set to delete a boundary from.
         let record = store
@@ -207,33 +208,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DeletePermissionsBoundaryFromPermissionSetErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(format!(
-                            "No permission set found with the ARN {permission_set_arn}"
+                            "No permission set found with the ARN {}",
+                            input.permission_set_arn
                         )),
                         reason: None,
                     },
                 )
             })?;
 
-        // The BOUNDARY is the resource of this call: a permission set carrying none —
-        // never attached, or already deleted — is NOT a successful delete, so it earns the
-        // modelled `ResourceNotFoundException` rather than an empty 200 that would tell
-        // the caller a boundary was removed when none was. Taking the stored boundary is
-        // the delete itself, so a permission set that carried one carries none after this.
-        if record.permissions_boundary.take().is_none() {
-            return Err(
-                DeletePermissionsBoundaryFromPermissionSetErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(
-                            crate::state::permissions_boundary_not_attached_message(
-                                &permission_set_arn,
-                            ),
-                        ),
-                        reason: None,
-                    },
-                )
-                .into(),
-            );
-        }
+        // The boundary is a PROPERTY of the permission set, not a resource of its own: its
+        // reader (`GetPermissionsBoundaryForPermissionSet`) models `PermissionsBoundary` as
+        // an OPTIONAL output member and answers a plain 200 with it absent for a permission
+        // set carrying none, so "this permission set holds no permissions boundary" is a
+        // state the service reports rather than a resource that is missing. Dropping the
+        // stored boundary is therefore the whole delete, and it is IDEMPOTENT: the
+        // permission set carries no boundary afterwards whether or not it carried one
+        // before, so a repeated delete answers the same empty 200 — exactly as the sibling
+        // singleton child, the inline policy, does. Nothing else of the record is touched,
+        // and the permission set's definition revision — derived from the stored fields on
+        // every read — changes with the boundary going away.
+        record.permissions_boundary = None;
 
         // The modeled response carries no members: the permission set now carrying no
         // boundary is observed through `GetPermissionsBoundaryForPermissionSet`.

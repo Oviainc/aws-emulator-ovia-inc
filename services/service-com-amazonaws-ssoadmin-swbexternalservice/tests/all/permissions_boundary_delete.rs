@@ -7,11 +7,14 @@
 //! boundary the named permission set carries — whichever of the two kinds
 //! `PermissionsBoundary` offers it was stored as — so a later
 //! `GetPermissionsBoundaryForPermissionSet` reports none and a later put can store a new
-//! one; the delete touches no other permission set; and a call that names no boundary this
-//! permission set carries (never attached, or already deleted) is refused with the modelled
-//! `ResourceNotFoundException` rather than answered with an empty success, as is an
-//! `InstanceArn` or `PermissionSetArn` nothing is held under. The whole permission-set
-//! surface, this operation included, is withdrawn on an account instance.
+//! one; the delete touches no other permission set; and it is IDEMPOTENT — a permission set
+//! carrying no boundary (never attached, or already deleted) is left carrying none and
+//! answered the same empty 200, because the boundary is an optional property of the
+//! permission set rather than a resource of its own (`GetPermissionsBoundaryForPermissionSet`
+//! reports its absence with a 200). An `InstanceArn` or `PermissionSetArn` nothing is held
+//! under IS a `ResourceNotFoundException`, and the whole permission-set surface, this
+//! operation included, is withdrawn on an account instance. The same rule over every
+//! singleton child of this service is `singleton_child_delete.rs`.
 //!
 //! Each rule is asserted over a TABLE whose rows differ along what the rule generalises
 //! over: the KIND of boundary deleted, the partition and path forms the `ManagedPolicyArn`
@@ -305,11 +308,11 @@ async fn a_put_after_the_delete_stores_a_new_boundary() {
     );
 }
 
-/// A call that names no boundary this permission set carries is REFUSED: a permission set
-/// that never had one, and one whose boundary a previous delete already removed, both earn
-/// the modelled `ResourceNotFoundException` rather than an empty success.
+/// The delete is IDEMPOTENT: a permission set carrying no boundary — never attached, or
+/// already deleted — is answered the same empty 200 and still carries none, because its
+/// reader reports carrying none with a plain 200 rather than refusing it.
 #[tokio::test]
-async fn a_delete_with_no_boundary_attached_is_not_found() {
+async fn a_delete_with_no_boundary_attached_is_an_idempotent_success() {
     let (router, instance_arn) = organization_router();
 
     for (index, case) in boundary_cases().into_iter().enumerate() {
@@ -318,15 +321,32 @@ async fn a_delete_with_no_boundary_attached_is_not_found() {
 
         // Never attached.
         let (status, body) = delete_boundary(&router, &instance_arn, &permission_set_arn).await;
-        assert_refused(
-            &case.label,
-            "a delete with no boundary attached",
-            "ResourceNotFoundException",
-            status,
-            &body,
+        assert_eq!(
+            status, 200,
+            "case {:?}: a delete with no boundary attached expected 200, got {status} {body}",
+            case.label
+        );
+        assert_eq!(
+            body,
+            json!({}),
+            "case {:?}: the response models no members, got {body}",
+            case.label
+        );
+        let (status, after) = get_boundary(&router, &instance_arn, &permission_set_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the get expected 200, got {status} {after}",
+            case.label
+        );
+        assert_eq!(
+            after,
+            Value::Null,
+            "case {:?}: no boundary may be carried, got {after}",
+            case.label
         );
 
-        // Attached, deleted once — the second delete has nothing left to name.
+        // Attached, then deleted twice over: the second delete answers exactly as the
+        // first, and a third still does.
         let (status, body) =
             put_boundary(&router, &instance_arn, &permission_set_arn, &case.sent).await;
         assert_eq!(
@@ -334,19 +354,117 @@ async fn a_delete_with_no_boundary_attached_is_not_found() {
             "case {:?}: the put expected 200, got {status} {body}",
             case.label
         );
-        let (status, body) = delete_boundary(&router, &instance_arn, &permission_set_arn).await;
+        for round in 0..3 {
+            let (status, body) = delete_boundary(&router, &instance_arn, &permission_set_arn).await;
+            assert_eq!(
+                status, 200,
+                "case {:?} round {round}: the delete expected 200, got {status} {body}",
+                case.label
+            );
+            assert_eq!(
+                body,
+                json!({}),
+                "case {:?} round {round}: the response models no members, got {body}",
+                case.label
+            );
+            let (status, after) = get_boundary(&router, &instance_arn, &permission_set_arn).await;
+            assert_eq!(
+                status, 200,
+                "case {:?} round {round}: the get expected 200, got {status} {after}",
+                case.label
+            );
+            assert_eq!(
+                after,
+                Value::Null,
+                "case {:?} round {round}: no boundary may be carried, got {after}",
+                case.label
+            );
+        }
+
+        // Still a usable permission set after the repeated deletes.
+        let (status, body) =
+            put_boundary(&router, &instance_arn, &permission_set_arn, &case.sent).await;
         assert_eq!(
             status, 200,
-            "case {:?}: the first delete expected 200, got {status} {body}",
+            "case {:?}: a put after the deletes expected 200, got {status} {body}",
             case.label
         );
-        let (status, body) = delete_boundary(&router, &instance_arn, &permission_set_arn).await;
-        assert_refused(
-            &case.label,
-            "a repeated delete",
-            "ResourceNotFoundException",
-            status,
-            &body,
+        let (_, stored) = get_boundary(&router, &instance_arn, &permission_set_arn).await;
+        assert_eq!(
+            stored, case.expected,
+            "case {:?}: the put after the deletes must be reported as {}, got {stored}",
+            case.label, case.expected
+        );
+    }
+}
+
+/// The CLEANUP a caller writes over a permission set — drop the inline policy, drop the
+/// boundary, without asking first — succeeds on both singleton children alike, whichever
+/// of them was attached, because both readers report carrying none with a 200.
+#[tokio::test]
+async fn an_unconditional_cleanup_of_both_singleton_children_succeeds() {
+    let (router, instance_arn) = organization_router();
+    let document = "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+
+    // Rows differ along WHICH of the two children is attached when the sweep runs: neither,
+    // only the policy, only the boundary, both.
+    for (index, (policy, boundary)) in [(false, false), (true, false), (false, true), (true, true)]
+        .into_iter()
+        .enumerate()
+    {
+        let case = format!("inline policy {policy}, boundary {boundary}");
+        let permission_set_arn =
+            create_permission_set(&router, &instance_arn, &format!("Cleanup{index}")).await;
+        if policy {
+            let (status, body) = call(
+                &router,
+                "PutInlinePolicyToPermissionSet",
+                &json!({
+                    "InstanceArn": instance_arn,
+                    "PermissionSetArn": permission_set_arn,
+                    "InlinePolicy": document,
+                }),
+            )
+            .await;
+            assert_eq!(status, 200, "case {case:?}: the policy put expected 200, got {status} {body}");
+        }
+        if boundary {
+            let (status, body) = put_boundary(
+                &router,
+                &instance_arn,
+                &permission_set_arn,
+                &boundary_cases()[index % boundary_cases().len()].sent,
+            )
+            .await;
+            assert_eq!(status, 200, "case {case:?}: the boundary put expected 200, got {status} {body}");
+        }
+
+        // The sweep, run twice: both deletes answer 200 both times.
+        for round in 0..2 {
+            let (status, body) = call(
+                &router,
+                "DeleteInlinePolicyFromPermissionSet",
+                &json!({"InstanceArn": instance_arn, "PermissionSetArn": permission_set_arn}),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} round {round}: the inline-policy delete expected 200, got \
+                 {status} {body}"
+            );
+            let (status, body) = delete_boundary(&router, &instance_arn, &permission_set_arn).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} round {round}: the boundary delete expected 200, got {status} \
+                 {body}"
+            );
+        }
+
+        let (_, stored) = get_boundary(&router, &instance_arn, &permission_set_arn).await;
+        assert_eq!(
+            stored,
+            Value::Null,
+            "case {case:?}: the sweep must leave no boundary, got {stored}"
         );
     }
 }
