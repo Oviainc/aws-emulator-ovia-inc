@@ -179,11 +179,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let region = crate::state::request_region(ctx.parts());
+        // ONE instant for the whole call, captured before the lock: the state this create
+        // resolves and the `CreatedDate` it stores are the same moment, so the new record
+        // cannot be dated after the state it was created against.
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // What the CLOCK already owes every instance, plus the account's ambient instance
         // if nothing has enabled one yet, so this create resolves the same instance a read
         // at this instant would resolve.
-        store.on_request(&region, ::std::time::SystemTime::now());
+        store.on_request(&region, now);
 
         // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: permission
         // sets are a feature of an organization instance, so on an account instance one
@@ -263,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             instance_arn,
             name: input.name,
             description: input.description,
-            created_date: ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+            created_date: ::aws_smithy_types::DateTime::from(now),
             session_duration: input.session_duration,
             relay_state: input.relay_state,
             tags: input.tags.unwrap_or_default(),

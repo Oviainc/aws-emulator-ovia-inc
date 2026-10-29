@@ -111,6 +111,8 @@ mod instance_region_removal;
 mod instance_region_status;
 #[path = "all/instance_regions.rs"]
 mod instance_regions;
+#[path = "all/instance_single_instant_read.rs"]
+mod instance_single_instant_read;
 #[path = "all/instance_update.rs"]
 mod instance_update;
 #[path = "all/list_application_access_scopes.rs"]

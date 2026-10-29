@@ -208,8 +208,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instance is otherwise reported exactly as it is held, and an ARN the store does
         // not hold is refused rather than created.
         let region = crate::state::request_region(ctx.parts());
+        // ONE instant for the whole call, captured before the lock: every value this
+        // response derives from the clock — the instance's own status, its Regions'
+        // statuses and its encryption status — is the value owed at the SAME moment, so
+        // one response cannot report two instants.
+        let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
-        guard.on_request(&region, ::std::time::SystemTime::now());
+        guard.on_request(&region, now);
         let Some(instance) = guard.instance(&input.instance_arn) else {
             return Err(DescribeInstanceErrorModeled::AccessDeniedException(
                 AccessDeniedException {
@@ -246,13 +251,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The configuration the instance's data at rest is encrypted under — always
             // present, since every instance is encrypted: the Amazon Web Services owned
             // key default until an `UpdateInstance` replaced it. Its `EncryptionStatus`
-            // is derived from the instant a replacement becomes effective, so this stays
-            // a pure READ.
-            encryption_configuration_details: Some(
-                instance
-                    .encryption
-                    .to_shape(::std::time::SystemTime::now()),
-            ),
+            // is derived from the instant a replacement becomes effective against the
+            // call's own instant, so this stays a pure READ and reports the key change as
+            // of the moment the rest of this response was computed at.
+            encryption_configuration_details: Some(instance.encryption.to_shape(now)),
             // A property of the INSTANCE: permission sets are a feature of an
             // organization instance, and an account instance serves none of that surface
             // until an `UpdateInstance` enables them on it.

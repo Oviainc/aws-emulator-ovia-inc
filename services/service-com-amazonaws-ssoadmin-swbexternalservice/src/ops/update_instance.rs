@@ -291,11 +291,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx.parts());
+        // ONE instant for the whole call, captured before the lock: the state this update
+        // resolves and every due instant it stores are the same moment, so a configuration
+        // this call accepts cannot fall due measured from a later clock than the one that
+        // settled the instance it is written to.
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // What the CLOCK already owes every instance, plus the account's ambient instance
         // if nothing has enabled one yet, so this update resolves the same instance a read
         // at this instant would resolve.
-        store.on_request(&region, ::std::time::SystemTime::now());
+        store.on_request(&region, now);
         // A syntactically valid ARN for an instance this account does not hold is a
         // MISSING RESOURCE, which this operation (unlike `DescribeInstance`) models.
         let instance = store.instance_mut(&input.instance_arn).ok_or_else(|| {
@@ -331,7 +336,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             instance.encryption = crate::state::EncryptionConfigurationRecord::new(
                 configuration.key_type,
                 configuration.kms_key_arn,
-                ::std::time::SystemTime::now(),
+                now,
             );
         }
 
