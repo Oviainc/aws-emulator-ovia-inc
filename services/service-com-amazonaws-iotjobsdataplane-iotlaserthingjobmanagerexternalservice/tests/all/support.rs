@@ -41,22 +41,50 @@ pub(crate) struct Emulator {
 
 impl Emulator {
     pub(crate) fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         // An execution starts only for a command that EXISTS; commands are the
         // control plane's resource (`iot:CreateCommand`, a scaffold in its own crate
         // under its own issue), so the shared index is seeded with the one command
         // these suites start — the same write that create makes. The refusal an
         // unregistered command gets is asserted in `command_execution_validation.rs`.
-        command_registry(&*engine)
-            .expect("the shared IoT command index")
-            .lock()
-            .register(COMMAND_ARN, CommandFacts::default())
-            .expect("register the command these tests start");
+        Self::with_commands(&[(COMMAND_ARN, CommandFacts::default())])
+    }
+
+    /// An emulator whose shared IoT command index holds exactly `commands`, each
+    /// with the facts its create decided — for a suite whose rows need a command in
+    /// a particular form (a static payload, a deprecation) or need none at all.
+    pub(crate) fn with_commands(commands: &[(&str, CommandFacts)]) -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        {
+            let index = command_registry(&*engine).expect("the shared IoT command index");
+            let mut index = index.lock();
+            for (command_arn, facts) in commands {
+                index
+                    .register(command_arn, *facts)
+                    .unwrap_or_else(|refusal| panic!("register {command_arn}: {refusal}"));
+            }
+        }
         let mut router = MultiServiceRouter::new();
         // These tests exercise handler behaviour, not request signing.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
         Self { router, engine }
+    }
+
+    /// `StartCommandExecution` exactly as a row asks for it — any `targetArn`, any
+    /// `commandArn`, and `parameters` when the row supplies them — answering the
+    /// status and body the wire carried, so a suite can assert on a REFUSAL as well
+    /// as on an accept.
+    pub(crate) async fn start_command(
+        &self,
+        target_arn: &str,
+        command_arn: &str,
+        parameters: Option<&Value>,
+    ) -> (u16, Value) {
+        let mut body = json!({"targetArn": target_arn, "commandArn": command_arn});
+        if let Some(parameters) = parameters {
+            body["parameters"] = parameters.clone();
+        }
+        self.call("POST", "/command-executions", Some(body)).await
     }
 
     async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
@@ -218,6 +246,11 @@ impl StoredExecution {
 /// The wire error code of a modeled failure (restJson1 carries it in `__type`).
 pub(crate) fn error_code(body: &Value) -> &str {
     body["__type"].as_str().unwrap_or("")
+}
+
+/// The `message` of a modeled failure.
+pub(crate) fn error_message(body: &Value) -> &str {
+    body["message"].as_str().unwrap_or("")
 }
 
 /// The `jobId`s of one pending list, in the order the service returned them.

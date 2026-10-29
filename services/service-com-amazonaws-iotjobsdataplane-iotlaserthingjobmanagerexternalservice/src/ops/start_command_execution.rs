@@ -186,6 +186,15 @@ fn quota_exceeded(message: String) -> StartCommandExecutionError {
 
 /// A refusal of this operation's request as the modeled `ValidationException`
 /// (HTTP 400), carrying `message`.
+///
+/// This is how the recorded service refuses EVERY request this operation declines on
+/// the caller's side, including one whose values are all well formed and whose only
+/// fault is that the `commandArn` names no command that exists: the wire recording
+/// `iotjobsdata-command-execution-validation-refusals` answers that start 400, not
+/// with the `ResourceNotFoundException` the operation also declares. The declared
+/// 404 belongs to the per-execution reads and writes of this plane, which answer a
+/// `jobId`/`thingName` pair holding no execution with it
+/// (`crate::state::not_found_message`).
 fn invalid_request(message: String) -> StartCommandExecutionError {
     StartCommandExecutionErrorModeled::ValidationException(ValidationException {
         message: Some(message),
