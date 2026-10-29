@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for the Glue integration table property slice:
-//! `CreateIntegrationTableProperties` and the `GetIntegrationTableProperties` that reads
-//! back what it stored.
+//! `CreateIntegrationTableProperties`, the `GetIntegrationTableProperties` that reads back
+//! what it stored and the `DeleteIntegrationTableProperties` that removes it.
 //!
 //! Every call goes over the wire through the shared [`crate::wire`] harness, so what is
 //! asserted is the HTTP behaviour and not a direct call into a handler.
@@ -16,6 +16,11 @@
 //! * a read reaches a record only through the ARN of an integration LEG (the Glue
 //!   connection of the source, the Glue database of the target): a create against a
 //!   replicated table's own ARN is accepted and that record is not readable through it;
+//! * a delete resolves the record the same way and removes that ONE record, so a later read
+//!   of the pair misses and every other pair is left as stored;
+//! * a read or a delete that reaches no record reports the resource as not found while that
+//!   resource carries no integration table properties at all, and otherwise names the pair
+//!   the request addressed;
 //! * one call carries the configuration of the one leg its `ResourceArn` names, so a call
 //!   stating both sides is refused;
 //! * a `SourceTableConfig` member the service does not process yet is refused.
@@ -134,6 +139,37 @@ async fn read(router: &MultiServiceRouter, resource_arn: &str, table: &str) -> (
         &json!({ "ResourceArn": resource_arn, "TableName": table }),
     )
     .await
+}
+
+/// The status and body of a delete of one pair.
+async fn delete_properties(
+    router: &MultiServiceRouter,
+    resource_arn: &str,
+    table: &str,
+) -> (u16, Value) {
+    call(
+        router,
+        "DeleteIntegrationTableProperties",
+        &json!({ "ResourceArn": resource_arn, "TableName": table }),
+    )
+    .await
+}
+
+/// The refusal wording a read or a delete of ONE record carries when it reaches none: the
+/// pair the request addressed while `carries_properties` (the resource carries integration
+/// table properties of some table), and the resource itself while it carries none.
+///
+/// Recorded in the Glue integration table property lifecycle: a read and a repeated delete of
+/// a pair whose resource was left carrying nothing report the resource as not found.
+fn miss_message(resource_arn: &str, table: &str, carries_properties: bool) -> String {
+    if carries_properties {
+        format!(
+            "Failed to find the sourceTableProperties with sourceArn {resource_arn} and tableName \
+             {table}"
+        )
+    } else {
+        format!("The target resource {resource_arn} is not found.")
+    }
 }
 
 /// A string of exactly `length` characters starting with `prefix`, for the rows that sit on
@@ -750,15 +786,16 @@ async fn a_resource_arn_naming_an_absent_resource_is_refused() {
 
 /// A read reaches a record only through the ARN of an integration LEG. A create against a
 /// replicated table's OWN ARN is accepted, and the record it writes is not readable through
-/// that ARN; a leg's record written for another table name is not readable either. Both
-/// misses carry the service's record-not-found wording, which names the two members the
-/// request addressed the record by.
+/// that ARN; a leg's record written for another table name is not readable either. Each miss
+/// carries the wording its resource earns: the pair the request addressed while that resource
+/// carries properties of other tables, and the resource itself while it carries none.
 #[tokio::test]
 async fn a_record_is_read_back_only_through_an_integration_leg() {
     let router = emulator();
     create_database(&router, "orphans").await;
     create_table(&router, "orphans", "orders").await;
     create_connection(&router, "orphans-source").await;
+    create_connection(&router, "orphans-written-source").await;
 
     // The create against the table's own ARN is accepted.
     let created = create_properties(
@@ -785,27 +822,49 @@ async fn a_record_is_read_back_only_through_an_integration_leg() {
         }),
     )
     .await;
+    // One leg carrying properties of ANOTHER table, so the two misses below differ only in
+    // whether the addressed resource carries any properties at all.
+    create_properties(
+        &router,
+        &json!({
+            "ResourceArn": connection_arn("orphans-written-source"),
+            "TableName": "sap-invoices",
+            "SourceTableConfig": { "PrimaryKey": ["id"] },
+        }),
+    )
+    .await;
 
-    for (case, resource_arn, table) in [
+    // (case, the ARN, the table name, whether that ARN carries properties of some table)
+    for (case, resource_arn, table, carries_properties) in [
         (
             "a record written against the table's own ARN",
             table_arn("orphans", "orders"),
             "sap-orders".to_string(),
+            true,
         ),
         (
             "a leg with no record for this table",
             database_arn("orphans"),
             "sap-invoices".to_string(),
+            true,
+        ),
+        (
+            "a leg carrying only another table's record",
+            connection_arn("orphans-written-source"),
+            "sap-orders".to_string(),
+            true,
         ),
         (
             "a leg that was never written to",
             connection_arn("orphans-source"),
             "sap-orders".to_string(),
+            false,
         ),
         (
             "a table name differing only in case from the stored one",
             database_arn("orphans"),
             "SAP-ORDERS".to_string(),
+            true,
         ),
     ] {
         let (status, body) = read(&router, &resource_arn, &table).await;
@@ -820,11 +879,8 @@ async fn a_record_is_read_back_only_through_an_integration_leg() {
         );
         assert_eq!(
             error_message(&body),
-            format!(
-                "Failed to find the sourceTableProperties with sourceArn {resource_arn} and \
-                 tableName {table}"
-            ),
-            "case {case}: expected the service's record-not-found wording, got {body}"
+            miss_message(&resource_arn, &table, carries_properties),
+            "case {case}: expected the wording this resource's miss earns, got {body}"
         );
     }
 
@@ -918,4 +974,395 @@ async fn a_create_past_the_integration_table_properties_ceiling_is_refused() {
             .remove(&(database_arn("seeded"), "seeded-0".to_string()));
     }
     create_properties(&router, &past).await;
+}
+
+// ---------------------------------------------------------------------------
+// Delete
+// ---------------------------------------------------------------------------
+
+/// A delete removes the ONE record the pair it names addresses: it answers an empty 200, a
+/// read of that pair then misses, a second delete of it is refused and removes nothing, and
+/// every other pair's record is left exactly as stored. The rows differ along which leg kind
+/// the ARN names, which side of the integration the record carries, how many members that
+/// side carries and the form and length of the table name.
+#[tokio::test]
+async fn deleting_integration_table_properties_removes_only_the_pair_it_addresses() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(engine.clone());
+    create_connection(&router, "deleted-source").await;
+    create_database(&router, "deleted-target").await;
+
+    let leg_arn = |is_connection: bool| {
+        if is_connection {
+            connection_arn("deleted-source")
+        } else {
+            database_arn("deleted-target")
+        }
+    };
+    let held = || {
+        engine
+            .state::<ComAmazonawsGlueAwsglueState>()
+            .lock()
+            .integration_table_properties
+            .len()
+    };
+
+    // (case, whether the ARN names the connection leg, the table name, the configuration)
+    let rows: Vec<(&str, bool, String, Value)> = vec![
+        (
+            "a source primary key of one field",
+            true,
+            "SapEntityOf".to_string(),
+            json!({ "SourceTableConfig": { "PrimaryKey": ["id"] } }),
+        ),
+        (
+            "a source primary key of several fields",
+            true,
+            "sap/entity/with/slashes".to_string(),
+            json!({ "SourceTableConfig": { "PrimaryKey": ["tenant", "id", "line_item"] } }),
+        ),
+        (
+            "a target naming only its table",
+            false,
+            "orders".to_string(),
+            json!({ "TargetTableConfig": { "TargetTableName": "orders_replica" } }),
+        ),
+        (
+            "a target carrying every modelled member",
+            false,
+            "invoices".to_string(),
+            json!({
+                "TargetTableConfig": {
+                    "UnnestSpec": "NOUNNEST",
+                    "TargetTableName": "invoices_replica",
+                    "IntegrationArn": format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:integration/zero-etl"),
+                    "PartitionSpec": [
+                        { "FieldName": "created_at", "FunctionSpec": "day", "ConversionSpec": "iso" },
+                    ],
+                },
+            }),
+        ),
+        (
+            "a table name at the modelled length bound",
+            false,
+            padded("long-", MAX_NAME_LENGTH),
+            json!({ "TargetTableConfig": { "TargetTableName": "long_replica" } }),
+        ),
+        (
+            "a table name of the shortest length the model admits",
+            false,
+            "t".to_string(),
+            json!({ "TargetTableConfig": { "TargetTableName": "r" } }),
+        ),
+        (
+            "a target stating no member at all",
+            false,
+            "empty-config".to_string(),
+            json!({ "TargetTableConfig": {} }),
+        ),
+    ];
+
+    for (case, is_connection, table, config) in &rows {
+        let resource_arn = leg_arn(*is_connection);
+        let mut request = config.clone();
+        request["ResourceArn"] = json!(resource_arn);
+        request["TableName"] = json!(table);
+        create_properties(&router, &request).await;
+        // The record is there to begin with, so what the delete below removes is a stored
+        // record and not an absent one.
+        let read_back = get_properties(&router, &resource_arn, table).await;
+        assert_echoed(case, config, &read_back);
+    }
+
+    let mut remaining: Vec<(&str, String, String, Value)> = rows
+        .iter()
+        .map(|(case, is_connection, table, config)| {
+            (*case, leg_arn(*is_connection), table.clone(), config.clone())
+        })
+        .collect();
+
+    while !remaining.is_empty() {
+        let (case, resource_arn, table, _) = remaining.remove(0);
+        let before = held();
+
+        let (status, body) = delete_properties(&router, &resource_arn, &table).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected 200 deleting {table:?} of {resource_arn:?}, got {status} with \
+             {body}"
+        );
+        // `DeleteIntegrationTablePropertiesResponse` models no member at all, so the delete
+        // reports the 200 and nothing else.
+        assert_eq!(
+            body,
+            json!({}),
+            "case {case}: the delete must answer an empty body, got {body}"
+        );
+        let after = held();
+        assert_eq!(
+            after,
+            before - 1,
+            "case {case}: exactly one record must be removed, the store held {before}, got \
+             {after}"
+        );
+
+        // Whether that resource still carries properties of another table is what decides
+        // the wording the miss of this pair now earns.
+        let carries_properties = remaining.iter().any(|(_, arn, _, _)| arn == &resource_arn);
+        let (status, miss) = read(&router, &resource_arn, &table).await;
+        assert_eq!(
+            status, 400,
+            "case {case}: a read of the deleted pair must be refused, got {status} with {miss}"
+        );
+        assert!(
+            error_code(&miss).contains("EntityNotFoundException"),
+            "case {case}: expected EntityNotFoundException from the read, got {miss}"
+        );
+        assert_eq!(
+            error_message(&miss),
+            miss_message(&resource_arn, &table, carries_properties),
+            "case {case}: expected the wording this resource's miss earns, got {miss}"
+        );
+
+        // The delete of a pair that is already gone is refused the same way and removes
+        // nothing: it is not answered as though a delete had happened.
+        let (status, again) = delete_properties(&router, &resource_arn, &table).await;
+        assert_eq!(
+            status, 400,
+            "case {case}: a repeated delete must be refused, got {status} with {again}"
+        );
+        assert!(
+            error_code(&again).contains("EntityNotFoundException"),
+            "case {case}: expected EntityNotFoundException from the repeated delete, got {again}"
+        );
+        assert_eq!(
+            error_message(&again),
+            miss_message(&resource_arn, &table, carries_properties),
+            "case {case}: expected the wording this resource's miss earns, got {again}"
+        );
+        assert_eq!(
+            held(),
+            after,
+            "case {case}: a refused delete must remove nothing, the store held {after}, got {}",
+            held()
+        );
+
+        // Every pair not yet deleted still reports what its create stored, so the delete
+        // above removed one record and not a resource's worth of them.
+        for (other_case, other_arn, other_table, other_config) in &remaining {
+            let read_back = get_properties(&router, other_arn, other_table).await;
+            assert_echoed(
+                &format!("{case} deleted, then {other_case}"),
+                other_config,
+                &read_back,
+            );
+        }
+    }
+
+    let left = held();
+    assert_eq!(
+        left, 0,
+        "case every row deleted: expected an empty store, got {left} record(s)"
+    );
+}
+
+/// A delete that reaches no record is refused with the modelled `EntityNotFoundException`,
+/// carrying the wording its resource earns, and removes nothing. The rows differ along how
+/// the record misses: another table under a written leg, a leg carrying nothing, a resource
+/// this account does not hold, a record written against a replicated table's OWN ARN (which
+/// is not reachable through that ARN) and a table name differing only in case.
+#[tokio::test]
+async fn a_delete_reaching_no_record_is_refused_and_removes_nothing() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(engine.clone());
+    create_database(&router, "undeleted").await;
+    create_table(&router, "undeleted", "orders").await;
+    create_connection(&router, "undeleted-source").await;
+
+    // One record under the database leg, and one written against the replicated table's own
+    // ARN, which the create accepts.
+    for resource_arn in [table_arn("undeleted", "orders"), database_arn("undeleted")] {
+        create_properties(
+            &router,
+            &json!({
+                "ResourceArn": resource_arn,
+                "TableName": "sap-orders",
+                "TargetTableConfig": { "TargetTableName": "orders_replica" },
+            }),
+        )
+        .await;
+    }
+    let held = || {
+        engine
+            .state::<ComAmazonawsGlueAwsglueState>()
+            .lock()
+            .integration_table_properties
+            .len()
+    };
+    let before = held();
+
+    // (case, the ARN, the table name, whether that ARN carries properties of some table)
+    for (case, resource_arn, table, carries_properties) in [
+        (
+            "a leg with no record for this table",
+            database_arn("undeleted"),
+            "sap-invoices".to_string(),
+            true,
+        ),
+        (
+            "a table name differing only in case from the stored one",
+            database_arn("undeleted"),
+            "SAP-ORDERS".to_string(),
+            true,
+        ),
+        (
+            "a record written against the table's own ARN",
+            table_arn("undeleted", "orders"),
+            "sap-orders".to_string(),
+            true,
+        ),
+        (
+            "a leg that was never written to",
+            connection_arn("undeleted-source"),
+            "sap-orders".to_string(),
+            false,
+        ),
+        (
+            "a database this account does not hold",
+            database_arn("absent"),
+            "sap-orders".to_string(),
+            false,
+        ),
+        (
+            "a connection this account does not hold",
+            connection_arn("absent"),
+            "sap-orders".to_string(),
+            false,
+        ),
+    ] {
+        let (status, body) = delete_properties(&router, &resource_arn, &table).await;
+        assert_eq!(
+            status, 400,
+            "case {case}: expected 400 for {resource_arn:?} and {table:?}, got {status} with \
+             {body}"
+        );
+        assert!(
+            error_code(&body).contains("EntityNotFoundException"),
+            "case {case}: expected EntityNotFoundException, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            miss_message(&resource_arn, &table, carries_properties),
+            "case {case}: expected the wording this resource's miss earns, got {body}"
+        );
+        let left = held();
+        assert_eq!(
+            left, before,
+            "case {case}: a refused delete must remove nothing, the store held {before}, got \
+             {left}"
+        );
+    }
+
+    // Both stored records are still there, so the refusals above are misses and not a broken
+    // lookup followed by a removal.
+    let read_back = get_properties(&router, &database_arn("undeleted"), "sap-orders").await;
+    assert_eq!(
+        read_back
+            .pointer("/TargetTableConfig/TargetTableName")
+            .and_then(Value::as_str),
+        Some("orders_replica"),
+        "case the leg's own record: expected the stored target table, got {read_back}"
+    );
+    assert_eq!(
+        held(),
+        before,
+        "case every refusal: the store must still hold {before} record(s), got {}",
+        held()
+    );
+}
+
+/// A `ResourceArn` that can name no Glue resource integration table properties could belong
+/// to is a bad parameter for the delete too: it is refused with the modelled
+/// `InvalidInputException` naming the member it read, and removes nothing. The rows differ
+/// along how the value misses.
+#[tokio::test]
+async fn a_delete_whose_resource_arn_names_no_glue_resource_is_refused() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(engine.clone());
+    create_database(&router, "arn-shapes").await;
+    create_properties(
+        &router,
+        &json!({
+            "ResourceArn": database_arn("arn-shapes"),
+            "TableName": "orders",
+            "TargetTableConfig": { "TargetTableName": "orders_replica" },
+        }),
+    )
+    .await;
+    let held = || {
+        engine
+            .state::<ComAmazonawsGlueAwsglueState>()
+            .lock()
+            .integration_table_properties
+            .len()
+    };
+
+    for (case, resource_arn) in [
+        ("not an ARN at all", "my-connection".to_string()),
+        (
+            "another service's namespace",
+            "arn:aws:s3:::bucket/key".to_string(),
+        ),
+        (
+            "a Glue crawler ARN",
+            format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:crawler/nightly"),
+        ),
+        (
+            "a Glue job ARN",
+            format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:job/etl"),
+        ),
+        (
+            "the Data Catalog's own ARN",
+            format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:catalog"),
+        ),
+        (
+            "a database ARN carrying no name",
+            format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:database/"),
+        ),
+        (
+            "a table ARN carrying no table after its database",
+            format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:table/sales"),
+        ),
+    ] {
+        let (status, body) = delete_properties(&router, &resource_arn, "orders").await;
+        assert_eq!(
+            status, 400,
+            "case {case}: expected 400 for {resource_arn:?}, got {status} with {body}"
+        );
+        assert!(
+            error_code(&body).contains("InvalidInputException"),
+            "case {case}: expected InvalidInputException for {resource_arn:?}, got {body}"
+        );
+        assert!(
+            error_message(&body).contains("ResourceArn"),
+            "case {case}: the refusal must name the member it read, got {body}"
+        );
+        let left = held();
+        assert_eq!(
+            left, 1,
+            "case {case}: a refused delete must remove nothing, got {left} record(s)"
+        );
+    }
+
+    // The ARN shapes above are refused for their shape: the stored pair is still deletable.
+    let (status, body) = delete_properties(&router, &database_arn("arn-shapes"), "orders").await;
+    assert_eq!(
+        status, 200,
+        "case the stored pair: expected 200, got {status} with {body}"
+    );
+    let left = held();
+    assert_eq!(
+        left, 0,
+        "case the stored pair: expected the record to be gone, got {left} record(s)"
+    );
 }

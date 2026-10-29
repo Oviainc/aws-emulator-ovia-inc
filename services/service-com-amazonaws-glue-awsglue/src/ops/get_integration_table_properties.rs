@@ -209,12 +209,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetIntegrationTablePropertiesErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
-                        message: Some(
-                            crate::state::messages::integration_table_properties_not_found(
-                                &input.resource_arn,
-                                &input.table_name,
-                            ),
-                        ),
+                        // The miss of a pair and the miss of a resource carrying no
+                        // integration table properties at all are reported differently, and
+                        // the store is what tells them apart.
+                        message: Some(store.integration_table_properties_miss(
+                            &input.resource_arn,
+                            &input.table_name,
+                        )),
                         from_federation_source: None,
                     },
                 )

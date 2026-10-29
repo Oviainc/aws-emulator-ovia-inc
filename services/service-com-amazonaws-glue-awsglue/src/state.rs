@@ -2437,6 +2437,36 @@ impl ComAmazonawsGlueAwsglueState {
         self.integration_table_properties.len() < MAX_INTEGRATION_TABLE_PROPERTIES
     }
 
+    /// Whether this account holds ANY integration table property record for `resource_arn`,
+    /// whatever table each one overrides.
+    ///
+    /// This is what tells the miss of ONE pair apart from a resource that carries no
+    /// integration table properties at all, which the two operations that address a record
+    /// report differently ([`Self::integration_table_properties_miss`]).
+    pub fn holds_integration_table_properties_of(&self, resource_arn: &str) -> bool {
+        self.integration_table_properties
+            .keys()
+            .any(|(arn, _)| arn == resource_arn)
+    }
+
+    /// The message an operation that addresses ONE integration table property record
+    /// (`GetIntegrationTableProperties`, `DeleteIntegrationTableProperties`) carries when it
+    /// reaches no record for the pair it was asked about.
+    ///
+    /// RECORDED behaviour: a resource carrying no integration table properties at all is
+    /// reported as the resource itself not being found ([`messages::target_resource_not_found`]),
+    /// while a resource that carries properties for other tables answers with the miss of the
+    /// pair the request addressed ([`messages::integration_table_properties_not_found`]). The
+    /// ONE reading of that rule, so the read and the delete cannot disagree about which miss
+    /// a request earns.
+    pub fn integration_table_properties_miss(&self, resource_arn: &str, table_name: &str) -> String {
+        if self.holds_integration_table_properties_of(resource_arn) {
+            messages::integration_table_properties_not_found(resource_arn, table_name)
+        } else {
+            messages::target_resource_not_found(resource_arn)
+        }
+    }
+
     /// Whether this store holds the resource an integration table property call's
     /// `ResourceArn` named ([`integration_table_reference`]).
     ///
@@ -11000,8 +11030,10 @@ pub mod messages {
     /// An operation of the integration API family that addresses ONE record by the ARN of
     /// the resource it belongs to, for a `ResourceArn` this account holds no such record
     /// for — the integration resource property read
-    /// (`GetIntegrationResourceProperty`), and the resource miss of an integration table
-    /// properties write. RECORDED template: the sentence is fixed around its one variable
+    /// (`GetIntegrationResourceProperty`), the resource miss of an integration table
+    /// properties write, and the miss of a read or a delete of integration table properties
+    /// whose resource carries none at all
+    /// ([`ComAmazonawsGlueAwsglueState::integration_table_properties_miss`]). RECORDED template: the sentence is fixed around its one variable
     /// part, the ARN the request addressed, taken verbatim from `ResourceArn`; what is
     /// pinned is the behaviour — `EntityNotFoundException`.
     pub fn target_resource_not_found(resource_arn: &str) -> String {
@@ -11019,8 +11051,12 @@ pub mod messages {
          in the request.";
 
     /// An operation that addresses ONE integration table property record
-    /// (`GetIntegrationTableProperties`) for a `ResourceArn` and `TableName` this account
-    /// holds no reachable record for. Recorded template: the fixed text around the two
+    /// (`GetIntegrationTableProperties`, `DeleteIntegrationTableProperties`) for a
+    /// `TableName` whose `ResourceArn` carries integration table properties of OTHER tables
+    /// but none of that pair; a resource carrying none at all earns
+    /// [`target_resource_not_found`] instead
+    /// ([`ComAmazonawsGlueAwsglueState::integration_table_properties_miss`]). Recorded
+    /// template: the fixed text around the two
     /// members the request addressed the record by, which the service names `sourceArn` and
     /// `tableName`, and no trailing period.
     pub fn integration_table_properties_not_found(resource_arn: &str, table_name: &str) -> String {
