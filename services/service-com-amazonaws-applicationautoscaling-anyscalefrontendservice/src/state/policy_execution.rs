@@ -10,21 +10,28 @@
 //! alarm that names its `PolicyARN` among those actions moves into `ALARM`, whoever created
 //! that alarm.
 //!
-//! The policy type this module executes is `StepScaling`, the one whose CONFIGURATION states
-//! the adjustment to make: "A set of adjustments that enable you to scale based on the size of
-//! the alarm breach" (`StepScalingPolicyConfiguration$StepAdjustments`), interpreted by its
-//! `AdjustmentType`. A target-tracking policy states a target value for a metric instead, so
-//! what it would move the capacity to is the answer of a control loop over that metric rather
-//! than a number its document carries; this module computes no such answer and executes no such
-//! policy.
+//! Two policy types are executed here, each answering the same question — what capacity does
+//! this breach ask for — from what its own document states:
+//!
+//! * `StepScaling` states the adjustment to make: "A set of adjustments that enable you to
+//!   scale based on the size of the alarm breach"
+//!   (`StepScalingPolicyConfiguration$StepAdjustments`), interpreted by its `AdjustmentType`;
+//! * `TargetTrackingScaling` states a target value for a metric, so the capacity it asks for
+//!   is the answer of a control loop over the value its own alarm graded
+//!   ([`super::target_tracking_capacity`]) — which is why only the pair that policy minted on
+//!   the metric it tracks executes it.
+//!
+//! A `PredictiveScaling` policy is driven by a forecast rather than by an alarm, so no breach
+//! executes one.
 //!
 //! What an execution does, in order:
 //!
-//! 1. pick the step adjustment the breach falls in — the interval is of the DIFFERENCE between
-//!    the metric and the alarm's threshold, and which end is inclusive follows the direction
-//!    of the breach ("If the metric value is above the breach threshold, the lower bound is
-//!    inclusive […] Otherwise, it's exclusive", and the mirror of that for the upper bound);
-//! 2. compute the capacity that adjustment asks for, as its `AdjustmentType` interprets it;
+//! 1. read the breach the alarm reports — the metric value it graded, and the DIFFERENCE
+//!    between that value and the alarm's threshold, which is what a step adjustment's
+//!    interval is an interval of ("If the metric value is above the breach threshold, the
+//!    lower bound is inclusive […] Otherwise, it's exclusive", and the mirror of that for the
+//!    upper bound);
+//! 2. compute the capacity the policy asks for, as its own configuration states it;
 //! 3. CLAMP that capacity into the `MinCapacity`/`MaxCapacity` the scalable target carries at
 //!    this instant — "Application Auto Scaling will not scale capacity to values that are
 //!    outside of the minimum and maximum range" — which is a re-read of the registered
@@ -42,9 +49,15 @@
 //! makes no further Application Auto Scaling call.
 //!
 //! One transition fires one execution: the instant the alarm last moved into `ALARM` is
-//! recorded on the policy, so no later pass performs the same breach twice. A breach the
-//! policy's `Cooldown` makes WAIT is the exception — the alarm is still breaching, so it is
-//! left unperformed rather than consumed, and the first pass after the wait performs it.
+//! recorded on the policy, so no later pass performs the same breach twice. A breach that is
+//! WITHHELD rather than performed is the exception, and is left unconsumed — the alarm is
+//! still breaching, so the first pass that may perform it does:
+//!
+//! * the policy's cooldown makes the breach wait for a previous activity to take effect;
+//! * the target's `SuspendedState` suspends the direction the movement would be in ("while a
+//!   suspension is in effect, all scale-out activities that are triggered by a scaling policy
+//!   are suspended"), so lifting the suspension delivers the withheld movement with no new
+//!   metric movement of its own.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -53,11 +66,15 @@ use super::{
     service_state, ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState, PolicyKey,
     TargetKey,
 };
-use crate::ops::types::StepScalingPolicyConfiguration;
+use crate::ops::types::{StepScalingPolicyConfiguration, TargetTrackingScalingPolicyConfiguration};
 
 /// The policy type whose own configuration states the arithmetic of its adjustment, and so the
 /// one an alarm breach can be executed from on the policy document alone.
 pub const STEP_SCALING_POLICY_TYPE: &str = "StepScaling";
+
+/// The policy type whose configuration states a TARGET for the metric its own alarms watch,
+/// so the capacity a breach asks for is computed from the value the alarm graded.
+pub const TARGET_TRACKING_POLICY_TYPE: &str = "TargetTrackingScaling";
 
 /// `Cooldown`'s documented default: "The amount of time, in seconds, to wait for a previous
 /// scaling activity to take effect. If not specified, the default value is 300."
@@ -103,6 +120,8 @@ struct Breach {
     /// The instant it moved into `ALARM`, in epoch seconds — the identity of the transition,
     /// so the same one is executed once.
     transitioned_secs: f64,
+    /// The alarm's own `Threshold`, which the difference below is measured from.
+    threshold: f64,
     /// The difference between the metric and the alarm's `Threshold`, which is what a step
     /// adjustment's interval is an interval OF.
     difference: f64,
@@ -111,13 +130,35 @@ struct Breach {
     above: bool,
 }
 
+impl Breach {
+    /// The metric value the alarm graded, which is what a target-tracking control loop
+    /// computes a capacity from: the threshold plus the difference the alarm measured.
+    ///
+    /// An alarm whose state was forced rather than evaluated carries no datapoint, so the
+    /// difference is the smallest one in the direction it breached ([`breach_of`]) and this
+    /// answers the threshold itself — the metric is read as sitting exactly at the value the
+    /// alarm compares against, which is the only thing such a state says.
+    fn measured(&self) -> f64 {
+        self.threshold + self.difference
+    }
+}
+
+/// The configuration ONE firing policy computes its capacity from, by policy type.
+#[derive(Debug, Clone)]
+enum FiringConfig {
+    /// `StepScaling`: the adjustments and how to interpret them.
+    Step(StepScalingPolicyConfiguration),
+    /// `TargetTrackingScaling`: the metric and the value to hold it at.
+    TargetTracking(TargetTrackingScalingPolicyConfiguration),
+}
+
 /// One policy an alarm breach is to be executed on: the snapshot a pass takes under this
 /// service's lock, so the CloudWatch read below happens with it released.
 #[derive(Debug, Clone)]
 struct FiringPolicy {
     key: PolicyKey,
     policy_arn: String,
-    config: StepScalingPolicyConfiguration,
+    config: FiringConfig,
     /// The transitions this policy has already been executed for, by alarm name.
     executed: BTreeMap<String, f64>,
 }
@@ -314,11 +355,19 @@ fn still_wanted_or_release(
     let wanted = store
         .policies
         .values()
-        .any(|record| record.policy_type == STEP_SCALING_POLICY_TYPE);
+        .any(|record| is_alarm_driven(&record.policy_type));
     if !wanted {
         release_scaling_clock(store, generation);
     }
     wanted
+}
+
+/// Whether an alarm breach executes a policy of this type at all.
+fn is_alarm_driven(policy_type: &str) -> bool {
+    matches!(
+        policy_type,
+        STEP_SCALING_POLICY_TYPE | TARGET_TRACKING_POLICY_TYPE
+    )
 }
 
 /// Every policy of this store an alarm breach can be executed on, with what it has already
@@ -326,19 +375,26 @@ fn still_wanted_or_release(
 ///
 /// A policy whose scalable target is gone is left out: the target is what carries the window a
 /// movement is clamped into and the capacity it moves, so there is nothing to execute against.
+/// So is one whose own configuration is absent, which states no capacity to move to.
 fn firing_candidates(
     store: &ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
 ) -> Vec<FiringPolicy> {
     store
         .policies
         .iter()
-        .filter(|(_, record)| record.policy_type == STEP_SCALING_POLICY_TYPE)
         .filter(|(key, _)| store.targets.contains_key(&key.target))
         .filter_map(|(key, record)| {
+            let config = match record.policy_type.as_str() {
+                STEP_SCALING_POLICY_TYPE => FiringConfig::Step(record.step_config.clone()?),
+                TARGET_TRACKING_POLICY_TYPE => {
+                    FiringConfig::TargetTracking(record.target_tracking_config.clone()?)
+                }
+                _ => return None,
+            };
             Some(FiringPolicy {
                 key: key.clone(),
                 policy_arn: record.policy_arn.clone(),
-                config: record.step_config.clone()?,
+                config,
                 executed: record.executed_transitions.clone(),
             })
         })
@@ -385,7 +441,7 @@ fn unexecuted_breaches<Eng: Send + Sync + 'static>(
             .as_ref()
             .or(alarm.state_updated_timestamp.as_ref())
             .map_or(0.0, ::aws_smithy_types::DateTime::as_secs_f64);
-        let Some((difference, above)) = breach_of(alarm) else {
+        let Some((threshold, difference, above)) = breach_of(alarm) else {
             continue;
         };
         for action in alarm.alarm_actions.iter().flatten() {
@@ -408,6 +464,7 @@ fn unexecuted_breaches<Eng: Send + Sync + 'static>(
                 Breach {
                     alarm_name: alarm_name.clone(),
                     transitioned_secs,
+                    threshold,
                     difference,
                     above,
                 },
@@ -427,7 +484,7 @@ fn unexecuted_breaches<Eng: Send + Sync + 'static>(
 }
 
 /// How far past its threshold the metric an alarm watches was, and whether it was ABOVE the
-/// threshold rather than below it.
+/// threshold rather than below it, beside the threshold the difference is measured from.
 ///
 /// The size of a breach is a measurement, so it is read from the alarm's own explanation of the
 /// state it is in — "An explanation for the alarm state, in JSON format"
@@ -439,7 +496,7 @@ fn unexecuted_breaches<Eng: Send + Sync + 'static>(
 /// take, and so fires no step.
 fn breach_of(
     alarm: &::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::ops::types::MetricAlarm,
-) -> Option<(f64, bool)> {
+) -> Option<(f64, f64, bool)> {
     let threshold = alarm.threshold?;
     let measured = alarm
         .state_reason_data
@@ -457,9 +514,13 @@ fn breach_of(
         // says, whichever comparison put the alarm in ALARM.
         Some(value) => {
             let difference = value - threshold;
-            Some((difference, difference >= 0.0))
+            Some((threshold, difference, difference >= 0.0))
         }
-        None => Some((0.0, breaches_above(alarm.comparison_operator.as_deref()?)?)),
+        None => Some((
+            threshold,
+            0.0,
+            breaches_above(alarm.comparison_operator.as_deref()?)?,
+        )),
     }
 }
 
@@ -506,22 +567,36 @@ fn apply_breaches(
         {
             continue;
         }
+        // Which of a target-tracking policy's own alarms this breach is of, which is what
+        // names the direction it drives before any arithmetic: that policy is executed by
+        // the pair it minted on the metric it tracks, one alarm per direction.
+        let tracked_kind = match &policy.config {
+            FiringConfig::Step(_) => None,
+            FiringConfig::TargetTracking(_) => {
+                match super::policy_alarm_kind(&policy.key, &breach.alarm_name) {
+                    Some(kind) if !kind.watches_capacity() => Some(kind),
+                    // The pair that watches the provisioned capacity reports a stale
+                    // threshold rather than drive a direction, and an alarm this policy did
+                    // not mint states no target for a metric at all: neither moves capacity.
+                    _ => {
+                        remember_transition(
+                            store,
+                            &policy.key,
+                            &breach.alarm_name,
+                            breach.transitioned_secs,
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
         // "The amount of time, in seconds, to wait for a previous scaling activity to take
         // effect": a breach inside that span of this policy's own last execution WAITS — the
         // alarm is still breaching, so the breach is left unperformed rather than consumed,
         // and the first pass after the wait is over performs it.
-        let cooldown = Duration::from_secs(
-            record
-                .step_config
-                .as_ref()
-                .and_then(|config| config.cooldown)
-                .map_or(DEFAULT_COOLDOWN_SECS, i64::from)
-                .max(0)
-                .unsigned_abs(),
-        );
         let waiting = record
             .last_executed
-            .and_then(|last| last.checked_add(cooldown))
+            .and_then(|last| last.checked_add(cooldown_of(record, tracked_kind)))
             .is_some_and(|due| now < due);
         if waiting {
             continue;
@@ -542,23 +617,33 @@ fn apply_breaches(
             .copied()
             .unwrap_or(target.current_capacity);
         let suspended = target.suspended_state.clone();
-        // This transition has now been evaluated, whether or not it moved anything, so no
-        // later pass performs it again.
-        remember_transition(store, &policy.key, &breach.alarm_name, breach.transitioned_secs);
 
-        let Some(wanted) = adjusted_capacity(&policy.config, breach, current) else {
+        // The capacity the policy asks for, as its OWN configuration states it.
+        let wanted = match &policy.config {
+            FiringConfig::Step(config) => adjusted_capacity(config, breach, current),
+            FiringConfig::TargetTracking(config) => {
+                super::target_tracking_capacity(&policy.key, config, breach.measured(), current)
+            }
+        };
+        let Some(wanted) = wanted else {
+            // The configuration names no capacity for this breach, so the transition is
+            // evaluated and done with.
+            remember_transition(store, &policy.key, &breach.alarm_name, breach.transitioned_secs);
             continue;
         };
         let capacity = wanted.max(min_capacity).min(max_capacity);
         if capacity == current {
-            // Nothing moved, so there is no capacity movement to record: the adjustment asked
-            // for the capacity the resource already holds, or for one past a bound it already
+            // Nothing moved, so there is no capacity movement to record: the policy asked for
+            // the capacity the resource already holds, or for one past a bound it already
             // sits at.
+            remember_transition(store, &policy.key, &breach.alarm_name, breach.transitioned_secs);
             continue;
         }
         // "DynamicScalingInSuspended […] Whether scale in by a target tracking scaling policy
         // or a step scaling policy is suspended" — and the same for scale out: a suspended
-        // direction performs no movement at all.
+        // direction performs no movement at all. The breach is WITHHELD, not consumed: the
+        // alarm is still breaching, so the first pass after the suspension is lifted delivers
+        // the movement it was owed, with no new metric movement of its own.
         let scaling_out = capacity > current;
         let direction_suspended = suspended.is_some_and(|suspended| {
             if scaling_out {
@@ -570,6 +655,8 @@ fn apply_breaches(
         if direction_suspended {
             continue;
         }
+        // This transition has now been performed, so no later pass performs it again.
+        remember_transition(store, &policy.key, &breach.alarm_name, breach.transitioned_secs);
         let cause = format!(
             "monitor alarm {} in state ALARM triggered policy {}",
             breach.alarm_name, policy.key.policy_name
@@ -582,6 +669,39 @@ fn apply_breaches(
             record.last_executed = Some(now);
         }
     }
+}
+
+/// The wait a policy's own configuration gives a breach after this policy's last execution.
+///
+/// One cooldown per policy type, and for target tracking one per DIRECTION: "The amount of
+/// time, in seconds, to wait for a previous scale-out activity to take effect"
+/// (`TargetTrackingScalingPolicyConfiguration$ScaleOutCooldown`) and "The amount of time, in
+/// seconds, after a scale-in activity completes before another scale-in activity can start"
+/// (`$ScaleInCooldown`), against the one `StepScalingPolicyConfiguration$Cooldown` a step
+/// policy carries for both. A member the request left out falls back to the only default the
+/// model states for a cooldown, [`DEFAULT_COOLDOWN_SECS`]; the target-tracking members
+/// document theirs as a per-service table outside the model, which this emulator has no
+/// recording of.
+fn cooldown_of(
+    record: &super::ScalingPolicyRecord,
+    tracked_kind: Option<super::AlarmKind>,
+) -> Duration {
+    let configured = match tracked_kind {
+        Some(kind) => record.target_tracking_config.as_ref().and_then(|config| {
+            if kind.scales_out() {
+                config.scale_out_cooldown
+            } else {
+                config.scale_in_cooldown
+            }
+        }),
+        None => record.step_config.as_ref().and_then(|config| config.cooldown),
+    };
+    Duration::from_secs(
+        configured
+            .map_or(DEFAULT_COOLDOWN_SECS, i64::from)
+            .max(0)
+            .unsigned_abs(),
+    )
 }
 
 /// Record on a policy that it has been executed for the transition of `alarm_name` at

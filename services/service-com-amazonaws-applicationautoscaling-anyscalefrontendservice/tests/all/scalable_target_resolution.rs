@@ -476,7 +476,7 @@ async fn a_refusal_names_the_member_the_request_got_wrong() {
     );
     assert_eq!(
         error_message(&body),
-        "No scalable target found for service namespace: dynamodb, resource ID: \
+        "No scalable target registered for service namespace: dynamodb, resource ID: \
          table/orders, scalable dimension: dynamodb:table:ReadCapacityUnits",
         "case \"policy on an unregistered target\": expected the message to name the identity \
          it looked for, got {body:?}"

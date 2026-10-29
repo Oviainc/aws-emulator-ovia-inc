@@ -661,9 +661,10 @@ async fn a_list_too_long_is_refused_with_the_list_the_caller_sent() {
 // A target that is not registered
 // ---------------------------------------------------------------------------
 
-/// RULE: an operation addressed at a scalable target that is not registered is refused
-/// with the service's own not-found sentence, built from the three identity members of the
-/// request.
+/// RULE: an operation addressed at a scalable target that does not exist is refused with
+/// the service's own sentence for that operation, built from the three identity members of
+/// the request — `DeregisterScalableTarget` went looking for the registration in order to
+/// remove it, so it reports that none was FOUND.
 ///
 /// Rows differ along the identity (three namespaces, three resource-id forms) and along
 /// why the target is absent: never registered, or deregistered already.
@@ -727,6 +728,68 @@ async fn deregistering_a_target_that_is_not_registered_names_the_identity() {
          service/prod-cluster/web-app, scalable dimension: ecs:service:DesiredCount",
     )
     .await;
+}
+
+/// RULE: the sentence an absent scalable target is reported with follows what the operation
+/// was DOING with the registration — an operation that cannot proceed without one ("You
+/// cannot create a scaling policy until you have registered the resource as a scalable
+/// target", and the same for a scheduled action) reports that no scalable target is
+/// REGISTERED for the triple, while the operation that looked the registration up in order
+/// to remove it reports that none was FOUND. The three identity members are the request's in
+/// every row.
+#[tokio::test]
+async fn the_absent_target_sentence_follows_what_the_operation_wanted_the_registration_for() {
+    let emulator = Emulator::empty();
+    let namespace = "dynamodb";
+    let resource_id = "table/absent";
+    let dimension = "dynamodb:table:ReadCapacityUnits";
+    let identity = json!({"ServiceNamespace": namespace, "ResourceId": resource_id,
+                          "ScalableDimension": dimension});
+
+    let mut policy = identity.clone();
+    policy["PolicyName"] = json!("tracker");
+    policy["PolicyType"] = json!("TargetTrackingScaling");
+    policy["TargetTrackingScalingPolicyConfiguration"] = json!({
+        "TargetValue": 40.0,
+        "PredefinedMetricSpecification": {"PredefinedMetricType": "DynamoDBReadCapacityUtilization"},
+    });
+    let mut action = identity.clone();
+    action["ScheduledActionName"] = json!("nightly");
+    action["Schedule"] = json!("rate(5 minutes)");
+
+    for (case, operation, request, verb) in [
+        (
+            "a policy on an absent target",
+            "PutScalingPolicy",
+            policy,
+            "registered",
+        ),
+        (
+            "a scheduled action on an absent target",
+            "PutScheduledAction",
+            action,
+            "registered",
+        ),
+        (
+            "deregistering an absent target",
+            "DeregisterScalableTarget",
+            identity.clone(),
+            "found",
+        ),
+    ] {
+        refused(
+            &emulator,
+            case,
+            operation,
+            request,
+            "ObjectNotFoundException",
+            &format!(
+                "No scalable target {verb} for service namespace: {namespace}, resource ID: \
+                 {resource_id}, scalable dimension: {dimension}"
+            ),
+        )
+        .await;
+    }
 }
 
 // ---------------------------------------------------------------------------

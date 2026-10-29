@@ -616,19 +616,36 @@ pub fn capacity_below_floor_message(bound: CapacityBound, floor: i32) -> String 
     format!("{} capacity cannot be less than {floor}", bound.noun())
 }
 
-/// How this service states an operation addressed at a scalable target that is not
-/// registered.
+/// How this service states an operation addressed at a scalable target that does not exist.
 ///
 /// `ObjectNotFoundException` is "thrown if the scalable target with the specified service
 /// namespace, resource ID, and scalable dimension does not exist", and the sentence names
-/// exactly that triple, built from the request — the same phrasing
-/// `DeleteScalingPolicy` uses for the policy it cannot find.
-pub fn target_not_found_message(target: &TargetKey) -> String {
+/// exactly that triple, built from the request. The VERB follows what the operation was
+/// doing with the registration, which is how each operation's own recorded refusal words it:
+/// an operation that needs an existing registration to proceed is told that no scalable
+/// target is REGISTERED for the triple ([`target_not_registered_message`]), while one that
+/// looked the registration up in order to remove it is told that none was FOUND
+/// ([`target_not_found_message`]).
+fn missing_target_message(target: &TargetKey, verb: &str) -> String {
     format!(
-        "No scalable target found for service namespace: {}, resource ID: {}, scalable \
+        "No scalable target {verb} for service namespace: {}, resource ID: {}, scalable \
          dimension: {}",
         target.service_namespace, target.resource_id, target.scalable_dimension
     )
+}
+
+/// The refusal of an operation that cannot proceed because nothing registered the scalable
+/// target it addresses — "You cannot create a scaling policy until you have registered the
+/// resource as a scalable target", and the same for a scheduled action. See
+/// [`missing_target_message`].
+pub fn target_not_registered_message(target: &TargetKey) -> String {
+    missing_target_message(target, "registered")
+}
+
+/// The refusal of an operation that went looking for the registration itself and did not
+/// find it, which is `DeregisterScalableTarget`. See [`missing_target_message`].
+pub fn target_not_found_message(target: &TargetKey) -> String {
+    missing_target_message(target, "found")
 }
 
 /// `len` lowercase hex characters derived from `seed`, clamped to the 64 characters a
@@ -1314,13 +1331,13 @@ impl AlarmKind {
     }
 
     /// Whether this alarm drives scale-out (rather than scale-in).
-    fn scales_out(self) -> bool {
+    pub fn scales_out(self) -> bool {
         matches!(self, Self::AlarmHigh | Self::ProvisionedCapacityHigh)
     }
 
     /// Whether this alarm watches the resource's provisioned capacity rather than the
     /// tracked metric.
-    fn watches_capacity(self) -> bool {
+    pub fn watches_capacity(self) -> bool {
         matches!(
             self,
             Self::ProvisionedCapacityHigh | Self::ProvisionedCapacityLow
@@ -1795,17 +1812,44 @@ pub fn metric_signature(config: &TargetTrackingScalingPolicyConfiguration) -> St
 }
 
 /// How the pair of alarms on the metric a policy TRACKS is evaluated: how many periods a
-/// breach has to last in each direction, and where the scale-in alarm sits relative to the
-/// scale-out threshold.
+/// breach has to last in each direction, and how far below the policy's target value the
+/// scale-in alarm's own target sits.
 #[derive(Debug, Clone, Copy)]
 struct TrackedAlarmRules {
     /// Periods the metric has to stay past the target before the scale-out alarm fires.
     scale_out_evaluation_periods: i32,
     /// Periods below the scale-in threshold before the scale-in alarm fires.
     scale_in_evaluation_periods: i32,
-    /// The fraction of the scale-out threshold the scale-in alarm's threshold sits at.
-    scale_in_fraction: f64,
+    /// The buffer that separates the scale-in alarm's target from the policy's own.
+    scale_in_buffer: ScaleInBuffer,
 }
+
+/// How far below the policy's `TargetValue` the target the SCALE-IN alarm is computed from
+/// sits.
+///
+/// Two forms, not one number: a buffer of percentage POINTS is an offset on the target
+/// utilisation, and so keeps its width whatever the target is, while a FRACTION of the
+/// target narrows as the target falls. Which form an integration uses is its own, so the
+/// two are kept apart rather than one being expressed as the other.
+#[derive(Debug, Clone, Copy)]
+enum ScaleInBuffer {
+    /// This many percentage points under the target utilisation: the scale-in alarm is
+    /// computed from `TargetValue - points`.
+    PercentagePoints(f64),
+    /// This fraction of the target value.
+    FractionOfTarget(f64),
+}
+
+/// How far below the policy's target value the scale-in alarm of a consumed-units metric is
+/// buffered, in PERCENTAGE POINTS of the resource's provisioned capacity.
+///
+/// Recorded behaviour of the auto scaling the two provisioned-throughput services mint: a
+/// policy tracking 40 percent of the provisioned capacity scales in below 20 percent of it,
+/// and one tracking 70 percent below 50 — the same twenty-point offset at either target,
+/// rather than a proportion of it. A target at the bottom of the published window
+/// ([`PROVISIONED_UTILIZATION_RANGE`]) therefore buffers to a negative threshold, which no
+/// sum of consumed units falls below: such a policy adds capacity and never removes it.
+const CONSUMED_UNITS_SCALE_IN_POINTS: f64 = 20.0;
 
 /// The rules for the pair on a tracked metric, which follow WHAT that metric measures.
 ///
@@ -1818,22 +1862,22 @@ struct TrackedAlarmRules {
 ///   above the target value and the scale-in alarm sits a tenth below it, over fifteen;
 /// * a metric that COUNTS the capacity units consumed over the period, which is how the two
 ///   provisioned-throughput services publish their utilisation: their auto scaling adds
-///   capacity after two periods above the target and removes it after fifteen below a fifth
-///   under it (the Amazon DynamoDB Developer Guide's "Managing throughput capacity
-///   automatically with DynamoDB auto scaling", which scales out on a two-minute breach and
-///   in on a fifteen-minute one).
+///   capacity after two periods above the target and removes it after fifteen below a target
+///   [`CONSUMED_UNITS_SCALE_IN_POINTS`] percentage points under it (the Amazon DynamoDB
+///   Developer Guide's "Managing throughput capacity automatically with DynamoDB auto
+///   scaling", which scales out on a two-minute breach and in on a fifteen-minute one).
 fn tracked_alarm_rules(consumed_units: bool) -> TrackedAlarmRules {
     if consumed_units {
         TrackedAlarmRules {
             scale_out_evaluation_periods: 2,
             scale_in_evaluation_periods: 15,
-            scale_in_fraction: 0.8,
+            scale_in_buffer: ScaleInBuffer::PercentagePoints(CONSUMED_UNITS_SCALE_IN_POINTS),
         }
     } else {
         TrackedAlarmRules {
             scale_out_evaluation_periods: 3,
             scale_in_evaluation_periods: 15,
-            scale_in_fraction: 0.9,
+            scale_in_buffer: ScaleInBuffer::FractionOfTarget(0.9),
         }
     }
 }
@@ -2040,6 +2084,86 @@ fn metric_dimensions(
     }
 }
 
+/// The SERIES a target-tracking policy's own pair of alarms watches, and the shape of the
+/// quantity it measures.
+///
+/// The one place a policy's metric specification is turned into a series, so the alarms that
+/// watch it and the capacity its control loop computes
+/// ([`target_tracking_capacity`]) can never read the specification two ways.
+#[derive(Debug, Clone)]
+struct TrackedSeries {
+    metric_namespace: String,
+    metric_name: String,
+    statistic: String,
+    /// The unit the series is measured in, where the specification names one.
+    unit: Option<String>,
+    dimensions: Vec<(String, String)>,
+    /// The alarm period, in seconds, which is also the window a consumed-units metric is
+    /// summed over.
+    period: i32,
+    /// Whether the metric COUNTS the capacity units consumed over that period rather than
+    /// already being the quantity the target value is expressed in.
+    consumed_units: bool,
+}
+
+/// The series `config` tracks, or `None` for a configuration that names no single one.
+///
+/// A customised specification that carries only a metric math query names no single series,
+/// so there is no static-threshold alarm to mint and no measurement to compute a capacity
+/// from.
+///
+/// A customised specification describes the series COMPLETELY — namespace, metric name,
+/// dimensions, statistic and unit — so every one of those five is carried onto the alarms; an
+/// alarm that aggregated the series differently from the specification would measure a
+/// different signal from the one the policy declared.
+fn tracked_series(
+    key: &PolicyKey,
+    config: &TargetTrackingScalingPolicyConfiguration,
+) -> Option<TrackedSeries> {
+    let predefined = config
+        .predefined_metric_specification
+        .as_ref()
+        .and_then(|specification| predefined_metric(&specification.predefined_metric_type));
+    if let Some(metric) = predefined {
+        return Some(TrackedSeries {
+            metric_namespace: metric.namespace.to_string(),
+            metric_name: metric.metric_name.to_string(),
+            statistic: metric.statistic.to_string(),
+            // The published predefined-metric table names no unit for any row.
+            unit: None,
+            dimensions: metric_dimensions(
+                &key.target.service_namespace,
+                &key.target.resource_id,
+                &key.target.scalable_dimension,
+            ),
+            period: metric.period,
+            consumed_units: metric.consumed_units,
+        });
+    }
+    let specification = config.customized_metric_specification.as_ref()?;
+    Some(TrackedSeries {
+        metric_namespace: specification.namespace.clone()?,
+        metric_name: specification.metric_name.clone()?,
+        statistic: specification
+            .statistic
+            .clone()
+            .unwrap_or_else(|| "Average".to_string()),
+        unit: specification.unit.clone(),
+        dimensions: specification
+            .dimensions
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|dimension| (dimension.name, dimension.value))
+            .collect(),
+        // A customised series is published on the resolution the caller publishes it at,
+        // which the specification does not state, so the alarms watch it on CloudWatch's
+        // own standard period.
+        period: 60,
+        consumed_units: false,
+    })
+}
+
 /// The alarms a target-tracking policy wants to exist right now.
 ///
 /// Empty for any other policy type: only target tracking is alarm-driven.
@@ -2049,105 +2173,54 @@ fn metric_dimensions(
 /// threshold is a function of the target, the alarm period and that capacity, never a copy of
 /// the target value.
 ///
-/// Which alarms are wanted is what `DisableScaleIn` and the target's `SuspendedState` decide:
-/// scale-in is "disabled and the target tracking scaling policy won't remove capacity" for the
-/// first, and for the second "while a suspension is in effect, all scale-in/scale-out
-/// activities that are triggered by a scaling policy are suspended" — a suspended direction has
-/// no alarm to trigger it, and resuming it brings the alarm back.
+/// Which alarms are wanted is what `DisableScaleIn` decides: scale-in is then "disabled and
+/// the target tracking scaling policy won't remove capacity", so that direction has no alarm
+/// to trigger it. A SUSPENDED direction keeps its alarm — a suspension withholds the scaling
+/// activity a breach would perform, not the watching of the metric, so a suspended target
+/// reports the same alarms as an unsuspended one and the breach is delivered once the
+/// suspension is lifted ([`policy_execution`]).
 pub fn target_tracking_alarms(
     key: &PolicyKey,
     record: &ScalingPolicyRecord,
-    suspended_state: Option<&SuspendedState>,
     provisioned_capacity: i64,
 ) -> Vec<AlarmSpec> {
-    if record.policy_type != "TargetTrackingScaling" {
+    if record.policy_type != policy_execution::TARGET_TRACKING_POLICY_TYPE {
         return Vec::new();
     }
     let Some(config) = record.target_tracking_config.as_ref() else {
         return Vec::new();
     };
-
-    let predefined = config
-        .predefined_metric_specification
-        .as_ref()
-        .and_then(|specification| predefined_metric(&specification.predefined_metric_type));
-    let customized = config.customized_metric_specification.as_ref();
-
-    // The metric the two utilisation alarms watch: the predefined metric's own series, or
-    // the one the caller described. A customised specification that carries only a metric
-    // math query names no single series, so there is no static-threshold alarm to mint.
-    //
-    // A customised specification describes the series COMPLETELY — namespace, metric name,
-    // dimensions, statistic and unit — so every one of those five is carried onto the
-    // alarms; an alarm that aggregated the series differently from the specification would
-    // measure a different signal from the one the policy declared.
-    let (metric_namespace, metric_name, statistic, unit, dimensions, period, consumed_units) =
-        match (predefined, customized) {
-            (Some(metric), _) => (
-                metric.namespace.to_string(),
-                metric.metric_name.to_string(),
-                metric.statistic.to_string(),
-                // The published predefined-metric table names no unit for any row.
-                None,
-                metric_dimensions(
-                    &key.target.service_namespace,
-                    &key.target.resource_id,
-                    &key.target.scalable_dimension,
-                ),
-                metric.period,
-                metric.consumed_units,
-            ),
-            (None, Some(specification)) => {
-                let (Some(namespace), Some(metric_name)) = (
-                    specification.namespace.clone(),
-                    specification.metric_name.clone(),
-                ) else {
-                    return Vec::new();
-                };
-                (
-                    namespace,
-                    metric_name,
-                    specification
-                        .statistic
-                        .clone()
-                        .unwrap_or_else(|| "Average".to_string()),
-                    specification.unit.clone(),
-                    specification
-                        .dimensions
-                        .clone()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|dimension| (dimension.name, dimension.value))
-                        .collect(),
-                    60,
-                    false,
-                )
-            }
-            (None, None) => return Vec::new(),
-        };
-
-    let suspended_in = suspended_state
-        .and_then(|state| state.dynamic_scaling_in_suspended)
-        .unwrap_or(false);
-    let suspended_out = suspended_state
-        .and_then(|state| state.dynamic_scaling_out_suspended)
-        .unwrap_or(false);
-    let scale_in_disabled = config.disable_scale_in.unwrap_or(false) || suspended_in;
-
-    // The utilisation threshold. For a metric that counts units consumed over the period,
-    // the target is a percentage of the provisioned capacity, so the comparable value is
-    // `target% * period * provisioned units`; for a metric that already is the quantity the
-    // target names, the target IS the threshold.
-    let utilisation_threshold = |fraction: f64| {
-        if consumed_units {
-            config.target_value / 100.0 * f64::from(period) * provisioned_capacity as f64 * fraction
-        } else {
-            config.target_value * fraction
-        }
+    let Some(series) = tracked_series(key, config) else {
+        return Vec::new();
     };
+    let TrackedSeries {
+        metric_namespace,
+        metric_name,
+        statistic,
+        unit,
+        dimensions,
+        period,
+        consumed_units,
+    } = series;
+
+    let scale_in_disabled = config.disable_scale_in.unwrap_or(false);
 
     let capacity_rules = capacity_alarm_rules(&key.target.service_namespace);
     let tracked_rules = tracked_alarm_rules(consumed_units);
+    // The threshold of the tracked metric's alarm for one direction: the target utilisation
+    // that direction watches ([`direction_target_value`]), expressed in what the metric
+    // MEASURES — for a metric that counts units consumed over the period that is
+    // `target% * period * provisioned units`, and for a metric that already is the quantity
+    // the target names the target itself.
+    let utilisation_threshold = |scales_out: bool| {
+        let target = direction_target_value(config.target_value, tracked_rules, scales_out);
+        if consumed_units {
+            target / 100.0 * f64::from(period) * provisioned_capacity as f64
+        } else {
+            target
+        }
+    };
+
     let mut alarms = Vec::new();
     for kind in AlarmKind::ALL {
         // A direction that cannot act has no alarm to trigger it. Whether that takes the
@@ -2155,13 +2228,7 @@ pub fn target_tracking_alarms(
         // mechanics ([`capacity_alarm_rules`]), since that alarm reports a stale
         // threshold rather than drive a scaling direction.
         let follows_direction = !kind.watches_capacity() || capacity_rules.follows_direction;
-        let withheld = follows_direction
-            && if kind.scales_out() {
-                suspended_out
-            } else {
-                scale_in_disabled
-            };
-        if withheld {
+        if follows_direction && !kind.scales_out() && scale_in_disabled {
             continue;
         }
         // The provisioned-capacity pair exists only where the thresholds depend on the
@@ -2195,11 +2262,7 @@ pub fn target_tracking_alarms(
                     statistic.clone(),
                     unit.clone(),
                     period,
-                    utilisation_threshold(if kind.scales_out() {
-                        1.0
-                    } else {
-                        tracked_rules.scale_in_fraction
-                    }),
+                    utilisation_threshold(kind.scales_out()),
                     if kind.scales_out() {
                         "GreaterThanThreshold"
                     } else {
@@ -2229,6 +2292,94 @@ pub fn target_tracking_alarms(
         });
     }
     alarms
+}
+
+/// The target utilisation the alarm of one DIRECTION is computed from: the policy's own
+/// `TargetValue` for scale-out, and that value buffered by the integration's own scale-in
+/// buffer for scale-in.
+///
+/// Scale-out is driven at the target itself — the metric is above the target, so the policy
+/// adds capacity — and scale-in only once the metric has fallen a buffer BELOW it, which is
+/// what keeps a metric sitting near the target from flapping between the two directions.
+fn direction_target_value(target_value: f64, rules: TrackedAlarmRules, scales_out: bool) -> f64 {
+    if scales_out {
+        return target_value;
+    }
+    match rules.scale_in_buffer {
+        ScaleInBuffer::PercentagePoints(points) => target_value - points,
+        ScaleInBuffer::FractionOfTarget(fraction) => target_value * fraction,
+    }
+}
+
+/// Which of a target-tracking policy's OWN alarms `alarm_name` is, or `None` for an alarm
+/// that policy did not mint.
+///
+/// A target-tracking policy is executed by the pair it minted on the metric it tracks: that
+/// is the pair whose threshold the policy's target value decides, so a breach of one of them
+/// names both the direction and the measurement the control loop needs. An alarm a client
+/// wired to the policy's ARN itself, and the pair that watches the provisioned capacity the
+/// thresholds were computed from, drive no capacity movement.
+pub fn policy_alarm_kind(key: &PolicyKey, alarm_name: &str) -> Option<AlarmKind> {
+    AlarmKind::ALL
+        .into_iter()
+        .find(|kind| policy_alarm_name(key, *kind) == alarm_name)
+}
+
+/// The capacity a target-tracking policy's control loop asks for, from the metric value its
+/// alarm graded, or `None` when the configuration computes none.
+///
+/// A target-tracking policy carries no adjustment: it states a target value for a metric, so
+/// the capacity it asks for is the LEAST capacity at which that metric would sit at or below
+/// the target — "Application Auto Scaling […] scales the capacity to keep the metric at, or
+/// close to, the specified target value". Which makes the arithmetic follow what the metric
+/// MEASURES:
+///
+/// * a metric that counts the capacity units consumed over the alarm's period measures the
+///   load in absolute units, and the target names what fraction of the provisioned capacity
+///   that load may fill, so the capacity it asks for is
+///   `measured / (TargetValue% * period)` — independent of the capacity the resource holds
+///   now;
+/// * a metric that already is the quantity the target names (a utilisation percentage, a
+///   count per capacity unit) varies inversely with the capacity serving it, so the same load
+///   at `wanted` units would read `measured * current / wanted`, and the capacity that puts
+///   that at the target is `current * measured / TargetValue`.
+///
+/// The answer is taken UP: a capacity a fraction of a unit short of the target would leave
+/// the metric past it. It is the capacity the policy asks for, before the registered
+/// `MinCapacity`/`MaxCapacity` window is applied to it by the caller.
+pub fn target_tracking_capacity(
+    key: &PolicyKey,
+    config: &TargetTrackingScalingPolicyConfiguration,
+    measured: f64,
+    current: i32,
+) -> Option<i32> {
+    let series = tracked_series(key, config)?;
+    let target = config.target_value;
+    // A target that is not a positive number scales nothing: it names no quantity to hold
+    // the metric at, and nothing can be divided by it.
+    if !measured.is_finite() || !target.is_finite() || target <= 0.0 {
+        return None;
+    }
+    let wanted = if series.consumed_units {
+        let per_unit = target / 100.0 * f64::from(series.period);
+        if per_unit <= 0.0 {
+            return None;
+        }
+        measured / per_unit
+    } else {
+        if current <= 0 {
+            return None;
+        }
+        f64::from(current) * measured / target
+    };
+    if !wanted.is_finite() {
+        return None;
+    }
+    Some(
+        wanted
+            .ceil()
+            .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32,
+    )
 }
 
 /// The metric that reports the provisioned capacity the utilisation thresholds were computed
@@ -2270,10 +2421,6 @@ pub fn plan_target_alarms(
     target: &TargetKey,
     resolved_capacity: Option<i64>,
 ) -> AlarmPlan {
-    let suspended_state = state
-        .targets
-        .get(target)
-        .and_then(|record| record.suspended_state.clone());
     let provisioned_capacity = resolved_capacity.unwrap_or_else(|| {
         state
             .targets
@@ -2288,12 +2435,7 @@ pub fn plan_target_alarms(
             (
                 key.clone(),
                 record.policy_arn.clone(),
-                target_tracking_alarms(
-                    key,
-                    record,
-                    suspended_state.as_ref(),
-                    provisioned_capacity,
-                ),
+                target_tracking_alarms(key, record, provisioned_capacity),
             )
         })
         .collect();
@@ -2394,28 +2536,38 @@ fn apply_alarms<Eng: Send + Sync + 'static>(
     let mut minted = Vec::new();
     for spec in wanted {
         let arn = cloudwatch::state::alarm_arn(region, &spec.name);
-        // An alarm that already exists keeps the state an evaluation gave it, and the
-        // tags a caller put on it; only its configuration is rewritten, exactly as
-        // PutMetricAlarm does.
+        // An alarm that already exists keeps the state an evaluation gave it — including
+        // the explanation that state was decided from, which is where the datapoints the
+        // evaluation graded are reported (`MetricAlarm$StateReasonData`) — and the tags a
+        // caller put on it; only its configuration is rewritten, exactly as PutMetricAlarm
+        // does.
         let existing = store.alarms.get(&spec.name).map(|stored| {
             (
                 stored.alarm.state_value.clone(),
                 stored.alarm.state_reason.clone(),
+                stored.alarm.state_reason_data.clone(),
                 stored.alarm.state_updated_timestamp,
                 stored.alarm.state_transitioned_timestamp,
                 stored.tags.clone(),
             )
         });
-        let (state_value, state_reason, state_updated, state_transitioned, tags) =
-            existing.unwrap_or_else(|| {
-                (
-                    Some("INSUFFICIENT_DATA".to_string()),
-                    Some("Unchecked: initial alarm creation".to_string()),
-                    Some(cloudwatch::state::to_timestamp(now)),
-                    Some(cloudwatch::state::to_timestamp(now)),
-                    Vec::new(),
-                )
-            });
+        let (
+            state_value,
+            state_reason,
+            state_reason_data,
+            state_updated,
+            state_transitioned,
+            tags,
+        ) = existing.unwrap_or_else(|| {
+            (
+                Some("INSUFFICIENT_DATA".to_string()),
+                Some("Unchecked: initial alarm creation".to_string()),
+                None,
+                Some(cloudwatch::state::to_timestamp(now)),
+                Some(cloudwatch::state::to_timestamp(now)),
+                Vec::new(),
+            )
+        });
         let alarm = MetricAlarm {
             alarm_name: Some(spec.name.clone()),
             alarm_arn: Some(arn.clone()),
@@ -2435,6 +2587,7 @@ fn apply_alarms<Eng: Send + Sync + 'static>(
             alarm_actions: Some(vec![policy_alarm_action(policy_arn, key)]),
             state_value,
             state_reason,
+            state_reason_data,
             state_updated_timestamp: state_updated,
             state_transitioned_timestamp: state_transitioned,
             metric_name: Some(spec.metric_name.clone()),

@@ -13,13 +13,16 @@
 //!   resource's provisioned capacity;
 //! * the scale-out alarm's threshold is COMPUTED, as `target% * period * provisioned units`
 //!   for such a consumed-units metric and as the target value itself for a metric that
-//!   already is the quantity the target names, with the scale-in alarm a margin below it —
-//!   how far below, and how many periods each direction is evaluated over, following what
-//!   the tracked metric measures;
-//! * a direction that is disabled (`DisableScaleIn`) or suspended (`SuspendedState`) has no
-//!   alarm on the tracked metric, and resuming it brings the alarm back — while the pair
-//!   that watches the provisioned capacity follows the direction only where the owning
-//!   service's integration pairs it with one, and is named as that service names it;
+//!   already is the quantity the target names, with the scale-in alarm computed from a target
+//!   a buffer BELOW the policy's own — a fixed 20 percentage points under it for a
+//!   consumed-units metric, a tenth of it for a metric that already is the quantity the
+//!   target names — and how many periods each direction is evaluated over following what the
+//!   tracked metric measures;
+//! * a direction the policy DISABLES (`DisableScaleIn`) has no alarm on the tracked metric,
+//!   while a direction a target merely SUSPENDS (`SuspendedState`) keeps its alarm — the
+//!   suspension withholds the scaling activity, not the watching of the metric — and the pair
+//!   that watches the provisioned capacity follows the disabled direction only where the
+//!   owning service's integration pairs it with one, and is named as that service names it;
 //! * an alarm belongs to the policy that minted it, so deleting that policy retires it and
 //!   leaves every sibling policy's alarms alone.
 
@@ -100,14 +103,19 @@ const CASSANDRA_CAPACITY_ALARMS: &[&str] = &[
 /// The catalog. Each row differs along what the rule generalises over: the namespace and
 /// resource type, whether the tracked metric is a consumed-units count or a percentage, the
 /// resource's provisioned capacity, the alarm period (the model documents the
-/// `…HighResolution` metric types as evaluating "every 20 seconds"), and whether scale-in is
-/// disabled. The first row is the case the issue cited — 40% of one provisioned read unit at
-/// a 60-second period, so a threshold of 24 consumed units.
+/// `…HighResolution` metric types as evaluating "every 20 seconds"), the target value —
+/// including both ends of the window a provisioned-throughput target must lie in, 10 and 90
+/// percent — and whether scale-in is disabled. The first row is the case the issue cited —
+/// 40% of one provisioned read unit at a 60-second period, so a threshold of 24 consumed
+/// units.
 ///
 /// The two expected scale-in thresholds and scale-out evaluation periods are the ones the
 /// integration that mints the pair uses: a consumed-units metric breaches out after two
-/// periods and in a fifth below the scale-out threshold, a metric that already is the
-/// quantity the target names after three periods and a tenth below it.
+/// periods above `target%` of the provisioned capacity and in after fifteen below
+/// `(target - 20)%` of it — a fixed twenty-percentage-point buffer, so the scale-in threshold
+/// of a target at the floor of that window is negative and no sum of consumed units falls
+/// under it — while a metric that already is the quantity the target names breaches out after
+/// three periods and in a tenth below it.
 const ALARM_CATALOG: &[AlarmRow] = &[
     AlarmRow {
         case: "dynamodb read capacity at 40% of one provisioned unit",
@@ -124,7 +132,49 @@ const ALARM_CATALOG: &[AlarmRow] = &[
         expected_statistic: "Sum",
         expected_period: 60,
         expected_threshold: 24.0,
-        expected_scale_in_threshold: 19.2,
+        expected_scale_in_threshold: 12.0,
+        expected_scale_out_evaluation_periods: 2,
+        expected_dimensions: &[("TableName", "orders")],
+    },
+    AlarmRow {
+        // The FLOOR of the window a provisioned-throughput target may lie in: the
+        // twenty-point buffer puts the scale-in alarm ten points below zero utilisation, so
+        // its threshold is negative and the policy never removes capacity.
+        case: "dynamodb read capacity at the 10% floor of the target window",
+        namespace: "dynamodb",
+        resource_id: "table/orders",
+        dimension: "dynamodb:table:ReadCapacityUnits",
+        metric_type: "DynamoDBReadCapacityUtilization",
+        target_value: 10.0,
+        resource: Resource::Table(2),
+        disable_scale_in: false,
+        expected_kinds: CAPACITY_ALARMS,
+        expected_namespace: "AWS/DynamoDB",
+        expected_metric: "ConsumedReadCapacityUnits",
+        expected_statistic: "Sum",
+        expected_period: 60,
+        expected_threshold: 12.0,
+        expected_scale_in_threshold: -12.0,
+        expected_scale_out_evaluation_periods: 2,
+        expected_dimensions: &[("TableName", "orders")],
+    },
+    AlarmRow {
+        // The CEILING of that window.
+        case: "dynamodb read capacity at the 90% ceiling of the target window",
+        namespace: "dynamodb",
+        resource_id: "table/orders",
+        dimension: "dynamodb:table:ReadCapacityUnits",
+        metric_type: "DynamoDBReadCapacityUtilization",
+        target_value: 90.0,
+        resource: Resource::Table(3),
+        disable_scale_in: false,
+        expected_kinds: CAPACITY_ALARMS,
+        expected_namespace: "AWS/DynamoDB",
+        expected_metric: "ConsumedReadCapacityUnits",
+        expected_statistic: "Sum",
+        expected_period: 60,
+        expected_threshold: 162.0,
+        expected_scale_in_threshold: 126.0,
         expected_scale_out_evaluation_periods: 2,
         expected_dimensions: &[("TableName", "orders")],
     },
@@ -143,7 +193,7 @@ const ALARM_CATALOG: &[AlarmRow] = &[
         expected_statistic: "Sum",
         expected_period: 60,
         expected_threshold: 210.0,
-        expected_scale_in_threshold: 168.0,
+        expected_scale_in_threshold: 150.0,
         expected_scale_out_evaluation_periods: 2,
         expected_dimensions: &[("TableName", "orders")],
     },
@@ -162,7 +212,7 @@ const ALARM_CATALOG: &[AlarmRow] = &[
         expected_statistic: "Sum",
         expected_period: 60,
         expected_threshold: 60.0,
-        expected_scale_in_threshold: 48.0,
+        expected_scale_in_threshold: 36.0,
         expected_scale_out_evaluation_periods: 2,
         expected_dimensions: &[
             ("TableName", "orders"),
@@ -244,7 +294,7 @@ const ALARM_CATALOG: &[AlarmRow] = &[
         expected_statistic: "Sum",
         expected_period: 60,
         expected_threshold: 24.0,
-        expected_scale_in_threshold: 19.2,
+        expected_scale_in_threshold: 12.0,
         expected_scale_out_evaluation_periods: 2,
         expected_dimensions: &[("Keyspace", "orders_ks"), ("TableName", "orders")],
     },
@@ -608,7 +658,7 @@ async fn a_threshold_is_recomputed_from_the_resources_capacity_not_copied_from_t
 }
 
 #[tokio::test]
-async fn suspending_a_direction_withholds_its_alarms_and_resuming_delivers_them() {
+async fn a_suspended_direction_keeps_the_alarms_that_watch_its_metric() {
     let emulator = Emulator::empty();
     emulator.create_provisioned_table("orders", 1, 1).await;
     let target = json!({
@@ -641,44 +691,61 @@ async fn suspending_a_direction_withholds_its_alarms_and_resuming_delivers_them(
         status, 200,
         "case \"policy under a suspension\": expected 200, got {status} {body:?}"
     );
-    assert_eq!(
-        alarm_kinds(&emulator.target_tracking_alarms().await),
-        ["AlarmLow", "ProvisionedCapacityLow"],
-        "case \"scale-out suspended\": expected only the scale-in alarms to exist"
-    );
+    // A suspension withholds the scaling ACTIVITY a breach would perform, not the watching of
+    // the metric: the suspended target carries the same alarm kinds an unsuspended one does.
+    const EVERY_KIND: [&str; 4] = [
+        "AlarmHigh",
+        "AlarmLow",
+        "ProvisionedCapacityHigh",
+        "ProvisionedCapacityLow",
+    ];
+    for (case, suspension) in [
+        ("scale-out suspended", json!({"DynamicScalingOutSuspended": true})),
+        ("resumed", json!({"DynamicScalingOutSuspended": false})),
+        ("scale-in suspended", json!({"DynamicScalingInSuspended": true})),
+        (
+            "both directions suspended",
+            json!({"DynamicScalingInSuspended": true, "DynamicScalingOutSuspended": true}),
+        ),
+        (
+            "both directions running",
+            json!({"DynamicScalingInSuspended": false, "DynamicScalingOutSuspended": false}),
+        ),
+    ] {
+        let mut update = target.clone();
+        update["SuspendedState"] = suspension;
+        let (status, body) = emulator.call("RegisterScalableTarget", update).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected RegisterScalableTarget to answer 200, got {status} {body:?}"
+        );
+        let kinds = alarm_kinds(&emulator.target_tracking_alarms().await);
+        assert_eq!(
+            kinds, EVERY_KIND,
+            "case {case:?}: expected a suspension to keep every alarm, got {kinds:?}"
+        );
+    }
 
-    // Resuming the direction is a RegisterScalableTarget, and it delivers the alarms the
-    // suspension withheld.
-    let mut resume = target.clone();
-    resume["SuspendedState"] = json!({"DynamicScalingOutSuspended": false});
-    let (status, body) = emulator.call("RegisterScalableTarget", resume).await;
+    // What DOES withhold the scale-in alarms is the policy's own `DisableScaleIn`: scale in is
+    // then "disabled and the target tracking scaling policy won't remove capacity".
+    let mut disabled = target.clone();
+    disabled["PolicyName"] = json!("tracker");
+    disabled["PolicyType"] = json!("TargetTrackingScaling");
+    disabled["TargetTrackingScalingPolicyConfiguration"] = json!({
+        "TargetValue": 40.0,
+        "DisableScaleIn": true,
+        "PredefinedMetricSpecification": {"PredefinedMetricType": "DynamoDBReadCapacityUtilization"},
+    });
+    let (status, body) = emulator.call("PutScalingPolicy", disabled).await;
     assert_eq!(
         status, 200,
-        "case \"resumed\": expected 200, got {status} {body:?}"
+        "case \"DisableScaleIn\": expected 200, got {status} {body:?}"
     );
+    let kinds = alarm_kinds(&emulator.target_tracking_alarms().await);
     assert_eq!(
-        alarm_kinds(&emulator.target_tracking_alarms().await),
-        [
-            "AlarmHigh",
-            "AlarmLow",
-            "ProvisionedCapacityHigh",
-            "ProvisionedCapacityLow"
-        ],
-        "case \"resumed\": expected every alarm to be delivered again"
-    );
-
-    // And suspending scale-in withholds the other pair.
-    let mut suspend_in = target.clone();
-    suspend_in["SuspendedState"] = json!({"DynamicScalingInSuspended": true});
-    let (status, body) = emulator.call("RegisterScalableTarget", suspend_in).await;
-    assert_eq!(
-        status, 200,
-        "case \"scale-in suspended\": expected 200, got {status} {body:?}"
-    );
-    assert_eq!(
-        alarm_kinds(&emulator.target_tracking_alarms().await),
+        kinds,
         ["AlarmHigh", "ProvisionedCapacityHigh"],
-        "case \"scale-in suspended\": expected only the scale-out alarms to exist"
+        "case \"DisableScaleIn\": expected only the scale-out alarms to exist, got {kinds:?}"
     );
 }
 

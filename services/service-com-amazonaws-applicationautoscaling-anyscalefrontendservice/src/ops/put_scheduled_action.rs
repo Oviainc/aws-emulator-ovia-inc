@@ -305,7 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.targets.contains_key(&key.target) {
             return Err(PutScheduledActionErrorModeled::ObjectNotFoundException(
                 ObjectNotFoundException {
-                    message: Some(crate::state::target_not_found_message(&key.target)),
+                    message: Some(crate::state::target_not_registered_message(&key.target)),
                 },
             )
             .into());
