@@ -69,6 +69,8 @@ mod dataflow_endpoint_groups;
 mod dataflow_endpoint_groups_v2;
 #[path = "all/empty_list_filters.rs"]
 mod empty_list_filters;
+#[path = "all/ended_contact_takes_no_version.rs"]
+mod ended_contact_takes_no_version;
 #[path = "all/ephemeris_catalog.rs"]
 mod ephemeris_catalog;
 #[path = "all/ephemeris_deletion.rs"]

@@ -1782,6 +1782,21 @@ impl Contact {
         !TERMINAL_CONTACT_STATUSES.contains(&self.contact_status.as_str())
     }
 
+    /// Whether anything of this contact is STILL TO BE FLOWN: its pass can still happen
+    /// and its reservation has not been released, so a configuration change the service
+    /// is applying still has a pass to take force for.
+    ///
+    /// A contact already in one of [`TERMINAL_CONTACT_STATUSES`] will never be flown
+    /// again, and so will a contact whose release is being carried out
+    /// ([`CONTACT_CANCELLING`]): the reservation was given up the moment the cancel was
+    /// accepted, and the stop only finishes giving it back. It is the question
+    /// `UpdateContact` asks before it STARTS a version change
+    /// ([`STATUSES_OPEN_TO_UPDATE`]) — asked here of a change already in flight, so one
+    /// the service cannot start on a contact is not one it goes on applying to it either.
+    pub fn is_still_to_be_flown(&self) -> bool {
+        self.is_non_terminal() && self.contact_status != CONTACT_CANCELLING
+    }
+
     /// Whether this contact is flown against the satellite `satellite_arn` names.
     ///
     /// The version in force answers it, and so does the version still being applied: an
@@ -1813,9 +1828,15 @@ impl Contact {
     /// Release this contact's reservation, from whichever side of its pass the cancel
     /// arrived on. Only called for a contact [`Contact::is_cancellable`] admits.
     ///
+    /// A cancel ends the contact: whichever side of its pass it arrived on, the service
+    /// owes the contact no further move of its own afterwards, so EVERY move still owed
+    /// to it is withdrawn here — the scheduler's `SCHEDULING` -> `SCHEDULED` move and the
+    /// `UPDATING` -> `ACTIVE` move of a version an update left in flight
+    /// ([`Contact::withdraw_owed_version_moves`]). The release the cancel starts is the
+    /// one move that survives it.
+    ///
     /// A contact whose pass has yet to start is `CANCELLED` outright: there is nothing to
-    /// stop, and the scheduler no longer owes it its `SCHEDULING` -> `SCHEDULED` move.
-    /// One whose pass is under way is STOPPED instead — it reports [`CONTACT_CANCELLING`]
+    /// stop. One whose pass is under way is STOPPED instead — it reports [`CONTACT_CANCELLING`]
     /// while the stop is carried out and the service owes it its move to
     /// [`CONTACT_CANCELLED`] [`CANCELLATION_SETTLES_AFTER`] from now (materialised by
     /// `settle_due_contacts`). That pass already had the antenna on the account's behalf,
@@ -1833,6 +1854,7 @@ impl Contact {
             self.cancellation_settles_at = None;
         }
         self.scheduling_settles_at = None;
+        self.withdraw_owed_version_moves();
         self.last_updated = now;
     }
 
@@ -2038,7 +2060,18 @@ impl Contact {
     ///
     /// The move was owed at this instant whether or not anybody called, so applying it
     /// on a read changes nothing a later caller could otherwise have seen.
+    ///
+    /// A version is applied only while there is still a pass to fly it with
+    /// ([`Contact::is_still_to_be_flown`]): a contact that was released or that will never
+    /// be flown again is owed no version move, so the moves it is still carrying are
+    /// withdrawn instead of materialised, and every later read reports the versions and
+    /// the `lastUpdated` the end of the contact left behind.
     pub fn apply_due_versions(&mut self) {
+        if !self.is_still_to_be_flown() {
+            self.withdraw_owed_version_moves();
+            return;
+        }
+
         let now = SystemTime::now();
         let Some(activating) = self
             .versions
@@ -2063,6 +2096,19 @@ impl Contact {
             }
         }
         self.last_updated = stamp;
+    }
+
+    /// Withdraw every `UPDATING` -> `ACTIVE` version move the service still owes this
+    /// contact, leaving each version's own record exactly where the withdrawal found it: a
+    /// version that was still being applied is never applied now, so it keeps the status,
+    /// the absent `activated` and the absent `superseded` it held.
+    ///
+    /// Called wherever the contact stops being one with a pass still to fly, so no later
+    /// settle can move a version of it (see [`Contact::apply_due_versions`]).
+    pub fn withdraw_owed_version_moves(&mut self) {
+        for version in &mut self.versions {
+            version.activates_at = None;
+        }
     }
 
     /// `tags` the way a response carries them: always the map, empty when the
@@ -5419,13 +5465,17 @@ impl ComAmazonawsGroundstationGroundstationState {
     /// A reporting operation calls this before reading: the moves were owed at this
     /// instant whether or not anybody called, so applying them changes nothing a later
     /// caller could otherwise have seen.
+    ///
+    /// A contact's own status moves come FIRST and the version move last, so the version
+    /// move is judged against the status the clock has already carried the contact to: a
+    /// contact with no pass left to fly takes no version change
+    /// ([`Contact::apply_due_versions`]).
     pub fn settle_due_contacts(&mut self) {
         let now = SystemTime::now();
         let now_seconds = now
             .duration_since(UNIX_EPOCH)
             .map_or(0.0, |since| since.as_secs_f64());
         for contact in self.contacts.values_mut() {
-            contact.apply_due_versions();
             if contact
                 .cancellation_settles_at
                 .is_some_and(|due| due <= now)
@@ -5444,11 +5494,17 @@ impl ComAmazonawsGroundstationGroundstationState {
                 contact.scheduling_settles_at = None;
             }
             // And then the pass itself: the stage of its window the clock has reached.
-            // Last, so a contact the scheduler has just confirmed is carried on to the
-            // stage its own timestamps owe it in the same settle.
+            // Last of the contact's own moves, so a contact the scheduler has just
+            // confirmed is carried on to the stage its own timestamps owe it in the same
+            // settle.
             if contact.advance_pass_stage(now_seconds) {
                 contact.last_updated = now_timestamp();
             }
+            // The version move comes after every status move, so it is judged against the
+            // status the clock has ALREADY carried the contact to: a contact the pass
+            // lifecycle or a release has just ended takes no version change
+            // ([`Contact::apply_due_versions`]).
+            contact.apply_due_versions();
         }
     }
 
