@@ -292,7 +292,8 @@ use crate::ops::types::{
     Trigger, TriggerNodeDetails,
     Tag, TargetProcessingProperties, TargetTableConfig,
     TriggerUpdate,
-    UpdateClassifierInput, UpdateCrawlerInput, UpdateMLTransformInput, UpdateWorkflowInput,
+    UpdateClassifierInput, UpdateCrawlerInput, UpdateGlossaryInput, UpdateMLTransformInput,
+    UpdateWorkflowInput,
     Workflow, WorkflowGraph,
     WorkflowRun,
     WorkflowRunStatistics, XMLClassifier,
@@ -7747,6 +7748,17 @@ pub fn glossary_not_found_message(identifier: &str) -> String {
     catalog_refusal_document(&format!("Business glossary {identifier} not found."))
 }
 
+/// The message every refusal of a glossary NAME this account already holds a glossary
+/// under carries: the value of that refusal's `AlreadyExistsException$Message`.
+///
+/// One copy, shared by the create that would mint a second glossary under a stored name
+/// and the update that would rename one onto it, so the two cannot disagree about how the
+/// one collision is worded. Pinned by no recording, so it follows the per-resource
+/// constant shape this service's other already-exists refusals use
+/// ([`messages::DATABASE_ALREADY_EXISTS`]): the resource kind, and no disclosure of the
+/// requested name.
+pub const GLOSSARY_ALREADY_EXISTS: &str = "Glossary already exists.";
+
 /// A stored form type: the schema for structured metadata `PutFormType` registers in the
 /// Data Catalog.
 ///
@@ -8161,6 +8173,25 @@ impl GlossaryEntry {
             input.description.clone(),
             input.client_token.clone(),
         )
+    }
+
+    /// Apply an `UpdateGlossary` request to this record.
+    ///
+    /// Every updatable member is optional on the request ("The updated name of the
+    /// glossary", "The updated description of the glossary"), so the ones the request
+    /// NAMES replace what is stored and the ones it omits are left where the last write
+    /// that named them put them: an update naming one member changes that one alone.
+    ///
+    /// [`Self::id`] is not a member of the request and so cannot move, and
+    /// [`Self::client_token`] keeps the CREATE's token, which is what a retry of that
+    /// create is recognised by and not something an update of the glossary restates.
+    pub fn apply_update(&mut self, input: &UpdateGlossaryInput) {
+        if let Some(name) = input.name.clone() {
+            self.name = name;
+        }
+        if let Some(description) = input.description.clone() {
+            self.description = Some(description);
+        }
     }
 }
 

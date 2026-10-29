@@ -193,8 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 AlreadyExistsException {
                     // Wording for this slice is pinned by no recording or doc, so the
                     // refusal states the resource kind and withholds the requested name,
-                    // as this service's other already-exists refusals do.
-                    message: Some("Glossary already exists.".to_string()),
+                    // as this service's other already-exists refusals do. ONE copy,
+                    // shared with the update that renames a glossary onto a stored name.
+                    message: Some(crate::state::GLOSSARY_ALREADY_EXISTS.to_string()),
                 },
             )
             .into());

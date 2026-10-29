@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGlossary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGlossary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates a business glossary in Glue Data Catalog.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGlossary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The update addresses ONE stored glossary by its `GlossaryId` and replaces the members
+//! the request names, leaving every member it omits where the last write put it. The id is
+//! not a member of the request, so a glossary keeps the identifier its create minted and a
+//! later read of that identifier reports what this update stored.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +154,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGlossary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGlossaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGlossary"))
+        // Glossaries live in one per-account namespace, so nothing here depends on the
+        // request's Region — exactly as `CreateGlossary`, `GetGlossary` and
+        // `DeleteGlossary` read it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(UpdateGlossaryErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue glossary store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // The ONE wording every operation that resolves a `GlossaryId` words a miss with,
+        // built once here because both the resolve below and the write that follows it
+        // report the same miss.
+        let missing = || -> UpdateGlossaryError {
+            UpdateGlossaryErrorModeled::EntityNotFoundException(EntityNotFoundException {
+                message: Some(crate::state::glossary_not_found_message(&input.identifier)),
+                from_federation_source: None,
+            })
+            .into()
+        };
+
+        let mut store = state.lock();
+
+        // `Identifier` is the whole address of a glossary, so an identifier this account
+        // holds no glossary under updates nothing and is refused. Judged before anything
+        // is written, so a refused update leaves the store as it was.
+        if store.glossary(&input.identifier).is_none() {
+            return Err(missing());
+        }
+
+        // A glossary's name identifies it to a caller, so the namespace holds one glossary
+        // per name: a rename onto a name ANOTHER glossary already carries is refused, the
+        // same collision `CreateGlossary` refuses and under the same wording. A request
+        // that restates the glossary's own name collides with nothing, so re-sending an
+        // update is served rather than refused.
+        if let Some(requested) = input.name.as_deref() {
+            if store
+                .glossary_by_name(requested)
+                .is_some_and(|other| other.id != input.identifier)
+            {
+                return Err(UpdateGlossaryErrorModeled::AlreadyExistsException(
+                    AlreadyExistsException {
+                        message: Some(crate::state::GLOSSARY_ALREADY_EXISTS.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Modelled constraints — the required `Identifier`, the `Name`, `Description` and
+        // `ClientToken` lengths and the token's pattern — are refused before this handler
+        // runs, so the only thing left is to write the members the request named.
+        let Some(entry) = store.glossary_mut(&input.identifier) else {
+            return Err(missing());
+        };
+        entry.apply_update(&input);
+        let stored = entry.clone();
+        ::tracing::info!(
+            operation = "UpdateGlossary",
+            glossary = %stored.id,
+            "updated a Glue business glossary"
+        );
+
+        // Every member comes from the record just written, so the update reports exactly
+        // what a later `GetGlossary` of this id will.
+        Ok(UpdateGlossaryOutput {
+            id: Some(stored.id),
+            name: Some(stored.name),
+            description: stored.description,
+        })
     }
 }

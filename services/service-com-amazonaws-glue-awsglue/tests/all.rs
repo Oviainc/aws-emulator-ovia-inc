@@ -143,6 +143,8 @@ mod glossary_term_deletion;
 mod glossary_term_listing;
 #[path = "all/glossary_terms.rs"]
 mod glossary_terms;
+#[path = "all/glossary_updates.rs"]
+mod glossary_updates;
 #[path = "all/integration_resource_properties.rs"]
 mod integration_resource_properties;
 #[path = "all/integration_table_properties.rs"]
