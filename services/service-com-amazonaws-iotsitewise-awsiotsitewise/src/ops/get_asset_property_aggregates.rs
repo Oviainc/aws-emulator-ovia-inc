@@ -377,16 +377,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let aggregated = crate::state::aggregated_values(&store, &stream, &query);
         drop(store);
 
+        // Which enumeration a token of this read belongs to: the stream read and the
+        // query that derives and orders its windows — the range, the resolution, the
+        // quality counted, the aggregates computed and the ordering. A window start is
+        // no identity of a position on its own, because the epoch-aligned grid gives
+        // every stream the same window starts, so the token carries this scope beside
+        // the window start. The page size is not part of it: it decides where a page
+        // ends, not what is enumerated.
+        let scope = crate::state::pagination_scope(&[&stream, &query]);
+
         // `nextToken` is this enumeration's resume point: the window start of the first
         // aggregate of the next page, hex-encoded so the token matches the modelled
         // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration is
-        // refused rather than answered with an empty page.
+        // refused rather than answered with an empty page — and a token minted for
+        // ANOTHER enumeration is one of those, rather than a position in this one.
         let first = match input.next_token.as_deref() {
             Some(token) => {
-                let resume = decode_token(token)?;
+                let resume = crate::state::decode_timestamp_token(token, &scope)
+                    .ok_or_else(invalid_token)?;
                 aggregated
                     .iter()
-                    .position(|value| value.timestamp.secs() == resume)
+                    .position(|value| window_key(value) == resume)
                     .ok_or_else(invalid_token)?
             }
             None => 0,
@@ -394,7 +405,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let last = first.saturating_add(max_results).min(aggregated.len());
         let next_token = aggregated
             .get(last)
-            .map(|value| encode_token(value.timestamp.secs()));
+            .map(|value| crate::state::encode_timestamp_token(window_key(value), &scope));
         let aggregated_values = aggregated[first..last].to_vec();
 
         Ok(GetAssetPropertyAggregatesOutput {
@@ -420,19 +431,14 @@ const MAX_RESULTS_CEILING: i32 = 2_500;
 /// response bound, neither of which fixes a default page size.
 const DEFAULT_MAX_RESULTS: i32 = 100;
 
-/// A `nextToken` resuming at the window starting `window_start` seconds after the
-/// epoch.
-fn encode_token(window_start: i64) -> String {
-    ::hex::encode(window_start.to_string().as_bytes())
-}
-
-/// Decode a `nextToken` back into the window start it resumes from.
-fn decode_token(token: &str) -> Result<i64, GetAssetPropertyAggregatesError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|text| text.parse::<i64>().ok())
-        .ok_or_else(invalid_token)
+/// The resume point of one aggregate: the start of the window it reports, in the
+/// same `(seconds, nanos)` form the shared token codec carries.
+///
+/// A window of every modelled `Resolution` starts on a whole second — the grid is
+/// aligned to the epoch and the shortest window is a minute — so the nanosecond
+/// half of the key is always zero here.
+fn window_key(value: &AggregatedValue) -> (i64, i32) {
+    (value.timestamp.secs(), 0)
 }
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.

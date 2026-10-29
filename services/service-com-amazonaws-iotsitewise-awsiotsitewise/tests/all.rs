@@ -20,6 +20,13 @@
 #[path = "all/query_results.rs"]
 mod query_results;
 
+// `pagination_token_binding` is declared HERE, beside the suite above, for the
+// reason the note above gives: the sorted list and the END of this file are both
+// where every concurrent iotsitewise change puts a declaration of its own. Fold it
+// into the list once the churn settles.
+#[path = "all/pagination_token_binding.rs"]
+mod pagination_token_binding;
+
 // Declared here beside the suite above, for the reason its note gives.
 #[path = "all/asset_model_precondition_wording.rs"]
 mod asset_model_precondition_wording;

@@ -268,15 +268,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut selected: Vec<AssetPropertyValue> =
             crate::state::history_values(&store, &stream, &query);
 
+        // Which enumeration a token of this read belongs to: the stream read and the
+        // query that selects and orders its samples — the window, the quality filter
+        // and the ordering. A sample's timestamp is no identity of a position on its
+        // own, because a batch write puts the SAME instant into several streams and
+        // the same stream reads back as a different list under another filter or
+        // ordering, so the token carries this scope beside the instant. The page size
+        // is not part of it: it decides where a page ends, not what is enumerated.
+        let scope = crate::state::pagination_scope(&[&stream, &query]);
+
         // `nextToken` is this enumeration's resume point: the timestamp of the first
         // sample of the next page, hex-encoded so the token matches the modelled
         // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration is
         // refused rather than answered with an empty page, which would report absence
-        // as success.
+        // as success — and a token minted for ANOTHER enumeration is one of those,
+        // rather than a position in this one.
         let start = match input.next_token.as_deref() {
             Some(token) => {
-                let resume =
-                    crate::state::decode_timestamp_token(token).ok_or_else(invalid_token)?;
+                let resume = crate::state::decode_timestamp_token(token, &scope)
+                    .ok_or_else(invalid_token)?;
                 selected
                     .iter()
                     .position(|sample| crate::state::timestamp_key(&sample.timestamp) == resume)
@@ -287,7 +297,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let end = start.saturating_add(page_size).min(selected.len());
 
         let next_token = selected.get(end).map(|sample| {
-            crate::state::encode_timestamp_token(crate::state::timestamp_key(&sample.timestamp))
+            crate::state::encode_timestamp_token(
+                crate::state::timestamp_key(&sample.timestamp),
+                &scope,
+            )
         });
         selected.truncate(end);
 

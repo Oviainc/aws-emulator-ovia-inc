@@ -6835,31 +6835,80 @@ fn typed_variant(data_type: &str, text: &str) -> Option<Variant> {
     Some(variant)
 }
 
-/// The opaque pagination token that resumes at the [`timestamp_key`] `resume`:
-/// the hex of `seconds.nanos`.
+/// The opaque pagination token that resumes at the [`timestamp_key`] `resume` of
+/// the enumeration `scope` identifies: the hex of `seconds.nanos` beside that
+/// scope.
 ///
 /// ONE recipe for every time-ranged read of this service that pages by the
 /// instant it stopped at, so an encoding fix cannot drift between operations.
 /// Hex keeps the text inside the `^[A-Za-z0-9+/=]+$` pattern the paging members
 /// of this service carry.
-pub fn encode_timestamp_token(resume: (i64, i32)) -> String {
+///
+/// The token carries `scope` — a [`pagination_scope`] of the request members that
+/// decide WHICH entries are enumerated and in what order — beside the instant,
+/// because an instant alone names a position in every enumeration that happens to
+/// hold it. See [`pagination_scope`] for what that binding is for.
+pub fn encode_timestamp_token(resume: (i64, i32), scope: &str) -> String {
     let (seconds, nanos) = resume;
-    ::hex::encode(format!("{seconds}{TIMESTAMP_TOKEN_SEPARATOR}{nanos}").as_bytes())
+    ::hex::encode(
+        format!(
+            "{seconds}{TIMESTAMP_TOKEN_SEPARATOR}{nanos}{TOKEN_SCOPE_SEPARATOR}{scope}"
+        )
+        .as_bytes(),
+    )
 }
 
-/// The [`timestamp_key`] `token` encodes, or `None` for text this service never
-/// issued as a token — which its caller answers as the modelled refusal for an
-/// invalid `nextToken`.
-pub fn decode_timestamp_token(token: &str) -> Option<(i64, i32)> {
+/// The [`timestamp_key`] `token` resumes the enumeration `scope` identifies at,
+/// or `None` for text this service never issued as a token OF THAT enumeration —
+/// which its caller answers as the modelled refusal for an invalid `nextToken`.
+pub fn decode_timestamp_token(token: &str, scope: &str) -> Option<(i64, i32)> {
     let decoded = ::hex::decode(token)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())?;
-    let (seconds, nanos) = decoded.split_once(TIMESTAMP_TOKEN_SEPARATOR)?;
+    let (resume, carried) = decoded.rsplit_once(TOKEN_SCOPE_SEPARATOR)?;
+    if carried != scope {
+        return None;
+    }
+    let (seconds, nanos) = resume.split_once(TIMESTAMP_TOKEN_SEPARATOR)?;
     Some((seconds.parse().ok()?, nanos.parse().ok()?))
 }
 
-/// What joins the two halves of a token [`encode_timestamp_token`] builds.
+/// What joins the two halves of the resume point in a token
+/// [`encode_timestamp_token`] builds.
 const TIMESTAMP_TOKEN_SEPARATOR: char = '.';
+
+/// What joins a token's resume point to the [`pagination_scope`] it was minted
+/// in. Neither half can contain it: a resume point is digits and the separators
+/// above, and a scope is hex.
+const TOKEN_SCOPE_SEPARATOR: char = '|';
+
+/// A short digest of what a paginated read asks of its ENUMERATION: the request
+/// members that decide which entries it enumerates and in what order.
+///
+/// A pagination token carries this beside its resume point, so a token is only
+/// honoured against the request that produced it. A resume point on its own —
+/// an instant, a window start, a position — names something in any enumeration
+/// that happens to hold it, so a token replayed against another one (another
+/// stream, another filter, another ordering, another range) would silently serve
+/// a slice of that other enumeration and drop everything before the point it
+/// resumed at. Bound to the scope it was minted in, such a token names no page at
+/// all and its caller refuses it. The page SIZE is not part of a scope: it
+/// changes where a page ends, not which entries are enumerated or in what order.
+///
+/// `members` render through the shared [`request_fingerprint`], so one member
+/// renders one way wherever it is bound.
+pub fn pagination_scope(members: &[&dyn ::std::fmt::Debug]) -> String {
+    let rendered = request_fingerprint(members, None);
+    let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(rendered.as_bytes());
+    let mut scope = ::hex::encode(digest);
+    scope.truncate(PAGINATION_SCOPE_LENGTH);
+    scope
+}
+
+/// How many hex characters of the digest a [`pagination_scope`] carries: short
+/// enough to keep a token small, wide enough that two enumerations of one service
+/// do not collide.
+const PAGINATION_SCOPE_LENGTH: usize = 16;
 
 /// Where a page of a BATCH read resumes: the entry still being answered and how
 /// many of that entry's data points earlier pages already carried.

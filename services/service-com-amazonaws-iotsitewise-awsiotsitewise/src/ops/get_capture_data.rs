@@ -254,15 +254,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
+        // Which enumeration a token of this read belongs to: the capture source
+        // selected from (resolved, so either identifying form names the same one) and
+        // the window that selects its segments. A segment's start time is no identity
+        // of a position on its own, because two sources of one workspace can hold
+        // segments starting at the same instant and another window selects a different
+        // list, so the token carries this scope beside the instant.
+        let scope = crate::state::pagination_scope(&[
+            &source.workspace_name,
+            &source.time_series_id,
+            &start,
+            &end,
+        ]);
+
         // `nextToken` is "the token from a previous response used to continue
         // retrieving data": this enumeration's resume point, the start time of the
         // next segment to deliver. A token whose resume point is not in this
         // enumeration is refused rather than answered with an empty chunk, which
-        // would report absence as success.
+        // would report absence as success — and a token minted for ANOTHER
+        // enumeration is one of those.
         let at = match input.next_token.as_deref() {
             Some(token) => {
-                let resume =
-                    crate::state::decode_timestamp_token(token).ok_or_else(invalid_token)?;
+                let resume = crate::state::decode_timestamp_token(token, &scope)
+                    .ok_or_else(invalid_token)?;
                 selected
                     .iter()
                     .position(|segment| {
@@ -292,7 +306,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // segment and the response reports that segment's own span. The token is
         // absent on the last one — "Absent if no more data is available".
         let next_token = selected.get(at.saturating_add(1)).map(|segment| {
-            crate::state::encode_timestamp_token(crate::state::timestamp_key(&segment.start_time))
+            crate::state::encode_timestamp_token(
+                crate::state::timestamp_key(&segment.start_time),
+                &scope,
+            )
         });
 
         Ok(GetCaptureDataOutput {

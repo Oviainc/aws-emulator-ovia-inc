@@ -120,9 +120,13 @@ fn base64(bytes: &[u8]) -> String {
     ::aws_smithy_types::base64::encode(bytes)
 }
 
-/// The `nextToken` this operation issues to resume at the segment starting at
-/// `(seconds, nanos)`: the hex of that start time, built here from the test's own hex
-/// helper rather than from the handler's encoder.
+/// Text shaped like a resume point of this operation — the hex of the start time
+/// `(seconds, nanos)` — built here from the test's own hex helper rather than from the
+/// handler's encoder.
+///
+/// A token the operation really issues also names the enumeration it was minted in, so
+/// this is a token the operation never issued: it names an instant and no enumeration
+/// at all, which is what the refusal rows below send.
 fn resume_token(seconds: i64, nanos: i32) -> String {
     hex_token(&format!("{seconds}.{nanos}"))
 }
@@ -412,17 +416,17 @@ async fn a_window_delivers_every_segment_it_overlaps() {
                 "case {label:?}: chunk {position} expected the source's data type, \
                  got {page}"
             );
-            let expected_token = case
-                .expected
-                .get(position + 1)
-                .map(|next| SEEDED[*next])
-                .map(|next| resume_token(next.start_seconds, next.start_nanos));
+            // The token is opaque and belongs to the request that minted it, carrying
+            // the enumeration it resumes beside the resume point, so what is pinned
+            // here is that one is issued exactly while another chunk follows. That it
+            // resumes AT that chunk is pinned by the walk above: every page collected
+            // in `pages` was fetched by following the page before it.
+            let followed_by_another = position + 1 < case.expected.len();
             assert_eq!(
-                page.get("nextToken")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-                expected_token,
-                "case {label:?}: chunk {position} carried the wrong nextToken: {page}"
+                page.get("nextToken").and_then(Value::as_str).is_some(),
+                followed_by_another,
+                "case {label:?}: chunk {position} must carry a nextToken exactly while \
+                 another chunk follows (it does: {followed_by_another}), got {page}"
             );
         }
     }
