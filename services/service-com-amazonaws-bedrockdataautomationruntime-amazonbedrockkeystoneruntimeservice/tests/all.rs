@@ -29,3 +29,5 @@ mod support;
 mod tag_key_refusal;
 #[path = "all/tag_key_refusal_element_path.rs"]
 mod tag_key_refusal_element_path;
+#[path = "all/tag_key_refusal_list_bound.rs"]
+mod tag_key_refusal_list_bound;
