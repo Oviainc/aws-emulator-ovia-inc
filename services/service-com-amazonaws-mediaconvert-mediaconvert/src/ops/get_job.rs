@@ -154,6 +154,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // "the job ID of the job": `{Id}` arrives percent-decoded from the path, so a value
+        // made only of whitespace reaches here, and it is no more a job id than the blank
+        // `JobId` the other door on a job reference (`CreateResourceShare`) refuses. That is
+        // the test every resource-naming member in this service takes
+        // (`crate::state::carries_no_characters`), so it is refused as a problem in the
+        // request naming the member it arrived in, never as a lookup of an id nothing could
+        // hold.
+        if crate::state::carries_no_characters(&input.id) {
+            return Err(GetJobErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::blank_member_message("Id")),
+            })
+            .into());
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
