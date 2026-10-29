@@ -34,6 +34,11 @@
 //! The last test is the one assertion the delivery path cannot show: an alert is owed only
 //! on a topic of the account whose budget it names, and no topic of another account can
 //! exist here for a delivery to be observed on.
+//!
+//! An address that names no SNS topic at all — one whose Region field is no Region SNS can
+//! be addressed in, say — never reaches a delivery: the write that would establish such a
+//! subscriber refuses it (`tests/all/subscriber_address_validation.rs`), and
+//! `tests/all/subscriber_sns_topic_region.rs` asserts the two halves agree.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -64,19 +69,19 @@ const OTHER_REGION: &str = "eu-west-2";
 
 /// The account every budget below belongs to: the one account this emulator answers
 /// for, which is the only `AccountId` a budgets operation serves.
-fn account_id() -> String {
+pub(crate) fn account_id() -> String {
     caller_account()
 }
 
 /// The emulator: budgets and SNS on ONE engine — the shape `core/router/src/lib.rs`
 /// mounts them in — because a budget alert is published through the SNS API and read
 /// back where SNS delivered it.
-struct Emulator {
-    router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
-fn emulator() -> Emulator {
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -115,7 +120,7 @@ fn sns(emulator: &Emulator, region: &str) -> ::aws_sdk_sns::Client {
 /// The ARN of the topic `name` in `region`, as SNS mints it for this emulator's account.
 /// Every setup below asserts the ARN SNS answered against this, so the rows can name
 /// their subscriber addresses up front.
-fn topic_arn(region: &str, name: &str) -> String {
+pub(crate) fn topic_arn(region: &str, name: &str) -> String {
     format!(
         "arn:aws:sns:{region}:{}:{name}",
         ::engine::emulator_account_id()
@@ -125,7 +130,7 @@ fn topic_arn(region: &str, name: &str) -> String {
 /// The topic `name` in `region`, with one confirmed subscription on it so a publish onto
 /// it is observable — SNS "delivers the message to each endpoint that is subscribed to
 /// the topic", and a topic with no subscription holds no delivery to read back.
-async fn given_topic(emulator: &Emulator, region: &str, name: &str) {
+pub(crate) async fn given_topic(emulator: &Emulator, region: &str, name: &str) {
     let client = sns(emulator, region);
     let created = client
         .create_topic()
@@ -155,7 +160,7 @@ async fn given_topic(emulator: &Emulator, region: &str, name: &str) {
 
 /// Every alert SNS delivered, as `(topic ARN, message)` pairs with the message parsed,
 /// sorted so a comparison does not depend on which subscription SNS recorded first.
-fn delivered(emulator: &Emulator) -> Vec<(String, Value)> {
+pub(crate) fn delivered(emulator: &Emulator) -> Vec<(String, Value)> {
     let mut found: Vec<(String, Value)> = emulator
         .engine
         .state::<ComAmazonawsSnsAmazonsimplenotificationserviceState>()
@@ -184,7 +189,7 @@ fn email_subscriber(n: usize) -> Value {
 }
 
 /// An SNS subscriber whose `Address` is `address`.
-fn sns_subscriber(address: &str) -> Value {
+pub(crate) fn sns_subscriber(address: &str) -> Value {
     json!({"SubscriptionType": "SNS", "Address": address})
 }
 
@@ -228,7 +233,7 @@ fn other_topic() -> String {
 /// budget it is about, what that budget tracks and over what period, and what the
 /// notification alerts on.
 #[allow(clippy::too_many_arguments)]
-fn alert(
+pub(crate) fn alert(
     budget_name: &str,
     budget_type: &str,
     time_unit: &str,
@@ -257,7 +262,7 @@ fn alert(
 
 /// A `COST` budget on a monthly period with a 100 USD limit — the budget shape the rows
 /// that vary only the notification use.
-fn cost_budget() -> Value {
+pub(crate) fn cost_budget() -> Value {
     json!({
         "TimeUnit": "MONTHLY",
         "BudgetType": "COST",
@@ -496,21 +501,6 @@ fn rows() -> Vec<Row> {
             }),
             subscribers: json!([sns_subscriber(
                 "arn:aws-cn:sns:cn-north-1:123456789012:budget-alerts"
-            )]),
-            then_subscribe: None,
-            expected: Vec::new(),
-        },
-        Row {
-            case: "an SNS subscriber naming a topic in a Region nothing can be addressed in",
-            attach: Attach::AfterBudget,
-            budget: cost_budget(),
-            notification: json!({
-                "NotificationType": "ACTUAL",
-                "ComparisonOperator": "LESS_THAN",
-                "Threshold": 80
-            }),
-            subscribers: json!([sns_subscriber(
-                "arn:aws:sns:us-east-1/evil:123456789012:budget-alerts"
             )]),
             then_subscribe: None,
             expected: Vec::new(),

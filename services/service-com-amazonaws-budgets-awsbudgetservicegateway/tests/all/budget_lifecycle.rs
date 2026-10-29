@@ -244,7 +244,7 @@ fn lifecycle_rows() -> Vec<Row> {
                         "ThresholdType": "ABSOLUTE_VALUE"
                     },
                     "Subscribers": [
-                        {"SubscriptionType": "SNS", "Address": "arn:aws:sns::000000000000:budget"}
+                        {"SubscriptionType": "SNS", "Address": "arn:aws:sns:us-east-1:000000000000:budget"}
                     ]
                 },
                 {

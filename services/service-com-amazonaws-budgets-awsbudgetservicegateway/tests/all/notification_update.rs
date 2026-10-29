@@ -150,7 +150,7 @@ fn subscribers(position: usize) -> Vec<Value> {
     if !position.is_multiple_of(2) {
         list.push(json!({
             "SubscriptionType": "SNS",
-            "Address": format!("arn:aws:sns::000000000000:n{position}")
+            "Address": format!("arn:aws:sns:us-east-1:000000000000:n{position}")
         }));
     }
     list

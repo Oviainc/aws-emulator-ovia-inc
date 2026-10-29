@@ -17,9 +17,10 @@
 //! The tables span the class rather than one request: the malformed rows differ along
 //! WHICH way the address fails (no `@`, no domain, a single-label domain, an all-numeric
 //! top-level domain, internal whitespace, the other type's form, another vendor's ARN, an
-//! ARN naming something beneath a topic, and a line feed or a carriage return under
-//! either type), the well-formed rows along the forms each type admits (mailbox shapes
-//! and subdomains, partitions, a Region-less ARN, a topic name with a suffix), and both
+//! ARN naming something beneath a topic, an ARN whose Region field names no Region SNS can
+//! be addressed in, and a line feed or a carriage return under either type), the
+//! well-formed rows along the forms each type admits (mailbox shapes and subdomains,
+//! partitions, Regions up to the published bound, a topic name with a suffix), and both
 //! are driven through EVERY write that establishes a subscriber: `CreateBudget`'s
 //! `NotificationsWithSubscribers`, `CreateNotification`, `CreateSubscriber`,
 //! `UpdateSubscriber`, `CreateBudgetAction` and `UpdateBudgetAction`.
@@ -108,6 +109,31 @@ pub(crate) fn malformed_rows() -> Vec<Malformed> {
             "SNS",
             "arn:aws:sns:us-east-1:111122223333:budget-alerts:9f2b1c44-0000-4a0e-9c66-7f3f1a2b3c4d",
         ),
+        // Amazon SNS is a REGIONAL service, so a topic lives in a Region and a value whose
+        // Region field names none names no topic. The grammar the rows below step outside
+        // of is the one `service_common::arn::region_label` reads — non-empty, at most 20
+        // characters, `[a-z0-9-]` only — which is the Region field of every `*Arn`
+        // `@pattern` in the AWS models.
+        (
+            "SNS whose Region field is empty, so it names a partition rather than a Region",
+            "SNS",
+            "arn:aws:sns::111122223333:budget-alerts",
+        ),
+        (
+            "SNS whose Region field is in upper case",
+            "SNS",
+            "arn:aws:sns:US-EAST-1:111122223333:budget-alerts",
+        ),
+        (
+            "SNS whose Region field is one character past the published bound",
+            "SNS",
+            "arn:aws:sns:us-east-1-us-east-1xy:111122223333:budget-alerts",
+        ),
+        (
+            "SNS whose Region field carries a host label after a path separator",
+            "SNS",
+            "arn:aws:sns:us-east-1/evil.example.com:111122223333:budget-alerts",
+        ),
         (
             "SNS carrying whitespace in the topic name",
             "SNS",
@@ -170,8 +196,11 @@ pub(crate) fn well_formed_rows() -> Vec<(&'static str, Value)> {
             subscriber("SNS", "arn:aws-cn:sns:cn-north-1:111122223333:budget-alerts"),
         ),
         (
-            "an SNS topic ARN whose Region field is empty",
-            subscriber("SNS", "arn:aws:sns::111122223333:budget-alerts"),
+            "an SNS topic ARN whose Region field is exactly at the published bound",
+            subscriber(
+                "SNS",
+                "arn:aws:sns:us-east-1-us-east-1x:111122223333:budget-alerts",
+            ),
         ),
         (
             "an SNS topic ARN whose topic name carries a suffix",

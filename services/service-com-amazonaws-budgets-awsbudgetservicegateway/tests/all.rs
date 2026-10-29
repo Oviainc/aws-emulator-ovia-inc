@@ -111,5 +111,7 @@ mod subscriber_growth_address_rule;
 mod subscriber_notification_reads;
 #[path = "all/subscriber_set_identity.rs"]
 mod subscriber_set_identity;
+#[path = "all/subscriber_sns_topic_region.rs"]
+mod subscriber_sns_topic_region;
 #[path = "all/subscriber_update.rs"]
 mod subscriber_update;

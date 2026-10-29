@@ -1288,7 +1288,7 @@ pub fn subscriber_limit_violation<'a>(
 }
 
 /// Amazon SNS's own ARN namespace: the vendor field an address has to carry for it to
-/// name an SNS topic at all ([`names_sns_topic`]), which is also the prefix SNS is
+/// name an SNS topic at all ([`sns_topic`]), which is also the prefix SNS is
 /// addressed by in a Region (the endpoint [`alerts`] publishes an alert to).
 pub const SNS_NAMESPACE: &str = "sns";
 
@@ -1340,7 +1340,7 @@ const SUBSCRIBER_FORM_REFUSAL: &str =
 ///
 /// Neither form is decided here: an email address is read through the ONE shared reading
 /// of a caller-supplied address (`service_common::email_address`) and a topic through the
-/// ONE shared parse of a caller-supplied ARN ([`names_sns_topic`]), so this service cannot
+/// ONE shared parse of a caller-supplied ARN ([`sns_topic`]), so this service cannot
 /// disagree with another about what either is.
 ///
 /// Takes any iterator of subscribers, so an operation that establishes ONE subscriber and
@@ -1358,7 +1358,7 @@ pub fn subscriber_address_violation<'a>(
                     .then_some(EMAIL_ADDRESS_REFUSAL)
             }
             SUBSCRIPTION_TYPE_SNS => {
-                (!names_sns_topic(&subscriber.address)).then_some(SNS_ADDRESS_REFUSAL)
+                sns_topic(&subscriber.address).is_none().then_some(SNS_ADDRESS_REFUSAL)
             }
             // No request reaches this arm today: `SubscriptionType` is a modelled enum of
             // exactly these two, so a value outside them is refused at request validation.
@@ -1374,24 +1374,37 @@ pub fn subscriber_address_violation<'a>(
     Ok(())
 }
 
-/// Whether `address` names an Amazon SNS TOPIC — what an `SNS` subscriber's address has
-/// to be.
+/// The Amazon SNS TOPIC `address` names, as the fields of its ARN — `None` when it names
+/// no topic, which is what an `SNS` subscriber's address has to be.
+///
+/// The ONE reading of an `SNS` subscriber's address, for BOTH halves of what such a
+/// subscriber is for: the write that establishes one ([`subscriber_address_violation`])
+/// and the alert published to one ([`alerts`]) each read an address through here, so an
+/// address a write accepts is an address an alert can be published to, and the gate's
+/// guarantee holds instead of the delivery path quietly skipping a stored subscriber.
 ///
 /// Read through the ONE shared parse of a caller-supplied ARN (`service_common::arn`)
 /// rather than split here: the value has to be a well-formed resource ARN in SNS's own
-/// namespace ([`SNS_NAMESPACE`]), which is what makes it a topic a budget alert can be
-/// published to at all ([`alerts`]). An ARN's resource field is the topic's NAME, so a
+/// namespace ([`SNS_NAMESPACE`]). An ARN's resource field is the topic's NAME, so a
 /// value whose resource field carries a `:` or a `/` names something beneath a topic (a
 /// subscription of one) rather than the topic itself; a topic belongs to an account, so
-/// the account field has to name one; and no field of an ARN carries whitespace.
-fn names_sns_topic(address: &str) -> bool {
+/// the account field has to name one; Amazon SNS is a REGIONAL service, so a topic lives
+/// in a Region and the Region field has to be a Region LABEL
+/// (`service_common::arn::region_label`) — a partition-global ARN names no topic, and
+/// neither does a value outside that grammar, which is no Region SNS can be addressed in;
+/// and no field of an ARN carries whitespace.
+pub(crate) fn sns_topic(address: &str) -> Option<::service_common::arn::Arn<'_>> {
     // A line break is whitespace, so this scan covers one too — but an address carrying
-    // one never reaches here: the caller refuses that first, with the sentence the model
-    // states for it.
-    !address.chars().any(char::is_whitespace)
-        && ::service_common::arn::parse_of(address, SNS_NAMESPACE).is_some_and(|arn| {
-            !arn.account.is_empty() && !arn.resource.contains([':', '/'])
-        })
+    // one never reaches the refusal this feeds: the caller refuses that first, with the
+    // sentence the model states for it.
+    if address.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let topic = ::service_common::arn::parse_of(address, SNS_NAMESPACE)?;
+    let names_topic = ::service_common::arn::region_label(topic.region).is_some()
+        && !topic.account.is_empty()
+        && !topic.resource.contains([':', '/']);
+    names_topic.then_some(topic)
 }
 
 /// The notification and subscriber limits over the set of notifications ONE call would

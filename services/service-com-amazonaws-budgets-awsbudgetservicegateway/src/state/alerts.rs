@@ -89,8 +89,7 @@ pub struct BudgetAlert {
 /// Empty for a notification that is not in alarm: nothing has passed its threshold, so
 /// no subscriber of it is owed anything. Empty, too, for a notification in alarm whose
 /// subscribers are all addresses no alert of THIS budget can be published to
-/// ([`publishable`]) — an email mailbox, an address that is not an SNS topic ARN in a
-/// Region, or a topic of another account.
+/// ([`publishable`]) — an email mailbox, or a topic of another account.
 pub fn owed(
     source: &AlertSource,
     notification: &Notification,
@@ -114,19 +113,21 @@ pub fn owed(
 /// Whether an alert for a budget of the account `source` names can be published to the
 /// topic `address` names.
 ///
-/// Two things have to hold, and both are read off the address through the ONE shared ARN
-/// parse (`service_common::arn`) rather than by splitting it here:
+/// Two things have to hold, and both are read off the address through the ONE reading of
+/// an `SNS` subscriber's address ([`super::sns_topic`], over the shared ARN parse
+/// `service_common::arn`) rather than by splitting it here:
 ///
-/// * it names an SNS topic in a Region, which is what makes it an address this emulator
-///   can route a publish to at all (see [`topic_region`]);
+/// * it names an SNS topic, which — SNS being a regional service — is a topic in a Region
+///   and so an address this emulator can route a publish to at all. It is the SAME
+///   reading the write that established the subscriber was held to
+///   ([`super::subscriber_address_violation`]), so a stored `SNS` subscriber cannot fail
+///   it: an address no alert could be published to is refused before it is stored.
 /// * that topic belongs to the SAME account as the budget alerting on it. An alert carries
 ///   the budget's own figures ([`message`]), and a budget's notifications deliver to the
 ///   topics of the account that owns the budget, so an address naming any other account
 ///   names no topic this alert goes to — it is dropped here rather than published.
 fn publishable(source: &AlertSource, address: &str) -> bool {
-    topic_region(address).is_some()
-        && ::service_common::arn::parse_of(address, SNS_NAMESPACE)
-            .is_some_and(|topic| topic.account == source.account_id)
+    super::sns_topic(address).is_some_and(|topic| topic.account == source.account_id)
 }
 
 /// The alert published for `notification` of the budget `source` names: the budget it
@@ -212,11 +213,11 @@ pub async fn deliver(
 
 /// The Region of the SNS topic `address` names, or `None` when it names no SNS topic.
 ///
-/// Read through the ONE shared ARN parse (`service_common::arn`), which answers a Region
-/// only for a label inside the grammar every model states for one, so a caller-supplied
-/// address cannot put anything else where a Region goes.
+/// Read through the ONE reading of an `SNS` subscriber's address ([`super::sns_topic`]),
+/// which answers a Region only for a label inside the grammar every model states for one,
+/// so a caller-supplied address cannot put anything else where a Region goes.
 fn topic_region(address: &str) -> Option<&str> {
-    ::service_common::arn::region_of(address, SNS_NAMESPACE)
+    super::sns_topic(address).map(|topic| topic.region)
 }
 
 /// An Amazon SNS client over the IN-PROCESS callback into this same emulator.
