@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/index_and_view_lifecycle.rs"]
 mod index_and_view_lifecycle;
+#[path = "all/index_state_and_resource_tags.rs"]
+mod index_state_and_resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

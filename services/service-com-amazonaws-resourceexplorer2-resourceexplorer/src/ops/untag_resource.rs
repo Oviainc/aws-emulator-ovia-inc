@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the named keys from the tag map stored ON the index or view the
+//! `resourceArn` names — the same map `TagResource` writes and `ListTagsForResource`
+//! reports.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The ARN is resolved against the resources this service owns, in two steps:
+//!
+//! 1. An ARN outside this service's own ARN namespace — another service's resource, or
+//!    a value that is not an ARN at all — names nothing this operation can authorize
+//!    against, so it is refused with the modelled `UnauthorizedException` (HTTP 401)
+//!    and nothing is removed from anywhere.
+//! 2. An own-namespace ARN that no stored index or view carries is the modelled
+//!    `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +80,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -112,6 +117,15 @@ impl From<UntagResourceErrorModeled> for UntagResourceError {
     fn from(modeled: UntagResourceErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// Refuse a `resourceArn` outside this service's own ARN namespace: the modelled
+/// `UnauthorizedException`, HTTP 401. Returned before any write.
+fn unauthorized() -> UntagResourceError {
+    UntagResourceErrorModeled::UnauthorizedException(UnauthorizedException {
+        message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
+    })
+    .into()
 }
 
 /// The `UntagResource` operation.
@@ -150,18 +164,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // A Resource Explorer ARN carries its own Region, so the resource is resolved
+        // from the ARN alone — not from the Region the request was signed for.
+        if !crate::state::is_own_arn(&input.resource_arn) {
+            return Err(unauthorized());
+        }
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Resource Explorer store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = SystemTime::now();
+        let mut guard = store.lock();
+        // The index lifecycle the clock already owed at `now`, so a settled deletion has
+        // already taken its Region's views with it before the ARN is resolved.
+        guard.settle(now);
+
+        let Some(stored) = guard.tags_of_resource_mut(&input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        &input.resource_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+        // "Removes one or more tag key and value pairs": the request names KEYS, so a
+        // key the resource does not carry leaves the set as it was rather than failing
+        // — the model declares no error for one, and the end state is the same either
+        // way, which is what makes a repeated removal safe.
+        for key in &input.tag_keys {
+            stored.remove(key);
+        }
+        let remaining = stored.len();
+        drop(guard);
+
+        // Audit record for a call that changed stored state: who asked, what it changed
+        // and how it ended. The tag keys are NOT recorded — `StringList` is `@sensitive`
+        // here — only how many pairs the resource is left holding. The presented
+        // access-key id is an identifier, not a secret.
+        ::tracing::info!(
+            target: "audit",
+            operation = Self::NAME,
+            outcome = "untagged",
+            principal = %::engine::extract_akid(&ctx.parts().headers),
+            resource = %input.resource_arn,
+            pairs = remaining,
+            "removed the named keys from the resource's stored tag map"
+        );
+        Ok(UntagResourceOutput {})
     }
 }

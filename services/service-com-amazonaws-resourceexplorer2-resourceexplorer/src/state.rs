@@ -58,6 +58,19 @@ pub const SEARCH_RESULT_LIMIT: usize = 1000;
 /// modelled `ServiceQuotaExceededException`, which carries the quota's name and value.
 pub const VIEWS_PER_REGION_QUOTA: usize = 100;
 
+/// The most tag key/value pairs one index or view carries, from the Amazon Web Services
+/// tagging limit of 50 tags per resource.
+///
+/// It is also what BOUNDS a resource's stored tag map: `TagResource` is caller-driven and
+/// a tag lives as long as the resource it is attached to, so without a ceiling a caller
+/// could grow one resource's tags without end. Reaching it is the operation's own modelled
+/// `ValidationException`, which names the member at fault and the count the request would
+/// leave behind.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The input member a tagging refusal blames, named the way the model declares it.
+pub const TAGS_MEMBER: &str = "Tags";
+
 /// Whether `region` is an AWS Region this emulator serves.
 ///
 /// A request's Region comes from its SigV4 credential scope, which is caller-controlled
@@ -341,6 +354,34 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
         views
     }
 
+    /// The stored tag map of the index or view `arn` names, when this account holds one.
+    ///
+    /// The ONE place a tagging operation resolves a `resourceArn`, so the three
+    /// operations bound to `/tags/{resourceArn}` cannot disagree about which resources
+    /// are taggable or where a resource's tags live: an index's and a view's tags are
+    /// held ON the index and the view, which is why `GetIndex`, `GetView` and `Search`
+    /// report a tag write without knowing anything about the operation that made it.
+    pub fn tags_of_resource(&self, arn: &str) -> Option<&HashMap<String, String>> {
+        if let Some(view) = self.views.get(arn) {
+            return Some(&view.tags);
+        }
+        self.indexes
+            .values()
+            .find(|index| index.arn == arn)
+            .map(|index| &index.tags)
+    }
+
+    /// The same resolution, for the operations that WRITE a resource's tags.
+    pub fn tags_of_resource_mut(&mut self, arn: &str) -> Option<&mut HashMap<String, String>> {
+        if let Some(view) = self.views.get_mut(arn) {
+            return Some(&mut view.tags);
+        }
+        self.indexes
+            .values_mut()
+            .find(|index| index.arn == arn)
+            .map(|index| &mut index.tags)
+    }
+
     /// The indexes a `ListIndexes` caller can see, ordered by ARN.
     ///
     /// An index that is being torn down is left out: `Index` carries no state
@@ -424,6 +465,39 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// The resource-id portion of an ARN: whatever follows the last `/` or `:`.
 pub fn resource_id_of_arn(arn: &str) -> &str {
     arn.rsplit(['/', ':']).next().unwrap_or(arn)
+}
+
+// ---------------------------------------------------------------------------
+// Resource ARNs
+// ---------------------------------------------------------------------------
+
+/// Whether `arn` names a resource in THIS service's ARN namespace.
+///
+/// Resource Explorer owns only the `index/*` and `view/*` resources of its own
+/// [`SERVICE_NAMESPACE`], so an ARN naming another service's resource — or a value that
+/// is not an ARN, which names nothing — is outside what its operations can act or
+/// authorize on. The ARN itself is read by the workspace's one resource-ARN parse
+/// (`service_common::arn`), so this service cannot disagree with another about what an
+/// ARN is or which vendor field says whose resource it names.
+pub fn is_own_arn(arn: &str) -> bool {
+    ::service_common::arn::is_resource_arn_of(arn, SERVICE_NAMESPACE)
+}
+
+/// How an `UnauthorizedException` from this service is worded: the refusal says only
+/// that the principal is not permitted to perform the operation, so it carries nothing
+/// from the request.
+pub const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
+
+/// The `ResourceNotFoundException` message for an own-namespace ARN that this account
+/// holds no resource for, worded with the kind of resource the ARN names — the two kinds
+/// this service owns are `index/<id>` and `view/<name>/<id>`.
+pub fn resource_not_found_message(arn: &str) -> String {
+    let kind = match ::service_common::arn::resource_type(arn) {
+        Some("index") => "Index",
+        Some("view") => "View",
+        _ => "Resource",
+    };
+    format!("{kind} not found: {arn}")
 }
 
 // ---------------------------------------------------------------------------

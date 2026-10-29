@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the tag map stored ON the index or view the `resourceArn`
+//! names — the same map `TagResource` and `UntagResource` write, so a tag write is
+//! visible here and nowhere else is a second copy kept.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The ARN is resolved against the resources this service owns, in two steps:
+//!
+//! 1. An ARN outside this service's own ARN namespace — another service's resource, or
+//!    a value that is not an ARN at all — names nothing this operation can authorize
+//!    against, so it is refused with the modelled `UnauthorizedException` (HTTP 401).
+//! 2. An own-namespace ARN that no stored index or view carries is the modelled
+//!    `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +81,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -116,6 +120,15 @@ impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     }
 }
 
+/// Refuse a `resourceArn` outside this service's own ARN namespace: the modelled
+/// `UnauthorizedException`, HTTP 401.
+fn unauthorized() -> ListTagsForResourceError {
+    ListTagsForResourceErrorModeled::UnauthorizedException(UnauthorizedException {
+        message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
+    })
+    .into()
+}
+
 /// The `ListTagsForResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -150,20 +163,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // A Resource Explorer ARN carries its own Region, so the resource is resolved
+        // from the ARN alone — not from the Region the request was signed for.
+        if !crate::state::is_own_arn(&input.resource_arn) {
+            return Err(unauthorized());
+        }
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Resource Explorer store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = SystemTime::now();
+        let mut guard = store.lock();
+        // A read, so the only write is the index lifecycle the clock already owed at
+        // `now` — a deleted index takes its Region's views, and their tags, with it.
+        guard.settle(now);
+
+        let Some(stored) = guard.tags_of_resource(&input.resource_arn) else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        &input.resource_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+        // A resource that carries no tags has an EMPTY tag map, not an absent one: it
+        // exists, and the answer to "what is attached to it" is "nothing".
+        Ok(ListTagsForResourceOutput {
+            tags: Some(stored.clone()),
+        })
     }
 }

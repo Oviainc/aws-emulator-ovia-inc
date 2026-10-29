@@ -25,6 +25,9 @@ tracing = { workspace = true }
 hex = { workspace = true }
 # SHA-256 for the derived UUID-shaped segment of index and view ARNs.
 sha2 = { workspace = true }
+# `service-common` carries the ONE resource-ARN parse, which the tagging operations read a
+# caller-supplied `resourceArn`'s vendor and resource type through.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -32,6 +35,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 # `time` for the test-side wait past the index settle span (tokio::time::sleep).
 tokio = { workspace = true, features = ["time"] }
+# Percent-encoding for the `{resourceArn}` path label and the `tagKeys` query entries
+# the tagging suites send, so a test encodes a URI the way an SDK does.
+percent-encoding = "2.3"
 
 [lints]
 workspace = true

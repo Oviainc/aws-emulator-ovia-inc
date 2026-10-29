@@ -21,5 +21,9 @@ handler returns an error, so it never has to construct a value.
 // SKIPPED: DisassociateDefaultView — unsupported shape construct: operation 'DisassociateDefaultView' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: GetAccountLevelServiceConfiguration — unsupported shape construct: operation 'GetAccountLevelServiceConfiguration' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: GetDefaultView — unsupported shape construct: operation 'GetDefaultView' has a Unit/absent input, which the generator does not emit yet
-// SKIPPED: GetIndex — unsupported shape construct: operation 'GetIndex' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: GetServiceIndex — unsupported shape construct: operation 'GetServiceIndex' has a Unit/absent input, which the generator does not emit yet
+
+`GetIndex` was declined for the same reason and has since been hand-authored in
+`src/ops/get_index.rs`, which puts it in the service's `operations(...)` allow-list
+(`build.rs` derives that list from each ops file's `//! @op <Name>` header), so it is
+no longer answered by the unroutable-operation path.

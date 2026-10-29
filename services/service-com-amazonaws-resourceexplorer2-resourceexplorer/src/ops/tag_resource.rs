@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: merges the request's tags into the tag map stored ON the index or view
+//! the `resourceArn` names, so every reader of that resource reports them.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The ARN is resolved against the resources this service owns, in two steps, BEFORE
+//! anything is written:
+//!
+//! 1. An ARN outside this service's own ARN namespace — another service's resource, or
+//!    a value that is not an ARN at all — names nothing this operation can authorize
+//!    against, so it is refused with the modelled `UnauthorizedException` (HTTP 401)
+//!    and nothing anywhere is touched.
+//! 2. An own-namespace ARN that no stored index or view carries gets the same refusal:
+//!    this operation models no not-found error (`ListTagsForResource` and
+//!    `UntagResource` do, and answer 404 there), so an ARN it cannot resolve is one it
+//!    cannot authorize.
+//!
+//! The merge itself is bounded: a request that would leave the resource holding more
+//! than [`crate::state::MAX_TAGS_PER_RESOURCE`] distinct keys is the modelled
+//! `ValidationException` (HTTP 400), answered before anything is written, so a caller
+//! cannot grow one resource's stored tag map without end. A request naming only keys the
+//! resource already carries changes no count, so re-tagging is never refused by it.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +94,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -118,6 +131,39 @@ impl From<TagResourceErrorModeled> for TagResourceError {
     fn from(modeled: TagResourceErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// Refuse a `resourceArn` this operation cannot resolve to a resource this service
+/// owns: the modelled `UnauthorizedException`, HTTP 401. Returned before any write, so
+/// a refused request leaves the store — and every other service's — untouched.
+fn unauthorized() -> TagResourceError {
+    TagResourceErrorModeled::UnauthorizedException(UnauthorizedException {
+        message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// Refuse a merge that would leave the resource holding more tags than the quota admits:
+/// the modelled `ValidationException`, HTTP 400, naming the member the pairs arrived in.
+/// Returned before any write.
+fn too_many_tags() -> TagResourceError {
+    let member = crate::state::TAGS_MEMBER;
+    let max = crate::state::MAX_TAGS_PER_RESOURCE;
+    // The constraint sentence AWS words a bounded member's validation refusal with, in
+    // the envelope and in the field entry alike. The value itself is NOT echoed:
+    // `TagMap` is `@sensitive`, so nothing the caller sent is reflected back.
+    let issue = format!("Member must have length less than or equal to {max}");
+    TagResourceErrorModeled::ValidationException(ValidationException {
+        message: format!(
+            "1 validation error detected: Value at '{member}' failed to satisfy \
+             constraint: {issue}"
+        ),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            validation_issue: issue,
+        }]),
+    })
+    .into()
 }
 
 /// The `TagResource` operation.
@@ -156,18 +202,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The tags belong to the resource the ARN names, and a Resource Explorer ARN
+        // carries its own Region, so neither the caller nor the request's signing scope
+        // takes part in resolving it (`GetView` resolves a view ARN the same way).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The namespace check comes first, and before the store is locked: an ARN this
+        // service does not own is refused as a pure function of the request, so it never
+        // contends for the state lock.
+        if !crate::state::is_own_arn(&input.resource_arn) {
+            return Err(unauthorized());
+        }
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Resource Explorer store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = SystemTime::now();
+        let mut guard = store.lock();
+        // The index lifecycle the clock already owed at `now`, so an index whose
+        // deletion has settled — taking its Region's views with it — is already gone
+        // before the ARN is resolved.
+        guard.settle(now);
+
+        let Some(stored) = guard.tags_of_resource_mut(&input.resource_arn) else {
+            return Err(unauthorized());
+        };
+        let tags = input.tags.unwrap_or_default();
+
+        // What the resource would hold AFTER the merge: the keys it already carries plus
+        // the ones this request adds. The bound is on the STORED map, which outlives the
+        // request, so it is checked here rather than on the request's own size — and a
+        // request naming only keys the resource already has changes no count.
+        let resulting = stored
+            .keys()
+            .map(String::as_str)
+            .chain(tags.keys().map(String::as_str))
+            .collect::<::std::collections::BTreeSet<&str>>()
+            .len();
+        if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(too_many_tags());
+        }
+
+        // "Adds one or more tag key and value pairs": a key the resource already carries
+        // takes the request's value, and every other stored key stays.
+        let written = tags.len();
+        for (key, value) in tags {
+            stored.insert(key, value);
+        }
+        drop(guard);
+
+        // Audit record for a call that changed stored state: who asked, what it changed
+        // and how it ended. The tag keys and values are NOT recorded — `TagMap` is
+        // `@sensitive` — only how many pairs the call wrote. The presented access-key id
+        // is an identifier, not a secret.
+        ::tracing::info!(
+            target: "audit",
+            operation = Self::NAME,
+            outcome = "tagged",
+            principal = %::engine::extract_akid(&ctx.parts().headers),
+            resource = %input.resource_arn,
+            pairs = written,
+            "merged the request's tags into the resource's stored tag map"
+        );
+        Ok(TagResourceOutput {})
     }
 }
