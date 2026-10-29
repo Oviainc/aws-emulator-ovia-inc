@@ -26,6 +26,13 @@
 //!   included in the evaluation", filling what is still missing with the missing-data
 //!   treatment "only as few times as possible";
 //! * a datapoint BREACHES when the comparison between it and `Threshold` holds;
+//! * an alarm whose statistic is a PERCENTILE may be configured to withhold its state while a
+//!   window is too thinly sampled for that percentile to mean anything — "If you specify
+//!   `ignore`, the alarm state does not change during periods with too few data points to be
+//!   statistically significant" (`MetricAlarm$EvaluateLowSampleCountPercentile`) — so such a
+//!   window's value is not graded at all and no missing-data arm stands in for it, and an
+//!   evaluation whose every real datapoint was withheld that way computes no state
+//!   ([`low_sample_floor`]);
 //! * a slot no real datapoint filled counts as whatever `TreatMissingData` says ("Valid
 //!   Values: breaching | notBreaching | ignore | missing", default `missing`) — `breaching`
 //!   and `notBreaching` substitute a datapoint for it, `missing` leaves it out of the
@@ -493,6 +500,11 @@ struct GradedAgainst<'alarm> {
     threshold: f64,
     /// The comparison the alarm makes between a datapoint and that threshold.
     comparison: Comparison,
+    /// How many of those periods held a datapoint the alarm WITHHELD for holding too few
+    /// observations for its percentile ([`low_sample_floor`]): those slots are filled by
+    /// nothing, because the period was published into, so no arm of the missing-data treatment
+    /// decided anything for it.
+    withheld: usize,
     /// How many of the alarm's periods the verdict is made over — its `EvaluationPeriods`.
     evaluation_periods: usize,
     /// "Sets how this alarm is to handle missing data points."
@@ -755,11 +767,21 @@ impl State {
         let graded = self.graded_series(alarm, range_periods, now_secs, budget)?;
 
         let treat_missing = alarm.treat_missing_data.as_deref().unwrap_or(MISSING_MISSING);
+        // How many observations a window has to hold before this alarm grades the percentile
+        // over it at all, for an alarm configured to withhold its state while a period is too
+        // thinly sampled for that percentile ([`low_sample_floor`]); `None` for every alarm
+        // that is graded on whatever its periods hold.
+        let low_samples_withheld_below = graded
+            .statistic
+            .as_ref()
+            .and_then(|statistic| low_sample_floor(alarm, statistic));
         // The REAL datapoints of the range, newest first and at most `EvaluationPeriods` of
         // them: "all real data points in the evaluation range are included in the
         // evaluation", and where the range holds more than the alarm evaluates, it is the
         // most recent ones it evaluates.
         let mut evaluated: Vec<Evaluated> = Vec::with_capacity(evaluation_periods);
+        // How many windows held a datapoint this alarm WITHHELD for being under-sampled.
+        let mut withheld = 0_usize;
         for (index, window) in graded.windows.iter().enumerate() {
             if evaluated.len() == evaluation_periods {
                 break;
@@ -767,6 +789,15 @@ impl State {
             let Some(datapoint) = window else {
                 continue;
             };
+            // A window holding fewer observations than the percentile needs is not one this
+            // alarm grades: the value over it is withheld, so nothing it would have decided
+            // reaches the predicate below.
+            if low_samples_withheld_below.is_some_and(|floor| {
+                datapoint.sample_count.is_some_and(|count| count < floor)
+            }) {
+                withheld += 1;
+                continue;
+            }
             evaluated.push(Evaluated {
                 window: Some(index),
                 value: Some(datapoint.value),
@@ -780,12 +811,26 @@ impl State {
                 },
             });
         }
+        // "the alarm state does not change during periods with too few data points to be
+        // statistically significant": an evaluation whose every real datapoint was withheld
+        // has nothing left to decide on, so it computes no state and the alarm keeps the one
+        // it has — rather than being moved by a missing-data arm that stood in for a window
+        // the metric really was published into.
+        if withheld > 0 && evaluated.is_empty() {
+            return None;
+        }
         self.graded_evaluation(
             alarm,
             &graded,
             GradedAgainst {
                 threshold,
                 comparison,
+                // How many of the alarm's periods held a datapoint it withheld: those slots are
+                // not ones the missing-data treatment may stand in for either, because
+                // substituting a datapoint for a period the metric really was published into
+                // would move the state on the strength of exactly the under-sampled period the
+                // alarm asked to ignore.
+                withheld,
                 evaluation_periods,
                 treat_missing,
             },
@@ -1043,19 +1088,23 @@ impl State {
         let GradedAgainst {
             threshold,
             comparison,
+            withheld,
             evaluation_periods,
             treat_missing,
         } = against;
         let period = graded.period;
         // What the missing-data treatment fills the slots no real datapoint filled with: a
         // substituted datapoint under `breaching` and `notBreaching`, and nothing at all
-        // under `missing` and `ignore`, which leave the evaluation with fewer datapoints.
+        // under `missing` and `ignore`, which leave the evaluation with fewer datapoints. A
+        // slot a WITHHELD datapoint came from is filled by nothing at all whatever the
+        // treatment says: the period was published into, so no arm of the treatment decided
+        // anything for it.
         let substituted = match treat_missing {
             MISSING_BREACHING => Datapoint::Breaching,
             MISSING_NOT_BREACHING => Datapoint::NotBreaching,
             _ => Datapoint::Missing,
         };
-        for _ in evaluated.len()..evaluation_periods {
+        for _ in evaluated.len()..evaluation_periods.saturating_sub(withheld) {
             evaluated.push(Evaluated {
                 window: None,
                 value: None,
@@ -1286,6 +1335,58 @@ impl AlarmStatistic<'_> {
             Self::Basic(name) | Self::Percentile(name, _) => name,
         }
     }
+}
+
+/// The `EvaluateLowSampleCountPercentile` value under which a percentile alarm's state is NOT
+/// moved by a period too thinly sampled for that percentile to mean anything: "If you specify
+/// `ignore`, the alarm state does not change during periods with too few data points to be
+/// statistically significant." The other documented value, `evaluate`, and the OMISSION of the
+/// member both grade every period on whatever it holds — "If you specify `evaluate` or omit
+/// this parameter, the alarm is always evaluated and possibly changes state no matter how many
+/// data points are available" — so withholding is opt-in
+/// (`smithy_query(query="doc",shape="PutMetricAlarmInput",member="EvaluateLowSampleCountPercentile")`).
+const LOW_SAMPLE_IGNORE: &str = "ignore";
+
+/// The numerator of the sample-count floor a percentile has to clear to be statistically
+/// significant ([`significance_floor`]).
+const LOW_SAMPLE_FLOOR_NUMERATOR: f64 = 10.0;
+
+/// The whole of the distribution, in percent: the span a percentile cuts a tail off each end of.
+const WHOLE_DISTRIBUTION_PERCENT: f64 = 100.0;
+
+/// How many observations ONE window has to hold before the `percentile`th percentile over it is
+/// statistically significant: ten over the weight of the NEARER TAIL the percentile cuts off, so
+/// a percentile closer to an edge of the distribution needs proportionally more observations — a
+/// hundred at the ninetieth percentile (and at the tenth, which cuts off a tail of the same
+/// weight at the other end), a thousand at the ninety-ninth — rather than one flat count for
+/// every percentile.
+///
+/// `None` at the two degenerate ends of the range, where the nearer tail carries no weight at
+/// all and the percentile is the window's largest or smallest observation: a window is graded on
+/// what it holds there.
+///
+/// `percentile` is in PERCENT, the way an `ExtendedStatistic` name spells it
+/// ([`super::parse_percentile`]), and the tail is measured in percent too: the quotient of two
+/// whole percentages is exact for a percentile named in whole percent, so a window sitting
+/// exactly ON its floor is not withheld by a rounding of the floor itself.
+fn significance_floor(percentile: f64) -> Option<f64> {
+    let tail = percentile.min(WHOLE_DISTRIBUTION_PERCENT - percentile);
+    (tail > 0.0).then(|| LOW_SAMPLE_FLOOR_NUMERATOR * WHOLE_DISTRIBUTION_PERCENT / tail)
+}
+
+/// The sample count below which `alarm` WITHHOLDS the state a window would decide, or `None`
+/// for an alarm whose every window is graded on what it holds: one not configured to ignore low
+/// samples ([`LOW_SAMPLE_IGNORE`]), one whose statistic is not a percentile at all ("Used only
+/// for alarms based on percentiles"), and one whose percentile no floor is published for
+/// ([`significance_floor`]).
+fn low_sample_floor(alarm: &MetricAlarm, statistic: &AlarmStatistic<'_>) -> Option<f64> {
+    if alarm.evaluate_low_sample_count_percentile.as_deref() != Some(LOW_SAMPLE_IGNORE) {
+        return None;
+    }
+    let AlarmStatistic::Percentile(_, percentile) = statistic else {
+        return None;
+    };
+    significance_floor(*percentile)
 }
 
 /// What ONE evaluation counted over the slots it evaluated, which is what its `StateReason`

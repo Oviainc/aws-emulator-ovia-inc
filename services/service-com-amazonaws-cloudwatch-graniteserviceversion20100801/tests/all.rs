@@ -125,6 +125,8 @@ mod missing_series_alarms;
 mod not_found_messages;
 #[path = "all/otel_enrichment.rs"]
 mod otel_enrichment;
+#[path = "all/percentile_low_sample_alarms.rs"]
+mod percentile_low_sample_alarms;
 #[path = "all/period_refusal_message.rs"]
 mod period_refusal_message;
 #[path = "all/put_metric_data_validation.rs"]
