@@ -6,7 +6,9 @@
 //!
 //! * `enrollments` — one [`Enrollment`] per account id, created with the store
 //!   for the account Cost Optimization Hub knows (status `Inactive`, because it
-//!   has not opted in), written by `UpdateEnrollmentStatus` and read by
+//!   has not opted in), written by `UpdateEnrollmentStatus` — for the calling
+//!   account, and for every account of the organization where its management
+//!   account asks for its member accounts — and read by
 //!   `ListEnrollmentStatuses` — and by the recommendation readers, because Cost
 //!   Optimization Hub reports recommendations for an ENROLLED account only, and
 //!   only once the analysis that enrollment starts is due.
@@ -123,6 +125,29 @@ impl Enrollment {
     /// recommendations at.
     pub fn generation_due_at() -> SystemTime {
         SystemTime::now() + RECOMMENDATION_GENERATION_DELAY
+    }
+
+    /// Move this record to `status`, as of `now`.
+    ///
+    /// Written once here because one `UpdateEnrollmentStatus` may move SEVERAL
+    /// accounts' records (the organization's, where the management account asks
+    /// for its member accounts), and every record it moves is moved the same
+    /// way: enrolling starts the analysis that produces that account's
+    /// recommendations, so the instant they come due is set when the account
+    /// becomes `Active` and cleared when it leaves that status — opting in
+    /// again starts a fresh analysis, while a call that leaves an already
+    /// active account active does not restart it.
+    pub fn set_status(&mut self, status: &str, now: DateTime) {
+        if status == STATUS_ACTIVE {
+            if self.recommendations_due_at.is_none() {
+                self.recommendations_due_at = Some(Self::generation_due_at());
+            }
+        } else {
+            self.recommendations_due_at = None;
+        }
+        self.status = status.to_string();
+        // Refreshed on every call that moves the record, including the first.
+        self.last_updated_timestamp = now;
     }
 }
 

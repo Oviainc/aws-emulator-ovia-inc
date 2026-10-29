@@ -21,6 +21,8 @@ mod management_account_gating;
 mod max_results_bounds;
 #[path = "all/order_by_fidelity.rs"]
 mod order_by_fidelity;
+#[path = "all/organization_enrollment.rs"]
+mod organization_enrollment;
 #[path = "all/preference_gates.rs"]
 mod preference_gates;
 #[path = "all/preference_refusal_atomicity.rs"]

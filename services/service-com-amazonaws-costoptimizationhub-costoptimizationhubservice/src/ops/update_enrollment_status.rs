@@ -2,14 +2,23 @@
 
 //! @op UpdateEnrollmentStatus
 //!
-//! Writes the caller's enrollment record: the status it sets, whether the
-//! organization's member accounts were asked for, the instant the account first
-//! enrolled, and the instant of this call. The status it answers with is the
-//! value read back out of the store after the write.
+//! Writes the enrollment of every account the request addresses: the status it
+//! sets, whether the organization's member accounts were asked for, the instant
+//! the account first enrolled, and the instant of this call. The status it
+//! answers with is the value read back out of the store after the write.
 //!
-//! Becoming `Active` also starts the analysis that produces this account's
-//! recommendations, so the record carries the instant those recommendations come
-//! due; opting out clears it, and opting in again starts a fresh analysis.
+//! The accounts addressed are the caller's alone, widened to every account of
+//! the organization where the caller is its management account and the request
+//! asks for the organization's member accounts to be enrolled
+//! (`includeMemberAccounts`) — the same account set the organization-scoped
+//! readers scope to (`crate::state::...::addressed_accounts`). The
+//! member-account preference itself is recorded on the caller's own record,
+//! because it is what that caller asked for.
+//!
+//! Becoming `Active` also starts the analysis that produces an account's
+//! recommendations, so each record written carries the instant those
+//! recommendations come due; opting out clears it, and opting in again starts a
+//! fresh analysis.
 //!
 //! The accepted `status` values are the set the service takes on the WIRE
 //! (`crate::state::ENROLLMENT_STATUS_WIRE_VALUES`), which carries the terminal
@@ -189,37 +198,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let stored_status = {
             let mut store = state.lock();
-            let enrollment = store
-                .enrollments
-                .entry(account_id.clone())
-                .or_insert_with(|| crate::state::Enrollment {
-                    account_id: account_id.clone(),
-                    status: input.status.clone(),
-                    include_member_accounts,
-                    // Set once, when the account's record is created.
-                    created_timestamp: now,
-                    last_updated_timestamp: now,
-                    recommendations_due_at: None,
-                });
-            // Enrolling starts the analysis that produces this account's
-            // recommendations, so the instant they are due is set when the
-            // account becomes `Active` and cleared when it opts out — opting in
-            // again starts a fresh analysis. A call that leaves an already
-            // active account active does not restart it.
-            let becoming_active = input.status == crate::state::STATUS_ACTIVE;
-            if becoming_active {
-                if enrollment.recommendations_due_at.is_none() {
-                    enrollment.recommendations_due_at =
-                        Some(crate::state::Enrollment::generation_due_at());
-                }
-            } else {
-                enrollment.recommendations_due_at = None;
+            // Asking for the organization's member accounts is asking for the
+            // organization's view, which only its management account has, so
+            // the write reaches past the caller for that caller alone; for
+            // anyone else the member states a preference and addresses nothing
+            // but their own account. The accounts addressed are then the same
+            // set the organization-scoped readers scope to, so what this write
+            // moved and what they report cannot disagree.
+            let whole_organization = include_member_accounts == Some(true)
+                && store.is_management_account(&account_id);
+            let mut addressed = store.addressed_accounts(&account_id, &[], whole_organization);
+            // The caller's own account is addressed by its own call whether or
+            // not the write was widened to the organization's.
+            if !addressed.contains(&account_id) {
+                addressed.push(account_id.clone());
             }
-            enrollment.status = input.status.clone();
-            enrollment.include_member_accounts = include_member_accounts;
-            // Refreshed on every call, including the first.
-            enrollment.last_updated_timestamp = now;
-            enrollment.status.clone()
+
+            let mut stored_status = input.status.clone();
+            for account in &addressed {
+                let record = store
+                    .enrollments
+                    .entry(account.clone())
+                    .or_insert_with(|| crate::state::Enrollment {
+                        account_id: account.clone(),
+                        status: crate::state::STATUS_INACTIVE.to_string(),
+                        // The account has expressed no member-account
+                        // preference of its own; the caller's is stored below.
+                        include_member_accounts: None,
+                        // Set once, when the account's record is created.
+                        created_timestamp: now,
+                        last_updated_timestamp: now,
+                        recommendations_due_at: None,
+                    });
+                record.set_status(&input.status, now);
+                if account == &account_id {
+                    // `includeMemberAccounts` is what THIS caller asked for, so
+                    // it is recorded on the caller's own record and on no
+                    // member's: a member account enrolled by its organization
+                    // expressed nothing. The status answered is the one read
+                    // back off the record after the write.
+                    record.include_member_accounts = include_member_accounts;
+                    stored_status = record.status.clone();
+                }
+            }
+            stored_status
         };
 
         Ok(UpdateEnrollmentStatusOutput {

@@ -22,10 +22,10 @@
 //! asserted is the scoping that follows it.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_costoptimizationhub_costoptimizationhubservice::state::Enrollment;
 
 use crate::cost_optimization_hub::{
-    call, ids, management_account_router_with_store, ok, router, Store, ANALYSIS_WAIT,
+    call, catalog_rows_for, ids, listed, management_account_router_with_store, ok,
+    record_enrollment, router, Record, ANALYSIS_WAIT,
 };
 
 /// Member accounts of the organization the store records. Twelve digits, which
@@ -39,78 +39,10 @@ const MEMBER_FAILED: &str = "777788889999";
 /// it has nothing to report.
 const UNKNOWN_ACCOUNT: &str = "222233334444";
 
-/// Record `account`'s enrollment in the store, the way an Organizations
-/// control plane this emulator does not have would have left it.
-///
-/// `recommendations_due` decides whether the analysis the enrollment started
-/// is already due, which is what makes the account's catalog rows readable.
-fn record_enrollment(store: &Store, account: &str, status: &str, recommendations_due: bool) {
-    let now = std::time::SystemTime::now();
-    let timestamp = aws_smithy_types::DateTime::from(now);
-    store.lock().enrollments.insert(
-        account.to_string(),
-        Enrollment {
-            account_id: account.to_string(),
-            status: status.to_string(),
-            include_member_accounts: None,
-            created_timestamp: timestamp,
-            last_updated_timestamp: timestamp,
-            recommendations_due_at: recommendations_due.then_some(now),
-        },
-    );
-}
-
-/// Give `account` its own rows in the catalog — copies of the first `count`
-/// rows, under new ids — and answer the ids created, in catalog order.
-fn catalog_rows_for(store: &Store, account: &str, count: usize) -> Vec<String> {
-    let mut store = store.lock();
-    let sources: Vec<String> = store
-        .recommendation_order
-        .iter()
-        .take(count)
-        .cloned()
-        .collect();
-    let mut created = Vec::new();
-    for source in sources {
-        let mut row = store
-            .recommendations
-            .get(&source)
-            .expect("a catalog row for every ordered id")
-            .clone();
-        row.account_id = account.to_string();
-        row.recommendation_id = format!("{account}-{source}");
-        row.resource_id = format!("{account}-{}", row.resource_id);
-        created.push(row.recommendation_id.clone());
-        store.recommendation_order.push(row.recommendation_id.clone());
-        store
-            .recommendations
-            .insert(row.recommendation_id.clone(), row);
-    }
-    created
-}
-
-/// One enrollment record as an answer carries it: the account and its status.
-type Record = (String, String);
 
 /// One row of the enrollment table: the case it names, the request it sends,
 /// and the records the answer must carry.
 type EnrollmentCase = (String, Value, Vec<Record>);
-
-/// The `(accountId, status)` pairs a `ListEnrollmentStatuses` answer carries,
-/// in the order it carries them.
-fn listed(payload: &Value) -> Vec<Record> {
-    payload["items"]
-        .as_array()
-        .expect("items is a list")
-        .iter()
-        .map(|item| {
-            (
-                item["accountId"].as_str().unwrap_or_default().to_string(),
-                item["status"].as_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect()
-}
 
 /// `ListEnrollmentStatuses` answers for the accounts the request names.
 ///
@@ -275,7 +207,8 @@ async fn a_recommendation_read_answers_for_the_accounts_the_filter_names() {
     let caller = engine::emulator_account_id();
 
     // The caller enrolls over the wire, as a client would; the members are
-    // recorded in the store, because no operation enrolls another account.
+    // recorded in the store afterwards, because this emulator has no
+    // Organizations control plane to create another account's record.
     ok(
         &router,
         "UpdateEnrollmentStatus",

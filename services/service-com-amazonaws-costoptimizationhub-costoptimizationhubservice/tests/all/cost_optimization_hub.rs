@@ -65,8 +65,8 @@ pub(crate) type Store = engine::ServiceState<
 
 /// A [`management_account_router`] together with the store behind it, for a
 /// suite that has to record the organization's MEMBER accounts: this emulator
-/// has no Organizations control plane, so no operation creates a second
-/// account's enrollment or its rows in the catalog.
+/// has no Organizations control plane, so no operation CREATES a second
+/// account's enrollment record or its rows in the catalog.
 pub(crate) fn management_account_router_with_store() -> (MultiServiceRouter, Store) {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let state = cost_optimization_hub::state::service_state(&*engine)
@@ -243,6 +243,84 @@ pub(crate) fn ids(payload: &Value) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+/// Give `account` its own rows in the catalog — copies of the first `count`
+/// rows, under new ids — and answer the ids created, in catalog order.
+///
+/// Shared, because this emulator has no Organizations control plane and so no
+/// operation creates another account's catalog rows.
+pub(crate) fn catalog_rows_for(store: &Store, account: &str, count: usize) -> Vec<String> {
+    let mut store = store.lock();
+    let sources: Vec<String> = store
+        .recommendation_order
+        .iter()
+        .take(count)
+        .cloned()
+        .collect();
+    let mut created = Vec::new();
+    for source in sources {
+        let mut row = store
+            .recommendations
+            .get(&source)
+            .expect("a catalog row for every ordered id")
+            .clone();
+        row.account_id = account.to_string();
+        row.recommendation_id = format!("{account}-{source}");
+        row.resource_id = format!("{account}-{}", row.resource_id);
+        created.push(row.recommendation_id.clone());
+        store.recommendation_order.push(row.recommendation_id.clone());
+        store
+            .recommendations
+            .insert(row.recommendation_id.clone(), row);
+    }
+    created
+}
+
+/// One enrollment record as an answer carries it: the account and its status.
+pub(crate) type Record = (String, String);
+
+/// The `(accountId, status)` pairs a `ListEnrollmentStatuses` answer carries,
+/// in the order it carries them.
+pub(crate) fn listed(payload: &Value) -> Vec<Record> {
+    payload["items"]
+        .as_array()
+        .expect("items is a list")
+        .iter()
+        .map(|item| {
+            (
+                item["accountId"].as_str().unwrap_or_default().to_string(),
+                item["status"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Record `account`'s enrollment in the store, the way an Organizations
+/// control plane this emulator does not have would have left it — which is how
+/// a suite gives the organization MEMBER accounts at all.
+///
+/// `recommendations_due` decides whether the analysis the enrollment started
+/// is already due, which is what makes the account's catalog rows readable.
+pub(crate) fn record_enrollment(
+    store: &Store,
+    account: &str,
+    status: &str,
+    recommendations_due: bool,
+) {
+    let now = std::time::SystemTime::now();
+    let timestamp = aws_smithy_types::DateTime::from(now);
+    store.lock().enrollments.insert(
+        account.to_string(),
+        cost_optimization_hub::state::Enrollment {
+            account_id: account.to_string(),
+            status: status.to_string(),
+            include_member_accounts: None,
+            created_timestamp: timestamp,
+            last_updated_timestamp: timestamp,
+            recommendations_due_at: recommendations_due.then_some(now),
+        },
+    );
 }
 
 /// The catalog ids, by their last four characters, so a case can name a row
