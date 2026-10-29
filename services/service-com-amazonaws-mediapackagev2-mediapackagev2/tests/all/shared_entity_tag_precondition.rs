@@ -154,10 +154,10 @@ impl Writer {
             return endpoint_path;
         }
 
-        // A harvest job whose scheduled window opens shortly and ends long after this test
-        // does, so nothing the clock owes it beyond the queued transition below falls due
-        // while the row runs.
-        let start = epoch_seconds_from_now(60.0);
+        // A harvest job whose scheduled window is OPEN NOW and ends long after this test
+        // does: the queued transition below falls due within the emulator's own span, and
+        // nothing else the clock owes it comes due while the row runs.
+        let start = epoch_seconds_from_now(0.0);
         let mut request = harvest_body(start, start + 3600.0, &[MANIFEST]);
         request["HarvestJobName"] = json!(JOB);
         let (status, body) = emulator

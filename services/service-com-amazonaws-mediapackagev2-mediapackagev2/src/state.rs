@@ -1248,12 +1248,36 @@ impl OriginEndpoint {
     }
 }
 
-/// How long a harvest job stays `QUEUED` before the clock owes it `IN_PROGRESS`.
+/// The shortest time a harvest job spends in each status it has yet to leave.
 ///
 /// AWS does not publish this latency, so it is the EMULATOR's own span, inside the
 /// 250–750 ms band the project fixes for a transition a call starts: a caller that polls
-/// straight after `CreateHarvestJob` still observes `QUEUED`.
-const HARVEST_JOB_QUEUED_MILLIS: i64 = 400;
+/// straight after `CreateHarvestJob` still observes `QUEUED`, and a job whose scheduled
+/// window has already passed by the time it was created is still observed `IN_PROGRESS`
+/// before it ends, instead of crossing both transitions at one instant.
+const HARVEST_JOB_TRANSITION_MILLIS: i64 = 400;
+
+/// `at`, moved on by one [`HARVEST_JOB_TRANSITION_MILLIS`] span.
+fn after_harvest_job_span(at: ::aws_smithy_types::DateTime) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from_secs_f64(
+        at.as_secs_f64() + (HARVEST_JOB_TRANSITION_MILLIS as f64 / 1000.0),
+    )
+}
+
+/// Whichever of two instants comes later.
+///
+/// The modelled timestamp is compared through its epoch-seconds value, the same way every
+/// other instant in this crate is ordered.
+fn later_instant(
+    one: ::aws_smithy_types::DateTime,
+    other: ::aws_smithy_types::DateTime,
+) -> ::aws_smithy_types::DateTime {
+    if other.as_secs_f64() > one.as_secs_f64() {
+        other
+    } else {
+        one
+    }
+}
 
 /// What a harvest job reports once its scheduled window has passed.
 ///
@@ -1280,7 +1304,9 @@ pub struct HarvestJobRecord {
     pub error_message: Option<String>,
     pub created_at: ::aws_smithy_types::DateTime,
     pub modified_at: ::aws_smithy_types::DateTime,
-    /// When the clock owes this job its `QUEUED` -> `IN_PROGRESS` transition.
+    /// When the clock owes this job its `QUEUED` -> `IN_PROGRESS` transition: the start of
+    /// the window the caller scheduled, never sooner than one span after the create (see
+    /// [`harvest_job_in_progress_at`]).
     pub in_progress_at: ::aws_smithy_types::DateTime,
     /// See [`ChannelGroup::version`].
     pub version: u64,
@@ -1320,13 +1346,29 @@ impl HarvestJobRecord {
             || self.status == HARVEST_JOB_COMPLETED
     }
 
+    /// When the clock owes this job its exit from `IN_PROGRESS`.
+    ///
+    /// The end of the window the CALLER scheduled, the same half of
+    /// `ScheduleConfiguration` that [`harvest_job_in_progress_at`] takes the start from —
+    /// but never before the job has been `IN_PROGRESS` for one
+    /// [`HARVEST_JOB_TRANSITION_MILLIS`] span, so a job whose window had already ended
+    /// when it was created still passes through the status it is leaving.
+    fn terminal_at(&self) -> ::aws_smithy_types::DateTime {
+        later_instant(
+            after_harvest_job_span(self.in_progress_at),
+            self.schedule_configuration.end_time,
+        )
+    }
+
     /// Materialise the status changes the CLOCK already owed this job by `at`.
     ///
     /// Called by the reporting operations as well as the mutating ones, because each of
-    /// these transitions was due at the same instant whether or not anybody read the job:
-    /// `QUEUED` -> `IN_PROGRESS` once [`HARVEST_JOB_QUEUED_MILLIS`] has passed, and
-    /// `IN_PROGRESS` -> `FAILED` once the window the CALLER scheduled has ended (see
-    /// [`HARVESTER_UNAVAILABLE_MESSAGE`]).
+    /// these transitions was due at the same instant whether or not anybody read the job.
+    /// BOTH are decided by the window the CALLER scheduled: `QUEUED` -> `IN_PROGRESS`
+    /// when that window begins ([`harvest_job_in_progress_at`]) and `IN_PROGRESS` ->
+    /// `FAILED` when it ends ([`HarvestJobRecord::terminal_at`], and see
+    /// [`HARVESTER_UNAVAILABLE_MESSAGE`]), each no sooner than one
+    /// [`HARVEST_JOB_TRANSITION_MILLIS`] span after the job entered the status it leaves.
     pub fn materialise_due_transitions(&mut self, at: ::aws_smithy_types::DateTime) {
         if self.status == HARVEST_JOB_QUEUED
             && at.as_secs_f64() >= self.in_progress_at.as_secs_f64()
@@ -1335,7 +1377,7 @@ impl HarvestJobRecord {
             self.commit(at);
         }
         if self.status == HARVEST_JOB_IN_PROGRESS
-            && at.as_secs_f64() >= self.schedule_configuration.end_time.as_secs_f64()
+            && at.as_secs_f64() >= self.terminal_at().as_secs_f64()
         {
             self.status = HARVEST_JOB_FAILED.to_string();
             self.error_message = Some(HARVESTER_UNAVAILABLE_MESSAGE.to_string());
@@ -1344,13 +1386,20 @@ impl HarvestJobRecord {
     }
 }
 
-/// The instant a harvest job created at `created_at` is owed `IN_PROGRESS`.
+/// The instant the clock owes `IN_PROGRESS` to a harvest job created at `created_at` for
+/// a window that begins at `start_time`.
+///
+/// The schedule the caller submitted is WHEN THE JOB RUNS
+/// (`CreateHarvestJobRequest$ScheduleConfiguration`: "The configuration for when the
+/// harvest job should run, including start and end times"), so a job whose window has not
+/// begun stays `QUEUED` until it does; a job whose window has already begun waits only the
+/// emulator's own [`HARVEST_JOB_TRANSITION_MILLIS`] span, which is never zero. The end of
+/// the same window is read by [`HarvestJobRecord::terminal_at`].
 pub fn harvest_job_in_progress_at(
     created_at: ::aws_smithy_types::DateTime,
+    start_time: ::aws_smithy_types::DateTime,
 ) -> ::aws_smithy_types::DateTime {
-    ::aws_smithy_types::DateTime::from_secs_f64(
-        created_at.as_secs_f64() + (HARVEST_JOB_QUEUED_MILLIS as f64 / 1000.0),
-    )
+    later_instant(after_harvest_job_span(created_at), start_time)
 }
 
 /// The input-switch configuration a channel is stored with.

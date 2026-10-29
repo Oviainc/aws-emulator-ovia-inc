@@ -112,3 +112,5 @@ mod pagination_token_scope;
 mod segment_output_timestamp_mode;
 #[path = "all/endpoint_member_input_type_restriction.rs"]
 mod endpoint_member_input_type_restriction;
+#[path = "all/harvest_job_scheduled_window.rs"]
+mod harvest_job_scheduled_window;

@@ -4,9 +4,10 @@
 //! IMPLEMENTED. Reports one harvest job as it is stored. Reporting, with one exception
 //! the clock licenses: before answering it materialises the status changes that were
 //! already DUE at this instant whether or not anybody read the job (`QUEUED` ->
-//! `IN_PROGRESS`, and `IN_PROGRESS` -> `FAILED` once the caller's scheduled window has
-//! ended) — see `state::HarvestJobRecord::materialise_due_transitions`. It never moves a
-//! status because a read happened.
+//! `IN_PROGRESS` once the caller's scheduled window has begun, and `IN_PROGRESS` ->
+//! `FAILED` once it has ended) — see
+//! `state::HarvestJobRecord::materialise_due_transitions`. It never moves a status because
+//! a read happened.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken".

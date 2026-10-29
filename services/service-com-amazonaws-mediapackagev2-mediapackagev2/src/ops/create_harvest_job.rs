@@ -20,11 +20,12 @@
 //! holding as many jobs as it may is `ServiceQuotaExceededException` (402), worded by the
 //! crate's one quota refusal builder like every sibling create's.
 //!
-//! The job is created `QUEUED` and the CLOCK owes it `IN_PROGRESS` (see
+//! The job is created `QUEUED` and the CLOCK owes it `IN_PROGRESS` once the window the
+//! caller scheduled has begun (see
 //! `state::HarvestJobRecord::materialise_due_transitions`). This emulator runs no
-//! harvester, so once the scheduled window ends the job reaches the model's `FAILED`
-//! status with a reason that says exactly that, rather than claiming a `COMPLETED`
-//! export nothing performed.
+//! harvester, so once that window ends the job reaches the model's `FAILED` status with a
+//! reason that says exactly that, rather than claiming a `COMPLETED` export nothing
+//! performed.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken".
@@ -475,6 +476,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The schedule the request carried, read before the record takes ownership of it:
+        // its start is what the clock measures the job's `QUEUED` span against.
+        let schedule_configuration = input.schedule_configuration;
         let mut job = crate::state::HarvestJobRecord {
             name: name.clone(),
             group_name: endpoint.group_name.clone(),
@@ -489,14 +493,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             description: input.description,
             harvested_manifests: input.harvested_manifests,
-            schedule_configuration: input.schedule_configuration,
             destination: input.destination,
-            // A job is accepted into the queue; the clock owes it `IN_PROGRESS`.
+            // A job is accepted into the queue; the clock owes it `IN_PROGRESS` when the
+            // window the caller scheduled begins.
             status: crate::state::HARVEST_JOB_QUEUED.to_string(),
             error_message: None,
             created_at,
             modified_at: created_at,
-            in_progress_at: crate::state::harvest_job_in_progress_at(created_at),
+            in_progress_at: crate::state::harvest_job_in_progress_at(
+                created_at,
+                schedule_configuration.start_time,
+            ),
+            schedule_configuration,
             version: 1,
             etag: String::new(),
             tags,
