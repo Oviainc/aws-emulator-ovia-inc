@@ -18,6 +18,12 @@
 //! `ValidationException`. [`crate::state::resolve_user_pool_arn`] is the one
 //! implementation of that rule.
 //!
+//! The provider the request describes is reduced to what state holds by
+//! [`crate::ops::persisted_identity_source_configuration`], the single
+//! translation this operation shares with
+//! [`crate::ops::update_identity_source`] — the other writer of the same stored
+//! field — so the two accept the same providers and store the same values.
+//!
 //! LIMIT OF THAT CHECK, stated plainly: a well-formed ARN in this emulator's
 //! account and in the request's own region is accepted even when no
 //! `CreateUserPool` ever minted that pool. Whether a pool exists is knowledge
@@ -129,62 +135,6 @@ impl<Eng> CreateIdentitySource<Eng> {
     }
 }
 
-/// Reduce the request's `Configuration` to what state persists, refusing a
-/// provider reference this emulator cannot resolve. The `Err` names the member
-/// the caller has to fix, for the modelled `ValidationException`'s `fieldList`.
-pub(crate) fn persisted_configuration(
-    configuration: &Configuration,
-    request_region: &str,
-) -> Result<crate::state::IdentitySourceConfiguration, crate::ops::InvalidInput> {
-    match configuration {
-        Configuration::cognitoUserPoolConfiguration(cognito) => {
-            let (region, user_pool_id) =
-                crate::state::resolve_user_pool_arn(&cognito.user_pool_arn, request_region)?;
-            Ok(crate::state::IdentitySourceConfiguration::CognitoUserPool(
-                crate::state::CognitoUserPoolSource {
-                    user_pool_arn: cognito.user_pool_arn.clone(),
-                    user_pool_id,
-                    region,
-                    client_ids: cognito.client_ids.clone().unwrap_or_default(),
-                    group_entity_type: cognito
-                        .group_configuration
-                        .as_ref()
-                        .map(|group| group.group_entity_type.clone()),
-                },
-            ))
-        }
-        Configuration::openIdConnectConfiguration(oidc) => {
-            let token_selection = match &oidc.token_selection {
-                OpenIdConnectTokenSelection::accessTokenOnly(access) => {
-                    crate::state::OpenIdConnectTokens::AccessToken {
-                        principal_id_claim: access.principal_id_claim.clone(),
-                        audiences: access.audiences.clone().unwrap_or_default(),
-                    }
-                }
-                OpenIdConnectTokenSelection::identityTokenOnly(identity) => {
-                    crate::state::OpenIdConnectTokens::IdentityToken {
-                        principal_id_claim: identity.principal_id_claim.clone(),
-                        client_ids: identity.client_ids.clone().unwrap_or_default(),
-                    }
-                }
-            };
-            Ok(crate::state::IdentitySourceConfiguration::OpenIdConnect(
-                crate::state::OpenIdConnectSource {
-                    issuer: oidc.issuer.clone(),
-                    entity_id_prefix: oidc.entity_id_prefix.clone(),
-                    group_configuration: oidc.group_configuration.as_ref().map(|group| {
-                        crate::state::OpenIdConnectGroups {
-                            group_claim: group.group_claim.clone(),
-                            group_entity_type: group.group_entity_type.clone(),
-                        }
-                    }),
-                    token_selection,
-                },
-            ))
-        }
-    }
-}
-
 /// Render a persisted identity source as this operation's output. Every member
 /// is read out of state, so a value that never reached state cannot appear on
 /// the wire.
@@ -236,8 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The provider reference is resolved before any state is touched: a
         // request this service cannot resolve must change nothing.
         let region = crate::state::request_region(ctx.parts());
-        let configuration = persisted_configuration(&input.configuration, &region)
-            .map_err(invalid)?;
+        let configuration = crate::ops::persisted_identity_source_configuration(
+            &input.configuration,
+            &region,
+        )
+        .map_err(invalid)?;
 
         // `principalEntityType` is optional on the create and REQUIRED on every
         // read (`GetIdentitySourceOutput`, `IdentitySourceItem`), so an omitted

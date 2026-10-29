@@ -186,6 +186,251 @@ pub mod paths {
     pub const REQUESTS: &str = "/requests";
 }
 
+/// What a WRITE of an identity source says about the identity provider it points
+/// at, BORROWED out of whichever request union carried it.
+///
+/// `CreateIdentitySource` carries a `Configuration` and `UpdateIdentitySource` an
+/// `UpdateConfiguration` — two generated unions with the same members describing
+/// the same provider — so without a common description each writer of
+/// [`crate::state::IdentitySourceConfiguration`] would carry its own translation
+/// and a rule added to one of them (a new member, a new refusal, a different
+/// default for an absent list) would not apply to the other. Both unions borrow
+/// into this one shape through [`DescribesIdentityProvider`], and
+/// [`persisted_identity_source_configuration`] is the ONE place that decides what
+/// either writer stores — the mirror image of the single place
+/// [`crate::ops::get_identity_source`] is for what a READ reports.
+#[derive(Debug, Clone, Copy)]
+pub enum IdentityProviderDescription<'a> {
+    /// `cognitoUserPoolConfiguration`: an Amazon Cognito user pool, named by ARN.
+    CognitoUserPool {
+        /// `userPoolArn`, still unresolved — the translation resolves it.
+        user_pool_arn: &'a str,
+        /// `clientIds`, absent when the request carried none.
+        client_ids: Option<&'a [String]>,
+        /// `groupConfiguration.groupEntityType`, when the request set one.
+        group_entity_type: Option<&'a str>,
+    },
+    /// `openIdConnectConfiguration`: an OIDC provider outside the emulator.
+    OpenIdConnect {
+        /// `issuer`.
+        issuer: &'a str,
+        /// `entityIdPrefix`, when the request set one.
+        entity_id_prefix: Option<&'a str>,
+        /// `groupConfiguration`, when the request set one.
+        group_configuration: Option<OpenIdConnectGroupsDescription<'a>>,
+        /// `tokenSelection`, which the model makes required.
+        token_selection: OpenIdConnectTokenDescription<'a>,
+    },
+}
+
+/// `openIdConnectConfiguration.groupConfiguration` as a write describes it. Both
+/// its members are required whenever it is present, so the pair travels — and is
+/// stored — together or not at all.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenIdConnectGroupsDescription<'a> {
+    /// `groupClaim`.
+    pub group_claim: &'a str,
+    /// `groupEntityType`.
+    pub group_entity_type: &'a str,
+}
+
+/// `openIdConnectConfiguration.tokenSelection` as a write describes it: a policy
+/// store processes either the access token or the identity token, never both.
+#[derive(Debug, Clone, Copy)]
+pub enum OpenIdConnectTokenDescription<'a> {
+    /// `accessTokenOnly`.
+    AccessTokenOnly {
+        /// `principalIdClaim`.
+        principal_id_claim: &'a str,
+        /// `audiences`, absent when the request carried none.
+        audiences: Option<&'a [String]>,
+    },
+    /// `identityTokenOnly`.
+    IdentityTokenOnly {
+        /// `principalIdClaim`.
+        principal_id_claim: &'a str,
+        /// `clientIds`, absent when the request carried none.
+        client_ids: Option<&'a [String]>,
+    },
+}
+
+/// A request union that describes the identity provider an identity source points
+/// at.
+///
+/// The two impls below are the only per-union code there is: each one BORROWS its
+/// own union's members into [`IdentityProviderDescription`] and decides nothing —
+/// no resolution, no default, no refusal — so the rules all live in
+/// [`persisted_identity_source_configuration`].
+pub trait DescribesIdentityProvider {
+    /// This union's provider, as the shared translation reads it.
+    fn provider_description(&self) -> IdentityProviderDescription<'_>;
+}
+
+impl DescribesIdentityProvider for types::Configuration {
+    fn provider_description(&self) -> IdentityProviderDescription<'_> {
+        match self {
+            Self::cognitoUserPoolConfiguration(cognito) => {
+                IdentityProviderDescription::CognitoUserPool {
+                    user_pool_arn: &cognito.user_pool_arn,
+                    client_ids: cognito.client_ids.as_deref(),
+                    group_entity_type: cognito
+                        .group_configuration
+                        .as_ref()
+                        .map(|group| group.group_entity_type.as_str()),
+                }
+            }
+            Self::openIdConnectConfiguration(oidc) => IdentityProviderDescription::OpenIdConnect {
+                issuer: &oidc.issuer,
+                entity_id_prefix: oidc.entity_id_prefix.as_deref(),
+                group_configuration: oidc.group_configuration.as_ref().map(|group| {
+                    OpenIdConnectGroupsDescription {
+                        group_claim: &group.group_claim,
+                        group_entity_type: &group.group_entity_type,
+                    }
+                }),
+                token_selection: match &oidc.token_selection {
+                    types::OpenIdConnectTokenSelection::accessTokenOnly(access) => {
+                        OpenIdConnectTokenDescription::AccessTokenOnly {
+                            principal_id_claim: &access.principal_id_claim,
+                            audiences: access.audiences.as_deref(),
+                        }
+                    }
+                    types::OpenIdConnectTokenSelection::identityTokenOnly(identity) => {
+                        OpenIdConnectTokenDescription::IdentityTokenOnly {
+                            principal_id_claim: &identity.principal_id_claim,
+                            client_ids: identity.client_ids.as_deref(),
+                        }
+                    }
+                },
+            },
+        }
+    }
+}
+
+impl DescribesIdentityProvider for types::UpdateConfiguration {
+    fn provider_description(&self) -> IdentityProviderDescription<'_> {
+        match self {
+            Self::cognitoUserPoolConfiguration(cognito) => {
+                IdentityProviderDescription::CognitoUserPool {
+                    user_pool_arn: &cognito.user_pool_arn,
+                    client_ids: cognito.client_ids.as_deref(),
+                    group_entity_type: cognito
+                        .group_configuration
+                        .as_ref()
+                        .map(|group| group.group_entity_type.as_str()),
+                }
+            }
+            Self::openIdConnectConfiguration(oidc) => IdentityProviderDescription::OpenIdConnect {
+                issuer: &oidc.issuer,
+                entity_id_prefix: oidc.entity_id_prefix.as_deref(),
+                group_configuration: oidc.group_configuration.as_ref().map(|group| {
+                    OpenIdConnectGroupsDescription {
+                        group_claim: &group.group_claim,
+                        group_entity_type: &group.group_entity_type,
+                    }
+                }),
+                token_selection: match &oidc.token_selection {
+                    types::UpdateOpenIdConnectTokenSelection::accessTokenOnly(access) => {
+                        OpenIdConnectTokenDescription::AccessTokenOnly {
+                            principal_id_claim: &access.principal_id_claim,
+                            audiences: access.audiences.as_deref(),
+                        }
+                    }
+                    types::UpdateOpenIdConnectTokenSelection::identityTokenOnly(identity) => {
+                        OpenIdConnectTokenDescription::IdentityTokenOnly {
+                            principal_id_claim: &identity.principal_id_claim,
+                            client_ids: identity.client_ids.as_deref(),
+                        }
+                    }
+                },
+            },
+        }
+    }
+}
+
+/// A list member a write did not carry, stored as the EMPTY list: the member is
+/// optional on the request and a read reports `clientIds`/`audiences` as a list,
+/// so "the request named none" and "the request named an empty list" are one
+/// stored value. One place decides it, for every list of every arm.
+fn listed(values: Option<&[String]>) -> Vec<String> {
+    values.unwrap_or_default().to_vec()
+}
+
+/// Reduce the identity provider a write describes to what [`crate::state`]
+/// persists, refusing a provider reference this emulator cannot resolve.
+///
+/// This is the SINGLE translation both writers of an identity source's
+/// configuration go through — `CreateIdentitySource` with its `Configuration` and
+/// `UpdateIdentitySource` with its `UpdateConfiguration` — so an update stores
+/// exactly what a create carrying the same provider stores, accepts exactly the
+/// pools a create accepts, and gains any rule added here without a second edit.
+/// A Cognito pool reference goes through [`crate::state::resolve_user_pool_arn`],
+/// the one implementation of THAT rule; an OIDC `issuer` names a provider outside
+/// the emulator and is accepted as given.
+///
+/// The `Err` names the member the caller has to fix, for the modelled
+/// `ValidationException`'s `fieldList`.
+pub fn persisted_identity_source_configuration(
+    configuration: &impl DescribesIdentityProvider,
+    request_region: &str,
+) -> Result<crate::state::IdentitySourceConfiguration, InvalidInput> {
+    match configuration.provider_description() {
+        IdentityProviderDescription::CognitoUserPool {
+            user_pool_arn,
+            client_ids,
+            group_entity_type,
+        } => {
+            let (region, user_pool_id) =
+                crate::state::resolve_user_pool_arn(user_pool_arn, request_region)?;
+            Ok(crate::state::IdentitySourceConfiguration::CognitoUserPool(
+                crate::state::CognitoUserPoolSource {
+                    user_pool_arn: user_pool_arn.to_string(),
+                    user_pool_id,
+                    region,
+                    client_ids: listed(client_ids),
+                    group_entity_type: group_entity_type.map(str::to_string),
+                },
+            ))
+        }
+        IdentityProviderDescription::OpenIdConnect {
+            issuer,
+            entity_id_prefix,
+            group_configuration,
+            token_selection,
+        } => {
+            let token_selection = match token_selection {
+                OpenIdConnectTokenDescription::AccessTokenOnly {
+                    principal_id_claim,
+                    audiences,
+                } => crate::state::OpenIdConnectTokens::AccessToken {
+                    principal_id_claim: principal_id_claim.to_string(),
+                    audiences: listed(audiences),
+                },
+                OpenIdConnectTokenDescription::IdentityTokenOnly {
+                    principal_id_claim,
+                    client_ids,
+                } => crate::state::OpenIdConnectTokens::IdentityToken {
+                    principal_id_claim: principal_id_claim.to_string(),
+                    client_ids: listed(client_ids),
+                },
+            };
+            Ok(crate::state::IdentitySourceConfiguration::OpenIdConnect(
+                crate::state::OpenIdConnectSource {
+                    issuer: issuer.to_string(),
+                    entity_id_prefix: entity_id_prefix.map(str::to_string),
+                    group_configuration: group_configuration.map(|group| {
+                        crate::state::OpenIdConnectGroups {
+                            group_claim: group.group_claim.to_string(),
+                            group_entity_type: group.group_entity_type.to_string(),
+                        }
+                    }),
+                    token_selection,
+                },
+            ))
+        }
+    }
+}
+
 /// The modelled `ResourceNotFoundException` an AUTHORIZATION call answers for a
 /// reference that names no live resource: the message NAMES the missing
 /// resource's kind and the id the request referenced it by

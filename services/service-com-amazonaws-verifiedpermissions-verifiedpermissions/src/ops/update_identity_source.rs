@@ -15,10 +15,15 @@
 //! its own rule: the request's value when it carries one, otherwise the stored
 //! one, because every read of an identity source requires it.
 //!
-//! A Cognito `userPoolArn` is resolved exactly as the create resolves it
-//! ([`crate::state::resolve_user_pool_arn`]), so a pool this emulator cannot
-//! resolve is the same 400 `ValidationException` here as there and nothing is
-//! written.
+//! A Cognito `userPoolArn` is resolved exactly as the create resolves it, and
+//! every other member is stored exactly as the create stores it, because both
+//! writers go through the ONE translation
+//! [`crate::ops::persisted_identity_source_configuration`]: `UpdateConfiguration`
+//! is member-identical to the `Configuration` a create carries, so the two
+//! unions describe the same provider and only the description, not the rule, is
+//! per-union. A pool this emulator cannot resolve
+//! ([`crate::state::resolve_user_pool_arn`]) is therefore the same 400
+//! `ValidationException` here as there, and nothing is written.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -133,68 +138,6 @@ impl<Eng> UpdateIdentitySource<Eng> {
     }
 }
 
-/// Reduce an `UpdateConfiguration` to what state persists, refusing a provider
-/// reference this emulator cannot resolve. The `Err` names the member the caller
-/// has to fix, for the modelled `ValidationException`'s `fieldList`.
-///
-/// `UpdateConfiguration` is member-identical to the `Configuration` a create
-/// carries, so this translates the same provider description into the same
-/// stored shape — and a Cognito pool reference goes through
-/// [`crate::state::resolve_user_pool_arn`], the one implementation of that rule,
-/// so an update accepts exactly the pools a create accepts.
-fn persisted_configuration(
-    configuration: &UpdateConfiguration,
-    request_region: &str,
-) -> Result<crate::state::IdentitySourceConfiguration, crate::ops::InvalidInput> {
-    match configuration {
-        UpdateConfiguration::cognitoUserPoolConfiguration(cognito) => {
-            let (region, user_pool_id) =
-                crate::state::resolve_user_pool_arn(&cognito.user_pool_arn, request_region)?;
-            Ok(crate::state::IdentitySourceConfiguration::CognitoUserPool(
-                crate::state::CognitoUserPoolSource {
-                    user_pool_arn: cognito.user_pool_arn.clone(),
-                    user_pool_id,
-                    region,
-                    client_ids: cognito.client_ids.clone().unwrap_or_default(),
-                    group_entity_type: cognito
-                        .group_configuration
-                        .as_ref()
-                        .map(|group| group.group_entity_type.clone()),
-                },
-            ))
-        }
-        UpdateConfiguration::openIdConnectConfiguration(oidc) => {
-            let token_selection = match &oidc.token_selection {
-                UpdateOpenIdConnectTokenSelection::accessTokenOnly(access) => {
-                    crate::state::OpenIdConnectTokens::AccessToken {
-                        principal_id_claim: access.principal_id_claim.clone(),
-                        audiences: access.audiences.clone().unwrap_or_default(),
-                    }
-                }
-                UpdateOpenIdConnectTokenSelection::identityTokenOnly(identity) => {
-                    crate::state::OpenIdConnectTokens::IdentityToken {
-                        principal_id_claim: identity.principal_id_claim.clone(),
-                        client_ids: identity.client_ids.clone().unwrap_or_default(),
-                    }
-                }
-            };
-            Ok(crate::state::IdentitySourceConfiguration::OpenIdConnect(
-                crate::state::OpenIdConnectSource {
-                    issuer: oidc.issuer.clone(),
-                    entity_id_prefix: oidc.entity_id_prefix.clone(),
-                    group_configuration: oidc.group_configuration.as_ref().map(|group| {
-                        crate::state::OpenIdConnectGroups {
-                            group_claim: group.group_claim.clone(),
-                            group_entity_type: group.group_entity_type.clone(),
-                        }
-                    }),
-                    token_selection,
-                },
-            ))
-        }
-    }
-}
-
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for UpdateIdentitySource<Eng>
 {
@@ -240,8 +183,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The provider reference is resolved BEFORE any state is touched: a
         // configuration this service cannot resolve must change nothing.
         let region = crate::state::request_region(ctx.parts());
-        let configuration =
-            persisted_configuration(&input.update_configuration, &region).map_err(invalid)?;
+        let configuration = crate::ops::persisted_identity_source_configuration(
+            &input.update_configuration,
+            &region,
+        )
+        .map_err(invalid)?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
         let mut state = state.lock();

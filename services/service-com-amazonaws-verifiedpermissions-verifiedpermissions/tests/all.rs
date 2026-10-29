@@ -25,6 +25,8 @@ mod error_messages;
 mod evaluation_errors;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/identity_source_configuration_writers.rs"]
+mod identity_source_configuration_writers;
 #[path = "all/identity_sources.rs"]
 mod identity_sources;
 #[path = "all/is_authorized_with_token.rs"]
