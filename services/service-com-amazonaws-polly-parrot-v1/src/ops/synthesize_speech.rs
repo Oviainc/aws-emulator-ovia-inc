@@ -705,7 +705,10 @@ pub fn billed_characters(text: &str, text_type: &str) -> Result<usize, String> {
     let mut depth = 0i32;
     let mut root_seen = false;
     loop {
-        match reader.read_event().map_err(|e| e.to_string())? {
+        // Taken as a value so the event itself can be handed to the shared
+        // character-data rule below.
+        let event = reader.read_event().map_err(|e| e.to_string())?;
+        match event {
             Event::Eof => break,
             Event::Start(ref e) => {
                 check_document_element_is_the_only_one(depth, root_seen)?;
@@ -730,30 +733,17 @@ pub fn billed_characters(text: &str, text_type: &str) -> Result<usize, String> {
             Event::CData(_) | Event::GeneralRef(_) if depth == 0 => {
                 return Err(CHARACTER_DATA_OUTSIDE_THE_DOCUMENT.to_string());
             }
-            Event::Text(ref t) => {
-                // Entities count as the character they stand for, so the raw bytes
-                // are unescaped before counting.
-                let raw = String::from_utf8_lossy(t.as_ref()).to_string();
-                let decoded = quick_xml::escape::unescape(&raw).map_err(|e| e.to_string())?;
-                billed = billed.saturating_add(decoded.chars().count());
-            }
-            Event::CData(ref c) => {
+            // Text, a CDATA section and a reference are all character data of the
+            // document, and what is billed is the characters that data stands for —
+            // the service's one character-data rule
+            // ([`crate::service::xml::character_data_length`]), which is where the
+            // unescaping, the verbatim CDATA and the reference the reader emits on its
+            // own are decided, and which `PutLexicon` measures a replacement with.
+            // Only the accumulator is this operation's: text content is billed, and
+            // markup, which contributes nothing, is not.
+            Event::Text(_) | Event::CData(_) | Event::GeneralRef(_) => {
                 billed = billed
-                    .saturating_add(String::from_utf8_lossy(c.as_ref()).chars().count());
-            }
-            // The reader BREAKS text at a reference and emits the reference on its
-            // own, so a loop reading only text events would bill none of the
-            // characters the document spells with `&amp;` or `&#NN;` — and those are
-            // text content, which is billed, not markup, which is not.
-            Event::GeneralRef(ref reference) => {
-                let name = reference.decode().map_err(|e| e.to_string())?;
-                // Reconstructed and unescaped so a predefined entity and a numeric
-                // character reference resolve the same way, and a reference that
-                // stands for nothing stays an error rather than billing as nothing.
-                let reconstructed = format!("&{name};");
-                let resolved =
-                    quick_xml::escape::unescape(&reconstructed).map_err(|e| e.to_string())?;
-                billed = billed.saturating_add(resolved.chars().count());
+                    .saturating_add(crate::service::xml::character_data_length(&event)?);
             }
             _ => {}
         }

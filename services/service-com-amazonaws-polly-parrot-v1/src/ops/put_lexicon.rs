@@ -345,9 +345,8 @@ fn character_data_outside_the_document() -> PlsRejection {
     )
 }
 
-/// Resolve one run of character data — the text of an element, or an attribute value —
-/// to the characters it stands for, refusing the whole document when it stands for
-/// nothing.
+/// Resolve one attribute value to the characters it stands for, refusing the whole
+/// document when it stands for nothing.
 ///
 /// XML 1.0 declares exactly five general entities and admits no reference to an entity
 /// nothing declares, and a character reference denotes one code point, so character
@@ -355,21 +354,13 @@ fn character_data_outside_the_document() -> PlsRejection {
 /// well-formed XML and the content is not a document at all. This is the check, so it
 /// is independent of whether anything about the data is being MEASURED: the
 /// well-formedness of a document is a property of the whole document, not of the
-/// elements the lexicon quota happens to be read inside.
+/// elements the lexicon quota happens to be read inside. The character data an element
+/// carries BETWEEN its tags reaches the reader as events instead, and is resolved and
+/// counted by [`crate::service::xml::character_data_length`].
 fn resolve_character_data(raw: &str) -> Result<String, PlsRejection> {
     quick_xml::escape::unescape(raw)
         .map(|resolved| resolved.into_owned())
         .map_err(|e| PlsRejection::NotALexicon(e.to_string()))
-}
-
-/// Resolve one entity or character reference the reader emitted on its own.
-///
-/// The reference arrives as its NAME, so it is reconstructed before being resolved
-/// through [`resolve_character_data`]: a predefined entity and a numeric character
-/// reference then resolve the same way, and one that stands for nothing refuses the
-/// document wherever in it the reference sits.
-fn resolve_reference(name: &str) -> Result<String, PlsRejection> {
-    resolve_character_data(&format!("&{name};"))
 }
 
 /// Check every attribute value of one element.
@@ -406,8 +397,9 @@ fn check_attribute_values(
 /// Resolving references is part of that whole-document rule rather than part of the
 /// measuring: XML admits no reference that stands for nothing, so an entity nothing
 /// declares or a character reference denoting no code point refuses the document
-/// WHEREVER it sits in it — in a replacement, in any other element's content or in an
-/// attribute value ([`resolve_character_data`]) — and not only where a replacement is
+/// WHEREVER it sits in it — in a replacement, in any other element's content
+/// ([`crate::service::xml::character_data_length`]) or in an attribute value
+/// ([`resolve_character_data`]) — and not only where a replacement is
 /// open to count its characters.
 ///
 /// Each `<lexeme>`'s replacement elements are measured as they
@@ -543,46 +535,30 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
                     return Err(character_data_outside_the_document());
                 }
             }
-            Event::Text(ref text) => {
-                // Entities stand for the character they name, so the raw bytes are
-                // resolved — wherever in the document this text sits, because text
-                // that resolves to nothing is not well-formed whether or not a
-                // replacement is open to measure it.
-                let raw = String::from_utf8_lossy(text.as_ref()).to_string();
-                let unescaped = resolve_character_data(&raw)?;
-                // The innermost open replacement counts the text; the elements around
-                // it count it when that one closes.
-                if let Some(open) = replacements.last_mut() {
-                    *open = open.saturating_add(unescaped.chars().count());
-                }
-            }
             // A CDATA section and a reference are character data too, so outside
             // every element they are the same refusal as text there — whatever they
             // hold, since neither has a whitespace-only form XML admits there.
             Event::CData(_) | Event::GeneralRef(_) if open_elements == 0 => {
                 return Err(character_data_outside_the_document());
             }
-            Event::CData(ref text) => {
-                // CDATA carries the characters it holds verbatim: that is what it is
-                // for, so nothing in it is resolved before it is measured.
+            // Inside the document, text, a CDATA section and a reference are character
+            // data whose length is the service's one character-data rule
+            // ([`crate::service::xml::character_data_length`]): that is where the
+            // unescaping of text, the verbatim characters of a CDATA section and the
+            // reference the reader emits on its own after breaking the text around it
+            // are decided, and it is the same rule `SynthesizeSpeech` bills an SSML
+            // document with. Only the accumulator is this operation's.
+            Event::Text(_) | Event::CData(_) | Event::GeneralRef(_) => {
+                // Resolved first and counted second: character data that stands for
+                // nothing refuses the document anywhere in it, whether or not a
+                // replacement is open to measure what it does stand for.
+                let characters =
+                    crate::service::xml::character_data_length(&event)
+                        .map_err(PlsRejection::NotALexicon)?;
+                // The innermost open replacement counts the characters; the elements
+                // around it count them when that one closes.
                 if let Some(open) = replacements.last_mut() {
-                    let characters = String::from_utf8_lossy(text.as_ref()).chars().count();
                     *open = open.saturating_add(characters);
-                }
-            }
-            // The reader BREAKS text at a reference and emits the reference on its own,
-            // so a loop reading only text events would measure none of the characters a
-            // replacement spells with `&amp;` or `&#NN;`.
-            Event::GeneralRef(ref reference) => {
-                let name = reference
-                    .decode()
-                    .map_err(|e| PlsRejection::NotALexicon(e.to_string()))?;
-                // Resolved first and counted second: a reference standing for nothing
-                // refuses the document anywhere in it, and only a replacement that is
-                // open measures the characters it does stand for.
-                let resolved = resolve_reference(&name)?;
-                if let Some(open) = replacements.last_mut() {
-                    *open = open.saturating_add(resolved.chars().count());
                 }
             }
             _ => {}

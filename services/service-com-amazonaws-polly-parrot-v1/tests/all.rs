@@ -64,6 +64,8 @@ mod voice_catalog;
 mod voice_catalog_is_not_paged;
 #[path = "all/voice_engine_compatibility.rs"]
 mod voice_engine_compatibility;
+#[path = "all/xml_character_data_length.rs"]
+mod xml_character_data_length;
 #[path = "all/xml_document_well_formedness.rs"]
 mod xml_document_well_formedness;
 #[path = "all/xml_reference_resolution.rs"]
