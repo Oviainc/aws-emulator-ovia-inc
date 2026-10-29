@@ -739,7 +739,12 @@ async fn the_arn_form_of_a_resource_type_is_the_type_s_own() {
     for (resource_type, expected) in cases {
         let expected = expected
             .map(|form| form.replace("{account}", engine::EMULATOR_ACCOUNT_ID));
-        let got = aws_resource_arn(resource_type, "us-east-1", "the-id");
+        let got = aws_resource_arn(
+            resource_type,
+            engine::EMULATOR_ACCOUNT_ID,
+            "us-east-1",
+            "the-id",
+        );
         assert_eq!(
             got, expected,
             "case {resource_type:?}: expected {expected:?}, got {got:?}"

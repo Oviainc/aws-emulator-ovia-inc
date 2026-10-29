@@ -48,8 +48,8 @@
 //! flagged — what `ListRecommendationsForResource` looks a resource up by — is
 //! derived the same way, by
 //! [`aws_resource_arn_of`](ComAmazonawsTrustedadvisorTrustedadvisorState::aws_resource_arn_of)
-//! from the resource's own Region and id and the resource TYPE of the check
-//! behind it, so no stored ARN can disagree with them.
+//! from the resource's own Region, id and owning account and the resource TYPE
+//! of the check behind it, so no stored ARN can disagree with them.
 //!
 //! Beside the four maps the store holds the calling account's
 //! [`SupportPlan`] — the whole input to the support-level authorization stage
@@ -318,11 +318,17 @@ pub fn recommendation_resource_arn(recommendation_id: &str, resource_id: &str) -
 ///
 /// `None` for a type this table does not name: the emulator does not know that
 /// type's ARN form, so it reports no ARN for it rather than guessing one that a
-/// caller could not have formed. The account segment is the emulator's
-/// canonical account id, and the Region segment is the resource's own
-/// `regionCode` — an AWS resource ARN is Regional.
+/// caller could not have formed. The account segment is `account_id`, the
+/// account that OWNS the flagged resource, and the Region segment is the
+/// resource's own `regionCode` — an AWS resource ARN is Regional.
+///
+/// Formatted here rather than through `engine::emulator_arn`, which always
+/// writes the emulator's own account: the store spans the organization's member
+/// accounts, so the resources of a member account are named by ARNs carrying
+/// THAT account — the same reason [`check_arn`] is formatted by hand.
 pub fn aws_resource_arn(
     resource_type: &str,
+    account_id: &str,
     region_code: &str,
     aws_resource_id: &str,
 ) -> Option<String> {
@@ -332,7 +338,9 @@ pub fn aws_resource_arn(
         "AWS::RDS::DBInstance" => ("rds", format!("db:{aws_resource_id}")),
         _ => return None,
     };
-    Some(::engine::emulator_arn(service, region_code, &resource))
+    Some(format!(
+        "arn:aws:{service}:{region_code}:{account_id}:{resource}"
+    ))
 }
 
 /// The key prefix every resource of `recommendation_arn` shares: that ARN with
@@ -768,18 +776,26 @@ impl ComAmazonawsTrustedadvisorTrustedadvisorState {
     /// against.
     ///
     /// DERIVED on every read rather than stored, from the one copy of each of
-    /// its parts: the resource's own `regionCode` and `awsResourceId`, and the
-    /// resource TYPE of the check behind the recommendation that flagged it
-    /// (see [`aws_resource_arn`] for the per-type ARN forms). So a resource can
-    /// never carry an ARN that disagrees with the id and Region a caller can
-    /// also read.
+    /// its parts: the resource's own `regionCode`, `awsResourceId` and owning
+    /// account, and the resource TYPE of the check behind the recommendation
+    /// that flagged it (see [`aws_resource_arn`] for the per-type ARN forms). So
+    /// a resource can never carry an ARN that disagrees with the id, Region and
+    /// owner a caller can also read.
+    ///
+    /// The owning account is the account segment of the stored resource's OWN
+    /// ARN, read through the one derivation every view of a stored resource's
+    /// owner goes through ([`arn_account_id`]) — the store spans the
+    /// organization's member accounts, so an AWS resource ARN naming any other
+    /// account would make one account's resources answer to another account's
+    /// ARN.
     ///
     /// `None` when the check is not `resourceArnQueryable` — "Indicates whether
     /// this check is supported by the ListRecommendationsForResource API"
     /// (`smithy_query(query="doc",shape="CheckSummary",member="resourceArnQueryable")`)
-    /// — when it names no resource type, or when that type has no ARN form this
-    /// emulator knows. Such a finding is not addressable by resource ARN, so
-    /// no resource ARN can ever report it.
+    /// — when it names no resource type, when that type has no ARN form this
+    /// emulator knows, or when the stored resource's own ARN names no account to
+    /// own the flagged resource. Such a finding is not addressable by resource
+    /// ARN, so no resource ARN can ever report it.
     pub fn aws_resource_arn_of(&self, resource: &ResourceEntry) -> Option<String> {
         let recommendation = self.recommendations.get(&resource.recommendation_arn)?;
         let check = self.check_of(recommendation)?;
@@ -789,7 +805,13 @@ impl ComAmazonawsTrustedadvisorTrustedadvisorState {
         // A `resource`-granularity check reports one resource type, so the
         // first entry is the type of every resource it flags.
         let resource_type = check.aws_resource_types.first()?;
-        aws_resource_arn(resource_type, &resource.region_code, &resource.aws_resource_id)
+        let account_id = arn_account_id(&resource.arn)?;
+        aws_resource_arn(
+            resource_type,
+            &account_id,
+            &resource.region_code,
+            &resource.aws_resource_id,
+        )
     }
 
     /// `pillarSpecificAggregates` for a recommendation, COMPUTED from that

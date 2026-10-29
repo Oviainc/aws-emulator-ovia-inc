@@ -22,6 +22,12 @@
 //! so a finding of a check that is not addressable by resource ARN is reported
 //! by no ARN.
 //!
+//! That derived ARN names the account that OWNS the flagged resource, so a
+//! finding of an organization member account is addressable only by an ARN in
+//! THAT account — which this operation refuses, like any other ARN outside the
+//! calling account, so one account's resources can never answer to another's
+//! ARN.
+//!
 //! A well-formed ARN that no stored recommendation flagged is an EMPTY list,
 //! not a 404: this operation models no `ResourceNotFoundException`, and a
 //! resource Trusted Advisor found nothing wrong with has no recommendations —
