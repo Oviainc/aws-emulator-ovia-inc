@@ -686,9 +686,16 @@ pub fn metadata_for(
 
 /// A request member that is present and not empty, as a `&str`.
 ///
-/// The modelled length bounds on `campaignArn`, `userId` and `itemId` all start at 0,
-/// so the boundary validator accepts an empty string for each; an empty string names
-/// no resource and identifies no user, so every handler treats it as absent.
+/// `userId` and `itemId` are bounded only by a `@length` that starts at 0, so the
+/// boundary validator accepts an empty string for either; an empty string identifies no
+/// user and no item, so every handler reads it as the member not being supplied.
+///
+/// The ARN members — `campaignArn`, `recommenderArn` and `filterArn` — carry that same
+/// length bound AND the `Arn` `@pattern`, which no empty or blank string satisfies, so
+/// the boundary refuses an empty ARN as a pattern violation naming the member before any
+/// handler runs. For those members this is therefore the ABSENT member (the optional
+/// ones a request can leave out), never an empty one, and no handler ever looks an empty
+/// ARN up in the registry.
 pub fn present(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.is_empty())
 }

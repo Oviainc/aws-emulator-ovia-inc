@@ -83,3 +83,22 @@ Test coverage: the empty-string form of a member IS the pinned form elsewhere in
 3. Observe 400 InvalidInputException whose message is " does not exist or is not active yet." — it names no member, echoes no value, and claims a campaign the request never named is missing or not yet ACTIVE.
 4. POST /recommendations with {"campaignArn": "", "userId": "user-1"} and POST /action-recommendations with {"campaignArn": "", "userId": "user-1"} for comparison: both sibling handlers run the member through registry::present and report that no campaign was given ("Either campaignArn or recommenderArn is required." and "The given campaign ARN is invalid: " respectively).
 5. Compare with state.rs:686-693, which states that an empty string "names no resource" and that "every handler treats it as absent".
+
+## Resolution
+
+The premise above does not hold, so the symptom it describes is unreachable: `campaignArn`
+targets `Arn`, which carries the Personalize ARN `@pattern` as well as `length 0..256`
+(`smithy_query(query="shape",shape="Arn")`). An empty or blank string satisfies the length
+bound and misses the pattern, so the request boundary refuses it with the member-naming
+clause `1 validation error detected: Value at 'campaignArn' failed to satisfy constraint:
+Member must satisfy regular expression pattern: arn:([a-z\d-]+):personalize:.*:.*:.+`
+(400 `ValidationException`) and the handler never runs — on all three operations and for
+every ARN-carrying member, including `filterArn` and a promotion's `filterArn`.
+`Denied::unresolvable("")` is therefore never reachable from the wire.
+
+Only `userId` and `itemId` (bounded by `@length` from 0 and nothing else) reach a handler
+empty, and each is already read there as the member not being supplied and refused naming
+the member. The doc comment on `state::present` that this report was derived from claimed
+the empty string reaches the handler for `campaignArn` too; it has been corrected, and the
+behaviour of the whole class is now pinned by
+`services/service-com-amazonaws-personalizeruntime-amazonpersonalizeruntime/tests/all/empty_string_member_constraints.rs`.

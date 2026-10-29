@@ -206,7 +206,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // 2. The campaign, and the recipe type this operation serves.
+        // 2. The campaign, and the recipe type this operation serves. `campaignArn` is
+        //    `@required` and targets `Arn`, whose `@pattern` no empty or blank string
+        //    satisfies, so the boundary has already refused anything that names no
+        //    campaign at all: every value reaching this line is an ARN the boundary
+        //    admitted, which the registry either resolves or reports unresolvable.
         let campaign = guard.campaign(&input.campaign_arn).map_err(deny)?.clone();
         if campaign.recipe_type != RecipeType::PersonalizedRanking {
             return Err(invalid(format!(
