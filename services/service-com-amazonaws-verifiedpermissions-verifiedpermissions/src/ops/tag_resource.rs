@@ -17,9 +17,11 @@
 //! * the only taggable Verified Permissions resource is a policy store, so an
 //!   ARN no live store carries is `ResourceNotFoundException`.
 //!
-//! Tagging does not move the store's `lastUpdatedDate`: a tag is metadata
-//! beside the resource, not part of the configuration the update operations
-//! change, and the clock field is what those report.
+//! A merge that is accepted writes a member of the policy store's OWN record,
+//! so that record's `lastUpdatedDate` moves to the instant of the call — the
+//! same stamp `UpdatePolicyStore` and `PutSchema` move when they write the
+//! store's settings or its schema, and what every reader of the store reports
+//! afterwards. A merge that is REFUSED writes nothing, stamp included.
 //!
 //! ---
 //!
@@ -181,6 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         store.tags = merged;
+        // The tag set is a member of the store's own record, so writing it
+        // changed the store: its `lastUpdatedDate` moves to this instant, as it
+        // does for a write to the store's settings or its schema.
+        store.last_updated_date = crate::state::now();
 
         crate::ops::audit(ctx, "TagResource", &store_id, "tagged");
         Ok(TagResourceOutput {})

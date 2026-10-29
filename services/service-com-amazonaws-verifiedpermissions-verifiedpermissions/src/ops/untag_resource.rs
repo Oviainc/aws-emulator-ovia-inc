@@ -14,6 +14,11 @@
 //! The only taggable Verified Permissions resource is a policy store, so an ARN
 //! no live store carries is `ResourceNotFoundException`.
 //!
+//! Removing tags writes a member of the policy store's OWN record, so that
+//! record's `lastUpdatedDate` moves to the instant of the call — the same stamp
+//! `TagResource`, `UpdatePolicyStore` and `PutSchema` move when they write the
+//! store's tags, its settings or its schema.
+//!
 //! ---
 //!
 //! # Modeled contract for `UntagResource`
@@ -145,6 +150,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for key in &input.tag_keys {
             store.tags.remove(key);
         }
+        // The tag set is a member of the store's own record, so writing it
+        // changed the store: its `lastUpdatedDate` moves to this instant, as it
+        // does for a write to the store's settings or its schema.
+        store.last_updated_date = crate::state::now();
 
         crate::ops::audit(ctx, "UntagResource", &store_id, "untagged");
         Ok(UntagResourceOutput {})

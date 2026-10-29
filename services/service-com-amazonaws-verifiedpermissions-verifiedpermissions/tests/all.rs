@@ -53,6 +53,8 @@ mod policy_store_alias;
 mod policy_store_authorization;
 #[path = "all/policy_store_id_only_references.rs"]
 mod policy_store_id_only_references;
+#[path = "all/policy_store_record_stamp.rs"]
+mod policy_store_record_stamp;
 #[path = "all/policy_store_settings.rs"]
 mod policy_store_settings;
 #[path = "all/policy_templates.rs"]
