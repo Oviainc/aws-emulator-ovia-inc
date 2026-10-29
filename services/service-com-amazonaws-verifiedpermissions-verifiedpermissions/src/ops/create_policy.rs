@@ -262,13 +262,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let parameters = match &input.definition {
             PolicyDefinition::Static(def) => crate::state::idempotency_parameters(&[
                 ("store", Some(store_id.as_str())),
-                ("name", input.name.as_deref()),
+                ("name", crate::state::assigned_name(input.name.as_deref())),
                 ("statement", Some(def.statement.as_str())),
                 ("description", def.description.as_deref()),
             ]),
             PolicyDefinition::templateLinked(def) => crate::state::idempotency_parameters(&[
                 ("store", Some(store_id.as_str())),
-                ("name", input.name.as_deref()),
+                ("name", crate::state::assigned_name(input.name.as_deref())),
                 ("policyTemplateId", Some(def.policy_template_id.as_str())),
                 (
                     "principalType",
@@ -402,8 +402,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A policy name is unique within its store.
-        if let Some(name) = input.name.as_deref() {
+        // A policy name is unique within its store — among the policies that
+        // were ASSIGNED a name, so a request assigning none collides with
+        // nothing ([`crate::state::assigned_name`]).
+        if let Some(name) = crate::state::assigned_name(input.name.as_deref()) {
             if let Some(clash) = store
                 .policies
                 .values()
@@ -429,7 +431,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy_id: policy_id.clone(),
             policy_store_id: store_id.clone(),
             policy_type: policy_type.to_string(),
-            name: input.name.clone(),
+            // The name this request assigns, which an empty member assigns none
+            // of — the same reading `UpdatePolicy` applies to the same member.
+            name: crate::state::assigned_name(input.name.as_deref()).map(str::to_string),
             statement,
             description,
             template_link,

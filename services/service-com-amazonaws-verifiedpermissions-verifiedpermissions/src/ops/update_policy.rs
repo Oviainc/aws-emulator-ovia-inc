@@ -336,8 +336,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If you specify a name that is already associated with another policy
         // in the policy store, you receive a ConflictException error" — another
-        // policy: a request repeating this policy's own name changes nothing.
-        if let Some(name) = input.name.as_deref() {
+        // policy: a request repeating this policy's own name changes nothing, and
+        // one assigning no name ([`crate::state::assigned_name`]) collides with
+        // nothing.
+        if let Some(name) = crate::state::assigned_name(input.name.as_deref()) {
             if let Some(clash) = store
                 .policies
                 .values()
@@ -376,9 +378,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy.actions = scope.actions;
         }
         // "If you don't include the name in an update request, the existing name
-        // is unchanged. To remove a name, set it to an empty string ("")."
-        if let Some(name) = input.name.clone() {
-            policy.name = (!name.is_empty()).then_some(name);
+        // is unchanged. To remove a name, set it to an empty string ("")" — which
+        // is what reading the member through [`crate::state::assigned_name`] says.
+        if input.name.is_some() {
+            policy.name = crate::state::assigned_name(input.name.as_deref()).map(str::to_string);
         }
         policy.last_updated_date = crate::state::now();
 

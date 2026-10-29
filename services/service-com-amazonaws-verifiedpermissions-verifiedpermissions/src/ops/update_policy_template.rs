@@ -289,8 +289,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If you specify a name that is already associated with another policy
         // template in the policy store, you receive a ConflictException error" —
         // another template: a request repeating this template's own name changes
-        // nothing.
-        if let Some(name) = input.name.as_deref() {
+        // nothing, and one assigning no name ([`crate::state::assigned_name`])
+        // collides with nothing.
+        if let Some(name) = crate::state::assigned_name(input.name.as_deref()) {
             if let Some(clash) = store.policy_templates.values().find(|other| {
                 other.name.as_deref() == Some(name) && other.policy_template_id != template_id
             }) {
@@ -319,8 +320,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `description` follows the request, as it does on `UpdatePolicyStore`: a
         // call carrying none leaves the template without one.
         template.description = input.description.clone();
-        if let Some(name) = input.name.clone() {
-            template.name = (!name.is_empty()).then_some(name);
+        if input.name.is_some() {
+            template.name = crate::state::assigned_name(input.name.as_deref()).map(str::to_string);
         }
         template.last_updated_date = crate::state::now();
 

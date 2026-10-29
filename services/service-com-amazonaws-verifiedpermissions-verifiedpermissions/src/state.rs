@@ -800,6 +800,26 @@ pub struct PolicyTemplate {
     pub last_updated_date: DateTime,
 }
 
+/// The name an optional `name` request member ASSIGNS to the resource it
+/// arrived on, or `None` when it assigns none.
+///
+/// Every such member of this service is modelled `len 0..150`, so the empty
+/// string reaches a handler, and the only meaning the API gives that value is
+/// "no name": `UpdatePolicy`/`UpdatePolicyTemplate` document "to remove a name,
+/// set it to an empty string", and what a read reports is "the name ..., if one
+/// was assigned when the policy was created or last updated"
+/// (`smithy_query(query="shape", shape="PolicyItem")`). A name is also the
+/// `name/<name>` reference a caller may use in place of an id
+/// ([`POLICY_NAME_PREFIX`]), and the empty string is no such reference.
+///
+/// So this is the ONE reading of a `name` member every handler goes through,
+/// create and update alike: an empty one assigns no name, which means nothing is
+/// stored for it, no response reports it, it takes part in no name-uniqueness
+/// check and it resolves no `name/` reference.
+pub fn assigned_name(name: Option<&str>) -> Option<&str> {
+    name.filter(|name| !name.is_empty())
+}
+
 /// Why a `policyStoreId` request member named no store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreLookupMiss {

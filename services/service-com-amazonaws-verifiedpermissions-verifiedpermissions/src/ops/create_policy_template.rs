@@ -216,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // first call created; the same token with different parameters conflicts.
         let parameters = crate::state::idempotency_parameters(&[
             ("store", Some(store_id.as_str())),
-            ("name", input.name.as_deref()),
+            ("name", crate::state::assigned_name(input.name.as_deref())),
             ("statement", Some(input.statement.as_str())),
             ("description", input.description.as_deref()),
         ]);
@@ -275,8 +275,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is already associated with another policy template in the policy store,
         // you receive a ConflictException error." Checked BEFORE the quota, so a
         // name that already exists is the documented conflict whether or not the
-        // store is also at its bound.
-        if let Some(name) = input.name.as_deref() {
+        // store is also at its bound. A request that assigns no name — which an
+        // empty member does ([`crate::state::assigned_name`]) — collides with
+        // nothing.
+        if let Some(name) = crate::state::assigned_name(input.name.as_deref()) {
             if let Some(clash) = store
                 .policy_templates
                 .values()
@@ -324,7 +326,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let template = crate::state::PolicyTemplate {
             policy_template_id: policy_template_id.clone(),
             policy_store_id: store_id.clone(),
-            name: input.name.clone(),
+            // The name this request assigns, which an empty member assigns none
+            // of — the same reading `UpdatePolicyTemplate` applies to the same
+            // member.
+            name: crate::state::assigned_name(input.name.as_deref()).map(str::to_string),
             description: input.description.clone(),
             statement: input.statement.clone(),
             created_date: created,
