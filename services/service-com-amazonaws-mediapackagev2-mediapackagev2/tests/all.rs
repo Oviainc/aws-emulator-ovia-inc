@@ -126,3 +126,5 @@ mod entity_tag_precondition_precedence;
 mod tagging_arn_refusal_parity;
 #[path = "all/channel_reset_removes_ingested_content.rs"]
 mod channel_reset_removes_ingested_content;
+#[path = "all/origin_endpoint_reset_content_scope.rs"]
+mod origin_endpoint_reset_content_scope;

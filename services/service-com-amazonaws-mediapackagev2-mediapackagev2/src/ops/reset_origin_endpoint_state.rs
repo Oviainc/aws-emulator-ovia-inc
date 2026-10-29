@@ -2,12 +2,20 @@
 
 //! @op ResetOriginEndpointState
 //!
-//! Resets one origin endpoint: the endpoint's stored content is discarded and the moment
-//! of the reset is recorded on the endpoint as `ResetAt`, so a later `GetOriginEndpoint`
-//! reports the same instant this call answered with. The endpoint's identity and
-//! configuration (ARN, container type, segment, manifests, tags, `CreatedAt`,
-//! `ModifiedAt`, `ETag`) are untouched: a reset clears content, it does not reconfigure
-//! the resource.
+//! Resets one origin endpoint: the instant from which the endpoint no longer offers what
+//! it offered before is recorded on the endpoint as `ResetAt`, so a later
+//! `GetOriginEndpoint` reports the same instant this call answered with.
+//!
+//! That instant is the WHOLE of what a reset persists, because the availability of an
+//! endpoint's content is DERIVED and not stored: no record of this store hangs content off
+//! an origin endpoint — what an endpoint serves would come from the content its channel's
+//! ingest data plane retains, which belongs to the CHANNEL and is removed by that
+//! channel's own reset (`ResetChannelState`), never by a reset of one endpoint beneath it.
+//! So this call deletes no stored object, leaves the endpoints beside it and the channel
+//! above it exactly as they were, and leaves this endpoint's own identity and configuration
+//! (ARN, container type, segment, manifests, tags, `CreatedAt`, `ModifiedAt`, `ETag`)
+//! untouched: a reset moves the boundary of what the endpoint offers, it does not
+//! reconfigure the resource and it removes nothing another resource holds.
 //!
 //! ## Shape of an operation
 //!
@@ -218,10 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // The reset itself. The endpoint holds no media in this emulator, so what a reset
-        // persists is the instant its content was discarded; `ModifiedAt` and the ETag
-        // cover the endpoint's CONFIGURATION, which a reset does not change, so both stay
-        // as they were.
+        // The reset itself: the boundary instant from which this endpoint no longer offers
+        // what it offered before, which is all a reset persists. Nothing is stored UNDER an
+        // origin endpoint for this call to delete — the ingest data plane retains content
+        // against the CHANNEL, which the channel's own reset is what discards — and
+        // `ModifiedAt` and the ETag cover the endpoint's CONFIGURATION, which a reset does
+        // not change, so both stay as they were.
         let reset_at = crate::state::now();
         endpoint.reset_at = Some(reset_at);
 

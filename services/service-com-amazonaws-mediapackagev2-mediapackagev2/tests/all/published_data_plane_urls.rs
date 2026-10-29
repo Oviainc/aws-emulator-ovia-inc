@@ -105,7 +105,10 @@ const EGRESS_METHODS: &[(&str, &str)] = &[
 ];
 
 /// The published URL of the one manifest a response's `family` carries.
-fn manifest_url(created: &Value, family: &str) -> String {
+///
+/// `pub(crate)` for the same reason the client is: `origin_endpoint_reset_content_scope`
+/// addresses published manifest URLs through this one rather than carrying a second copy.
+pub(crate) fn manifest_url(created: &Value, family: &str) -> String {
     created
         .get(family)
         .and_then(Value::as_array)
@@ -118,7 +121,10 @@ fn manifest_url(created: &Value, family: &str) -> String {
 
 /// The path of a sibling object under the same origin endpoint as `manifest_path` — a
 /// segment beside the manifest, so the gate cannot be keyed to the manifest's own name.
-fn sibling_object(manifest_path: &str) -> String {
+///
+/// `pub(crate)`: shared with `origin_endpoint_reset_content_scope`, which probes the same
+/// pair of objects across a reset.
+pub(crate) fn sibling_object(manifest_path: &str) -> String {
     let parent = manifest_path
         .rsplit_once('/')
         .map(|(parent, _object)| parent)
