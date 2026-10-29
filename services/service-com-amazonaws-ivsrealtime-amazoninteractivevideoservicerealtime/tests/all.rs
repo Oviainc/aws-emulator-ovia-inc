@@ -77,6 +77,8 @@ mod list_encoder_configurations;
 mod list_ingest_configurations;
 #[path = "all/list_participant_replicas_paging.rs"]
 mod list_participant_replicas_paging;
+#[path = "all/list_participant_replicas_token_publisher_scope.rs"]
+mod list_participant_replicas_token_publisher_scope;
 #[path = "all/minted_identities.rs"]
 mod minted_identities;
 #[path = "all/page_token_filter_scope.rs"]
