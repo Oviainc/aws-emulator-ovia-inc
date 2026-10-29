@@ -25,6 +25,13 @@
 //!    DISABLED.
 //! 4. Whatever a caller sends through these three operations, no read reports both
 //!    features `ENABLED`.
+//! 5. Rule 3 over the WHOLE create input space rather than a chosen handful: every
+//!    way a create's `Features` list can treat the two features — leaving one out,
+//!    naming it with no status, naming it `ENABLED`, naming it `DISABLED`, in either
+//!    entry order — with the expectation COMPUTED from the rule for each
+//!    combination instead of written out per row, and with the deprecated
+//!    `DataSources` view (which the create applies over the same stored switches)
+//!    present alongside the list.
 
 use serde_json::{json, Value};
 
@@ -457,8 +464,202 @@ async fn a_create_stores_a_default_that_never_carries_both_features() {
 }
 
 // ---------------------------------------------------------------------------
+// Rule 5: the same rule over the whole create input space.
+// ---------------------------------------------------------------------------
+
+/// One way a create's `Features` list can treat one of the two features.
+///
+/// A list either leaves the feature out, or carries an entry for it — and an entry
+/// may state `ENABLED`, state `DISABLED`, or state no status at all, which enables
+/// the feature it names (`smithy_query(shape="DetectorFeatureConfiguration")` makes
+/// `Status` optional).
+#[derive(Clone, Copy, Debug)]
+enum Form {
+    Absent,
+    WithoutStatus,
+    Status(&'static str),
+}
+
+/// Every form, as the exhaustive walk enumerates them for each of the two features.
+const FORMS: [Form; 4] = [
+    Form::Absent,
+    Form::WithoutStatus,
+    Form::Status(ENABLED),
+    Form::Status(DISABLED),
+];
+
+/// The entry `form` puts in the list for `name`, or nothing where it names the
+/// feature at all.
+fn entry(name: &str, form: Form) -> Option<Value> {
+    match form {
+        Form::Absent => None,
+        Form::WithoutStatus => Some(json!({"name": name})),
+        Form::Status(status) => Some(json!({"name": name, "status": status})),
+    }
+}
+
+/// Whether the list ASKS FOR the feature `form` describes: `None` where it does not
+/// name it, otherwise whether the status it states enables it.
+fn asks_for(form: Form) -> Option<bool> {
+    match form {
+        Form::Absent => None,
+        // An entry that states no status enables the feature it names, so only an
+        // explicit DISABLED does not ask for it.
+        Form::WithoutStatus => Some(true),
+        Form::Status(status) => Some(status != DISABLED),
+    }
+}
+
+/// The status a feature ends up with, computed from the RULE rather than looked up
+/// per row: the list's own value where it names the feature; `DISABLED` where it
+/// does not and the list enables the other one of the pair, the service's default
+/// yielding to what the create asked for; and otherwise the default itself —
+/// `ENABLED` for every optional feature "with an exception to RUNTIME_MONITORING"
+/// (`smithy_query(query="doc",shape="CreateDetector")`), which is `enabled_by_default`.
+fn resolved(own: Option<bool>, other: Option<bool>, enabled_by_default: bool) -> &'static str {
+    let enabled = match own {
+        Some(enabled) => enabled,
+        None if other == Some(true) => false,
+        None => enabled_by_default,
+    };
+    if enabled {
+        ENABLED
+    } else {
+        DISABLED
+    }
+}
+
+#[tokio::test]
+async fn no_create_feature_list_can_store_both_runtime_monitoring_features() {
+    for eks in FORMS {
+        for runtime in FORMS {
+            // The entries in both orders, so the walk covers which of the two the
+            // list states first; with one of them absent the two lists are the same
+            // one, so it is sent once.
+            let orders: &[bool] = if matches!(eks, Form::Absent) || matches!(runtime, Form::Absent) {
+                &[false]
+            } else {
+                &[false, true]
+            };
+            for eks_first in orders.iter().copied() {
+                let ordered = if eks_first {
+                    [(EKS, eks), (RUNTIME, runtime)]
+                } else {
+                    [(RUNTIME, runtime), (EKS, eks)]
+                };
+                // A list that names neither feature is the empty one, which the walk
+                // covers too.
+                let entries: Vec<Value> = ordered
+                    .into_iter()
+                    .filter_map(|(name, form)| entry(name, form))
+                    .collect();
+                let case = format!(
+                    "create with {EKS} {eks:?}, {RUNTIME} {runtime:?}, EKS first {eks_first}: \
+                     {entries:?}"
+                );
+
+                let eks_asked = asks_for(eks);
+                let runtime_asked = asks_for(runtime);
+                // "Specifying both ... will cause an error": it is the list naming
+                // both of them as enabled that is refused, and nothing else.
+                let refused = eks_asked == Some(true) && runtime_asked == Some(true);
+                let expected = (
+                    resolved(eks_asked, runtime_asked, true),
+                    resolved(runtime_asked, eks_asked, false),
+                );
+
+                let router = new_router();
+                let (status, created) =
+                    create_detector(&router, json!({"enable": true, "features": entries})).await;
+                if refused {
+                    assert_refused(&case, status, &created);
+                    assert_no_detector(&router, &case).await;
+                    continue;
+                }
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected 200, got {status} {created:?}"
+                );
+                let reported = detector_features(&router, &created_id(&case, &created)).await;
+                assert_pair(&case, &reported, expected);
+            }
+        }
+    }
+}
+
+/// The create applies the deprecated `DataSources` view over the SAME stored
+/// switches its `Features` list is applied over, so the pair resolves the same way
+/// with a view present: the view configures the switches it names and neither of
+/// these two.
+#[tokio::test]
+async fn the_deprecated_data_sources_view_does_not_change_how_the_pair_resolves() {
+    // Every node the view carries, so the case covers a view that writes a switch
+    // beside the pair rather than one that writes nothing.
+    let view = json!({
+        "s3Logs": {"enable": true},
+        "kubernetes": {"auditLogs": {"enable": true}},
+        "malwareProtection": {"scanEc2InstanceWithFindings": {"ebsVolumes": false}},
+    });
+    // `expected` is the pair a read reports, so the refused row — which stores no
+    // detector at all — carries the default pair and never has it read.
+    let rows = [
+        ("no features beside the view", None, false, (ENABLED, DISABLED)),
+        (
+            "the view and a list enabling Runtime Monitoring",
+            Some(json!([{"name": RUNTIME, "status": ENABLED}])),
+            false,
+            (DISABLED, ENABLED),
+        ),
+        (
+            "the view and a list enabling both",
+            Some(json!([{"name": RUNTIME, "status": ENABLED}, {"name": EKS, "status": ENABLED}])),
+            true,
+            (ENABLED, DISABLED),
+        ),
+    ];
+
+    for (case, features, refused, expected) in rows {
+        let router = new_router();
+        let mut body = json!({"enable": true, "dataSources": view.clone()});
+        if let Some(features) = features {
+            body["features"] = features;
+        }
+        let (status, created) = create_detector(&router, body).await;
+        if refused {
+            assert_refused(case, status, &created);
+            assert_no_detector(&router, case).await;
+            continue;
+        }
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} {created:?}"
+        );
+        let reported = detector_features(&router, &created_id(case, &created)).await;
+        assert_pair(case, &reported, expected);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------
+
+/// The id a successful create minted.
+fn created_id(case: &str, created: &Value) -> String {
+    created["detectorId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a detectorId, got {created:?}"))
+        .to_string()
+}
+
+/// A refused create stores nothing, so the account has no detector in this Region.
+async fn assert_no_detector(router: &Router, case: &str) {
+    let (status, listed) = call(router, "GET", "/detector", None).await;
+    assert_eq!(
+        (status, &listed["detectorIds"]),
+        (200, &json!([])),
+        "case {case:?}: a refused create must store no detector, got {listed:?}"
+    );
+}
 
 /// `UpdateDetector` carrying only a `Features` list.
 async fn update_detector(router: &Router, detector_id: &str, features: Value) -> (u16, Value) {
