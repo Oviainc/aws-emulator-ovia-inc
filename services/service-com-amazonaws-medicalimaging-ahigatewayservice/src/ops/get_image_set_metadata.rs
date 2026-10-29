@@ -3,11 +3,11 @@
 //! @op GetImageSetMetadata
 //!
 //! Serves the AGGREGATED DICOM metadata document of one image set, built from persisted
-//! state and nothing else: the patient, study and series attributes the image set holds
-//! ([`crate::state::ImageSet::dicom_tags`]) and the image frames it holds
-//! ([`crate::state::ImageSet::image_frames`]), placed in the patient → study → series →
-//! instance hierarchy DICOM gives them. An attribute nothing has stored is not in the
-//! document at all, so a caller can never read an attribute this emulator invented.
+//! state and nothing else: the patient, study and series attributes the version being read
+//! holds ([`crate::state::ImageSet::attributes_of_version`]) and the image frames the image
+//! set holds ([`crate::state::ImageSet::image_frames`]), placed in the patient → study →
+//! series → instance hierarchy DICOM gives them. An attribute nothing has stored is not in
+//! the document at all, so a caller can never read an attribute this emulator invented.
 //!
 //! The model names sixteen DICOM attributes and DICOM defines thousands, so an image set
 //! also holds the attributes written into it that the model does not name
@@ -26,14 +26,17 @@
 //! because nothing compressed it. The response never names a compression the blob is not
 //! in, so a client decodes the blob from the response alone.
 //!
-//! `version` names ONE version of the image set, and a version the image set does not
-//! hold is absent (404) exactly as it is for `GetImageSet`. The DICOM attributes this
-//! service persists belong to the image SET rather than to one version of it — the
-//! model's own `DICOMTags` is per image set — so every version the image set holds
-//! aggregates the same content. What an EARLIER version held is kept for the one call that
-//! puts it back, a metadata update's revert
-//! ([`crate::state::ImageSet::attributes_of_version`]); once it has, those attributes are
-//! what the image set holds, and this document reports them.
+//! `version` names ONE version of the image set, and the document reports the DICOM
+//! attributes THAT version holds: the latest version's are the attributes the image set
+//! holds now, and an earlier version's are the snapshot taken when a later version
+//! superseded it ([`crate::state::ImageSet::attributes_of_version`]) — the same snapshot a
+//! metadata update's revert puts back, so a version can never be served a document it never
+//! held. A version the image set does not hold is absent (404) exactly as it is for
+//! `GetImageSet`, and a request naming no version reads the latest.
+//!
+//! The pixel data is NOT held per version — an image frame is addressed by its own
+//! identifier alone, which is all `GetImageFrame` takes — so the instance level reports the
+//! frames the image set holds, under the SOP instance each one's pixel data came from.
 //!
 //! A DELETED image set holds no content: its pixel data went with the deletion
 //! ([`crate::state::ImageSet::advance_to`]), so there is no document to aggregate and
@@ -100,7 +103,7 @@ use ::std::collections::BTreeMap;
 use ::serde_json::{Map, Value};
 
 use crate::state::{
-    ImageFrame, ImageSet, METADATA_DATASTORE_ID_KEY, METADATA_DICOM_KEY,
+    ImageFrame, ImageSet, ImageSetAttributes, METADATA_DATASTORE_ID_KEY, METADATA_DICOM_KEY,
     METADATA_IMAGE_SET_ID_KEY, METADATA_INSTANCES_KEY, METADATA_PATIENT_KEY,
     METADATA_SCHEMA_VERSION_KEY, METADATA_SERIES_KEY, METADATA_STUDY_KEY,
 };
@@ -223,15 +226,15 @@ fn instances(image_set: &ImageSet) -> Value {
     Value::Object(instances)
 }
 
-/// The series `image_set` holds, keyed by Series Instance UID.
+/// The series `tags` describe, keyed by Series Instance UID, holding the SOP instances the
+/// pixel data of `image_set` belongs to.
 ///
-/// This service persists the attributes of ONE series per image set (the model's
-/// `DICOMTags` declares one `dicomSeriesInstanceUID`), so an image set that has had DICOM
-/// content delivered to it reports that series and an image set nothing has delivered
-/// content to reports none — rather than a series with no identifier, which no caller
-/// could read an instance out of.
-fn series(image_set: &ImageSet) -> Value {
-    let tags = &image_set.dicom_tags;
+/// This service persists the attributes of ONE series per version of an image set (the
+/// model's `DICOMTags` declares one `dicomSeriesInstanceUID`), so a version that has had
+/// DICOM content delivered to it reports that series and one nothing has delivered content
+/// to reports none — rather than a series with no identifier, which no caller could read an
+/// instance out of.
+fn series(tags: &DICOMTags, image_set: &ImageSet) -> Value {
     let mut series = Map::new();
     if let Some(series_instance_uid) = tags.dicom_series_instance_uid.as_ref() {
         let mut dicom = Map::new();
@@ -290,25 +293,33 @@ fn merge_stored_attributes(document: &mut Value, stored: &Map<String, Value>) {
     }
 }
 
-/// The whole aggregated metadata document of `image_set`, as it stands in `datastore_id`.
+/// The whole aggregated metadata document `attributes` describe for `image_set`, as it
+/// stands in `datastore_id`.
 ///
 /// Every value in it is read from state: the two identifiers name the records the document
-/// was built from, and the attribute objects carry what has been stored for the image set
-/// and nothing besides. The structure built here is what the document reports — the
-/// attributes stored for the image set are merged INTO it ([`merge_stored_attributes`]), so
-/// nothing a caller stored can report another identity for it or hide a level of it.
-fn metadata_document(datastore_id: &str, image_set: &ImageSet) -> Value {
+/// was built from, and the attribute objects carry what has been stored for the version
+/// being read and nothing besides — which is why the attributes are passed IN rather than
+/// taken off the image set, so reading one version and reading another serve each one's own
+/// content. The structure built here is what the document reports — the attributes stored
+/// are merged INTO it ([`merge_stored_attributes`]), so nothing a caller stored can report
+/// another identity for it or hide a level of it.
+fn metadata_document(
+    datastore_id: &str,
+    image_set: &ImageSet,
+    attributes: &ImageSetAttributes,
+) -> Value {
+    let tags = &attributes.dicom_tags;
     let mut document = ::serde_json::json!({
         METADATA_SCHEMA_VERSION_KEY: METADATA_SCHEMA_VERSION,
         METADATA_DATASTORE_ID_KEY: datastore_id,
         METADATA_IMAGE_SET_ID_KEY: image_set.image_set_id,
-        METADATA_PATIENT_KEY: { METADATA_DICOM_KEY: patient_attributes(&image_set.dicom_tags) },
+        METADATA_PATIENT_KEY: { METADATA_DICOM_KEY: patient_attributes(tags) },
         METADATA_STUDY_KEY: {
-            METADATA_DICOM_KEY: study_attributes(&image_set.dicom_tags),
-            METADATA_SERIES_KEY: series(image_set),
+            METADATA_DICOM_KEY: study_attributes(tags),
+            METADATA_SERIES_KEY: series(tags, image_set),
         },
     });
-    merge_stored_attributes(&mut document, &image_set.extra_attributes);
+    merge_stored_attributes(&mut document, &attributes.extra_attributes);
     document
 }
 
@@ -429,21 +440,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `version` names ONE version of the image set; a version this image set does
-        // not hold is absent, not invalid. The content aggregated below belongs to the
-        // image SET, so every version it holds reports the same document.
-        if let Some(version_id) = &input.version_id {
-            if image_set.version(version_id).is_none() {
-                return Err(GetImageSetMetadataErrorModeled::ResourceNotFoundException(
+        // `version` names ONE version of the image set, and the attributes aggregated
+        // below are the ones THAT version holds: the latest version's are the image set's
+        // own, an earlier version's the snapshot taken when it was superseded. A version
+        // this image set does not hold holds no attributes to read, so it is absent rather
+        // than invalid; naming no version reads the latest.
+        let attributes = match &input.version_id {
+            Some(version_id) => image_set.attributes_of_version(version_id).ok_or_else(|| {
+                GetImageSetMetadataErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: crate::state::IMAGE_SET_VERSION_NOT_FOUND_MESSAGE.to_string(),
                     },
                 )
-                .into());
-            }
-        }
+            })?,
+            None => image_set.attributes(),
+        };
 
-        let document = metadata_document(&input.datastore_id, image_set);
+        let document = metadata_document(&input.datastore_id, image_set, &attributes);
         let serialized = ::serde_json::to_vec(&document).map_err(|_| {
             GetImageSetMetadataErrorModeled::InternalServerException(InternalServerException {
                 message: "the image set metadata document could not be written".to_string(),

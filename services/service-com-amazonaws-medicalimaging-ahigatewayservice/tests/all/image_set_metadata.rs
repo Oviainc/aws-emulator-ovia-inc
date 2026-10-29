@@ -12,7 +12,9 @@
 //! has stored is
 //! absent from the document rather than invented, so an image set nothing has delivered
 //! DICOM content to reports the hierarchy with no attributes and no series at all.
-//! `version` names one version of the image set, and a version it does not hold is 404
+//! `version` names one version of the image set, whose own attributes the document then
+//! reports (`image_set_metadata_versions` is that rule's suite), and a version it does not
+//! hold is 404
 //! `ResourceNotFoundException`, as are a data store or image set the service does not
 //! hold and an image set whose content went with its deletion; an identifier outside its
 //! modelled pattern is 400 `ValidationException`. Serving the metadata is an ACCESS of
@@ -211,6 +213,11 @@ fn seed(emulator: &Emulator, datastore_id: &str, case: &DocumentCase) -> (String
         false,
         SystemTime::now(),
     );
+    // The attributes before the versions: `push_version` snapshots what the image set
+    // holds AT THAT INSTANT onto the version it supersedes, so seeding this way gives every
+    // version this image set holds the content the case names — which is the content each
+    // of them must then report.
+    image_set.dicom_tags = case.tags.clone();
     for _ in 1..case.versions {
         image_set.push_version(
             ImageSetState::Active,
@@ -219,7 +226,6 @@ fn seed(emulator: &Emulator, datastore_id: &str, case: &DocumentCase) -> (String
             SystemTime::now(),
         );
     }
-    image_set.dicom_tags = case.tags.clone();
     for (frame_id, frame) in frame_ids.iter().zip(&case.frames) {
         image_set.image_frames.insert(
             frame_id.clone(),
@@ -539,8 +545,8 @@ async fn the_document_aggregates_exactly_what_the_image_set_holds() {
         let read = get_image_set_metadata(&emulator, &datastore_id, &image_set_id, None).await;
         assert_document(&read, &case, &datastore_id, &image_set_id, &frame_ids);
 
-        // Every version the image set holds aggregates the same content, and one past
-        // its latest is absent.
+        // Every version this image set holds held the content the case seeded, so each one
+        // reports it; one past its latest is absent.
         for version in 1..=case.versions {
             let for_version = get_image_set_metadata(
                 &emulator,
