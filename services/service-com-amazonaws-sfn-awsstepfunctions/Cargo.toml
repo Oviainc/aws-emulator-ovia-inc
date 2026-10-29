@@ -45,6 +45,10 @@ tracing = { workspace = true }
 # KMS makes about it: read out of the KMS service's own store, so this service and KMS
 # cannot disagree about what a key permits the caller of a read.
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# The identity-based policies in force on a state machine's EXECUTION ROLE, which is
+# what a `Task` state's integration call is made as: read out of IAM's own store, so
+# this service judges that call against the documents IAM's handlers wrote.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -56,10 +60,6 @@ hex = { workspace = true }
 # mounted beside Step Functions on the one engine the test router builds, the same shape
 # `core/router/src/lib.rs` mounts them in, so the call a task makes is served for real.
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
-# The principals `tests/all/execution_data_encryption.rs` judges a KMS key policy
-# against are made with IAM's own operations over that same engine, so the identity
-# policy the decision reads is the document IAM's handlers wrote.
-service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [lints]
 workspace = true

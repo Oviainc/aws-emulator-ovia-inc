@@ -349,7 +349,8 @@ async fn a_task_state_makes_the_call_its_resource_names() {
          GetItem"
     );
 
-    // A READING operation's response document is the state's result.
+    // A READING operation's response document is the state's result, beside the SDK
+    // response envelope an optimized integration reports it in.
     let read = chain
         .run(
             "chain-get",
@@ -360,10 +361,18 @@ async fn a_task_state_makes_the_call_its_resource_names() {
             &json!({}),
         )
         .await;
+    let result = output(&read, "a getItem integration");
     assert_eq!(
-        output(&read, "a getItem integration"),
-        json!({ "Item": { "pk": { "S": "o-1" }, "status": { "S": "shipped" } } }),
-        "case \"a getItem integration\": the state's result is the response document"
+        result.get("Item"),
+        Some(&json!({ "pk": { "S": "o-1" }, "status": { "S": "shipped" } })),
+        "case \"a getItem integration\": the state's result is the response document, got \
+         {result}"
+    );
+    assert_eq!(
+        result.pointer("/SdkHttpMetadata/HttpStatusCode"),
+        Some(&json!(200)),
+        "case \"a getItem integration\": the result carries the status the call answered, got \
+         {result}"
     );
 
     // A DELETE really removes the item.

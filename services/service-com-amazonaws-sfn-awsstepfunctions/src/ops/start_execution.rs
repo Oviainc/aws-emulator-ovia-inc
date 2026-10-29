@@ -421,6 +421,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // This is the attempt a START began, so the execution has been redriven
             // no times: the count the record is admitted with below.
             redrive_count: 0,
+            // The workflow type this execution runs under, which decides whether a
+            // `Task` state may ask for the run-a-job (`.sync`) integration pattern.
+            express: machine_type == crate::state::STATE_MACHINE_TYPE_EXPRESS,
         };
         // The walk is CPU work a caller's definition sizes, so it runs on a blocking
         // thread rather than on an async worker: an interpretation that reaches its
@@ -430,10 +433,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // made HERE, on this request's own task, with the walk waiting for its answer
         // (`state::integration::interpret`); the calls go out in the state machine's
         // own Region, which is the Region its execution reports.
+        // What this execution's `Task` states may do is what the policies in force on
+        // the state machine's execution role allow them: the calls below are made as
+        // that role ([`crate::state::task_authorization`]).
+        let role = crate::state::task_authorization::role_gate(&self.engine, &role_arn);
         let interpreted = {
             let definition = definition.clone();
             let execution_input = execution_input.clone();
-            crate::state::integration::interpret(ctx, &region, move |tasks| {
+            crate::state::integration::interpret(ctx, &region, role, move |tasks| {
                 crate::state::plan_run(
                     &crate::state::RunAttempt {
                         definition: &definition,

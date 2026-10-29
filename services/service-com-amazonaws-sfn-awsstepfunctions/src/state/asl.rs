@@ -33,6 +33,20 @@
 //!   worker exactly as it does on the real service. `GetActivityTask` hands that task
 //!   out; the worker's reply closes it.
 //!
+//! Two things decide whether that call is made at all, and both answer before it
+//! would be: the WORKFLOW TYPE, since the run-a-job pattern is served for `STANDARD`
+//! only and an EXPRESS execution fails at the state that asks for it
+//! ([`EXPRESS_RUN_A_JOB_UNSUPPORTED`]); and what the state machine's EXECUTION ROLE
+//! may do, since the call is made as that role and one its policies do not allow
+//! fails the task with the invoked service's own refusal
+//! ([`super::task_authorization`], asked through [`Tasks::authorize`]). Neither
+//! starts anything first.
+//!
+//! Every state records the pair of events the language names it with — entered, and
+//! left — each carrying the state's own data: the document it was entered WITH, and
+//! the one it EMITTED once its result-side filters had been applied, which is what a
+//! caller reconstructs an execution's data flow from.
+//!
 //! What is NOT executed is what cannot be executed inside this process:
 //!
 //! * an integration [`super::integration::read`] makes no call for — a service whose
@@ -159,6 +173,25 @@ pub const TOLERATED_FAILURE_ERROR: &str = "States.ExceedToleratedFailureThreshol
 /// The ASL predefined error name for an execution that ran longer than the
 /// `TimeoutSeconds` its definition declares ("States.Timeout").
 pub const TIMEOUT_ERROR: &str = "States.Timeout";
+
+/// The refusal an EXPRESS workflow answers a `Task` state that asks for the
+/// run-a-job (`.sync`) integration pattern with.
+///
+/// The pattern is served only for the STANDARD workflow type: an Express state
+/// machine is created from such a definition, and every execution of it fails AT that
+/// state with [`RUNTIME_ERROR`] carrying this sentence, having started no job. The
+/// state it failed at is named beside it ([`express_run_a_job_refusal`]), because a
+/// definition may carry several.
+pub const EXPRESS_RUN_A_JOB_UNSUPPORTED: &str =
+    "Express state machine does not support '.sync' service integration";
+
+/// [`EXPRESS_RUN_A_JOB_UNSUPPORTED`] as the state `name` reports it.
+fn express_run_a_job_refusal(name: &str) -> Failure {
+    runtime(format!(
+        "An error occurred while executing the state '{name}'. \
+         {EXPRESS_RUN_A_JOB_UNSUPPORTED}"
+    ))
+}
 
 /// The most state transitions one execution makes before the interpreter stops it.
 ///
@@ -814,6 +847,15 @@ pub struct Context {
     /// integer `DescribeExecution` projects as `redriveCount`, because both come from
     /// the one execution record.
     pub redrive_count: i32,
+    /// Whether the state machine being run is an EXPRESS workflow.
+    ///
+    /// Not a member of the context object a definition reads: it is the workflow type
+    /// the execution's own record carries, and the walk needs it because one
+    /// integration PATTERN is served only for the other workflow type — a `Task`
+    /// state asking for the run-a-job (`.sync`) pattern inside an Express workflow
+    /// fails at that state instead of starting a job
+    /// ([`EXPRESS_RUN_A_JOB_UNSUPPORTED`]).
+    pub express: bool,
 }
 
 impl Context {
@@ -2707,6 +2749,7 @@ fn interpret(
         machine_name: context.state_machine_name.clone(),
         region: super::arn_region(&context.state_machine_arn),
         child_counter: 0,
+        express: context.express,
     };
     let branch = interpreter.walk(
         states,
@@ -3098,6 +3141,9 @@ struct Interpreter<'tasks> {
     /// one's drawn name so two mints in the same nanosecond differ — exactly as the
     /// store's own counter does for an execution name it mints.
     child_counter: u64,
+    /// Whether this walk runs an EXPRESS workflow, which is what refuses a `Task`
+    /// state asking for the run-a-job pattern ([`Context::express`]).
+    express: bool,
 }
 
 /// Where a walk applied an [`ActivityReply`]: the step its own events begin at, and
@@ -3304,7 +3350,7 @@ impl Interpreter<'_> {
 
         match state_type {
             "Pass" => {
-                self.push("PassStateEntered", name, at);
+                self.push_entered("PassStateEntered", name, at, &raw);
                 // "Parameters ... Used to create a collection of key-value pairs
                 // that will be passed as input": it transforms the state's effective
                 // INPUT. `Result` is the state's RESULT, so a state that declares
@@ -3319,7 +3365,7 @@ impl Interpreter<'_> {
                 let value = self
                     .place_result(state, &raw, result, &context, false)
                     .map_err(|failure| failure.at(at))?;
-                self.push("PassStateExited", name, at);
+                self.push_exited("PassStateExited", name, at, &value);
                 Ok(StateStep {
                     value,
                     at,
@@ -3327,7 +3373,7 @@ impl Interpreter<'_> {
                 })
             }
             "Wait" => {
-                self.push("WaitStateEntered", name, at);
+                self.push_entered("WaitStateEntered", name, at, &raw);
                 let waited = self
                     .wait_duration(state, &effective, &context, at)
                     .map_err(|why| runtime(format!("state '{name}': {why}")).at(at))?;
@@ -3335,7 +3381,7 @@ impl Interpreter<'_> {
                 let value = self
                     .output_value(state, effective, &context)
                     .map_err(|failure| failure.at(at))?;
-                self.push("WaitStateExited", name, at);
+                self.push_exited("WaitStateExited", name, at, &value);
                 Ok(StateStep {
                     value,
                     at,
@@ -3343,14 +3389,14 @@ impl Interpreter<'_> {
                 })
             }
             "Choice" => {
-                self.push("ChoiceStateEntered", name, at);
+                self.push_entered("ChoiceStateEntered", name, at, &raw);
                 let next = self
                     .choose(state, &effective, &context)
                     .map_err(|failure| failure.at(at))?;
                 let value = self
                     .output_value(state, effective, &context)
                     .map_err(|failure| failure.at(at))?;
-                self.push("ChoiceStateExited", name, at);
+                self.push_exited("ChoiceStateExited", name, at, &value);
                 Ok(StateStep {
                     value,
                     at,
@@ -3358,11 +3404,11 @@ impl Interpreter<'_> {
                 })
             }
             "Succeed" => {
-                self.push("SucceedStateEntered", name, at);
+                self.push_entered("SucceedStateEntered", name, at, &raw);
                 let value = self
                     .output_value(state, effective, &context)
                     .map_err(|failure| failure.at(at))?;
-                self.push("SucceedStateExited", name, at);
+                self.push_exited("SucceedStateExited", name, at, &value);
                 Ok(StateStep {
                     value,
                     at,
@@ -3370,7 +3416,7 @@ impl Interpreter<'_> {
                 })
             }
             "Fail" => {
-                self.push("FailStateEntered", name, at);
+                self.push_entered("FailStateEntered", name, at, &raw);
                 // A `Fail` state ends the execution with the error and cause it
                 // declares, both of which ASL leaves optional and either of which
                 // may instead be read from the state's input through a `*Path`.
@@ -3452,7 +3498,7 @@ impl Interpreter<'_> {
             }
             None => effective,
         };
-        self.push("TaskStateEntered", name, at);
+        self.push_entered("TaskStateEntered", name, at, raw);
         self.push("ActivityScheduled", name, at);
         // A worker has already answered THIS state's task: the reply is that task's
         // result — "the JSON output of the task" — so the state's own result-side data
@@ -3473,7 +3519,7 @@ impl Interpreter<'_> {
             let value = self
                 .place_result(state, raw, reply.result, context, true)
                 .map_err(|failure| failure.at(at))?;
-            self.push("TaskStateExited", name, at);
+            self.push_exited("TaskStateExited", name, at, &value);
             let next = self.next_of(name, state).map_err(|failure| failure.at(at))?;
             return Ok(StateStep { value, at, next });
         }
@@ -3588,6 +3634,50 @@ impl Interpreter<'_> {
         );
     }
 
+    /// The event a state records when it is ENTERED, carrying the data that state was
+    /// entered WITH: "the string that contains the JSON input data for the state",
+    /// which is the raw input the state received, before its own `InputPath` selects
+    /// from it.
+    fn push_entered(
+        &mut self,
+        event_type: &'static str,
+        state_name: &str,
+        after: Duration,
+        input: &Value,
+    ) {
+        self.push_detailed(
+            event_type,
+            state_name,
+            after,
+            super::EventDetails {
+                input: Some(input.to_string()),
+                ..super::EventDetails::default()
+            },
+        );
+    }
+
+    /// The event a state records when it is LEFT, carrying the data that state EMITTED:
+    /// "the JSON output data of the state", which is the document the state's own
+    /// result-side data flow produced — `ResultSelector`, then `ResultPath`, then
+    /// `OutputPath` — and is the next state's input.
+    fn push_exited(
+        &mut self,
+        event_type: &'static str,
+        state_name: &str,
+        after: Duration,
+        output: &Value,
+    ) {
+        self.push_detailed(
+            event_type,
+            state_name,
+            after,
+            super::EventDetails {
+                output: Some(output.to_string()),
+                ..super::EventDetails::default()
+            },
+        );
+    }
+
     /// One history event carrying what the walk knew about it.
     fn push_detailed(
         &mut self,
@@ -3682,7 +3772,7 @@ impl Interpreter<'_> {
                 let value = self
                     .place_result(state, raw, result, context, true)
                     .map_err(|failure| failure.at(at))?;
-                self.push("TaskStateExited", name, at);
+                self.push_exited("TaskStateExited", name, at, &value);
                 let next = self.next_of(name, state).map_err(|failure| failure.at(at))?;
                 Ok(StateStep { value, at, next })
             }
@@ -3978,7 +4068,7 @@ impl Interpreter<'_> {
         if super::names_an_activity(task_resource(state)) {
             return self.activity_task_state(name, state, &raw, effective, context, at);
         }
-        self.push("TaskStateEntered", name, at);
+        self.push_entered("TaskStateEntered", name, at, &raw);
         let resource = state.get("Resource").and_then(Value::as_str).ok_or_else(|| {
             runtime(format!(
                 "the 'Task' state '{name}' carries no string 'Resource', so it names no work"
@@ -4057,6 +4147,18 @@ impl Interpreter<'_> {
                 at,
             ));
         }
+        // The run-a-job pattern is served only for the STANDARD workflow type, so an
+        // EXPRESS execution fails AT this state and the integration's call is NOT
+        // made: no job is started for a task the workflow type cannot wait at.
+        if call.job.is_some() && self.express {
+            return Err(self.task_fault(
+                name,
+                &resource_type,
+                &action,
+                express_run_a_job_refusal(name),
+                at,
+            ));
+        }
         let (outcome, end) = self.with_retries(state, at, &mut |me, at| {
             // This attempt's own request reads `$$.State.RetryCount`, so the payload
             // template is rendered with the context of the attempt it is on.
@@ -4087,6 +4189,20 @@ impl Interpreter<'_> {
                     ..super::EventDetails::default()
                 },
             );
+            // The call is made AS the state machine's execution role, so what that
+            // role may do decides whether it is made AT ALL: a call the policies in
+            // force on the role do not allow is the invoked service's own
+            // access-denied refusal and this task's own failure, reported before the
+            // request goes anywhere — so nothing is started for it and no submission
+            // is claimed.
+            if let Some(refused) = me.tasks.authorize(&call, &request) {
+                let failure = Failure {
+                    error: Some(refused.error),
+                    cause: Some(refused.cause),
+                };
+                me.push_task_failure(name, &resource_type, &action, &failure, at);
+                return (Err(failure), at);
+            }
             me.push_detailed(
                 super::EVENT_TASK_STARTED,
                 name,
@@ -4184,7 +4300,7 @@ impl Interpreter<'_> {
                 let value = self
                     .place_result(state, &raw, result, context, true)
                     .map_err(|failure| failure.at(end))?;
-                self.push("TaskStateExited", name, end);
+                self.push_exited("TaskStateExited", name, end, &value);
                 Ok(StateStep {
                     value,
                     at: end,
@@ -4217,7 +4333,7 @@ impl Interpreter<'_> {
         context: &Value,
         at: Duration,
     ) -> Result<StateStep, Fault> {
-        self.push("MapStateEntered", name, at);
+        self.push_entered("MapStateEntered", name, at, &raw);
         // Which Map state of this walk this one is, in ENTRY order: the Map Run it may
         // start is recorded once its items are done, and the list it goes in is read
         // in this order rather than that one.
@@ -4334,7 +4450,7 @@ impl Interpreter<'_> {
                 let value = self
                     .place_result(state, &raw, results, context, true)
                     .map_err(|failure| failure.at(end))?;
-                self.push("MapStateExited", name, end);
+                self.push_exited("MapStateExited", name, end, &value);
                 Ok(StateStep {
                     value,
                     at: end,
@@ -4657,7 +4773,7 @@ impl Interpreter<'_> {
         context: &Value,
         at: Duration,
     ) -> Result<StateStep, Fault> {
-        self.push("ParallelStateEntered", name, at);
+        self.push_entered("ParallelStateEntered", name, at, &raw);
         let branches = state
             .get("Branches")
             .and_then(Value::as_array)
@@ -4719,7 +4835,7 @@ impl Interpreter<'_> {
                 let value = self
                     .place_result(state, &raw, results, context, true)
                     .map_err(|failure| failure.at(end))?;
-                self.push("ParallelStateExited", name, end);
+                self.push_exited("ParallelStateExited", name, end, &value);
                 Ok(StateStep {
                     value,
                     at: end,
@@ -4999,7 +5115,7 @@ impl Interpreter<'_> {
             let value = self
                 .place_result(catcher, raw, failure.payload(), context, true)
                 .map_err(|failure| failure.at(at))?;
-            self.push(left, name, at);
+            self.push_exited(left, name, at, &value);
             return Ok(StateStep {
                 value,
                 at,
@@ -6639,6 +6755,9 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         machine_name: test.context.state_machine_name.clone(),
         region: super::arn_region(&test.context.state_machine_arn),
         child_counter: 0,
+        // The state under test belongs to no state machine, so no workflow type
+        // refuses it: the context the request supplies says nothing of one.
+        express: test.context.express,
     };
     interpreter.trial(test, &raw, inspection)
 }

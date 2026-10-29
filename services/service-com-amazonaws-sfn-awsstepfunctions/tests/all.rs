@@ -65,6 +65,8 @@ mod execution_interpreter;
 mod execution_key_state;
 #[path = "all/execution_redrive.rs"]
 mod execution_redrive;
+#[path = "all/express_run_a_job_refusal.rs"]
+mod express_run_a_job_refusal;
 #[path = "all/integration_member_names.rs"]
 mod integration_member_names;
 #[path = "all/json_parse_diagnostics.rs"]
@@ -85,8 +87,12 @@ mod refusal_message_wording;
 mod resource_tags;
 #[path = "all/response_request_id.rs"]
 mod response_request_id;
+#[path = "all/sdk_response_envelope.rs"]
+mod sdk_response_envelope;
 #[path = "all/send_task_failure.rs"]
 mod send_task_failure;
+#[path = "all/state_data_in_history.rs"]
+mod state_data_in_history;
 #[path = "all/state_machine_aliases.rs"]
 mod state_machine_aliases;
 #[path = "all/state_machine_create_options.rs"]
@@ -107,6 +113,8 @@ mod state_roundtrip;
 mod sync_execution;
 #[path = "all/sync_service_integration.rs"]
 mod sync_service_integration;
+#[path = "all/task_execution_role.rs"]
+mod task_execution_role;
 #[path = "all/task_integrations.rs"]
 mod task_integrations;
 #[path = "all/terminal_runtime_errors.rs"]

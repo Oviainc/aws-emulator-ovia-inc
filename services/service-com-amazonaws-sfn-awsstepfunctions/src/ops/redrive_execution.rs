@@ -298,6 +298,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // count this redrive takes the record to — the same one
                 // `DescribeExecution` projects once it is recorded below.
                 redrive_count: execution.redrive_count.saturating_add(1),
+                // The workflow type the re-run is interpreted under, which decides
+                // whether a `Task` state may ask for the run-a-job (`.sync`) pattern.
+                express: machine.sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS,
             };
             // "Redriven executions use the same state machine definition [...] as the
             // original execution attempt": the configuration the record was started
@@ -331,7 +334,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The re-run's integration calls go out in the state machine's own
             // Region, exactly as the first attempt's did.
             let region = crate::state::arn_region(&context.state_machine_arn);
-            crate::state::integration::interpret(ctx, &region, move |tasks| {
+            // And they are made as the SAME execution role the first attempt ran as,
+            // which is the one the record was started with.
+            let role =
+                crate::state::task_authorization::role_gate(&self.engine, &context.role_arn);
+            crate::state::integration::interpret(ctx, &region, role, move |tasks| {
                 crate::state::plan_redrive(
                     &crate::state::RunAttempt {
                         definition: &definition,

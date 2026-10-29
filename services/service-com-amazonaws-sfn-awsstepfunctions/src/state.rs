@@ -6942,6 +6942,7 @@ pub mod encryption;
 pub mod integration;
 mod json_diagnostic;
 pub mod run_a_job;
+pub mod task_authorization;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

@@ -175,6 +175,11 @@ async fn resolve<Eng: Send + Sync + 'static>(
                 state_machine_name: machine.name.clone(),
                 role_arn: machine.role_arn.clone(),
                 redrive_count: execution.redrive_count,
+                // The workflow type the continuation is interpreted under. A parked
+                // job belongs to a STANDARD execution — the run-a-job pattern is the
+                // one EXPRESS does not serve — and the type is read off the record
+                // rather than assumed from that.
+                express: machine.sm_type == super::STATE_MACHINE_TYPE_EXPRESS,
             };
             // The execution runs the definition it was STARTED on, which for one
             // started through a version ARN is that version's immutable snapshot.
@@ -209,7 +214,10 @@ async fn resolve<Eng: Send + Sync + 'static>(
         let definition = definition.clone();
         let input = input.clone();
         let region = region.clone();
-        integration::interpret_through(callback, depth, &region, move |tasks| {
+        // The states after the job call as the execution role the states before it
+        // did, which is the role the state machine carries.
+        let role = super::task_authorization::role_gate(engine, &context.role_arn);
+        integration::interpret_through(callback, depth, &region, role, move |tasks| {
             super::plan_job_reply(
                 &definition,
                 &input,

@@ -80,6 +80,23 @@
 //! asked anything). [`read`] still answers for one, so it is total over every
 //! `Resource` form a definition can carry.
 //!
+//! ## What a task may do, and what its call answers
+//!
+//! The call is made AS the state machine's execution role, so the policies in force
+//! on that role decide whether it is made at all: the `(action, resource)` pair the
+//! call is subject to is formed from the call itself ([`access_request`], over
+//! [`TARGET_RESOURCES`]) and decided by [`super::task_authorization`]. A call that
+//! role may not make is refused BEFORE the request goes anywhere, so nothing is
+//! started for it, and the task fails with the invoked service's own access-denied
+//! refusal.
+//!
+//! What a request-response call answers is reported to the state as the literal SDK
+//! response an OPTIMIZED integration returns: the operation's own members under the
+//! integration's convention, beside the SDK's response envelope
+//! ([`with_sdk_envelope`]), whose status, headers and request id are that answer's
+//! own. The AWS SDK family reports the operation's members alone, and the `.sync`
+//! pattern reports the job's own report instead.
+//!
 //! ## Where the call goes
 //!
 //! Nowhere outside this process. The destination is never a value a caller
@@ -424,6 +441,111 @@ pub struct Call {
     /// state built is carried as that document's JSON text
     /// ([`JSON_TEXT_MEMBERS`]). Empty for every call that converts nothing.
     pub json_text: &'static [&'static str],
+    /// Whether the task's result is the literal SDK response of this call, which
+    /// carries the SDK's own response envelope beside the operation's members
+    /// ([`with_sdk_envelope`]).
+    ///
+    /// True for the OPTIMIZED integration family, whose result is that SDK response
+    /// as it stands. False for the AWS SDK family, whose result is the invoked
+    /// operation's own members, and for the calls a run-a-job pattern makes to REPORT
+    /// and to STOP its job: those are not a task's own work, so what they answer is
+    /// read rather than reported.
+    pub sdk_envelope: bool,
+    /// The members of this call's RESPONSE that carry an instant, which the result
+    /// reports in whole epoch milliseconds ([`EPOCH_MILLIS_MEMBERS`]). Empty for every
+    /// call that converts nothing.
+    pub epoch_millis: &'static [&'static str],
+    /// Where this call's request names the resource it acts ON, for the integrations
+    /// whose target is named by the request ([`TARGET_RESOURCES`]); `None` for a call
+    /// no such entry is carried for.
+    pub targets: Option<&'static TargetResource>,
+}
+
+/// Where an integration's request names the resource its call acts ON, and how a
+/// refusal of that call is reported to the `Task` state.
+///
+/// A `Task` state's integration call is made AS the state machine's execution role,
+/// so it is subject to that role's own policies — an IAM access request over an
+/// `(action, resource)` pair. The ACTION is the IAM action the operation publishes,
+/// which is the invoked service's action namespace (an [`Api`]'s `arnNamespace`) and
+/// the operation's own name, so nothing is stated per action here. The RESOURCE is
+/// the integration's own: which member of the request names it is a fact of that
+/// integration, which is why there is one entry per integration rather than a rule.
+#[derive(Debug)]
+pub struct TargetResource {
+    /// The `<namespace>:<action>` the OPTIMIZED family names this integration by.
+    pub integration: &'static str,
+    /// The member of the integration's request that carries the ARN of the resource
+    /// the call acts on, named in the integration's own PascalCase.
+    pub member: &'static str,
+    /// The error name a `Task` state reports when the invoked service refuses this
+    /// call with an error its own operation does not model: the service as Step
+    /// Functions names it in a task error, and that service's base SDK exception.
+    pub refusal_error: &'static str,
+    /// The name that refusal's own metadata names the service under, which is the
+    /// name its SDK client carries rather than anything in its model.
+    pub refusal_service: &'static str,
+}
+
+/// The integrations whose request names the resource their call acts on.
+///
+/// One entry per integration, because which member names the target is that
+/// integration's own fact: an entry for an integration of another service also needs
+/// that service's base SDK exception, which only that service can state, so this
+/// table carries the integrations of the service this crate owns and a later entry is
+/// added beside them rather than guessed at. An integration with no entry is one no
+/// access request is formed for, and the call is made as before.
+///
+/// An entry is keyed by the `<namespace>:<action>` the OPTIMIZED family writes, and
+/// serves BOTH families: the AWS SDK family names the same service and the same
+/// action, so it makes the same call on the same resource and is subject to the same
+/// access request. Only the SPELLING of the request's members differs between them,
+/// which [`TargetResource::resource_of`] reads either way.
+pub const TARGET_RESOURCES: &[TargetResource] = &[
+    // `arn:aws:states:::states:startExecution` starts an execution of the state
+    // machine its `StateMachineArn` parameter names, which is the resource
+    // `states:StartExecution` is taken on
+    // (`smithy_query(query="operation",operation="StartExecution")` on this crate's
+    // own model: `stateMachineArn` is the ARN "of the state machine to execute").
+    // A refusal this operation does not model is reported under this service's own
+    // base SDK exception, the one the AWS SDKs deserialize an unmodelled Step
+    // Functions error into.
+    TargetResource {
+        integration: "states:startExecution",
+        member: "StateMachineArn",
+        refusal_error: "StepFunctions.AWSStepFunctionsException",
+        refusal_service: "AWSStepFunctions",
+    },
+];
+
+impl TargetResource {
+    /// The ARN this call's `request` names as the resource it acts on.
+    ///
+    /// The member is read under both spellings a definition may write it in — the
+    /// integration's own PascalCase and the invoked model's ([`MemberCase`]) — because
+    /// either reaches the operation ([`wire_request`]).
+    fn resource_of(&self, request: &Value) -> Option<String> {
+        [MemberCase::Pascal, MemberCase::LowerCamel]
+            .into_iter()
+            .find_map(|case| request.get(case.spell(self.member)))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+}
+
+/// The access request this call is subject to: the IAM action the invoked operation
+/// publishes, and the ARN of the resource the request names.
+///
+/// `None` when no [`TARGET_RESOURCES`] entry is carried for the integration, or when
+/// the request names no resource at all — a request the invoked operation will itself
+/// refuse, which is its own answer to give rather than an authorization decision.
+pub fn access_request(call: &Call, request: &Value) -> Option<(String, String)> {
+    let targets = call.targets?;
+    let resource = targets.resource_of(request)?;
+    Some((
+        format!("{}:{}", call.api.namespace, call.operation),
+        resource,
+    ))
 }
 
 /// The members an OPTIMIZED integration documents as a document while the operation
@@ -441,6 +563,23 @@ const JSON_TEXT_MEMBERS: &[(&str, &[&str])] = &[
     // (`smithy_query(query="operation",operation="StartExecution")` on this crate's
     // own model).
     ("states:startExecution", &["input"]),
+];
+
+/// The members of an integration's RESPONSE that carry an INSTANT, named by the
+/// spelling the invoked model gives them.
+///
+/// A `Task` state reads the SDK response of its call, and the SDK renders a timestamp
+/// as its own date type — whole MILLISECONDS since the epoch — while the `awsJson`
+/// protocol carries one on the wire as epoch SECONDS with a fractional part. The
+/// members are the invoked model's own, which this crate cannot read for another
+/// service, so there is one entry per integration and a later entry is added beside
+/// them rather than guessed at; an integration with no entry converts nothing.
+const EPOCH_MILLIS_MEMBERS: &[(&str, &[&str])] = &[
+    // `StartExecution`'s output is `executionArn` and `startDate`, "the date the
+    // execution is started", a Timestamp
+    // (`smithy_query(query="operation",operation="StartExecution")` on this crate's
+    // own model).
+    ("states:startExecution", &["startDate"]),
 ];
 
 /// The suffix a `Resource` names the run-a-job integration pattern with, and the
@@ -669,6 +808,17 @@ pub trait Tasks: Send + Sync {
     /// emulator's own ceiling ([`MAX_CALL_DURATION`]) as the only bound, and a
     /// declared timeout longer than that ceiling does not lift it.
     fn perform(&self, call: &Call, request: &Value, within: Option<Duration>) -> Answer;
+
+    /// Why the execution role this walk runs as may NOT make `call` with `request`,
+    /// or `None` when nothing of the kind can be shown.
+    ///
+    /// A `Task` state's integration call is made as the state machine's execution
+    /// role, so a call that role's policies do not allow never happens: the walk asks
+    /// this BEFORE [`Tasks::perform`] and fails the task with what this answers. The
+    /// default shows nothing, for a walk with no role to judge the call against.
+    fn authorize(&self, _call: &Call, _request: &Value) -> Option<Failed> {
+        None
+    }
 }
 
 /// A [`Tasks`] that makes no call, for a walk with no operation around it to make
@@ -803,15 +953,16 @@ pub fn read(resource: &str) -> Result<Call, String> {
     // The conversion a member of this call's request needs is the integration's,
     // so it is read off the optimized `<namespace>:<action>` and is empty for the
     // AWS SDK family, whose parameters are the operation's own members.
+    let integration = format!("{}:{action}", api.namespace);
     let json_text = match aws_sdk {
         true => &[][..],
-        false => {
-            let integration = format!("{service}:{action}");
-            JSON_TEXT_MEMBERS
-                .iter()
-                .find(|(named, _)| *named == integration)
-                .map_or(&[][..], |(_, members)| *members)
-        }
+        false => members_of(JSON_TEXT_MEMBERS, &integration),
+    };
+    // The same for the instants its RESPONSE carries: the optimized family's result
+    // is the SDK response, which renders a date as epoch milliseconds.
+    let epoch_millis = match aws_sdk {
+        true => &[][..],
+        false => members_of(EPOCH_MILLIS_MEMBERS, &integration),
     };
     Ok(Call {
         api,
@@ -819,7 +970,28 @@ pub fn read(resource: &str) -> Result<Call, String> {
         job,
         parsed_output,
         json_text,
+        // The OPTIMIZED family's result is the literal SDK response; the AWS SDK
+        // family's is the invoked operation's own members.
+        sdk_envelope: !aws_sdk,
+        epoch_millis,
+        // What the call acts ON is the same resource whichever family named it, so
+        // the entry is read for both.
+        targets: TARGET_RESOURCES
+            .iter()
+            .find(|entry| entry.integration == integration),
     })
+}
+
+/// The members `table` names for the integration `integration`, and none when it
+/// names it at all.
+fn members_of(
+    table: &'static [(&'static str, &'static [&'static str])],
+    integration: &str,
+) -> &'static [&'static str] {
+    table
+        .iter()
+        .find(|(named, _)| *named == integration)
+        .map_or(&[][..], |(_, members)| *members)
 }
 
 /// The call that reports the job `job` started under `job_id`, and its request.
@@ -836,6 +1008,11 @@ pub fn describing(api: &'static Api, job: &'static RunAJob, job_id: &str) -> (Ca
             job: None,
             parsed_output: false,
             json_text: &[],
+            // The job's REPORT is read, not reported as a task's own result, so it
+            // carries no integration envelope.
+            sdk_envelope: false,
+            epoch_millis: &[],
+            targets: None,
         },
         Value::Object(request),
     )
@@ -855,6 +1032,11 @@ pub fn stopping(api: &'static Api, job: &'static RunAJob, job_id: &str) -> (Call
             job: None,
             parsed_output: false,
             json_text: &[],
+            // As the reporting call: this one is made to END the job, not to produce
+            // a task's result.
+            sdk_envelope: false,
+            epoch_millis: &[],
+            targets: None,
         },
         Value::Object(request),
     )
@@ -943,7 +1125,22 @@ struct Dispatcher {
     /// in — the depth the request that started it arrived at — against
     /// [`MAX_CALL_CHAIN_DEPTH`].
     depth: u8,
+    /// What decides whether the execution role this walk runs as may make a call,
+    /// when the call that started the walk could resolve that role; `None` leaves
+    /// every call unjudged, which is what a walk with no role to ask about does.
+    role: Option<RoleGate>,
 }
+
+/// What decides whether the execution role a walk runs as may make one integration
+/// call: the `(action, resource)` the call is subject to is formed from the call
+/// itself ([`access_request`]), and this answers the refusal the task reports when
+/// the policies in force on the role do not allow it.
+///
+/// A closure rather than a trait, because the documents it reads live in another
+/// service's store and are reached through the engine the operation holds
+/// ([`super::task_authorization`]): the walk knows nothing of either, and asks only
+/// the question.
+pub type RoleGate = ::std::sync::Arc<dyn Fn(&Call, &Value) -> Option<Failed> + Send + Sync>;
 
 /// What a task fails with when the call could not be handed over or answered at all
 /// — the walk and the operation running it parted company, which is this emulator
@@ -1023,6 +1220,10 @@ impl Tasks for Dispatcher {
             }
         }
     }
+
+    fn authorize(&self, call: &Call, request: &Value) -> Option<Failed> {
+        self.role.as_ref()?(call, request)
+    }
 }
 
 /// Run `work` — one interpretation of a definition — on a blocking thread, serving
@@ -1044,13 +1245,14 @@ impl Tasks for Dispatcher {
 pub async fn interpret<Work, Outcome>(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
+    role: Option<RoleGate>,
     work: Work,
 ) -> Result<Outcome, ::tokio::task::JoinError>
 where
     Work: FnOnce(&dyn Tasks) -> Outcome + Send + 'static,
     Outcome: Send + 'static,
 {
-    interpret_through(ctx.callback(), chain_depth(ctx), region, work).await
+    interpret_through(ctx.callback(), chain_depth(ctx), region, role, work).await
 }
 
 /// As [`interpret`], from a callback handle and a chain depth rather than from a
@@ -1065,6 +1267,7 @@ pub async fn interpret_through<Work, Outcome>(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     depth: u8,
     region: &str,
+    role: Option<RoleGate>,
     work: Work,
 ) -> Result<Outcome, ::tokio::task::JoinError>
 where
@@ -1075,7 +1278,11 @@ where
     // transitions, so a deeper channel would buffer nothing.
     let (calls, mut handovers) = ::tokio::sync::mpsc::channel::<Handover>(1);
     let walk = ::tokio::task::spawn_blocking(move || {
-        let dispatcher = Dispatcher { calls, depth };
+        let dispatcher = Dispatcher {
+            calls,
+            depth,
+            role,
+        };
         work(&dispatcher)
     });
     let serve = async {
@@ -1189,8 +1396,26 @@ pub async fn call_api(
         }
     };
     match dispatch(callback, api, region, &call.operation, body).await {
-        Ok((status, error_type, payload)) => {
-            answer_of(api, &call.operation, status, error_type.as_deref(), &payload)
+        Ok(answered) => {
+            let read = answer_of(
+                api,
+                &call.operation,
+                answered.status,
+                answered.error_type.as_deref(),
+                &answered.payload,
+            );
+            // The result of an OPTIMIZED integration is the literal SDK response of
+            // the call, which renders each instant the response carries as whole
+            // epoch milliseconds and carries the SDK's own response envelope beside
+            // the operation's members; a refusal carries no result to wrap.
+            match read {
+                Ok(document) if call.sdk_envelope => Ok(with_sdk_envelope(
+                    in_epoch_millis(document, call.epoch_millis),
+                    &answered,
+                )),
+                Ok(document) => Ok(in_epoch_millis(document, call.epoch_millis)),
+                other => other,
+            }
         }
         Err(why) => Err(Failed {
             error: super::asl::RUNTIME_ERROR.to_string(),
@@ -1200,6 +1425,113 @@ pub async fn call_api(
             ),
         }),
     }
+}
+
+/// The member a task's result carries the HTTP facts of the call under, as the SDK
+/// response reports them: the status the call answered, and its headers under both
+/// spellings the SDK exposes them in.
+const SDK_HTTP_METADATA: &str = "SdkHttpMetadata";
+
+/// The member a task's result carries the call's response metadata under: the
+/// identifier of the request the call made.
+const SDK_RESPONSE_METADATA: &str = "SdkResponseMetadata";
+
+/// The header an AWS service names the request it answered in, which the SDK reports
+/// as the response's request id.
+const REQUEST_ID_HEADER: &str = "x-amzn-requestid";
+
+/// How many milliseconds one second holds, which is the whole of the conversion
+/// between the wire form of a timestamp and the SDK's.
+const MILLIS_PER_SECOND: f64 = 1_000.0;
+
+/// The largest figure of milliseconds this conversion reports: 2^53, the last integer
+/// a double holds exactly, so a value past it is left as it came back rather than
+/// reported as an integer it is not. It is some 285 000 years from the epoch, far past
+/// any instant a service answers.
+const MAX_EPOCH_MILLIS: f64 = 9_007_199_254_740_992.0;
+
+/// `document` with each of `members` reported in whole epoch MILLISECONDS.
+///
+/// An `awsJson` timestamp is on the wire as epoch SECONDS with a fractional part,
+/// while the SDK response a `Task` state reads renders a date as the integer number of
+/// milliseconds; the instant is the same one either way, so the value is the answer's
+/// own and only its unit changes. A member the answer did not carry, or carried as
+/// something other than a number this can convert, is left exactly as it came back.
+///
+/// Pure, so the conversion is pinned by this module's own tests.
+fn in_epoch_millis(document: Value, members: &[&str]) -> Value {
+    if members.is_empty() {
+        return document;
+    }
+    let Value::Object(mut carried) = document else {
+        return document;
+    };
+    for member in members {
+        // The member is read under both spellings a response may carry it in, as the
+        // request's own members are ([`MemberCase`]).
+        for spelling in [
+            MemberCase::LowerCamel.spell(member),
+            MemberCase::Pascal.spell(member),
+        ] {
+            let Some(seconds) = carried.get(&spelling).and_then(Value::as_f64) else {
+                continue;
+            };
+            let millis = (seconds * MILLIS_PER_SECOND).round();
+            if millis.is_finite() && millis.abs() < MAX_EPOCH_MILLIS {
+                carried.insert(spelling, Value::Number((millis as i64).into()));
+            }
+        }
+    }
+    Value::Object(carried)
+}
+
+/// `document` as a `Task` state reports the literal SDK response of the call that
+/// answered it: the operation's own members, plus the envelope the SDK puts the
+/// response's HTTP facts in.
+///
+/// Every value in it is the ANSWER's own — the status the call came back with, and the
+/// headers it carried, the request id among them — so a definition reading
+/// `$.SdkHttpMetadata.HttpStatusCode` or `$.SdkResponseMetadata.RequestId` reads what
+/// the call really answered, and a fact the answer did not carry is reported by
+/// nothing rather than filled in: the envelope's members are there because the
+/// integration returns them, and each holds exactly what came back. A response whose
+/// body is not an object carries no members to put the envelope beside, so it is
+/// reported as it stands.
+///
+/// Pure, so the shape of the envelope is pinned by this module's own tests.
+fn with_sdk_envelope(document: Value, answered: &Answered) -> Value {
+    let Value::Object(mut members) = document else {
+        return document;
+    };
+    // `HttpHeaders` carries one value per header and `AllHttpHeaders` every value a
+    // header was repeated with, which is the pair the SDK exposes.
+    let mut single = Map::new();
+    let mut all: Map<String, Value> = Map::new();
+    for (name, value) in &answered.headers {
+        single.insert(name.clone(), Value::String(value.clone()));
+        match all.get_mut(name).and_then(Value::as_array_mut) {
+            Some(values) => values.push(Value::String(value.clone())),
+            None => {
+                all.insert(name.clone(), Value::Array(vec![Value::String(value.clone())]));
+            }
+        }
+    }
+    let mut http = Map::new();
+    if !single.is_empty() {
+        http.insert("AllHttpHeaders".to_string(), Value::Object(all));
+        http.insert("HttpHeaders".to_string(), Value::Object(single));
+    }
+    http.insert(
+        "HttpStatusCode".to_string(),
+        Value::Number(answered.status.into()),
+    );
+    members.insert(SDK_HTTP_METADATA.to_string(), Value::Object(http));
+    let mut response = Map::new();
+    if let Some(request_id) = answered.header(REQUEST_ID_HEADER) {
+        response.insert("RequestId".to_string(), Value::String(request_id));
+    }
+    members.insert(SDK_RESPONSE_METADATA.to_string(), Value::Object(response));
+    Value::Object(members)
 }
 
 /// The result or the failure one answer carries.
@@ -1311,7 +1643,7 @@ async fn dispatch(
     region: &str,
     operation: &str,
     body: Vec<u8>,
-) -> Result<(u16, Option<String>, Vec<u8>), String> {
+) -> Result<Answered, String> {
     let mut request = ::http::Request::builder()
         .method("POST")
         .uri("/")
@@ -1348,12 +1680,48 @@ async fn dispatch(
         .headers()
         .get(ERROR_TYPE_HEADER)
         .map(str::to_string);
+    // Every header the answer carried, in the order it carried them: the task's own
+    // result reports them for an integration whose result is the literal SDK response
+    // ([`with_sdk_envelope`]), so they are read off the answer rather than invented.
+    let headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
     let payload = response
         .body()
         .bytes()
         .ok_or("the in-process answer carried a streaming body")?
         .to_vec();
-    Ok((status, error_type, payload))
+    Ok(Answered {
+        status,
+        error_type,
+        headers,
+        payload,
+    })
+}
+
+/// What one in-process call came back with.
+struct Answered {
+    /// The HTTP status the service answered.
+    status: u16,
+    /// The error shape it named in [`ERROR_TYPE_HEADER`], for a refusal.
+    error_type: Option<String>,
+    /// Every header of the answer, as it carried them.
+    headers: Vec<(String, String)>,
+    /// Its body.
+    payload: Vec<u8>,
+}
+
+impl Answered {
+    /// The first value the answer carried `name` under, compared without regard to
+    /// case as HTTP field names are.
+    fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .iter()
+            .find(|(carried, _)| carried.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    }
 }
 
 /// The credentials a callback signs with: the emulator's own, through the provider
@@ -1471,6 +1839,23 @@ mod tests {
         &'static str,
         Result<&'static str, &'static str>,
     );
+
+    /// One row of the access-request table: the case, the `Resource`, the request the
+    /// state built, and the `(action, resource)` pair the call is subject to.
+    type AccessRow = (
+        &'static str,
+        &'static str,
+        Value,
+        Option<(&'static str, &'static str)>,
+    );
+
+    /// One row of the envelope table: the case, the document the operation answered,
+    /// and the headers its answer carried.
+    type EnvelopeRow = (&'static str, Value, Vec<(&'static str, &'static str)>);
+
+    /// One row of the instant table: the case, the members to convert, the answer and
+    /// the result reported for it.
+    type InstantRow = (&'static str, &'static [&'static str], Value, Value);
 
     /// Which call a `Resource` names, over a TABLE of the forms a definition writes
     /// one in: the two integration families, the services in [`APIS`] and the forms
@@ -1838,6 +2223,7 @@ mod tests {
             let dispatcher = Dispatcher {
                 calls: calls.clone(),
                 depth,
+                role: None,
             };
             let answer = dispatcher.perform(&call, &::serde_json::json!({}), None);
             let Err(failed) = answer else {
@@ -1873,7 +2259,11 @@ mod tests {
         // The serving half is held, never drained: the send succeeds and no answer
         // ever comes back.
         let (calls, _handovers) = ::tokio::sync::mpsc::channel::<Handover>(1);
-        let dispatcher = Dispatcher { calls, depth: 0 };
+        let dispatcher = Dispatcher {
+            calls,
+            depth: 0,
+            role: None,
+        };
         let within = Duration::from_millis(50);
 
         let began = ::std::time::Instant::now();
@@ -1898,6 +2288,240 @@ mod tests {
             waited < MAX_CALL_DURATION,
             "case \"a call that never answers\": the state's own bound must decide, not the \
              {MAX_CALL_DURATION:?} ceiling, waited {waited:?}"
+        );
+    }
+
+    /// The result of a request-response OPTIMIZED integration is the literal SDK
+    /// response of the call: the operation's own members, plus the envelope the SDK
+    /// puts that response's HTTP facts in, with every value read off the answer.
+    ///
+    /// The rows span what the rule generalises over: a response with members and one
+    /// with none, a repeated header, an answer carrying no request id at all, and a
+    /// body that is not an object.
+    #[test]
+    fn an_optimized_integrations_result_carries_the_sdk_response_envelope() {
+        // (case, the document the operation answered, the headers it carried)
+        let rows: [EnvelopeRow; 4] = [
+            (
+                "a response with members of its own",
+                ::serde_json::json!({"ExecutionArn": "arn:execution", "StartDate": 1}),
+                vec![("x-amzn-requestid", "req-1"), ("content-type", "text/json")],
+            ),
+            (
+                "a response carrying no member at all",
+                ::serde_json::json!({}),
+                vec![("x-amzn-RequestId", "req-2")],
+            ),
+            (
+                "a header the answer repeated",
+                ::serde_json::json!({"Attributes": {}}),
+                vec![
+                    ("x-amzn-requestid", "req-3"),
+                    ("set-cookie", "a=1"),
+                    ("set-cookie", "b=2"),
+                ],
+            ),
+            (
+                "an answer naming no request id",
+                ::serde_json::json!({"Item": {}}),
+                vec![("content-type", "text/json")],
+            ),
+        ];
+
+        for (case, document, headers) in rows {
+            let answered = Answered {
+                status: 200,
+                error_type: None,
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect(),
+                payload: Vec::new(),
+            };
+            let members = document.as_object().expect("each row answers a document").clone();
+            let result = with_sdk_envelope(document, &answered);
+            // Every member the operation answered is still there, untouched.
+            for (member, value) in &members {
+                assert_eq!(
+                    result.get(member),
+                    Some(value),
+                    "case {case:?}: expected the operation's own {member:?}, got {result}"
+                );
+            }
+            assert_eq!(
+                result.pointer("/SdkHttpMetadata/HttpStatusCode"),
+                Some(&::serde_json::json!(200)),
+                "case {case:?}: expected the status the call answered, got {result}"
+            );
+            for (name, value) in &headers {
+                assert!(
+                    result
+                        .pointer(&format!("/SdkHttpMetadata/AllHttpHeaders/{name}"))
+                        .and_then(Value::as_array)
+                        .is_some_and(|carried| carried.contains(&::serde_json::json!(value))),
+                    "case {case:?}: expected the header {name:?} among the answer's, got {result}"
+                );
+            }
+            let request_id = headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(REQUEST_ID_HEADER))
+                .map(|(_, value)| ::serde_json::json!(value));
+            assert_eq!(
+                result.pointer("/SdkResponseMetadata/RequestId"),
+                request_id.as_ref(),
+                "case {case:?}: expected the request id the answer named, got {result}"
+            );
+        }
+
+        // A body that is not an object carries no members to put the envelope beside.
+        let answered = Answered {
+            status: 200,
+            error_type: None,
+            headers: Vec::new(),
+            payload: Vec::new(),
+        };
+        let listed = with_sdk_envelope(::serde_json::json!([1, 2]), &answered);
+        assert_eq!(
+            listed,
+            ::serde_json::json!([1, 2]),
+            "case \"a response that is not an object\": expected it as it stands, got {listed}"
+        );
+    }
+
+    /// The access request a call is subject to: the IAM action the invoked operation
+    /// publishes, and the ARN the request names as the resource acted on.
+    /// The rows span what the rule generalises over: both spellings a definition may
+    /// write the member in, the pattern suffixes (which name the same action), an
+    /// integration the table carries no entry for, the AWS SDK family, and a request
+    /// naming no resource at all.
+    #[test]
+    fn an_access_request_is_the_action_and_the_resource_the_request_names() {
+        let child = "arn:aws:states:us-west-2:000000000000:stateMachine:child";
+        // (case, the Resource, the request the state built, the expected pair)
+        let rows: [AccessRow; 6] = [
+            (
+                "a nested execution, the member in the integration's own spelling",
+                "arn:aws:states:::states:startExecution",
+                ::serde_json::json!({"StateMachineArn": child}),
+                Some(("states:StartExecution", child)),
+            ),
+            (
+                "the same member as the invoked model spells it",
+                "arn:aws:states:::states:startExecution",
+                ::serde_json::json!({"stateMachineArn": child}),
+                Some(("states:StartExecution", child)),
+            ),
+            (
+                "the run-a-job pattern, whose action is the same one",
+                "arn:aws:states:::states:startExecution.sync:2",
+                ::serde_json::json!({"StateMachineArn": child, "Input": {}}),
+                Some(("states:StartExecution", child)),
+            ),
+            (
+                "an integration no entry is carried for",
+                "arn:aws:states:::dynamodb:putItem",
+                ::serde_json::json!({"TableName": "orders"}),
+                None,
+            ),
+            (
+                "the AWS SDK family of that same call, which acts on the same resource",
+                "arn:aws:states:::aws-sdk:sfn:startExecution",
+                ::serde_json::json!({"stateMachineArn": child}),
+                Some(("states:StartExecution", child)),
+            ),
+            (
+                "a request naming no resource at all",
+                "arn:aws:states:::states:startExecution",
+                ::serde_json::json!({"Input": {}}),
+                None,
+            ),
+        ];
+
+        for (case, resource, request, expected) in rows {
+            let call = read(resource).expect("every row names a call");
+            let asked = access_request(&call, &request);
+            let expected =
+                expected.map(|(action, named)| (action.to_string(), named.to_string()));
+            assert_eq!(
+                asked, expected,
+                "case {case:?}: expected {expected:?}, got {asked:?}"
+            );
+        }
+    }
+
+    /// An instant the invoked operation answered is reported in whole epoch
+    /// MILLISECONDS, which is the unit the SDK response a `Task` state reads renders a
+    /// date in — the `awsJson` wire form is epoch seconds with a fractional part.
+    ///
+    /// The rows span what the rule generalises over: a fractional figure, a whole one,
+    /// the epoch itself, both spellings the member may come back under, a member the
+    /// response does not carry, one carrying something that is not a number, and a
+    /// member no entry names.
+    #[test]
+    fn an_instant_in_a_result_is_reported_in_epoch_millis() {
+        // (case, the members to convert, the answer, the result)
+        let rows: [InstantRow; 7] = [
+            (
+                "a timestamp carrying a fractional second",
+                &["startDate"],
+                ::serde_json::json!({"executionArn": "arn:e", "startDate": 1_793_241_840.725}),
+                ::serde_json::json!({"executionArn": "arn:e", "startDate": 1_793_241_840_725i64}),
+            ),
+            (
+                "a whole number of seconds",
+                &["startDate"],
+                ::serde_json::json!({"startDate": 1_793_241_840i64}),
+                ::serde_json::json!({"startDate": 1_793_241_840_000i64}),
+            ),
+            (
+                "the epoch itself",
+                &["startDate"],
+                ::serde_json::json!({"startDate": 0}),
+                ::serde_json::json!({"startDate": 0}),
+            ),
+            (
+                "the member under the integration's own spelling",
+                &["startDate"],
+                ::serde_json::json!({"StartDate": 1.5}),
+                ::serde_json::json!({"StartDate": 1_500i64}),
+            ),
+            (
+                "a member the response does not carry",
+                &["startDate"],
+                ::serde_json::json!({"executionArn": "arn:e"}),
+                ::serde_json::json!({"executionArn": "arn:e"}),
+            ),
+            (
+                "a member carrying something that is not a number",
+                &["startDate"],
+                ::serde_json::json!({"startDate": "2026-10-28T20:13:41Z"}),
+                ::serde_json::json!({"startDate": "2026-10-28T20:13:41Z"}),
+            ),
+            (
+                "an integration whose entry names no member",
+                &[],
+                ::serde_json::json!({"startDate": 1.5}),
+                ::serde_json::json!({"startDate": 1.5}),
+            ),
+        ];
+
+        for (case, members, answer, expected) in rows {
+            let reported = in_epoch_millis(answer, members);
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected {expected}, got {reported}"
+            );
+        }
+
+        // The catalogue names the member for the integration whose result carries an
+        // instant, so the rule reaches a task through `read` and not only through the
+        // conversion above.
+        let call = read("arn:aws:states:::states:startExecution").expect("this names a call");
+        assert!(
+            call.epoch_millis.contains(&"startDate"),
+            "case \"a nested execution\": expected the start date among the instants its result \
+             reports, got {:?}",
+            call.epoch_millis
         );
     }
 }

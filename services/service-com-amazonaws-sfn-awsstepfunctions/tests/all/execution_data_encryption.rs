@@ -112,9 +112,10 @@ fn policy_with(statements: Vec<Value>) -> Value {
 /// An awsQuery parameter value, percent-encoded as that protocol takes it, so a
 /// policy document's braces and quotes survive the round trip.
 ///
-/// A copy: an integration-test module cannot be imported across crates, so every
-/// suite that drives an awsQuery service holds its own.
-fn form_encode(value: &str) -> String {
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so a sibling
+/// suite that drives an awsQuery service reads this helper rather than carrying a
+/// second copy of it.
+pub(crate) fn form_encode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
@@ -126,9 +127,9 @@ fn form_encode(value: &str) -> String {
     encoded
 }
 
-/// The text of the first `<name>…</name>` element of an awsQuery response. A copy,
-/// for the same reason as [`form_encode`].
-fn xml_element(body: &str, name: &str) -> Option<String> {
+/// The text of the first `<name>…</name>` element of an awsQuery response.
+/// `pub(crate)` for the same reason as [`form_encode`].
+pub(crate) fn xml_element(body: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
     let start = body.find(&open)? + open.len();

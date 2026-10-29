@@ -291,6 +291,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // beginning another, so the states it runs on read the count the
                 // record already carries — not one more.
                 redrive_count: execution.redrive_count,
+                // The workflow type the continuation is interpreted under, which
+                // decides whether a `Task` state after the reply may ask for the
+                // run-a-job (`.sync`) integration pattern.
+                express: machine.sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS,
             };
             // The execution runs the definition it was STARTED on, which for one
             // started through a version ARN — or through an alias that routed to a
@@ -333,7 +337,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let definition = definition.clone();
             let execution_input = execution_input.clone();
             let region = crate::state::arn_region(&machine_arn);
-            crate::state::integration::interpret(ctx, &region, move |tasks| {
+            // The states after the reply call as the SAME execution role the states
+            // before it did.
+            let role =
+                crate::state::task_authorization::role_gate(&self.engine, &context.role_arn);
+            crate::state::integration::interpret(ctx, &region, role, move |tasks| {
                 crate::state::plan_reply(
                     &definition,
                     &execution_input,

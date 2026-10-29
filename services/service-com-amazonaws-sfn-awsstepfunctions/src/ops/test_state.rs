@@ -519,6 +519,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             role_arn: input.role_arn.clone().unwrap_or_default(),
             // The test runs no execution, so there is none that has been redriven.
             redrive_count: 0,
+            // And none that belongs to a state machine, so there is no workflow type
+            // to refuse a state under: `TestState` names a state rather than a machine.
+            express: false,
         };
 
         // The walk is CPU work a caller's definition sizes, so it runs on a blocking

@@ -318,9 +318,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// or version it was started through) is read off the record.
 ///
 /// A detail this emulator does not record is left unset rather than filled with a
-/// stand-in: `stateEnteredEventDetails`/`stateExitedEventDetails` name the state the
-/// event was written for, and the four execution-level details carry the input, the
-/// output, the error and the cause the record holds.
+/// stand-in: `stateEnteredEventDetails`/`stateExitedEventDetails` carry the state's
+/// name and the data it was entered with or emitted, and the four execution-level
+/// details carry the input, the output, the error and the cause the record holds.
 fn projected(
     stored: &crate::state::HistoryEvent,
     execution: &crate::state::Execution,
@@ -379,16 +379,30 @@ fn projected(
         if event_type.ends_with(STATE_ENTERED_SUFFIX) {
             event.state_entered_event_details = Some(StateEnteredEventDetails {
                 name,
-                input: None,
-                input_details: None,
+                // "The string that contains the JSON input data for the state": the
+                // data the state was entered WITH, which the walk recorded on the
+                // event. `inputDetails` says whether that data is included, so it is
+                // reported beside the data rather than instead of it.
+                input: data(stored.details.input.clone()),
+                input_details: included
+                    .clone()
+                    .filter(|_| with_data && stored.details.input.is_some()),
             });
             return event;
         }
         if event_type.ends_with(STATE_EXITED_SUFFIX) {
             event.state_exited_event_details = Some(StateExitedEventDetails {
                 name,
-                output: None,
-                output_details: None,
+                // "The JSON output data of the state": what the state EMITTED, which
+                // is its post-processing result — `ResultSelector`, `ResultPath` and
+                // `OutputPath` already applied — as the walk recorded it.
+                output: data(stored.details.output.clone()),
+                output_details: included
+                    .clone()
+                    .filter(|_| with_data && stored.details.output.is_some()),
+                // A JSONata-mode definition's `Assign` is not interpreted (see
+                // `crate::state::asl`), so no state assigns a variable and there is
+                // nothing to report under either member.
                 assigned_variables: None,
                 assigned_variables_details: None,
             });
