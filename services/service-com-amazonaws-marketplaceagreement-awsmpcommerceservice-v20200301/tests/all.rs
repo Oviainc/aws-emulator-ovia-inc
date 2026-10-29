@@ -27,6 +27,8 @@ mod agreement_expiry;
 mod agreement_lifecycle;
 #[path = "all/agreement_parties.rs"]
 mod agreement_parties;
+#[path = "all/agreement_renewals.rs"]
+mod agreement_renewals;
 #[path = "all/billing_adjustments.rs"]
 mod billing_adjustments;
 #[path = "all/cancellation_request_decisions.rs"]

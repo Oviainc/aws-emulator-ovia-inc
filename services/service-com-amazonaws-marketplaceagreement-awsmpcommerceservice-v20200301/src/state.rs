@@ -8,7 +8,10 @@
 //!   (`CreateAgreementRequest`), which captures the requested terms and the
 //!   charges they imply;
 //! * an **agreement** — what `AcceptAgreementRequest` finalises from one of
-//!   those requests, and what `DescribeAgreement`, `GetAgreementTerms`,
+//!   those requests, and what the clock creates again at the end date of one
+//!   whose accepted terms renew it there
+//!   ([`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::settle_agreement`]),
+//!   and what `DescribeAgreement`, `GetAgreementTerms`,
 //!   `SearchAgreements` and `CancelAgreement` report on and mutate. Accepting it
 //!   also provisions the **entitlements** it grants, which belong to the
 //!   agreement rather than standing on their own and which
@@ -127,11 +130,28 @@ pub const STATUS_CANCELLED: &str = "CANCELLED";
 /// from then on: "REPLACED – The agreement was replaced using an agreement
 /// replacement offer."
 pub const STATUS_REPLACED: &str = "REPLACED";
-/// The `AgreementStatus` an agreement carries once its own end date has passed:
-/// "EXPIRED – The agreement ended on the defined end date" — reached by the
-/// clock rather than by any call, and materialised by
-/// [`Agreement::expire`].
+/// The `AgreementStatus` an agreement carries once its own end date has passed
+/// and its terms do not renew it at that date: "EXPIRED – The agreement ended on
+/// the defined end date" — reached by the clock rather than by any call, and
+/// materialised by
+/// [`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::settle_agreement`].
 pub const STATUS_EXPIRED: &str = "EXPIRED";
+/// The `AgreementStatus` an agreement carries once its own end date has passed
+/// and its terms renewed it at that date: "RENEWED – The agreement was renewed
+/// into a new agreement (for example, an auto-renewal)" — the other end the
+/// clock owes at an end date, materialised by the same
+/// [`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::settle_agreement`]
+/// that creates the renewal agreement.
+pub const STATUS_RENEWED: &str = "RENEWED";
+
+/// How many renewals of one chain a single call materialises.
+///
+/// A guard on the walk of a chain rather than a rule of the service: what
+/// bounds the renewals of an agreement is its own renewal term
+/// (`RenewalTerm$maxRenewals`), and a term that publishes no limit — "the field
+/// is null when the number of renewals is unlimited" — would otherwise renew
+/// once per contract length for however long ago the chain's end date passed.
+const RENEWALS_PER_CALL: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Entitlements
@@ -2133,6 +2153,20 @@ pub struct Agreement {
     pub catalog: String,
     pub acceptor: Acceptor,
     pub proposer: Proposer,
+    /// The region the caller who accepted this agreement signed for
+    /// ([`request_region`]), which is the region its entitlements' licences were
+    /// minted in. Held on the record so a renewal the clock performs — which no
+    /// caller signs — mints its own licences in the same region as the agreement
+    /// it continues rather than in a region nothing asked for.
+    pub region: String,
+    /// How many times the chain this agreement belongs to has been renewed: zero
+    /// for one an acceptance created, and one more than its source for each
+    /// renewal the clock performs ([`Agreement::renew`]).
+    ///
+    /// This is what `RenewalTerm$maxRenewals` — "the maximum number of times the
+    /// agreement can be renewed" — is measured against, so the count lives on
+    /// the record rather than being re-derived per read.
+    pub renewal_count: u32,
     /// One of `AgreementStatus`'s values.
     pub status: String,
     pub start_time: SystemTime,
@@ -2240,6 +2274,21 @@ impl Agreement {
         self.leave_active(STATUS_REPLACED, now)
     }
 
+    /// Record this agreement as renewed into a new agreement at `now`: the one
+    /// transition to [`STATUS_RENEWED`], which the clock performs at the end
+    /// date of an agreement whose terms renew it there
+    /// ([`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::settle_agreement`],
+    /// which is also what creates the renewal agreement itself).
+    ///
+    /// Guarded by [`Agreement::leave_active`] exactly as [`Agreement::cancel`]
+    /// is, which is also what makes the renewal happen ONCE: the agreement this
+    /// moved is no longer `ACTIVE`, so a later call finds nothing due and mints
+    /// no second renewal.
+    #[must_use]
+    pub fn renew(&mut self, now: SystemTime) -> bool {
+        self.leave_active(STATUS_RENEWED, now)
+    }
+
     /// Materialise the expiry this agreement's own stored end date has already
     /// made due by `now`.
     ///
@@ -2254,42 +2303,42 @@ impl Agreement {
     /// agreements, which don't have end dates") never reaches one, so nothing is
     /// ever due for it.
     ///
-    /// Only an agreement its end date ENDS is moved. `EndTimeBehaviorType`
-    /// distinguishes the two ends: `EXPIRE` is "the agreement ends and isn't
-    /// renewed or replaced", while `RENEW` is "a new agreement is created from
-    /// the accepted terms of this agreement" — whose status is then `RENEWED`,
-    /// "the agreement was renewed into a new agreement". This service creates no
-    /// renewal agreement, so one whose acceptor enabled auto-renewal is left as
-    /// it stands rather than reported with a status that contradicts the
-    /// behaviour it reports at that same end date.
+    /// Only an agreement its end date ENDS is moved, which is what the behaviour
+    /// at that date decides ([`Agreement::end_time_behavior_at_end_date`]):
+    /// `EXPIRE` is "the agreement ends and isn't renewed or replaced", while an
+    /// agreement that `RENEW`s there is renewed into a new agreement instead and
+    /// carries [`STATUS_RENEWED`] — the transition
+    /// [`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::settle_agreement`]
+    /// performs beside the renewal agreement it creates, so neither end is
+    /// reported without the other.
     ///
     /// `updated_at` becomes the instant the change was DUE, never the instant it
     /// was observed, so repeated reads report the same `lastUpdateTime`. Guarded
     /// by [`Agreement::leave_active`] exactly as [`Agreement::cancel`] is, so an
     /// agreement the acceptor cancelled or a replacement superseded before its
     /// end date keeps the status it reached.
-    pub fn expire(&mut self, now: SystemTime) {
+    fn expire(&mut self, now: SystemTime) {
+        if !self.reached_end_date(now) || self.renews_at_end_date() {
+            // Either the end date is still ahead (or there is none at all, so
+            // nothing is ever due), or it renews this agreement rather than
+            // ending it.
+            return;
+        }
         let Some(end) = self.end_time else {
-            // No end date: nothing is ever due.
             return;
         };
-        if now < end {
-            // The end date is still ahead: the agreement runs on.
-            return;
-        }
-        if self.auto_renew() == Some(true) {
-            // The acceptor's renewal term carries this agreement past its end
-            // date instead of ending it, and the renewal agreement that
-            // transition creates is not something this service mints — so the
-            // agreement is left as it stands rather than reported with a status
-            // contradicting the behaviour it reports at the same date. The
-            // renewal itself is filed as its own gap (the auto-renewal report
-            // under `issues/`); nothing in this call claims it happened.
-            return;
-        }
         // Whether this call is what moved it matters to nobody: no audit record
         // is owed for a transition no caller made.
         let _ = self.leave_active(STATUS_EXPIRED, end);
+    }
+
+    /// Whether this agreement's own stored end date has passed by `now`.
+    ///
+    /// An agreement with no end date never reaches one — "the field is null for
+    /// pay-as-you-go agreements, which don't have end dates" — so nothing its
+    /// end date would make due is ever due for it.
+    fn reached_end_date(&self, now: SystemTime) -> bool {
+        self.end_time.is_some_and(|end| now >= end)
     }
 
     /// Whether the acceptor asked for auto-renewal, as the accepted renewal
@@ -2306,6 +2355,35 @@ impl Agreement {
         })
     }
 
+    /// How many times the accepted renewal term allows the chain this agreement
+    /// belongs to to be renewed, or `None` for a term that sets no limit.
+    ///
+    /// `RenewalTerm$maxRenewals` is "the maximum number of times the agreement
+    /// can be renewed. The field is null when the number of renewals is
+    /// unlimited."
+    fn renewal_limit(&self) -> Option<i32> {
+        self.accepted_terms.iter().find_map(|term| match term {
+            AcceptedTerm::renewalTerm(renewal) => renewal.max_renewals,
+            _ => None,
+        })
+    }
+
+    /// Whether the chain this agreement belongs to has used up the renewals its
+    /// accepted renewal term allows: "after the agreement reaches this limit, it
+    /// expires on its end date instead of renewing"
+    /// (`RenewalTerm$maxRenewals`).
+    fn renewal_limit_reached(&self) -> bool {
+        self.renewal_limit()
+            .is_some_and(|max| self.renewal_count >= u32::try_from(max).unwrap_or(0))
+    }
+
+    /// Whether this agreement is renewed into a new agreement at its end date
+    /// rather than ended by it: the `RENEW` case of
+    /// [`Agreement::end_time_behavior_at_end_date`].
+    pub fn renews_at_end_date(&self) -> bool {
+        self.end_time.is_some() && self.auto_renew() == Some(true) && !self.renewal_limit_reached()
+    }
+
     /// What happens to this agreement at its end date, computed from the end
     /// date and the accepted terms it stores: `None` only for an agreement that
     /// has no end date, which "never reach[es] an end time", as
@@ -2313,21 +2391,30 @@ impl Agreement {
     ///
     /// This is the behaviour itself, so it is the value every projection whose
     /// member documents no further null case reports, whatever status the
-    /// agreement has reached: a cancellation or a replacement leaves the stored
-    /// end date and accepted terms untouched, so what the agreement does at that
-    /// date stays computable from them. The projection that withholds it from an
-    /// inactive agreement is [`Agreement::end_time_behavior`], which states that
-    /// rule from its own member.
+    /// agreement has reached: a cancellation, a replacement or the renewal of
+    /// the agreement leaves the stored end date and accepted terms untouched, so
+    /// what the agreement does at that date stays computable from them. The
+    /// projection that withholds it from an inactive agreement is
+    /// [`Agreement::end_time_behavior`], which states that rule from its own
+    /// member.
     ///
     /// The behaviour follows `EndTimeBehavior`: `RENEW` when the accepted
-    /// renewal term enables auto-renewal, and otherwise `EXPIRE` with the reason
-    /// the terms give — `NO_RENEWAL_TERM` when they carry no renewal term at
-    /// all, `ACCEPTOR_RENEW_OPTED_OUT` when they carry one the acceptor turned
-    /// off.
+    /// renewal term enables auto-renewal and the chain has renewals left under
+    /// it, and otherwise `EXPIRE` with the reason the terms give —
+    /// `NO_RENEWAL_TERM` when they carry no renewal term at all,
+    /// `ACCEPTOR_RENEW_OPTED_OUT` when they carry one the acceptor turned off,
+    /// and `RENEWAL_LIMIT_EXHAUSTED` once "the agreement reached the maximum
+    /// number of renewals allowed by its renewal term", after which "it expires
+    /// on its end date instead of renewing".
     pub fn end_time_behavior_at_end_date(&self) -> Option<EndTimeBehavior> {
         self.end_time?;
+        let expires = |reason_code: &str| EndTimeBehavior {
+            r#type: "EXPIRE".to_string(),
+            reason_code: Some(reason_code.to_string()),
+            renewal_summary: None,
+        };
         Some(match self.auto_renew() {
-            Some(true) => EndTimeBehavior {
+            Some(true) if !self.renewal_limit_reached() => EndTimeBehavior {
                 r#type: "RENEW".to_string(),
                 // "The field is null when the agreement renews."
                 reason_code: None,
@@ -2335,16 +2422,9 @@ impl Agreement {
                 // proposal this emulator does not hold.
                 renewal_summary: None,
             },
-            Some(false) => EndTimeBehavior {
-                r#type: "EXPIRE".to_string(),
-                reason_code: Some("ACCEPTOR_RENEW_OPTED_OUT".to_string()),
-                renewal_summary: None,
-            },
-            None => EndTimeBehavior {
-                r#type: "EXPIRE".to_string(),
-                reason_code: Some("NO_RENEWAL_TERM".to_string()),
-                renewal_summary: None,
-            },
+            Some(true) => expires("RENEWAL_LIMIT_EXHAUSTED"),
+            Some(false) => expires("ACCEPTOR_RENEW_OPTED_OUT"),
+            None => expires("NO_RENEWAL_TERM"),
         })
     }
 
@@ -4743,32 +4823,177 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
             .find(|request| request.client_token == token)
     }
 
-    /// Materialise the expiry the clock has already made due by `now` for the
-    /// ONE agreement `agreement_id` names ([`Agreement::expire`]), or nothing
-    /// when this store holds no agreement under that id.
+    /// Materialise what the end date of the ONE agreement `agreement_id` names
+    /// has already made due by `now`, and the same for each renewal that
+    /// creates — or nothing when this store holds no agreement under that id.
+    ///
+    /// An end date makes exactly one of two things due, which is what the
+    /// behaviour at it says ([`Agreement::end_time_behavior_at_end_date`]): the
+    /// agreement expires there ([`Agreement::expire`]), or it is renewed into a
+    /// new agreement there ([`Self::renew_agreement`]). Both are owed at that
+    /// instant whether or not anybody calls, so every operation that reports or
+    /// guards on an agreement's status materialises them before it answers.
+    ///
+    /// A renewal starts where its source ended, so its OWN end date can be past
+    /// too: the chain is walked until an agreement whose end date is still ahead
+    /// or that renews no further, which `RenewalTerm$maxRenewals` bounds. The
+    /// loop is additionally capped by [`RENEWALS_PER_CALL`] for a renewal term
+    /// that publishes no limit at all.
     ///
     /// What an operation answering about a single agreement calls: the record it
-    /// is about is the only one its answer depends on, so it is the only one to
-    /// bring up to date. An id that names nothing is left to the operation's own
-    /// refusal.
-    pub fn expire_agreement(&mut self, agreement_id: &str, now: SystemTime) {
-        if let Some(agreement) = self.agreements.get_mut(agreement_id) {
-            agreement.expire(now);
+    /// is about is the only one its answer depends on, so it and the chain it
+    /// starts are the only ones to bring up to date. An id that names nothing is
+    /// left to the operation's own refusal.
+    pub fn settle_agreement(&mut self, agreement_id: &str, now: SystemTime) {
+        let mut id = agreement_id.to_string();
+        for _ in 0..=RENEWALS_PER_CALL {
+            if let Some(agreement) = self.agreements.get_mut(&id) {
+                agreement.expire(now);
+            }
+            match self.renew_agreement(&id, now) {
+                Some(renewal) => id = renewal,
+                None => return,
+            }
         }
     }
 
-    /// Materialise every agreement expiry the clock has already made due by
-    /// `now` ([`Agreement::expire`]).
+    /// Materialise every end-date transition the clock has already made due by
+    /// `now`, for every agreement this store holds ([`Self::settle_agreement`]).
     ///
     /// What an operation that SCANS the store calls, where the answer depends on
     /// every agreement rather than on one: the status an agreement past its own
-    /// end date is searched by, and the summary status reported beside it, are
-    /// then the ones the clock already owed it. An operation answering about a
-    /// single agreement calls [`Self::expire_agreement`] instead.
-    pub fn expire_agreements(&mut self, now: SystemTime) {
-        for agreement in self.agreements.values_mut() {
-            agreement.expire(now);
+    /// end date is searched by, the summary status reported beside it, and the
+    /// renewal agreement its end date created are then the ones the clock
+    /// already owed. An operation answering about a single agreement calls
+    /// [`Self::settle_agreement`] instead.
+    ///
+    /// The ids are taken before the walk, because a renewal inserts a new
+    /// agreement: each chain is settled to its end by the walk of its first
+    /// link, so the ones it inserted need no second pass.
+    pub fn settle_agreements(&mut self, now: SystemTime) {
+        let ids: Vec<String> = self.agreements.keys().cloned().collect();
+        for id in ids {
+            self.settle_agreement(&id, now);
         }
+    }
+
+    /// Materialise the renewal the end date of the agreement `agreement_id`
+    /// names has already made due by `now`, answering the id of the renewal
+    /// agreement it created — or `None` when no renewal is due.
+    ///
+    /// `AgreementStatus` documents both halves of this transition: the source
+    /// agreement becomes "RENEWED – The agreement was renewed into a new
+    /// agreement (for example, an auto-renewal)", and `EndTimeBehaviorType`
+    /// `RENEW` says what the new agreement is — "a new agreement is created from
+    /// the accepted terms of this agreement". So the renewal re-states the terms
+    /// the source's own quote asked for, over the window that starts where the
+    /// source ended:
+    ///
+    /// * it continues the same chain, so it carries the source's
+    ///   `initialAgreementId` ("it stays the same across all agreements in that
+    ///   chain, which lets you trace an agreement back to the original") and one
+    ///   more than its [`Agreement::renewal_count`];
+    /// * it is created AT the source's end date, so that instant is its
+    ///   `startTime` and its `acceptanceTime`, and its own end date is a further
+    ///   contract length on ([`agreement_end_time`]) — nothing here is dated at
+    ///   the instant somebody looked, so repeated reads report the same record;
+    /// * it is a new purchase of those terms rather than an amendment of the
+    ///   source's, so it gets its OWN quote ([`Self::charge_summary`], at
+    ///   [`INTENT_NEW`], whose charges nothing else holds), the invoices that
+    ///   quote bills on acceptance ([`Self::issue_acceptance_invoices`]) and its
+    ///   own freshly provisioned entitlements
+    ///   ([`Self::provision_entitlements`]) — the purchase orders the acceptor
+    ///   associated with the SOURCE's charges stay with those charges, since the
+    ///   renewal's charges are not the ones they were associated with.
+    ///
+    /// Nothing is due unless the source is still `ACTIVE`, its stored end date
+    /// has passed and its terms renew it there
+    /// ([`Agreement::renews_at_end_date`]), and the transition itself is what
+    /// makes this happen once: the source leaves `ACTIVE` for [`STATUS_RENEWED`]
+    /// ([`Agreement::renew`]), so a later call finds nothing due for it and
+    /// mints no second renewal. An agreement whose own quote this store no
+    /// longer holds is left as it stands: the terms the renewal would re-state
+    /// are read from that quote.
+    fn renew_agreement(&mut self, agreement_id: &str, now: SystemTime) -> Option<String> {
+        let source = self.agreements.get(agreement_id)?;
+        if source.status != STATUS_ACTIVE
+            || !source.reached_end_date(now)
+            || !source.renews_at_end_date()
+        {
+            return None;
+        }
+        // The instant the renewal is due at, which is the source's end date.
+        let end = source.end_time?;
+        let source = source.clone();
+        let quote = self.agreement_requests.get(&source.agreement_request_id)?.clone();
+        let requested_terms = quote.requested_terms;
+
+        // The renewal's own quote, which prices the same requested terms afresh
+        // for the new window: its charge ids are minted here, so the renewal
+        // reports charges of its own rather than the source's.
+        let charge_summary = self.charge_summary(&requested_terms, INTENT_NEW, None);
+        let request_id = self.mint_agreement_request_id();
+        let id = self.mint_agreement_id();
+        let context = AcceptedTermContext::new(&requested_terms, end, Some(&source));
+        let terms = accepted_terms(&requested_terms, &context);
+        let end_time = agreement_end_time(&terms, &context);
+        // The renewal entitles its acceptor to the same resources the source's
+        // chain is involved with, each with its own newly provisioned licence.
+        let resources = agreement_resources(source.proposal_summary.resources.as_deref());
+        let entitlements = self.provision_entitlements(&resources, &source.region, end);
+        self.agreement_requests.insert(
+            request_id.clone(),
+            AgreementRequest {
+                id: request_id.clone(),
+                // A renewal buys the accepted terms for a new window rather
+                // than changing what the source bought, so its quote is quoted
+                // as a new purchase: nothing of the source's quantities is
+                // carried into it.
+                intent: INTENT_NEW.to_string(),
+                requested_terms,
+                source_agreement_identifier: None,
+                // The proposal and the tax estimation the source's own quote
+                // named: the renewal re-states that quote's terms.
+                agreement_proposal_identifier: quote.agreement_proposal_identifier,
+                tax_configuration: quote.tax_configuration,
+                charge_summary,
+                // No caller sent this quote, so it carries no client token, and
+                // the renewal below is the agreement it was accepted as.
+                client_token: None,
+                accepted_agreement_id: Some(id.clone()),
+                created_at: end,
+            },
+        );
+        self.agreements.insert(
+            id.clone(),
+            Agreement {
+                id: id.clone(),
+                initial_agreement_id: source.initial_agreement_id.clone(),
+                agreement_request_id: request_id,
+                agreement_type: source.agreement_type.clone(),
+                catalog: source.catalog.clone(),
+                acceptor: source.acceptor.clone(),
+                proposer: source.proposer.clone(),
+                region: source.region.clone(),
+                renewal_count: source.renewal_count.saturating_add(1),
+                status: STATUS_ACTIVE.to_string(),
+                start_time: end,
+                end_time,
+                acceptance_time: end,
+                proposal_summary: source.proposal_summary.clone(),
+                accepted_terms: terms,
+                purchase_orders: Vec::new(),
+                entitlements,
+                updated_at: end,
+            },
+        );
+        // The renewal's quote bills its prepaid charges on acceptance exactly as
+        // an acceptor's own would, dated at the instant the renewal was created.
+        let _ = self.issue_acceptance_invoices(&id, end);
+        if let Some(renewed) = self.agreements.get_mut(agreement_id) {
+            let _ = renewed.renew(end);
+        }
+        Some(id)
     }
 
     /// Materialise every billing adjustment status change the clock has already

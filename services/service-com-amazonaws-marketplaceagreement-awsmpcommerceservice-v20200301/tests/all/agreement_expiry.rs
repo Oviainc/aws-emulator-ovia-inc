@@ -17,9 +17,9 @@
 //! (`smithy_query(query="doc", shape="DescribeAgreementOutput", member="status")`).
 //! Which end a date is depends on the behaviour at it: `EXPIRE` is "the agreement
 //! ends and isn't renewed or replaced", while `RENEW` creates "a new agreement …
-//! from the accepted terms of this agreement" and leaves this one `RENEWED`, a
-//! renewal this service does not create — so an agreement whose acceptor enabled
-//! auto-renewal is not ended by its end date here.
+//! from the accepted terms of this agreement" and leaves this one `RENEWED` — the
+//! transition `agreement_renewals` owns the rest of, so an agreement whose
+//! acceptor enabled auto-renewal reaches that status here rather than `EXPIRED`.
 //!
 //! Everything the status decides follows from it in the same call: the
 //! `endTimeBehavior` `DescribeAgreement` reports only "for every active
@@ -73,6 +73,9 @@ const ACTIVE: &str = "ACTIVE";
 const EXPIRED: &str = "EXPIRED";
 /// See [`ACTIVE`].
 const CANCELLED: &str = "CANCELLED";
+/// See [`ACTIVE`]: "RENEWED – The agreement was renewed into a new agreement
+/// (for example, an auto-renewal)".
+const RENEWED: &str = "RENEWED";
 
 /// `AgreementEntitlementStatus` and `AgreementEntitlementStatusReasonCode` values
 /// an entitlement of an agreement reports, from
@@ -106,7 +109,9 @@ const CONTRACT_LENGTHS: &[(&str, u64)] = &[
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// `days` of a contract length, as a duration.
-fn days(days: u64) -> Duration {
+///
+/// `pub(crate)` for the same reason as [`signed_ago`].
+pub(crate) fn days(days: u64) -> Duration {
     DAY * u32::try_from(days).expect("a published contract length fits in days")
 }
 
@@ -118,7 +123,14 @@ fn days(days: u64) -> Duration {
 /// whose own instants all sit `ago` earlier is the same thing seen from the
 /// handler's side. Nothing about the agreement's status, its behaviour or its
 /// entitlements is touched — those are what the rows then read back over HTTP.
-fn signed_ago(engine: &engine::InMemoryEngine, agreement_id: &str, ago: Duration) {
+///
+/// `pub(crate)` because the suite over the renewal an end date makes due
+/// (`tests/all/agreement_renewals.rs`) ages the same records the same way.
+pub(crate) fn signed_ago(
+    engine: &engine::InMemoryEngine,
+    agreement_id: &str,
+    ago: Duration,
+) {
     let state = service_state(engine).expect("the emulator's own engine carries this store");
     let mut store = state.lock();
     let agreement = store
@@ -146,7 +158,9 @@ fn now_epoch_secs() -> f64 {
 
 /// Create and accept one agreement over `terms`, then wind its window back by
 /// `ago`, answering its agreement id.
-async fn aged_agreement(
+///
+/// `pub(crate)` for the same reason as [`signed_ago`].
+pub(crate) async fn aged_agreement(
     router: &MultiServiceRouter,
     engine: &engine::InMemoryEngine,
     proposal: &str,
@@ -335,14 +349,14 @@ fn aged_cases() -> Vec<Aged> {
             end_dated: false,
         },
         Aged {
-            case: "auto-renewal enabled: its end date renews the agreement rather than ending it",
+            case: "auto-renewal enabled: its end date renews the agreement rather than expiring it",
             requested: vec![
                 upfront_term("cfg", "P1M", &[("Users", 1)]),
                 renewal_term("renew", true),
                 payment_term(),
             ],
             signed_ago: days(31),
-            status: ACTIVE,
+            status: RENEWED,
             end_dated: true,
         },
         Aged {
@@ -442,7 +456,7 @@ async fn an_agreement_reports_the_status_its_end_date_has_made_due() {
             "case {case:?}: a search for {:?} must select {agreement_id}, got {selected:?}",
             row.status
         );
-        for other in [ACTIVE, EXPIRED, CANCELLED] {
+        for other in [ACTIVE, EXPIRED, CANCELLED, RENEWED] {
             if other == row.status {
                 continue;
             }

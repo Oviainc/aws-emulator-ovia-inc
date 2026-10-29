@@ -192,9 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(id) = request.source_agreement_identifier.as_deref() {
             // The agreement a `REPLACE` request acts upon is moved below, and
             // only an active agreement is: one past its own stored end date
-            // expired at that instant, so it keeps the status the clock gave it
-            // rather than being moved to `REPLACED` afterwards.
-            store.expire_agreement(id, now);
+            // ended at that instant — expired, or renewed into the agreement
+            // that continues its chain — so it keeps the status the clock gave
+            // it rather than being moved to `REPLACED` afterwards.
+            store.settle_agreement(id, now);
             let Some(stored) = store.agreements.get(id) else {
                 // The agreement this request acts upon is gone: the same
                 // not-found refusal, naming the agreement that was looked for.
@@ -294,6 +295,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             catalog: crate::state::CATALOG.to_string(),
             acceptor,
             proposer,
+            // The region this caller signed for, which the licences above were
+            // minted in: a renewal the clock performs later mints its own in the
+            // same region.
+            region,
+            // "The maximum number of times the agreement can be renewed" counts
+            // from the agreement an acceptance created, which has been renewed
+            // no times.
+            renewal_count: 0,
             status: crate::state::STATUS_ACTIVE.to_string(),
             // "AcceptanceTime and StartTime can differ for future dated
             // agreements"; the accepted terms carry no start date, so this

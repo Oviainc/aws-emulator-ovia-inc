@@ -198,9 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // The agreement guard below acts on the status the clock has already
-        // left the agreement in: one past its own stored end date expired at
+        // left the agreement in: one past its own stored end date ended at
         // that instant, so there is nothing left for a seller to ask to cancel.
-        store.expire_agreement(&input.agreement_id, now);
+        store.settle_agreement(&input.agreement_id, now);
 
         // `@idempotencyToken`: the same token names the same cancellation
         // request, so a retried send reports the first one rather than asking

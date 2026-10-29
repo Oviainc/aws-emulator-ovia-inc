@@ -251,12 +251,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // past its own stored end date ended at that instant whether or not
         // anybody searched, so the status that transition is owed is
         // materialised before anything is selected — which is what lets the
-        // `Status` filter select an `EXPIRED` agreement and the summary report
-        // it. Nothing else here writes: every member of a summary is read from
-        // the agreement's own record.
+        // `Status` filter select an `EXPIRED` agreement, a `RENEWED` one and the
+        // renewal agreement its end date created, and the summary report them.
+        // Nothing else here writes: every member of a summary is read from the
+        // agreement's own record.
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        store.expire_agreements(now);
+        store.settle_agreements(now);
         let mut matched: Vec<&crate::state::Agreement> = Vec::new();
         for agreement in store.agreements.values() {
             // "The catalog in which the agreement was created": the selector is
