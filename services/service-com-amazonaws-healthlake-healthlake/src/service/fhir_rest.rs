@@ -295,7 +295,7 @@ impl<Eng: Send + Sync + 'static> FhirRestDataPlane<Eng> {
         }
         // The retention budgets, charged the same way for a create and for an update:
         // a create retains one more resource and releases none.
-        if let Err(failure) = admits(&store, &route.datastore_id, bytes, 0, true) {
+        if let Err(failure) = admits(&mut store, &route.datastore_id, bytes, 0, true) {
             return failure.response();
         }
         let resource = crate::state::FhirResource {
@@ -442,22 +442,27 @@ impl<Eng: Send + Sync + 'static> FhirRestDataPlane<Eng> {
         // further ones, oldest first, rather than refusing a write that a data store
         // keeping no history would have admitted. How many go is settled HERE, before
         // anything is written, so the write either fits every budget or is refused.
-        let dropped = match store
+        //
+        // What each candidate number of dropped versions would RELEASE is read out
+        // of the store FIRST: charging the budgets needs the store mutably (the
+        // store-wide ceiling reaps terminal records before refusing), so the held
+        // resource is not borrowed across that walk. Bounded by
+        // [`crate::state::MAX_FHIR_RESOURCE_VERSIONS`].
+        let candidates: Option<Vec<(usize, usize)>> = store
             .datastores
             .get(&route.datastore_id)
             .and_then(|datastore| datastore.fhir_resource(resource_type, id))
-        {
-            Some(held) => {
+            .map(|held| {
+                (held.forced_drops_on_supersede()..=held.max_drops_on_supersede())
+                    .map(|drop| (drop, held.release_dropping(drop)))
+                    .collect()
+            });
+        let dropped = match candidates {
+            Some(candidates) => {
                 let mut admitted = None;
                 let mut refused = None;
-                for drop in held.forced_drops_on_supersede()..=held.max_drops_on_supersede() {
-                    match admits(
-                        &store,
-                        &route.datastore_id,
-                        bytes,
-                        held.release_dropping(drop),
-                        false,
-                    ) {
+                for (drop, released) in candidates {
+                    match admits(&mut store, &route.datastore_id, bytes, released, false) {
                         Ok(()) => {
                             admitted = Some(drop);
                             break;
@@ -477,7 +482,7 @@ impl<Eng: Send + Sync + 'static> FhirRestDataPlane<Eng> {
             }
             // `update-as-create` retains one more resource and releases nothing.
             None => {
-                if let Err(failure) = admits(&store, &route.datastore_id, bytes, 0, true) {
+                if let Err(failure) = admits(&mut store, &route.datastore_id, bytes, 0, true) {
                     return failure.response();
                 }
                 0
@@ -783,15 +788,25 @@ fn submitted_within_size(body: &[u8]) -> Result<(), Failure> {
 /// retains together. Each is checked BEFORE anything is written, and with
 /// `saturating_*`, so no product of caller-chosen factors can grow the heap and an
 /// arithmetic edge cannot wrap into an admission.
+///
+/// The store-wide total is charged through
+/// [`crate::state::ComAmazonawsHealthlakeHealthlakeState::admits_fhir_resource_bytes`],
+/// which is why the store is taken by `&mut`: that ceiling bounds what this service
+/// HOLDS, so the terminal records whose bytes come back by being dropped are reaped
+/// before a write is refused for them — the same answer a full registry gets before a
+/// create is refused. The two per-data-store ceilings are about the data store being
+/// written, which is serving and so never terminal, and are unaffected.
 fn admits(
-    store: &crate::state::ComAmazonawsHealthlakeHealthlakeState,
+    store: &mut crate::state::ComAmazonawsHealthlakeHealthlakeState,
     datastore_id: &str,
     bytes: usize,
     released: usize,
     retains_one_more: bool,
 ) -> Result<(), Failure> {
-    let datastore = store.datastores.get(datastore_id);
-    let held = datastore.map_or(0, |datastore| datastore.fhir_resources.len());
+    let held = store
+        .datastores
+        .get(datastore_id)
+        .map_or(0, |datastore| datastore.fhir_resources.len());
     if retains_one_more && held >= crate::state::MAX_FHIR_RESOURCES_PER_DATASTORE {
         return Err(Failure::new(
             507,
@@ -803,7 +818,9 @@ fn admits(
             ),
         ));
     }
-    let held_bytes = datastore
+    let held_bytes = store
+        .datastores
+        .get(datastore_id)
         .map_or(0, |datastore| datastore.fhir_resource_bytes)
         .saturating_sub(released);
     if held_bytes.saturating_add(bytes) > crate::state::MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE {
@@ -817,12 +834,7 @@ fn admits(
             ),
         ));
     }
-    if store
-        .fhir_resource_bytes_total()
-        .saturating_sub(released)
-        .saturating_add(bytes)
-        > crate::state::MAX_FHIR_RESOURCE_BYTES_TOTAL
-    {
+    if !store.admits_fhir_resource_bytes(bytes, released) {
         return Err(Failure::new(
             507,
             TOO_COSTLY,

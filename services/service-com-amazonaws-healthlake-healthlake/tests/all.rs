@@ -79,6 +79,8 @@ mod source_format_enum_refusal;
 mod start_data_transformation_job;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/store_wide_byte_ceiling_holders.rs"]
+mod store_wide_byte_ceiling_holders;
 #[path = "all/tag_mutation_requires_a_live_resource.rs"]
 mod tag_mutation_requires_a_live_resource;
 #[path = "all/timestamp_cutoff_filters.rs"]

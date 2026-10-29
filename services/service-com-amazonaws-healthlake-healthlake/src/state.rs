@@ -1953,6 +1953,56 @@ impl ComAmazonawsHealthlakeHealthlakeState {
         self.reap_datastores_where(|datastore| datastore.status == DatastoreStatus::Deleted);
     }
 
+    /// Whether this service can hold ONE more data store record — what
+    /// [`MAX_DATASTORES`] bounds.
+    ///
+    /// The ONE place a store-wide registry refusal is decided, so every
+    /// operation that mints a data store refuses on the same terms: a record
+    /// that has reached the terminal [`DatastoreStatus::Deleted`] status is
+    /// lingering only for [`DELETED_RETENTION`] and gives its slot back by being
+    /// dropped, so when the registry as it stands is full the terminal records
+    /// are reaped ([`Self::reap_terminal_records`]) and the count taken again.
+    /// Only a genuinely full store is refused.
+    pub fn admits_another_datastore(&mut self) -> bool {
+        if self.datastores.len() < MAX_DATASTORES {
+            return true;
+        }
+        self.reap_terminal_records();
+        self.datastores.len() < MAX_DATASTORES
+    }
+
+    /// Whether every data store together can RETAIN `added` more BYTES of FHIR
+    /// resources once the `released` bytes the same write gives back are
+    /// returned — what [`MAX_FHIR_RESOURCE_BYTES_TOTAL`] bounds.
+    ///
+    /// The ONE place a store-wide byte refusal is decided, for the reason
+    /// [`Self::admits_another_datastore`] is the one place the count refusal is:
+    /// the ceiling bounds what this service HOLDS, and a terminal record's bytes
+    /// come back exactly by dropping the record
+    /// ([`Self::fhir_resource_bytes_total`] is summed over the records), so when
+    /// the total as it stands does not admit the write the terminal records are
+    /// reaped and the total is taken again. A caller that deletes the data
+    /// stores it filled can therefore always write again, and only a genuinely
+    /// full service is refused.
+    pub fn admits_fhir_resource_bytes(&mut self, added: usize, released: usize) -> bool {
+        if self.fhir_resource_bytes_total_admits(added, released) {
+            return true;
+        }
+        self.reap_terminal_records();
+        self.fhir_resource_bytes_total_admits(added, released)
+    }
+
+    /// Whether the retained total AS IT STANDS admits `added` more bytes once
+    /// `released` of the bytes it counts come back.
+    ///
+    /// `saturating_*`, so no arithmetic edge can wrap into an admission.
+    fn fhir_resource_bytes_total_admits(&self, added: usize, released: usize) -> bool {
+        self.fhir_resource_bytes_total()
+            .saturating_sub(released)
+            .saturating_add(added)
+            <= MAX_FHIR_RESOURCE_BYTES_TOTAL
+    }
+
     /// Materialise every export job transition the clock has ALREADY made due.
     ///
     /// The companion of [`Self::settle_lifecycle`] for the job records: called

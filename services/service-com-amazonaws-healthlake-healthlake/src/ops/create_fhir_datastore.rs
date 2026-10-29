@@ -292,10 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store holds a bounded number of data stores. Terminal records are
         // reaped before the refusal, so a caller that deletes what it created
         // can always create again; only a genuinely full store is refused.
-        if store.datastores.len() >= crate::state::MAX_DATASTORES {
-            store.reap_terminal_records();
-        }
-        if store.datastores.len() >= crate::state::MAX_DATASTORES {
+        if !store.admits_another_datastore() {
             return Err(CreateFHIRDatastoreErrorModeled::ThrottlingException(
                 ThrottlingException {
                     message: Some(format!(
@@ -338,12 +335,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resources are held to together, exactly as a FHIR write and a restore
         // do. The data set itself is bounded by construction
         // (`synthea::PRELOADED_RESOURCE_COUNT` resources), so only a service
-        // already close to the ceiling is refused.
-        if store
-            .fhir_resource_bytes_total()
-            .saturating_add(fhir_resource_bytes)
-            > crate::state::MAX_FHIR_RESOURCE_BYTES_TOTAL
-        {
+        // already close to the ceiling is refused — and, exactly as for the
+        // count ceiling above, terminal records give their bytes back before
+        // the refusal, so only a genuinely full service is refused.
+        if !store.admits_fhir_resource_bytes(fhir_resource_bytes, 0) {
             return Err(CreateFHIRDatastoreErrorModeled::ThrottlingException(
                 ThrottlingException {
                     message: Some(format!(
