@@ -55,6 +55,8 @@ mod continuous_deployment_policies;
 mod continuous_deployment_policy_config_read;
 #[path = "all/continuous_deployment_policy_delete.rs"]
 mod continuous_deployment_policy_delete;
+#[path = "all/continuous_deployment_policy_update.rs"]
+mod continuous_deployment_policy_update;
 #[path = "all/create_location_header.rs"]
 mod create_location_header;
 #[path = "all/distribution_config_defaults.rs"]

@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateContinuousDeploymentPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateContinuousDeploymentPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Replaces the configuration of the continuous deployment policy an id names, WHOLE:
+//! "when you update a continuous deployment policy configuration, all the fields are
+//! updated with the values that are provided in the request. You cannot update some fields
+//! independent of others" — so the stored configuration becomes the submitted one down to
+//! the members it leaves out, `LastModifiedTime` moves to now, and a fresh version token is
+//! minted, which is the one a later `If-Match` against this policy is checked against.
+//! Reports the record as it then stands, read from the store rather than from the request.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateContinuousDeploymentPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The refusals, in the order they are checked — each one BEFORE anything is written, so a
+//! refused update leaves the stored policy, its version token and its `LastModifiedTime`
+//! exactly as they were:
+//!
+//! * an id no stored policy holds — `NoSuchContinuousDeploymentPolicy` (HTTP 404), decided
+//!   BEFORE the precondition, because the id is what the mutation is about: a policy that
+//!   is gone is unusable, not merely unreadable, so no version of it can make the write
+//!   land ([`crate::state::no_such_continuous_deployment_policy`]);
+//! * an `If-Match` that is absent or is not a version token at all —
+//!   `InvalidIfMatchVersion` (HTTP 400), "The If-Match version is missing or not valid";
+//!   one that carries a token that is not this policy's current one — `PreconditionFailed`
+//!   (HTTP 412), so an update only lands on the configuration its caller actually read
+//!   ([`crate::state::check_if_match`]);
+//! * a list wrapper whose `Quantity` disagrees with the length of its `Items` —
+//!   `InconsistentQuantities` (HTTP 400), the same rule every CloudFront list wrapper
+//!   obeys and the one the create path walks
+//!   ([`crate::state::policy_config_quantity_mismatch`]);
+//! * a member outside what the documentation allows for it (the traffic configuration the
+//!   stated `Type` selects, the weight's range, the session stickiness TTLs, how many
+//!   staging distribution domain names one policy may name) — `InvalidArgument` (HTTP
+//!   400), named member by member ([`crate::state::policy_config_invalid_argument`]);
+//! * a staging distribution domain name ANOTHER policy already routes traffic to —
+//!   `StagingDistributionInUse` (HTTP 409): a staging distribution takes part in at most
+//!   ONE policy, and the names this policy itself already holds are its own, so an update
+//!   that keeps them is not a conflict with itself
+//!   ([`crate::state::policy_using_staging_distribution`]).
+//!
+//! Those are exactly the configuration constraints
+//! [`crate::ops::create_continuous_deployment_policy`] refuses a payload with, so an
+//! update stores nothing the create would have refused and refuses nothing it accepts. A
+//! policy carries neither a status nor a propagation deadline, so the clock owes an updated
+//! policy nothing. `AccessDenied` is unreachable here, as it is from every other operation
+//! in this service: the emulator authorizes no caller.
 //!
 //! ## Shape of an operation
 //!
@@ -93,6 +125,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -167,18 +203,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateContinuousDeploymentPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateContinuousDeploymentPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateContinuousDeploymentPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let config = input.continuous_deployment_policy_config;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of the store before this
+        // call reads it; a policy itself carries neither a status nor a propagation
+        // deadline, so nothing about one is owed.
+        store.settle(now);
+
+        // The policy being updated is looked up FIRST: every refusal below is about the
+        // record this id names, so an id the store does not hold is answered "does not
+        // exist" before any precondition is evaluated, and nothing is minted for it.
+        let Some(current_etag) = store
+            .continuous_deployment_policy(&input.id)
+            .map(|stored| stored.etag.clone())
+        else {
+            return Err(
+                UpdateContinuousDeploymentPolicyErrorModeled::NoSuchContinuousDeploymentPolicy(
+                    crate::state::no_such_continuous_deployment_policy(),
+                )
+                .into(),
+            );
+        };
+
+        // The precondition is checked against the STORED version, so an update only lands
+        // on the configuration its caller actually read.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(
+                    UpdateContinuousDeploymentPolicyErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into(),
+                );
+            }
+            IfMatch::Stale => {
+                return Err(
+                    UpdateContinuousDeploymentPolicyErrorModeled::PreconditionFailed(
+                        crate::state::precondition_failed(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "The value of Quantity and the size of Items don't match." — the one list wrapper
+        // this configuration carries, checked exactly as the create path checks it.
+        if let Some(message) = crate::state::policy_config_quantity_mismatch(&config) {
+            return Err(
+                UpdateContinuousDeploymentPolicyErrorModeled::InconsistentQuantities(
+                    InconsistentQuantities {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A member outside what the documentation allows for it is "An argument is
+        // invalid", named member by member — the same walk the create path makes, so an
+        // update cannot store a configuration a create would have refused.
+        if let Some(reason) = crate::state::policy_config_invalid_argument(&config) {
+            return Err(
+                UpdateContinuousDeploymentPolicyErrorModeled::InvalidArgument(InvalidArgument {
+                    message: Some(format!("An argument is invalid: {reason}")),
+                })
+                .into(),
+            );
+        }
+
+        // A staging distribution takes part in at most ONE policy, so an update that moves
+        // this policy onto a domain name another policy routes traffic to is refused. The
+        // policy being updated already holds its own names, which is why the holder's id is
+        // compared.
+        let dns_names = crate::state::staging_distribution_dns_names(&config).to_vec();
+        if let Some(holder_id) = store
+            .policy_using_staging_distribution(&dns_names)
+            .map(|holder| holder.id.clone())
+            .filter(|holder_id| *holder_id != input.id)
+        {
+            return Err(
+                UpdateContinuousDeploymentPolicyErrorModeled::StagingDistributionInUse(
+                    crate::state::staging_distribution_in_use(&holder_id),
+                )
+                .into(),
+            );
+        }
+
+        // Defensive: the id was confirmed present above under this same lock, so the write
+        // cannot miss. The `None` arm is the modelled 404 rather than a panic.
+        let Some(stored) = store.apply_continuous_deployment_policy_config(&input.id, config, now)
+        else {
+            return Err(
+                UpdateContinuousDeploymentPolicyErrorModeled::NoSuchContinuousDeploymentPolicy(
+                    crate::state::no_such_continuous_deployment_policy(),
+                )
+                .into(),
+            );
+        };
+
+        Ok(UpdateContinuousDeploymentPolicyOutput {
+            // "A continuous deployment policy" — read from the record just written, never
+            // from the request.
+            continuous_deployment_policy: Some(stored.to_policy()),
+            // "The version identifier for the current version of the continuous deployment
+            // policy" — a fresh token, so the version this caller just replaced no longer
+            // satisfies an `If-Match`.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }
