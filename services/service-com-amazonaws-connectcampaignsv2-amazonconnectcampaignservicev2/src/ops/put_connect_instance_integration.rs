@@ -215,23 +215,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The attempt to change what this service holds for the instance is recorded
+        // on this exit as on every other, named by the modelled error it answers with.
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            // The attempt ended in a modelled server error rather than in a change,
-            // which the trail records as it records every other outcome this call can
-            // return through.
-            crate::state::audit_onboarding_change(
-                ctx.parts(),
-                Self::NAME,
-                &input.connect_instance_id,
-                "InternalServerException",
-            );
             return Err(
                 PutConnectInstanceIntegrationErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: "the ConnectCampaignsV2 instance integration store is unavailable"
-                            .to_string(),
-                        x_amz_error_type: None,
-                    },
+                    crate::state::instance_server_fault(
+                        ctx.parts(),
+                        Self::NAME,
+                        &input.connect_instance_id,
+                        "the ConnectCampaignsV2 instance integration store is unavailable",
+                    ),
                 )
                 .into(),
             );
@@ -270,20 +264,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
             Some(crate::state::InstanceRegistryRefusal::Unavailable) => {
-                // Also an outcome of an attempted change, so also recorded.
-                crate::state::audit_onboarding_change(
-                    ctx.parts(),
-                    Self::NAME,
-                    &input.connect_instance_id,
-                    "InternalServerException",
-                );
                 return Err(
                     PutConnectInstanceIntegrationErrorModeled::InternalServerException(
-                        InternalServerException {
-                            message: crate::state::INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE
-                                .to_string(),
-                            x_amz_error_type: None,
-                        },
+                        crate::state::instance_server_fault(
+                            ctx.parts(),
+                            Self::NAME,
+                            &input.connect_instance_id,
+                            crate::state::INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE,
+                        ),
                     )
                     .into(),
                 );
@@ -319,15 +307,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record it hands back is what the instance now holds; this operation's
         // modelled output is empty, so `ListConnectInstanceIntegrations` is where it
         // surfaces.
-        let Some(_stored) = store.put_instance_integration(
+        if let Err(refused) = store.put_instance_integration(
             &region,
             &input.connect_instance_id,
             input.integration_config,
-        ) else {
-            // The store is bounded: past its ceiling the put is refused rather than
+        ) {
+            // The store is bounded: past a ceiling the put is refused rather than
             // growing the process without limit. Of the errors this operation models,
             // the conflict is the one that fits — the service's own state, not the
-            // request, is what stops it.
+            // request, is what stops it, and the refusal names the ceiling it hit.
             crate::state::audit_onboarding_change(
                 ctx.parts(),
                 Self::NAME,
@@ -336,15 +324,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Err(PutConnectInstanceIntegrationErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "The maximum number of integrations ({}) are already configured for this Connect instance",
-                        crate::state::MAX_INTEGRATIONS_PER_INSTANCE
-                    ),
+                    message: refused.message(),
                     x_amz_error_type: None,
                 },
             )
             .into());
-        };
+        }
 
         // The call changed what this service holds for the instance, so it leaves an
         // audit record naming the caller, the instance and the outcome.

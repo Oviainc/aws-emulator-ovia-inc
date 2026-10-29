@@ -215,22 +215,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `RETAIN_ALL` and a request carrying no policy both retain them.
         let delete_campaigns = policy == Some(crate::state::CAMPAIGN_DELETION_POLICY_DELETE_ALL);
 
+        // The attempt to change what this service holds for the instance is recorded
+        // on this exit as on every other, named by the modelled error it answers with.
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            // The attempt ended in a modelled server error rather than in a change,
-            // which the trail records as it records every other outcome this call can
-            // return through.
-            crate::state::audit_onboarding_change(
-                ctx.parts(),
-                Self::NAME,
-                &input.connect_instance_id,
-                "InternalServerException",
-            );
             return Err(
                 DeleteConnectInstanceConfigErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: "the ConnectCampaignsV2 instance store is unavailable".to_string(),
-                        x_amz_error_type: None,
-                    },
+                    crate::state::instance_server_fault(
+                        ctx.parts(),
+                        Self::NAME,
+                        &input.connect_instance_id,
+                        "the ConnectCampaignsV2 instance store is unavailable",
+                    ),
                 )
                 .into(),
             );

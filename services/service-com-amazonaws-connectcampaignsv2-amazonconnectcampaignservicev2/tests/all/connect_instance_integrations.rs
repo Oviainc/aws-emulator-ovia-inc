@@ -24,12 +24,16 @@
 //! * listing only reports: repeated reads agree, and one instance's integrations are
 //!   never another's;
 //! * the store is bounded: past the ceiling a further put is refused with HTTP 409
-//!   `ConflictException` and the integrations already stored are untouched.
+//!   `ConflictException` and the integrations already stored are untouched, and the
+//!   same holds for the number of INSTANCES the store holds integrations for.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::ops::types::EVENT_TYPE_VALUES;
+use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::ops::types::{
+    IntegrationConfig, LambdaIntegrationConfig, EVENT_TYPE_VALUES,
+};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
-    MAX_INTEGRATIONS_PER_INSTANCE, ONBOARDING_JOB_DURATION,
+    ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State, IntegrationPutRefused,
+    MAX_INTEGRATIONS_PER_INSTANCE, MAX_INTEGRATION_INSTANCES, ONBOARDING_JOB_DURATION,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -481,6 +485,75 @@ async fn a_put_past_the_ceiling_is_refused_and_changes_nothing() {
     assert_eq!(
         status, 200,
         "case \"update at the ceiling\": expected HTTP 200, got {status} {body}"
+    );
+}
+
+/// The store's INSTANCE-KEY space is bounded as well as each instance's list: past
+/// `MAX_INTEGRATION_INSTANCES`, a put that would give a FURTHER instance its first
+/// integration is refused and writes nothing, while an instance the store already holds
+/// integrations for still takes one.
+///
+/// Driven against the store itself rather than over the wire, because the wire cannot
+/// reach this ceiling: a put requires the instance to be onboarded, and the onboarding
+/// store is capped at the same figure, so an HTTP caller meets the onboarding refusal
+/// first. The bound still has to hold here — it is what keeps the map from growing once
+/// per instance id a request carries.
+#[test]
+fn a_put_for_a_further_instance_past_the_key_ceiling_is_refused_and_changes_nothing() {
+    let mut store = ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::default();
+    // One distinct Lambda function per put, so every record is a new integration
+    // rather than an update of one already stored.
+    let config = |n: usize| {
+        IntegrationConfig::Lambda(LambdaIntegrationConfig {
+            function_arn: format!(
+                "arn:aws:lambda:us-east-1:000000000000:function:key-ceiling-handler-{n}"
+            ),
+        })
+    };
+    let instance = |n: usize| format!("key-ceiling-instance-{n}");
+
+    for n in 0..MAX_INTEGRATION_INSTANCES {
+        assert!(
+            store
+                .put_instance_integration(REGION, &instance(n), config(n))
+                .is_ok(),
+            "case \"instance {n} of {MAX_INTEGRATION_INSTANCES}\": expected the put to be taken, \
+             got a refusal"
+        );
+    }
+
+    let beyond = instance(MAX_INTEGRATION_INSTANCES);
+    let refused = store
+        .put_instance_integration(REGION, &beyond, config(MAX_INTEGRATION_INSTANCES))
+        .err();
+    assert_eq!(
+        refused,
+        Some(IntegrationPutRefused::StoreFull),
+        "case \"one instance past the key ceiling\": expected the store-full refusal, \
+         got {refused:?}"
+    );
+    let stored = store.instance_integrations(REGION, &beyond).count();
+    assert_eq!(
+        stored, 0,
+        "case \"one instance past the key ceiling\": a refused put must store nothing, \
+         got {stored} records"
+    );
+
+    // Only a FURTHER instance is blocked: one the store already holds integrations for
+    // still takes another.
+    let held = instance(0);
+    assert!(
+        store
+            .put_instance_integration(REGION, &held, config(MAX_INTEGRATION_INSTANCES + 1))
+            .is_ok(),
+        "case \"a second integration of an instance at the key ceiling\": expected the put to \
+         be taken, got a refusal"
+    );
+    let stored = store.instance_integrations(REGION, &held).count();
+    assert_eq!(
+        stored, 2,
+        "case \"a second integration of an instance at the key ceiling\": expected 2 records, \
+         got {stored}"
     );
 }
 

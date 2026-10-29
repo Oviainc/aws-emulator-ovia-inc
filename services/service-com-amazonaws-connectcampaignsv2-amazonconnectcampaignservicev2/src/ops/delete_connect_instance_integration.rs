@@ -174,11 +174,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The ARN the identifier carries sits behind a union member, which the
-        // centralized constraint walk does not reach, so the shared check holds it to
-        // the `@length` and `@pattern` of the shape it targets — as a bad request,
-        // before the instance is looked up or anything is removed. An ARN those bounds
-        // refuse is one no put could have stored an integration under.
+        // The ARN the identifier carries is judged off the generated schema of the
+        // structure behind the union member, as a bad request, before the instance is
+        // looked up or anything is removed: an ARN those bounds refuse is one no put
+        // could have stored an integration under. A BACKSTOP rather than the first line
+        // of defence — the boundary validator reaches that structure's members and
+        // refuses such a value before `handle` runs — but it is what keeps this
+        // handler's own contract if that walk ever narrows.
         if let Some(message) = crate::state::integration_identifier_violation(
             "integrationIdentifier",
             &input.integration_identifier,
@@ -203,23 +205,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The attempt to change what this service holds for the instance is recorded
+        // on this exit as on every other, named by the modelled error it answers with.
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            // The attempt ended in a modelled server error rather than in a change,
-            // which the trail records as it records every other outcome this call can
-            // return through.
-            crate::state::audit_onboarding_change(
-                ctx.parts(),
-                Self::NAME,
-                &input.connect_instance_id,
-                "InternalServerException",
-            );
             return Err(
                 DeleteConnectInstanceIntegrationErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: "the ConnectCampaignsV2 instance integration store is unavailable"
-                            .to_string(),
-                        x_amz_error_type: None,
-                    },
+                    crate::state::instance_server_fault(
+                        ctx.parts(),
+                        Self::NAME,
+                        &input.connect_instance_id,
+                        "the ConnectCampaignsV2 instance integration store is unavailable",
+                    ),
                 )
                 .into(),
             );
@@ -262,20 +258,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
             Some(crate::state::InstanceRegistryRefusal::Unavailable) => {
-                // Also an outcome of an attempted change, so also recorded.
-                crate::state::audit_onboarding_change(
-                    ctx.parts(),
-                    Self::NAME,
-                    &input.connect_instance_id,
-                    "InternalServerException",
-                );
                 return Err(
                     DeleteConnectInstanceIntegrationErrorModeled::InternalServerException(
-                        InternalServerException {
-                            message: crate::state::INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE
-                                .to_string(),
-                            x_amz_error_type: None,
-                        },
+                        crate::state::instance_server_fault(
+                            ctx.parts(),
+                            Self::NAME,
+                            &input.connect_instance_id,
+                            crate::state::INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE,
+                        ),
                     )
                     .into(),
                 );

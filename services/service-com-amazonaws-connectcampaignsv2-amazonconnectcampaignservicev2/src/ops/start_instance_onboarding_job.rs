@@ -204,22 +204,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The attempt to change the instance is recorded on this exit as on every
+        // other, named by the modelled error it answers with: the shared helper
+        // writes the record and hands back the payload together.
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            // The attempt ended in a modelled server error rather than in a change,
-            // which the trail records as it records every other outcome this call can
-            // return through.
-            crate::state::audit_onboarding_change(
-                ctx.parts(),
-                Self::NAME,
-                &input.connect_instance_id,
-                "InternalServerException",
-            );
             return Err(StartInstanceOnboardingJobErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: "the ConnectCampaignsV2 instance onboarding store is unavailable"
-                        .to_string(),
-                    x_amz_error_type: None,
-                },
+                crate::state::instance_server_fault(
+                    ctx.parts(),
+                    Self::NAME,
+                    &input.connect_instance_id,
+                    "the ConnectCampaignsV2 instance onboarding store is unavailable",
+                ),
             )
             .into());
         };
@@ -269,18 +264,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             Some(crate::state::InstanceRegistryRefusal::Unavailable) => {
-                // Also an outcome of an attempted change, so also recorded.
-                crate::state::audit_onboarding_change(
-                    ctx.parts(),
-                    Self::NAME,
-                    &input.connect_instance_id,
-                    "InternalServerException",
-                );
                 return Err(StartInstanceOnboardingJobErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: crate::state::INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE.to_string(),
-                        x_amz_error_type: None,
-                    },
+                    crate::state::instance_server_fault(
+                        ctx.parts(),
+                        Self::NAME,
+                        &input.connect_instance_id,
+                        crate::state::INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE,
+                    ),
                 )
                 .into());
             }

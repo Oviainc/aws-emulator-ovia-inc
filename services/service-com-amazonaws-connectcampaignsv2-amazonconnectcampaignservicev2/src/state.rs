@@ -50,8 +50,8 @@ use crate::ops::types::{
     CommunicationLimitsConfig, CommunicationTimeConfig, CustomerProfilesIntegrationConfig,
     CustomerProfilesIntegrationIdentifier, CustomerProfilesIntegrationSummary,
     EmailChannelSubtypeParameters, EncryptionConfig, EntryLimitsConfig, EventTrigger,
-    InstanceCommunicationLimitsConfig, InstanceConfig,
-    InstanceOnboardingJobStatus, IntegrationConfig, IntegrationIdentifier, IntegrationSummary,
+    InstanceCommunicationLimitsConfig, InstanceConfig, InstanceOnboardingJobStatus,
+    IntegrationConfig, IntegrationIdentifier, IntegrationSummary, InternalServerException,
     LambdaIntegrationConfig, LambdaIntegrationIdentifier, LambdaIntegrationSummary,
     OpenHours, QConnectIntegrationConfig, QConnectIntegrationIdentifier, QConnectIntegrationSummary,
     Schedule, SmsChannelSubtypeParameters, Source, TelephonyChannelSubtypeParameters, TimeWindow,
@@ -1466,6 +1466,31 @@ pub fn audit_onboarding_change(
     );
 }
 
+/// The modelled server error a state-changing Connect-instance call answers with when
+/// a store it has to read cannot be reached, recorded through
+/// [`audit_onboarding_change`] on the way out.
+///
+/// The one place that pairing is made, so the server-fault exit of such a call cannot
+/// answer without leaving the record every one of its exits owes: the payload the
+/// caller sees and the record the trail keeps come out of the same call. `detail` is
+/// the text the exception carries — which store the handler could not reach — and goes
+/// nowhere near the record, which carries only wire metadata and the instance id the
+/// request named.
+pub fn instance_server_fault(
+    parts: &::http::request::Parts,
+    operation: &'static str,
+    connect_instance_id: &str,
+    detail: &str,
+) -> InternalServerException {
+    // The outcome is named by the modelled error the refusal answers with, exactly as
+    // the request-fault exits name theirs.
+    audit_onboarding_change(parts, operation, connect_instance_id, "InternalServerException");
+    InternalServerException {
+        message: detail.to_string(),
+        x_amz_error_type: None,
+    }
+}
+
 /// The `InstanceOnboardingJobStatusCode` value a job that has not finished
 /// onboarding the instance yet reports, as the model's catalog declares it (see
 /// `INSTANCE_ONBOARDING_JOB_STATUS_CODE_VALUES` in [`crate::ops::types`]).
@@ -1818,6 +1843,18 @@ pub fn connect_instance_registry_refusal<Eng: Send + Sync + 'static>(
 /// each.
 pub const MAX_INTEGRATIONS_PER_INSTANCE: usize = 100;
 
+/// The most Connect instances one region's integration store holds records for at
+/// once, counted per instance and not per integration: past it a put that would give a
+/// FURTHER instance its first integration is refused exactly as an instance already at
+/// [`MAX_INTEGRATIONS_PER_INSTANCE`] is, and nothing is written.
+///
+/// The instance id a put carries is the caller's, so the per-instance ceiling alone
+/// bounds no growth: without a ceiling on the KEYS a caller could repeat the put under
+/// fresh ids until the process runs out of memory. It is [`MAX_ONBOARDED_INSTANCES`],
+/// the most instances one region holds onboarding records for, because only an
+/// onboarded instance has integrations to hold.
+pub const MAX_INTEGRATION_INSTANCES: usize = MAX_ONBOARDED_INSTANCES;
+
 /// Which of the three integrations the `IntegrationConfig`, `IntegrationIdentifier`
 /// and `IntegrationSummary` unions each declare a member for a record is.
 ///
@@ -2050,6 +2087,39 @@ impl ConfigurationRejected {
             Self::NotConfigurable { state } => {
                 format!("A campaign in state {} cannot be reconfigured", state.as_wire())
             }
+        }
+    }
+}
+
+/// Why the store refused to take an integration into a Connect instance, as
+/// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::put_instance_integration`]
+/// reports it. Nothing is written in either case.
+///
+/// Two ceilings, kept apart because each is a different thing being full, and
+/// [`Self::message`] carries the sentence that names the one actually hit — so the
+/// refusal never describes a state the store is not in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrationPutRefused {
+    /// The instance already holds [`MAX_INTEGRATIONS_PER_INSTANCE`] integrations.
+    InstanceFull,
+    /// The store has no room for a FURTHER instance's integrations: the region already
+    /// holds them for [`MAX_INTEGRATION_INSTANCES`] instances, or the store already
+    /// holds [`MAX_REGIONS`] regions and this would be a new one's first.
+    StoreFull,
+}
+
+impl IntegrationPutRefused {
+    /// The sentence this refusal is reported with.
+    pub fn message(self) -> String {
+        match self {
+            Self::InstanceFull => format!(
+                "The maximum number of integrations ({MAX_INTEGRATIONS_PER_INSTANCE}) are \
+                 already configured for this Connect instance"
+            ),
+            Self::StoreFull => format!(
+                "The maximum number of Connect instances ({MAX_INTEGRATION_INSTANCES}) already \
+                 have integrations configured"
+            ),
         }
     }
 }
@@ -2871,23 +2941,26 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// is what makes the call an update of that integration rather than a second one
     /// beside it. A config under an identity the instance does not hold is appended.
     ///
-    /// `None` means the instance already holds [`MAX_INTEGRATIONS_PER_INSTANCE`]
-    /// integrations and nothing was written — a refusal consumes no sequence number
-    /// and leaves no empty entry behind.
+    /// `Err` means nothing was written, and which ceiling stopped it (see
+    /// [`IntegrationPutRefused`]): a refusal consumes no sequence number and leaves no
+    /// empty entry behind.
     pub fn put_instance_integration(
         &mut self,
         region: &str,
         connect_instance_id: &str,
         config: IntegrationConfig,
-    ) -> Option<StoredIntegration> {
+    ) -> Result<StoredIntegration, IntegrationPutRefused> {
         let (kind, arn) = {
             let (kind, arn) = integration_key(&config);
             (kind, arn.to_string())
         };
         let sequence = self.next_integration_sequence;
         // Past the region ceiling there is no room for a region's first integration,
-        // which the caller answers exactly as it answers a full store.
-        let store = self.region_mut(region)?;
+        // which the caller answers exactly as it answers a store whose key space is
+        // full — in both the store, and not the request, is what stops the put.
+        let store = self
+            .region_mut(region)
+            .ok_or(IntegrationPutRefused::StoreFull)?;
         let held = store
             .instance_integrations
             .get(connect_instance_id)
@@ -2902,10 +2975,19 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
             })
         {
             existing.config = config;
-            return Some(existing.clone());
+            return Ok(existing.clone());
         }
         if held >= MAX_INTEGRATIONS_PER_INSTANCE {
-            return None;
+            return Err(IntegrationPutRefused::InstanceFull);
+        }
+        // The KEY space is bounded as well as each instance's list, so the store cannot
+        // grow through fresh instance ids: past the ceiling a put that would give a
+        // further instance its first integration is refused and writes nothing, which
+        // is why capacity is weighed BEFORE the entry is created (as `region_mut` does).
+        if !store.instance_integrations.contains_key(connect_instance_id)
+            && store.instance_integrations.len() >= MAX_INTEGRATION_INSTANCES
+        {
+            return Err(IntegrationPutRefused::StoreFull);
         }
         // Only now, past the refusal, is a sequence number taken — so the cursor
         // space has no gaps a refused put left behind.
@@ -2916,7 +2998,7 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
             .or_default()
             .push(record.clone());
         self.next_integration_sequence = sequence.saturating_add(1);
-        Some(record)
+        Ok(record)
     }
 
     /// Every integration `region` holds for `connect_instance_id`, in the order they

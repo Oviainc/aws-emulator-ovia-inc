@@ -68,28 +68,30 @@ struct Row {
     record: Option<(&'static str, &'static str)>,
 }
 
-/// An instance-wide communication-limits config, as `PutInstanceCommunicationLimits`
-/// takes it.
-fn limits_body() -> Value {
-    json!({"communicationLimitsConfig": {"allChannelSubtypes": {
-        "communicationLimitsList": [
-            {"maxCountPerRecipient": 3, "frequency": 1, "unit": "DAY"},
-        ],
-    }}})
-}
-
-/// An instance-wide communication-limits config carrying one entry MORE than
-/// `communicationLimitsList` admits — the list's modelled `@length` maximum, which
-/// the crate restates once as `state::MAX_COMMUNICATION_LIMITS`. A union member's
-/// `@length` is one the boundary walk does not reach, so this is the handler's own
-/// refusal, taken before the instance is looked up.
-fn over_long_limits_body() -> Value {
-    let entries: Vec<Value> = (0..=MAX_COMMUNICATION_LIMITS)
+/// An instance-wide communication-limits config whose `communicationLimitsList` holds
+/// `count` entries, as `PutInstanceCommunicationLimits` takes it. Each entry is inside
+/// `CommunicationLimit`'s own modelled bounds (`maxCountPerRecipient` at least 1,
+/// `frequency` in 1..30, `unit` from `CommunicationLimitTimeUnit`), so the only thing a
+/// case turns on is the LENGTH.
+///
+/// Shared with [`super::instance_mutation_audit_refusal_paths`], which drives the same
+/// operation on other lengths, so this crate keeps one builder for the config.
+pub(crate) fn limits_body(count: usize) -> Value {
+    let entries: Vec<Value> = (0..count)
         .map(|index| json!({"maxCountPerRecipient": index + 1, "frequency": 1, "unit": "DAY"}))
         .collect();
     json!({"communicationLimitsConfig": {"allChannelSubtypes": {
         "communicationLimitsList": entries,
     }}})
+}
+
+/// [`limits_body`] carrying one entry MORE than `communicationLimitsList` admits — the
+/// list's modelled `@length` maximum, which the crate restates once as
+/// `state::MAX_COMMUNICATION_LIMITS`. A union member's `@length` is one the boundary
+/// walk does not reach, so this is the handler's own refusal, taken before the instance
+/// is looked up.
+fn over_long_limits_body() -> Value {
+    limits_body(MAX_COMMUNICATION_LIMITS + 1)
 }
 
 /// An `IntegrationIdentifier` whose Lambda ARN is outside `LambdaArn`'s `@pattern` —
@@ -103,7 +105,7 @@ fn malformed_integration_identifier() -> Value {
 
 /// A Lambda integration config, as `PutConnectInstanceIntegration` takes it. The ARN
 /// it carries is what no audit record may repeat.
-fn integration_body() -> Value {
+pub(crate) fn integration_body() -> Value {
     json!({"integrationConfig": {"lambda": {
         "functionArn": "arn:aws:lambda:us-east-1:000000000000:function:audited-handler",
     }}})
@@ -111,7 +113,7 @@ fn integration_body() -> Value {
 
 /// The `IntegrationIdentifier` naming the integration [`integration_body`]
 /// configures, as `DeleteConnectInstanceIntegration` takes it.
-fn integration_identifier() -> Value {
+pub(crate) fn integration_identifier() -> Value {
     json!({"integrationIdentifier": {"lambda": {
         "functionArn": "arn:aws:lambda:us-east-1:000000000000:function:audited-handler",
     }}})
@@ -121,7 +123,7 @@ fn integration_identifier() -> Value {
 /// event type the model's `EventType` catalog does not hold, which
 /// `PutConnectInstanceIntegration` refuses inside the handler — so the attempt is one
 /// this trail records.
-fn off_catalog_integration_body() -> Value {
+pub(crate) fn off_catalog_integration_body() -> Value {
     json!({"integrationConfig": {"customerProfiles": {
         "domainArn": "arn:aws:profile:us-east-1:000000000000:domains/audited-domain",
         "objectTypeNames": {"Campaign-Fax": "object-type"},
@@ -175,7 +177,7 @@ fn rows() -> Vec<Row> {
             setup: Setup::Onboarded,
             method: "PUT",
             path: "/communication-limits",
-            body: limits_body(),
+            body: limits_body(1),
             status: 200,
             error: None,
             record: Some(("PutInstanceCommunicationLimits", "accepted")),
@@ -186,7 +188,7 @@ fn rows() -> Vec<Row> {
             setup: Setup::Fresh,
             method: "PUT",
             path: "/communication-limits",
-            body: limits_body(),
+            body: limits_body(1),
             status: 404,
             error: Some("ResourceNotFoundException"),
             record: Some((
@@ -618,7 +620,7 @@ async fn a_repeated_refusal_is_recorded_once_per_attempt() {
 /// Matched on the instance-id field's whole value — an instance id carries no
 /// whitespace — so a record of an instance whose id merely starts with the same
 /// characters is not picked up.
-fn records_for(captured: &AuditCapture, instance: &str) -> Vec<String> {
+pub(crate) fn records_for(captured: &AuditCapture, instance: &str) -> Vec<String> {
     captured
         .audit_records()
         .into_iter()
@@ -627,7 +629,7 @@ fn records_for(captured: &AuditCapture, instance: &str) -> Vec<String> {
 }
 
 /// The value one field carries in a rendered record.
-fn field(record: &str, name: &str) -> String {
+pub(crate) fn field(record: &str, name: &str) -> String {
     record
         .split_once(&format!("{name}="))
         .map(|(_, rest)| rest.split(' ').next().unwrap_or_default())
@@ -640,7 +642,7 @@ fn field(record: &str, name: &str) -> String {
 /// `tracing` itself — a dependency this crate already carries — rather than pulling
 /// in a collector crate.
 #[derive(Clone, Default)]
-struct AuditCapture {
+pub(crate) struct AuditCapture {
     rendered: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
@@ -707,7 +709,7 @@ impl tracing::Subscriber for AuditCapture {
 /// global capture plus an interest-cache rebuild removes that ordering dependency;
 /// the assertions above are scoped to the instance ids these cases name, so records
 /// other cases produce into the same capture do not affect them.
-fn audit_capture() -> &'static AuditCapture {
+pub(crate) fn audit_capture() -> &'static AuditCapture {
     static CAPTURE: std::sync::OnceLock<AuditCapture> = std::sync::OnceLock::new();
     CAPTURE.get_or_init(|| {
         let capture = AuditCapture::default();

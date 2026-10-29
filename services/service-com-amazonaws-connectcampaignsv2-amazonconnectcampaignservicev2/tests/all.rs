@@ -77,6 +77,8 @@ mod instance_communication_limits;
 mod instance_communication_limits_isolation;
 #[path = "all/instance_mutation_audit.rs"]
 mod instance_mutation_audit;
+#[path = "all/instance_mutation_audit_refusal_paths.rs"]
+mod instance_mutation_audit_refusal_paths;
 #[path = "all/instance_onboarding.rs"]
 mod instance_onboarding;
 #[path = "all/instance_onboarding_requires_a_connect_instance.rs"]
