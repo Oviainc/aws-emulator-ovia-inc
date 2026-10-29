@@ -34,7 +34,11 @@
 //!    back, so one item's score is the same whatever the request asked for.
 //! 6. **Promote.** A `promotions` entry takes `percentPromotedItems` of the returned
 //!    slots from the entries its own filter selects; each such item carries
-//!    `promotionName` and the documented `reason` "Promoted item".
+//!    `promotionName` and the documented `reason` "Promoted item". The share is taken
+//!    of the entries the response actually REPORTS — `numResults` is what the caller
+//!    asked for, and a catalog or filter that leaves fewer candidates reports fewer —
+//!    so the promoted fraction of the list is the one the request named whatever the
+//!    response's length turns out to be.
 //! 7. **Metadata.** `metadataColumns` is served from the stored item attributes; with
 //!    no `metadataColumns` the `metadata` member is omitted entirely.
 //!
@@ -261,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.filter_values.as_ref(),
             )
             .map_err(deny)?;
-        let promotion = promotion(&guard, input.promotions.as_deref(), num_results)?;
+        let promotion = promotion(&guard, input.promotions.as_deref())?;
 
         // 6. Score the resolved resource's WHOLE stored catalog and settle each entry's
         //    share of the certainty over it. `RELATED_ITEMS` recommends items related
@@ -320,10 +324,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // 7. Fill the returned slots: the promotion's share first, then the rest of
         //    the ranking. Both are drawn in descending-score order, and the chosen
         //    positions are re-sorted so the response stays in that order.
+        //
+        //    How many slots the response REPORTS is settled here, before the promotion
+        //    takes its share of them: `numResults` is what the request asked for, but a
+        //    catalog (minus the item a related-items request queried) and a request
+        //    filter that leave fewer candidates report fewer. The promotion's share is
+        //    "the percentage of recommended items to apply the promotion to", so it is
+        //    a percentage of the reported entries, not of the requested count.
+        let reported = num_results.min(candidates.len());
         let mut chosen: Vec<(usize, bool)> = Vec::new();
         if let Some(promotion) = promotion.as_ref() {
+            let slots = promoted_slots(reported, promotion.percent);
             for (position, (index, _)) in candidates.iter().enumerate() {
-                if chosen.len() >= promotion.slots.min(num_results) {
+                if chosen.len() >= slots {
                     break;
                 }
                 if promotion.filter.retains(&resolved.items[*index].attributes) {
@@ -332,7 +345,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         for position in 0..candidates.len() {
-            if chosen.len() >= num_results {
+            if chosen.len() >= reported {
                 break;
             }
             if chosen.iter().any(|(taken, _)| *taken == position) {
@@ -440,8 +453,9 @@ fn resolve(
 struct PreparedPromotion {
     /// `Promotion$name`, reported as `PredictedItem$promotionName`.
     name: String,
-    /// How many of the returned slots the promotion takes.
-    slots: usize,
+    /// `Promotion$percentPromotedItems`: the share of the REPORTED entries the
+    /// promotion takes, applied once the response's length is known.
+    percent: i32,
     /// The promotion's own filter: "This filter defines the criteria for promoted
     /// items."
     filter: BoundFilter,
@@ -455,7 +469,6 @@ struct PreparedPromotion {
 fn promotion(
     state: &crate::state::ComAmazonawsPersonalizeruntimeAmazonpersonalizeruntimeState,
     promotions: Option<&[Promotion]>,
-    num_results: usize,
 ) -> Result<Option<PreparedPromotion>, GetRecommendationsError> {
     let Some(promotion) = promotions.and_then(<[Promotion]>::first) else {
         return Ok(None);
@@ -481,20 +494,25 @@ fn promotion(
     };
     Ok(Some(PreparedPromotion {
         name: name.to_string(),
-        slots: promoted_slots(num_results, percent),
+        percent,
         filter,
     }))
 }
 
-/// How many of `num_results` slots a promotion of `percent` percent takes.
+/// How many of the `reported` slots a promotion of `percent` percent takes.
+///
+/// `reported` is the number of entries the response actually carries, which is what
+/// "the percentage of recommended items to apply the promotion to" is a percentage of:
+/// a response shorter than the requested `numResults` gives the promotion a
+/// proportionally smaller share, never the whole list.
 ///
 /// Rounded UP, so a promotion the caller asked for is always applied to at least one
-/// slot: `percentPromotedItems` is modelled `range 1..100`, so asking for a promotion
-/// at all asks for a non-empty share. The rounding direction is CHOSEN — AWS
-/// documents only "the percentage of recommended items to apply the promotion to".
-fn promoted_slots(num_results: usize, percent: i32) -> usize {
+/// of the slots there are: `percentPromotedItems` is modelled `range 1..100`, so asking
+/// for a promotion at all asks for a non-empty share. The rounding direction is
+/// CHOSEN — AWS documents only the percentage itself.
+fn promoted_slots(reported: usize, percent: i32) -> usize {
     let percent = percent.clamp(0, 100) as usize;
-    num_results.saturating_mul(percent).div_ceil(100)
+    reported.saturating_mul(percent).div_ceil(100)
 }
 
 /// The modelled `InvalidInputException` (HTTP 400): "Provide a valid value for the

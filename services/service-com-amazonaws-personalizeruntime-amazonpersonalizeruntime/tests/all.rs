@@ -27,6 +27,8 @@ mod inference;
 mod metadata_member_presence;
 #[path = "all/optional_input_refusal_order.rs"]
 mod optional_input_refusal_order;
+#[path = "all/promotion_share.rs"]
+mod promotion_share;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/request_only_refusal_order.rs"]
