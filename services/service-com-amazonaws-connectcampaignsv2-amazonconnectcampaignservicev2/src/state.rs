@@ -847,24 +847,77 @@ pub fn requested_channel_subtype(parameters: &ChannelSubtypeParameters) -> &'sta
     }
 }
 
-/// Encode a cursor-paged list's cursor: the sequence number of the last record on
-/// the page just returned, hex-encoded so the token is opaque rather than a
-/// readable position.
+/// The listing a cursor belongs to: the operation that minted it, together with the
+/// selectors that chose the result set it was computed over.
 ///
-/// The cursor is a sequence number rather than an id so that a record deleted
-/// between two pages does not invalidate a token already handed out: the next
-/// page is simply everything created after that point.
-pub fn encode_next_token(last_sequence: u64) -> String {
-    ::hex::encode(last_sequence.to_string())
+/// A cursor is a position in ONE listing's stored order, so it is a resume point for
+/// that listing and for nothing else. The sequence values the paged lists of this
+/// service page by are minted from counters that advance independently of each other
+/// ([`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State`]), and a
+/// listing scoped to one region, instance or filter reports a different set from a
+/// listing scoped to another, so the same bare sequence value names an unrelated
+/// position in each. Carrying the scope in the token and requiring it back is what
+/// lets a list tell a cursor of its own from one it never issued — the second being
+/// an [`UnissuedCursor`] refusal rather than a page silently cut short.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorScope(String);
+
+impl CursorScope {
+    /// The listing `operation` makes over the result set `selectors` chooses — the
+    /// region it is scoped to and whatever path or filter members narrow it further,
+    /// in a fixed order.
+    ///
+    /// Each selector goes in length-prefixed, so no two different selector lists can
+    /// spell one scope: a listing filtered by an instance and an unfiltered one over
+    /// the same region stay apart, as do two instance ids whose concatenations agree.
+    pub fn new<'s>(operation: &str, selectors: impl IntoIterator<Item = &'s str>) -> Self {
+        let mut scope = operation.to_string();
+        for selector in selectors {
+            scope.push_str(&format!("/{}:{selector}", selector.len()));
+        }
+        Self(scope)
+    }
+
+    /// The fixed-size tag a token carries this scope as: the leading
+    /// [`CURSOR_SCOPE_TAG_BYTES`] bytes of the scope's digest, hex-encoded.
+    ///
+    /// A digest rather than the scope itself keeps the token opaque and its length
+    /// independent of how long the names the listing was scoped by are, so a cursor
+    /// stays well inside the bound `NextToken` declares however it was scoped.
+    fn tag(&self) -> String {
+        use ::sha2::Digest as _;
+
+        let digest = ::sha2::Sha256::digest(self.0.as_bytes());
+        ::hex::encode(&digest[..CURSOR_SCOPE_TAG_BYTES])
+    }
 }
 
-/// Decode a cursor produced by [`encode_next_token`], or `None` when the token
-/// was not produced by it.
-pub fn decode_next_token(token: &str) -> Option<u64> {
-    String::from_utf8(::hex::decode(token).ok()?)
-        .ok()?
-        .parse()
-        .ok()
+/// How much of a [`CursorScope`]'s digest a token carries: enough that two listings
+/// of this service cannot be confused for one another.
+const CURSOR_SCOPE_TAG_BYTES: usize = 16;
+
+/// Encode a cursor-paged list's cursor: the listing that minted it ([`CursorScope`])
+/// and the sequence number of the last record on the page just returned,
+/// hex-encoded so the token is opaque rather than a readable position.
+///
+/// The position is a sequence number rather than an id so that a record deleted
+/// between two pages does not invalidate a token already handed out: the next
+/// page is simply everything stored after that point. The scope beside it is what
+/// makes the token a resume point for the listing that handed it out alone.
+pub fn encode_next_token(scope: &CursorScope, last_sequence: u64) -> String {
+    ::hex::encode(format!("{}:{last_sequence}", scope.tag()))
+}
+
+/// Decode a cursor [`encode_next_token`] minted for `scope`, or `None` when the
+/// token was not produced by it for THIS listing — a token this codec never minted,
+/// and a token it minted for another listing alike.
+pub fn decode_next_token(scope: &CursorScope, token: &str) -> Option<u64> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let (tag, position) = decoded.split_once(':')?;
+    if tag != scope.tag() {
+        return None;
+    }
+    position.parse().ok()
 }
 
 /// The page size a cursor-paged list uses when the caller names no `maxResults`:
@@ -872,8 +925,8 @@ pub fn decode_next_token(token: &str) -> Option<u64> {
 /// unpaged call sees as much as one page can carry.
 pub const DEFAULT_PAGE_SIZE: usize = 50;
 
-/// A `nextToken` a caller sent that [`encode_next_token`] did not mint, which a
-/// paged list answers as a `ValidationException` carrying
+/// A `nextToken` a caller sent that [`encode_next_token`] did not mint for THIS
+/// listing, which a paged list answers as a `ValidationException` carrying
 /// [`Self::message`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnissuedCursor;
@@ -899,30 +952,33 @@ pub struct CursorPage<'a, T> {
 }
 
 /// The window `next_token` and `max_results` name over `items`, already in stored
-/// order, each item's cursor position read by `sequence_of`.
+/// order, each item's cursor position read by `sequence_of`, for the listing
+/// `scope` names.
 ///
 /// The one place the rule the opaque cursor is built around lives, beside the codec
 /// that mints it ([`encode_next_token`] / [`decode_next_token`]), so every paged
 /// list of this service pages identically: the page starts at the first item whose
 /// sequence is past the cursor, runs for `max_results` items (or
 /// [`DEFAULT_PAGE_SIZE`] when the caller named none) clamped to what is left, and
-/// hands back a token — the sequence of the item it ended at — only while items
-/// remain beyond it.
+/// hands back a token — the sequence of the item it ended at, stamped with `scope` —
+/// only while items remain beyond it.
 ///
-/// A cursor names a position in the stored order rather than a record, so an item
-/// removed between two pages does not invalidate a token already handed out. A
-/// token this codec did not mint resolves to no position at all, which is
-/// [`UnissuedCursor`] rather than a page.
+/// A cursor names a position in the stored order of ONE listing rather than a
+/// record, so an item removed between two pages does not invalidate a token already
+/// handed out, while a token minted for any other listing resolves to no position
+/// here at all — which is [`UnissuedCursor`] rather than a page, exactly as a token
+/// this codec never minted is.
 pub fn cursor_page<'a, T>(
     items: &'a [T],
     sequence_of: impl Fn(&T) -> u64,
+    scope: &CursorScope,
     next_token: Option<&str>,
     max_results: Option<i32>,
 ) -> Result<CursorPage<'a, T>, UnissuedCursor> {
     let start = match next_token {
         None => 0,
         Some(token) => {
-            let after = decode_next_token(token).ok_or(UnissuedCursor)?;
+            let after = decode_next_token(scope, token).ok_or(UnissuedCursor)?;
             items
                 .iter()
                 .position(|item| sequence_of(item) > after)
@@ -936,7 +992,8 @@ pub fn cursor_page<'a, T>(
     let page = &items[start..end];
     Ok(CursorPage {
         next_token: if end < items.len() {
-            page.last().map(|item| encode_next_token(sequence_of(item)))
+            page.last()
+                .map(|item| encode_next_token(scope, sequence_of(item)))
         } else {
             None
         },

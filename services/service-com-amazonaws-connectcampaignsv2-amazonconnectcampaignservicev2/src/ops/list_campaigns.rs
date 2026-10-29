@@ -177,12 +177,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The cursor is the creation sequence number the previous page ended at,
         // so this page is everything matching that was created after it. A
         // campaign deleted between two pages therefore does not invalidate a token
-        // already handed out. A token this service did not mint is a bad request.
-        // The window itself is the one `crate::state::cursor_page` computes for
-        // every paged list of this service.
+        // already handed out. The cursor is a position in THIS listing's order, so
+        // the token is stamped with the listing that minted it — this operation, the
+        // region the result set is scoped by and the instance filter that selected
+        // it — and a token minted by any other listing names no position here, which
+        // is a bad request exactly as a token this service never minted is. The
+        // window itself is the one `crate::state::cursor_page` computes for every
+        // paged list of this service.
+        let scope = crate::state::CursorScope::new(
+            Self::NAME,
+            ::std::iter::once(region.as_str()).chain(instance_id.as_deref()),
+        );
         let window = crate::state::cursor_page(
             &matching,
             |(sequence, _)| *sequence,
+            &scope,
             input.next_token.as_deref(),
             input.max_results,
         )

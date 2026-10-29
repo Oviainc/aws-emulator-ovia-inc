@@ -230,12 +230,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The cursor is the sequence number the previous page ended at, so this page
         // is every integration stored after it. An integration removed between two
-        // pages therefore does not invalidate a token already handed out. A token
-        // this service did not mint is a bad request. The window itself is the one
-        // `crate::state::cursor_page` computes for every paged list of this service.
+        // pages therefore does not invalidate a token already handed out. The cursor
+        // is a position in THIS listing's order, so the token is stamped with the
+        // listing that minted it — this operation, the region the result set is
+        // scoped by and the instance whose integrations it reports — and a token
+        // minted by any other listing names no position here, which is a bad request
+        // exactly as a token this service never minted is. The window itself is the
+        // one `crate::state::cursor_page` computes for every paged list of this
+        // service.
+        let scope = crate::state::CursorScope::new(
+            Self::NAME,
+            [region.as_str(), input.connect_instance_id.as_str()],
+        );
         let window = crate::state::cursor_page(
             &integrations,
             |stored| stored.sequence,
+            &scope,
             input.next_token.as_deref(),
             input.max_results,
         )

@@ -75,6 +75,8 @@ mod connect_instance_integrations;
 mod connect_instance_registry_gate;
 #[path = "all/cursor_paging_is_one_rule.rs"]
 mod cursor_paging_is_one_rule;
+#[path = "all/cursor_tokens_are_scoped_to_their_listing.rs"]
+mod cursor_tokens_are_scoped_to_their_listing;
 #[path = "all/instance_communication_limits.rs"]
 mod instance_communication_limits;
 #[path = "all/instance_communication_limits_isolation.rs"]
