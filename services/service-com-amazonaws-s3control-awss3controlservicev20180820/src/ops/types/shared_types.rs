@@ -488,18 +488,180 @@ pub struct StorageLensGroupFilter {
     pub or: Option<StorageLensGroupOrOperator>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.s3control#MatchObjectAge")]
-#[derive(Debug, Clone, Default)]
+// `MatchObjectAge` and `MatchObjectSize` below are declared BY HAND rather than through
+// `smithy_macros::smithy(shape = …)`, because each of their two members carries a
+// modelled `@default` of 0 and the macro's rule for a defaulted member is a non-`Option`
+// field written on every response. A bound the request never sent would then be reported
+// back as `0` — a value these members' own documentation excludes ("must be a positive
+// number, greater than 0", `MatchObjectSize$BytesGreaterThan`; "greater than the minimum
+// object size", `BytesLessThan`; the same of both `MatchObjectAge` members) and which,
+// read literally, is an empty range. AWS OMITS the member it was not given, so an absent
+// bound has to stay absent through deserialize → store → serialize, which is what
+// `Option` here gives it. Everything else matches what the macro emits for a structure:
+// the member schemas carry the shape ids, wire names and member indices the model
+// declares, the restXml codec reads the element name off them, and the two members carry
+// no constraint traits because the model declares none on them
+// (smithy_query(query="shape",shape="MatchObjectSize,MatchObjectAge,ObjectSizeValue")).
+//
+// REMOVE THIS BLOCK once the vendored codegen keeps a `@default` member's PRESENCE —
+// delete the two hand-written schema/serialize/deserialize blocks and put
+// `#[smithy_macros::smithy(shape = "com.amazonaws.s3control#MatchObjectAge")]` /
+// `…#MatchObjectSize")]` back on the structs with `Option` fields.
+
+/// `MatchObjectAge`: the object-age range a Storage Lens group filters on, in days.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MatchObjectAge {
-    pub days_greater_than: i32,
-    pub days_less_than: i32,
+    /// `DaysGreaterThan`, absent when the filter sets no lower bound.
+    pub days_greater_than: Option<i32>,
+    /// `DaysLessThan`, absent when the filter sets no upper bound.
+    pub days_less_than: Option<i32>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.s3control#MatchObjectSize")]
-#[derive(Debug, Clone, Default)]
+#[allow(non_upper_case_globals)]
+impl MatchObjectAge {
+    const M_DAYS_GREATER_THAN: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.s3control#MatchObjectAge$DaysGreaterThan",
+                "com.amazonaws.s3control",
+                "DaysGreaterThan",
+            ),
+            ::aws_smithy_schema::ShapeType::Integer,
+            "DaysGreaterThan",
+            0,
+        );
+    const M_DAYS_LESS_THAN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.s3control#MatchObjectAge$DaysLessThan",
+            "com.amazonaws.s3control",
+            "DaysLessThan",
+        ),
+        ::aws_smithy_schema::ShapeType::Integer,
+        "DaysLessThan",
+        1,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.s3control#MatchObjectAge",
+            "com.amazonaws.s3control",
+            "MatchObjectAge",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_DAYS_GREATER_THAN, &Self::M_DAYS_LESS_THAN],
+    );
+}
+
+pub static MATCH_OBJECT_AGE_SCHEMA: &::aws_smithy_schema::Schema = &MatchObjectAge::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for MatchObjectAge {
+    fn serialize_members(
+        &self,
+        __s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(__v) = self.days_greater_than.as_ref() {
+            __s.write_integer(&Self::M_DAYS_GREATER_THAN, *__v)?;
+        }
+        if let Some(__v) = self.days_less_than.as_ref() {
+            __s.write_integer(&Self::M_DAYS_LESS_THAN, *__v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for MatchObjectAge {
+    fn deserialize(
+        __d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut __out = Self::default();
+        __d.read_struct(&Self::SCHEMA, &mut |__member, __d| {
+            match __member.member_index() {
+                Some(0) => __out.days_greater_than = Some(__d.read_integer(__member)?),
+                Some(1) => __out.days_less_than = Some(__d.read_integer(__member)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(__out)
+    }
+}
+
+/// `MatchObjectSize`: the object-size range a Storage Lens group filters on, in bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MatchObjectSize {
-    pub bytes_greater_than: i64,
-    pub bytes_less_than: i64,
+    /// `BytesGreaterThan`, absent when the filter sets no lower bound.
+    pub bytes_greater_than: Option<i64>,
+    /// `BytesLessThan`, absent when the filter sets no upper bound.
+    pub bytes_less_than: Option<i64>,
+}
+
+#[allow(non_upper_case_globals)]
+impl MatchObjectSize {
+    const M_BYTES_GREATER_THAN: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.s3control#MatchObjectSize$BytesGreaterThan",
+                "com.amazonaws.s3control",
+                "BytesGreaterThan",
+            ),
+            ::aws_smithy_schema::ShapeType::Long,
+            "BytesGreaterThan",
+            0,
+        );
+    const M_BYTES_LESS_THAN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.s3control#MatchObjectSize$BytesLessThan",
+            "com.amazonaws.s3control",
+            "BytesLessThan",
+        ),
+        ::aws_smithy_schema::ShapeType::Long,
+        "BytesLessThan",
+        1,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.s3control#MatchObjectSize",
+            "com.amazonaws.s3control",
+            "MatchObjectSize",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_BYTES_GREATER_THAN, &Self::M_BYTES_LESS_THAN],
+    );
+}
+
+pub static MATCH_OBJECT_SIZE_SCHEMA: &::aws_smithy_schema::Schema = &MatchObjectSize::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for MatchObjectSize {
+    fn serialize_members(
+        &self,
+        __s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(__v) = self.bytes_greater_than.as_ref() {
+            __s.write_long(&Self::M_BYTES_GREATER_THAN, *__v)?;
+        }
+        if let Some(__v) = self.bytes_less_than.as_ref() {
+            __s.write_long(&Self::M_BYTES_LESS_THAN, *__v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for MatchObjectSize {
+    fn deserialize(
+        __d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut __out = Self::default();
+        __d.read_struct(&Self::SCHEMA, &mut |__member, __d| {
+            match __member.member_index() {
+                Some(0) => __out.bytes_greater_than = Some(__d.read_long(__member)?),
+                Some(1) => __out.bytes_less_than = Some(__d.read_long(__member)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(__out)
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.s3control#StorageLensGroupAndOperator")]

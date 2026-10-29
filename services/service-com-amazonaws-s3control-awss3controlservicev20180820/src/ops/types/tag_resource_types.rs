@@ -11,7 +11,20 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3control-awss3controlservicev20180820.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.s3control#TagResourceRequest")]
+// `skip_validation = ["ResourceArn"]`: AWS does NOT enforce this member's modelled
+// `@pattern` (`^arn:[^:]+:s3(express)?:[^:]`) as a request-rejecting constraint. That
+// pattern requires a non-colon character straight after `s3:`, so it admits no general
+// purpose bucket ARN (`arn:aws:s3:::<bucket>`, whose Region and account fields are
+// empty) — yet a general purpose bucket is the FIRST resource this operation's own
+// documentation says it tags, and a recorded call naming one is accepted and the tags
+// land on the bucket. Keeping the constraint on the schema refuses such a request before
+// the handler can resolve it, and in a JSON `ValidationException` body foreign to this
+// restXml service, so the pattern comes off here and the ARN is read by
+// `crate::state::tagged_resource`, which answers this service's own XML envelope.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.s3control#TagResourceRequest",
+    skip_validation = ["ResourceArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct TagResourceInput {
     pub account_id: String,

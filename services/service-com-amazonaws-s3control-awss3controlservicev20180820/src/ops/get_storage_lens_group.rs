@@ -4,7 +4,7 @@
 //! Reports the S3 Storage Lens group of the name the URI names, as the account
 //! that owns it recorded it — the whole document, including the read-only
 //! `StorageLensGroupArn` the service assigned. A name the account owns no group
-//! of is a 404 `NoSuchStorageLensGroup`
+//! of is a 404 `NoSuchConfiguration`
 //! ([`crate::state::no_such_storage_lens_group`]).
 //!
 //! A read: it reports what the store holds and writes nothing. The group's
@@ -147,7 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = (input.account_id, input.name);
         let store = state.lock();
         let Some(record) = store.storage_lens_groups.get(&key) else {
-            return Err(crate::state::no_such_storage_lens_group(&key.1));
+            return Err(crate::state::no_such_storage_lens_group());
         };
 
         Ok(GetStorageLensGroupOutput {

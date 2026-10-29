@@ -1695,6 +1695,379 @@ impl ComAmazonawsS3controlAwss3controlservicev20180820State {
         let key = (record.account_id.clone(), record.request_token_arn.clone());
         self.async_requests.insert(key, record);
     }
+
+    /// The tag set of the resource `resource_arn` names among the ones THIS
+    /// store holds, or `None` when it holds no such resource.
+    ///
+    /// Addressed by the ARN the store RECORDED for the resource, so a tagging
+    /// call reaches exactly the resource whose own reads report that ARN and
+    /// nothing is derived twice from the ARN's text. The account is the one the
+    /// request names — a resource is tagged through the account that owns it —
+    /// which is the first field of every key here.
+    ///
+    /// The ONE seam the generic tagging surface writes a held resource's tags
+    /// through, so `TagResource`, `UntagResource` and `ListTagsForResource`
+    /// cannot disagree about where a resource's tags live, and each resource's
+    /// own create call keeps writing the same field.
+    pub fn resource_tags_mut(
+        &mut self,
+        account_id: &str,
+        resource_arn: &str,
+    ) -> Option<&mut Vec<Tag>> {
+        if let Some(record) = self
+            .access_points
+            .iter_mut()
+            .find(|((owner, _), record)| owner == account_id && record.arn == resource_arn)
+            .map(|(_, record)| record)
+        {
+            return Some(&mut record.tags);
+        }
+        if let Some(record) = self
+            .storage_lens_groups
+            .iter_mut()
+            .find(|((owner, _), record)| {
+                owner == account_id
+                    && record.group.storage_lens_group_arn.as_deref() == Some(resource_arn)
+            })
+            .map(|(_, record)| record)
+        {
+            return Some(&mut record.tags);
+        }
+        if let Some(record) = self
+            .access_grants_instances
+            .iter_mut()
+            .find(|((owner, _), record)| owner == account_id && record.arn == resource_arn)
+            .map(|(_, record)| record)
+        {
+            return Some(&mut record.tags);
+        }
+        if let Some(record) = self
+            .access_grants_locations
+            .iter_mut()
+            .find(|((owner, _, _), record)| owner == account_id && record.arn == resource_arn)
+            .map(|(_, record)| record)
+        {
+            return Some(&mut record.tags);
+        }
+        self.access_grants
+            .iter_mut()
+            .find(|((owner, _, _), record)| owner == account_id && record.arn == resource_arn)
+            .map(|(_, record)| &mut record.tags)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The generic resource tagging surface
+//
+// `TagResource`, `UntagResource` and `ListTagsForResource` each address ONE S3
+// resource by its ARN, whatever kind of resource that is, so the resolution
+// below and the tag-set change beside it are shared by the three rather than
+// restated in each handler.
+// ---------------------------------------------------------------------------
+
+/// The ARN namespace of this service's own resources and of Amazon S3's:
+/// `awsService.arnNamespace` of both models, which is what the third field of a
+/// `ResourceArn` has to name for the ARN to address an S3 resource at all.
+pub const S3_ARN_NAMESPACE: &str = "s3";
+
+/// The ARN namespace of the S3 Express One Zone resources — a directory bucket
+/// and an access point for one — which `S3ResourceArn`'s own pattern
+/// (`^arn:[^:]+:s3(express)?:[^:]`) names beside [`S3_ARN_NAMESPACE`].
+pub const S3_EXPRESS_ARN_NAMESPACE: &str = "s3express";
+
+/// The resource type of a bucket in an S3 Express One Zone bucket ARN
+/// (`arn:<partition>:s3express:<region>:<account>:bucket/<name>`).
+const BUCKET_RESOURCE_TYPE: &str = "bucket";
+
+/// The resource type of an access point ARN, as [`access_point_arn`] builds it.
+const ACCESS_POINT_RESOURCE_TYPE: &str = "accesspoint";
+
+/// The resource type of a Storage Lens group ARN, as
+/// [`storage_lens_group_arn`] builds it.
+const STORAGE_LENS_GROUP_RESOURCE_TYPE: &str = "storage-lens-group";
+
+/// The resource type shared by the three S3 Access Grants ARNs, as
+/// [`access_grants_instance_arn`], [`access_grants_location_arn`] and
+/// [`access_grant_arn`] build them; the id after it is what tells the three
+/// apart.
+const ACCESS_GRANTS_RESOURCE_TYPE: &str = "access-grants";
+
+/// The largest tag set an S3 resource carries.
+///
+/// "You can add up to 50 Amazon Web Services resource tags for each S3
+/// resource" (`TagResource`'s own documentation). The modelled `TagList` bound
+/// (len 0..50) says that of ONE request's list, which the boundary already
+/// enforces; this bounds the set the RESOURCE ends up with, which a merge onto
+/// tags it already carries can take past the length of any one request.
+pub const MAX_RESOURCE_TAGS: usize = 50;
+
+/// Which S3 resource the `ResourceArn` of a generic tagging call names, read
+/// from the ARN alone.
+///
+/// "This operation is only supported for the following Amazon S3 resource:
+/// General purpose buckets[,] Access Points for directory buckets[,] Access
+/// Points for general purpose buckets[,] Directory buckets[,] S3 Storage Lens
+/// groups[,] S3 Access Grants instances, registered locations, or grants"
+/// (`TagResource`), so the ARN's own resource type is what says which resource
+/// — and so which store's tag set — a call addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// A bucket, named by the ARN's resource: a general purpose bucket
+    /// (`arn:<partition>:s3:::<name>`, whose Region and account fields are
+    /// empty "because a bucket name is globally unique") or a directory bucket
+    /// (`arn:<partition>:s3express:<region>:<account>:bucket/<name>`). A
+    /// bucket's tag set is the one Amazon S3's own
+    /// `GetBucketTagging`/`PutBucketTagging` read and write, so it lives in the
+    /// bucket store THAT service serves rather than in a second copy here.
+    Bucket(String),
+    /// A resource THIS service holds — an access point, a Storage Lens group, or
+    /// an S3 Access Grants instance, registered location or grant. Which one it
+    /// is does not have to be carried: the resource is addressed by the ARN it
+    /// reports for itself
+    /// ([`ComAmazonawsS3controlAwss3controlservicev20180820State::resource_tags_mut`]),
+    /// and this surface answers ONE missing-resource refusal for every kind of
+    /// resource it tags ([`no_such_tagged_resource`]).
+    Held,
+}
+
+/// The resource `resource_arn` names, or `None` when it names no S3 resource
+/// this surface tags.
+///
+/// Read through the workspace's ONE caller-supplied-ARN parse
+/// ([`::service_common::arn`]), so this service does not split an ARN its own
+/// way: the vendor field has to be [`S3_ARN_NAMESPACE`] or
+/// [`S3_EXPRESS_ARN_NAMESPACE`] and the resource type is what the form after it
+/// is read against.
+///
+/// Deliberately independent of `S3ResourceArn`'s modelled `@pattern`, which
+/// requires a non-colon character straight after `s3:` and so admits no general
+/// purpose bucket ARN: the service accepts that form, which is why the pattern
+/// is off the boundary for these three operations (`skip_validation` in
+/// `src/ops/types/`) and the ARN is read here instead.
+pub fn tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
+    let arn = ::service_common::arn::parse(resource_arn)?;
+    if arn.vendor != S3_ARN_NAMESPACE && arn.vendor != S3_EXPRESS_ARN_NAMESPACE {
+        return None;
+    }
+    let resource_type = arn.resource_type();
+    // A general purpose bucket ARN carries the bucket name as its WHOLE
+    // resource field — there is no type token — beside empty Region and account
+    // fields.
+    if resource_type == arn.resource {
+        return (arn.vendor == S3_ARN_NAMESPACE && arn.region.is_empty() && arn.account.is_empty())
+            .then(|| TaggedResource::Bucket(arn.resource.to_string()));
+    }
+    let id = ::service_common::arn::resource_id_of_type(resource_arn, resource_type)?;
+    match resource_type {
+        BUCKET_RESOURCE_TYPE => Some(TaggedResource::Bucket(id.to_string())),
+        ACCESS_POINT_RESOURCE_TYPE
+        | STORAGE_LENS_GROUP_RESOURCE_TYPE
+        | ACCESS_GRANTS_RESOURCE_TYPE => Some(TaggedResource::Held),
+        _ => None,
+    }
+}
+
+/// What a generic tagging call does to the one tag set it addresses.
+///
+/// The three operations differ only in this, so the rule each follows is stated
+/// once here and applied to whichever store holds the addressed resource's
+/// tags.
+#[derive(Debug, Clone, Copy)]
+pub enum TagSetChange<'a> {
+    /// `TagResource`: add each pair, re-valuing a key the resource already
+    /// carries — "Creates a new user-defined tag or updates an existing tag"
+    /// (`TagResource`), so a tagging call MERGES rather than replacing, and the
+    /// tags an earlier call set are kept.
+    Merge(&'a [Tag]),
+    /// `UntagResource`: remove the keys it names and nothing else — "This
+    /// operation ... removes the specified Amazon Web Services resource tags"
+    /// (`UntagResource`). A key the resource does not carry removes nothing and
+    /// is not an error, so repeating one call answers what making it once did.
+    Remove(&'a [String]),
+    /// `ListTagsForResource`: report the set, changing nothing.
+    Report,
+}
+
+impl TagSetChange<'_> {
+    /// The tag set `tags` becomes under this change, or `None` when the change
+    /// writes nothing (a report).
+    ///
+    /// `Err(count)` when a merge would take the resource past
+    /// [`MAX_RESOURCE_TAGS`] tags, carrying how many it would have ended up
+    /// with; nothing is written then, so a refused call leaves the tag set
+    /// exactly as it was.
+    pub fn applied(&self, tags: &[Tag]) -> Result<Option<Vec<Tag>>, usize> {
+        match self {
+            Self::Report => Ok(None),
+            Self::Merge(pairs) => {
+                let mut merged = tags.to_vec();
+                for pair in *pairs {
+                    match merged.iter_mut().find(|held| held.key == pair.key) {
+                        Some(held) => held.value = pair.value.clone(),
+                        None => merged.push(pair.clone()),
+                    }
+                }
+                if merged.len() > MAX_RESOURCE_TAGS {
+                    return Err(merged.len());
+                }
+                Ok(Some(merged))
+            }
+            Self::Remove(keys) => {
+                let mut kept = tags.to_vec();
+                kept.retain(|held| !keys.iter().any(|removed| removed == &held.key));
+                Ok(Some(kept))
+            }
+        }
+    }
+}
+
+/// Apply `change` to the ONE tag set `resource_arn` addresses, wherever that
+/// tag set lives, and answer the set afterwards.
+///
+/// The whole of what the three generic tagging operations do, so none of them
+/// resolves an ARN or merges a tag set its own way: a bucket's tags are reached
+/// in the bucket store Amazon S3 serves ([`change_bucket_tags`]) and every other
+/// resource's in this service's own ([`
+/// ComAmazonawsS3controlAwss3controlservicev20180820State::resource_tags_mut`]),
+/// and an ARN naming a resource no store holds is refused as that resource being
+/// missing ([`no_such_tagged_resource`]) rather than as a bad request.
+pub fn change_resource_tags<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    account_id: &str,
+    resource_arn: &str,
+    change: TagSetChange<'_>,
+) -> Result<Vec<Tag>, crate::scaffolded::Scaffolded<E>> {
+    let Some(resource) = tagged_resource(resource_arn) else {
+        return Err(untaggable_resource_arn(resource_arn));
+    };
+    if let TaggedResource::Bucket(bucket) = &resource {
+        return change_bucket_tags(engine, bucket, change);
+    }
+    let Some(state) = service_state(engine) else {
+        return Err(state_unavailable());
+    };
+    let mut store = state.lock();
+    let Some(held) = store.resource_tags_mut(account_id, resource_arn) else {
+        return Err(no_such_tagged_resource());
+    };
+    match change.applied(held).map_err(too_many_resource_tags)? {
+        Some(updated) => {
+            *held = updated.clone();
+            Ok(updated)
+        }
+        // A report writes nothing, so a later caller sees what this one saw.
+        None => Ok(held.clone()),
+    }
+}
+
+/// [`change_resource_tags`] for a BUCKET, whose tag set is the one Amazon S3's
+/// own bucket tagging operations read and write.
+///
+/// A bucket has ONE tag set however it is written: a set this surface records is
+/// what S3's `GetBucketTagging` reports, and a set `PutBucketTagging` recorded is
+/// what this surface reports. So the set is reached in the bucket store that
+/// service serves rather than copied into this one, where each API would hold a
+/// tag set of its own and neither would see the other's.
+///
+/// LOCK ORDER: this takes the bucket store's lock and holds no other while it
+/// does, and hands back an owned value rather than a guard — so it must be
+/// called with NO guard of this service's store held. Keeping the cross-service
+/// access one-directional and guard-free is what makes a lock cycle between the
+/// two stores unreachable.
+///
+/// Takes no account id, where a resource THIS store holds is reached under the
+/// account that owns it: a bucket name is globally unique and the bucket store
+/// keys a bucket by that name alone, which is also why a bucket ARN carries no
+/// account field for a request to be checked against.
+fn change_bucket_tags<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    bucket: &str,
+    change: TagSetChange<'_>,
+) -> Result<Vec<Tag>, crate::scaffolded::Scaffolded<E>> {
+    use ::service_com_amazonaws_s3_amazons3::state::ResourceTag;
+
+    let Some(state) = ::service_com_amazonaws_s3_amazons3::state::service_state(engine) else {
+        return Err(state_unavailable());
+    };
+    let mut store = state.lock();
+    let Some(held) = store.bucket_mut(bucket) else {
+        return Err(no_such_tagged_resource());
+    };
+    let current: Vec<Tag> = held
+        .tags()
+        .iter()
+        .map(|tag| Tag {
+            key: tag.key.clone(),
+            value: tag.value.clone(),
+        })
+        .collect();
+    match change.applied(&current).map_err(too_many_resource_tags)? {
+        Some(updated) => {
+            held.replace_tags(
+                updated
+                    .iter()
+                    .map(|tag| ResourceTag {
+                        key: tag.key.clone(),
+                        value: tag.value.clone(),
+                    })
+                    .collect(),
+            );
+            Ok(updated)
+        }
+        None => Ok(current),
+    }
+}
+
+/// `InvalidRequest` (HTTP 400): `ResourceArn` names no S3 resource the generic
+/// tagging surface tags.
+///
+/// The code and status are the ones this service answers a well-formed request
+/// it cannot carry out with (see [`job_not_found`]); a refusal of this service
+/// travels in its own S3-style XML `<Code>`/`<Message>` envelope, as every
+/// refusal above does.
+pub fn untaggable_resource_arn<E>(resource_arn: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "InvalidRequest",
+        400,
+        format!("The specified ARN names no S3 resource that can be tagged: {resource_arn}"),
+    )
+}
+
+/// `NoSuchResource` (HTTP 404): no resource the generic tagging surface holds
+/// tags for answers to that ARN — the resource was never created, or has been
+/// deleted, or belongs to another account.
+///
+/// ONE refusal for every kind of resource this surface tags, rather than each
+/// resource's own `NoSuch<Resource>` code: a recorded `ListTagsForResource` on
+/// the ARN of a Storage Lens group that had just been deleted is answered
+/// `NoSuchResource`, and the resource kind is not something a tagging call
+/// names — it reads the ARN it was handed. The fixed message is the sentence S3
+/// publishes for that code, naming no resource: it is what the surface answers
+/// for every ARN it holds nothing under.
+pub fn no_such_tagged_resource<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "NoSuchResource",
+        404,
+        "The specified resource doesn't exist.".to_string(),
+    )
+}
+
+/// `TooManyTagsException` (HTTP 400): the tag set the request would leave on
+/// the resource carries more than [`MAX_RESOURCE_TAGS`] tags.
+///
+/// The code and status are this service's own modelled `TooManyTagsException`
+/// ("Amazon S3 throws this exception if you have too many tags in your tag
+/// set", a 400 client error), which these operations' models do not list — the
+/// same pairing [`too_many_storage_lens_tags`] answers one tag set over.
+pub fn too_many_resource_tags<E>(submitted: usize) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "TooManyTagsException",
+        400,
+        format!(
+            "An S3 resource carries at most {MAX_RESOURCE_TAGS} tags; this request would \
+             leave it with {submitted}."
+        ),
+    )
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -2217,20 +2590,19 @@ pub fn too_many_storage_lens_configurations<E>() -> crate::scaffolded::Scaffolde
     )
 }
 
-/// `NoSuchStorageLensGroup` (HTTP 404): no S3 Storage Lens group of that name
-/// is owned by the account the request names.
+/// `NoSuchConfiguration` (HTTP 404): no S3 Storage Lens group of that name is
+/// owned by the account the request names.
 ///
 /// S3 Control declares no error for the Storage Lens group operations, so — as
 /// for every refusal above — it is carried in the S3-style XML
-/// `<Code>`/`<Message>` envelope, with the `NoSuch…` code and the 404 status S3
-/// answers a read of an absent resource with (the same pairing as
-/// [`no_such_access_point`] and [`no_such_storage_lens_configuration`]).
-pub fn no_such_storage_lens_group<E>(name: &str) -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::service_failure(
-        "NoSuchStorageLensGroup",
-        404,
-        format!("The specified Storage Lens group does not exist: {name}"),
-    )
+/// `<Code>`/`<Message>` envelope. The code and the fixed sentence are the ones
+/// the Storage Lens surface answers for a resource that is not there, the SAME
+/// pair [`no_such_storage_lens_configuration`] answers one resource over: a
+/// recorded read of a group that had just been deleted is answered
+/// `NoSuchConfiguration`, not a code naming the group kind, so the two reads do
+/// not disagree and a client matching on the code sees one for both.
+pub fn no_such_storage_lens_group<E>() -> crate::scaffolded::Scaffolded<E> {
+    no_such_storage_lens_configuration()
 }
 
 /// `InvalidRequestException` (HTTP 400): the account already owns an S3 Storage

@@ -46,7 +46,11 @@ use crate::storage_lens_group::{
 
 /// The body of an `UpdateStorageLensGroup` call carrying `leaves` as its
 /// `StorageLensGroup` document.
-fn update_body(leaves: &[Leaf]) -> String {
+///
+/// `pub(crate)` because the sibling suite that pins which filter members an update
+/// reports back (`storage_lens_group_absent_bounds`) submits its documents through this
+/// one builder rather than writing a second one.
+pub(crate) fn update_body(leaves: &[Leaf]) -> String {
     format!(
         "<UpdateStorageLensGroupRequest xmlns=\"{XMLNS}\">\
          <StorageLensGroup>{}</StorageLensGroup>\
@@ -201,11 +205,10 @@ async fn every_value_a_partial_filter_condition_carries_is_reported_back() {
     // conditions. The bound the document DOES carry must come back with exactly
     // the value it was submitted with, whatever the update replaced.
     //
-    // The sibling bound a row leaves out is not asserted either way: the model
-    // gives `MatchObjectAge$DaysGreaterThan` / `DaysLessThan` and
-    // `MatchObjectSize$BytesGreaterThan` / `BytesLessThan` a `@default` of 0, so
-    // the shape layer holds each as a plain value and an omitted one is
-    // indistinguishable from a submitted 0 by the time a handler sees it.
+    // The sibling bound a row leaves out is reported by NEITHER name: a member the
+    // document did not carry is not materialised on the response, which the
+    // `storage_lens_group_absent_bounds` suite pins over the whole class of partial
+    // conditions.
     let partial: Vec<(Group, &str, &str)> = vec![
         (
             Group {
@@ -403,7 +406,7 @@ async fn updating_a_group_that_is_not_there_is_not_found_and_records_nothing() {
         let refused = update_group(&emulator, ACCOUNT, &absent, &groups[3]).await;
         assert_eq!(
             (refused.status, refused.code().as_str()),
-            (404, "NoSuchStorageLensGroup"),
+            (404, "NoSuchConfiguration"),
             "case {absent:?}: expected the update of a missing group to be refused, got {} {}",
             refused.status,
             refused.body

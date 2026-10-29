@@ -8,6 +8,14 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# `service-common` carries the workspace's ONE caller-supplied-ARN parse, which the
+# generic resource tagging operations read a `ResourceArn` through.
+service-common = { path = "../common" }
+# A BUCKET's tag set is the one Amazon S3's own `GetBucketTagging` /
+# `PutBucketTagging` read and write, so the generic tagging operations reach it in
+# THAT service's bucket store (`state::change_bucket_tags`) instead of holding a
+# second copy here.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

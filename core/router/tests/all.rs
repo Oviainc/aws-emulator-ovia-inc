@@ -30,6 +30,11 @@ mod cloudformation_ec2_ebs_instance_estate;
 #[path = "all/kinesisanalytics_signing_name_routing.rs"]
 mod kinesisanalytics_signing_name_routing;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `s…` span (where the other s3 suites land) are both regions concurrently
+// landing suites add their line to.
+#[path = "all/s3control_tags_a_general_purpose_bucket.rs"]
+mod s3control_tags_a_general_purpose_bucket;
+// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `e…` span (where the other ecr/eks suites land) are both regions concurrently
 // landing suites add their line to.
 #[path = "all/ecr_public_action_scoped_iam_identity.rs"]

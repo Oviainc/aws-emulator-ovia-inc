@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3control-awss3controlservicev20180820.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.s3control#UntagResourceRequest")]
+// `skip_validation = ["ResourceArn"]`: the same member, the same pattern and the same
+// reason as on `TagResourceInput` (see `tag_resource_types`) — the three generic tagging
+// operations address one resource through one `ResourceArn`, so they read it the same
+// way, through `crate::state::tagged_resource`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.s3control#UntagResourceRequest",
+    skip_validation = ["ResourceArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct UntagResourceInput {
     pub account_id: String,

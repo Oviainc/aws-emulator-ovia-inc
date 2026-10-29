@@ -198,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = (input.account_id, input.name);
         let mut store = state.lock();
         let Some(record) = store.storage_lens_groups.get_mut(&key) else {
-            return Err(crate::state::no_such_storage_lens_group(&key.1));
+            return Err(crate::state::no_such_storage_lens_group());
         };
         // The whole document is replaced. The group's resource tags are a
         // separate resource this request carries no member for, so they are

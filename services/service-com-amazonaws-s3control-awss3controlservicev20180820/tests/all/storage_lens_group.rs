@@ -467,7 +467,7 @@ async fn a_read_of_a_group_that_is_not_there_is_not_found() {
         );
         assert_eq!(
             read.code(),
-            "NoSuchStorageLensGroup",
+            "NoSuchConfiguration",
             "case {absent:?}: unexpected error code in {}",
             read.body
         );

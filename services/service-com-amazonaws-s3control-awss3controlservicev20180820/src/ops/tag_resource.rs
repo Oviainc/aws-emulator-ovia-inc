@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds the submitted tags to the ONE tag set of the S3 resource `ResourceArn` names —
+//! re-valuing a key the resource already carries, rather than replacing the set — and
+//! answers the modelled 204. Which store holds that tag set is decided by the ARN alone
+//! ([`crate::state::tagged_resource`]): a BUCKET's tags are the ones Amazon S3's own
+//! `GetBucketTagging` / `PutBucketTagging` read and write, so they are written in that
+//! service's bucket store, and every other S3 Control resource's on its own record here.
 //!
 //! ## Shape of an operation
 //!
@@ -145,20 +143,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // "Creates a new user-defined tag or updates an existing tag": the submitted
+        // pairs are MERGED into the resource's tag set, so a key it already carries is
+        // re-valued and the tags an earlier call set are kept. The resolution of the
+        // ARN, the merge and the refusals are the ones the whole generic tagging
+        // surface shares.
+        crate::state::change_resource_tags(
+            &*self.engine,
+            &input.account_id,
+            &input.resource_arn,
+            crate::state::TagSetChange::Merge(&input.tags),
+        )?;
+        Ok(TagResourceOutput {})
     }
 }

@@ -43,6 +43,8 @@ mod batch_job_tagging;
 mod multi_region_access_point_lifecycle;
 #[path = "all/public_access_block.rs"]
 mod public_access_block;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/storage_lens_configuration.rs"]
@@ -55,5 +57,9 @@ mod storage_lens_configuration_list;
 mod storage_lens_configuration_tagging_delete;
 #[path = "all/storage_lens_group.rs"]
 mod storage_lens_group;
+#[path = "all/storage_lens_group_absent_bounds.rs"]
+mod storage_lens_group_absent_bounds;
+#[path = "all/storage_lens_group_delete.rs"]
+mod storage_lens_group_delete;
 #[path = "all/storage_lens_group_update.rs"]
 mod storage_lens_group_update;
