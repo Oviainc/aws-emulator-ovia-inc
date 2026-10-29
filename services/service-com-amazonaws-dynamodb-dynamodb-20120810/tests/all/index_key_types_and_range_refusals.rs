@@ -22,18 +22,19 @@
 //!    TABLE's schema sees it (the type rule), naming the refused element's
 //!    `ValidationError` reason, and answers a fault of the VALUE the request carried
 //!    (the emptiness rule) directly, like every other write path;
-//! 2. a numeric input member outside the `@range` its model declares is refused
-//!    with the NUMBER the request carried echoed, at the lowerCamel input path the
-//!    request validator builds — the same clause form this service already states
-//!    for a value outside an enumerated set — so a client can read out of the
-//!    message which value of which member was refused.
+//! 2. a numeric input member outside the `@range` its model declares is refused by
+//!    a clause whose FORM follows the OPERATION it was refused on: the item-request
+//!    form names the member by the spelling the model gives it on the wire and
+//!    echoes no value, while the request validator's form names it by the lowerCamel
+//!    input path that validator builds and echoes the NUMBER the request carried.
 //!
 //! The rows differ along what each rule generalises over. For rule 1: the declared
 //! type (`S`, `N`, `B`), the type supplied (a scalar of another type, a set, a
 //! boolean, a list, a map), the index's kind (global and local), the attribute's
 //! position in the index key schema (hash and range), and the operation
 //! (`PutItem`, `UpdateItem`, `BatchWriteItem`, `TransactWriteItems`). For rule 2:
-//! the operation, the member, which bound was broken (minimum and maximum), the
+//! the clause form (the item-request one and the request validator's), the
+//! operation, the member, which bound was broken (minimum and maximum), the
 //! published bound's value, and how far past it the value went — each bound tested
 //! AT the bound and one past it.
 //!
@@ -588,7 +589,9 @@ async fn a_table_key_of_the_wrong_type_keeps_the_table_key_refusal() {
     )
     .await;
     assert_eq!(
-        stated, "Type mismatch for key pk expected: S actual: N",
+        stated,
+        "One or more parameter values were invalid: Type mismatch for key pk expected: S \
+         actual: N",
         "case \"the table's own partition key supplied as a number\": expected the table-key \
          refusal, got {stated:?}"
     );
@@ -611,9 +614,11 @@ async fn a_table_key_of_the_wrong_type_keeps_the_table_key_refusal() {
     );
 }
 
-/// One row of rule 2: an operation, the member the request sets, the lowerCamel
-/// path the clause must name it by, the value sent, and the bound phrase the
-/// clause must state. `table` is the `TableName` the operation also requires.
+/// One row of rule 2: an operation, the member the request sets, the path the
+/// clause must name it by, the value sent, and the bound phrase the clause must
+/// state. `table` is the `TableName` the operation also requires, and `echoes`
+/// is whether the clause echoes the rejected number — which, with the path's
+/// spelling, is what the request surface decides.
 struct RangeRow {
     case: &'static str,
     operation: &'static str,
@@ -622,6 +627,7 @@ struct RangeRow {
     value: i64,
     requirement: &'static str,
     table: Option<&'static str>,
+    echoes: bool,
 }
 
 /// The requirement phrase AWS states for a `@range` minimum of `min`.
@@ -644,7 +650,7 @@ fn range_request(row: &RangeRow) -> Value {
 }
 
 #[tokio::test]
-async fn a_numeric_member_outside_its_range_echoes_the_rejected_number() {
+async fn a_numeric_member_outside_its_range_is_refused_in_its_operation_s_form() {
     let router = emulator();
     create_indexed_table(&router).await;
 
@@ -657,6 +663,7 @@ async fn a_numeric_member_outside_its_range_echoes_the_rejected_number() {
             value: 0,
             requirement: "",
             table: None,
+            echoes: true,
         },
         RangeRow {
             case: "the same member far below the same minimum",
@@ -666,6 +673,7 @@ async fn a_numeric_member_outside_its_range_echoes_the_rejected_number() {
             value: -41,
             requirement: "",
             table: None,
+            echoes: true,
         },
         RangeRow {
             case: "the same member one past its maximum",
@@ -675,6 +683,7 @@ async fn a_numeric_member_outside_its_range_echoes_the_rejected_number() {
             value: 101,
             requirement: "max 100",
             table: None,
+            echoes: true,
         },
         RangeRow {
             case: "an export listing page size one past its maximum",
@@ -684,6 +693,7 @@ async fn a_numeric_member_outside_its_range_echoes_the_rejected_number() {
             value: 26,
             requirement: "max 25",
             table: None,
+            echoes: true,
         },
         RangeRow {
             case: "the same member one below its minimum",
@@ -693,6 +703,7 @@ async fn a_numeric_member_outside_its_range_echoes_the_rejected_number() {
             value: 0,
             requirement: "",
             table: None,
+            echoes: true,
         },
         RangeRow {
             case: "an import listing page size one past the same maximum",
@@ -702,6 +713,7 @@ async fn a_numeric_member_outside_its_range_echoes_the_rejected_number() {
             value: 26,
             requirement: "max 25",
             table: None,
+            echoes: true,
         },
         RangeRow {
             case: "a table listing limit one past its maximum",
@@ -711,6 +723,7 @@ async fn a_numeric_member_outside_its_range_echoes_the_rejected_number() {
             value: 101,
             requirement: "max 100",
             table: None,
+            echoes: true,
         },
         RangeRow {
             case: "a contributor-insights page size one past its maximum",
@@ -720,15 +733,17 @@ async fn a_numeric_member_outside_its_range_echoes_the_rejected_number() {
             value: 101,
             requirement: "max 100",
             table: None,
+            echoes: true,
         },
         RangeRow {
             case: "a data-plane read limit one below its minimum",
             operation: "Query",
             member: "Limit",
-            path: "limit",
+            path: "Limit",
             value: 0,
             requirement: "",
             table: Some(TABLE),
+            echoes: false,
         },
         RangeRow {
             case: "the same bound on another data-plane read, far below it",
@@ -738,6 +753,7 @@ async fn a_numeric_member_outside_its_range_echoes_the_rejected_number() {
             value: -7,
             requirement: "",
             table: Some(TABLE),
+            echoes: true,
         },
         RangeRow {
             case: "a parallel-scan segment count one past its maximum",
@@ -747,6 +763,7 @@ async fn a_numeric_member_outside_its_range_echoes_the_rejected_number() {
             value: 1_000_001,
             requirement: "max 1000000",
             table: Some(TABLE),
+            echoes: true,
         },
         RangeRow {
             case: "a parallel-scan segment count one below its minimum",
@@ -756,6 +773,7 @@ async fn a_numeric_member_outside_its_range_echoes_the_rejected_number() {
             value: 0,
             requirement: "",
             table: Some(TABLE),
+            echoes: true,
         },
         RangeRow {
             case: "a parallel-scan segment one past its maximum",
@@ -765,6 +783,7 @@ async fn a_numeric_member_outside_its_range_echoes_the_rejected_number() {
             value: 1_000_000,
             requirement: "max 999999",
             table: Some(TABLE),
+            echoes: true,
         },
         RangeRow {
             case: "a parallel-scan segment one below its zero minimum",
@@ -774,6 +793,7 @@ async fn a_numeric_member_outside_its_range_echoes_the_rejected_number() {
             value: -1,
             requirement: "min 0",
             table: Some(TABLE),
+            echoes: true,
         },
     ];
 
@@ -788,9 +808,14 @@ async fn a_numeric_member_outside_its_range_echoes_the_rejected_number() {
             "min 0" => at_least(0),
             _ => at_least(1),
         };
+        let subject = if row.echoes {
+            format!("Value '{}'", row.value)
+        } else {
+            "Value".to_string()
+        };
         let expected = format!(
-            "1 validation error detected: Value '{}' at '{}' failed to satisfy constraint: {}",
-            row.value, row.path, requirement
+            "1 validation error detected: {subject} at '{}' failed to satisfy constraint: {}",
+            row.path, requirement
         );
         let stated = refusal(&router, case, row.operation, range_request(row)).await;
         assert_eq!(
@@ -798,13 +823,12 @@ async fn a_numeric_member_outside_its_range_echoes_the_rejected_number() {
             "case {case:?} ({}): expected the message {expected:?}, got {stated:?}",
             row.operation
         );
-        // The member is named by the path the validator builds, never by the
-        // UpperCamel spelling the model uses on the wire.
+        // A clause that echoes no value echoes NONE of it: the rejected number is
+        // nowhere in the message a data-plane refusal states.
         assert!(
-            !stated.contains(&format!("at '{}'", row.member)),
-            "case {case:?} ({}): expected the member named {:?}, got {stated:?}",
-            row.operation,
-            row.path
+            row.echoes || !stated.contains(&row.value.to_string()),
+            "case {case:?} ({}): expected no rejected value echoed, got {stated:?}",
+            row.operation
         );
     }
 }

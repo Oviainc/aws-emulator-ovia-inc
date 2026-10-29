@@ -169,6 +169,9 @@ mod undefined_expression_tokens;
 #[path = "all/update_contributor_insights_writes.rs"]
 mod update_contributor_insights_writes;
 
+#[path = "all/validation_message_fidelity.rs"]
+mod validation_message_fidelity;
+
 #[path = "all/validation_message_wording.rs"]
 mod validation_message_wording;
 

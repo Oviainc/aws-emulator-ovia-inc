@@ -826,8 +826,8 @@ fn key_value_type(value: &crate::state::AttributeValueKey) -> &'static str {
 }
 
 /// The key conditions this request states, from `KeyConditionExpression` or from the
-/// legacy `KeyConditions` map — "Either the KeyConditions or KeyConditionExpression
-/// parameter must be specified", and never both.
+/// legacy `KeyConditions` map — a request must state one of the two
+/// ([`crate::state::KEY_CONDITION_REQUIRED_MESSAGE`]), and never both.
 fn key_comparisons(input: &QueryInput) -> Result<Vec<Comparison>, crate::state::RequestError> {
     let legacy = input
         .key_conditions
@@ -848,8 +848,7 @@ fn key_comparisons(input: &QueryInput) -> Result<Vec<Comparison>, crate::state::
             .map(|(attribute, condition)| legacy_comparison(attribute, condition))
             .collect(),
         (None, None) => Err(crate::state::RequestError::Validation(
-            "Either the KeyConditions or KeyConditionExpression parameter must be specified"
-                .to_string(),
+            crate::state::KEY_CONDITION_REQUIRED_MESSAGE.to_string(),
         )),
     }
 }

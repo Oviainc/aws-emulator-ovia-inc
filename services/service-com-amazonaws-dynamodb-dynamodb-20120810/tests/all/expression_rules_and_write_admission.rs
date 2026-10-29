@@ -625,7 +625,8 @@ async fn a_substitution_token_no_expression_references_is_refused() {
             row.case
         );
         let expected = format!(
-            "Value provided in {} unused in expressions: keys: {{{}}}",
+            "1 validation error detected: Value provided in {} unused in expressions: \
+             keys: {{{}}}",
             row.member, row.keys
         );
         assert_eq!(

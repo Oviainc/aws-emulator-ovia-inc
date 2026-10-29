@@ -57,10 +57,12 @@ pub(crate) fn expression_refusal(member: &str, clause: &str) -> String {
     stated
 }
 
-/// The sentence AWS states for entries of `member` that no expression referenced.
+/// The sentence AWS states for entries of `member` that no expression referenced,
+/// inside the validation envelope the request validator states every clause in.
 pub(crate) fn unused_entries(member: &str, keys: &[&str]) -> String {
     format!(
-        "Value provided in {member} unused in expressions: keys: {{{}}}",
+        "1 validation error detected: Value provided in {member} unused in expressions: \
+         keys: {{{}}}",
         keys.join(", ")
     )
 }

@@ -560,6 +560,18 @@ pub fn max_length_requirement(max: usize) -> String {
     format!("Member must have length less than or equal to {max}")
 }
 
+/// The requirement phrase for a `@range` minimum, over the bound the model
+/// declares (held as the text it displays with, so an integral bound reads `1`
+/// rather than `1.0`).
+pub fn min_value_requirement(min: &str) -> String {
+    format!("Member must have value greater than or equal to {min}")
+}
+
+/// The requirement phrase for a `@range` maximum.
+pub fn max_value_requirement(max: &str) -> String {
+    format!("Member must have value less than or equal to {max}")
+}
+
 /// The requirement phrase for `@uniqueItems`.
 pub fn unique_items_requirement() -> String {
     "Member must have unique values".to_string()
@@ -640,6 +652,12 @@ pub fn nesting_levels_exceeded() -> RequestError {
             .to_string(),
     )
 }
+
+/// How a `Query` that states neither of the two members a key condition can be
+/// written in is refused: AWS's fixed sentence for the pair, which states the two
+/// member names and that the request must carry one of them.
+pub const KEY_CONDITION_REQUIRED_MESSAGE: &str = "Either the KeyConditions or \
+     KeyConditionExpression parameter must be specified in the request.";
 
 /// The refusal for a key attribute whose value is empty.
 ///
@@ -4108,7 +4126,8 @@ impl Table {
             ),
             (_, actual) => {
                 return Err(RequestError::Validation(format!(
-                    "Type mismatch for key {attribute} expected: {declared} actual: {}",
+                    "{INVALID_PARAMETER_CLAUSE}: Type mismatch for key {attribute} expected: \
+                     {declared} actual: {}",
                     attribute_value_type(actual)
                 )))
             }
@@ -6742,26 +6761,26 @@ pub fn item_size(item: &Item) -> i64 {
 
 /// The `ValidationException` a bad `N` value earns, naming the rule its text breaks.
 ///
-/// The clauses are DynamoDB's own for the documented rules — the precision one inside
-/// the validation envelope ([`validation_message`]) the service states it in, the
-/// magnitude ones as the standalone sentences the service answers them with. Only the
-/// numeric-text limit is this emulator's, and its message says so.
+/// Every clause is DynamoDB's own for the documented rule it states — the unparsable
+/// text, the precision ceiling and the two magnitude bounds — and each is stated
+/// inside the validation envelope ([`validation_message`]), which is where this
+/// service states a clause about a value a request carried. Only the numeric-text
+/// limit is this emulator's, and its message says so.
 pub fn number_rejection(text: &str, fault: NumberFault) -> RequestError {
     match fault {
-        NumberFault::NotNumeric => RequestError::Validation(format!(
-            "One or more parameter values were invalid: The parameter cannot be converted to a \
-             numeric value: {}",
+        NumberFault::NotNumeric => refused(format!(
+            "The parameter cannot be converted to a numeric value: {}",
             clipped(text)
         )),
         NumberFault::Precision => refused(format!(
             "Attempting to store more than {MAX_SIGNIFICANT_DIGITS} significant digits in a Number"
         )),
-        NumberFault::Overflow => RequestError::Validation(
+        NumberFault::Overflow => refused(
             "Number overflow. Attempting to store a number with magnitude larger than supported \
              range"
                 .to_string(),
         ),
-        NumberFault::Underflow => RequestError::Validation(
+        NumberFault::Underflow => refused(
             "Number underflow. Attempting to store a number with magnitude smaller than \
              supported range"
                 .to_string(),
@@ -7911,7 +7930,9 @@ impl<'a> Substitutions<'a> {
 ///
 /// The keys are reported in one stable order — the order the map sorts in — so the
 /// same request earns the same message every time, and the refusal names the member
-/// that carried them.
+/// that carried them. The sentence is stated inside the validation envelope
+/// ([`validation_message`]), the way the request validator states every clause it
+/// raises about an input member.
 fn check_referenced<V>(
     member: &str,
     supplied: Option<&HashMap<String, V>>,
@@ -7926,7 +7947,7 @@ fn check_referenced<V>(
     if unused.is_empty() {
         return Ok(());
     }
-    Err(RequestError::Validation(format!(
+    Err(refused(format!(
         "Value provided in {member} unused in expressions: keys: {{{}}}",
         unused.into_iter().collect::<Vec<&str>>().join(", ")
     )))
@@ -8219,8 +8240,36 @@ fn too_many_actions(count: usize) -> RequestError {
 pub const INVALID_DOCUMENT_PATH_MESSAGE: &str =
     "The document path provided in the update expression is invalid for update";
 
+/// AWS's fixed text for an update action given an operand of a data type that action
+/// cannot be applied to — an `ADD` of one set type onto another, an `ADD` of anything
+/// but a number onto a number, an `ADD` or `DELETE` against an attribute that is
+/// neither a number nor a set.
+///
+/// It names NEITHER operand: the sentence AWS states for this class carries no
+/// attribute path and no `AttributeValue` type tag, so the types the request and the
+/// stored item happened to carry are not interpolated into it.
+pub const INCORRECT_UPDATE_OPERAND_TYPE_MESSAGE: &str =
+    "An operand in the update expression has an incorrect data type";
+
+/// The refusal [`INCORRECT_UPDATE_OPERAND_TYPE_MESSAGE`] states, which every update
+/// action raises for an operand whose type it cannot be applied to.
+fn incorrect_update_operand_type() -> RequestError {
+    RequestError::Validation(INCORRECT_UPDATE_OPERAND_TYPE_MESSAGE.to_string())
+}
+
+/// AWS's fixed text for an update operand that reads an attribute the item does not
+/// carry: the sentence names the class of mistake and not the path that was read, which
+/// is the one place a caller would otherwise read a path out of this message.
+pub const MISSING_OPERAND_ATTRIBUTE_MESSAGE: &str =
+    "The provided expression refers to an attribute that does not exist in the item";
+
 /// The refusal for two actions of one update that write the same document location, or
 /// one inside the other: DynamoDB cannot apply both.
+///
+/// The two paths are stated in the ORDER THE UPDATE STATES THEM — `path one` is the
+/// path of the earlier action and `path two` the later one, whichever of them is the
+/// deeper — because the message is a report of what the caller wrote. Two actions on
+/// the SAME location state that one location twice, which reads alike either way round.
 fn overlapping_paths(member: &str, one: &str, two: &str) -> RequestError {
     invalid_expression_member(
         member,
@@ -8549,11 +8598,7 @@ fn set_union(
             }
             Ok(AttributeValue::Bs(members))
         }
-        (held, incoming) => Err(RequestError::Validation(format!(
-            "Type mismatch for attribute to update: an ADD of a {} cannot be applied to a {}",
-            attribute_value_type(incoming),
-            attribute_value_type(held)
-        ))),
+        (_held, _incoming) => Err(incorrect_update_operand_type()),
     }
 }
 
@@ -8592,13 +8637,7 @@ fn set_difference(
                 .collect();
             (!members.is_empty()).then_some(AttributeValue::Bs(members))
         }
-        (held, removed) => {
-            return Err(RequestError::Validation(format!(
-                "Type mismatch for attribute to update: a DELETE of a {} cannot be applied to a {}",
-                attribute_value_type(removed),
-                attribute_value_type(held)
-            )))
-        }
+        (_held, _removed) => return Err(incorrect_update_operand_type()),
     };
     Ok(remaining)
 }
@@ -9006,7 +9045,9 @@ impl ParsedUpdate {
     /// overlap check, before [`Self::apply`] walks it and before any caller takes the
     /// store's lock — and the overlap check itself indexes the paths rather than
     /// comparing every pair: a path overlaps another exactly when one is a step-prefix
-    /// of the other, so each path only has to look its own prefixes up.
+    /// of the other, so each path only has to look its own prefixes up. The index
+    /// keeps each path's POSITION in the update, because that is what orders the two
+    /// paths in the refusal ([`overlapping_paths`]).
     fn from_actions(
         member: &'static str,
         actions: Vec<UpdateAction>,
@@ -9014,10 +9055,10 @@ impl ParsedUpdate {
         if actions.len() > MAX_UPDATE_ACTIONS {
             return Err(too_many_actions(actions.len()));
         }
-        let mut written: BTreeSet<String> = BTreeSet::new();
-        for action in &actions {
+        let mut written: BTreeMap<String, usize> = BTreeMap::new();
+        for (position, action) in actions.iter().enumerate() {
             let path = action.path();
-            if !written.insert(path.render()) {
+            if written.insert(path.render(), position).is_some() {
                 return Err(overlapping_paths(
                     member,
                     &path.render_tokens(),
@@ -9025,16 +9066,20 @@ impl ParsedUpdate {
                 ));
             }
         }
-        for action in &actions {
+        for (position, action) in actions.iter().enumerate() {
             let path = action.path();
             for steps in 1..path.0.len() {
                 let prefix = path.render_prefix(steps);
-                if written.contains(&prefix) {
-                    return Err(overlapping_paths(
-                        member,
-                        &path.render_tokens_prefix(steps),
-                        &path.render_tokens(),
-                    ));
+                if let Some(wrote_prefix) = written.get(&prefix) {
+                    let whole = path.render_tokens();
+                    let prefix = path.render_tokens_prefix(steps);
+                    // The path stated EARLIER in the update is `path one`.
+                    let (one, two) = if *wrote_prefix < position {
+                        (prefix, whole)
+                    } else {
+                        (whole, prefix)
+                    };
+                    return Err(overlapping_paths(member, &one, &two));
                 }
             }
         }
@@ -9234,30 +9279,16 @@ fn apply_add(
         None => match value {
             AttributeValue::N(_) | AttributeValue::Ns(_) | AttributeValue::Ss(_)
             | AttributeValue::Bs(_) => Ok(value.clone()),
-            other => Err(RequestError::Validation(format!(
-                "One or more parameter values were invalid: ADD only supports Number and set \
-                 data types, got {} for {}",
-                attribute_value_type(other),
-                path.render()
-            ))),
+            _other => Err(incorrect_update_operand_type()),
         },
         Some(AttributeValue::N(held)) => match value {
             AttributeValue::N(increment) => Ok(AttributeValue::N(number_arithmetic(
                 held, increment, false,
             )?)),
-            other => Err(RequestError::Validation(format!(
-                "Type mismatch for attribute to update: an ADD of a {} cannot be applied to a \
-                 number",
-                attribute_value_type(other)
-            ))),
+            _other => Err(incorrect_update_operand_type()),
         },
         Some(held) if set_members(held).is_some() => set_union(held, value),
-        Some(held) => Err(RequestError::Validation(format!(
-            "One or more parameter values were invalid: ADD only supports Number and set data \
-             types, and {} holds a {}",
-            path.render(),
-            attribute_value_type(held)
-        ))),
+        Some(_held) => Err(incorrect_update_operand_type()),
     }
 }
 
@@ -9334,13 +9365,10 @@ fn evaluate_set_operand(
 ) -> Result<AttributeValue, RequestError> {
     match operand {
         SetOperand::Value(value) => Ok(value.clone()),
-        SetOperand::Path(path) => path.get(before).cloned().ok_or_else(|| {
-            RequestError::Validation(format!(
-                "The provided expression refers to an attribute that does not exist in the item: \
-                 {}",
-                path.render()
-            ))
-        }),
+        SetOperand::Path(path) => path
+            .get(before)
+            .cloned()
+            .ok_or_else(|| RequestError::Validation(MISSING_OPERAND_ATTRIBUTE_MESSAGE.to_string())),
         SetOperand::IfNotExists(path, fallback) => match path.get(before) {
             Some(value) => Ok(value.clone()),
             None => evaluate_set_operand(member, fallback, before),

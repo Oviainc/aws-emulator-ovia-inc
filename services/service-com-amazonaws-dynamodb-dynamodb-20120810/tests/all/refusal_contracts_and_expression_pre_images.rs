@@ -225,6 +225,17 @@ async fn an_expression_refusal_names_its_member_and_the_request_detail() {
                 .to_string(),
         ),
         (
+            "the same two paths stated the other way round",
+            "UpdateItem",
+            json!({"TableName": "Expressions", "Key": {"pk": {"S": "one"}},
+                   "UpdateExpression": "SET m.kept = :v, m = :v",
+                   "ExpressionAttributeValues": {":v": {"S": "X"}}}),
+            "1 validation error detected: Invalid UpdateExpression: Two document paths overlap \
+             with each other; must remove or rewrite one of these paths; path one: [m, kept], \
+             path two: [m]"
+                .to_string(),
+        ),
+        (
             "an undefined #name in a condition",
             "DeleteItem",
             json!({"TableName": "Expressions", "Key": {"pk": {"S": "one"}},
