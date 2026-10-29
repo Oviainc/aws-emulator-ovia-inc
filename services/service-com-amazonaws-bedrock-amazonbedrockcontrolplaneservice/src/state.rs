@@ -254,6 +254,71 @@ pub const CONFIGURATION_OWNER_ACCOUNT: &str = "ACCOUNT";
 /// one value rather than wording the miss itself.
 pub const GUARDRAIL_NOT_FOUND: &str = "This guardrail does not exist.";
 
+/// What this service answers as its `ResourceNotFoundException` message when the guardrail
+/// a request's own BODY names — the `guardrailInferenceConfig` an enforced guardrail
+/// configuration is installed from — resolves to no guardrail revision of this account.
+///
+/// RECORDED behaviour: Amazon Bedrock words this miss as the guardrail "provided in the
+/// request" rather than with the sentence an operation ADDRESSED by a guardrail identifier
+/// answers ([`GUARDRAIL_NOT_FOUND`]): the two are different sentences of the service, and a
+/// caller reading the message learns which half of its request named the missing guardrail.
+/// Like that one it is wholly FIXED — no identifier, no version, no account reference.
+pub const REQUEST_GUARDRAIL_NOT_FOUND: &str =
+    "The guardrail provided in the request does not exist.";
+
+/// The collections of guardrail policy entries whose modelled maximum is a per-guardrail
+/// QUOTA, each with the sentence Amazon Bedrock refuses a request carrying more entries than
+/// that with.
+///
+/// RECORDED behaviour: a guardrail policy's entries are bounded by a service quota, and
+/// going past one is reported as that quota — a FIXED sentence naming the entries and the
+/// policy holding them, carrying neither the count submitted nor the limit — rather than
+/// through the generic member-length clause [`crate::service::validation`] words a modelled
+/// `@length` violation with, so a caller can tell "you sent too many entries" apart from
+/// "one entry is malformed".
+///
+/// Every list member of the guardrail policy configurations the model declares a MAXIMUM
+/// for, keyed by the member path the constraint walk reports it at
+/// (`smithy_query(query="shape",shape="GuardrailTopicPolicyConfig,GuardrailContentPolicyConfig,GuardrailWordPolicyConfig,GuardrailSensitiveInformationPolicyConfig,GuardrailAutomatedReasoningPolicyConfig")`):
+/// `topicsConfig` 1..30, `filtersConfig` 1..6, `wordsConfig` 1..10000, `regexesConfig`
+/// 1..30 and `policies` 1..2. The members those same shapes declare with NO maximum —
+/// `piiEntitiesConfig`, `managedWordListsConfig` and the contextual grounding policy's
+/// `filtersConfig` — bound no count, so no request can exceed one and none is listed here.
+/// A collection's MINIMUM is not a quota (an empty list is a malformed request, not too much
+/// of one), so it keeps the member-length clause.
+pub const GUARDRAIL_POLICY_ENTRY_QUOTAS: &[(&str, &str)] = &[
+    (
+        "topicPolicyConfig.topicsConfig",
+        "Number of topics in topic policy exceeds quota limit.",
+    ),
+    (
+        "contentPolicyConfig.filtersConfig",
+        "Number of filters in content policy exceeds quota limit.",
+    ),
+    (
+        "wordPolicyConfig.wordsConfig",
+        "Number of words in word policy exceeds quota limit.",
+    ),
+    (
+        "sensitiveInformationPolicyConfig.regexesConfig",
+        "Number of regexes in sensitive information policy exceeds quota limit.",
+    ),
+    (
+        "automatedReasoningPolicyConfig.policies",
+        "Number of policies in automated reasoning policy exceeds quota limit.",
+    ),
+];
+
+/// The quota sentence for the guardrail policy collection at `member`, or `None` when that
+/// member bounds no quota.
+#[must_use]
+pub fn guardrail_policy_entry_quota_message(member: &str) -> Option<&'static str> {
+    GUARDRAIL_POLICY_ENTRY_QUOTAS
+        .iter()
+        .find(|(path, _)| *path == member)
+        .map(|(_, message)| *message)
+}
+
 /// The most guardrails this account may hold at once, past which a create is
 /// refused with `ServiceQuotaExceededException`.
 ///
@@ -659,6 +724,21 @@ pub const PROVISIONED_MODEL_SETTLE_AFTER: Duration = Duration::from_millis(500);
 /// a server-side cap a caller could grow this part of the store with nothing but fresh
 /// names.
 pub const MAX_PROVISIONED_MODEL_THROUGHPUTS_PER_ACCOUNT: usize = 100;
+
+/// What a request addressing a Provisioned Throughput this store does not hold answers as
+/// its `ResourceNotFoundException` message, wherever that request came from: a read of it or
+/// a delete of it.
+///
+/// RECORDED behaviour: Amazon Bedrock names the identifier the request provided and nothing
+/// else — no account scope and no region — so the wording is fixed and the identifier is its
+/// one variable part, echoed in the spelling the caller sent (`ProvisionedModelId` admits
+/// both the name and the ARN). Stated once here because the message belongs to the RESOURCE
+/// rather than to one operation, so every operation that addresses a Provisioned Throughput
+/// refuses it the same way.
+#[must_use]
+pub fn provisioned_model_not_found_message(provisioned_model_id: &str) -> String {
+    format!("Provisioned model with the provided name {provisioned_model_id} was not found.")
+}
 
 /// The model units an account has been granted for a Provisioned Throughput bought with
 /// `commitment_duration`, past which a create is refused with
@@ -2750,6 +2830,51 @@ pub fn automated_reasoning_policy_test_case_not_found_message(
     )
 }
 
+/// What a write to a test whose `lastUpdatedAt` concurrency token is not the one the stored
+/// test holds answers as its `ConflictException` message, for the write named by `action`
+/// ("deleting", "updating").
+///
+/// RECORDED behaviour: Amazon Bedrock states the conflict, the write it conflicts with, and
+/// then the same two ids
+/// [`automated_reasoning_policy_test_case_not_found_message`] carries — so the wording is
+/// fixed, its variable parts are the ids the REQUEST carried, and no instant appears in it:
+/// neither the one the test holds nor the one the request submitted. Stated once here
+/// because every write of a test is held against that token the same way.
+#[must_use]
+pub fn automated_reasoning_policy_test_case_conflict_message(
+    action: &str,
+    test_case_id: &str,
+    policy_arn: &str,
+) -> String {
+    format!("Conflict with {action} TestCase with testCaseId: {test_case_id} and policyArn: {policy_arn}")
+}
+
+/// The `ConflictException` message a request whose `lastUpdatedDefinitionHash` is not the
+/// DRAFT policy's current definition hash is refused with.
+///
+/// RECORDED behaviour: Amazon Bedrock states that the hash the request PROVIDED is not the
+/// draft's — a wholly fixed sentence, carrying neither the policy ARN nor either hash — so
+/// an optimistic-concurrency client matches it to decide "re-read the policy and retry".
+pub const AUTOMATED_REASONING_POLICY_DEFINITION_HASH_CONFLICT: &str =
+    "Provided definition hash does not match the DRAFT policy definition hash.";
+
+/// The `ResourceInUseException` message a request to start a test workflow for a build
+/// workflow whose tests are still running is refused with.
+///
+/// RECORDED behaviour: a wholly fixed sentence — no build workflow id and no status name, so
+/// the refusal couples a caller to nothing but the fact that testing is under way, which is
+/// what it backs off and retries on.
+pub const AUTOMATED_REASONING_POLICY_TEST_WORKFLOW_IN_PROGRESS: &str =
+    "Testing workflow is currently in progress";
+
+/// What a request whose `AutomatedReasoningPolicyArn` carries a `:<version>` suffix the
+/// addressed policy has not cut answers as its `ResourceNotFoundException` message.
+///
+/// RECORDED behaviour: Amazon Bedrock reports the missing VERSION — a wholly fixed sentence,
+/// carrying neither the ARN nor the number — rather than reporting the policy as absent, so
+/// a caller learns the policy is there and the revision it addressed is not.
+pub const AUTOMATED_REASONING_POLICY_VERSION_NOT_FOUND: &str = "Policy version does not exist";
+
 /// One stored Automated Reasoning policy test: the identity
 /// `CreateAutomatedReasoningPolicyTestCase` minted, and the sample input and expected
 /// outcome every later read of that test reports.
@@ -3012,6 +3137,16 @@ pub struct EnforcedGuardrailConfiguration {
 /// retention mode is set at this scope", so it is a mode a caller ASKS for rather than the
 /// standing answer for an account that asked for nothing.
 pub const DATA_RETENTION_MODE_DEFAULT: &str = "default";
+
+/// What `GetUseCaseForModelAccess` answers as its `ResourceNotFoundException` message while
+/// the account has submitted no form
+/// ([`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::use_case_for_model_access`]).
+///
+/// RECORDED behaviour: Amazon Bedrock tells the caller what to DO — fill the form out before
+/// asking for access — in a wholly fixed sentence that carries nothing about the account, so
+/// a wrapper surfacing the message verbatim shows the same guidance production does.
+pub const USE_CASE_FOR_MODEL_ACCESS_NOT_SUBMITTED: &str =
+    "You have not filled out the request form. Fill out the form before getting access.";
 
 /// The account's data retention setting: the `mode` `PutAccountDataRetention` last stored,
 /// and the instant that put stored it.

@@ -143,8 +143,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetUseCaseForModelAccessErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(
-                        "no use case for model access has been submitted for this account"
-                            .to_string(),
+                        crate::state::USE_CASE_FOR_MODEL_ACCESS_NOT_SUBMITTED.to_string(),
                     ),
                 },
             )

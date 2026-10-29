@@ -275,18 +275,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.build_workflow_id,
             now,
         );
-        if let Some(running) = store
+        if store
             .automated_reasoning_policy_test_runs_of(&input.policy_arn, &input.build_workflow_id)
             .into_iter()
-            .find(|run| run.is_active())
+            .any(|run| run.is_active())
         {
             return Err(
                 StartAutomatedReasoningPolicyTestWorkflowErrorModeled::ResourceInUseException(
                     ResourceInUseException {
-                        message: Some(format!(
-                            "Test workflow for build workflow: {} is already in {} status",
-                            input.build_workflow_id, running.status
-                        )),
+                        message: Some(
+                            crate::state::AUTOMATED_REASONING_POLICY_TEST_WORKFLOW_IN_PROGRESS
+                                .to_string(),
+                        ),
                     },
                 )
                 .into(),

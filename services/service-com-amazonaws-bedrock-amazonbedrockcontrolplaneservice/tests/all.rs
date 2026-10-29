@@ -99,6 +99,8 @@ mod prompt_routers;
 mod published_catalogues;
 #[path = "all/range_refusal_wording.rs"]
 mod range_refusal_wording;
+#[path = "all/refusal_message_fidelity.rs"]
+mod refusal_message_fidelity;
 #[path = "all/provisioned_model_throughputs.rs"]
 mod provisioned_model_throughputs;
 #[path = "all/provisioned_model_units_wire_form.rs"]

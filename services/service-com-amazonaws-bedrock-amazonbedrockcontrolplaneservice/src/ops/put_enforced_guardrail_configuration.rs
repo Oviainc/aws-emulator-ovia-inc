@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         };
-        let missing_revision = || not_found(crate::state::GUARDRAIL_NOT_FOUND.to_string());
+        let missing_revision = || not_found(crate::state::REQUEST_GUARDRAIL_NOT_FOUND.to_string());
         let Some(guardrail) = store.guardrail(&config.guardrail_identifier) else {
             return Err(missing_revision().into());
         };

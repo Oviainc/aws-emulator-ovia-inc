@@ -951,8 +951,10 @@ async fn a_build_workflow_whose_tests_are_running_refuses_another_test_workflow(
         "case {case:?}: expected ResourceInUseException, got {:?}",
         second.error
     );
-    let expected =
-        format!("Test workflow for build workflow: {build_workflow_id} is already in {SCHEDULED} status");
+    // The refusal is Amazon Bedrock's own fixed sentence: it names neither the build
+    // workflow nor a status, so a caller keying on it backs off without being coupled to
+    // either.
+    let expected = "Testing workflow is currently in progress";
     assert_eq!(
         second.text("message"),
         expected,

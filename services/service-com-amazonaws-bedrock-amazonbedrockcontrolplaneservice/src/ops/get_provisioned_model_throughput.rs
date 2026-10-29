@@ -187,9 +187,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetProvisionedModelThroughputErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "no Provisioned Throughput {} exists in this account",
-                            input.provisioned_model_id
+                        message: Some(crate::state::provisioned_model_not_found_message(
+                            &input.provisioned_model_id,
                         )),
                     },
                 )

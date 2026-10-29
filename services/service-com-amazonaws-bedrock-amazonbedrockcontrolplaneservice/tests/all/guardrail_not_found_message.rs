@@ -11,7 +11,11 @@
 //! reference. Every operation that resolves such an identifier answers alike, with the
 //! modelled `ResourceNotFoundException` at `@httpError(404)`
 //! (`smithy_query(query="operation",operation="GetGuardrail,UpdateGuardrail,DeleteGuardrail,CreateGuardrailVersion,ListGuardrails")`),
-//! so it is the refusal of the shared guardrail LOOKUP rather than of one read.
+//! so it is the refusal of the shared guardrail LOOKUP rather than of one read. The one
+//! operation whose own BODY names the guardrail — `PutEnforcedGuardrailConfiguration`,
+//! through `guardrailInferenceConfig` — answers the service's OTHER fixed sentence for this
+//! miss, the one that says the guardrail came from the request; it is pinned here beside the
+//! lookup's so the two stay distinct.
 //!
 //! # What the table below generalises over
 //!
@@ -30,6 +34,10 @@ use crate::support::{emulator, Emulator, Reply, ACCOUNT, REGION};
 /// rather than read off the crate so the recorded text is pinned by this suite
 /// independently of the constant that produces it.
 const GUARDRAIL_NOT_FOUND: &str = "This guardrail does not exist.";
+
+/// The sentence Amazon Bedrock answers when the guardrail the REQUEST BODY provided is not
+/// there, written out here for the reason the one above is.
+const REQUEST_GUARDRAIL_NOT_FOUND: &str = "The guardrail provided in the request does not exist.";
 
 /// A `guardrailId` nothing created: `GuardrailId` is `^[a-z0-9]+$`.
 const UNKNOWN_ID: &str = "zzzzzzzzzzzz";
@@ -66,6 +74,11 @@ async fn put_enforced(emu: &Emulator, identifier: &str, version: &str) -> Reply 
 
 /// Every answer this suite checks: 404, the modelled code, and the fixed sentence.
 fn assert_not_found(case: &str, reply: &Reply) {
+    assert_sentence(case, reply, GUARDRAIL_NOT_FOUND);
+}
+
+/// The same, for a refusal whose sentence is `expected` rather than the lookup's.
+fn assert_sentence(case: &str, reply: &Reply, expected: &str) {
     assert_eq!(
         (reply.status, reply.error.as_deref()),
         (404, Some("ResourceNotFoundException")),
@@ -79,8 +92,8 @@ fn assert_not_found(case: &str, reply: &Reply) {
         .and_then(Value::as_str)
         .unwrap_or_default();
     assert_eq!(
-        message, GUARDRAIL_NOT_FOUND,
-        "case {case:?}: expected the message {GUARDRAIL_NOT_FOUND:?}, got {message:?}"
+        message, expected,
+        "case {case:?}: expected the message {expected:?}, got {message:?}"
     );
 }
 
@@ -139,9 +152,10 @@ async fn every_guardrail_lookup_reports_a_missing_guardrail_in_one_sentence() {
             &format!("DeleteGuardrail / {case}"),
             &emu.delete(&identifier, version).await,
         );
-        assert_not_found(
+        assert_sentence(
             &format!("PutEnforcedGuardrailConfiguration / {case}"),
             &put_enforced(&emu, &identifier, version.unwrap_or("1")).await,
+            REQUEST_GUARDRAIL_NOT_FOUND,
         );
 
         // The three operations that resolve the identifier WITHOUT a version member: a row

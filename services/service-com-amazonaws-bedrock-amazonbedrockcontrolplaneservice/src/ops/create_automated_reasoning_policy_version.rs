@@ -256,11 +256,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateAutomatedReasoningPolicyVersionErrorModeled::ConflictException(
                     ConflictException {
-                        message: Some(format!(
-                            "the definition of automated reasoning policy {base_arn} has \
-                             changed since it was last retrieved; retrieve the policy again \
-                             and retry with its current definition hash"
-                        )),
+                        message: Some(
+                            crate::state::AUTOMATED_REASONING_POLICY_DEFINITION_HASH_CONFLICT
+                                .to_string(),
+                        ),
                     },
                 )
                 .into(),

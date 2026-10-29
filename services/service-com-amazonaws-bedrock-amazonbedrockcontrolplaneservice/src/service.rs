@@ -24,12 +24,13 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — EDITED HERE. An ARN this service checks itself is refused with
-//!   this service's own sentence (see "This service's own ARN check" below); every other
-//!   request refused for breaking a modelled input constraint is worded by the ONE
-//!   formatter in [`validation`]: a `@pattern` is quoted without the `^` / `$` anchors the
-//!   model spells it with, and a violation on a collection's ELEMENT is reported at the
-//!   collection member with that element shape's whole constraint set. See the inline
-//!   note on that method.
+//!   this service's own sentence (see "This service's own ARN check" below), and a guardrail
+//!   policy carrying more entries than its quota admits with the quota's own sentence
+//!   ([`refused_policy_entry_quota`]); every other request refused for breaking a modelled
+//!   input constraint is worded by the ONE formatter in [`validation`]: a `@pattern` is
+//!   quoted without the `^` / `$` anchors the model spells it with, and a violation on a
+//!   collection's ELEMENT is reported at the collection member with that element shape's
+//!   whole constraint set. See the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -211,6 +212,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // constraints, so it decides the answer even when the same request also breaks
         // another rule.
         //
+        // The second sentence of this service's own is the guardrail policy ENTRY QUOTA
+        // ([`refused_policy_entry_quota`]): a policy collection past the maximum the model
+        // declares for it is over a service quota, which Amazon Bedrock reports as that
+        // quota rather than as a member that is too long.
+        //
         // EVERY OTHER input-constraint refusal — a value outside a length, range or enum,
         // a member that is not an ARN at all, an absent required member — is worded by the
         // ONE formatter in [`validation`], which states the AWS envelope with the two
@@ -226,6 +232,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 message: violations
                     .iter()
                     .find_map(refused_arn)
+                    .or_else(|| violations.iter().find_map(refused_policy_entry_quota))
                     .or_else(|| validation::envelope(violations))?,
             }),
             // `Refusal` is `#[non_exhaustive]`: a refusal this service has no wording of
@@ -306,6 +313,27 @@ fn refused_arn(violation: &Violation) -> Option<String> {
         && crate::state::pattern_names_self_validated_resource(declared)
         && ::service_common::arn::parse(value).is_none();
     unreadable.then(|| crate::state::ARN_INVALID.to_string())
+}
+
+/// This service's own sentence for `violation`, when what it refused is a guardrail policy
+/// carrying more entries than its quota admits.
+///
+/// Amazon Bedrock bounds the entries of a guardrail policy by a service QUOTA and reports
+/// going past one as that quota — the fixed sentence
+/// [`crate::state::GUARDRAIL_POLICY_ENTRY_QUOTAS`] holds for the member — rather than
+/// through the member-length clause [`validation`] words a modelled `@length` with: the two
+/// say different things to a caller, which is "you sent too many entries" against "one entry
+/// is malformed", and only the first names a quota to ask for an increase of.
+///
+/// Decided from the violation ALONE, which is all this seam is handed: the member path the
+/// walk reports the collection at, and the `@length` MAXIMUM as the class that failed. Only
+/// the maximum — a collection under its minimum is a malformed request rather than too much
+/// of one, so it keeps the clause the model's own constraint words.
+fn refused_policy_entry_quota(violation: &Violation) -> Option<String> {
+    let ViolationKind::MaxLength(_) = &violation.kind else {
+        return None;
+    };
+    crate::state::guardrail_policy_entry_quota_message(&violation.path).map(str::to_string)
 }
 
 /// One modelled operation, served behind this service's own ARN check.

@@ -91,6 +91,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The write this operation performs, as the conflict message names it
+/// ([`crate::state::automated_reasoning_policy_test_case_conflict_message`]).
+const UPDATING: &str = "updating";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -214,15 +218,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // test currently holds, so an update issued against a test somebody has written
         // since is refused instead of overwriting that write.
         if epoch_millis(&input.last_updated_at) != epoch_millis(&held) {
-            return Err(conflict(format!(
-                "test {} of automated reasoning policy {} was last updated at {}, not at \
-                 {}; read the test again and retry the update with the updatedAt that read \
-                 reports",
-                input.test_case_id,
-                input.policy_arn,
-                rendered(&held),
-                rendered(&input.last_updated_at)
-            )));
+            return Err(conflict(
+                crate::state::automated_reasoning_policy_test_case_conflict_message(
+                    UPDATING,
+                    &input.test_case_id,
+                    &input.policy_arn,
+                ),
+            ));
         }
 
         let Some(record) = store
@@ -262,12 +264,6 @@ fn epoch_millis(at: &::aws_smithy_types::DateTime) -> i128 {
     i128::from(at.secs()) * 1_000 + i128::from(at.subsec_nanos() / 1_000_000)
 }
 
-/// A wire timestamp as the `date-time` text this service reports it as, so a refusal names
-/// an instant in the spelling the caller sent and read.
-fn rendered(at: &::aws_smithy_types::DateTime) -> String {
-    at.fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_else(|_| at.as_secs_f64().to_string())
-}
 
 /// The modelled 404 this operation answers for a pair this account holds no test under —
 /// the test is addressed by the PAIR, so either half missing is "the resource was not
