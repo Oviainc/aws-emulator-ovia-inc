@@ -209,9 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         caller_akid = %caller_akid,
                         "no signing certificate was updated"
                     );
-                    return Err(crate::scaffolded::Scaffolded::validation(
-                        "Must specify userName when calling with non-User credentials",
-                    ));
+                    return Err(crate::state::must_specify_user_name());
                 }
             },
         };

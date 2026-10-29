@@ -18,9 +18,11 @@
 //! 3. a policy document past a size quota names the QUOTA where the quota is the account's
 //!    (a managed policy's `PolicySize`) and the ENTITY where it is the entity's (an inline
 //!    policy's, in `bytes`), and a document that is no IAM policy is refused with one fixed
-//!    sentence per defect — `Syntax errors in policy.` for text that does not parse as a
-//!    JSON object, `Policy has no statements` for an object carrying no `Statement` —
-//!    carrying nothing of the document and nothing of the member that supplied it.
+//!    sentence per defect and per document CLASS — `Syntax errors in policy.` for an
+//!    identity or resource policy that does not parse as a JSON object, `This policy
+//!    contains invalid Json` for a role's trust policy that does not, `Policy has no
+//!    statements` for an object carrying no `Statement` — carrying nothing of the document
+//!    and nothing of the member that supplied it.
 //!
 //! Each suite is a TABLE whose rows differ along what its rule generalises over: which
 //! operation of the family is called, which entity kind is addressed, the way the
@@ -60,6 +62,15 @@ const MUST_REMOVE_USERS_FROM_GROUP: &str =
 /// AWS's two fixed sentences for a value that is no IAM policy document.
 const SYNTAX_ERRORS_IN_POLICY: &str = "Syntax errors in policy.";
 const POLICY_HAS_NO_STATEMENTS: &str = "Policy has no statements";
+
+/// AWS's fixed sentence for a role's TRUST policy that does not parse as a JSON object:
+/// IAM validates a trust policy with its own validator, which words that defect its own
+/// way.
+const TRUST_POLICY_INVALID_JSON: &str = "This policy contains invalid Json";
+
+/// The operations of this service whose document is a role's trust policy, so the
+/// unparseable-document row expects the trust-policy sentence for them.
+const TRUST_POLICY_WRITERS: &[&str] = &["CreateRole", "UpdateAssumeRolePolicy"];
 
 /// What AWS answers a delete whose entity still carries one class of dependent:
 /// `(the row's name, the delete that is refused, the fixed sentence)`.
@@ -517,9 +528,11 @@ async fn a_policy_document_past_a_quota_names_the_quota_it_broke() {
 }
 
 /// RULE 3 (the malformed half): a value supplied where an IAM policy document is expected
-/// is refused with ONE fixed sentence per defect — text that does not parse as a JSON
-/// object is `Syntax errors in policy.`, a JSON object carrying no `Statement` is `Policy
-/// has no statements` — whichever operation and whichever member supplied it.
+/// is refused with ONE fixed sentence per defect and per document class — an identity or
+/// resource policy that does not parse as a JSON object is `Syntax errors in policy.`, a
+/// role's trust policy that does not is `This policy contains invalid Json`, a JSON object
+/// carrying no `Statement` is `Policy has no statements` — whichever operation and
+/// whichever member supplied it.
 #[tokio::test]
 async fn a_document_that_is_no_policy_is_refused_with_one_sentence_per_defect() {
     // The rows span the whole class each defect generalises over: text that is not JSON at
@@ -645,8 +658,19 @@ async fn a_document_that_is_no_policy_is_refused_with_one_sentence_per_defect() 
                 error_code(&body)
             );
             let message = element(&body, "Message");
+            // A role's trust policy is read by IAM's trust-policy validator, which words
+            // an unparseable document its own way; every other member here takes an
+            // identity or resource policy. An object carrying no `Statement` is reported
+            // the same way for both classes.
+            let expected = if TRUST_POLICY_WRITERS.contains(action)
+                && *expected == SYNTAX_ERRORS_IN_POLICY
+            {
+                TRUST_POLICY_INVALID_JSON
+            } else {
+                *expected
+            };
             assert_eq!(
-                message, *expected,
+                message, expected,
                 "case {case:?}: expected AWS's fixed sentence for this defect, got \
                  {message:?}"
             );

@@ -324,10 +324,11 @@ async fn delete_frees_the_room_the_credential_took_in_the_quota() {
     }
 }
 
-/// RULE: a credential is reachable only through the user that holds it, so an id the
-/// account never minted and an id another user holds are the same answer —
-/// `NoSuchEntity` (HTTP 404), with nothing removed. A user the account does not hold
-/// is the same refusal.
+/// RULE: a credential is addressed by the (user, id) pair, so the two ways that pair
+/// can fail are different refusals: an id the account holds no credential under at all
+/// is `NoSuchEntity` (HTTP 404), while an id another user holds is a validation failure
+/// of the pair — `ValidationError` (HTTP 400) naming the user and the id — and nothing is
+/// removed by either. A user the account does not hold is the missing-entity refusal.
 #[tokio::test]
 async fn delete_reaches_only_a_credential_the_named_user_holds() {
     let router = router();
@@ -363,34 +364,46 @@ async fn delete_reaches_only_a_credential_the_named_user_holds() {
 
     for (user, id, why) in &cases {
         let (status, body) = delete_credential(&router, user, id).await;
+        // An id another user holds EXISTS, so the refusal is the validation failure of
+        // the pair naming both halves of it; the other rows name no credential at all.
+        // The fixed text is IAM's, the variable parts are this request's, so each row's
+        // message differs.
+        let (expected_status, expected_code, expected_message) = if *why == "another holder's id"
+        {
+            (
+                400,
+                "ValidationError",
+                format!("User {user} does not have a service specific credential with id {id}"),
+            )
+        } else if *why == "a user the account does not hold" {
+            (
+                404,
+                "NoSuchEntity",
+                format!("The user with name {user} cannot be found."),
+            )
+        } else {
+            (
+                404,
+                "NoSuchEntity",
+                format!("No such credential {id} exists"),
+            )
+        };
         assert_eq!(
-            status, 404,
-            "case {user:?} with {why} ({id:?}): expected 404, got {status}: {body}"
+            status, expected_status,
+            "case {user:?} with {why} ({id:?}): expected {expected_status}, got {status}: {body}"
         );
         assert_eq!(
             error_code(&body),
-            "NoSuchEntity",
-            "case {user:?} with {why} ({id:?}): expected NoSuchEntity, got {:?}",
+            expected_code,
+            "case {user:?} with {why} ({id:?}): expected {expected_code}, got {:?}",
             error_code(&body)
         );
-        // The refusal names the id the request asked for: the fixed text is IAM's,
-        // the variable part is this request's id, so each row's message differs.
-        if *why == "a user the account does not hold" {
-            assert_eq!(
-                element(&body, "Message"),
-                format!("The user with name {user} cannot be found."),
-                "case {user:?} with {why}: expected the missing-user wording, got {:?}",
-                element(&body, "Message")
-            );
-        } else {
-            assert_eq!(
-                element(&body, "Message"),
-                format!("No such credential {id} exists"),
-                "case {user:?} with {why}: expected the missing-credential wording naming \
-                 {id:?}, got {:?}",
-                element(&body, "Message")
-            );
-        }
+        assert_eq!(
+            element(&body, "Message"),
+            expected_message,
+            "case {user:?} with {why} ({id:?}): expected {expected_message:?}, got {:?}",
+            element(&body, "Message")
+        );
     }
 
     // Nothing was removed by any refusal: every credential is still held.
@@ -452,8 +465,9 @@ async fn an_omitted_name_deletes_the_signing_users_credential() {
         );
     }
 
-    // A nameless request signed by one holder cannot reach the other's credential:
-    // the id resolves against the signing user, so it is not found.
+    // A nameless request signed by one holder cannot reach the other's credential: the
+    // id resolves against the signing user, and a credential that user does not hold
+    // fails the pair the call addressed.
     let (status, body) = call_signed_by(
         &router,
         Some(&holders[0].1),
@@ -462,15 +476,25 @@ async fn an_omitted_name_deletes_the_signing_users_credential() {
     )
     .await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "expected a nameless delete to reach only the signing user's credentials, \
          got {status}: {body}"
     );
     assert_eq!(
         error_code(&body),
-        "NoSuchEntity",
-        "expected NoSuchEntity, got {:?}",
+        "ValidationError",
+        "expected ValidationError, got {:?}",
         error_code(&body)
+    );
+    // The implicitly resolved user is named as the account holds it.
+    assert_eq!(
+        element(&body, "Message"),
+        format!(
+            "User {} does not have a service specific credential with id {}",
+            holders[0].0, holders[1].3
+        ),
+        "expected the pair refusal to name the signing user and the id, got {:?}",
+        element(&body, "Message")
     );
 
     // Rows spanning no signing key at all, the fallback id an unsigned request
@@ -497,8 +521,8 @@ async fn an_omitted_name_deletes_the_signing_users_credential() {
         );
         assert_eq!(
             error_code(&body),
-            "ValidationException",
-            "case {signer:?}: expected ValidationException, got {:?}",
+            "ValidationError",
+            "case {signer:?}: expected ValidationError, got {:?}",
             error_code(&body)
         );
     }

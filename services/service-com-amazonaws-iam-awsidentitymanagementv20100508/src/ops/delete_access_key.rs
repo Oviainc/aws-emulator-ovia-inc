@@ -202,10 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(record) => record.user_key.clone(),
                 None => {
                     // Neither modelled client error fits: the request named no entity
-                    // to be missing and no quota was reached, so the refusal goes
-                    // through the crate's generic client-input channel (HTTP 400, code
-                    // `ValidationException`), exactly as `GetUser` and
-                    // `CreateAccessKey` refuse the same request.
+                    // to be missing and no quota was reached, so the refusal is the one
+                    // this service answers every unresolvable implicit `UserName` with,
+                    // worded and coded in the one place the family holds it, exactly as
+                    // `GetUser` and `CreateAccessKey` refuse the same request.
                     ::tracing::info!(
                         audit = true,
                         operation = "DeleteAccessKey",
@@ -213,9 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         caller_akid = %caller_akid,
                         "no access key was deleted"
                     );
-                    return Err(crate::scaffolded::Scaffolded::validation(
-                        "Must specify userName when calling with non-User credentials",
-                    ));
+                    return Err(crate::state::must_specify_user_name());
                 }
             },
         };

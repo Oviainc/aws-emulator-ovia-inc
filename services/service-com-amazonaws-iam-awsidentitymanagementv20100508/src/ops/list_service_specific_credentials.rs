@@ -256,9 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             // Credentials that belong to no IAM user resolve to no
                             // user, and the call is refused rather than answered from
                             // an invented identity.
-                            return Err(crate::scaffolded::Scaffolded::validation(
-                                "Must specify userName when calling with non-User credentials",
-                            ));
+                            return Err(crate::state::must_specify_user_name());
                         }
                     }
                 }

@@ -174,12 +174,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // `GetLoginProfile` models only `NoSuchEntityException` and
                         // `ServiceFailureException`, and neither fits: the request
                         // named no entity to be missing and the service did not
-                        // fail, so the refusal goes through the crate's generic
-                        // client-input channel (HTTP 400, `ValidationException`), as
-                        // `GetUser` refuses the same request.
-                        return Err(crate::scaffolded::Scaffolded::validation(
-                            "Must specify userName when calling with non-User credentials",
-                        ));
+                        // fail, so the refusal is the one this service answers every
+                        // unresolvable implicit `UserName` with, worded and coded in
+                        // the one place the family holds it, as `GetUser` refuses
+                        // the same request.
+                        return Err(crate::state::must_specify_user_name());
                     }
                 }
             }

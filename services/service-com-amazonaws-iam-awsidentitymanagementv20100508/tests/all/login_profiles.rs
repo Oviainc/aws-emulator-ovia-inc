@@ -564,13 +564,14 @@ async fn an_omitted_name_refuses_non_user_credentials() {
                 status, 400,
                 "case {case:?}: expected 400 from {action}, got {status}: {refused}"
             );
-            // The behaviour under test is the REFUSAL: a 400 that creates nothing.
-            // The code is the framework's single client-input refusal shape, because
-            // neither operation models an error for a request that named no entity.
+            // The behaviour under test is the REFUSAL: a 400 that creates nothing,
+            // under the error code IAM answers a request it cannot accept with,
+            // because neither operation models an error for a request that named no
+            // entity.
             assert_eq!(
                 error_code(&refused),
-                "ValidationException",
-                "case {case:?}: expected the framework's client-input refusal code from {action}, got {:?}",
+                "ValidationError",
+                "case {case:?}: expected IAM's validation refusal code from {action}, got {:?}",
                 error_code(&refused)
             );
         }

@@ -176,16 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // `ServiceFailureException`
                         // (`smithy_query(query="operation", operation="GetUser")`), and
                         // neither fits: the request named no entity to be missing, and
-                        // the service did not fail. The refusal therefore goes through
-                        // the crate's generic client-input channel, which renders HTTP
-                        // 400 with the code `ValidationException`. Real IAM spells that
-                        // code `ValidationError` on awsQuery, but no shape in this
-                        // model carries it, so the status and the "refused as invalid,
-                        // no identity invented" behaviour are what this answers; the
-                        // code follows the framework's one refusal shape.
-                        return Err(crate::scaffolded::Scaffolded::validation(
-                            "Must specify userName when calling with non-User credentials",
-                        ))
+                        // the service did not fail. The refusal is therefore the one
+                        // this service answers every unresolvable implicit `UserName`
+                        // with, worded and coded in the one place the family holds it,
+                        // so no identity is invented here.
+                        return Err(crate::state::must_specify_user_name())
                     }
                 }
             }

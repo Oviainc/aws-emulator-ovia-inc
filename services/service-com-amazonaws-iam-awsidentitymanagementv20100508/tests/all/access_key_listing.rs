@@ -436,13 +436,13 @@ async fn an_omitted_name_refuses_non_user_credentials() {
             status, 400,
             "case {case:?}: expected 400, got {status}: {refused}"
         );
-        // The behaviour under test is the REFUSAL: a 400 reporting no key. The code
-        // is the framework's single client-input refusal shape, because
+        // The behaviour under test is the REFUSAL: a 400 reporting no key, under the
+        // error code IAM answers a request it cannot accept with, because
         // `ListAccessKeys` models no error for a request that named no entity.
         assert_eq!(
             error_code(&refused),
-            "ValidationException",
-            "case {case:?}: expected the framework's client-input refusal code, got {:?}",
+            "ValidationError",
+            "case {case:?}: expected IAM's validation refusal code, got {:?}",
             error_code(&refused)
         );
         assert!(

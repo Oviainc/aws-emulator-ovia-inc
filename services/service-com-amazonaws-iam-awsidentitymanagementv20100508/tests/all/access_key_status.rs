@@ -464,13 +464,13 @@ async fn an_omitted_name_updates_the_signing_users_key() {
              got {status}: {refused}"
         );
         // The modelled behaviour under test is the REFUSAL: a 400 that writes
-        // nothing. The code is the framework's single client-input refusal shape,
+        // nothing, under the error code IAM answers a request it cannot accept with,
         // because `UpdateAccessKey` models no error for a request that named no
-        // entity; only the status and the key's survival are claims about IAM.
+        // entity.
         assert_eq!(
             error_code(&refused),
-            "ValidationException",
-            "case {signer:?}: expected the framework's client-input refusal code, got {:?}",
+            "ValidationError",
+            "case {signer:?}: expected IAM's validation refusal code, got {:?}",
             error_code(&refused)
         );
     }

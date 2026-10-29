@@ -85,6 +85,8 @@ mod group_renames;
 mod human_readable_summaries;
 #[path = "all/identity_policy_enforcement.rs"]
 mod identity_policy_enforcement;
+#[path = "all/implicit_user_and_credential_pair_refusals.rs"]
+mod implicit_user_and_credential_pair_refusals;
 #[path = "all/inline_policy_size_quota.rs"]
 mod inline_policy_size_quota;
 #[path = "all/instance_profile_listing.rs"]

@@ -203,13 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "no login profile was deleted"
                     );
                     // Neither modelled client error fits: the request named no entity
-                    // to be missing and no quota was reached, so the refusal goes
-                    // through the crate's generic client-input channel (HTTP 400, code
-                    // `ValidationException`), exactly as the other login-profile
-                    // operations refuse the same request.
-                    return Err(crate::scaffolded::Scaffolded::validation(
-                        "Must specify userName when calling with non-User credentials",
-                    ));
+                    // to be missing and no quota was reached, so the refusal is the
+                    // one this service answers every unresolvable implicit `UserName`
+                    // with, worded and coded in the one place the family holds it,
+                    // exactly as the other login-profile operations refuse the same
+                    // request.
+                    return Err(crate::state::must_specify_user_name());
                 }
             },
         };

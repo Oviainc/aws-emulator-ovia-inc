@@ -105,7 +105,11 @@ const INACTIVE: &str = "Inactive";
 
 /// Generate a real self-signed X.509 certificate, PEM-encoded, from a fresh key pair —
 /// so every call yields a DIFFERENT certificate even for the same subject.
-fn certificate_pem(
+///
+/// Shared with the suites that need a well-formed certificate for a refusal that happens
+/// AFTER the certificate is read (`tests/all/implicit_user_and_credential_pair_refusals.rs`),
+/// so the two cannot drift apart on what a valid `CertificateBody` is.
+pub(crate) fn certificate_pem(
     algorithm: &'static rcgen::SignatureAlgorithm,
     validity: (i32, i32),
     common_name: &str,
@@ -452,13 +456,13 @@ async fn an_omitted_name_refuses_non_user_credentials() {
             status, 400,
             "case {label:?}: expected 400, got {status}: {refused}"
         );
-        // The modelled behaviour under test is the REFUSAL: a 400 storing nothing. The
-        // code is the framework's single client-input refusal shape, because this
+        // The modelled behaviour under test is the REFUSAL: a 400 storing nothing, under
+        // the error code IAM answers a request it cannot accept with, because this
         // operation models no error for a request that named no entity.
         assert_eq!(
             error_code(&refused),
-            "ValidationException",
-            "case {label:?}: expected the framework's client-input refusal code, got {:?}",
+            "ValidationError",
+            "case {label:?}: expected IAM's validation refusal code, got {:?}",
             error_code(&refused)
         );
         assert!(

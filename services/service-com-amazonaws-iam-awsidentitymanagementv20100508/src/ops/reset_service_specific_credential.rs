@@ -170,10 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // used to call the operation", resolved through the same binding `GetUser`,
         // `ListServiceSpecificCredentials` and `UpdateServiceSpecificCredential`
         // resolve a nameless caller through. A caller whose credentials belong to no
-        // IAM user is refused rather than having an identity invented for it, and this
-        // operation models no error for a request that named no entity, so the refusal
-        // goes through the crate's generic client-input channel (HTTP 400
-        // `ValidationException`).
+        // IAM user is refused rather than having an identity invented for it, through
+        // the one refusal this service answers every unresolvable implicit `UserName`
+        // with.
         let user_key = match &input.user_name {
             Some(user_name) => crate::state::name_key(user_name),
             None => match store.access_keys.get(&caller_akid) {
@@ -186,16 +185,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         caller_akid = %caller_akid,
                         "no service-specific credential was reset"
                     );
-                    return Err(crate::scaffolded::Scaffolded::validation(
-                        "Must specify userName when calling with non-User credentials",
-                    ));
+                    return Err(crate::state::must_specify_user_name());
                 }
             },
         };
 
         // The credential belongs to a user the account holds. IAM entity names "are not
-        // distinguished by case", so the lookup is on the case-folded key.
-        if !store.users.contains_key(&user_key) {
+        // distinguished by case", so the lookup is on the case-folded key; the name the
+        // held record carries is what a refusal naming the user reports for a caller that
+        // named none.
+        let Some(held_user_name) = store.users.get(&user_key).map(|user| user.user_name.clone())
+        else {
             ::tracing::info!(
                 audit = true,
                 operation = "ResetServiceSpecificCredential",
@@ -215,35 +215,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        };
+        // The user the refusals below name: the spelling the request carried, or — for a
+        // caller that named none — the spelling the account holds that user under.
+        let addressed_user = input.user_name.clone().unwrap_or(held_user_name);
+
+        // A service-specific credential is addressed by the (user, id) PAIR, so the two
+        // ways that pair can fail are different refusals: an id the account holds no
+        // credential under at all is the modelled missing entity, while an id the account
+        // DOES hold under another user is a validation failure of the pair the request
+        // named — it names the user and the id, and does not claim the credential is
+        // absent. No new password is generated in either case.
+        match store
+            .service_specific_credential_lookup(&user_key, &input.service_specific_credential_id)
+        {
+            crate::state::ServiceSpecificCredentialLookup::Held => {}
+            crate::state::ServiceSpecificCredentialLookup::HeldByAnotherUser => {
+                ::tracing::info!(
+                    audit = true,
+                    operation = "ResetServiceSpecificCredential",
+                    outcome = "refused_credential_of_another_user",
+                    caller_akid = %caller_akid,
+                    user_key = %user_key,
+                    service_specific_credential_id = %input.service_specific_credential_id,
+                    "no service-specific credential was reset"
+                );
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::service_specific_credential_not_owned(
+                        &addressed_user,
+                        &input.service_specific_credential_id,
+                    ),
+                ));
+            }
+            crate::state::ServiceSpecificCredentialLookup::Absent => {
+                ::tracing::info!(
+                    audit = true,
+                    operation = "ResetServiceSpecificCredential",
+                    outcome = "refused_no_such_credential",
+                    caller_akid = %caller_akid,
+                    user_key = %user_key,
+                    service_specific_credential_id = %input.service_specific_credential_id,
+                    "no service-specific credential was reset"
+                );
+                return Err(
+                    ResetServiceSpecificCredentialErrorModeled::NoSuchEntityException(
+                        NoSuchEntityException {
+                            message: Some(
+                                crate::state::service_specific_credential_not_found(
+                                    &input.service_specific_credential_id,
+                                ),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
 
-        // A service-specific credential is reachable only through the user that holds
-        // it, so an id the account never minted and an id that belongs to a DIFFERENT
-        // user are the same answer: that user has no such credential, and no new
-        // password is generated in either case.
-        let held = store
+        // The record the pair resolved to. The decision above read the same map under
+        // the same lock, so it is the entry that decision admitted; an entry that is not
+        // there is reported as the missing one it would be, never invented.
+        let Some(credential) = store
             .service_specific_credentials
             .get(&input.service_specific_credential_id)
-            .filter(|credential| crate::state::name_key(&credential.user_name) == user_key);
-        let Some(credential) = held.cloned() else {
-            ::tracing::info!(
-                audit = true,
-                operation = "ResetServiceSpecificCredential",
-                outcome = "refused_no_such_credential",
-                caller_akid = %caller_akid,
-                user_key = %user_key,
-                service_specific_credential_id = %input.service_specific_credential_id,
-                "no service-specific credential was reset"
-            );
+            .cloned()
+        else {
             return Err(
                 ResetServiceSpecificCredentialErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {
-                        // How IAM words a service-specific credential lookup that
-                        // found nothing, the same text its delete answers with: the
-                        // fixed text around the id the request asked for.
-                        message: Some(format!(
-                            "No such credential {} exists",
-                            input.service_specific_credential_id
+                        message: Some(crate::state::service_specific_credential_not_found(
+                            &input.service_specific_credential_id,
                         )),
                     },
                 )

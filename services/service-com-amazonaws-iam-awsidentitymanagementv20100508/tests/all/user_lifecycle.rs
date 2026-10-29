@@ -676,19 +676,17 @@ async fn get_user_without_a_name_refuses_non_user_credentials() {
     let router = with_fixture_users().await;
     let (status, body) = call(&router, "GetUser", &[]).await;
     assert_eq!(status, 400, "expected 400, got {status}: {body}");
-    // The modelled behaviour under test is the REFUSAL: a 400 carrying no user.
-    // The code is the framework's single client-input refusal shape, because
-    // `GetUser` models no error for a request that named no entity (see the
-    // handler's comment); only the status and the absence of an identity are
-    // claims about IAM.
+    // The modelled behaviour under test is the REFUSAL: a 400 carrying no user, under
+    // the error code IAM answers a request it cannot accept with, because `GetUser`
+    // models no error for a request that named no entity (see the handler's comment).
     assert!(
         elements(&body, "UserName").is_empty(),
         "expected no user to be invented for credentials that belong to none, got {body:?}"
     );
     assert_eq!(
         error_code(&body),
-        "ValidationException",
-        "expected the framework's client-input refusal code, got {:?}",
+        "ValidationError",
+        "expected IAM's validation refusal code, got {:?}",
         error_code(&body)
     );
 }

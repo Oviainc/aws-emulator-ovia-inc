@@ -499,13 +499,13 @@ async fn an_omitted_name_refuses_non_user_credentials() {
             "case {case:?}: expected 400, got {status}: {refused}"
         );
         // The modelled behaviour under test is the REFUSAL: a 400 that deletes
-        // nothing. The code is the framework's single client-input refusal shape,
+        // nothing, under the error code IAM answers a request it cannot accept with,
         // because `DeleteAccessKey` models no error for a request that named no
-        // entity; only the status and the key's survival are claims about IAM.
+        // entity.
         assert_eq!(
             error_code(&refused),
-            "ValidationException",
-            "case {case:?}: expected the framework's client-input refusal code, got {:?}",
+            "ValidationError",
+            "case {case:?}: expected IAM's validation refusal code, got {:?}",
             error_code(&refused)
         );
     }

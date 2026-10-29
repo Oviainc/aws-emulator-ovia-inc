@@ -2094,6 +2094,32 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             .count()
     }
 
+    /// What the (user, credential id) PAIR an operation on a service-specific credential
+    /// was addressed by resolves to.
+    ///
+    /// The three answers are deliberately distinct, because the refusals are: a credential
+    /// is reachable only through the user that holds it, so the pair is what the operation
+    /// resolves, and an id the account holds under ANOTHER user is a different failure of
+    /// that pair from an id the account holds no credential under at all. The one place
+    /// that decision is made, so the status, the code and the wording every operation
+    /// reaching a credential by id answers cannot drift apart.
+    ///
+    /// A READ: the store is only consulted. Names compare case-folded, because IAM entity
+    /// names "are not distinguished by case".
+    pub fn service_specific_credential_lookup(
+        &self,
+        user_key: &str,
+        credential_id: &str,
+    ) -> ServiceSpecificCredentialLookup {
+        match self.service_specific_credentials.get(credential_id) {
+            None => ServiceSpecificCredentialLookup::Absent,
+            Some(credential) if name_key(&credential.user_name) == user_key => {
+                ServiceSpecificCredentialLookup::Held
+            }
+            Some(_) => ServiceSpecificCredentialLookup::HeldByAnotherUser,
+        }
+    }
+
     /// Mint the next managed policy's `PolicyId`.
     ///
     /// Unique and stable for the same reason [`next_user_id`](Self::next_user_id)
@@ -4604,6 +4630,67 @@ pub fn inline_policy_size_exceeded(quota: usize, entity_kind: &str, entity_name:
     format!("Maximum policy size of {quota} bytes exceeded for {entity_kind} {entity_name}")
 }
 
+/// What the (user, credential id) pair an operation naming a service-specific credential
+/// resolves to, as
+/// [`service_specific_credential_lookup`](ComAmazonawsIamAwsidentitymanagementv20100508State::service_specific_credential_lookup)
+/// decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceSpecificCredentialLookup {
+    /// The user the request names holds the credential the id names, so the operation
+    /// acts on it.
+    Held,
+    /// The account holds a credential under that id, but ANOTHER user holds it: the pair
+    /// the request named is not one the account holds, while the credential itself exists.
+    HeldByAnotherUser,
+    /// The account holds no credential under that id at all.
+    Absent,
+}
+
+/// The message IAM refuses a service-specific credential lookup that found NOTHING with —
+/// the `NoSuchEntityException` text, whose fixed parts are `No such credential ` and
+/// ` exists` around the id the request asked for.
+///
+/// ONE wording, shared by every operation that reaches a credential by id, so a delete, a
+/// status update and a reset cannot describe the same missing credential three ways.
+pub fn service_specific_credential_not_found(credential_id: &str) -> String {
+    format!("No such credential {credential_id} exists")
+}
+
+/// The message IAM refuses a request pairing a user with a service-specific credential id
+/// that user does not hold with — the fixed parts `User ` and ` does not have a service
+/// specific credential with id ` around the user name and the id the request paired.
+///
+/// Distinct from [`service_specific_credential_not_found`], which is the missing-entity
+/// text for an id the account holds no credential under at all: here the credential
+/// EXISTS, and what fails is the pair the request named, so the refusal names both halves
+/// of it and is the unmodelled validation one
+/// ([`crate::scaffolded::Scaffolded::validation_error`]) rather than a claim that the
+/// credential is absent. The two names are deliberately unalike, because picking one at a
+/// call site picks the error code a client branches on.
+pub fn service_specific_credential_not_owned(user_name: &str, credential_id: &str) -> String {
+    format!("User {user_name} does not have a service specific credential with id {credential_id}")
+}
+
+/// The fixed sentence IAM refuses a call whose implicit `UserName` resolved to no IAM user
+/// with: the whole message is fixed text, naming neither the caller nor the operation.
+pub const MUST_SPECIFY_USER_NAME: &str =
+    "Must specify userName when calling with non-User credentials";
+
+/// How this service refuses an operation whose optional `UserName` was omitted by a caller
+/// whose credentials belong to no IAM user.
+///
+/// ONE definition for the whole family — every operation that resolves an absent
+/// `UserName` "based on the Amazon Web Services access key ID used to sign the request" —
+/// so the status, the wire code and the sentence cannot drift between them. None of those
+/// operations models an error for a request that named no entity (the request named no
+/// entity to be missing, and the service did not fail), so the refusal goes through the
+/// crate's unmodelled client-input channel, under the code IAM itself answers a request it
+/// cannot accept with and the one its clients branch on — the same code the boundary
+/// validator already answers a value outside a modelled bound with.
+pub fn must_specify_user_name<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::validation_error(MUST_SPECIFY_USER_NAME)
+}
+
 /// Encode a state map key as the opaque pagination `Marker` a client echoes back.
 ///
 /// The codec is `aws_smithy_types::base64` — already in this crate's dependency
@@ -5204,6 +5291,16 @@ pub enum PolicyDocumentDefect {
 /// The fixed sentence IAM refuses a document that does not parse as a JSON object with.
 pub const SYNTAX_ERRORS_IN_POLICY: &str = "Syntax errors in policy.";
 
+/// The fixed sentence IAM refuses a TRUST policy document that does not parse as a JSON
+/// object with.
+///
+/// A role's trust policy is validated by its own validator in IAM, which words an
+/// unusable document differently from the one that reads an identity or resource policy
+/// ([`SYNTAX_ERRORS_IN_POLICY`]) — recorded behaviour for a trust-policy write carrying
+/// text that is no JSON object. Fixed text throughout: it carries nothing of the document
+/// and nothing of the member that supplied it.
+pub const TRUST_POLICY_INVALID_JSON: &str = "This policy contains invalid Json";
+
 /// The fixed sentence IAM refuses a JSON object carrying no `Statement` element with.
 pub const POLICY_HAS_NO_STATEMENTS: &str = "Policy has no statements";
 
@@ -5215,6 +5312,21 @@ impl PolicyDocumentDefect {
     pub fn message(self) -> &'static str {
         match self {
             Self::Syntax => SYNTAX_ERRORS_IN_POLICY,
+            Self::NoStatements => POLICY_HAS_NO_STATEMENTS,
+        }
+    }
+
+    /// How IAM words this defect for a TRUST policy document — a role's
+    /// `AssumeRolePolicyDocument`, which `CreateRole` and `UpdateAssumeRolePolicy` write.
+    ///
+    /// The DECISION is the same one [`policy_document_defect`] makes for every policy
+    /// document; only the sentence for a document that does not parse as a JSON object
+    /// differs, because IAM validates a role's trust policy with a validator of its own
+    /// ([`TRUST_POLICY_INVALID_JSON`]). An object that parses and carries no `Statement`
+    /// is reported as any other policy document carrying none is.
+    pub fn trust_policy_message(self) -> &'static str {
+        match self {
+            Self::Syntax => TRUST_POLICY_INVALID_JSON,
             Self::NoStatements => POLICY_HAS_NO_STATEMENTS,
         }
     }
