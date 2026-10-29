@@ -14,6 +14,12 @@
 //! version it last changed at, and the instant it finishes provisioning), never
 //! fabricated per response — so two reads of an unchanged domain agree and a
 //! read never has to write.
+//!
+//! The other resource this store holds is the outbound
+//! [`CrossClusterSearchConnection`]: `CreateOutboundCrossClusterSearchConnection`
+//! mints one and `DescribeOutboundCrossClusterSearchConnections` reports it. Its
+//! status is COMPUTED from the stored validation outcome and the instant that
+//! outcome falls due, for the same reason: reporting it must not write.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -719,6 +725,159 @@ fn automated_snapshot_pause_options(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cross-cluster search connections
+// ---------------------------------------------------------------------------
+
+/// `OutboundCrossClusterSearchConnectionStatusCode`'s `VALIDATING`: "The outbound
+/// connection request is being validated." The status a connection holds from the
+/// instant the create returns until [`VALIDATION_SPAN`] has passed.
+pub const CONNECTION_STATUS_VALIDATING: &str = "VALIDATING";
+
+/// `OutboundCrossClusterSearchConnectionStatusCode`'s `PENDING_ACCEPTANCE`:
+/// "Outbound connection request is validated and is not yet accepted by destination
+/// domain owner" — where a request that passed validation waits for that decision.
+pub const CONNECTION_STATUS_PENDING_ACCEPTANCE: &str = "PENDING_ACCEPTANCE";
+
+/// `OutboundCrossClusterSearchConnectionStatusCode`'s `VALIDATION_FAILED`:
+/// "Validation failed for the connection request" — where a request naming a domain
+/// that does not resolve ends up, since no owner can decide on it.
+pub const CONNECTION_STATUS_VALIDATION_FAILED: &str = "VALIDATION_FAILED";
+
+/// How long a connection request stays [`CONNECTION_STATUS_VALIDATING`] before the
+/// clock settles it on the outcome the create computed.
+///
+/// The emulator CHOOSES this span: AWS validates a connection request
+/// asynchronously, so the create's answer is never the validation's outcome. It is
+/// deliberately non-zero, so a caller that reads the connection straight after
+/// creating it still observes the modelled `VALIDATING` status. Nothing sleeps for
+/// it: the due instant is stored and compared against the clock on each read.
+pub const VALIDATION_SPAN: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How many outbound cross-cluster search connections ONE source domain may hold
+/// before the create answers the modelled `LimitExceededException` ("an exception
+/// for trying to create more than allowed resources or sub-resources").
+///
+/// 20 is the service's documented limit on the cross-cluster search connections a
+/// domain takes part in. It bounds what one domain can add to the store.
+pub const MAX_CONNECTIONS_PER_DOMAIN: usize = 20;
+
+/// A hard ceiling on every stored connection, across every source domain and
+/// region.
+///
+/// [`MAX_CONNECTIONS_PER_DOMAIN`] alone does not bound the store: the source domain
+/// is named by the request, so a caller varying it would get a fresh allowance each
+/// time. This cap dominates the single growth site instead, and sits at the product
+/// of the two documented quotas, so it never clips a caller that stays inside both.
+pub const MAX_CONNECTIONS_TOTAL: usize = MAX_CONNECTIONS_PER_DOMAIN * MAX_DOMAINS_TOTAL;
+
+/// The odd multiplier that scrambles a connection counter into its id.
+///
+/// Multiplication by an odd constant modulo 2^64 is a BIJECTION on `u64`, so two
+/// counter values can never render the same id.
+const CONNECTION_ID_MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// The id an outbound cross-cluster search connection is addressed by.
+///
+/// `CrossClusterSearchConnectionId` declares no constraint, so what matters is that
+/// the id is opaque and that two connections never share one: it is the store's
+/// monotonic connection counter scrambled through the bijection described on
+/// [`CONNECTION_ID_MULTIPLIER`], behind the prefix naming the resource it
+/// identifies.
+pub fn cross_cluster_connection_id(seq: u64) -> String {
+    format!(
+        "ccs-{token:016x}",
+        token = seq.wrapping_mul(CONNECTION_ID_MULTIPLIER)
+    )
+}
+
+/// A `DomainInformation` reference with the owner and Region it is resolved against
+/// filled in.
+///
+/// A reference naming no `OwnerId` is to a domain of the account making the call,
+/// and one naming no `Region` is to a domain in the Region the call was signed for —
+/// so the stored record, and every report of it, names the domain in full however
+/// little the request said.
+pub fn resolved_domain_information(info: DomainInformation, region: &str) -> DomainInformation {
+    DomainInformation {
+        owner_id: Some(
+            info.owner_id
+                .unwrap_or_else(|| ::engine::emulator_account_id().to_string()),
+        ),
+        domain_name: info.domain_name,
+        region: Some(info.region.unwrap_or_else(|| region.to_string())),
+    }
+}
+
+/// One outbound cross-cluster search connection, as stored.
+///
+/// The record is the single source of truth for every answer about the connection:
+/// the create's response and every later read are both [`Self::to_outbound`] of it,
+/// so the two cannot disagree. Where the connection is in its lifecycle is COMPUTED
+/// from the stored validation outcome and its due instant rather than stored as a
+/// mutable status, so no read has to write.
+#[derive(Debug, Clone)]
+pub struct CrossClusterSearchConnection {
+    /// `CrossClusterSearchConnectionId`, unique per connection, so it IS the key the
+    /// store holds the record under.
+    pub connection_id: String,
+    /// The Region the connection itself lives in: the one the create was signed for,
+    /// which is the control plane that holds it.
+    pub region: String,
+    /// `ConnectionAlias`: the name the source domain's owner gave the connection.
+    pub connection_alias: String,
+    /// The source domain, as [`resolved_domain_information`] recorded it.
+    pub source_domain: DomainInformation,
+    /// The destination domain, as [`resolved_domain_information`] recorded it.
+    pub destination_domain: DomainInformation,
+    /// When the clock finishes validating the request.
+    pub validated_at: SystemTime,
+    /// The status the connection is in once [`Self::validated_at`] has passed: the
+    /// outcome the create computed from the domains the request named.
+    pub validated_status: String,
+    /// `OutboundCrossClusterSearchConnectionStatus$Message` for that outcome, where
+    /// there is something to say about it.
+    pub validated_message: Option<String>,
+}
+
+impl CrossClusterSearchConnection {
+    /// Where the connection is in its lifecycle at `now` — one of
+    /// `OUTBOUND_CROSS_CLUSTER_SEARCH_CONNECTION_STATUS_CODE_VALUES`. Still being
+    /// validated until the clock has made the outcome due.
+    pub fn status_code(&self, now: SystemTime) -> &str {
+        if now < self.validated_at {
+            CONNECTION_STATUS_VALIDATING
+        } else {
+            &self.validated_status
+        }
+    }
+
+    /// The verbose information for that status, which a request still being
+    /// validated has none of: the outcome's message is only the settled status's.
+    pub fn status_message(&self, now: SystemTime) -> Option<String> {
+        if now < self.validated_at {
+            None
+        } else {
+            self.validated_message.clone()
+        }
+    }
+
+    /// This record as the `OutboundCrossClusterSearchConnection` the describe
+    /// reports, member for member the projection the create answers with.
+    pub fn to_outbound(&self, now: SystemTime) -> OutboundCrossClusterSearchConnection {
+        OutboundCrossClusterSearchConnection {
+            source_domain_info: Some(self.source_domain.clone()),
+            destination_domain_info: Some(self.destination_domain.clone()),
+            cross_cluster_search_connection_id: Some(self.connection_id.clone()),
+            connection_alias: Some(self.connection_alias.clone()),
+            connection_status: Some(OutboundCrossClusterSearchConnectionStatus {
+                status_code: Some(self.status_code(now).to_string()),
+                message: self.status_message(now),
+            }),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-elasticsearchservice-amazonelasticsearchservice2015. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State {
@@ -730,6 +889,12 @@ pub struct ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State {
     /// Monotonic counter feeding generated endpoint suffixes, so each domain
     /// created in a run gets its own.
     pub next_id_seq: u64,
+    /// Every outbound cross-cluster search connection, keyed by its
+    /// `CrossClusterSearchConnectionId`. Ordered, so the describe reports the same
+    /// order twice — which is what lets a pagination token name a place in the set.
+    pub connections: BTreeMap<String, CrossClusterSearchConnection>,
+    /// Monotonic counter feeding [`Self::mint_connection_id`].
+    pub connection_seq: u64,
 }
 
 impl ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State {
@@ -754,6 +919,69 @@ impl ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State {
             .iter()
             .filter(move |((each, _), _)| each == region)
             .map(|(_, domain)| domain)
+    }
+
+    /// Hand out the id of the next connection created, so two connections never
+    /// share one. See [`cross_cluster_connection_id`].
+    pub fn mint_connection_id(&mut self) -> String {
+        self.connection_seq = self.connection_seq.wrapping_add(1);
+        cross_cluster_connection_id(self.connection_seq)
+    }
+
+    /// Whether the domain a `DomainInformation` reference names is one this store
+    /// holds — what a connection request is validated against.
+    ///
+    /// A reference is resolved against the registry this emulator serves, which
+    /// holds one account's domains keyed by Region and name, so it is the Region and
+    /// the NAME that resolve; the `OwnerId` a request names is recorded with the
+    /// reference rather than resolved, since no other account's domains are here to
+    /// resolve it against.
+    pub fn holds_referenced_domain(&self, reference: &DomainInformation) -> bool {
+        reference.region.as_ref().is_some_and(|region| {
+            self.domains
+                .contains_key(&domain_key(region, &reference.domain_name))
+        })
+    }
+
+    /// The connections of one Region, in connection-id order: a connection lives in
+    /// the Region its create was signed for, so that is the scope a describe reports.
+    pub fn connections_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a CrossClusterSearchConnection> {
+        self.connections
+            .values()
+            .filter(move |connection| connection.region == region)
+    }
+
+    /// How many connections one source domain already holds — the count the
+    /// per-domain quota is checked against.
+    pub fn connection_count_from(&self, region: &str, source_domain_name: &str) -> usize {
+        self.connections_in(region)
+            .filter(|connection| connection.source_domain.domain_name == source_domain_name)
+            .count()
+    }
+}
+
+/// What a handler answers when [`service_state`] cannot reach this service's store.
+///
+/// Only reachable when the service is mounted on an engine that is not the shared
+/// [`::engine::InMemoryEngine`] — the router never does that. It is the scaffold's
+/// 501 rather than a 5xx because there is nothing to retry: no engine of this
+/// process will ever serve the call. An operation whose model declares a server
+/// error answers with THAT instead.
+pub fn state_unavailable<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::NotImplemented(crate::scaffolded::NotImplemented {
+        message: "the Elasticsearch emulator's state store is not reachable from this engine"
+            .to_string(),
+    })
+}
+
+/// `InvalidPaginationTokenException` for a `NextToken` that names no place in the
+/// set being paginated.
+pub fn invalid_pagination_token(token: &str) -> InvalidPaginationTokenException {
+    InvalidPaginationTokenException {
+        message: Some(format!("Invalid pagination token: {token}")),
     }
 }
 

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOutboundCrossClusterSearchConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOutboundCrossClusterSearchConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Records a request for a cross-cluster search connection from a source domain to a
+//! destination domain and PERSISTS it: the stored record is what the response and
+//! every later `DescribeOutboundCrossClusterSearchConnections` are both built from.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOutboundCrossClusterSearchConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The domains the request names are validated ASYNCHRONOUSLY: the connection the
+//! create answers with is still `VALIDATING`, and the outcome the request earns —
+//! `PENDING_ACCEPTANCE` when both domains resolve, `VALIDATION_FAILED` when one does
+//! not — is stored with the instant the clock makes it due.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +87,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    resolved_domain_information, CrossClusterSearchConnection,
+    CONNECTION_STATUS_PENDING_ACCEPTANCE, CONNECTION_STATUS_VALIDATION_FAILED,
+    MAX_CONNECTIONS_PER_DOMAIN, MAX_CONNECTIONS_TOTAL, VALIDATION_SPAN,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -160,18 +164,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOutboundCrossClusterSearchConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOutboundCrossClusterSearchConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOutboundCrossClusterSearchConnection"))
+        // `InternalException` ("the failure is internal to the service", HTTP 500) is
+        // this operation's own modelled server error, so an unreachable store answers
+        // with THAT rather than with `crate::state::state_unavailable`, which is for
+        // an operation whose model declares none.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateOutboundCrossClusterSearchConnectionErrorModeled::InternalException(
+                    InternalException {
+                        message: Some(
+                            "the Elasticsearch domain store is unavailable".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // The connection lives in the Region the call was signed for: that control
+        // plane is what holds it, and it is what a reference naming no Region of its
+        // own is resolved against.
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let source = resolved_domain_information(input.source_domain_info, &region);
+        let destination = resolved_domain_information(input.destination_domain_info, &region);
+
+        let mut store = state.lock();
+
+        // The alias is how the source domain names the cluster it is connected to, so
+        // one source domain cannot hold two connections under one alias: the stored
+        // record stays exactly as it is and the second create is the modelled
+        // already-exists refusal rather than another record.
+        if store.connections_in(&region).any(|connection| {
+            connection.source_domain.domain_name == source.domain_name
+                && connection.connection_alias == input.connection_alias
+        }) {
+            return Err(
+                CreateOutboundCrossClusterSearchConnectionErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!(
+                            "Connection alias {alias} already exists for domain {domain}",
+                            alias = input.connection_alias,
+                            domain = source.domain_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The documented per-domain limit on the connections one domain takes part
+        // in, and the store's hard ceiling across every source domain and Region (the
+        // source domain is request-named, so the per-domain limit alone would not
+        // bound the store). The message names whichever bound was reached.
+        let limit_reached = if store.connection_count_from(&region, &source.domain_name)
+            >= MAX_CONNECTIONS_PER_DOMAIN
+        {
+            Some(format!(
+                "Domain {domain} already has the maximum of {MAX_CONNECTIONS_PER_DOMAIN} \
+                 cross-cluster search connections",
+                domain = source.domain_name
+            ))
+        } else if store.connections.len() >= MAX_CONNECTIONS_TOTAL {
+            Some(format!(
+                "This account already has the maximum of {MAX_CONNECTIONS_TOTAL} cross-cluster \
+                 search connections"
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = limit_reached {
+            return Err(
+                CreateOutboundCrossClusterSearchConnectionErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A connection request is VALIDATED against the domain registry before any
+        // owner can decide on it: a reference that resolves to no domain this service
+        // holds names a cluster nothing can be connected to, so the request fails
+        // validation instead of waiting for a decision no owner can make. The outcome
+        // is computed here and stored with the instant the clock makes it due — it is
+        // not what this call reports, because the validation is asynchronous.
+        let mut unresolved: Vec<String> = [&source, &destination]
+            .into_iter()
+            .filter(|reference| !store.holds_referenced_domain(reference))
+            .map(|reference| reference.domain_name.clone())
+            .collect();
+        // The two references may name the SAME absent domain; that is one thing that
+        // did not resolve, so the message says it once.
+        unresolved.dedup();
+        let (validated_status, validated_message) = if unresolved.is_empty() {
+            (CONNECTION_STATUS_PENDING_ACCEPTANCE.to_string(), None)
+        } else {
+            (
+                CONNECTION_STATUS_VALIDATION_FAILED.to_string(),
+                Some(format!(
+                    "Validation failed: no domain found for {domains}",
+                    domains = unresolved.join(", ")
+                )),
+            )
+        };
+
+        let connection_id = store.mint_connection_id();
+        let connection = CrossClusterSearchConnection {
+            connection_id: connection_id.clone(),
+            region,
+            connection_alias: input.connection_alias,
+            source_domain: source,
+            destination_domain: destination,
+            validated_at: now + VALIDATION_SPAN,
+            validated_status,
+            validated_message,
+        };
+
+        // The response is the projection of the record being stored — the same one
+        // the next describe reports it with — so the two cannot disagree.
+        let stored = connection.to_outbound(now);
+        store.connections.insert(connection_id, connection);
+        Ok(CreateOutboundCrossClusterSearchConnectionOutput {
+            source_domain_info: stored.source_domain_info,
+            destination_domain_info: stored.destination_domain_info,
+            connection_alias: stored.connection_alias,
+            connection_status: stored.connection_status,
+            cross_cluster_search_connection_id: stored.cross_cluster_search_connection_id,
+        })
     }
 }

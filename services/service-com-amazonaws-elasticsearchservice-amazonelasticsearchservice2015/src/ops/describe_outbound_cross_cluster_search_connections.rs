@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeOutboundCrossClusterSearchConnections
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeOutboundCrossClusterSearchConnections`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the outbound cross-cluster search connections of this Region FROM THE STORE:
+//! every connection `CreateOutboundCrossClusterSearchConnection` persisted, narrowed
+//! by the request's filters and paginated by its `MaxResults` and `NextToken`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeOutboundCrossClusterSearchConnections::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure report: the status it gives each connection is COMPUTED from the stored
+//! validation outcome and the instant that outcome falls due, so reading a connection
+//! never changes what the next read sees.
 //!
 //! ## Shape of an operation
 //!
@@ -78,8 +76,54 @@
 //! * `InvalidPaginationTokenException` (HTTP 400) — The request processing has failed because
 //!   of invalid pagination token provided by customer. Returns an HTTP status code of 400.
 
+use std::collections::BTreeSet;
+
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::CrossClusterSearchConnection;
+
+/// The largest page this operation answers with, and the page size a request that
+/// asks for none gets: `MaxResults` is `@range(max: 100)`, and the member's own
+/// documentation says "if not specified, defaults to 100".
+const MAX_PAGE: usize = 100;
+
+/// `Filter$Name` for the connection's own id.
+///
+/// This and the four below are exactly the filter names the `Filters` member
+/// documents as available for this operation; a connection has no value for any
+/// OTHER name, so a filter naming one selects nothing.
+const FILTER_CONNECTION_ID: &str = "cross-cluster-search-connection-id";
+
+/// `Filter$Name` for the destination domain's name.
+const FILTER_DESTINATION_DOMAIN_NAME: &str = "destination-domain-info.domain-name";
+
+/// `Filter$Name` for the account that owns the destination domain.
+const FILTER_DESTINATION_OWNER_ID: &str = "destination-domain-info.owner-id";
+
+/// `Filter$Name` for the Region the destination domain is in.
+const FILTER_DESTINATION_REGION: &str = "destination-domain-info.region";
+
+/// `Filter$Name` for the source domain's name.
+const FILTER_SOURCE_DOMAIN_NAME: &str = "source-domain-info.domain-name";
+
+/// The most filters one request may carry.
+///
+/// An EMULATOR-IMPOSED cap, not a modelled constraint: neither `FilterList` nor its
+/// `values` member carries a `@length` trait, so nothing refuses an arbitrarily long
+/// filter list before this handler runs, and the scan below is linear in the filter
+/// count. These two caps are what bound its work: one request performs at most
+/// `MAX_FILTERS * crate::state::MAX_CONNECTIONS_TOTAL` set lookups, each over a set
+/// of at most [`MAX_VALUES_PER_FILTER`] values. It is well above the five filter
+/// names this operation has properties for, so no request a caller can mean is
+/// refused by it.
+const MAX_FILTERS: usize = 10;
+
+/// The most values one filter may carry — also an emulator-imposed cap, for the same
+/// reason: each filter's values become one set, so this bounds the set a connection
+/// is looked up in and the work of building it. It is far above the number of
+/// connections the store can hold for one source domain, so a filter enumerating
+/// every connection a caller could have is inside it.
+const MAX_VALUES_PER_FILTER: usize = 1_000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -150,18 +194,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeOutboundCrossClusterSearchConnections` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeOutboundCrossClusterSearchConnectionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeOutboundCrossClusterSearchConnections"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        // A connection is held by the control plane of the Region its create was
+        // signed for, so that is the set this call reports.
+        let region = crate::state::request_region(&ctx.parts().headers);
+        // The filters are bounded and compiled BEFORE the store is locked, so the
+        // work done while holding it is bounded by the caps above and by the store's
+        // own size rather than by how much a request asked for.
+        let filters = compile_filters(input.filters.unwrap_or_default())?;
+
+        let store = state.lock();
+        // Order-stable, because the store is keyed by connection id: the same request
+        // reports the same order twice, which is what lets a token name a place in
+        // the set. Bounded by the store itself rather than unbounded.
+        let matching: Vec<&CrossClusterSearchConnection> = store
+            .connections_in(&region)
+            .filter(|connection| matches_every_filter(connection, &filters))
+            .collect();
+
+        // A token names the connection the next page starts at, so paging resumes
+        // from a place in the set rather than from an offset a later create would
+        // have shifted. A token that names no connection of THIS filtered set — one
+        // this service never minted, or one carried over to a request with different
+        // filters — names no such place, which is the modelled refusal.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => matching
+                .iter()
+                .position(|connection| connection.connection_id == token)
+                .ok_or_else(|| {
+                    DescribeOutboundCrossClusterSearchConnectionsErrorModeled::InvalidPaginationTokenException(
+                        crate::state::invalid_pagination_token(token),
+                    )
+                })?,
+        };
+
+        // "Set this value to limit the number of results returned. If not specified,
+        // defaults to 100": the model defaults the member to 0, so a request that
+        // asks for no particular page size gets the whole page rather than none. The
+        // member declares no minimum, so a negative value also reaches here; it names
+        // no page size either, and the documented unspecified case is the only one
+        // the member defines, so it is answered the same way rather than refused.
+        let page_size = match usize::try_from(input.max_results) {
+            Ok(0) | Err(_) => MAX_PAGE,
+            Ok(size) => size.min(MAX_PAGE),
+        };
+        let end = start.saturating_add(page_size).min(matching.len());
+
+        Ok(DescribeOutboundCrossClusterSearchConnectionsOutput {
+            cross_cluster_search_connections: Some(
+                matching[start..end]
+                    .iter()
+                    .map(|connection| connection.to_outbound(now))
+                    .collect(),
+            ),
+            // "If more results are available and NextToken is present, make the next
+            // request to the same API with the received NextToken": the token is the
+            // next connection in the set, and there is none once this page ended it.
+            next_token: matching
+                .get(end)
+                .map(|connection| connection.connection_id.clone()),
+        })
+    }
+}
+
+/// One request filter as the scan uses it: the property it names, and the values that
+/// satisfy it as a SET, so testing a connection against it costs one lookup rather
+/// than a walk of everything the request listed.
+struct CompiledFilter {
+    name: String,
+    values: BTreeSet<String>,
+}
+
+/// The request's filters, bounded and turned into [`CompiledFilter`]s once per
+/// request.
+///
+/// A filter list or a value list past the caps is refused — with the 400
+/// `ValidationException`, since this operation models no client-input error, and
+/// naming the cap as the emulator's own — rather than scanned: the caps are what keep
+/// the scan's comparison count bounded by `MAX_FILTERS * MAX_CONNECTIONS_TOTAL`
+/// lookups.
+fn compile_filters(
+    filters: Vec<Filter>,
+) -> Result<Vec<CompiledFilter>, DescribeOutboundCrossClusterSearchConnectionsError> {
+    if filters.len() > MAX_FILTERS {
+        return Err(crate::scaffolded::Scaffolded::validation(format!(
+            "Filters carries {count} filters, which is more than the {MAX_FILTERS} this \
+             emulator matches in one request",
+            count = filters.len()
+        )));
+    }
+    filters
+        .into_iter()
+        .map(|filter| {
+            let values = filter.values.unwrap_or_default();
+            if values.len() > MAX_VALUES_PER_FILTER {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Filters.Values carries {count} values for filter {name}, which is more \
+                     than the {MAX_VALUES_PER_FILTER} this emulator matches per filter",
+                    count = values.len(),
+                    name = filter.name.unwrap_or_default()
+                )));
+            }
+            Ok(CompiledFilter {
+                name: filter.name.unwrap_or_default(),
+                values: values.into_iter().collect(),
+            })
+        })
+        .collect()
+}
+
+/// Whether `connection` is reported under `filters`.
+///
+/// A connection must match EVERY filter given, and "must match at least one of the
+/// specified values" of each (`Filter`'s own documentation), so the values within one
+/// filter are alternatives and the filters themselves are cumulative. A filter naming
+/// a property a connection has no value for — including a name this operation does
+/// not filter on — matches nothing.
+fn matches_every_filter(
+    connection: &CrossClusterSearchConnection,
+    filters: &[CompiledFilter],
+) -> bool {
+    filters.iter().all(|filter| {
+        filtered_property(connection, &filter.name)
+            .is_some_and(|actual| filter.values.contains(&actual))
+    })
+}
+
+/// The value of the connection property `name` filters on, or `None` when this
+/// operation filters on no such property.
+fn filtered_property(connection: &CrossClusterSearchConnection, name: &str) -> Option<String> {
+    match name {
+        FILTER_CONNECTION_ID => Some(connection.connection_id.clone()),
+        FILTER_DESTINATION_DOMAIN_NAME => Some(connection.destination_domain.domain_name.clone()),
+        FILTER_DESTINATION_OWNER_ID => connection.destination_domain.owner_id.clone(),
+        FILTER_DESTINATION_REGION => connection.destination_domain.region.clone(),
+        FILTER_SOURCE_DOMAIN_NAME => Some(connection.source_domain.domain_name.clone()),
+        _ => None,
     }
 }

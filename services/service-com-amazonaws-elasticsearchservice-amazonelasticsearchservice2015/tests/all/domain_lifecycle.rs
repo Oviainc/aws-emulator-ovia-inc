@@ -21,13 +21,12 @@
 //! 7. A created domain is `Processing` for a non-zero span and then settles,
 //!    without any read changing what the next read sees.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_elasticsearchservice_amazonelasticsearchservice2015::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::harness::{call_in, router, Answer};
 
 /// The region the test signs for; every ARN and endpoint must carry it.
 const REGION: &str = "us-west-2";
@@ -38,61 +37,6 @@ const ACCOUNT: &str = "000000000000";
 /// Longer than the emulator's provisioning span, so a change is certainly due.
 const PAST_PROVISIONING: Duration = Duration::from_millis(900);
 
-/// A router carrying only this service, over one shared engine.
-fn router() -> MultiServiceRouter {
-    let engine = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// A request routed to this service by its SigV4 credential scope, which is
-/// also where the handler reads the region from.
-fn request(region: &str, method: &str, path: &str, body: Option<&Value>) -> http::Request<Bytes> {
-    let builder = http::Request::builder()
-        .method(method)
-        .uri(format!("http://localhost{path}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20260101/{region}/es/aws4_request, \
-                 SignedHeaders=host, Signature=0000"
-            ),
-        );
-    match body {
-        Some(body) => builder
-            .header("content-type", "application/json")
-            .body(Bytes::from(serde_json::to_vec(body).expect("serialize body")))
-            .expect("build request"),
-        None => builder.body(Bytes::new()).expect("build request"),
-    }
-}
-
-/// One call's HTTP status, `x-amzn-errortype` (restJson1 names the error shape
-/// there) and parsed JSON body.
-struct Answer {
-    status: u16,
-    error_type: String,
-    body: Value,
-}
-
-impl Answer {
-    /// The member at `pointer`, or a failure naming the case and the body.
-    fn at(&self, case: &str, pointer: &str) -> &Value {
-        self.body.pointer(pointer).unwrap_or_else(|| {
-            panic!(
-                "case {case:?}: response has no {pointer}, got {body}",
-                body = self.body
-            )
-        })
-    }
-
-    /// Whether `pointer` is absent (or JSON null).
-    fn missing(&self, pointer: &str) -> bool {
-        self.body.pointer(pointer).is_none_or(Value::is_null)
-    }
-}
-
 /// One call against [`REGION`].
 async fn call(
     router: &MultiServiceRouter,
@@ -101,36 +45,6 @@ async fn call(
     body: Option<&Value>,
 ) -> Answer {
     call_in(router, REGION, method, path, body).await
-}
-
-async fn call_in(
-    router: &MultiServiceRouter,
-    region: &str,
-    method: &str,
-    path: &str,
-    body: Option<&Value>,
-) -> Answer {
-    let response = router.dispatch(request(region, method, path, body)).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let bytes = response.into_body();
-    let body = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or_else(|_| {
-            Value::String(String::from_utf8_lossy(&bytes).to_string())
-        })
-    };
-    Answer {
-        status,
-        error_type,
-        body,
-    }
 }
 
 async fn create(router: &MultiServiceRouter, body: &Value) -> Answer {

@@ -13,6 +13,10 @@
 // points it into `tests/all/`.
 #[path = "all/domain_lifecycle.rs"]
 mod domain_lifecycle;
+#[path = "all/harness.rs"]
+mod harness;
+#[path = "all/outbound_cross_cluster_search_connections.rs"]
+mod outbound_cross_cluster_search_connections;
 #[path = "all/shared_es_signing_name_claim.rs"]
 mod shared_es_signing_name_claim;
 #[path = "all/state_roundtrip.rs"]
