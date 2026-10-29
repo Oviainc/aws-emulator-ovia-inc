@@ -509,7 +509,14 @@ pub fn resolve_data_query(
     // under the properties THIS request puts in force.
     let mut published: BTreeSet<&'static str> = BTreeSet::new();
     for table in &shape.tables {
-        let (spec, properties) = resolve_table(table, requested, require_table_configurations)?;
+        // This table's name was submitted in the statement, so a refusal about the NAME
+        // names that member.
+        let (spec, properties) = resolve_table(
+            table,
+            QUERY_STATEMENT_FIELD,
+            requested,
+            require_table_configurations,
+        )?;
         published.extend(spec.columns_in_force(&properties).map(|column| column.name));
         record_configuration(table, properties, &mut effective);
     }
@@ -535,7 +542,14 @@ pub fn resolve_data_query(
         .filter(|table| !queried.contains(table))
         .collect();
     for table in configured_only {
-        let (_, properties) = resolve_table(table, requested, require_table_configurations)?;
+        // This table's name was submitted as a KEY of `TableConfigurations` and nowhere
+        // else, so a refusal about the NAME names that member.
+        let (_, properties) = resolve_table(
+            table,
+            TABLE_CONFIGURATIONS_FIELD,
+            requested,
+            require_table_configurations,
+        )?;
         record_configuration(table, properties, &mut effective);
     }
     Ok((!effective.is_empty()).then_some(effective))
@@ -550,12 +564,19 @@ pub fn resolve_data_query(
 /// left unsaid, a property the table does not publish, or a value outside the property's
 /// published values, each the modelled 400) and the effective properties the stored
 /// configuration reports are the very ones the verdict was read from.
+///
+/// `name_field` is the member path of the submitted definition that CARRIED THIS NAME —
+/// the statement for a table the query reads, the configuration map for one the request
+/// only configures — because `ValidationExceptionField$Name` is "[t]he field name where
+/// the invalid entry was detected" (smithy_query shape `ValidationExceptionField`), and
+/// an unpublished name is an invalid entry of whichever member the request wrote it at.
 fn resolve_table(
     table: &str,
+    name_field: &str,
     requested: Option<&TableConfigurations>,
     require_table_configurations: bool,
 ) -> Result<(&'static TableSpec, BTreeMap<String, String>), QueryRefusal> {
-    let spec = table_spec(table).ok_or_else(|| invalid_query_table(table))?;
+    let spec = table_spec(table).ok_or_else(|| invalid_query_table(name_field, table))?;
     if require_table_configurations && !spec.properties.is_empty() {
         let configured =
             requested.is_some_and(|configurations| configurations.contains_key(spec.name));
@@ -661,15 +682,18 @@ fn too_many_relations() -> ValidationException {
     )
 }
 
-/// The modelled 400 for a `QueryStatement` naming a table outside the catalog.
+/// The modelled 400 for a submitted definition naming a table outside the catalog,
+/// naming the caller's own member path `field` as the place the invalid entry was
+/// detected: the statement for a table the query reads, the configuration map for a table
+/// the request only configures.
 ///
 /// The sentence is built from the request and names the offending table, which is the
 /// only part of the request the caller has to change; the table it must be one of is what
 /// `ListTables` reports. RECORDED AWS wording for that rule: `Table name <name> is
 /// invalid`.
-fn invalid_query_table(table: &str) -> ValidationException {
+fn invalid_query_table(field: &str, table: &str) -> ValidationException {
     field_validation_failed(
-        QUERY_STATEMENT_FIELD,
+        field,
         format!("Table name {} is invalid", clip_for_message(table)),
         "Must name a table data exports publishes; call ListTables for them.".to_string(),
     )
