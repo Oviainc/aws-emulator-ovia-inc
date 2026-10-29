@@ -105,6 +105,12 @@ mod member_account_policy_scope;
 #[path = "all/administrator_gate_clock_reading.rs"]
 mod administrator_gate_clock_reading;
 
+// Declared beside them, for the same reason: this suite's name sorts right into
+// the contended region of the list below. The suite itself is an ordinary
+// `tests/all/<name>.rs` file.
+#[path = "all/administrator_offboarding.rs"]
+mod administrator_offboarding;
+
 #[path = "all/admin_account_disassociation.rs"]
 mod admin_account_disassociation;
 #[path = "all/admin_account_scopes.rs"]

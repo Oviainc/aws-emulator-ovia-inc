@@ -25,7 +25,10 @@
 //! * a CREATE records the account with the scope sent (an absent `AdminScope`
 //!   grants nothing yet) and starts it `ONBOARDING`, the non-terminal
 //!   `OrganizationStatus` the clock completes
-//!   ([`crate::state::ADMIN_ONBOARDING_SPAN`]);
+//!   ([`crate::state::ADMIN_ONBOARDING_SPAN`]) — and an account that
+//!   `DisassociateAdminAccount` has already REMOVED as an administrator is
+//!   created again this way rather than updated, since it is no administrator
+//!   for this call to update;
 //! * an UPDATE replaces the stored scope, leaves the account's onboarding and
 //!   its `onboarded_at` alone, and — following this service's convention for an
 //!   absent optional member of a `Put` payload — treats an absent `AdminScope`
@@ -269,8 +272,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         store.settle_organization_admins_at(now);
-        let onboarded = store.organization_admins.len();
+        // How many accounts the organization holds AS administrators at this
+        // instant. A record whose removal has completed is KEPT (it reports what
+        // became of that account) but is an administrator no longer, so it takes
+        // up none of the slots this bound counts.
+        let onboarded = store
+            .organization_admins
+            .values()
+            .filter(|admin| admin.is_administrator_at(now))
+            .count();
+        // The bound is on CREATING an administrator — whether this account was
+        // never one or was one and has been removed — not on updating the scope
+        // of one the organization already holds, which adds no administrator.
+        let creating = store
+            .organization_admins
+            .get(&input.admin_account)
+            .is_none_or(|existing| !existing.is_administrator_at(now));
+        if creating && onboarded >= MAX_ADMIN_ACCOUNTS {
+            return Err(PutAdminAccountErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the maximum of {MAX_ADMIN_ACCOUNTS} Firewall Manager administrator \
+                         accounts has already been onboarded for this organization"
+                    )),
+                },
+            )
+            .into());
+        }
         match store.organization_admins.get_mut(&input.admin_account) {
+            // CREATE AGAIN: the account was an administrator and HAS BEEN
+            // REMOVED as one (`DisassociateAdminAccount` took it out, and the
+            // clock completed the removal), so there is no administrator here
+            // for this call to update — it creates one, which onboards from the
+            // start exactly as a first-time create does. The record that was
+            // left behind reports what became of the previous role and does not
+            // carry over into the new one.
+            Some(existing) if !existing.is_administrator_at(now) => {
+                *existing = crate::state::OrganizationAdminRecord::onboarding(
+                    &input.admin_account,
+                    input.admin_scope.clone().unwrap_or_default(),
+                    now,
+                );
+            }
             // UPDATE: this account already is an administrator, so only its
             // scope changes; an absent `AdminScope` leaves the stored one as it
             // is, which is what makes a repeated call idempotent.
@@ -283,31 +326,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // CREATE: record the account and start the onboarding the clock
             // completes.
             None => {
-                if onboarded >= MAX_ADMIN_ACCOUNTS {
-                    return Err(PutAdminAccountErrorModeled::LimitExceededException(
-                        LimitExceededException {
-                            message: Some(format!(
-                                "the maximum of {MAX_ADMIN_ACCOUNTS} Firewall Manager \
-                                 administrator accounts has already been onboarded for this \
-                                 organization"
-                            )),
-                        },
-                    )
-                    .into());
-                }
                 store.organization_admins.insert(
                     input.admin_account.clone(),
-                    crate::state::OrganizationAdminRecord {
-                        account_id: input.admin_account.clone(),
-                        admin_scope: input.admin_scope.clone().unwrap_or_default(),
-                        status: crate::state::ORGANIZATION_STATUS_ONBOARDING.to_string(),
-                        settles_to: Some(
-                            crate::state::ORGANIZATION_STATUS_ONBOARDING_COMPLETE.to_string(),
-                        ),
-                        settles_at: Some(now + crate::state::ADMIN_ONBOARDING_SPAN),
-                        onboarded_at: now,
-                        updated_at: now,
-                    },
+                    crate::state::OrganizationAdminRecord::onboarding(
+                        &input.admin_account,
+                        input.admin_scope.clone().unwrap_or_default(),
+                        now,
+                    ),
                 );
             }
         }

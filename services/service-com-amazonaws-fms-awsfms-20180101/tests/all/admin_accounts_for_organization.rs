@@ -55,7 +55,7 @@ const ADMIN_ACCOUNTS: &[&str] = &[
 
 /// One administrator as the enumeration reports it: the account, whether it is
 /// the default administrator, and its `OrganizationStatus`.
-type Summary = (String, bool, String);
+pub(crate) type Summary = (String, bool, String);
 
 /// `ListAdminAccountsForOrganization` with `request`, as `(http status, error
 /// code or "", the administrators reported, NextToken)`.
@@ -63,7 +63,11 @@ type Summary = (String, bool, String);
 /// Every `Status` that comes back is checked against the model's own
 /// `OrganizationStatus` catalog here, so no assertion below can pass on a value
 /// the enum does not carry.
-async fn list_admins(
+///
+/// `pub(crate)` so the sibling suite that drives an administrator out of the
+/// organization reads the enumeration through this one reader rather than
+/// keeping a second copy of it.
+pub(crate) async fn list_admins(
     router: &MultiServiceRouter,
     request: &Value,
     region: &str,

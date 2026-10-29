@@ -199,6 +199,20 @@ pub const ORGANIZATION_STATUS_OFFBOARDING_COMPLETE: &str = "OFFBOARDING_COMPLETE
 /// ([`OrganizationAdminRecord::settles_at`]); nothing sleeps for it.
 pub const ADMIN_ONBOARDING_SPAN: Duration = Duration::from_millis(500);
 
+/// How long an administrator account that has asked to be disassociated stays
+/// `OFFBOARDING` before the clock makes `OFFBOARDING_COMPLETE` due.
+///
+/// A CHOSEN span, not a documented one, for the same reason
+/// [`ADMIN_ONBOARDING_SPAN`] is: Firewall Manager publishes no duration for
+/// removing an administrator, only the non-terminal `OFFBOARDING` status its
+/// `AdminAccountSummary$Status` passes through on the way to
+/// `OFFBOARDING_COMPLETE`. It is deliberately NON-ZERO, so a caller that reads
+/// the administrator straight after asking for the removal still observes that
+/// transient status, and short enough that a caller that waits does not wait
+/// long. The due instant is STORED on the record
+/// ([`OrganizationAdminRecord::settles_at`]); nothing sleeps for it.
+pub const ADMIN_OFFBOARDING_SPAN: Duration = Duration::from_millis(500);
+
 /// One Firewall Manager administrator account the organization's management
 /// account onboarded with `PutAdminAccount`, keyed in
 /// [`ComAmazonawsFmsAwsfms20180101State::organization_admins`] by its account
@@ -237,6 +251,25 @@ pub struct OrganizationAdminRecord {
 }
 
 impl OrganizationAdminRecord {
+    /// A newly onboarded administrator account: `ONBOARDING` now, with the
+    /// clock owing `ONBOARDING_COMPLETE` [`ADMIN_ONBOARDING_SPAN`] later.
+    ///
+    /// The ONE place that shape is built, so onboarding an account for the
+    /// first time and onboarding one again after it has been removed as an
+    /// administrator ([`Self::is_administrator_at`] false) cannot drift apart:
+    /// both are the "create" half of `PutAdminAccount`'s "creates or updates".
+    pub fn onboarding(account_id: &str, admin_scope: AdminScope, now: SystemTime) -> Self {
+        Self {
+            account_id: account_id.to_string(),
+            admin_scope,
+            status: ORGANIZATION_STATUS_ONBOARDING.to_string(),
+            settles_to: Some(ORGANIZATION_STATUS_ONBOARDING_COMPLETE.to_string()),
+            settles_at: Some(now + ADMIN_ONBOARDING_SPAN),
+            onboarded_at: now,
+            updated_at: now,
+        }
+    }
+
     /// The `OrganizationStatus` this administrator account has AT `now`,
     /// derived from the CLOCK: once [`Self::settles_at`] has passed the status
     /// IS [`Self::settles_to`], because that transition was owed at that instant
@@ -245,6 +278,51 @@ impl OrganizationAdminRecord {
     pub fn status_at(&self, now: SystemTime) -> &str {
         pending_transition_due(&self.settles_to, self.settles_at, now)
             .unwrap_or(self.status.as_str())
+    }
+
+    /// Whether this account still IS one of the organization's Firewall Manager
+    /// administrators AT `now`.
+    ///
+    /// An account whose `OrganizationStatus` has reached
+    /// [`ORGANIZATION_STATUS_OFFBOARDING_COMPLETE`] "has been removed as an
+    /// Firewall Manager administrator" (`AdminAccountSummary$Status`), so it is
+    /// not one any more; every other status is a role the account still holds,
+    /// including the removal that is still under way. The record is KEPT once
+    /// the removal completes — exactly as the default administrator's
+    /// association is kept `DELETED` — so a reader is still told what became of
+    /// the account.
+    ///
+    /// Derived from [`Self::status_at`], so it is the CLOCK that decides it and
+    /// no reader of the store can disagree with another about whether an
+    /// account is still an administrator.
+    pub fn is_administrator_at(&self, now: SystemTime) -> bool {
+        self.status_at(now) != ORGANIZATION_STATUS_OFFBOARDING_COMPLETE
+    }
+
+    /// Start removing this account as an administrator: the status becomes
+    /// `OFFBOARDING` now and the clock owes `OFFBOARDING_COMPLETE`
+    /// [`ADMIN_OFFBOARDING_SPAN`] later — the removal side of the same pending
+    /// transition the onboarding uses, so both settle through
+    /// [`Self::settle`].
+    ///
+    /// An onboarding still in flight is SUPERSEDED rather than waited for: an
+    /// account on its way out is being removed from that instant, so the
+    /// transition the clock owed it is replaced by this one.
+    ///
+    /// Idempotent: an account that is already being removed, or already
+    /// removed, has nothing left to start, so a second call does not push its
+    /// due instant back.
+    pub fn start_offboarding(&mut self, now: SystemTime) {
+        let status = self.status_at(now);
+        if status == ORGANIZATION_STATUS_OFFBOARDING
+            || status == ORGANIZATION_STATUS_OFFBOARDING_COMPLETE
+        {
+            return;
+        }
+        self.status = ORGANIZATION_STATUS_OFFBOARDING.to_string();
+        self.settles_to = Some(ORGANIZATION_STATUS_OFFBOARDING_COMPLETE.to_string());
+        self.settles_at = Some(now + ADMIN_OFFBOARDING_SPAN);
+        self.updated_at = now;
     }
 
     /// Write the clock-due transition into the record — the ONLY write a
@@ -1320,6 +1398,27 @@ impl ComAmazonawsFmsAwsfms20180101State {
     ) -> Option<&OrganizationAdminRecord> {
         self.settle_organization_admins_at(now);
         self.organization_admins.get(account_id)
+    }
+
+    /// The administrator role `account_id` still HOLDS at `now`, mutably: the
+    /// record an operation that CHANGES that account's administrator role works
+    /// on, so the write site neither re-derives the still-an-administrator
+    /// predicate ([`OrganizationAdminRecord::is_administrator_at`]) nor re-reads
+    /// the clock after deciding — the counterpart of
+    /// [`Self::active_admin_account_mut_at`] for the administrators
+    /// `PutAdminAccount` onboards.
+    ///
+    /// Unlike [`Self::organization_admin_at`] it settles NOTHING: the status it
+    /// answers from is clock-derived either way, and a caller that resolves a
+    /// role only to refuse the request must leave the store exactly as it was.
+    pub fn organization_admin_mut_at(
+        &mut self,
+        account_id: &str,
+        now: SystemTime,
+    ) -> Option<&mut OrganizationAdminRecord> {
+        self.organization_admins
+            .get_mut(account_id)
+            .filter(|admin| admin.is_administrator_at(now))
     }
 
     /// The stored Firewall Manager resource whose ARN is `arn` — whatever KIND of

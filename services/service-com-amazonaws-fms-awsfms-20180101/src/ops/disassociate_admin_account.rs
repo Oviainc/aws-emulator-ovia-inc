@@ -11,20 +11,47 @@
 //! The modelled documentation reproduced below is written in the second person
 //! about the administrator itself — "If you are the default administrator, all
 //! Firewall Manager administrators within the organization must first
-//! disassociate their accounts before you can disassociate your account" — so the
-//! caller of a successful disassociation IS the account that currently holds the
-//! association. A caller that does not hold it has nothing it is allowed to
-//! disassociate, which Firewall Manager answers with `AccessDeniedException`
+//! disassociate their accounts before you can disassociate your account" — so
+//! the caller of a successful disassociation IS the account whose administrator
+//! role is removed, and a request that names no account is about the role the
+//! CALLER holds. Firewall Manager's model offers no operation by which one
+//! account removes another account's administrator role (`PutAdminAccount` only
+//! creates or updates one), which is why "all administrators must FIRST
+//! disassociate THEIR accounts" is addressed to them and not to the default
+//! administrator.
+//!
+//! An account can hold either of the two administrator roles this service
+//! records, and this operation removes whichever one the caller holds:
+//!
+//! * the DELEGATED administrator role `PutAdminAccount` onboarded for it
+//!   ([`crate::state::ComAmazonawsFmsAwsfms20180101State::organization_admins`]),
+//!   which goes `OFFBOARDING` and then `OFFBOARDING_COMPLETE` — "the account
+//!   has been removed as an Firewall Manager administrator"
+//!   (`AdminAccountSummary$Status`) — after which the organisation holds it as
+//!   an administrator no longer;
+//! * otherwise the organisation's DEFAULT administrator association
+//!   ([`crate::state::ComAmazonawsFmsAwsfms20180101State::admin_account`]),
+//!   which comes out LAST (below).
+//!
+//! The two are separate records, so one account could in principle hold both;
+//! the DELEGATED role is resolved first, because it is the role the account was
+//! given LAST and so the one it leaves first, and because the default
+//! association's own precondition counts the organisation's other
+//! administrators — which would otherwise include the caller's own delegated
+//! role and refuse the call on the strength of it.
+//!
+//! A caller that holds neither has nothing it is allowed to disassociate, which
+//! Firewall Manager answers with `AccessDeniedException`
 //! ([`crate::scaffolded::Scaffolded::access_denied`]): an authorization refusal,
 //! not a missing resource, and a shape this service's model does not declare at
-//! all. With NO association made, no caller holds it, so that is the same
-//! refusal — the one [`crate::state::require_administrator`], the gate every
-//! organisation-scoped operation of this service shares, states; this handler
-//! resolves the association mutably (it changes it) and states that refusal
+//! all. With NO association made and no administrator role of its own, that is
+//! the same refusal — the one [`crate::state::require_administrator`], the gate
+//! every organisation-scoped operation of this service shares, states; this
+//! handler resolves the role mutably (it changes it) and states that refusal
 //! through [`crate::state::no_administrator_refusal`], the gate's own wording.
 //!
 //! Every request this emulator serves is signed by the single emulator account
-//! (`engine::emulator_account_id`), so "the caller holds the association" is read
+//! (`engine::emulator_account_id`), so "the caller holds the role" is read
 //! against that account id.
 //!
 //! ### First in, last out
@@ -41,7 +68,13 @@
 //! modelled `InvalidOperationException` reports ("the operation failed because
 //! there was nothing to do or the operation wasn't possible"). The refusal names
 //! the administrators that still have to leave, so the caller knows which
-//! accounts must call this operation first.
+//! accounts must call this operation first; each of them leaves through the
+//! delegated branch above, which is also what makes them stop being counted
+//! here.
+//!
+//! The precondition belongs to the DEFAULT administrator's association alone: a
+//! delegated administrator is not the organisation's first administrator, so
+//! nothing has to leave before it may.
 //!
 //! The precondition is checked on the call that STARTS the tear-down, not on a
 //! repeat of one already recorded (see the idempotence below): an administrator
@@ -62,15 +95,26 @@
 //! persists the `DELETED` status that follows, for whichever operation looks
 //! next.
 //!
+//! A delegated administrator's removal is not instantaneous either, for the same
+//! modelled reason: `OrganizationStatus` carries the non-terminal `OFFBOARDING`
+//! before `OFFBOARDING_COMPLETE`, so
+//! [`OrganizationAdminRecord::start_offboarding`](crate::state::OrganizationAdminRecord::start_offboarding)
+//! records the instant the removal completes
+//! ([`crate::state::ADMIN_OFFBOARDING_SPAN`] from now) on the record's own
+//! pending-transition pair, which every reader already derives its status from.
+//!
 //! The whole request decides from ONE reading of the clock (`SystemTime` is not
 //! monotonic), so this handler cannot see the association active and then gone
 //! between the check and the write; a caller whose association completes its
 //! tear-down first is simply a caller that holds none, and gets the shared
 //! refusal.
 //!
-//! Asking again while the tear-down is still pending is IDEMPOTENT: the caller
-//! still holds the association and the request is already recorded, so it answers
-//! 200 and leaves the due instant where it is rather than extending it.
+//! Asking again while the tear-down is still pending is IDEMPOTENT, for either
+//! role: the caller still holds it and the request is already recorded, so it
+//! answers 200 and leaves the due instant where it is rather than extending it.
+//! Once the removal has COMPLETED the caller holds that role no longer, so a
+//! further call is the refusal above — and `PutAdminAccount` is what makes a
+//! removed account an administrator again.
 //!
 //! ## Shape of an operation
 //!
@@ -247,6 +291,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
+        // A DELEGATED administrator — an account `PutAdminAccount` onboarded —
+        // is an administrator in its own right, and the administrator role THIS
+        // caller holds is its own: the default administrator's association is a
+        // different record, which the account holding it tears down. So when
+        // the caller holds such a role, this call removes THAT role: the
+        // account goes `OFFBOARDING` and the clock completes the removal. First
+        // in, last out is a rule about the DEFAULT administrator's association,
+        // so nothing has to leave before a delegated administrator may.
+        if let Some(delegated) = store.organization_admin_mut_at(caller, now) {
+            delegated.start_offboarding(now);
+            return Ok(DisassociateAdminAccountOutput);
+        }
         // The organisation's other Firewall Manager administrators, as of the
         // same instant, read BEFORE the association is resolved mutably: the
         // first-in-last-out precondition below is about them, and this reading
@@ -262,11 +318,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::no_administrator_refusal(&region));
         };
         // An association exists, but a disassociation is the holder's own call: an
-        // account that is not the one holding it has nothing it may tear down.
+        // account that holds neither this association nor an administrator role of
+        // its own has nothing it may tear down.
         if admin.account_id != caller {
             return Err(crate::scaffolded::Scaffolded::access_denied(format!(
-                "account {caller} is not the Firewall Manager default administrator, \
-                 so it cannot disassociate the default administrator account"
+                "account {caller} is not a Firewall Manager administrator, \
+                 so it cannot disassociate an administrator account"
             )));
         }
 
