@@ -41,7 +41,9 @@
 //! associable: a global service's ARN carries no Region and an account-less
 //! service's carries no account, and an empty field names nothing to disagree
 //! with, while the resource type is read off the ARN as its owning service
-//! spells it (see [`crate::state::resource_set_item_failure_reason`]).
+//! spells it — under that service's own ARN namespace, since a declared resource
+//! type names the one service that owns resources of it
+//! (see [`crate::state::resource_set_item_failure_reason`]).
 //!
 //! Both sizes a caller controls here are BOUNDED: how many items one call may
 //! carry ([`crate::state::MAX_RESOURCE_SET_ITEMS_PER_CALL`]) and how many

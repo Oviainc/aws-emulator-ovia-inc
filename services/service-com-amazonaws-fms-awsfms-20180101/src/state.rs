@@ -3067,13 +3067,72 @@ fn keywords_name_resource_type(keywords: &[String], declared: &str) -> bool {
             .any(|(_, keyword)| names(&type_keyword(keyword)))
 }
 
+/// The ARN service namespace of a resource type whose owning service publishes a
+/// namespace spelled differently from the SERVICE segment of the type's own
+/// `AWS::<Service>::<Type>` name, so the two cannot be matched by spelling
+/// alone — the service-field twin of [`ARN_RESOURCE_TYPE_KEYWORDS`].
+///
+/// SOURCE: the namespace the owning service publishes as its `arnNamespace`.
+/// Elastic Load Balancing serves BOTH load balancer generations under the one
+/// `elasticloadbalancing` namespace
+/// (`smithy_query(query="service_info")` on either Elastic Load Balancing
+/// model, and the namespace this emulator's own Elastic Load Balancing v2 crate
+/// mints its ARNs under), while the v2 resource type is named
+/// `AWS::ElasticLoadBalancingV2::LoadBalancer`. One entry per type whose two
+/// spellings differ; a type absent from this table is spelled the same way in
+/// both, so nothing needs to be said about it here.
+const ARN_RESOURCE_TYPE_NAMESPACES: &[(&str, &str)] =
+    &[(RESOURCE_TYPE_ELBV2_LOAD_BALANCER, "elasticloadbalancing")];
+
+/// The service a resource type belongs to, as the type's own name states it: the
+/// MIDDLE segment of an `AWS::<Service>::<Type>` name (`EC2` of
+/// `AWS::EC2::Instance`). `None` for a value that is not in that form, which
+/// states no owning service at all.
+fn resource_type_service(declared: &str) -> Option<&str> {
+    let mut segments = declared.split("::");
+    let (_vendor, service, _type) = (segments.next()?, segments.next()?, segments.next()?);
+    (!service.is_empty()).then_some(service)
+}
+
+/// Whether `service` — the SERVICE field of an item's ARN — is the namespace of
+/// the service that owns resources of the type `declared` names, which is a
+/// `Policy$ResourceType` value in the format of the Amazon Web Services Resource
+/// Types Reference (`AWS::<Service>::<Type>`).
+///
+/// A resource type names exactly one owning service, and every ARN of a resource
+/// of that type carries that service's namespace in its third field, so the type
+/// and the service field of an item's ARN are two readings of the SAME fact: the
+/// type's service segment compared the way the two spellings differ
+/// ([`normalized_type_name`] drops the punctuation an ARN namespace writes, so
+/// `network-firewall` names `AWS::NetworkFirewall::Firewall`), plus the table of
+/// namespaces a service publishes differently from its type names
+/// ([`ARN_RESOURCE_TYPE_NAMESPACES`]).
+///
+/// A declared value that states no owning service ([`resource_type_service`])
+/// names no namespace to disagree with, exactly as an ARN field the owning
+/// service leaves empty names no value to disagree with, so it refuses nothing
+/// on the service field.
+fn arn_service_names_resource_type(service: &str, declared: &str) -> bool {
+    let Some(declared_service) = resource_type_service(declared) else {
+        return true;
+    };
+    let names = |candidate: &str| normalized_type_name(candidate) == normalized_type_name(service);
+    names(declared_service)
+        || ARN_RESOURCE_TYPE_NAMESPACES
+            .iter()
+            .filter(|(resource_type, _)| {
+                normalized_type_name(resource_type) == normalized_type_name(declared)
+            })
+            .any(|(_, namespace)| names(namespace))
+}
+
 /// Why `uri` cannot be a member of a resource set that holds `resource_types`
 /// in `region`, or `None` when it can.
 ///
 /// Every reason is a value of the model's `FailedItemReason`
-/// (`crate::ops::types::FAILED_ITEM_REASON_VALUES`), and the checks run in the
-/// order the ARN is built, so an item is reported against the FIRST field that
-/// disagrees:
+/// (`crate::ops::types::FAILED_ITEM_REASON_VALUES`), and the checks run from the
+/// field that places the resource widest to the field that places it narrowest,
+/// so an item is reported against the FIRST field that disagrees:
 ///
 /// * not an ARN at all -> `NOT_VALID_ARN`;
 /// * another partition than the one this emulator's resources live in
@@ -3085,7 +3144,20 @@ fn keywords_name_resource_type(keywords: &[String], declared: &str) -> bool {
 /// * a resource whose type no entry of the set's `ResourceTypeList` names ->
 ///   `NOT_VALID_RESOURCE_TYPE`, because the set's `ResourceTypeList`
 ///   "determines the resources that can be associated to the resource set"
-///   (`ResourceSet$ResourceTypeList`).
+///   (`ResourceSet$ResourceTypeList`);
+/// * a resource whose type the set DOES name, under the namespace of a service
+///   that does not own resources of that type -> `NOT_VALID_SERVICE`.
+///
+/// The last two are ONE reading of the declared types rather than two: a
+/// `ResourceTypeList` entry names both the type and the service that owns
+/// resources of it, and every ARN of such a resource carries that service's
+/// namespace in its service field, so an item is in scope only where ONE
+/// declared type answers for both of its fields
+/// ([`keywords_name_resource_type`], [`arn_service_names_resource_type`]) — an
+/// ARN naming a declared type under another service's namespace names a resource
+/// that service does not hold. The item is reported against the broader
+/// disagreement first: the type, which no declared entry names at all, before
+/// the service field of an item whose type one of them does name.
 ///
 /// An ARN field a service LEAVES EMPTY names no value to disagree with, so it is
 /// no reason to refuse the item: a global service's ARN carries no Region and its
@@ -3096,7 +3168,9 @@ fn keywords_name_resource_type(keywords: &[String], declared: &str) -> bool {
 /// Those are the same readings the discoverable inventory makes
 /// ([`in_region`], [`discovered_resources`]), which is what keeps a resource
 /// reported as "available to be associated with a resource set" one these
-/// operations actually take.
+/// operations actually take: that inventory reads each type from the store of the
+/// service that OWNS it, so every URI it yields carries that service's namespace
+/// and its own declared type.
 ///
 /// `partition` and `accounts` are derived ONCE by the caller, so classifying a
 /// batch does not rebuild them per item. It is one shared classifier so the
@@ -3125,10 +3199,25 @@ pub fn resource_set_item_failure_reason(
     // so classifying one item against a set's `ResourceTypeList` costs its ARN
     // plus that list rather than one times the other.
     let keywords = arn_type_keywords(arn.resource);
-    let in_scope = resource_types
+    // One declared type has to answer for BOTH fields the type decides: the
+    // resource field's keyword and the service field's namespace.
+    let in_scope = resource_types.iter().any(|declared| {
+        keywords_name_resource_type(&keywords, declared)
+            && arn_service_names_resource_type(arn.service, declared)
+    });
+    if in_scope {
+        return None;
+    }
+    // Only a refused item is weighed a second time, to say WHICH of the two the
+    // declared types disagree with it on.
+    let names_a_declared_type = resource_types
         .iter()
         .any(|declared| keywords_name_resource_type(&keywords, declared));
-    (!in_scope).then_some("NOT_VALID_RESOURCE_TYPE")
+    Some(if names_a_declared_type {
+        "NOT_VALID_SERVICE"
+    } else {
+        "NOT_VALID_RESOURCE_TYPE"
+    })
 }
 
 /// Whether `arn` names a resource of `region`: its Region field is `region`, or

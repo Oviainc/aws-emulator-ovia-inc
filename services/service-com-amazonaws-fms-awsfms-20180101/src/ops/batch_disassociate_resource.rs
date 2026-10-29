@@ -40,7 +40,9 @@
 //! disassociated either way: a batch is not all-or-nothing. That classifier
 //! judges an item on the ARN fields it CARRIES, so a resource whose owning
 //! service leaves the Region or the account field empty is no failure here
-//! either.
+//! either, while a URI naming a declared resource type under another service's
+//! ARN namespace is one, since that type names the one service that owns
+//! resources of it.
 //!
 //! How many items one call may carry is BOUNDED
 //! ([`crate::state::MAX_RESOURCE_SET_ITEMS_PER_CALL`]), so the per-call work
