@@ -77,6 +77,8 @@ mod db_subnet_group_in_use_wording;
 mod db_subnet_group_not_found_wording;
 #[path = "all/db_subnet_group_resolution.rs"]
 mod db_subnet_group_resolution;
+#[path = "all/delete_custom_db_engine_version.rs"]
+mod delete_custom_db_engine_version;
 #[path = "all/docdb_query_surface.rs"]
 mod docdb_query_surface;
 #[path = "all/engine_default_cluster_parameters.rs"]

@@ -116,6 +116,48 @@ pub fn reports_engine_media_type(engine: &str) -> bool {
 /// using `CreateCustomDBEngineVersion`" — which is what every record here was.
 pub const MEDIA_TYPE_CUSTOMER_PROVIDED: &str = "Customer Provided";
 
+/// The IAM action `DeleteCustomDBEngineVersion` asks for, written in this service's own
+/// action namespace (`<arn namespace>:<API name>`), which is how a refusal names it.
+const DELETE_ACTION: &str = "rds:DeleteCustomDBEngineVersion";
+
+/// The ARN a CEV is NAMED by when a request over it is authorized: the published resource
+/// form `cev:<engine name>/<engine version name>/<CEV id>`, with the id segment left as a
+/// wildcard because a request carries the engine and the CEV name only — the id belongs to
+/// whichever record of that name exists, which an authorization refusal does not resolve.
+#[must_use]
+pub fn custom_db_engine_version_resource_arn(
+    region: &str,
+    engine: &str,
+    engine_version: &str,
+) -> String {
+    emulator_server::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{ARN_RESOURCE_TYPE}:{engine}/{engine_version}/*"),
+    )
+}
+
+/// How a `DeleteCustomDBEngineVersion` request that names a custom engine version the
+/// account does not hold in the request's region is refused: the principal the caller's
+/// credential speaks for, the action it asked for, and the CEV ARN it asked for.
+///
+/// Every value in it comes from the request and from the account contract, and NOTHING in
+/// it comes from the named version — whether an account could own one of that name, and
+/// whether one exists, are exactly what a denial does not disclose.
+#[must_use]
+pub fn custom_db_engine_version_deletion_denied_message(
+    region: &str,
+    engine: &str,
+    engine_version: &str,
+) -> String {
+    let principal = ::service_common::caller_principal::ambient_user_arn();
+    let resource = custom_db_engine_version_resource_arn(region, engine, engine_version);
+    format!(
+        "User: {principal} is not authorized to perform: {DELETE_ACTION} on resource: \
+         {resource} because no identity-based policy allows the {DELETE_ACTION} action"
+    )
+}
+
 /// The second half of a CEV's store key: one `(Engine, EngineVersion)` pair names one
 /// custom engine version in a region, since the name "is unique per customer per Amazon
 /// Web Services Regions" and two engines can carry the same version name.

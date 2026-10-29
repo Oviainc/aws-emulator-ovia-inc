@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCustomDBEngineVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCustomDBEngineVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation removes a custom DB engine version (CEV) this service holds
+//! from the store and answers with that record projected onto the `DBEngineVersion` shape,
+//! so a later `DescribeDBEngineVersions` no longer reports it. This is the ONLY file to
+//! touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCustomDBEngineVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The request is authorized against the CEV it NAMES before anything about that CEV is
+//! resolved, which is what decides the two refusals:
+//!
+//! * `(Engine, EngineVersion)` that names no CEV the account holds in the region the
+//!   request was signed for is a resource the account cannot act on at all — an AWS-managed
+//!   engine version, a CEV of another region, a name nothing created — and is refused with
+//!   HTTP 403 `AccessDenied`
+//!   ([`crate::state::custom_db_engine_version_deletion_denied_message`]), which discloses
+//!   nothing about the named version: not whether an account could own one of that name,
+//!   and not whether one exists;
+//! * a CEV the account DOES hold is deleted only once its prerequisites hold — it must have
+//!   finished being created ([`crate::state::custom_engine_version_is_modifiable`]) and must
+//!   "not be associated with an RDS Custom DB instance, RDS Custom instance snapshot, or
+//!   automated backup"
+//!   ([`crate::state::ComAmazonawsRdsAmazonrdsv19State::custom_db_engine_version_in_use`]) —
+//!   and is otherwise refused with `InvalidCustomDBEngineVersionStateFault`, with the
+//!   stored record left exactly as it was.
+//!
+//! The answer is the record that was removed, read through the ONE projection
+//! `crate::ops::describe_db_engine_versions::custom_version_to_wire` — the same one the
+//! create answered with and the report listed — so the delete's answer cannot disagree with
+//! the last read of that CEV. The model publishes no "deleting" status for an engine
+//! version, so there is no transient state to report: the record is gone when the delete
+//! answers.
 //!
 //! ## Shape of an operation
 //!
@@ -248,18 +268,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCustomDBEngineVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCustomDBEngineVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCustomDBEngineVersion"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DeleteCustomDBEngineVersionError::validation)?;
+
+        // Engine names are published lowercase and keyed that way everywhere in this
+        // crate, so the request's value is folded once before anything is resolved with it.
+        let engine = input.engine.to_ascii_lowercase();
+        let engine_version = input.engine_version.clone();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated delete.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // A CEV "is unique per customer per Amazon Web Services Regions", so the pair is
+        // resolved in the region this request was signed for and nowhere else.
+        let key = (
+            region.clone(),
+            crate::state::custom_db_engine_version_key(&engine, &engine_version),
+        );
+        // This operation deletes an engine version the ACCOUNT minted. A pair that names
+        // none is a resource the account does not hold, so the action over it is withheld
+        // before it is resolved: the refusal names the principal, the action and the CEV ARN
+        // the request asked for, and nothing about the version itself.
+        let Some(record) = store.custom_db_engine_versions.get(&key) else {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                crate::state::custom_db_engine_version_deletion_denied_message(
+                    &region,
+                    &engine,
+                    &engine_version,
+                ),
+            ));
+        };
+
+        // "Typically, deletion takes a few minutes" — but only of a CEV whose own creation
+        // has finished: one still being created has reached no availability status at all,
+        // so there is nothing to delete yet and the stored record is left as it was.
+        let status = record.status.clone();
+        if !crate::state::custom_engine_version_is_modifiable(&status) {
+            return Err(state_refusal(format!(
+                "Custom engine version {engine_version} for engine {engine} is in status \
+                 {status} and can't be deleted"
+            )));
+        }
+        // "The CEV must not be associated with an RDS Custom DB instance, RDS Custom
+        // instance snapshot, or automated backup of your RDS Custom instance": the
+        // association is the instance's and the snapshot's own engine version, so the guard
+        // reads this service's store rather than trusting the caller.
+        if store.custom_db_engine_version_in_use(&region, &engine, &engine_version) {
+            return Err(state_refusal(format!(
+                "Custom engine version {engine_version} for engine {engine} is in use and \
+                 can't be deleted"
+            )));
+        }
+
+        let Some(record) = store.custom_db_engine_versions.remove(&key) else {
+            // Unreachable: the record was read a few lines above under this one lock.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(format!(
+                "custom engine version {engine_version} for engine {engine} vanished while it \
+                 was being deleted"
+            )));
+        };
+
+        let basis = crate::ops::describe_db_engine_versions::custom_version_basis(
+            &engine,
+            &engine_version,
+        );
+        let certificates = crate::state::supported_ca_certificate_identifiers();
+        // The answer is the record that was removed, projected onto the wire through the
+        // SAME projection `DescribeDBEngineVersions` reported it with. That report's
+        // character-set and time-zone lists are a property of the request that asks for
+        // them, and this request carries none, so none of them is reported here.
+        let version = crate::ops::describe_db_engine_versions::custom_version_to_wire(
+            &record,
+            basis.profile,
+            &DescribeDBEngineVersionsInput::default(),
+            &certificates,
+        );
+        Ok(as_output(version))
+    }
+}
+
+/// This operation's modelled state refusal, carrying `message`.
+///
+/// HTTP 400 with the awsQuery code `InvalidCustomDBEngineVersionStateFault` — "you can't
+/// delete the CEV" — which is what a client branches on to retry once the CEV's
+/// prerequisites hold; the wording says which CEV and why.
+fn state_refusal(message: String) -> DeleteCustomDBEngineVersionError {
+    DeleteCustomDBEngineVersionErrorModeled::InvalidCustomDBEngineVersionStateFault(
+        InvalidCustomDBEngineVersionStateFault {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// Re-seat the shared `DBEngineVersion` projection in THIS operation's output struct.
+///
+/// The model gives `CreateCustomDBEngineVersion`, `DescribeDBEngineVersions` and this
+/// operation the one `DBEngineVersion` shape, and the generator emits a struct per
+/// operation for it. Every member is moved across unchanged — this computes nothing, so the
+/// projection stays the single place a CEV becomes wire members.
+fn as_output(version: CreateCustomDBEngineVersionOutput) -> DeleteCustomDBEngineVersionOutput {
+    DeleteCustomDBEngineVersionOutput {
+        engine: version.engine,
+        major_engine_version: version.major_engine_version,
+        engine_version: version.engine_version,
+        database_installation_files_s3_bucket_name: version
+            .database_installation_files_s3_bucket_name,
+        database_installation_files_s3_prefix: version.database_installation_files_s3_prefix,
+        database_installation_files: version.database_installation_files,
+        custom_db_engine_version_manifest: version.custom_db_engine_version_manifest,
+        db_parameter_group_family: version.db_parameter_group_family,
+        db_engine_description: version.db_engine_description,
+        db_engine_version_arn: version.db_engine_version_arn,
+        db_engine_version_description: version.db_engine_version_description,
+        default_character_set: version.default_character_set,
+        failure_reason: version.failure_reason,
+        image: version.image,
+        db_engine_media_type: version.db_engine_media_type,
+        kms_key_id: version.kms_key_id,
+        create_time: version.create_time,
+        supported_character_sets: version.supported_character_sets,
+        supported_nchar_character_sets: version.supported_nchar_character_sets,
+        valid_upgrade_target: version.valid_upgrade_target,
+        supported_timezones: version.supported_timezones,
+        exportable_log_types: version.exportable_log_types,
+        supports_log_exports_to_cloudwatch_logs: version.supports_log_exports_to_cloudwatch_logs,
+        supports_read_replica: version.supports_read_replica,
+        supported_engine_modes: version.supported_engine_modes,
+        supported_feature_names: version.supported_feature_names,
+        status: version.status,
+        supports_parallel_query: version.supports_parallel_query,
+        supports_global_databases: version.supports_global_databases,
+        tag_list: version.tag_list,
+        supports_babelfish: version.supports_babelfish,
+        supports_limitless_database: version.supports_limitless_database,
+        supports_certificate_rotation_without_restart: version
+            .supports_certificate_rotation_without_restart,
+        supported_ca_certificate_identifiers: version.supported_ca_certificate_identifiers,
+        supports_local_write_forwarding: version.supports_local_write_forwarding,
+        supports_integrations: version.supports_integrations,
+        serverless_v2_features_support: version.serverless_v2_features_support,
     }
 }

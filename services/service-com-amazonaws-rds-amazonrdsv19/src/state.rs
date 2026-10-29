@@ -116,11 +116,12 @@ pub use blue_green::{
     BLUE_GREEN_STATUS_AVAILABLE, BLUE_GREEN_STATUS_DELETING, BLUE_GREEN_STATUS_PROVISIONING,
 };
 pub use custom_engine_versions::{
-    check_custom_engine, custom_db_engine_version_key, custom_engine_version_is_modifiable,
-    is_ami_backed_custom_engine, reports_engine_media_type, CustomDbEngineVersionRecord,
-    CUSTOM_DB_ENGINE_VERSION_QUOTA_PER_REGION, CUSTOM_ENGINE_VERSION_ENGINES,
-    CUSTOM_ENGINE_VERSION_STATUS_AVAILABLE, CUSTOM_ENGINE_VERSION_STATUS_CREATING,
-    MEDIA_TYPE_CUSTOMER_PROVIDED,
+    check_custom_engine, custom_db_engine_version_deletion_denied_message,
+    custom_db_engine_version_key, custom_db_engine_version_resource_arn,
+    custom_engine_version_is_modifiable, is_ami_backed_custom_engine, reports_engine_media_type,
+    CustomDbEngineVersionRecord, CUSTOM_DB_ENGINE_VERSION_QUOTA_PER_REGION,
+    CUSTOM_ENGINE_VERSION_ENGINES, CUSTOM_ENGINE_VERSION_STATUS_AVAILABLE,
+    CUSTOM_ENGINE_VERSION_STATUS_CREATING, MEDIA_TYPE_CUSTOMER_PROVIDED,
 };
 pub use db_proxies::{
     check_target_group_name, default_connection_pool_config, target_to_wire, DbProxyRecord,
