@@ -5,8 +5,11 @@
 //! Every resource group this emulator holds lives in ONE map, [`ComAmazonawsResourcegroupsArdiState::groups`],
 //! so `CreateGroup`, `GetGroup`, `GetGroupConfiguration`, `PutGroupConfiguration`,
 //! `ListGroups`, `GroupResources`,
-//! `UngroupResources`, `ListGroupResources`, `ListGroupingStatuses`, `UpdateGroup` and
-//! `DeleteGroup` all read and write the same records. The map is a
+//! `UngroupResources`, `ListGroupResources`, `ListGroupingStatuses`, `UpdateGroup`,
+//! `SearchResources` and
+//! `DeleteGroup` all read and write the same records. Those records are also the
+//! only resources this service knows of, so `SearchResources` runs a query over the
+//! groups of a region and the memberships recorded in them. The map is a
 //! [`BTreeMap`] keyed by [`GroupKey`] — the region the group was created in and its
 //! name — because this service is REGIONAL: a group belongs to the region whose
 //! endpoint created it, and only that region's callers see it. Within one region
@@ -996,21 +999,14 @@ impl GroupRecord {
     /// The resource types this group's query LIMITS its members to, or `None`
     /// when its query imposes no such limit.
     ///
-    /// A limit exists only when the stored query names the types it admits: a
-    /// group created without a query, one whose query document names no
-    /// resource types at all, and one that names
-    /// [`ALL_SUPPORTED_RESOURCE_TYPES`] all admit any supported type, so they
-    /// carry no limit to judge a request's resource types against.
+    /// A limit exists only when the stored query names the types it admits, which
+    /// is decided by the query itself ([`ResourceQueryRecord::resource_type_limit`]);
+    /// a group created without a query carries no limit either, so it admits any
+    /// supported type.
     pub fn query_resource_type_limit(&self) -> Option<Vec<String>> {
-        let declared = self.query_resource_types();
-        if declared.is_empty()
-            || declared
-                .iter()
-                .any(|declared| declared == ALL_SUPPORTED_RESOURCE_TYPES)
-        {
-            return None;
-        }
-        Some(declared)
+        self.resource_query
+            .as_ref()
+            .and_then(ResourceQueryRecord::resource_type_limit)
     }
 
     /// The modelled `ResourceQuery` for this record, if it was created with one.
@@ -1489,6 +1485,27 @@ impl ResourceQueryRecord {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+
+    /// The resource types this query LIMITS its matches to, or `None` when it
+    /// imposes no such limit.
+    ///
+    /// The ONE place this service decides what a query's
+    /// [`RESOURCE_TYPE_FILTERS_ELEMENT`] limits, so a group's membership listing
+    /// and a search over the recorded resources judge a type the same way: a
+    /// query whose document names no resource type at all, and one that names
+    /// [`ALL_SUPPORTED_RESOURCE_TYPES`], both match any supported type, so
+    /// neither carries a limit to judge a type against.
+    pub fn resource_type_limit(&self) -> Option<Vec<String>> {
+        let declared = self.resource_type_filters();
+        if declared.is_empty()
+            || declared
+                .iter()
+                .any(|declared| declared == ALL_SUPPORTED_RESOURCE_TYPES)
+        {
+            return None;
+        }
+        Some(declared)
     }
 }
 

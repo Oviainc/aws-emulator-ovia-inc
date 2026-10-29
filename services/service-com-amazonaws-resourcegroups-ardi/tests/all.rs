@@ -59,6 +59,8 @@ mod reserved_tag_keys;
 mod resource_arns_rule;
 #[path = "all/resource_group_lifecycle.rs"]
 mod resource_group_lifecycle;
+#[path = "all/search_resources.rs"]
+mod search_resources;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_character_class.rs"]
