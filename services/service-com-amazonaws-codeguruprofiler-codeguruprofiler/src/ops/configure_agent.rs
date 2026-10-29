@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ConfigureAgent
-//! Records that the agent of a profiling group pinged back, and answers with the
-//! orchestration decision stored for that group: `shouldProfile` is the group's
+//! Stores what the agent of a profiling group reports about itself — the profiling
+//! instance it identifies itself as and the metadata it captured — against that
+//! instance's record on the group, records that the agent pinged back, and answers with
+//! the orchestration decision stored for that group: `shouldProfile` is the group's
 //! `agentOrchestrationConfig.profilingEnabled`.
 //!
 //! ## Shape of an operation
@@ -217,11 +219,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
 
-        // This call IS the agent reporting its current state, so it records the ping:
-        // `profilingStatus.latestAgentOrchestratedAt` is "the date and time when the
-        // profiling agent most recently pinged back", which a later
+        // This call IS the agent reporting its current state, so the state it reports is
+        // STORED: the instance it identifies itself as (`fleetInstanceId`) is what the
+        // report is filed under, and the metadata it captured about its compute platform
+        // is the content of that report, so one instance's report is distinguishable from
+        // another's and a further report from the same instance supersedes it. Recording
+        // it also moves `profilingStatus.latestAgentOrchestratedAt` — "the date and time
+        // when the profiling agent most recently pinged back" — which a later
         // DescribeProfilingGroup reads back.
-        group.latest_agent_orchestrated_at = Some(crate::state::now());
+        group.record_agent_report(crate::state::AgentReport {
+            fleet_instance_id: input.fleet_instance_id,
+            metadata: input.metadata.unwrap_or_default(),
+            reported_at: crate::state::now(),
+        });
 
         Ok(ConfigureAgentOutput {
             configuration: AgentConfiguration {

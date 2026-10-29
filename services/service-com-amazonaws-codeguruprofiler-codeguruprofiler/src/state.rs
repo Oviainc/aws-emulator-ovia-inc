@@ -359,6 +359,22 @@ pub const MAX_RETAINED_PROFILE_TOKENS_PER_GROUP: usize = 64;
 /// [`ProfilingGroup::submit_anomaly_feedback`].
 pub const MAX_RETAINED_ANOMALY_FEEDBACK_PER_GROUP: usize = 64;
 
+/// How many agent reports one profiling group retains, one per profiling instance that
+/// has reported to it. Emulator-chosen, like
+/// [`MAX_RETAINED_ANOMALY_FEEDBACK_PER_GROUP`]: the instance a report identifies itself
+/// with is agent-supplied, so an in-memory store must bound how many distinct ones it
+/// accumulates; the group's least recently reporting instance is dropped first by
+/// [`ProfilingGroup::record_agent_report`].
+pub const MAX_RETAINED_AGENT_REPORTS_PER_GROUP: usize = 64;
+
+/// How many reported BYTES one group retains across the agent reports it holds, so a few
+/// large reports are bounded as well as many small ones. Emulator-chosen, for the same
+/// reason as [`MAX_RETAINED_AGENT_REPORTS_PER_GROUP`]: the metadata a report carries is
+/// agent-supplied and the model constrains neither its field count nor its value lengths.
+/// The report just made is always kept even when it alone is larger than this, the way
+/// [`MAX_RETAINED_PROFILE_BYTES_PER_GROUP`] keeps the newest profile.
+pub const MAX_RETAINED_AGENT_REPORT_BYTES_PER_GROUP: usize = 64 * 1024;
+
 /// The hex-digit group lengths a `RevisionId` carries, as the model's `RevisionId`
 /// pattern (`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`) spells them
 /// out: 32 lowercase hex characters in five hyphen-separated groups.
@@ -737,6 +753,52 @@ impl AgentProfile {
     }
 }
 
+/// The state ONE profiling instance reported with its latest `ConfigureAgent` call.
+///
+/// That operation's doc makes reporting as much of it as configuring — "Used by profiler
+/// agents to report their current state and to receive remote configuration updates" — so
+/// what an agent reports about itself is stored against the instance that reported it:
+/// `fleetInstanceId` is "a universally unique identifier (UUID) for a profiling instance"
+/// and `metadata` is "metadata captured about the compute platform the agent is running
+/// on. It includes information about sampling and reporting".
+///
+/// No operation reports a stored report back: the modelled `AgentConfiguration` carries
+/// the service's decision FOR an agent, not the agent's own account of itself, and the
+/// model declares no shape that returns the latter. So this is the record a group holds
+/// about each instance that has reported to it, read through
+/// [`ProfilingGroup::agent_report`] — the same standing as the stored
+/// [`AnomalyFeedback`] a submission leaves behind.
+#[derive(Debug, Clone)]
+pub struct AgentReport {
+    /// The `FleetInstanceId` the report named, or `None` when the agent named none (the
+    /// member is optional). This is the identity the report is filed under, so a later
+    /// report from the same instance supersedes this one.
+    pub fleet_instance_id: Option<String>,
+    /// The `Metadata` the report carried, keyed by the modelled `MetadataField`, and
+    /// empty when the report carried none — a report that names no metadata reports that
+    /// it has none, so it does not inherit what the instance sent before.
+    pub metadata: HashMap<String, String>,
+    /// When this instance reported. The most recent such instant over every instance is
+    /// what the group's `profilingStatus.latestAgentOrchestratedAt` reports.
+    pub reported_at: DateTime,
+}
+
+impl AgentReport {
+    /// How many bytes of reported text this record holds — what
+    /// [`MAX_RETAINED_AGENT_REPORT_BYTES_PER_GROUP`] bounds across a group's reports.
+    fn reported_bytes(&self) -> usize {
+        let metadata: usize = self
+            .metadata
+            .iter()
+            .map(|(field, value)| field.len().saturating_add(value.len()))
+            .sum();
+        self.fleet_instance_id
+            .as_ref()
+            .map_or(0, String::len)
+            .saturating_add(metadata)
+    }
+}
+
 /// One anomaly-notification channel of a profiling group, as
 /// `AddNotificationChannels` stored it.
 ///
@@ -901,6 +963,13 @@ pub struct ProfilingGroup {
     /// the group — the feedback is about an anomaly of THIS group's analysis — so
     /// deleting the group takes it with it and a re-created group starts with none.
     pub anomaly_feedback: VecDeque<AnomalyFeedback>,
+    /// What each profiling instance reported about itself with its latest
+    /// `ConfigureAgent` call, least recently reporting instance FIRST and at most one
+    /// record per instance. Bounded at [`MAX_RETAINED_AGENT_REPORTS_PER_GROUP`] by
+    /// [`ProfilingGroup::record_agent_report`], which is the only writer. It lives ON the
+    /// group — an agent reports to the group it is profiling — so deleting the group takes
+    /// its reports with it and a re-created group starts with none.
+    pub agent_reports: VecDeque<AgentReport>,
 }
 
 impl ProfilingGroup {
@@ -1136,6 +1205,55 @@ impl ProfilingGroup {
         self.anomaly_feedback.push_back(feedback);
         while self.anomaly_feedback.len() > MAX_RETAINED_ANOMALY_FEEDBACK_PER_GROUP {
             self.anomaly_feedback.pop_front();
+        }
+    }
+
+    /// What the profiling instance identified by `fleet_instance_id` reported about itself
+    /// most recently, or `None` when this group holds no report under that identity (or it
+    /// has since been evicted). `None` asks about the reports that identified no instance.
+    pub fn agent_report(&self, fleet_instance_id: Option<&str>) -> Option<&AgentReport> {
+        self.agent_reports
+            .iter()
+            .find(|report| report.fleet_instance_id.as_deref() == fleet_instance_id)
+    }
+
+    /// Record what one profiling instance reports about itself, and the instant it
+    /// reported — the state half of a `ConfigureAgent` call.
+    ///
+    /// A report states the instance's CURRENT state, so a further report from the same
+    /// instance REPLACES the record held for it rather than accumulating beside it, and
+    /// becomes this group's most recent report; a report that identifies no instance is
+    /// one such identity of its own. `latestAgentOrchestratedAt` — "the date and time when
+    /// the profiling agent most recently pinged back" — is the instant of the most recent
+    /// report from any instance, so it moves with every report. The only writer, so the
+    /// group never holds two records for one instance, nor more than
+    /// [`MAX_RETAINED_AGENT_REPORTS_PER_GROUP`] of them or
+    /// [`MAX_RETAINED_AGENT_REPORT_BYTES_PER_GROUP`] of reported text: once past either
+    /// bound the least recently reporting instance is dropped first, never the report just
+    /// made.
+    pub fn record_agent_report(&mut self, report: AgentReport) {
+        if let Some(at) = self
+            .agent_reports
+            .iter()
+            .position(|stored| stored.fleet_instance_id == report.fleet_instance_id)
+        {
+            self.agent_reports.remove(at);
+        }
+        self.latest_agent_orchestrated_at = Some(report.reported_at);
+        self.agent_reports.push_back(report);
+        let mut retained_bytes: usize = self
+            .agent_reports
+            .iter()
+            .map(AgentReport::reported_bytes)
+            .sum();
+        while self.agent_reports.len() > 1
+            && (self.agent_reports.len() > MAX_RETAINED_AGENT_REPORTS_PER_GROUP
+                || retained_bytes > MAX_RETAINED_AGENT_REPORT_BYTES_PER_GROUP)
+        {
+            match self.agent_reports.pop_front() {
+                Some(evicted) => retained_bytes -= evicted.reported_bytes(),
+                None => break,
+            }
         }
     }
 

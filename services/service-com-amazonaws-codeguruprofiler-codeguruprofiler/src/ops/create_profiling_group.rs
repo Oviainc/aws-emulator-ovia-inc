@@ -272,6 +272,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nobody has given feedback about an anomaly of a group that is only now
             // coming into existence: `SubmitFeedback` is what files the first one.
             anomaly_feedback: ::std::collections::VecDeque::new(),
+            // No agent has reported to a group that is only now coming into existence:
+            // `ConfigureAgent` is what records the first report.
+            agent_reports: ::std::collections::VecDeque::new(),
         };
         let description = group.created_description(created_at);
         guard
