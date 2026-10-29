@@ -1078,6 +1078,30 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
         Some(true)
     }
 
+    /// Turn around the removal still in flight for `admin_account_id`, the
+    /// delegated administrator `region`'s endpoint holds, through
+    /// [`OrganizationAdminAccountRecord::cancel_disable`].
+    ///
+    /// `true` when a pending removal was turned around, `false` when that
+    /// endpoint holds no administrator, holds a DIFFERENT one — a designation of
+    /// another account is a second administrator rather than a reversal, so this
+    /// never replaces the account the record holds — or holds this one with no
+    /// removal pending, in which case nothing was owed and nothing changed,
+    /// exactly as a repeated request leaves [`EntitySetRecord::set_activation`]
+    /// where it is. The account is checked HERE, where the record is reached, so
+    /// the reversal cannot be applied to a record the request does not name.
+    pub fn redesignate_organization_admin_account(
+        &mut self,
+        region: &str,
+        admin_account_id: &str,
+    ) -> bool {
+        self.organization_admin_accounts
+            .get_mut(region)
+            .is_some_and(|record| {
+                record.admin_account_id == admin_account_id && record.cancel_disable()
+            })
+    }
+
     /// Materialise the removal the CLOCK already owes every delegated
     /// administrator whose disable has fallen due.
     ///
@@ -8402,6 +8426,21 @@ impl OrganizationAdminAccountRecord {
         if self.disable_due_millis.is_none() {
             self.disable_due_millis = Some(now.saturating_add(ADMIN_DISABLE_SPAN_MILLIS));
         }
+    }
+
+    /// Turn around a removal still in flight: the record keeps the account it
+    /// holds, reports [`ENABLED`] again and the clock owes nothing. `true` when a
+    /// removal was pending, `false` when there was nothing to turn around.
+    ///
+    /// The other half of the rule [`EntitySetRecord::set_activation`] and
+    /// [`ThreatIntelSetRecord::set_activation`] implement: asking a transitional
+    /// record for the status it has already settled on, or is already
+    /// transitioning to, owes nothing and answers `false`, while asking for the
+    /// status it is transitioning AWAY from replaces whatever was owed, so a
+    /// request that reverses a transition still running turns it around instead of
+    /// being refused or queueing behind it.
+    pub fn cancel_disable(&mut self) -> bool {
+        self.disable_due_millis.take().is_some()
     }
 }
 

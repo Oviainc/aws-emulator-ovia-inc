@@ -4,8 +4,9 @@
 //!
 //! Designates one account as the GuardDuty delegated administrator the Region the
 //! request was signed for serves, and persists that designation. A Region holds at
-//! most one, so designating the account it already holds changes nothing and
-//! designating another is refused until the current one is removed.
+//! most one, so designating the account it already holds changes nothing — beyond
+//! turning around a removal of that account still in flight — and designating
+//! another is refused until the current one is removed.
 //!
 //! ## Shape of an operation
 //!
@@ -160,12 +161,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_organization_admin_accounts();
 
         if let Some(current) = state.organization_admin_account_in(&region) {
-            // Designating the account the Region already holds is the same
-            // designation: it answers success and changes nothing, so a retried
-            // call is not a second designation.
-            if current.admin_account_id == input.admin_account_id
-                && current.disable_due_millis.is_none()
-            {
+            let holds_this_account = current.admin_account_id == input.admin_account_id;
+            if holds_this_account {
+                // Designating the account the Region already holds is the same
+                // designation: it answers success and changes nothing, so a
+                // retried call is not a second designation. When a removal of
+                // that same account is still in flight the designation reverses
+                // it — the transition is turned around rather than refused or
+                // queued behind it, so the account the Region holds is reported
+                // enabled again.
+                state.redesignate_organization_admin_account(&region, &input.admin_account_id);
                 return Ok(EnableOrganizationAdminAccountOutput {});
             }
             // Anything else would be a SECOND administrator for one organization,
