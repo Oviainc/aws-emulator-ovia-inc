@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The buckets the rules-per-security-group quota is counted in — one per group, direction
+// and address family — and what a filled bucket refuses. Declared beside `prefix_lists` for
+// the reason the note above gives: the sorted neighbourhood and the tail of this file are
+// where every new ec2 suite inserts its lines.
+#[path = "all/security_group_rule_quota_buckets.rs"]
+mod security_group_rule_quota_buckets;
 // What `AcceptReservedInstancesExchangeQuote` exchanges: which Convertible Reserved Instances
 // it retires, the purchases of the target offerings it mints in their place, and what it
 // refuses. Declared beside `prefix_lists` for the reason the note above gives: the sorted

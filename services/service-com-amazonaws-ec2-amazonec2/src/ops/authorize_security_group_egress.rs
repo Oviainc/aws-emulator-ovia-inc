@@ -253,12 +253,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // How many rules the request asks for is how many destinations it names, and that is
         // bounded HERE, before any work proportional to it: "inbound or outbound rules per
-        // security group" is a published quota per side, so a request that would take the
-        // group past it is refused before a rule is stored for any of them. Asked about
+        // security group" is a published quota per side, counted separately for each address
+        // family of that side, so a request that would take any one of those buckets past it
+        // is refused before a rule is stored for any of them. Asked about
         // every rule of the request at once, so the writer below cannot refuse one of them
         // after its predecessors were stored.
-        let requested: usize = prepared.iter().map(state::ip_permission_grant_count).sum();
-        if !store.has_security_group_rule_capacity(&group_id, IS_EGRESS, requested) {
+        let demand = store.security_group_rule_demand(&prepared);
+        let requested: usize = demand.records();
+        if !store.has_security_group_rule_capacity(&group_id, IS_EGRESS, demand) {
             return Err(state::rules_per_security_group_limit_exceeded());
         }
 

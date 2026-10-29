@@ -4917,7 +4917,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// writer has to remember to keep the two views in step.
     ///
     /// ALL OR NOTHING, and BOUNDED: the whole permission is weighed against the published
-    /// per-direction quota ([`MAX_SECURITY_GROUP_RULES_PER_DIRECTION`]) and this store's
+    /// quota ([`MAX_SECURITY_GROUP_RULES_PER_DIRECTION`], in each bucket of the direction
+    /// the quota is counted in) and this store's
     /// ceiling ([`MAX_SECURITY_GROUP_RULES`]) ONCE, before anything is stored, so a
     /// permission that does not fit stores NOTHING and answers with no ids rather than
     /// leaving a group half of what the request asked for — and however many grants a
@@ -4938,9 +4939,10 @@ impl ComAmazonawsEc2Amazonec2State {
     ) -> Vec<String> {
         // One rule per grant the permission names, so the whole batch is what the quota is
         // weighed against — counted once here rather than per grant, which also keeps the
-        // count off the per-rule path.
-        let grants = ip_permission_grant_count(permission);
-        if !self.has_security_group_rule_capacity(group_id, is_egress, grants) {
+        // count off the per-rule path, and in the BUCKETS the quota is counted in, so a
+        // grant of one address family is not weighed against another family's rules.
+        let demand = self.security_group_rule_demand(::std::slice::from_ref(permission));
+        if !self.has_security_group_rule_capacity(group_id, is_egress, demand) {
             return Vec::new();
         }
         let mut minted: Vec<String> = Vec::new();
@@ -5022,6 +5024,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// How many rules `group_id` holds in one direction — inbound when `is_egress` is
     /// false, outbound when it is true. The two directions are counted apart because the
     /// quota is published per direction.
+    ///
+    /// The whole side, whatever address family each of its rules grants; what the QUOTA is
+    /// weighed against is one family's bucket of that side
+    /// ([`Self::security_group_rule_family_count`]).
     pub fn security_group_rule_count(&self, group_id: &str, is_egress: bool) -> usize {
         self.security_group_rules
             .values()
@@ -5032,9 +5038,105 @@ impl ComAmazonawsEc2Amazonec2State {
             .count()
     }
 
-    /// Whether `additional` more rules fit on `group_id` in one direction: inside the
-    /// published per-direction quota ([`MAX_SECURITY_GROUP_RULES_PER_DIRECTION`]) and inside
-    /// this store's ceiling ([`MAX_SECURITY_GROUP_RULES`]).
+    /// Which of a side's quota buckets one stored rule is counted in: the bucket of the
+    /// address family it grants, and EVERY bucket where its grant names no address family.
+    ///
+    /// A rule grants one source, "a CIDR range, security group, or prefix list"
+    /// (`RevokeSecurityGroupIngress`). A CIDR grant is of one family, so it is counted in
+    /// that family's bucket alone; a prefix list grants the family the list was created for
+    /// (`ManagedPrefixList$AddressFamily`); and a grant naming a security group carries no
+    /// family at all — it admits that group's traffic of either family — so it is counted in
+    /// each. A prefix list this store holds no record of is read the same way as that last
+    /// case, because which family it grants is not knowable here.
+    pub fn security_group_rule_charges_family(
+        &self,
+        rule: &SecurityGroupRule,
+        family: AddressFamily,
+    ) -> bool {
+        if rule.cidr_ipv4.is_some() {
+            return family == AddressFamily::Ipv4;
+        }
+        if rule.cidr_ipv6.is_some() {
+            return family == AddressFamily::Ipv6;
+        }
+        if let Some(prefix_list_id) = rule.prefix_list_id.as_deref() {
+            return self
+                .prefix_list_address_family(prefix_list_id)
+                .is_none_or(|list_family| list_family == family);
+        }
+        true
+    }
+
+    /// The address family the managed prefix list `prefix_list_id` names grants, or `None`
+    /// when this store holds no such list — an AWS-managed list of a Region, or one of
+    /// another account, is not a record here.
+    fn prefix_list_address_family(&self, prefix_list_id: &str) -> Option<AddressFamily> {
+        let record = self.managed_prefix_lists.get(prefix_list_id)?;
+        match record.view.address_family.as_deref()? {
+            PREFIX_LIST_ADDRESS_FAMILY_IPV4 => Some(AddressFamily::Ipv4),
+            PREFIX_LIST_ADDRESS_FAMILY_IPV6 => Some(AddressFamily::Ipv6),
+            _ => None,
+        }
+    }
+
+    /// How many rules `group_id` holds in one direction that are counted in `family`'s
+    /// bucket of it — the count the published quota is weighed against.
+    pub fn security_group_rule_family_count(
+        &self,
+        group_id: &str,
+        is_egress: bool,
+        family: AddressFamily,
+    ) -> usize {
+        self.security_group_rules
+            .values()
+            .filter(|record| {
+                record.rule.group_id.as_deref() == Some(group_id)
+                    && record.rule.is_egress.unwrap_or(false) == is_egress
+                    && self.security_group_rule_charges_family(&record.rule, family)
+            })
+            .count()
+    }
+
+    /// What the rules `permissions` grant would ask of a group's quota buckets, counted the
+    /// way a stored rule is counted ([`Self::security_group_rule_charges_family`]).
+    ///
+    /// The ONE reading of a request's demand, so the question a writer asks
+    /// ([`Self::has_security_group_rule_capacity`]) cannot weigh a permission differently
+    /// from the rules [`Self::insert_security_group_rules`] then stores for it.
+    pub fn security_group_rule_demand(
+        &self,
+        permissions: &[IpPermission],
+    ) -> SecurityGroupRuleDemand {
+        let mut demand = SecurityGroupRuleDemand::default();
+        for permission in permissions {
+            demand.charge(
+                Some(AddressFamily::Ipv4),
+                permission.ip_ranges.iter().flatten().count(),
+            );
+            demand.charge(
+                Some(AddressFamily::Ipv6),
+                permission.ipv6_ranges.iter().flatten().count(),
+            );
+            for entry in permission.prefix_list_ids.iter().flatten() {
+                let family = entry
+                    .prefix_list_id
+                    .as_deref()
+                    .and_then(|prefix_list_id| self.prefix_list_address_family(prefix_list_id));
+                demand.charge(family, 1);
+            }
+            demand.charge(None, permission.user_id_group_pairs.iter().flatten().count());
+        }
+        demand
+    }
+
+    /// Whether the rules `demand` describes fit on `group_id` in one direction: every
+    /// address family's bucket of that direction inside the published quota
+    /// ([`MAX_SECURITY_GROUP_RULES_PER_DIRECTION`]), and the store inside its own ceiling
+    /// ([`MAX_SECURITY_GROUP_RULES`]).
+    ///
+    /// The quota is counted PER BUCKET — one per group, direction and address family — so a
+    /// side whose IPv4 rules have reached it still takes a rule of the other family, and
+    /// neither side's rules are weighed against the other's.
     ///
     /// The same contract as [`Self::has_security_group_capacity`]: a writer asks this
     /// BEFORE storing anything and refuses the whole request with
@@ -5044,12 +5146,19 @@ impl ComAmazonawsEc2Amazonec2State {
         &self,
         group_id: &str,
         is_egress: bool,
-        additional: usize,
+        demand: SecurityGroupRuleDemand,
     ) -> bool {
-        self.security_group_rule_count(group_id, is_egress)
-            .saturating_add(additional)
-            <= MAX_SECURITY_GROUP_RULES_PER_DIRECTION
-            && self.security_group_rules.len().saturating_add(additional) <= MAX_SECURITY_GROUP_RULES
+        for family in SECURITY_GROUP_RULE_FAMILIES {
+            let held = self.security_group_rule_family_count(group_id, is_egress, family);
+            if held.saturating_add(demand.in_bucket(family)) > MAX_SECURITY_GROUP_RULES_PER_DIRECTION
+            {
+                return false;
+            }
+        }
+        self.security_group_rules
+            .len()
+            .saturating_add(demand.records())
+            <= MAX_SECURITY_GROUP_RULES
     }
 
     /// Recompute the aggregate `IpPermissions` and `IpPermissionsEgress` of `group_id` from
@@ -5861,6 +5970,59 @@ pub struct SecurityGroupRuleRecord {
     /// record so [`ComAmazonawsEc2Amazonec2State::remove_security_group`] gives back exactly
     /// what the insert took, the way [`LaunchTemplateRecord::payload_bytes`] does.
     pub payload_bytes: usize,
+}
+
+/// What the rules of a request would ask of a group's quota buckets in ONE direction.
+///
+/// The rules-per-security-group quota is counted per bucket — one per group, direction and
+/// address family — so a demand is not a single number: a request naming IPv4 and IPv6
+/// grants asks of two buckets at once, and a grant that names no address family asks of
+/// every bucket. The record count is held beside them because a rule counted in two buckets
+/// is still ONE stored record, which is what the store's own ceiling
+/// ([`MAX_SECURITY_GROUP_RULES`]) is weighed in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SecurityGroupRuleDemand {
+    /// How many rules would be stored, each counted once however many buckets it falls in.
+    records: usize,
+    /// How many of them fall in the IPv4 bucket of the direction.
+    ipv4: usize,
+    /// How many of them fall in the IPv6 bucket of the direction.
+    ipv6: usize,
+}
+
+impl SecurityGroupRuleDemand {
+    /// Count `rules` more rules whose grant is of `family` — or of no address family, when
+    /// it is `None`, which is a rule counted in EVERY bucket.
+    pub fn charge(&mut self, family: Option<AddressFamily>, rules: usize) {
+        self.records = self.records.saturating_add(rules);
+        if family.is_none_or(|family| family == AddressFamily::Ipv4) {
+            self.ipv4 = self.ipv4.saturating_add(rules);
+        }
+        if family.is_none_or(|family| family == AddressFamily::Ipv6) {
+            self.ipv6 = self.ipv6.saturating_add(rules);
+        }
+    }
+
+    /// The demand of `rules` rules that each grant one range of `family` — what a caller
+    /// that counts in one family alone asks with.
+    pub fn in_family(family: AddressFamily, rules: usize) -> Self {
+        let mut demand = Self::default();
+        demand.charge(Some(family), rules);
+        demand
+    }
+
+    /// How many of these rules fall in `family`'s bucket of the direction.
+    pub fn in_bucket(self, family: AddressFamily) -> usize {
+        match family {
+            AddressFamily::Ipv4 => self.ipv4,
+            AddressFamily::Ipv6 => self.ipv6,
+        }
+    }
+
+    /// How many records the store would hold for these rules.
+    pub fn records(self) -> usize {
+        self.records
+    }
 }
 
 /// How many rules one [`IpPermission`] grants: one per value it names, since "If you
@@ -17207,25 +17369,36 @@ pub const SECURITY_GROUP_ID_PREFIX: &str = "sg-";
 /// writer asks first; a create past it refuses with [`SECURITY_GROUP_LIMIT_EXCEEDED`].
 pub const MAX_SECURITY_GROUPS: usize = 2_500;
 
-/// How many rules one security group may hold in ONE direction.
+/// How many rules one security group may hold in ONE direction, per IP address family.
 ///
 /// A published AWS quota, not a capacity bound invented here: "Inbound or outbound rules
-/// per security group: 60" (Amazon VPC quotas, "Security groups"). The two directions are
-/// counted apart because the quota is published per direction, which is also why
-/// [`ComAmazonawsEc2Amazonec2State::has_security_group_rule_capacity`] takes one.
+/// per security group: 60" (Amazon VPC quotas, "Security groups"), the same value this
+/// emulator's Service Quotas surface publishes for the `vpc` quota of that name, so the two
+/// surfaces agree on what a caller may add. The quota is counted per direction AND per
+/// address family — the published quota applies to a group's IPv4 rules and to its IPv6
+/// rules separately — which together are the buckets
+/// [`ComAmazonawsEc2Amazonec2State::has_security_group_rule_capacity`] weighs a request
+/// against.
 pub const MAX_SECURITY_GROUP_RULES_PER_DIRECTION: usize = 60;
+
+/// The IP address families a group's rules are counted in separately, one bucket of a
+/// direction each.
+pub const SECURITY_GROUP_RULE_FAMILIES: [AddressFamily; 2] =
+    [AddressFamily::Ipv4, AddressFamily::Ipv6];
 
 /// The largest number of security group rules this in-memory store holds.
 ///
-/// Derived rather than chosen: the published per-direction quota, in both directions, for
-/// every group the store can hold ([`MAX_SECURITY_GROUPS`]). A ceiling is needed for the
-/// reason [`MAX_STORED_INSTANCES`] gives — nothing reclaims a stored rule except the delete
-/// of its group — and a per-group quota alone would not bound a store that can hold many
-/// groups. The bytes each rule retains are charged against [`MAX_STORED_BYTES`] as well
-/// ([`security_group_rule_payload_bytes`]), because a record count alone is not a memory
-/// bound.
-pub const MAX_SECURITY_GROUP_RULES: usize =
-    MAX_SECURITY_GROUPS * 2 * MAX_SECURITY_GROUP_RULES_PER_DIRECTION;
+/// Derived rather than chosen: the published per-direction quota, in each address family of
+/// both directions, for every group the store can hold ([`MAX_SECURITY_GROUPS`]). A ceiling
+/// is needed for the reason [`MAX_STORED_INSTANCES`] gives — nothing reclaims a stored rule
+/// except the delete of its group — and a per-group quota alone would not bound a store that
+/// can hold many groups. The bytes each rule retains are charged against
+/// [`MAX_STORED_BYTES`] as well ([`security_group_rule_payload_bytes`]), because a record
+/// count alone is not a memory bound.
+pub const MAX_SECURITY_GROUP_RULES: usize = MAX_SECURITY_GROUPS
+    * 2
+    * SECURITY_GROUP_RULE_FAMILIES.len()
+    * MAX_SECURITY_GROUP_RULES_PER_DIRECTION;
 
 /// EC2's error code for an authorize that would take a security group past its
 /// per-direction rule quota (EC2 API error codes, "RulesPerSecurityGroupLimitExceeded").

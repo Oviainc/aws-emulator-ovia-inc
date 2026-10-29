@@ -1124,20 +1124,34 @@ async fn a_group_holds_at_most_the_published_rules_per_direction() {
             expected,
             "case {case:?}: expected the store to hold {expected} inbound rules"
         );
-        // Capacity is what is left under the ceiling in THIS direction.
+        // Capacity is what is left under the ceiling in THIS direction, in the bucket of the
+        // address family the rules under test grant.
         let left = ceiling - expected;
+        let ipv4 = ec2::state::AddressFamily::Ipv4;
         assert!(
-            guard.has_security_group_rule_capacity(&group_id, false, left),
+            guard.has_security_group_rule_capacity(
+                &group_id,
+                false,
+                ec2::state::SecurityGroupRuleDemand::in_family(ipv4, left)
+            ),
             "case {case:?}: expected room for the {left} rules still under the ceiling"
         );
         assert!(
-            !guard.has_security_group_rule_capacity(&group_id, false, left + 1),
+            !guard.has_security_group_rule_capacity(
+                &group_id,
+                false,
+                ec2::state::SecurityGroupRuleDemand::in_family(ipv4, left + 1)
+            ),
             "case {case:?}: expected no room for one rule more than the ceiling"
         );
         // The other direction is counted apart, because the quota is published per
         // direction.
         assert!(
-            guard.has_security_group_rule_capacity(&group_id, true, ceiling),
+            guard.has_security_group_rule_capacity(
+                &group_id,
+                true,
+                ec2::state::SecurityGroupRuleDemand::in_family(ipv4, ceiling)
+            ),
             "case {case:?}: expected the outbound direction to still hold {ceiling} rules"
         );
         assert_eq!(
