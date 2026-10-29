@@ -7,7 +7,9 @@
 //! namespace, is refused with `InvalidParameterValueException` (400) before
 //! anything is removed (`state::tag_keys_violation`), a `ruleRevision` other
 //! than the rule's current one is refused the same way, and an ARN no rule has
-//! is `ResourceNotFoundException` (404).
+//! is `ResourceNotFoundException` (404). A removal that changes the rule's tag
+//! list stamps the rule's `lastUpdatedTimestamp`, while leaving `ruleRevision`
+//! where it is.
 //!
 //! ## Shape of an operation
 //!
@@ -246,14 +248,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // The clock is read AFTER the store lock is taken, so the rule is
+        // stamped with the instant the store actually applied the removal.
+        let removed_at = crate::state::now();
         let Some(rule) = guard.rules.get_mut(&input.resource_arn) else {
             return Err(not_found(&input.resource_arn));
         };
         // Remove exactly the keys named; a key the rule does not carry leaves
         // the rule as it is, so the same request may be repeated (the operation
         // is modelled `@idempotent`). For the same reason the removal does not
-        // advance `ruleRevision`: a repeat would then fail the check above.
-        rule.tags.retain(|tag| !input.tag_keys.contains(&tag.key));
+        // advance `ruleRevision`: a repeat would then fail the check above. The
+        // removal IS an update of the rule, so the write goes through
+        // [`crate::state::StoredRule::set_tags`], which stamps
+        // `lastUpdatedTimestamp` whenever it changes the stored list.
+        let retained: Vec<Tag> = rule
+            .tags
+            .iter()
+            .filter(|tag| !input.tag_keys.contains(&tag.key))
+            .cloned()
+            .collect();
+        rule.set_tags(retained, removed_at);
 
         guard.record_token(
             client_token,

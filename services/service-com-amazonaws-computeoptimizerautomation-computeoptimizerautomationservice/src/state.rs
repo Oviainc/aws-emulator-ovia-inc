@@ -1038,6 +1038,31 @@ pub struct StoredRule {
 }
 
 impl StoredRule {
+    /// Replace this rule's tag list with `tags`, stamping
+    /// [`Self::last_updated_timestamp`] with `at` when that write actually
+    /// changes the rule.
+    ///
+    /// The ONE path by which a tagging operation writes a stored rule, so both
+    /// of them record when the rule changed — which is what the member every
+    /// reader answers with means, "when the automation rule was last updated"
+    /// (`smithy_query(query="doc",shape="AutomationRule",member="lastUpdatedTimestamp")`).
+    /// A request that leaves the list exactly as it stood updated nothing —
+    /// re-adding the tags the rule already carries, removing a key it does not
+    /// carry — so it moves no timestamp, the same way an opt-out stamps only the
+    /// rules whose status it changes.
+    pub fn set_tags(&mut self, tags: Vec<Tag>, at: ::aws_smithy_types::DateTime) {
+        let unchanged = tags.len() == self.tags.len()
+            && tags
+                .iter()
+                .zip(&self.tags)
+                .all(|(new, stored)| new.key == stored.key && new.value == stored.value);
+        if unchanged {
+            return;
+        }
+        self.tags = tags;
+        self.last_updated_timestamp = at;
+    }
+
     /// This rule as the `AutomationRule` summary `ListAutomationRules` returns.
     /// The summary shape carries neither `criteria` nor `tags` — the model does
     /// not declare them on it — so those are reachable only through

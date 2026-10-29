@@ -12,7 +12,8 @@
 //! would leave the rule holding more than `state::MAX_TAGS_PER_RESOURCE` tags;
 //! an ARN no rule has is `ResourceNotFoundException` (404). Tagging is not a
 //! rule revision, so the same request may be repeated — the operation is
-//! modelled `@idempotent`.
+//! modelled `@idempotent` — but an addition that changes the rule's tag list
+//! stamps the rule's `lastUpdatedTimestamp`.
 //!
 //! ## Shape of an operation
 //!
@@ -264,13 +265,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(crate::state::tag_limit_exceeded_message()));
         }
 
+        // The clock is read AFTER the store lock is taken, so the rule is
+        // stamped with the instant the store actually applied the addition.
+        let stored_at = crate::state::now();
         let Some(rule) = guard.rules.get_mut(&input.resource_arn) else {
             return Err(not_found(&input.resource_arn));
         };
         // The addition does not advance `ruleRevision`: a repeat of the same
         // request would then fail the revision check above, and the operation is
-        // modelled `@idempotent`.
-        rule.tags = merged;
+        // modelled `@idempotent`. It IS an update of the rule, so the write goes
+        // through [`crate::state::StoredRule::set_tags`], which stamps
+        // `lastUpdatedTimestamp` whenever it changes the stored list.
+        rule.set_tags(merged, stored_at);
 
         guard.record_token(
             client_token,

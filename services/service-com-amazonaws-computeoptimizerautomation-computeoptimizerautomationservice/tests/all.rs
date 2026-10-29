@@ -99,3 +99,5 @@ mod shared_page_walk;
 mod state_roundtrip;
 #[path = "all/store_lock_clock_reads.rs"]
 mod store_lock_clock_reads;
+#[path = "all/tag_write_timestamps.rs"]
+mod tag_write_timestamps;
