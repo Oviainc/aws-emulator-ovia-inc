@@ -185,9 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         probe.client_token = None;
         let request_fingerprint = crate::state::fingerprint(&probe);
         let client_token = input.client_token.as_deref();
-        let now = ::std::time::SystemTime::now();
 
         let mut guard = state.lock();
+        // The clock is read AFTER the store lock is taken, so this one instant is
+        // the instant this handler observes and writes the store at: eligibility
+        // is judged on the status the event has then, and what this call stores
+        // is stamped with the time the store actually took it. A clock read taken
+        // before the lock is a different, earlier instant — it says nothing about
+        // the store this handler is about to read and write.
+        let now = ::std::time::SystemTime::now();
 
         // The service-wide enrollment gate, AHEAD of the token ledger and of
         // the event lookup: an account that is not opted in may not roll back

@@ -91,3 +91,5 @@ mod schedule_expression_forms;
 mod shared_page_walk;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/store_lock_clock_reads.rs"]
+mod store_lock_clock_reads;

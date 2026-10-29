@@ -74,6 +74,16 @@ pub(crate) fn enroll_caller(engine: &Arc<engine::InMemoryEngine>) {
     );
 }
 
+/// Put `event` in the store the mounted service reads from.
+///
+/// A test PRECONDITION for the suites about an automation event in a status this
+/// emulator's own runs do not produce, or mid-run: one copy here rather than one
+/// per suite.
+pub(crate) fn seed_event(engine: &Arc<engine::InMemoryEngine>, event: &state::StoredEvent) {
+    let service_state = state::service_state(&**engine).expect("the service state is reachable");
+    service_state.lock().events.insert(event.clone());
+}
+
 /// Call one operation and return `(http status, parsed body)`.
 ///
 /// `pub(crate)` because the other suites in this crate drive the service the same

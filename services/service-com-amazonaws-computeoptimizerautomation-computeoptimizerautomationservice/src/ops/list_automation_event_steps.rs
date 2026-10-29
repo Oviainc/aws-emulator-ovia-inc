@@ -203,13 +203,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // zero page: `crate::state::page_size`.
         let page_size = crate::state::page_size(input.max_results);
 
+        let mut guard = state.lock();
+        // The clock is read AFTER the store lock is taken, so the instant this
+        // call judges the event's reachability and materialises its transition
+        // at is the instant it observes the store at.
         let now = ::std::time::SystemTime::now();
         // "You can only list steps for events created within the past year": an
         // event created before that floor is out of this operation's reach, so
         // it is as absent as one the store never held.
         let window_start = crate::state::effective_window_start(None, now);
-
-        let mut guard = state.lock();
         // The service-wide enrollment gate, AHEAD of the event lookup: an
         // account that is not opted in is refused the whole call, so it is never
         // told "no such event" when what it has to do is enroll. See

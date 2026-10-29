@@ -33,8 +33,8 @@ use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomations
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::automation_rule_lifecycle::{
-    assert_refused, call, call_ok, emulator_with_engine, enroll_caller, member, string_member,
-    unenrolled_emulator_with_engine,
+    assert_refused, call, call_ok, emulator_with_engine, enroll_caller, member, seed_event,
+    string_member, unenrolled_emulator_with_engine,
 };
 
 /// One recommended action, as Compute Optimizer's analysis would have produced
@@ -104,12 +104,6 @@ fn stored_event(index: usize, event_status: &str) -> StoredEvent {
         // no transition.
         pending: None,
     }
-}
-
-/// Put `event` in the store the mounted service reads from.
-fn seed_event(engine: &Arc<engine::InMemoryEngine>, event: &StoredEvent) {
-    let service_state = state::service_state(&**engine).expect("the service state is reachable");
-    service_state.lock().events.insert(event.clone());
 }
 
 /// `RollbackAutomationEvent` for `event_id`, with an optional client token.

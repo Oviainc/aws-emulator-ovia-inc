@@ -288,13 +288,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // non-advancing zero page: `crate::state::page_size`.
         let page_size = crate::state::page_size(input.max_results);
 
+        let mut guard = state.lock();
+        // The clock is read AFTER the store lock is taken, so the one instant
+        // this call summarises at is the instant it observes the store at: the
+        // window it selects on, the statuses it groups by and the open end it
+        // reports all come from the same clock read.
         let now = ::std::time::SystemTime::now();
         // Only events created inside the retrieval window are reachable, so the
         // window this call summarises over starts at the later of the caller's
         // `startDateInclusive` and that floor.
         let window_start = crate::state::effective_window_start(start_date, now);
-
-        let mut guard = state.lock();
         // The service-wide enrollment gate, AHEAD of filter evaluation: an
         // account that is not opted in is refused the whole call rather than
         // handed an (empty) summary that reads as a healthy, idle account. See

@@ -27,7 +27,7 @@ use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomations
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::automation_rule_lifecycle::{
-    assert_refused, call, call_ok, emulator_with_engine, member, string_member,
+    assert_refused, call, call_ok, emulator_with_engine, member, seed_event, string_member,
 };
 
 // ---------------------------------------------------------------------------
@@ -74,12 +74,6 @@ fn seed_action(engine: &Arc<engine::InMemoryEngine>, action: &RecommendedAction)
         .lock()
         .recommended_actions
         .insert(id, action.clone());
-}
-
-/// Put `event` in the store the mounted service reads from.
-fn seed_event(engine: &Arc<engine::InMemoryEngine>, event: &StoredEvent) {
-    let service_state = state::service_state(&**engine).expect("the service state is reachable");
-    service_state.lock().events.insert(event.clone());
 }
 
 /// One stored step, already terminal, so a seeded event owes the clock nothing.

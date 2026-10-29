@@ -229,15 +229,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // zero page: `crate::state::page_size`.
         let page_size = crate::state::page_size(input.max_results);
 
+        let mut guard = state.lock();
+        // The clock is read AFTER the store lock is taken, so the one instant
+        // this call reports at is the instant it observes the store at: the
+        // retrieval window it selects on and the transitions it materialises are
+        // the same clock read, not two reads taken either side of the lock.
+        let now = ::std::time::SystemTime::now();
         // Only events created inside the retrieval window are reachable, so the
         // window this call reports over starts at the later of the caller's
         // `startTimeInclusive` and that floor.
-        let window_start = crate::state::effective_window_start(
-            input.start_time_inclusive,
-            ::std::time::SystemTime::now(),
-        );
-
-        let mut guard = state.lock();
+        let window_start =
+            crate::state::effective_window_start(input.start_time_inclusive, now);
         // The service-wide enrollment gate, AHEAD of filter evaluation: an
         // account that is not opted in is refused the whole call rather than
         // handed an (empty) listing that reads as a healthy, idle account. See
@@ -248,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Before reporting, materialise the status transitions the clock has
         // already made due, so this reader and `GetAutomationEvent` agree on
         // every event's status and a status filter selects on the current one.
-        guard.events.settle_due(::std::time::SystemTime::now());
+        guard.events.settle_due(now);
         // The events inside the window that match the filters are what gets
         // paged, and the page walk is the one every paginated listing of this
         // service performs: `crate::state::serve_page`.

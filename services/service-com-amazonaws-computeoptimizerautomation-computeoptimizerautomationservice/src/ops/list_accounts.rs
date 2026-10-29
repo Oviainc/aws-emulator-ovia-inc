@@ -194,8 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::page_size`.
         let page_size = crate::state::page_size(input.max_results);
 
-        let at = crate::state::now();
         let guard = state.lock();
+        // The clock is read AFTER the store lock is taken, so the instant this
+        // listing reports at is the instant it observes the store at.
+        let at = crate::state::now();
         // The service-wide enrollment gate, AHEAD of reading the store: an
         // account that is not opted in is refused the whole call rather than
         // handed a listing tooling would then build on. See
