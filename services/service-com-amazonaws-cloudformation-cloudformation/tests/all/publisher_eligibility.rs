@@ -128,10 +128,10 @@ async fn an_account_that_is_not_a_marketplace_seller_cannot_register_as_a_publis
     }
 
     // And because nothing registered, every operation downstream of "is this account a
-    // publisher" goes on answering its own refusal. `TestType` and `PublishType` both resolve
-    // the extension the request names against this account's registry BEFORE they read the
-    // caller, so their rows name a record the registry does hold — what they are refused for
-    // is the caller.
+    // publisher" goes on answering its own refusal. `PublishType` resolves the extension the
+    // request names against this account's registry before it reads the caller, so its row
+    // names a record the registry does hold — what it is refused for is the caller, as
+    // `TestType`, which reads the caller first, is for that row too.
     {
         let state = store(&engine);
         state.lock().extensions.push(StoredExtension::new(

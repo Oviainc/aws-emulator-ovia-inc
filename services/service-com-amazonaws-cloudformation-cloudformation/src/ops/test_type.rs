@@ -28,21 +28,23 @@
 //!    and is refused with the registry's modelled `CFNRegistryException` (400). An ARN that
 //!    names a version pins the version too, so a `VersionId` beside it must be that same
 //!    version. This is read first, because it is a property of the request alone.
-//! 2. WHICH record it names, resolved against the registry of THIS account and Region: an
-//!    extension that registry does not hold is the modelled 404 — existence is resolved
-//!    before the caller is looked at, so a call naming an extension nothing registered is
-//!    refused for the extension rather than for the account. A record it holds but did not
-//!    REGISTER — a public extension, whether provided by Amazon Web Services or published by
-//!    a third party and activated here — carries no contract-test status at all
-//!    (`DescribeType`: `TypeTestsStatus` "applies only to registered private extension
-//!    versions"), so there is nothing on it to test and the call is refused with the
-//!    modelled 400.
-//! 3. The CALLER: testing an extension is a step on the way to publishing one, and the
+//! 2. The CALLER: testing an extension is a step on the way to publishing one, and the
 //!    account doing it must be registered with CloudFormation as an extension publisher
 //!    ([`crate::state::publisher`], which `RegisterPublisher` writes). An account that holds
-//!    no such registration is refused with that same modelled 400. The version the request
-//!    selects — or the record's default version — is read after it, and a version the record
-//!    does not carry is the modelled 404.
+//!    no such registration cannot test ANY extension, so this is a PRE-FLIGHT of the whole
+//!    operation: it is answered — with that same modelled 400 carrying
+//!    [`NOT_A_PUBLISHER`] — before the registry is consulted at all, however the request
+//!    spells the extension and whether or not any record answers to it. An account that is
+//!    not a publisher therefore never learns from this operation whether the extension it
+//!    named exists.
+//! 3. WHICH record it names, resolved against the registry of THIS account and Region: an
+//!    extension that registry does not hold is the modelled 404. A record it holds but did
+//!    not REGISTER — a public extension, whether provided by Amazon Web Services or
+//!    published by a third party and activated here — carries no contract-test status at all
+//!    (`DescribeType`: `TypeTestsStatus` "applies only to registered private extension
+//!    versions"), so there is nothing on it to test and the call is refused with the
+//!    modelled 400. The version the request selects — or the record's default version — is
+//!    read after the record, and a version the record does not carry is the modelled 404.
 //!
 //! `LogDeliveryBucket` is "the S3 bucket to which CloudFormation delivers the contract test
 //! execution logs"; no modelled member reports it back and this emulator delivers no log
@@ -199,9 +201,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let (identifier, version_id) = read_request(&input).map_err(registry_exception)?;
 
-        // The record the request names, in the Region the request was signed for, resolved
-        // BEFORE the caller gate: the registry is regional, so a record another Region holds
-        // is not addressable here.
+        // The caller gate, read BEFORE anything is resolved: an account that has not
+        // registered as an extension publisher cannot test an extension at all, so this
+        // refusal is owed to it whatever extension the request names — including one no
+        // registry holds, which it never gets as far as looking for.
+        if store.publisher(None).is_none() {
+            return Err(registry_exception(NOT_A_PUBLISHER.to_string()));
+        }
+
+        // The record the request names, in the Region the request was signed for: the
+        // registry is regional, so a record another Region holds is not addressable here.
         let stored = match identifier {
             Identifier::Arn { extension, .. } => store.extension_by_arn(&region, extension),
             Identifier::Name {
@@ -233,11 +242,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         if !extension.is_private() {
             return Err(registry_exception(not_a_private_extension(&extension.arn)));
-        }
-        // The caller gate, read against the record that resolved: an account that has not
-        // registered as an extension publisher cannot test an extension at all.
-        if store.publisher(None).is_none() {
-            return Err(registry_exception(NOT_A_PUBLISHER.to_string()));
         }
         // "If you don't specify a version, CloudFormation uses the default version of the
         // extension in your account and Region for testing."
@@ -271,7 +275,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The refusal AWS answers an account that has not registered as a publisher of public
-/// extensions, which is what this operation requires of its caller.
+/// extensions, which is what this operation requires of its caller before it looks at
+/// anything else. Entirely fixed text: no part of it comes from the request or from the
+/// store, so there is nothing in it to template.
 const NOT_A_PUBLISHER: &str =
     "You must register as a publisher with CloudFormation to call test-type.";
 

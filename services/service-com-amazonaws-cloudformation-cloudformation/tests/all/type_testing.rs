@@ -3,21 +3,21 @@
 //! `TestType` over the awsQuery wire: the contract tests of one registered extension
 //! version.
 //!
-//! The rule every case here holds the service to: **`TestType` resolves the extension a
-//! request identifies against the registry of THIS account and Region first — an extension
-//! that registry holds no record for is the modelled `TypeNotFoundException` (404) naming
-//! what the request named, and a record this account did not register (a public extension)
-//! the registry's modelled `CFNRegistryException` (400), whether or not the caller is a
-//! publisher — and for a record that does resolve it requires the CALLING ACCOUNT to hold a
-//! CloudFormation extension-publisher registration, refusing an account that holds none with
-//! that same modelled 400 and writing nothing; for a caller that holds one it starts the
-//! contract tests of ONE version of a PRIVATE extension this account and Region registered:
-//! the version its `VersionId` (or its version ARN) names, or the record's default version
-//! where it names none, answered with that version's own ARN while the version's
-//! `TypeTestsStatus` is `IN_PROGRESS` and the conclusion the tests reach over the model the
-//! registry holds for that version becomes due a moment later; a request that identifies no
-//! extension is that same modelled 400, and a version the record does not carry the modelled
-//! 404.**
+//! The rule every case here holds the service to: **`TestType` requires the CALLING ACCOUNT
+//! to hold a CloudFormation extension-publisher registration and refuses an account that
+//! holds none with the registry's modelled `CFNRegistryException` (400) carrying the
+//! register-as-a-publisher sentence, before it resolves the extension the request names and
+//! without writing anything; for a caller that holds one it resolves that extension against
+//! the registry of THIS account and Region — an extension that registry holds no record for
+//! is the modelled `TypeNotFoundException` (404) naming what the request named, and a record
+//! this account did not register (a public extension) that same modelled 400 — and starts
+//! the contract tests of ONE version of a PRIVATE extension this account and Region
+//! registered: the version its `VersionId` (or its version ARN) names, or the record's
+//! default version where it names none, answered with that version's own ARN while the
+//! version's `TypeTestsStatus` is `IN_PROGRESS` and the conclusion the tests reach over the
+//! model the registry holds for that version becomes due a moment later; a request that
+//! identifies no extension at all is that same modelled 400, and a version the record does
+//! not carry the modelled 404.**
 //!
 //! The table spans the class the rule generalises over: every way a request can identify an
 //! extension (`Type` and `TypeName`, the extension's ARN, a version ARN) and select a
@@ -52,10 +52,13 @@ use crate::stack_lifecycle::{
 /// The refusal AWS answers an account that has not registered as an extension publisher,
 /// which is what this operation requires of its caller. Entirely fixed text: no part of it
 /// comes from the request or from the store.
-const NOT_A_PUBLISHER: &str =
+pub(crate) const NOT_A_PUBLISHER: &str =
     "You must register as a publisher with CloudFormation to call test-type.";
 
-async fn test_type(router: &MultiServiceRouter, members: &[(&str, &str)]) -> (u16, String) {
+pub(crate) async fn test_type(
+    router: &MultiServiceRouter,
+    members: &[(&str, &str)],
+) -> (u16, String) {
     let members: Vec<(String, String)> = members
         .iter()
         .map(|(key, value)| member(key, value))
@@ -73,7 +76,7 @@ async fn describe_type(router: &MultiServiceRouter, members: &[(&str, &str)]) ->
 
 /// Register this account as an extension publisher, which is the gate every successful test
 /// below is behind.
-async fn register_publisher(router: &MultiServiceRouter) {
+pub(crate) async fn register_publisher(router: &MultiServiceRouter) {
     let (status_code, body) = call(
         router,
         "RegisterPublisher",
@@ -88,7 +91,7 @@ async fn register_publisher(router: &MultiServiceRouter) {
 
 /// Hold a refused call to the registry's modelled refusal: HTTP 400 `CFNRegistryException`,
 /// carrying `message`.
-fn assert_registry_refusal(case: &str, status_code: u16, body: &str, message: &str) {
+pub(crate) fn assert_registry_refusal(case: &str, status_code: u16, body: &str, message: &str) {
     assert_eq!(
         status_code, 400,
         "case {case:?}: expected the call refused with 400, got {status_code} {body}"
@@ -108,7 +111,7 @@ fn assert_registry_refusal(case: &str, status_code: u16, body: &str, message: &s
 
 /// Hold a refused call to the modelled 404: `TypeNotFoundException`, "the specified
 /// extension doesn't exist in the CloudFormation registry", naming what the request named.
-fn assert_not_found(case: &str, status_code: u16, body: &str, identifier: &str) {
+pub(crate) fn assert_not_found(case: &str, status_code: u16, body: &str, identifier: &str) {
     assert_eq!(
         status_code, 404,
         "case {case:?}: expected the call refused with 404, got {status_code} {body}"
@@ -129,12 +132,12 @@ fn assert_not_found(case: &str, status_code: u16, body: &str, identifier: &str) 
 
 /// Every record the registry holds right now, as the one snapshot a case compares a refused
 /// call against: a refusal must leave every version's test status exactly as it was.
-fn registry_snapshot(engine: &Arc<engine::InMemoryEngine>) -> String {
+pub(crate) fn registry_snapshot(engine: &Arc<engine::InMemoryEngine>) -> String {
     format!("{:?}", store(engine).lock().extensions)
 }
 
 /// The ARNs of the seeded records, which every case addresses its extension by.
-fn resource_arn() -> String {
+pub(crate) fn resource_arn() -> String {
     type_arn(REGION, registry_type::RESOURCE, "My::Sample::Resource")
 }
 
@@ -144,12 +147,11 @@ async fn test_type_is_refused_for_an_account_that_is_not_a_registered_publisher(
     let before = registry_snapshot(&engine);
 
     // One row per thing the request can name that DOES resolve to a private registration of
-    // this account and Region — a registered private extension, a module, one version of it
-    // — because the gate is on the CALLER: what the request names is resolved first and then
-    // nothing further is read until the account is a publisher, so every row is refused with
-    // the same message. (An identifier that resolves NO record, one that resolves a record
-    // this account did not register, and a request that identifies no extension at all are
-    // each refused for that instead, before the caller is looked at.)
+    // this account and Region — a registered private extension, a module, one version of it.
+    // The gate is on the CALLER, so each row is refused with the same message; the rows that
+    // resolve NOTHING are refused with it too, which `test_type_publisher_gate.rs` is the
+    // table for. (A request that identifies no extension at all is a property of the request
+    // alone and is refused for that instead, as the row below it holds.)
     for (case, members) in [
         (
             "a registered private resource type, no version named",
@@ -226,13 +228,15 @@ async fn test_type_is_refused_for_an_account_that_is_not_a_registered_publisher(
 }
 
 /// The extension a request identifies is resolved against this account and Region's registry
-/// BEFORE the caller gate: an identifier the registry holds no record for is refused the
+/// once the CALLER gate is open: an identifier the registry holds no record for is refused the
 /// modelled 404 naming what the request named, and a record this account did not register the
-/// not-a-private-extension 400 — for an account that is not a publisher just as for one that
-/// is, since neither refusal is about the caller.
+/// not-a-private-extension 400. What an account that is NOT a publisher is answered for the
+/// same identifiers — the caller refusal, before any of this is resolved — is the table in
+/// `test_type_publisher_gate.rs`.
 #[tokio::test]
-async fn an_identifier_the_registry_does_not_hold_is_refused_before_the_caller() {
+async fn an_identifier_the_registry_does_not_hold_is_refused_for_what_it_names() {
     let (router, engine) = router_with_registry();
+    register_publisher(&router).await;
     let before = registry_snapshot(&engine);
 
     let unheld_arn = type_arn(REGION, registry_type::RESOURCE, "No::Such::Resource");
@@ -275,52 +279,47 @@ async fn an_identifier_the_registry_does_not_hold_is_refused_before_the_caller()
 
     // Before the account is a publisher and after it is: the refusal is about what the
     // request named, so the caller makes no difference to it.
-    for registered_publisher in [false, true] {
-        if registered_publisher {
-            register_publisher(&router).await;
-        }
-        for (case, members, identifier) in &unheld {
-            let members: Vec<(&str, &str)> = members
-                .iter()
-                .map(|(key, value)| (*key, value.as_str()))
-                .collect();
-            let (status_code, body) = test_type(&router, &members).await;
-            assert_not_found(case, status_code, &body, identifier);
-            assert_eq!(
-                registry_snapshot(&engine),
-                before,
-                "case {case:?}: expected the refused call to write nothing"
-            );
-        }
-
-        // A record the registry DOES hold that this account did not register: it exists, so
-        // the refusal is the one about what the record IS.
-        let public_arn = type_arn(REGION, registry_type::RESOURCE, "MyAlias::Sample::Resource");
-        let expected = format!(
-            "Cannot test {public_arn}: only a private extension registered in this account \
-             and Region can be tested"
-        );
-        let (status_code, body) = test_type(
-            &router,
-            &[
-                ("Type", registry_type::RESOURCE),
-                ("TypeName", "MyAlias::Sample::Resource"),
-            ],
-        )
-        .await;
-        assert_registry_refusal(
-            "a public third-party extension activated in this account",
-            status_code,
-            &body,
-            &expected,
-        );
+    for (case, members, identifier) in &unheld {
+        let members: Vec<(&str, &str)> = members
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect();
+        let (status_code, body) = test_type(&router, &members).await;
+        assert_not_found(case, status_code, &body, identifier);
         assert_eq!(
             registry_snapshot(&engine),
             before,
-            "case {:?}: expected the refused call to write nothing",
-            "a public third-party extension activated in this account"
+            "case {case:?}: expected the refused call to write nothing"
         );
     }
+
+    // A record the registry DOES hold that this account did not register: it exists, so
+    // the refusal is the one about what the record IS.
+    let public_arn = type_arn(REGION, registry_type::RESOURCE, "MyAlias::Sample::Resource");
+    let expected = format!(
+        "Cannot test {public_arn}: only a private extension registered in this account \
+         and Region can be tested"
+    );
+    let (status_code, body) = test_type(
+        &router,
+        &[
+            ("Type", registry_type::RESOURCE),
+            ("TypeName", "MyAlias::Sample::Resource"),
+        ],
+    )
+    .await;
+    assert_registry_refusal(
+        "a public third-party extension activated in this account",
+        status_code,
+        &body,
+        &expected,
+    );
+    assert_eq!(
+        registry_snapshot(&engine),
+        before,
+        "case {:?}: expected the refused call to write nothing",
+        "a public third-party extension activated in this account"
+    );
 }
 
 /// One row of the testing table: what the request names, the version it must test, and the

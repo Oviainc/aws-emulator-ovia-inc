@@ -271,6 +271,8 @@ mod template_stages_and_resource_events;
 mod template_summary;
 #[path = "all/template_validation.rs"]
 mod template_validation;
+#[path = "all/test_type_publisher_gate.rs"]
+mod test_type_publisher_gate;
 #[path = "all/third_party_extensions.rs"]
 mod third_party_extensions;
 #[path = "all/type_configurations.rs"]
