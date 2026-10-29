@@ -53,6 +53,8 @@ mod procurement_portals;
 mod refused_procurement_portal_writes;
 #[path = "all/rejected_validation_code_keeps_the_version.rs"]
 mod rejected_validation_code_keeps_the_version;
+#[path = "all/reported_arn_fits_the_modelled_bound.rs"]
+mod reported_arn_fits_the_modelled_bound;
 #[path = "all/request_derived_refusal_message_bound.rs"]
 mod request_derived_refusal_message_bound;
 #[path = "all/retired_units_and_portal_validation.rs"]

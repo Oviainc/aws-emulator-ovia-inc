@@ -1276,10 +1276,21 @@ pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The resource could not be found.";
 /// The 404 an operation of the INVOICE-UNIT or TAG plane answers for an ARN that is not
 /// in state: the constant message, plus `arn` in the shape's own ARN member, keyed the
 /// way those planes' recorded bodies key it ([`MessageKey::ModelMemberName`]).
+///
+/// The ARN is reported only when it is one that member can hold
+/// ([`crate::service::validation::reportable_resource_arn`]), as every value this service
+/// reports is held to the bound the model gives the member it travels in: that member is
+/// modelled `InvoiceUnitArnString`, `@length(max: 256)`, while the tag plane accepts a
+/// `TagrisArn` of up to 2048 characters, so a legal request can name a resource no
+/// reporting member of this model holds. Such an ARN leaves the member ABSENT rather than
+/// being cut down to the bound — a truncated ARN names a different resource — which is the
+/// same answer this service gives for an identifier that member's `@pattern` does not
+/// admit ([`no_such_resource_unnamed`]). An ARN from a member the model already caps at
+/// 256, as every `InvoiceUnitArn` input of the invoice-unit plane is, is reported whole.
 pub fn no_such_resource(arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-        resource_id: Some(arn.to_string()),
+        resource_id: crate::service::validation::reportable_resource_arn(arn),
         message_key: MessageKey::ModelMemberName,
     }
 }
@@ -1305,13 +1316,16 @@ const PROCUREMENT_PORTAL_PREFERENCE_KIND: &str = "Procurement portal preference"
 /// ([`crate::service::validation::bounded_message`]), as every message this service words
 /// from a request is, so no wording of this service rests on a maximum that lives in
 /// another shape — here `ProcurementPortalPreferenceArnString`'s own `@length(max: 256)`,
-/// which already leaves the sentence inside the bound.
+/// which already leaves the sentence inside the bound. The ARN member is held to its own
+/// modelled bound the same way ([`crate::service::validation::reportable_resource_arn`],
+/// see [`no_such_resource`]); that same input maximum of 256 already leaves this plane's
+/// ARN inside it, so this refusal reports it whole.
 pub fn no_such_procurement_portal_preference(arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(crate::service::validation::bounded_message(format!(
             "{PROCUREMENT_PORTAL_PREFERENCE_KIND} with arn {arn} does not exist"
         ))),
-        resource_id: Some(arn.to_string()),
+        resource_id: crate::service::validation::reportable_resource_arn(arn),
         message_key: MessageKey::Capitalised,
     }
 }

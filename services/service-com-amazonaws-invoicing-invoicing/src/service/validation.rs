@@ -32,6 +32,12 @@
 //!   number of clauses it states — a message is never longer than the member it travels
 //!   in can carry (see [`MAX_MESSAGE_LENGTH`] and [`bounded_message`]).
 //!
+//! The last of those is a rule about the body this service WRITES rather than about the
+//! request, so it holds of every value any refusal of this service reports, not only of
+//! its prose: an ARN reported back to a client travels in a member the model bounds too,
+//! and [`reportable_resource_arn`] is that rule for an identifier, which — unlike a
+//! sentence — cannot be cut down to the bound and still name what was asked about.
+//!
 //! Both halves of a refusal body are built from the same clause: the `message`
 //! envelope and each `fieldList` entry's own `message` (see
 //! [`field_validation_failed`]), so the two cannot drift.
@@ -101,6 +107,43 @@ pub(crate) fn bounded_message(text: String) -> String {
         Some((end, _)) => text[..end].to_string(),
         None => text,
     }
+}
+
+/// The lengths an ARN this service REPORTS may run to: the SHORTEST one such a member
+/// holds, with [`MAX_REPORTED_ARN_LENGTH`] the longest.
+///
+/// Every member of every error shape of this model that reports the resource an operation
+/// was asked about — `ResourceNotFoundException$resourceName`, and the same member of
+/// `AccessDeniedException` and of `ValidationException` — targets `InvoiceUnitArnString`,
+/// which the model gives `@length(min: 1, max: 256)` (`smithy_query(query="shape",
+/// shape="ResourceNotFoundException,InvoiceUnitArnString")`). An ARN outside that is a
+/// value the model says those members never hold, whatever the request supplied: the tag
+/// plane's `ResourceArn` is a `TagrisArn`, `@length(min: 20, max: 2048)`, so one legal
+/// request can name a resource eight times longer than the member that would report it.
+///
+/// As with [`MAX_MESSAGE_LENGTH`], `@length` on a string counts CHARACTERS.
+pub(crate) const MIN_REPORTED_ARN_LENGTH: usize = 1;
+
+/// The longest ARN one of those members holds — the other end of
+/// [`MIN_REPORTED_ARN_LENGTH`]'s range, from the same `@length`.
+pub(crate) const MAX_REPORTED_ARN_LENGTH: usize = 256;
+
+/// `arn` as it can travel in a member the model types `InvoiceUnitArnString`: the ARN
+/// itself when its length is one the member admits, else NOTHING — the member is reported
+/// ABSENT.
+///
+/// An ARN is an IDENTIFIER rather than prose, so this cannot do what [`bounded_message`]
+/// does to an over-long sentence: a cut-down ARN names a different resource, or none, and
+/// a client reading it mechanically would be answered something the request never asked
+/// about. The member is optional, so leaving it out — "the resource is not named back
+/// here" — is an answer the model admits where an over-long ARN is not, and it is the
+/// choice this service already makes for an identifier that member's `@pattern` does not
+/// admit (see [`crate::state::no_such_resource_unnamed`]).
+pub(crate) fn reportable_resource_arn(arn: &str) -> Option<String> {
+    let length = arn.chars().count();
+    (MIN_REPORTED_ARN_LENGTH..=MAX_REPORTED_ARN_LENGTH)
+        .contains(&length)
+        .then(|| arn.to_string())
 }
 
 /// The sentence a refusal falls back to when no violation has a wording here: the
