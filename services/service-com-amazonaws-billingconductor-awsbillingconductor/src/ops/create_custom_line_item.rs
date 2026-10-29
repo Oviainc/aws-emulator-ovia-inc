@@ -210,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before anything is minted, so a create naming such a key leaves no resource
         // and no tag behind (see [`crate::state::check_tag_keys_not_reserved`]).
         if let Err(refusal) = crate::state::check_tag_keys_not_reserved(
-            "Tags",
+            crate::state::TAGS_MEMBER,
             input.tags.iter().flat_map(|tags| tags.keys().map(String::as_str)),
         ) {
             return Err(CreateCustomLineItemErrorModeled::ValidationException(refusal).into());

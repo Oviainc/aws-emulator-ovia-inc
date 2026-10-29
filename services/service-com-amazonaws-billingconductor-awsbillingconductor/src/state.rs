@@ -3873,6 +3873,22 @@ pub fn is_reserved_tag_key(key: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
 }
 
+/// The input member a caller-supplied TAG MAP travels in, as the model declares it —
+/// what a refusal about that map names in `Fields`, and the spelling the clause it builds
+/// interpolates.
+///
+/// `TagResource` and the four creates that persist tags all declare it under this one
+/// name (`smithy_query(query="operation",operation="TagResource")`). It is a constant
+/// rather than a literal per call site so the several refusals ABOUT that member — the
+/// reserved namespace, the per-resource cap — cannot spell it two different ways.
+pub const TAGS_MEMBER: &str = "Tags";
+
+/// The input member the tag KEYS of a removal travel in, as the model declares it
+/// (`smithy_query(query="operation",operation="UntagResource")`), beside
+/// [`TAGS_MEMBER`] for the map a tagging call carries: a refusal names the member the
+/// request itself carried the offending value in.
+pub const TAG_KEYS_MEMBER: &str = "TagKeys";
+
 /// `Ok(())` when no key in `keys` is reserved, or the modelled `ValidationException`
 /// that refuses the request.
 ///
@@ -3880,7 +3896,8 @@ pub fn is_reserved_tag_key(key: &str) -> bool {
 /// and `UntagResource`, and the `Tags` of `CreateBillingGroup`, `CreatePricingPlan`,
 /// `CreatePricingRule` and `CreateCustomLineItem` — refuses that namespace the same way
 /// and cannot drift apart. `member` names the input member that carried the keys, which
-/// is what travels in `Fields`, and the message is built from the request: the offenders
+/// is what travels in `Fields` — [`TAGS_MEMBER`] or [`TAG_KEYS_MEMBER`], as the model
+/// declares it — and the message is built from the request: the offenders
 /// are sorted and deduplicated, so a map's iteration order never shows through the text.
 pub fn check_tag_keys_not_reserved<'a>(
     member: &str,

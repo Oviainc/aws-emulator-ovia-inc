@@ -22,6 +22,13 @@
 //! [`crate::state::check_tag_keys_not_reserved`], which every path taking a
 //! caller-supplied tag key shares.
 //!
+//! A merge that would take the resource past [`crate::state::MAX_TAGS_PER_RESOURCE`]
+//! tags is likewise REFUSED with the modelled 400 `ValidationException` and stores
+//! nothing. Both refusals are about the SAME input member, so both name it the one way
+//! the model declares it ([`crate::state::TAGS_MEMBER`]), in `Fields` and in the clause
+//! they build: a client that reads `Fields` to locate the offending member of its own
+//! request reads one spelling from either refusal.
+//!
 //! This operation is NOT payer-account-gated
 //! (`crate::service::PAYER_UNGATED_OPERATIONS`): a recorded call from a non-payer
 //! account is answered by resolution.
@@ -174,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request carrying one such key therefore stores NONE of its pairs rather than
         // the rest of them.
         if let Err(refusal) = crate::state::check_tag_keys_not_reserved(
-            "Tags",
+            crate::state::TAGS_MEMBER,
             input.tags.keys().map(String::as_str),
         ) {
             return Err(TagResourceErrorModeled::ValidationException(refusal).into());
@@ -213,13 +220,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect::<std::collections::BTreeSet<&str>>()
             .len();
         if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
+            // The member at fault is the one the request carried the pairs in, named the
+            // way the model declares it ([`crate::state::TAGS_MEMBER`]) — the same member
+            // the reserved-key refusal above names, so both of this handler's refusals
+            // tell a client reading `Fields` the same thing.
+            let member = crate::state::TAGS_MEMBER;
             return Err(TagResourceErrorModeled::ValidationException(
                 crate::state::validation_exception(
                     "FIELD_VALIDATION_FAILED",
-                    "tags",
+                    member,
                     format!(
-                        "Value at 'tags' failed to satisfy constraint: a resource must have \
-                         no more than {} tags; this request would leave it with {resulting}",
+                        "Value at '{member}' failed to satisfy constraint: a resource must \
+                         have no more than {} tags; this request would leave it with \
+                         {resulting}",
                         crate::state::MAX_TAGS_PER_RESOURCE
                     ),
                 ),

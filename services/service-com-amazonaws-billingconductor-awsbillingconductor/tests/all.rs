@@ -143,6 +143,8 @@ mod update_billing_group;
 mod update_custom_line_item;
 #[path = "all/update_custom_line_item_billing_period_window.rs"]
 mod update_custom_line_item_billing_period_window;
+#[path = "all/validation_exception_field_member_names.rs"]
+mod validation_exception_field_member_names;
 #[path = "all/validation_exception_message.rs"]
 mod validation_exception_message;
 #[path = "all/validation_messages.rs"]

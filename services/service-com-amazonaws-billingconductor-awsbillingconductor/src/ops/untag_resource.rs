@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request is answered the same way `TagResource` answers one that tries to set
         // it, and no key the request names is removed.
         if let Err(refusal) = crate::state::check_tag_keys_not_reserved(
-            "TagKeys",
+            crate::state::TAG_KEYS_MEMBER,
             input.tag_keys.iter().map(String::as_str),
         ) {
             return Err(UntagResourceErrorModeled::ValidationException(refusal).into());
