@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEmailAddressInsights
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEmailAddressInsights`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEmailAddressInsights::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation reports
+//!
+//! One confidence verdict per documented mailbox evaluation for the address in the
+//! request: its syntax, the DNS records of its domain, whether the mailbox exists,
+//! whether it is a role address, whether its domain is a disposable mailbox service
+//! and whether the input reads as random text. The overall `IsValid` verdict is the
+//! weakest of them once the three evaluations whose HIGH value counts AGAINST an
+//! address are inverted. Every verdict is computed from the value itself and from
+//! what the account's own records already say about its domain and its mailbox (the
+//! identity table and the account-level suppression list); reporting only, so
+//! nothing is written beyond the transitions the clock already owed.
+//!
+//! The call grades whatever text it is given rather than refusing it: an input that
+//! names no mailbox is what a LOW syntax verdict says, and `IsRandomInput` is
+//! documented over "the input", so there is no value this report cannot answer for.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +147,460 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEmailAddressInsights` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEmailAddressInsightsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEmailAddressInsights"))
+        // Request metadata is not needed: the report is about the address in the
+        // request, read against the one emulated account's records.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetEmailAddressInsights without the shared emulator state",
+            ));
+        };
+
+        let mut store = state.lock();
+        // Reporting-only, with one exception: an identity verification the clock
+        // already owed is materialised before reading, so the DNS and mailbox
+        // evidence this report is computed from is what every later caller sees too.
+        store.settle(::std::time::SystemTime::now());
+
+        Ok(GetEmailAddressInsightsOutput {
+            mailbox_validation: Some(mailbox_validation(&store, &input.email_address)),
+        })
     }
+}
+
+/// The confidence one evaluation is reported with: `EmailAddressInsightsVerdict`'s
+/// `ConfidenceVerdict` is an `EmailAddressInsightsConfidenceVerdict`, whose three
+/// values are the ones below (see
+/// `crate::ops::types::EMAIL_ADDRESS_INSIGHTS_CONFIDENCE_VERDICT_VALUES`).
+///
+/// The order is the confidence order — `Low` < `Medium` < `High` — so the weakest of
+/// a set of verdicts is their minimum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Confidence {
+    /// The evaluation's assertion does not hold, as far as the address itself and the
+    /// account's records can say.
+    Low,
+    /// Nothing observable settles the evaluation either way.
+    Medium,
+    /// The evaluation's assertion holds.
+    High,
+}
+
+impl Confidence {
+    /// The modelled enum value.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "LOW",
+            Self::Medium => "MEDIUM",
+            Self::High => "HIGH",
+        }
+    }
+
+    /// This confidence as the modelled verdict a response carries.
+    fn verdict(self) -> EmailAddressInsightsVerdict {
+        EmailAddressInsightsVerdict {
+            confidence_verdict: Some(self.as_str().to_string()),
+        }
+    }
+
+    /// The confidence in the OPPOSITE assertion: being sure an address IS a role
+    /// address is being sure it is NOT a personal one, and knowing nothing either way
+    /// stays knowing nothing.
+    ///
+    /// This is what lets the overall verdict combine the evaluations whose HIGH value
+    /// counts FOR an address with the three whose HIGH value counts against it.
+    fn inverted(self) -> Self {
+        match self {
+            Self::Low => Self::High,
+            Self::Medium => Self::Medium,
+            Self::High => Self::Low,
+        }
+    }
+}
+
+/// The longest an email address this report grades can be, in characters:
+/// `InsightsEmailAddress`, the longest address member this model declares, is a
+/// `length 1..320` string. A value past that names no mailbox any SES surface would
+/// carry, however it is spelled.
+const MAX_EMAIL_ADDRESS_CHARS: usize = 320;
+
+/// `SuppressionListReason`'s value for an address a message bounced from (see
+/// `crate::ops::types::SUPPRESSION_LIST_REASON_VALUES`).
+const SUPPRESSION_REASON_BOUNCE: &str = "BOUNCE";
+
+/// `SuppressionListReason`'s value for an address whose owner reported a message as
+/// spam (see `crate::ops::types::SUPPRESSION_LIST_REASON_VALUES`).
+const SUPPRESSION_REASON_COMPLAINT: &str = "COMPLAINT";
+
+/// Local parts that name a ROLE at a domain rather than a person.
+///
+/// `IsRoleAddress` is documented as identifying "role-based addresses (such as
+/// admin@, support@, or info@) that may have lower engagement rates", and those three
+/// are here; the rest are RFC 2142's mailbox names for common services, roles and
+/// functions, which is where the mail world's list of them is written down. Compared
+/// in lower case, since a local part's case is not what makes it a role.
+const ROLE_LOCAL_PARTS: [&str; 16] = [
+    "abuse",
+    "admin",
+    "ftp",
+    "hostmaster",
+    "info",
+    "marketing",
+    "news",
+    "noc",
+    "postmaster",
+    "sales",
+    "security",
+    "support",
+    "usenet",
+    "uucp",
+    "webmaster",
+    "www",
+];
+
+/// The characters that separate the segments of a local part: the dot of a dot-atom,
+/// the hyphen and the underscore a compound local part is written with, and the `+`
+/// that opens an RFC 5233 subaddress.
+const LOCAL_PART_SEPARATORS: [char; 4] = ['.', '-', '_', '+'];
+
+/// Domains operated as public throwaway mailbox services — the "disposable or
+/// temporary email addresses that could negatively impact your sender reputation"
+/// `IsDisposable` is documented over: a mailbox under one is handed to anyone for
+/// minutes, with no owner to engage with afterwards. Each entry covers the domains
+/// under it too, which is how such a service hands out addresses under many names at
+/// once.
+const DISPOSABLE_MAIL_DOMAINS: [&str; 13] = [
+    "10minutemail.com",
+    "dispostable.com",
+    "fakeinbox.com",
+    "getnada.com",
+    "guerrillamail.com",
+    "maildrop.cc",
+    "mailinator.com",
+    "mohmal.com",
+    "sharklasers.com",
+    "temp-mail.org",
+    "throwawaymail.com",
+    "trashmail.com",
+    "yopmail.com",
+];
+
+/// How many letters and digits a value has to carry before its character mix says
+/// anything about whether it was typed or generated: a short value looks the same
+/// either way.
+const RANDOM_INPUT_MIN_CHARS: usize = 6;
+
+/// How long a run of consonants has to be to be a signal of generated text: written
+/// English does not spell five consonants in a row inside a word.
+const RANDOM_INPUT_CONSONANT_RUN: usize = 5;
+
+/// How long a value has to be before carrying no repeated character at all is a
+/// signal of generated text: a written word of this length almost always repeats one.
+const RANDOM_INPUT_DISTINCT_CHARS: usize = 8;
+
+/// How many of those signals a value has to carry to be reported as random text with
+/// HIGH confidence; one signal alone is MEDIUM.
+const RANDOM_INPUT_SIGNALS_FOR_HIGH: usize = 2;
+
+/// The `MailboxValidation` the value `value` and the account's records yield.
+///
+/// The evaluations are resolved in this order because the later ones depend on the
+/// earlier: a value that names no mailbox has no domain to look DNS records up for,
+/// and a domain no DNS zone can cover holds no mailbox.
+fn mailbox_validation(
+    store: &crate::state::ComAmazonawsSesv2SimpleemailserviceV2State,
+    value: &str,
+) -> MailboxValidation {
+    // The local part and the domain of the mailbox the value names, when it names one
+    // at all. The form is the one every service in this emulator reads a
+    // caller-supplied address against, so this API and the rest of SES cannot
+    // disagree about what an email address is.
+    let mailbox = if ::service_common::email_address::is_email_address(value) {
+        value.split_once('@')
+    } else {
+        None
+    };
+
+    let has_valid_syntax = syntax_confidence(value, mailbox);
+    let has_valid_dns_records = dns_records_confidence(store, value, mailbox);
+    let mailbox_exists = mailbox_confidence(store, value, has_valid_dns_records);
+    let is_role_address = match mailbox {
+        Some((local, _)) => role_address_confidence(local),
+        // A value that names no mailbox names no role mailbox at a domain either.
+        None => Confidence::Low,
+    };
+    let is_disposable = match mailbox {
+        Some((_, domain)) => disposable_confidence(domain),
+        None => Confidence::Low,
+    };
+    // "Checks if the input appears to be random text": the INPUT, so a value that
+    // names no mailbox is read whole, and an address is read on the part that
+    // identifies the mailbox rather than on its domain.
+    let is_random_input = match mailbox {
+        Some((local, _)) => random_input_confidence(local),
+        None => random_input_confidence(value),
+    };
+
+    MailboxValidation {
+        // "The overall validation verdict": the weakest of the evaluations, with the
+        // three whose HIGH value counts AGAINST the address inverted first, so an
+        // address is valid with HIGH confidence only while every evaluation agrees,
+        // and doubtful as soon as one of them does not.
+        is_valid: Some(
+            [
+                has_valid_syntax,
+                has_valid_dns_records,
+                mailbox_exists,
+                is_role_address.inverted(),
+                is_disposable.inverted(),
+                is_random_input.inverted(),
+            ]
+            .into_iter()
+            .min()
+            .unwrap_or(Confidence::Low)
+            .verdict(),
+        ),
+        evaluations: Some(EmailAddressInsightsMailboxEvaluations {
+            has_valid_syntax: Some(has_valid_syntax.verdict()),
+            has_valid_dns_records: Some(has_valid_dns_records.verdict()),
+            mailbox_exists: Some(mailbox_exists.verdict()),
+            is_role_address: Some(is_role_address.verdict()),
+            is_disposable: Some(is_disposable.verdict()),
+            is_random_input: Some(is_random_input.verdict()),
+        }),
+    }
+}
+
+/// `HasValidSyntax`: "that the email address follows proper RFC standards and
+/// contains valid characters in the correct format".
+///
+/// HIGH for a value that is an address whose domain is spelled as a domain name and
+/// which is short enough to be one; MEDIUM for one that is an address but is spelled
+/// in a way a receiving mail system may still turn down — a domain outside DNS's
+/// preferred name syntax, or a value longer than [`MAX_EMAIL_ADDRESS_CHARS`]; LOW for
+/// a value that is no address at all.
+fn syntax_confidence(value: &str, mailbox: Option<(&str, &str)>) -> Confidence {
+    let Some((_, domain)) = mailbox else {
+        return Confidence::Low;
+    };
+    if crate::state::domain_name_is_well_formed(domain)
+        && value.chars().count() <= MAX_EMAIL_ADDRESS_CHARS
+    {
+        Confidence::High
+    } else {
+        Confidence::Medium
+    }
+}
+
+/// `HasValidDnsRecords`: "that the domain exists, has valid DNS records, and is
+/// configured to receive email".
+///
+/// LOW when there is no domain to query — the value names no mailbox — or when no DNS
+/// zone can cover the domain at all, so the records can never be published there
+/// ([`crate::state::dns_zone_can_exist`]). HIGH when the account holds a verified
+/// domain identity covering the address: the records SES was told to look for in that
+/// zone were found, which is the evidence here that the zone exists and answers.
+/// MEDIUM otherwise — a zone that may well exist, with nothing in the account's
+/// records saying what it publishes.
+fn dns_records_confidence(
+    store: &crate::state::ComAmazonawsSesv2SimpleemailserviceV2State,
+    value: &str,
+    mailbox: Option<(&str, &str)>,
+) -> Confidence {
+    let Some((_, domain)) = mailbox else {
+        return Confidence::Low;
+    };
+    if !crate::state::dns_zone_can_exist(domain) {
+        return Confidence::Low;
+    }
+    // The identity whose DNS zone SES searched for this address's records: the domain
+    // identity covering it, when the account holds one.
+    let zone_searched = store
+        .sending_identity(value)
+        .map(|record| store.dkim_authority(record))
+        .filter(|record| record.identity_kind == crate::state::IdentityKind::Domain);
+    if zone_searched
+        .is_some_and(|record| record.verification_status == crate::state::SesStatus::Success)
+    {
+        Confidence::High
+    } else {
+        Confidence::Medium
+    }
+}
+
+/// `MailboxExists`: "that the mailbox exists and can receive messages without
+/// actually sending an email".
+///
+/// LOW when the domain's records could not be looked up at all, and when the account
+/// suppressed the address for a bounce — mail to it was returned, which is the
+/// evidence that the mailbox does not take it. HIGH on evidence that mail reached the
+/// mailbox: a verified email-address identity, whose owner followed the link in a
+/// message delivered there, and an address suppressed for a complaint, whose owner
+/// reported a message they received. MEDIUM otherwise, since the check is documented
+/// as made "without actually sending an email" and nothing else here observes a
+/// mailbox.
+fn mailbox_confidence(
+    store: &crate::state::ComAmazonawsSesv2SimpleemailserviceV2State,
+    value: &str,
+    has_valid_dns_records: Confidence,
+) -> Confidence {
+    if has_valid_dns_records == Confidence::Low {
+        return Confidence::Low;
+    }
+    // The account-level suppression list, which is the list a call carrying no tenant
+    // name reads everywhere else in this service.
+    let suppressed = store
+        .suppressed_destinations
+        .get(&crate::state::suppression_key(None, value));
+    if suppressed.is_some_and(|entry| entry.reason == SUPPRESSION_REASON_BOUNCE) {
+        return Confidence::Low;
+    }
+    let verified_mailbox = store
+        .identities
+        .get(&crate::state::identity_key(value))
+        .is_some_and(|record| {
+            record.identity_kind == crate::state::IdentityKind::EmailAddress
+                && record.verification_status == crate::state::SesStatus::Success
+        });
+    if verified_mailbox
+        || suppressed.is_some_and(|entry| entry.reason == SUPPRESSION_REASON_COMPLAINT)
+    {
+        Confidence::High
+    } else {
+        Confidence::Medium
+    }
+}
+
+/// `IsRoleAddress`: "role-based addresses (such as admin@, support@, or info@) that
+/// may have lower engagement rates".
+///
+/// HIGH when the local part IS one of [`ROLE_LOCAL_PARTS`], including one carrying an
+/// RFC 5233 subaddress (`support+eu@…`), which the receiving system delivers to the
+/// role mailbox itself. MEDIUM when a role name is one SEGMENT of a longer local part
+/// (`sales.emea@…`, `admin-team@…`): the mailbox is addressed by a role rather than by
+/// a person, but it is not that role's own mailbox. LOW otherwise.
+fn role_address_confidence(local: &str) -> Confidence {
+    let local = local.to_lowercase();
+    // The subaddress a `+` opens is a tag on the mailbox before it, not part of the
+    // name the mail is delivered to.
+    let mailbox = local.split('+').next().unwrap_or(local.as_str());
+    if ROLE_LOCAL_PARTS.contains(&mailbox) {
+        return Confidence::High;
+    }
+    if local
+        .split(LOCAL_PART_SEPARATORS)
+        .any(|segment| ROLE_LOCAL_PARTS.contains(&segment))
+    {
+        return Confidence::Medium;
+    }
+    Confidence::Low
+}
+
+/// `IsDisposable`: "disposable or temporary email addresses that could negatively
+/// impact your sender reputation".
+///
+/// HIGH for a mailbox at one of [`DISPOSABLE_MAIL_DOMAINS`] or at a domain under one,
+/// LOW for every other domain. There is no middle reading: a domain either is one of
+/// the throwaway mailbox services or is not, and the names are compared the way DNS
+/// compares them.
+fn disposable_confidence(domain: &str) -> Confidence {
+    let candidate = crate::state::domain_key(domain);
+    if DISPOSABLE_MAIL_DOMAINS
+        .iter()
+        .any(|service| crate::state::domain_covers(service, &candidate))
+    {
+        Confidence::High
+    } else {
+        Confidence::Low
+    }
+}
+
+/// `IsRandomInput`: "if the input appears to be random text".
+///
+/// Read off the character mix of `text`, which is what tells a typed name from a
+/// generated string: letters with almost no vowels, a run of consonants no written
+/// word carries, digits interleaved between letters rather than appended, and a long
+/// value that repeats no character at all. One such signal is MEDIUM and
+/// [`RANDOM_INPUT_SIGNALS_FOR_HIGH`] of them HIGH; a value too short for its mix to
+/// mean anything ([`RANDOM_INPUT_MIN_CHARS`]) is LOW.
+fn random_input_confidence(text: &str) -> Confidence {
+    // Read over at most the longest an address member of this model may carry
+    // ([`MAX_EMAIL_ADDRESS_CHARS`]): a value past that length is already doubtful on
+    // syntax, so looking at more of it than an address could hold would only let the
+    // caller choose how much work this report costs.
+    let text: String = text
+        .chars()
+        .take(MAX_EMAIL_ADDRESS_CHARS)
+        .flat_map(char::to_lowercase)
+        .collect();
+    let alphanumeric: Vec<char> = text.chars().filter(char::is_ascii_alphanumeric).collect();
+    if alphanumeric.len() < RANDOM_INPUT_MIN_CHARS {
+        return Confidence::Low;
+    }
+    let letters = alphanumeric
+        .iter()
+        .filter(|character| character.is_ascii_alphabetic())
+        .count();
+    let vowels = alphanumeric
+        .iter()
+        .filter(|character| is_vowel(**character))
+        .count();
+    let mut distinct = alphanumeric.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+
+    let signals = [
+        // Written language is around two letters in five a vowel; a generated string
+        // is not, and one in five is the floor this reads as a signal.
+        letters >= RANDOM_INPUT_MIN_CHARS && vowels * 5 < letters,
+        longest_consonant_run(&text) >= RANDOM_INPUT_CONSONANT_RUN,
+        // A digit a letter FOLLOWS is part of the mix; digits appended to a name — a
+        // year, a house number — are not.
+        has_interleaved_digit(&text),
+        alphanumeric.len() >= RANDOM_INPUT_DISTINCT_CHARS && distinct.len() == alphanumeric.len(),
+    ]
+    .into_iter()
+    .filter(|signal| *signal)
+    .count();
+
+    if signals >= RANDOM_INPUT_SIGNALS_FOR_HIGH {
+        Confidence::High
+    } else if signals > 0 {
+        Confidence::Medium
+    } else {
+        Confidence::Low
+    }
+}
+
+/// Whether `character` is one of the letters English spells a vowel sound with, `y`
+/// among them: it carries one in the words a local part is written from.
+fn is_vowel(character: char) -> bool {
+    matches!(character, 'a' | 'e' | 'i' | 'o' | 'u' | 'y')
+}
+
+/// The longest run of consecutive consonants in `text`, which is already lower case.
+/// Anything that is not a letter — a digit, a separator — ends a run, since a run is
+/// about how one word is spelled.
+fn longest_consonant_run(text: &str) -> usize {
+    let mut longest = 0;
+    let mut run = 0;
+    for character in text.chars() {
+        if character.is_ascii_alphabetic() && !is_vowel(character) {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    longest
+}
+
+/// Whether `text` carries a digit that a letter follows: a digit INSIDE the value
+/// rather than a numeric suffix on a name.
+fn has_interleaved_digit(text: &str) -> bool {
+    text.chars()
+        .zip(text.chars().skip(1))
+        .any(|(left, right)| left.is_ascii_digit() && right.is_ascii_alphabetic())
 }

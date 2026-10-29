@@ -67,6 +67,8 @@ mod dedicated_ip_pools;
 mod dedicated_ip_warmup_attributes;
 #[path = "all/dedicated_ips.rs"]
 mod dedicated_ips;
+#[path = "all/email_address_insights.rs"]
+mod email_address_insights;
 #[path = "all/email_identity_certificates.rs"]
 mod email_identity_certificates;
 #[path = "all/email_identity_configuration_set_association.rs"]
