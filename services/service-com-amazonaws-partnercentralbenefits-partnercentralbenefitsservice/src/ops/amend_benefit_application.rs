@@ -2,7 +2,8 @@
 
 //! @op AmendBenefitApplication
 //! Applies a list of field amendments to one stored benefit application in
-//! [`crate::state`], bumps its revision and `UpdatedAt`, and records the amendment.
+//! [`crate::state`], bumps its revision and `UpdatedAt` where that changed the record,
+//! and records the amendment.
 //!
 //! The operation answers in this order, which is the order AWS reports:
 //!
@@ -20,6 +21,11 @@
 //!    current one, else `ConflictException`;
 //! 6. the amendments themselves, applied to a copy so that a request carrying one that
 //!    cannot be applied leaves the stored application exactly as it was.
+//!
+//! The revision is the record's optimistic-concurrency token, so it moves only when the
+//! amendments actually CHANGED the stored record
+//! ([`crate::state::BenefitApplication::revise`]): an amendment naming the value a field
+//! already holds is accepted and answers with the record left as it was.
 //!
 //! ## What a `FieldPath` may name
 //!
@@ -604,7 +610,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(AmendBenefitApplicationErrorModeled::ValidationException(refusal).into());
         }
 
-        amended.revise(now);
+        // The revision and `UpdatedAt` move only when the record actually changed, so an
+        // amendment naming the value a field already holds reports the revision the
+        // application already had — the same rule the writes beside this one apply (see
+        // [`crate::state::BenefitApplication::revise`]). The three amendable fields are
+        // the only ones `apply_amendment` writes.
+        if amended.name != application.name
+            || amended.description != application.description
+            || amended.benefit_application_details != application.benefit_application_details
+        {
+            amended.revise(now);
+        }
         amended.record_write(crate::state::AppliedWrite {
             operation: Self::NAME,
             client_token: input.client_token.clone(),

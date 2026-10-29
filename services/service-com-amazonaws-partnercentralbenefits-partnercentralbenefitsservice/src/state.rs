@@ -2219,6 +2219,17 @@ pub fn fingerprint_value<T: FingerprintValue>(value: &T) -> Document {
     value.fingerprint_document()
 }
 
+/// Whether two values of one modelled shape are the SAME value, compared through the
+/// canonical document each renders as ([`fingerprint_value`]) so the comparison does not
+/// depend on how the value was spelled.
+///
+/// What a write needs to tell a change from a no-op: a member carrying the value the
+/// record already holds changes nothing, and a change is what moves the revision (see
+/// [`BenefitApplication::revise`]).
+pub fn same_value<T: FingerprintValue>(stored: &T, supplied: &T) -> bool {
+    stored.fingerprint_document() == supplied.fingerprint_document()
+}
+
 /// The fingerprint of one request's parameters: the identity a repeated `ClientToken` is
 /// judged against, so a token already spent replays its first answer only for the SAME
 /// request.
@@ -2561,6 +2572,25 @@ pub fn file_detail(input: &FileInput, created_by: &str, now_millis: i64) -> File
         created_by: Some(created_by.to_string()),
         created_at: Some(timestamp(now_millis)),
     }
+}
+
+/// Whether `stored` already holds exactly the files `supplied` names, in the same order.
+///
+/// A file's caller-supplied content is its `FileURI` and `BusinessUseCase`, and the
+/// `FileName`/`FileType` beside them follow the URI (see [`file_detail`]), so two
+/// attachments naming the same URI and use case are the same attachment; `CreatedBy` and
+/// `CreatedAt` record WHO attached that file and WHEN rather than what was attached, so
+/// they are not part of what the caller can change. A request re-sending the files an
+/// application already carries therefore changes nothing.
+pub fn same_file_details(stored: &[FileDetail], supplied: &[FileInput]) -> bool {
+    stored.len() == supplied.len()
+        && stored
+            .iter()
+            .zip(supplied)
+            .all(|(stored, supplied)| {
+                stored.file_uri == supplied.file_uri
+                    && stored.business_use_case == supplied.business_use_case
+            })
 }
 
 /// The last path segment of `uri`, which is the file's name, with any query or fragment

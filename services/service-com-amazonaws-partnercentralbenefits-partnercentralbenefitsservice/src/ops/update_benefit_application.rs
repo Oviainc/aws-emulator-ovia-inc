@@ -2,7 +2,15 @@
 
 //! @op UpdateBenefitApplication
 //! Applies the supplied members to one stored benefit application in [`crate::state`],
-//! bumps its revision and `UpdatedAt`, and reports the new revision.
+//! bumps its revision and `UpdatedAt` where that changed the record, and reports the
+//! revision the record then holds.
+//!
+//! The revision is the record's optimistic-concurrency token, so it moves only when the
+//! write actually CHANGED the stored record ([`crate::state::BenefitApplication::revise`]):
+//! a request that names no member to apply, or names only values the record already
+//! holds, is accepted and answers with the revision and `UpdatedAt` it already had —
+//! exactly as `crate::ops::associate_benefit_application_resource` answers a request
+//! naming a resource the application already carries.
 //!
 //! An update edits the partner's own DRAFT: it is accepted only while the application is
 //! `PENDING_SUBMISSION` ([`crate::state::UPDATABLE_STATUSES`]), and from any other status
@@ -387,34 +395,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Only the members the request carried are applied: an absent one leaves the
-        // stored value alone, which is what lets a caller update one field without
-        // having to resend the rest. Each one applied is named on the write record below.
+        // Only the members the request carried are applied, and only where the value the
+        // request names is not the one the record already holds: an absent member leaves
+        // the stored value alone, which is what lets a caller update one field without
+        // having to resend the rest, and a member carrying the stored value writes
+        // nothing. Each member this request CHANGED is named on the write record below.
         let mut applied_members: Vec<String> = Vec::new();
         if let Some(name) = input.name {
-            application.name = Some(name);
-            applied_members.push(MEMBER_NAME.to_string());
+            if application.name.as_deref() != Some(name.as_str()) {
+                application.name = Some(name);
+                applied_members.push(MEMBER_NAME.to_string());
+            }
         }
         if let Some(description) = input.description {
-            application.description = Some(description);
-            applied_members.push(MEMBER_DESCRIPTION.to_string());
+            if application.description.as_deref() != Some(description.as_str()) {
+                application.description = Some(description);
+                applied_members.push(MEMBER_DESCRIPTION.to_string());
+            }
         }
         if let Some(details) = input.benefit_application_details {
-            application.benefit_application_details = Some(details);
-            applied_members.push(MEMBER_DETAILS.to_string());
+            if application.benefit_application_details.as_ref() != Some(&details) {
+                application.benefit_application_details = Some(details);
+                applied_members.push(MEMBER_DETAILS.to_string());
+            }
         }
         if let Some(contacts) = input.partner_contacts {
-            application.partner_contacts = contacts;
-            applied_members.push(MEMBER_PARTNER_CONTACTS.to_string());
+            if !crate::state::same_value(&application.partner_contacts, &contacts) {
+                application.partner_contacts = contacts;
+                applied_members.push(MEMBER_PARTNER_CONTACTS.to_string());
+            }
         }
         if let Some(files) = input.file_details {
-            application.file_details = files
-                .iter()
-                .map(|file| crate::state::file_detail(file, &principal, now))
-                .collect();
-            applied_members.push(MEMBER_FILE_DETAILS.to_string());
+            // An attachment is the file the caller named, so a request re-sending the
+            // files the application already carries attaches nothing a second time and
+            // leaves the `CreatedBy`/`CreatedAt` the first attachment recorded — see
+            // [`crate::state::same_file_details`].
+            if !crate::state::same_file_details(&application.file_details, &files) {
+                application.file_details = files
+                    .iter()
+                    .map(|file| crate::state::file_detail(file, &principal, now))
+                    .collect();
+                applied_members.push(MEMBER_FILE_DETAILS.to_string());
+            }
         }
-        application.revise(now);
+
+        // The revision and `UpdatedAt` move only when the record actually changed, so an
+        // update that applied nothing — one naming no member, or naming only values the
+        // record already holds — reports the revision it already had and leaves the
+        // idempotency window a preceding recall opened open (see
+        // [`crate::state::BenefitApplication::revise`]).
+        if !applied_members.is_empty() {
+            application.revise(now);
+        }
 
         // What this call reported, kept so a retry carrying the same `ClientToken`
         // answers it again. The token is at most
