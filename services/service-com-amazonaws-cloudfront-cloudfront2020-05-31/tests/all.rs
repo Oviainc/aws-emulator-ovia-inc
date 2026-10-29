@@ -37,6 +37,8 @@ mod connection_function_delete;
 mod connection_function_lifecycle;
 #[path = "all/connection_function_list.rs"]
 mod connection_function_list;
+#[path = "all/connection_function_not_found_message.rs"]
+mod connection_function_not_found_message;
 #[path = "all/connection_function_publish.rs"]
 mod connection_function_publish;
 #[path = "all/connection_group_by_routing_endpoint.rs"]

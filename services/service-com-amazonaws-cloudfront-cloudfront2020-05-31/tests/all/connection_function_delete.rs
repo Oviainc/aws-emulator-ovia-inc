@@ -58,9 +58,11 @@ const STAGE_LIVE: &str = "LIVE";
 const ENTITY_NOT_FOUND: &str = "EntityNotFound";
 const NO_SUCH_RESOURCE: &str = "NoSuchResource";
 
-/// The sentence the model documents on `EntityNotFound` (`smithy_query(query="doc",
-/// shape="EntityNotFound")`), which every not-found refusal of this surface opens with.
-const ENTITY_NOT_FOUND_SENTENCE: &str = "The entity was not found.";
+/// The sentence CloudFront refuses a connection function it does not hold with — the whole
+/// of it, carrying no identifier and no stage — spelled out here so a wrong constant in the
+/// crate cannot make these assertions pass.
+const CONNECTION_FUNCTION_NOT_FOUND_SENTENCE: &str =
+    "The specified connection function does not exist.";
 
 /// The sentence the model documents on `CannotDeleteEntityWhileInUse`
 /// (`smithy_query(query="doc", shape="CannotDeleteEntityWhileInUse")`), spelled out here so a
@@ -78,7 +80,10 @@ const UNHELD_VERSION_TOKEN: &str = "E1ABCDEFGHIJKL";
 
 /// `DELETE /2020-05-31/connection-function/{Id}`, carrying `if_match` as the `If-Match`
 /// header the operation binds its required `IfMatch` member to.
-async fn delete_connection_function(
+///
+/// `pub(crate)` so the suite that asserts the wording of this surface's refusals drives the
+/// delete through this one call path rather than a second copy of it.
+pub(crate) async fn delete_connection_function(
     router: &MultiServiceRouter,
     id: &str,
     if_match: &str,
@@ -173,9 +178,9 @@ async fn assert_gone(router: &MultiServiceRouter, created: &Created, name: &str,
             described.raw
         );
         let message = described.root().find_text("Message").unwrap_or_default();
-        assert!(
-            message.starts_with(ENTITY_NOT_FOUND_SENTENCE.trim_end_matches('.')),
-            "case {case}: expected the modelled not-found sentence describing {stage:?}, got \
+        assert_eq!(
+            message, CONNECTION_FUNCTION_NOT_FOUND_SENTENCE,
+            "case {case}: expected the fixed not-found sentence describing {stage:?}, got \
              {message:?}"
         );
     }
@@ -528,9 +533,9 @@ async fn an_id_no_connection_function_answers_to_is_not_found() {
                 answer.raw
             );
             let message = answer.root().find_text("Message").unwrap_or_default();
-            assert!(
-                message.starts_with(ENTITY_NOT_FOUND_SENTENCE.trim_end_matches('.')),
-                "case {case} / {token_case}: expected the modelled not-found sentence, got \
+            assert_eq!(
+                message, CONNECTION_FUNCTION_NOT_FOUND_SENTENCE,
+                "case {case} / {token_case}: expected the fixed not-found sentence, got \
                  {message:?}"
             );
         }

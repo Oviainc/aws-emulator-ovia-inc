@@ -113,7 +113,14 @@ pub(crate) fn config_xml(caller_reference: &str, attached: Option<&str>) -> Stri
 /// One `ListDistributionsByConnectionFunction` call: `GET
 /// /2020-05-31/distributionsByConnectionFunction` with the identifier and the paging query
 /// the caller names.
-async fn list_by_function(router: &MultiServiceRouter, identifier: &str, query: &str) -> Answer {
+///
+/// `pub(crate)` so the suite that asserts the wording of the connection function refusals
+/// reaches this operation through this one call path rather than a second copy of it.
+pub(crate) async fn list_by_function(
+    router: &MultiServiceRouter,
+    identifier: &str,
+    query: &str,
+) -> Answer {
     call(
         router,
         "GET",
@@ -508,15 +515,19 @@ async fn an_identifier_naming_no_connection_function_is_not_found() {
             "case {case}: expected EntityNotFound, got {}",
             answer.raw
         );
-        assert!(
-            answer.raw.contains("The entity was not found"),
-            "case {case}: expected the sentence the model states on the shape, got {}",
-            answer.raw
+        let message = answer
+            .root()
+            .find_text("Message")
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            message, "The specified connection function does not exist.",
+            "case {case}: expected the fixed not-found sentence, got {message:?}"
         );
         assert!(
-            answer.raw.contains(identifier.as_str()),
-            "case {case}: expected the refusal to name the identifier {identifier:?}, got {}",
-            answer.raw
+            !message.contains(identifier.as_str()),
+            "case {case}: the refusal must not name the identifier {identifier:?}, got \
+             {message:?}"
         );
     }
 }

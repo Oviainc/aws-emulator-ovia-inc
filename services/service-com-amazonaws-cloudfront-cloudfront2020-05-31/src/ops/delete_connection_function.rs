@@ -187,10 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // its create minted, which is the key the record is held under, so no other
         // identifier names a connection function to delete. An id the store holds nothing
         // under is answered BEFORE the precondition, which can only be checked against a
-        // stored version.
+        // stored version, with the one fixed sentence this service words that condition
+        // with — it carries no part of the request.
         let Some(stored) = store.connection_functions.get(&input.id) else {
             return Err(DeleteConnectionFunctionErrorModeled::EntityNotFound(
-                crate::state::connection_function_identifier_not_found(&input.id),
+                crate::state::connection_function_not_found(),
             )
             .into());
         };

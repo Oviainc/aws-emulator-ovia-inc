@@ -195,9 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(function) = store.connection_function(&input.connection_function_identifier)
         else {
             return Err(ListDistributionsByConnectionFunctionErrorModeled::EntityNotFound(
-                crate::state::connection_function_identifier_not_found(
-                    &input.connection_function_identifier,
-                ),
+                crate::state::connection_function_not_found(),
             )
             .into());
         };

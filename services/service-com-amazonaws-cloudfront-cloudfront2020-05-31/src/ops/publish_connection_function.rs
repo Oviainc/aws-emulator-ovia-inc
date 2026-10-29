@@ -156,23 +156,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
-        // The stage a publish READS and copies from is the one a connection function is
-        // created in, so the version token the precondition is checked against is that
-        // stage's: `IfMatch` is "The current version (ETag value) of the connection
-        // function", which a describe of that stage hands back.
-        let published_from = crate::state::DEFAULT_FUNCTION_STAGE;
-
         // "The connection function ID": this operation addresses the resource by the id its
         // create minted, which is the key the record is held under — an id no connection
         // function answers to names no resource to publish, and is answered before the
-        // precondition, which can only be checked against a stored version.
+        // precondition, which can only be checked against a stored version. The stage a
+        // publish READS and copies from is the one a connection function is created in
+        // (`crate::state::DEFAULT_FUNCTION_STAGE`), so the version token the precondition is
+        // checked against is that stage's: `IfMatch` is "The current version (ETag value) of
+        // the connection function", which a describe of that stage hands back.
         let Some(current_etag) = store
             .connection_functions
             .get(&input.id)
             .map(|function| function.development.etag.clone())
         else {
             return Err(PublishConnectionFunctionErrorModeled::EntityNotFound(
-                crate::state::connection_function_not_found(&input.id, published_from),
+                crate::state::connection_function_not_found(),
             )
             .into());
         };
@@ -202,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same configuration, status, stage and timestamps.
         let Some(summary) = store.publish_connection_function(&input.id, now) else {
             return Err(PublishConnectionFunctionErrorModeled::EntityNotFound(
-                crate::state::connection_function_not_found(&input.id, published_from),
+                crate::state::connection_function_not_found(),
             )
             .into());
         };

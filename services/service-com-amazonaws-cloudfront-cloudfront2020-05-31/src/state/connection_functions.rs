@@ -321,35 +321,29 @@ pub fn connection_function_path(id: &str) -> String {
     format!("/2020-05-31/connection-function/{id}")
 }
 
-/// The modelled `EntityNotFound` (HTTP 404) for a connection function stage no stored
-/// connection function has — either no connection function answering to that identifier, or
-/// one that has never been published to the stage the request names.
+/// The sentence a connection function this store does not hold is refused with, in the form
+/// CloudFront words a missing named resource — "The specified <resource> does not exist.",
+/// as [`super::CONNECTION_GROUP_NOT_FOUND_MESSAGE`] and
+/// [`super::NO_SUCH_FUNCTION_EXISTS_MESSAGE`] carry it for the neighbouring resource kinds;
+/// the shape's own documentation states only its shorter generic form.
 ///
-/// The sentence is the one the model states on the shape — "The entity was not found." —
-/// followed by which identifier and stage was asked for, which is built from the request and
-/// is what tells a caller whether it addressed the wrong resource or the wrong stage.
-pub fn connection_function_not_found(identifier: &str, stage: &str) -> EntityNotFound {
-    EntityNotFound {
-        message: Some(format!(
-            "The entity was not found: no connection function {identifier} in the {stage} stage"
-        )),
-    }
-}
+/// The WHOLE sentence is fixed: what the refusal states is that no such connection function
+/// exists, which is a property of the store rather than of the value submitted, so neither
+/// the identifier asked about nor the stage it was asked for is any part of it.
+pub const CONNECTION_FUNCTION_NOT_FOUND_MESSAGE: &str =
+    "The specified connection function does not exist.";
 
-/// The modelled `EntityNotFound` (HTTP 404) for an identifier no stored connection function
-/// answers to — neither by its id, nor by the name it was created under, nor by the ARN
-/// minted for it.
+/// The modelled `EntityNotFound` (HTTP 404) for a connection function this store does not
+/// hold — no connection function answering to the identifier (by its id, by the name it was
+/// created under or by the ARN minted for it), or one that has never been published to the
+/// stage the request names.
 ///
-/// The sentence is the one the model states on the shape — "The entity was not found." —
-/// followed by the identifier that was asked for, which is built from the request and is
-/// what tells a caller which resource was addressed. Where a read also names a STAGE, the
-/// refusal that names it ([`connection_function_not_found`]) is the one to answer with.
-pub fn connection_function_identifier_not_found(identifier: &str) -> EntityNotFound {
+/// Takes neither identifier nor stage, so every connection function read and every
+/// connection function mutation refuses this condition with the one fixed sentence
+/// ([`CONNECTION_FUNCTION_NOT_FOUND_MESSAGE`]).
+pub fn connection_function_not_found() -> EntityNotFound {
     EntityNotFound {
-        message: Some(format!(
-            "The entity was not found: no connection function {identifier} in this Amazon Web \
-             Services account"
-        )),
+        message: Some(CONNECTION_FUNCTION_NOT_FOUND_MESSAGE.to_string()),
     }
 }
 

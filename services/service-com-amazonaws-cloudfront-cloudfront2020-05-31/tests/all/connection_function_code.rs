@@ -60,6 +60,12 @@ const BLOB_MEDIA_TYPE: &str = "application/octet-stream";
 /// that is not there (`EntityNotFound`, HTTP 404).
 const ENTITY_NOT_FOUND: &str = "EntityNotFound";
 
+/// The sentence CloudFront refuses a connection function it does not hold with — the whole
+/// of it, carrying no identifier and no stage — spelled out here so a wrong constant in the
+/// crate cannot make these assertions pass.
+const CONNECTION_FUNCTION_NOT_FOUND_SENTENCE: &str =
+    "The specified connection function does not exist.";
+
 // ---------------------------------------------------------------------------
 // Calling the code read
 // ---------------------------------------------------------------------------
@@ -336,8 +342,8 @@ async fn the_live_stage_serves_code_only_after_a_publish() {
 
 /// A connection function stage this service does not hold is the modelled `EntityNotFound`
 /// (HTTP 404), whatever identifier namespace the request addressed it in and whatever stage
-/// it named — and the sentence names the identifier and the stage that was asked for, so a
-/// caller can tell which of the two it got wrong.
+/// it named — and the sentence is the fixed one for the condition, carrying neither the
+/// identifier nor the stage that was asked for.
 #[tokio::test]
 async fn a_stage_the_service_does_not_hold_is_not_found() {
     let router = emulator();
@@ -398,14 +404,15 @@ async fn a_stage_the_service_does_not_hold_is_not_found() {
             .find_text("Message")
             .unwrap_or_default()
             .to_string();
-        assert!(
-            message.starts_with("The entity was not found"),
-            "case {case}: expected the sentence the model states on the shape, got {message:?}"
+        assert_eq!(
+            message, CONNECTION_FUNCTION_NOT_FOUND_SENTENCE,
+            "case {case}: expected the fixed not-found sentence, got {message:?}"
         );
         assert!(
-            message.contains(&identifier) && message.contains(stage.unwrap_or(STAGE_DEVELOPMENT)),
-            "case {case}: expected the identifier and the stage that was asked for in the \
-             message, got {message:?}"
+            !message.contains(&identifier)
+                && !message.contains(stage.unwrap_or(STAGE_DEVELOPMENT)),
+            "case {case}: the refusal must carry neither the identifier nor the stage, got \
+             {message:?}"
         );
     }
 }

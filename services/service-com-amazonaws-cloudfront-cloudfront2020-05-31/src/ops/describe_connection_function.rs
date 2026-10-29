@@ -160,13 +160,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An identifier no connection function answers to, and a stage a connection
         // function has not been published to, are the same thing to the caller: the entity
-        // it asked for was not found.
+        // it asked for was not found, refused with the one fixed sentence this service
+        // words that condition with — it carries neither the identifier nor the stage.
         let Some((function, stage_record)) = store
             .connection_function(&input.identifier)
             .and_then(|function| Some((function, function.stage(stage)?)))
         else {
             return Err(DescribeConnectionFunctionErrorModeled::EntityNotFound(
-                crate::state::connection_function_not_found(&input.identifier, stage),
+                crate::state::connection_function_not_found(),
             )
             .into());
         };
