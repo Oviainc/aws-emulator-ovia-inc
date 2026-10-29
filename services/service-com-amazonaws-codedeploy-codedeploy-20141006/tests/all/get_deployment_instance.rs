@@ -33,7 +33,9 @@ use crate::list_deployment_targets::{deploy, force_status, group_with, register}
 
 /// The same on-premises selector, deployed blue/green — the only deployment
 /// style whose instances belong to an environment at all.
-fn deployable_blue_green() -> Value {
+///
+/// `pub(crate)` for the same reason as [`summary_of`].
+pub(crate) fn deployable_blue_green() -> Value {
     let mut extras = deployable();
     extras["deploymentStyle"] =
         json!({"deploymentType": "BLUE_GREEN", "deploymentOption": "WITH_TRAFFIC_CONTROL"});
@@ -41,7 +43,11 @@ fn deployable_blue_green() -> Value {
 }
 
 /// The `instanceSummary` of a successful `GetDeploymentInstance` answer.
-async fn summary_of(emulator: &Emulator, deployment_id: &str, instance_id: &str) -> Value {
+///
+/// `pub(crate)` because [`super::batch_get_deployment_instances`] pins the batch
+/// reader against this one answer for answer; there is one helper for reading an
+/// instance, not one per suite.
+pub(crate) async fn summary_of(emulator: &Emulator, deployment_id: &str, instance_id: &str) -> Value {
     emulator
         .ok(
             "GetDeploymentInstance",

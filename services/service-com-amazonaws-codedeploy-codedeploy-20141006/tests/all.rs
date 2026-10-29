@@ -17,6 +17,8 @@ mod application_revisions;
 mod batch_get_application_revisions;
 #[path = "all/batch_get_applications.rs"]
 mod batch_get_applications;
+#[path = "all/batch_get_deployment_instances.rs"]
+mod batch_get_deployment_instances;
 #[path = "all/batch_get_deployments.rs"]
 mod batch_get_deployments;
 #[path = "all/client_error_messages.rs"]

@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetDeploymentInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetDeploymentInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers one `InstanceSummary` per instance of the deployment the request
+//! names, in the order it named them, from the deployment's own record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetDeploymentInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the instance-shaped BATCH reader of the very records
+//! `BatchGetDeploymentTargets` answers (the model: "This method works, but is
+//! deprecated. Use BatchGetDeploymentTargets instead"), and it goes through the
+//! same lookup ([`crate::state::find_deployment_target`]) and the same instance
+//! builder ([`crate::state::instance_summary`]) the single-instance reader
+//! `GetDeploymentInstance` goes through, so an instance reads the same whichever
+//! of the two a client asks.
+//!
+//! Instances are what only the EC2/on-premises and Lambda compute platforms
+//! have, so a deployment on any other platform is refused with
+//! `InvalidComputePlatformException`; see
+//! [`crate::state::platform_reports_instances`]. Like the other batch readers of
+//! this service, and unlike `BatchGetDeploymentTargets`, this one models no
+//! does-not-exist error for the ids it takes, so an id the deployment holds no
+//! instance under is simply absent from the answer rather than refusing the
+//! whole batch.
+//!
+//! This operation models no `DeploymentNotStartedException` either, so a
+//! deployment the clock has not started yet is REPORTED rather than refused: its
+//! instances are `Pending`, which is what `InstanceStatus` documents for them
+//! ("Pending: The deployment is pending for this instance").
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +176,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetDeploymentInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetDeploymentInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetDeploymentInstances"))
+        let _ = ctx;
+        let deployment_id = input.deployment_id;
+        let instance_ids = input.instance_ids;
+
+        // The deployment id's FORMAT is gated before anything is looked up, so
+        // "that is not an id" and "no deployment has that id" stay two different
+        // answers, as they are everywhere else in this service.
+        if deployment_id.trim().is_empty() {
+            return Err(
+                BatchGetDeploymentInstancesErrorModeled::DeploymentIdRequiredException(
+                    DeploymentIdRequiredException {
+                        message: Some(crate::state::DEPLOYMENT_ID_MISSING.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        if !crate::state::deployment_id_is_well_formed(&deployment_id) {
+            return Err(
+                BatchGetDeploymentInstancesErrorModeled::InvalidDeploymentIdException(
+                    InvalidDeploymentIdException {
+                        message: Some(crate::state::malformed_deployment_id_message(
+                            &deployment_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The batch bound is a property of the REQUEST as a whole, so it is
+        // answered before any id in it is examined: a caller that sent too many
+        // ids learns that, rather than learning that one of them is malformed.
+        // The quota is the one `BatchLimitExceededException` states for every
+        // batch reader of this service (`crate::state::MAX_BATCH_SIZE`), so this
+        // reader accepts the batch sizes its siblings accept.
+        if instance_ids.len() > crate::state::MAX_BATCH_SIZE {
+            return Err(
+                BatchGetDeploymentInstancesErrorModeled::BatchLimitExceededException(
+                    BatchLimitExceededException {
+                        message: Some(crate::state::batch_limit_exceeded_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `instanceIds` is @required but carries no modelled length, so an empty
+        // list — and an empty id inside a non-empty list — both reach the
+        // handler, and both are "you did not give me this instance id":
+        // `InstanceIdRequiredException`. Any other way a value falls outside the
+        // form an instance is reported under is `InvalidInstanceNameException` —
+        // the same two refusals, in the same order, as the single-instance
+        // reader `GetDeploymentInstance` answers for its `instanceId`.
+        if instance_ids.is_empty() {
+            return Err(
+                BatchGetDeploymentInstancesErrorModeled::InstanceIdRequiredException(
+                    InstanceIdRequiredException {
+                        message: Some(crate::state::INSTANCE_ID_MISSING.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        for instance_id in &instance_ids {
+            match crate::state::check_instance_name(instance_id) {
+                Ok(()) => {}
+                Err(crate::state::NameRefusal::Missing) => {
+                    return Err(
+                        BatchGetDeploymentInstancesErrorModeled::InstanceIdRequiredException(
+                            InstanceIdRequiredException {
+                                message: Some(crate::state::INSTANCE_ID_MISSING.to_string()),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                Err(refusal) => {
+                    return Err(
+                        BatchGetDeploymentInstancesErrorModeled::InvalidInstanceNameException(
+                            InvalidInstanceNameException {
+                                message: Some(
+                                    crate::state::invalid_instance_name_message(refusal)
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        // The instances come from the deployment's own record — the snapshot its
+        // deployment group resolved when it was created — and their status from
+        // how far that deployment has got, which `with_state` has already
+        // brought up to the instants the clock owed it.
+        let outcome = crate::state::with_state(&*self.engine, |state| {
+            let Some(deployment) = state.deployments.get(&deployment_id) else {
+                return Err(
+                    BatchGetDeploymentInstancesErrorModeled::DeploymentDoesNotExistException(
+                        DeploymentDoesNotExistException {
+                            message: Some(crate::state::deployment_not_found(&deployment_id)),
+                        },
+                    ),
+                );
+            };
+            // Whether this operation applies to the deployment AT ALL is
+            // answered before any instance is looked up: a deployment on a
+            // compute platform that has no instances has none to report
+            // whatever a caller asks for.
+            if !crate::state::platform_reports_instances(&deployment.compute_platform) {
+                return Err(
+                    BatchGetDeploymentInstancesErrorModeled::InvalidComputePlatformException(
+                        InvalidComputePlatformException {
+                            message: Some(crate::state::instances_not_reported_for_platform(
+                                &deployment.compute_platform,
+                            )),
+                        },
+                    ),
+                );
+            }
+            // One entry per id the deployment holds an instance under, in the
+            // order the request named them — so a repeated id is answered at
+            // each position it appears at. A well-formed id the deployment
+            // resolved no instance under is simply absent from the answer: this
+            // operation models no does-not-exist error for its ids, so an
+            // unknown one cannot be reported as one and does not refuse the
+            // batch, exactly as the other batch readers of this service do.
+            Ok(instance_ids
+                .iter()
+                .filter_map(|instance_id| {
+                    crate::state::find_deployment_target(deployment, instance_id)
+                })
+                .map(|target| crate::state::instance_summary(deployment, target))
+                .collect::<Vec<_>>())
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        Ok(BatchGetDeploymentInstancesOutput {
+            // `errorMessage` reports "errors that might have occurred during the
+            // API call": this batch either reports the instances the deployment
+            // holds or is refused outright with the modelled error for why, so
+            // there is no partial failure left to describe here.
+            error_message: None,
+            instances_summary: Some(outcome?),
+        })
     }
 }
