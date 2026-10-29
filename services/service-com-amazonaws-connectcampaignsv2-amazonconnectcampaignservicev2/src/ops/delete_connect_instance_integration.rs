@@ -183,6 +183,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "integrationIdentifier",
             &input.integration_identifier,
         ) {
+            // A refused attempt to change the instance is still an attempt to change
+            // it, so it leaves the same record an accepted one does, naming the
+            // outcome it ended in.
+            crate::state::audit_onboarding_change(
+                ctx.parts(),
+                Self::NAME,
+                &input.connect_instance_id,
+                "ValidationException",
+            );
             return Err(
                 DeleteConnectInstanceIntegrationErrorModeled::ValidationException(
                     ValidationException {
@@ -195,6 +204,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The attempt ended in a modelled server error rather than in a change,
+            // which the trail records as it records every other outcome this call can
+            // return through.
+            crate::state::audit_onboarding_change(
+                ctx.parts(),
+                Self::NAME,
+                &input.connect_instance_id,
+                "InternalServerException",
+            );
             return Err(
                 DeleteConnectInstanceIntegrationErrorModeled::InternalServerException(
                     InternalServerException {
@@ -244,6 +262,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
             Some(crate::state::InstanceRegistryRefusal::Unavailable) => {
+                // Also an outcome of an attempted change, so also recorded.
+                crate::state::audit_onboarding_change(
+                    ctx.parts(),
+                    Self::NAME,
+                    &input.connect_instance_id,
+                    "InternalServerException",
+                );
                 return Err(
                     DeleteConnectInstanceIntegrationErrorModeled::InternalServerException(
                         InternalServerException {

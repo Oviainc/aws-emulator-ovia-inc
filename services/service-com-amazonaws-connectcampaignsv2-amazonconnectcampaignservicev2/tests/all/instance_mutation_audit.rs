@@ -21,7 +21,9 @@
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::ONBOARDING_JOB_DURATION;
+use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
+    MAX_COMMUNICATION_LIMITS, ONBOARDING_JOB_DURATION,
+};
 
 use super::common::{call, error_code, router, Harness};
 
@@ -73,6 +75,29 @@ fn limits_body() -> Value {
         "communicationLimitsList": [
             {"maxCountPerRecipient": 3, "frequency": 1, "unit": "DAY"},
         ],
+    }}})
+}
+
+/// An instance-wide communication-limits config carrying one entry MORE than
+/// `communicationLimitsList` admits — the list's modelled `@length` maximum, which
+/// the crate restates once as `state::MAX_COMMUNICATION_LIMITS`. A union member's
+/// `@length` is one the boundary walk does not reach, so this is the handler's own
+/// refusal, taken before the instance is looked up.
+fn over_long_limits_body() -> Value {
+    let entries: Vec<Value> = (0..=MAX_COMMUNICATION_LIMITS)
+        .map(|index| json!({"maxCountPerRecipient": index + 1, "frequency": 1, "unit": "DAY"}))
+        .collect();
+    json!({"communicationLimitsConfig": {"allChannelSubtypes": {
+        "communicationLimitsList": entries,
+    }}})
+}
+
+/// An `IntegrationIdentifier` whose Lambda ARN is outside `LambdaArn`'s `@pattern` —
+/// its account field is not twelve digits. The ARN is also what no audit record may
+/// repeat.
+fn malformed_integration_identifier() -> Value {
+    json!({"integrationIdentifier": {"lambda": {
+        "functionArn": "arn:aws:lambda:us-east-1:123:function:short-account",
     }}})
 }
 
@@ -170,6 +195,31 @@ fn rows() -> Vec<Row> {
             )),
         },
         Row {
+            case: "instance limits refused: more limits than the list admits",
+            instance: "audit-limits-too-many",
+            setup: Setup::Onboarded,
+            method: "PUT",
+            path: "/communication-limits",
+            body: over_long_limits_body(),
+            status: 400,
+            error: Some("ValidationException"),
+            record: Some(("PutInstanceCommunicationLimits", "ValidationException")),
+        },
+        // The same refusal on an instance this service holds nothing for: the
+        // over-long list is weighed before the instance is resolved, so the attempt
+        // ends in the bad request and is recorded as that outcome and no other.
+        Row {
+            case: "instance limits refused: more limits than the list admits, no configuration",
+            instance: "audit-limits-too-many-missing",
+            setup: Setup::Fresh,
+            method: "PUT",
+            path: "/communication-limits",
+            body: over_long_limits_body(),
+            status: 400,
+            error: Some("ValidationException"),
+            record: Some(("PutInstanceCommunicationLimits", "ValidationException")),
+        },
+        Row {
             case: "integration accepted",
             instance: "audit-integration-ok",
             setup: Setup::Onboarded,
@@ -215,6 +265,22 @@ fn rows() -> Vec<Row> {
                 "DeleteConnectInstanceIntegration",
                 "ResourceNotFoundException",
             )),
+        },
+        // The identifier's ARN is judged off the generated schema of the structure
+        // behind the union member, so the boundary validator refuses it BEFORE the
+        // handler runs: the request never reaches an instance mutation, which is why it
+        // leaves no record of one — unlike the over-long list above, whose `@length`
+        // sits on the union member itself and so is the handler's own refusal.
+        Row {
+            case: "integration delete refused at the boundary: an ARN outside the modelled bounds",
+            instance: "audit-integration-delete-bad-arn",
+            setup: Setup::Onboarded,
+            method: "POST",
+            path: "/integrations/delete",
+            body: malformed_integration_identifier(),
+            status: 400,
+            error: Some("ValidationException"),
+            record: None,
         },
         Row {
             case: "config delete accepted",
@@ -478,11 +544,12 @@ async fn a_repeated_refusal_is_recorded_once_per_attempt() {
     start_onboarding(&router, instance, "repeated refusals").await;
     tokio::time::sleep(ONBOARDING_JOB_DURATION + std::time::Duration::from_millis(150)).await;
 
-    for (case, method, path, status, operation, outcome) in [
+    for (case, method, path, request, status, operation, outcome) in [
         (
             "onboarding job delete of a job that has not failed",
             "DELETE",
             "/onboarding",
+            Value::Null,
             409u16,
             "DeleteInstanceOnboardingJob",
             "InvalidStateException",
@@ -491,9 +558,19 @@ async fn a_repeated_refusal_is_recorded_once_per_attempt() {
             "config delete of an instance with no configuration",
             "DELETE",
             "/config",
+            Value::Null,
             404u16,
             "DeleteConnectInstanceConfig",
             "ResourceNotFoundException",
+        ),
+        (
+            "instance limits carrying more limits than the list admits",
+            "PUT",
+            "/communication-limits",
+            over_long_limits_body(),
+            400u16,
+            "PutInstanceCommunicationLimits",
+            "ValidationException",
         ),
     ] {
         // The configuration delete rows run against an instance that has none: a
@@ -510,7 +587,7 @@ async fn a_repeated_refusal_is_recorded_once_per_attempt() {
                 REGION,
                 method,
                 &format!("/v2/connect-instance/{target}{path}"),
-                &Value::Null,
+                &request,
             )
             .await;
             assert_eq!(

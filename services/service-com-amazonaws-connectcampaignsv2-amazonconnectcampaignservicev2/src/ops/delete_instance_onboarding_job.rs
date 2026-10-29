@@ -166,6 +166,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The attempt ended in a modelled server error rather than in a change,
+            // which the trail records as it records every other outcome this call can
+            // return through.
+            crate::state::audit_onboarding_change(
+                ctx.parts(),
+                Self::NAME,
+                &input.connect_instance_id,
+                "InternalServerException",
+            );
             return Err(DeleteInstanceOnboardingJobErrorModeled::InternalServerException(
                 InternalServerException {
                     message: "the ConnectCampaignsV2 instance onboarding store is unavailable"
