@@ -74,7 +74,12 @@ pub const DEFAULT_LANGUAGE_CODE: &str = "en-US";
 /// The primary language subtag of a `LanguageCode` — `en` of `en-GB` — which is
 /// what makes a code with no stored translation resolve to another variant of
 /// the same language rather than straight to the base text.
-fn primary_subtag(language_code: &str) -> &str {
+///
+/// This crate's one statement of when two `LanguageCode` values name the SAME
+/// language: [`LocalizedText::in_language`] resolves a requested code with it,
+/// so both activity readers group codes by it, and the suites that pin that
+/// grouping call it here instead of restating it.
+pub fn primary_subtag(language_code: &str) -> &str {
     language_code
         .split_once('-')
         .map_or(language_code, |(primary, _)| primary)

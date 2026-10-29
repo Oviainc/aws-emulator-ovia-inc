@@ -21,6 +21,8 @@ mod date_time_wire_form;
 mod dimension_decode;
 #[path = "all/free_tier.rs"]
 mod free_tier;
+#[path = "all/language_code_subtag_rule.rs"]
+mod language_code_subtag_rule;
 #[path = "all/refused_request_media_type.rs"]
 mod refused_request_media_type;
 #[path = "all/resource_not_found_status.rs"]

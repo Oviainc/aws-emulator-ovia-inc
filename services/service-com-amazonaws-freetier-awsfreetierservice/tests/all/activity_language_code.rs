@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_freetier_awsfreetierservice::ops::types::LANGUAGE_CODE_VALUES;
+use service_com_amazonaws_freetier_awsfreetierservice::state::primary_subtag;
 use service_com_amazonaws_freetier_awsfreetierservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -153,14 +154,6 @@ fn untranslated(payload: &Value) -> Value {
         object.remove(member);
     }
     stripped
-}
-
-/// The primary language subtag of a `LanguageCode` — `en` of `en-GB` — which is
-/// what makes two codes name the same language.
-fn primary_subtag(language_code: &str) -> &str {
-    language_code
-        .split_once('-')
-        .map_or(language_code, |(primary, _)| primary)
 }
 
 /// `GetAccountActivity$languageCode` selects the language of the reported
