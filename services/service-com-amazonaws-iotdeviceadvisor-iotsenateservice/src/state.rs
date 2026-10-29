@@ -747,6 +747,57 @@ pub fn is_page_token_shape(token: &str) -> bool {
         && groups.iter().all(|group| group.bytes().all(is_lower_hex))
 }
 
+/// The message a listing refuses a `nextToken` it cannot have issued with.
+///
+/// One definition for the whole service, so every listing words that refusal the same way,
+/// whichever error shape the operation models for it.
+pub const INVALID_PAGE_TOKEN_MESSAGE: &str = "Invalid nextToken";
+
+/// Where one listing call starts, and how many entries the page it answers may carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageRequest {
+    /// The resource id the page resumes AT, or `None` to start from the beginning of the
+    /// listing's order.
+    pub resume_at: Option<String>,
+    /// The greatest number of entries the page may carry. Never zero, so a paging loop
+    /// always makes progress.
+    pub page_size: usize,
+}
+
+/// Decide the [`PageRequest`] the paging members of a listing request ask for.
+///
+/// The paging rule belongs to the SERVICE, not to one listing, so every paginated
+/// operation here asks this rather than restating it: an absent or empty `nextToken` starts
+/// from the beginning (`Token` is `len 0..2000`, and an empty token carries no position, so
+/// it is the same request as naming none), any other token must be one this service could
+/// have issued ([`is_page_token_shape`]), and an absent `maxResults` means one page holds
+/// everything, so it defaults to [`MAX_RESULTS_MAX`].
+///
+/// `Err` carries the message for the refusal — the caller lifts it into the modelled
+/// client-input error its own operation declares, which is how one rule serves listings
+/// with different error enums.
+pub fn page_request(
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+) -> Result<PageRequest, String> {
+    let resume_at = match next_token {
+        None | Some("") => None,
+        Some(token) if is_page_token_shape(token) => Some(token.to_string()),
+        Some(_) => return Err(INVALID_PAGE_TOKEN_MESSAGE.to_string()),
+    };
+
+    // The boundary validator has already refused a `maxResults` outside `range 1..50`;
+    // `max(1)` only keeps a paging loop terminating if it ever stops doing so.
+    let page_size = usize::try_from(max_results.unwrap_or(MAX_RESULTS_MAX))
+        .unwrap_or(1)
+        .max(1);
+
+    Ok(PageRequest {
+        resume_at,
+        page_size,
+    })
+}
+
 /// The one rule the model states in prose for `SuiteDefinitionConfiguration$rootGroup`
 /// and cannot express as a constraint: "if intendedForQualification is set to true,
 /// rootGroup can be an empty string. If intendedForQualification is false, rootGroup

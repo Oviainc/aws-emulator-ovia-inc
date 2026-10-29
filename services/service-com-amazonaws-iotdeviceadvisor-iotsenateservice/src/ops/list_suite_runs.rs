@@ -171,29 +171,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A token is a position this service handed out, never arbitrary caller text: it
-        // is the suite-run id the next page resumes AT, so one that cannot be an id this
-        // service mints is refused instead of being read as "start from the beginning".
-        // `Token` is `len 0..2000`, and an empty token carries no position, so it is the
-        // same request as naming none.
-        let resume_at = match input.next_token.as_deref() {
-            None | Some("") => None,
-            Some(token) if crate::state::is_page_token_shape(token) => Some(token.to_string()),
-            Some(_) => {
-                return Err(ListSuiteRunsErrorModeled::ValidationException(ValidationException {
-                    message: Some("Invalid nextToken".to_string()),
+        // The paging rule is the SERVICE's, decided once in `crate::state`: a token is a
+        // position this service handed out, never arbitrary caller text — here the
+        // suite-run id the next page resumes AT — and an absent `maxResults` means one page
+        // holds every matching run. A token this service cannot have issued is refused with
+        // the modelled client-input error this operation declares, carrying the message the
+        // rule names, instead of being read as "start from the beginning".
+        let crate::state::PageRequest {
+            resume_at,
+            page_size,
+        } = crate::state::page_request(input.next_token.as_deref(), input.max_results).map_err(
+            |message| {
+                ListSuiteRunsErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
                 })
-                .into());
-            }
-        };
-
-        // An absent `maxResults` means one page holds everything, so it defaults to the
-        // modelled maximum. The boundary validator has already refused anything outside
-        // `range 1..50`; `max(1)` only keeps the loop below terminating if it ever stops
-        // doing so.
-        let page_size = usize::try_from(input.max_results.unwrap_or(crate::state::MAX_RESULTS_MAX))
-            .unwrap_or(1)
-            .max(1);
+            },
+        )?;
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
