@@ -176,34 +176,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let order = store.workload_order();
-        // The cursor is start-EXCLUSIVE: the page resumes just past the last key already
-        // returned, so every workload is enumerated exactly once across the pages.
+        // The cursor is start-EXCLUSIVE: the page resumes just past the id already served,
+        // so every workload is enumerated exactly once across the pages, and a workload
+        // renamed, created or deleted between two pages moves nothing already served.
         let start = match &cursor {
-            Some(key) => order.partition_point(|candidate| candidate <= key),
+            Some(workload_id) => order.partition_point(|candidate| candidate <= workload_id),
             None => 0,
         };
 
-        let matching: Vec<&(String, String)> = order[start..]
+        let matching: Vec<&crate::state::WorkloadRecord> = order[start..]
             .iter()
-            .filter(|(name, _)| {
+            .filter_map(|workload_id| store.workloads.get(workload_id))
+            .filter(|record| {
+                // "An optional string added to the beginning of each workload name returned
+                // in the results": the member selects the workloads whose name BEGINS with
+                // it, and a request that carries no prefix asks for no filtering.
                 input
                     .workload_name_prefix
                     .as_deref()
-                    .is_none_or(|prefix| name.starts_with(prefix))
+                    .is_none_or(|prefix| record.workload_name.starts_with(prefix))
             })
             .collect();
 
         let page = &matching[..matching.len().min(page_size)];
+        // A cursor is issued only when the selection did NOT fit in this page, so the last
+        // page omits `NextToken` and a caller following it terminates.
         let next_token = match page.last() {
-            Some((name, id)) if matching.len() > page.len() => {
-                Some(crate::state::encode_next_token(name, id))
+            Some(record) if matching.len() > page.len() => {
+                Some(crate::state::encode_next_token(&record.workload_id))
             }
             _ => None,
         };
 
         let workload_summaries = page
             .iter()
-            .filter_map(|(_, id)| store.workloads.get(id))
             // Each workload's roll-up is counted over the content of the lenses IT reviews,
             // resolved from the whole lens catalog.
             .map(|record| record.to_summary(&store.reviewed_lens_content(&record.reviewed_lens_versions())))

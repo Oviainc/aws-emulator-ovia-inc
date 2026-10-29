@@ -785,7 +785,7 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
         ),
         (
             "another-list-cursor",
-            state::encode_next_token("a-workload", "0123456789abcdef0123456789abcdef"),
+            state::encode_next_token("0123456789abcdef0123456789abcdef"),
         ),
     ];
 

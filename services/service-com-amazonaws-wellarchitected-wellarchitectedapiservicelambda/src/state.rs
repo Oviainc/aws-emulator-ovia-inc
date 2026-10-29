@@ -7242,14 +7242,17 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         keys
     }
 
-    /// The service's stable list order: workload name, then id to break ties between
-    /// two names that normalize apart but sort equal.
-    pub fn workload_order(&self) -> Vec<(String, String)> {
-        let mut keys: Vec<(String, String)> = self
-            .workloads
-            .values()
-            .map(|w| (w.workload_name.clone(), w.workload_id.clone()))
-            .collect();
+    /// The stable list order `ListWorkloads` pages over: `WorkloadId`, which is also what
+    /// [`Self::workloads`] is keyed by.
+    ///
+    /// The model publishes no order for `WorkloadSummaries`, so this is the emulator's own,
+    /// chosen for the reason [`Self::review_template_order`] gives: the `NextToken` carries
+    /// the key of the last workload a page served, so both the order and that key have to
+    /// be unique and fixed for the workload's whole life, or a value moving between two
+    /// pages would serve a workload twice or skip it. The id is both, where `WorkloadName`
+    /// is a member `UpdateWorkload` can move.
+    pub fn workload_order(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.workloads.keys().cloned().collect();
         keys.sort();
         keys
     }
@@ -8111,18 +8114,20 @@ fn decode_cursor(token: &str) -> Option<::serde_json::Value> {
     ::serde_json::from_slice(&bytes).ok()
 }
 
-/// Encode a `ListWorkloads` cursor: the last `(workload name, workload id)` served.
-pub fn encode_next_token(workload_name: &str, workload_id: &str) -> String {
-    encode_cursor(&::serde_json::json!({ "n": workload_name, "i": workload_id }))
+/// Encode a `ListWorkloads` cursor: the `WorkloadId` last served, in the same opaque
+/// scheme as every other cursor in this service. Workloads are enumerated in `WorkloadId`
+/// order ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::workload_order`]),
+/// so that id is the whole cursor: it is unique and fixed for the workload's whole life,
+/// where `WorkloadName` is a member `UpdateWorkload` can move. Its own key, so a cursor
+/// issued by another paginated operation is not a cursor here.
+pub fn encode_next_token(workload_id: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "i": workload_id }))
 }
 
-/// The `(workload name, workload id)` a `NextToken` points just past, or `None` when
-/// the token is not one this service issued.
-pub fn decode_next_token(token: &str) -> Option<(String, String)> {
-    let cursor = decode_cursor(token)?;
-    let name = cursor.get("n")?.as_str()?.to_string();
-    let id = cursor.get("i")?.as_str()?.to_string();
-    Some((name, id))
+/// The `WorkloadId` a `NextToken` points just past, or `None` when the token is not one
+/// this service issued.
+pub fn decode_next_token(token: &str) -> Option<String> {
+    Some(decode_cursor(token)?.get("i")?.as_str()?.to_string())
 }
 
 /// Encode a `ListWorkloadShares` cursor: the last `ShareId` served, in the same opaque

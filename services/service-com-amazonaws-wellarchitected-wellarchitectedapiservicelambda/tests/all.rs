@@ -402,3 +402,8 @@ mod profile_template;
 // this list's sorted middle is what repeatedly refused to merge.
 #[path = "all/shared_page_size.rs"]
 mod shared_page_size;
+
+// Declared last for the same reason as the declaration above: the sorted position for a
+// workload suite falls in a crowded run of this list.
+#[path = "all/workload_paging_stability.rs"]
+mod workload_paging_stability;
