@@ -174,8 +174,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // This operation carries no filters, so the only thing a page token is
         // bound to is the walk it was issued for: a token one of this service's
-        // other paginated operations minted cannot resume this listing.
-        let query_fingerprint = crate::state::fingerprint(&Self::NAME);
+        // other paginated operations minted cannot resume this listing. The
+        // empty query is what every other listing's filters and window are to
+        // `crate::state::page_fingerprint` — there is nothing else to bind.
+        let query_fingerprint = crate::state::page_fingerprint(Self::NAME, &());
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => match crate::state::decode_page_token(token) {

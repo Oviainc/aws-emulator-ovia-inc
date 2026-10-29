@@ -503,6 +503,22 @@ pub fn fingerprint<T: std::fmt::Debug>(value: &T) -> String {
     hex::encode(digest)
 }
 
+/// The fingerprint a paginated listing binds into the page tokens it mints: the
+/// name of the operation that issued the token, together with the query the walk
+/// was taken for.
+///
+/// A page token is opaque and belongs to ONE walk, so what a handler accepts is
+/// the fingerprint it would itself have minted: a token taken for a different
+/// query, and equally a token one of this service's other paginated operations
+/// minted, is refused rather than answered with a page of a different result
+/// set. The operation name is a parameter of this helper rather than something
+/// each caller remembers to mix in, so no listing can bind the query alone and
+/// end up accepting a sibling's token. [`preview_selection_fingerprint`] is this
+/// same rule over the preview selection.
+pub fn page_fingerprint<T: std::fmt::Debug + ?Sized>(operation: &str, query: &T) -> String {
+    fingerprint(&(operation, query))
+}
+
 // ---------------------------------------------------------------------------
 // Error wording
 //
@@ -1522,12 +1538,10 @@ pub fn preview_selection_fingerprint(
     recommended_action_types: &[String],
     criteria: &Criteria,
 ) -> String {
-    fingerprint(&(
+    page_fingerprint(
         operation,
-        scope,
-        recommended_action_types,
-        canonical_criteria(criteria),
-    ))
+        &(scope, recommended_action_types, canonical_criteria(criteria)),
+    )
 }
 
 /// `criteria` with every criterion that constrains nothing spelled the ONE way

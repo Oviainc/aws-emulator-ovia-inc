@@ -229,7 +229,7 @@ fn token_of(body: &Value, case: &str) -> Option<String> {
 
 /// A router with every paginated listing of this service given something to
 /// report, and the id of the one event that carries steps.
-async fn emulator_with_a_fixture() -> (MultiServiceRouter, String) {
+pub(crate) async fn emulator_with_a_fixture() -> (MultiServiceRouter, String) {
     let (router, engine) = emulator_with_engine();
 
     for account_id in member_account_ids(MEMBER_ACCOUNTS) {

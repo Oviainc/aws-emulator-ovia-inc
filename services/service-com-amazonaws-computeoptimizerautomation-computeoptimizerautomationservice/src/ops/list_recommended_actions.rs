@@ -186,8 +186,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The page token carries this operation's name and the filters it was
         // taken with, so resuming a walk with different filters, or with a token
         // another operation issued, is refused rather than answered with a page
-        // of a different result set.
-        let filter_fingerprint = crate::state::fingerprint(&(Self::NAME, &filters));
+        // of a different result set: `crate::state::page_fingerprint`.
+        let filter_fingerprint = crate::state::page_fingerprint(Self::NAME, &filters);
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => {

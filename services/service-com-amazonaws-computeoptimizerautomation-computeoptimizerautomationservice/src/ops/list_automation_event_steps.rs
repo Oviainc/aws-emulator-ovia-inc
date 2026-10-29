@@ -174,9 +174,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The sequence a page is a window onto is the steps of ONE event, so the
-        // event this call asks about is what the token is bound to: a token
-        // issued for one event cannot resume a walk over another's steps.
-        let query_fingerprint = crate::state::fingerprint(&input.event_id);
+        // event this call asks about is what the token is bound to, alongside
+        // this operation's name: a token issued for one event cannot resume a
+        // walk over another's steps, and neither can one another operation of
+        // this service issued: `crate::state::page_fingerprint`.
+        let query_fingerprint = crate::state::page_fingerprint(Self::NAME, &input.event_id);
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => {

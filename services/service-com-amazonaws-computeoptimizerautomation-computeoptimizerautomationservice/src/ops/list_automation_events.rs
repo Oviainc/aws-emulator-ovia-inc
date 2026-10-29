@@ -186,15 +186,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // The page token carries a fingerprint of the whole query — the filters
-        // AND the time window — because both define the sequence a page is a
-        // window onto, so resuming with a different query is refused instead of
-        // answered with a page of a different result set.
-        let query_fingerprint = crate::state::fingerprint(&(
-            &filters,
-            input.start_time_inclusive.map(crate::state::instant_key),
-            input.end_time_exclusive.map(crate::state::instant_key),
-        ));
+        // The page token carries this operation's name and a fingerprint of the
+        // whole query — the filters AND the time window — because both define
+        // the sequence a page is a window onto, so resuming with a different
+        // query, or with a token another operation issued, is refused instead of
+        // answered with a page of a different result set:
+        // `crate::state::page_fingerprint`.
+        let query_fingerprint = crate::state::page_fingerprint(
+            Self::NAME,
+            &(
+                &filters,
+                input.start_time_inclusive.map(crate::state::instant_key),
+                input.end_time_exclusive.map(crate::state::instant_key),
+            ),
+        );
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => {

@@ -50,7 +50,7 @@ fn expected_message(requirement: &str) -> String {
 /// the refusal — HTTP 400, `InvalidParameterValueException`, and exactly
 /// `requirement` reported on `nextToken` — and answer the message it carried, so
 /// a caller can assert about the body as well.
-async fn assert_token_refused(
+pub(crate) async fn assert_token_refused(
     router: &MultiServiceRouter,
     operation: &str,
     body: &Value,
@@ -130,7 +130,7 @@ async fn start_event(
 /// The operations are the ones the model marks `@paginated`
 /// (`smithy_query(query="digest")`); `ListAccounts` takes no query at all, so a
 /// token not taken for its own walk is the same refusal as one it never issued.
-fn paginated_operations(event_id: &str) -> Vec<(&'static str, Value, &'static str)> {
+pub(crate) fn paginated_operations(event_id: &str) -> Vec<(&'static str, Value, &'static str)> {
     let preview_selection = json!({
         "ruleType": "AccountRule",
         "recommendedActionTypes": ["UpgradeEbsVolumeType"],

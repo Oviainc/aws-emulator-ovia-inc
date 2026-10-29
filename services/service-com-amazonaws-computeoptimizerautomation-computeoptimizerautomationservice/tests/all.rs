@@ -39,6 +39,8 @@ mod automation_rule_preview;
 mod automation_rule_preview_summaries;
 #[path = "all/automation_rule_validation.rs"]
 mod automation_rule_validation;
+#[path = "all/cross_operation_page_tokens.rs"]
+mod cross_operation_page_tokens;
 #[path = "all/disassociated_member_initiation.rs"]
 mod disassociated_member_initiation;
 #[path = "all/disassociated_member_retrieval.rs"]
