@@ -69,6 +69,7 @@ impl Reply {
 /// The emulator under test: this one service mounted on one shared engine.
 pub struct Emulator {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -79,9 +80,16 @@ impl Emulator {
         // scope above still routes the request and names the caller.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_databrew_awsgluedatabrew::EmulatedService::new(engine),
+            service_com_amazonaws_databrew_awsgluedatabrew::EmulatedService::new(engine.clone()),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// The SINGLE shared engine this service is mounted on, so a case can read or seed
+    /// the very store the handlers serve from (`engine.state::<State>()`) rather than a
+    /// private copy.
+    pub fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// Serve one request, signed with [`DEFAULT_AKID`].

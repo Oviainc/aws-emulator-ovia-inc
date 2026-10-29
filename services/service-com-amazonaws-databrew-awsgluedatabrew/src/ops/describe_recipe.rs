@@ -3,7 +3,7 @@
 //! @op DescribeRecipe
 //! Serves the definition of one VERSION of a stored recipe from [`crate::state`]: the
 //! version the request names, or — when it names none — the latest published version,
-//! falling back to the recipe's working version while nothing has been published.
+//! which is what an omitted identifier asks for and the only thing it resolves.
 //!
 //! ## Shape of an operation
 //!
@@ -180,24 +180,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let store = state.lock();
-        let Some(recipe) = store.recipes.get(&input.name) else {
+        // This operation addresses the (recipe, VERSION) PAIR — the version the request
+        // names, or the alias an omitted identifier asks for — and only the pair
+        // resolves to a definition. Either half missing is one miss of that pair, so
+        // one lookup and one message, naming both halves.
+        let requested = crate::state::requested_recipe_version(input.recipe_version.as_deref());
+        let resolved = store.recipes.get(&input.name).and_then(|recipe| {
+            Some((
+                recipe,
+                recipe.resolve_version(input.recipe_version.as_deref())?,
+            ))
+        });
+        let Some((recipe, version)) = resolved else {
             return Err(DescribeRecipeErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::not_found_message("Recipe", &input.name)),
-                },
-            )
-            .into());
-        };
-        // A request that names a version addresses the (recipe, version) PAIR, and
-        // only the pair resolves to a definition: a version this recipe does not hold
-        // is a miss, and the identifier the request looked up is both halves.
-        let Some(version) = recipe.resolve_version(input.recipe_version.as_deref()) else {
-            let requested = input.recipe_version.clone().unwrap_or_default();
-            return Err(DescribeRecipeErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::not_found_message(
-                        "Recipe",
-                        &format!("{} version {requested}", input.name),
+                    message: Some(crate::state::recipe_version_not_found_message(
+                        &input.name,
+                        requested,
                     )),
                 },
             )

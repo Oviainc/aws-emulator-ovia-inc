@@ -10,6 +10,10 @@
 //! shape="ResourceNotFoundException")`) describes the error CLASS; it is not the
 //! message a particular lookup answers with.
 //!
+//! A lookup that addresses a (recipe, VERSION) pair has DataBrew's own sentence for
+//! that pair (`The recipe <Name> for version <RecipeVersion> wasn't found.`), which
+//! `tests/all/recipe_version_resolution.rs` is where the version forms are spanned.
+//!
 //! The table is two-dimensional: every operation that answers the error (across every
 //! resource kind this service stores) crossed with the forms a DataBrew resource name
 //! takes — one character, the modelled maximum length of that operation's name shape,
@@ -146,7 +150,10 @@ fn not_found_cases() -> Vec<NotFoundCase> {
         NotFoundCase {
             case: "DescribeRecipe",
             request: |name| ("GET", format!("/recipes/{}", label(name)), None),
-            expected: |name| format!("Recipe {name} wasn't found."),
+            // `DescribeRecipe` addresses a (recipe, version) pair, and an omitted
+            // `RecipeVersion` asks for the latest published version, so the identifier
+            // reported for a versionless request is that alias.
+            expected: |name| format!("The recipe {name} for version LATEST_PUBLISHED wasn't found."),
             name_max: 255,
         },
         NotFoundCase {
@@ -321,7 +328,7 @@ async fn a_compound_identifier_names_the_half_that_is_missing() {
             "case {version:?}: expected 404, got {} {:?}",
             refused.status, refused.body
         );
-        let expected = format!("Recipe {recipe} version {version} wasn't found.");
+        let expected = format!("The recipe {recipe} for version {version} wasn't found.");
         assert_eq!(
             error_message(&refused),
             expected,

@@ -12,6 +12,10 @@
 //! condition expressions), every version identifier the model documents (both aliases,
 //! a numeric `X.Y` version, each at its published digit bound and one past it) and
 //! every form a recipe name can take.
+//!
+//! A created recipe holds only its working draft, so the reads below address that draft
+//! by the `LATEST_WORKING` alias: an omitted `RecipeVersion` asks for the latest
+//! PUBLISHED version instead, which `tests/all/recipe_version_resolution.rs` covers.
 
 use serde_json::{json, Value};
 
@@ -133,7 +137,7 @@ async fn a_recipe_round_trips_every_shape_of_steps() {
             created.body
         );
 
-        let described = describe_recipe(&emulator, &name, None).await;
+        let described = describe_recipe(&emulator, &name, Some("LATEST_WORKING")).await;
         assert_eq!(
             described.status, 200,
             "case {case:?}: expected DescribeRecipe to answer 200, got {} {:?}",
@@ -227,8 +231,8 @@ async fn a_recipe_round_trips_every_shape_of_steps() {
 /// and `"0.0"` invalid, or the `LATEST_WORKING` and `LATEST_PUBLISHED` aliases — and
 /// `DescribeRecipeRequest$RecipeVersion`, which makes an omitted identifier ask for the
 /// latest published version. A recipe nobody has published holds only its working
-/// version, so that is what resolves; `LATEST_PUBLISHED` asked for by name resolves
-/// nothing.
+/// version, so only the identifiers that name THAT resolve; `LATEST_PUBLISHED`, and the
+/// omitted identifier that defaults to it, resolve nothing.
 #[tokio::test]
 async fn a_recipe_version_resolves_only_a_version_the_recipe_holds() {
     let emulator = Emulator::new();
@@ -240,7 +244,6 @@ async fn a_recipe_version_resolves_only_a_version_the_recipe_holds() {
     );
 
     let resolved = [
-        ("no identifier at all", None),
         ("the working-version alias", Some("LATEST_WORKING")),
         ("the working version by number", Some(INITIAL_VERSION)),
     ];
@@ -268,23 +271,26 @@ async fn a_recipe_version_resolves_only_a_version_the_recipe_holds() {
     // A well-formed identifier naming a version this recipe does not hold: nothing is
     // published yet, and no other numeric version exists. `999999.999999` is the
     // documented 6-digit maximum of each half, so it is well formed and still unheld.
+    // An omitted identifier asks for the latest published version, so with nothing
+    // published it names nothing either.
     let unheld = [
-        ("the published-version alias, nothing published", "LATEST_PUBLISHED"),
-        ("a published major version", "1.0"),
-        ("another minor of the working major", "0.2"),
-        ("both halves at the documented 6-digit maximum", "999999.999999"),
+        ("the published-version alias, nothing published", Some("LATEST_PUBLISHED")),
+        ("no identifier at all, nothing published", None),
+        ("a published major version", Some("1.0")),
+        ("another minor of the working major", Some("0.2")),
+        ("both halves at the documented 6-digit maximum", Some("999999.999999")),
     ];
     for (case, version) in unheld {
-        let described = describe_recipe(&emulator, "versioned", Some(version)).await;
+        let described = describe_recipe(&emulator, "versioned", version).await;
         assert_eq!(
             described.status, 404,
-            "case {case:?} ({version}): expected 404, got {} {:?}",
+            "case {case:?} ({version:?}): expected 404, got {} {:?}",
             described.status, described.body
         );
         assert_eq!(
             described.error_type.as_deref(),
             Some("ResourceNotFoundException"),
-            "case {case:?} ({version}): expected ResourceNotFoundException, got {:?}",
+            "case {case:?} ({version:?}): expected ResourceNotFoundException, got {:?}",
             described.error_type
         );
     }
@@ -367,7 +373,9 @@ async fn a_recipe_name_is_unique_and_from_the_documented_character_set() {
             created.status, created.body
         );
         assert_eq!(
-            describe_recipe(&emulator, name, None).await.text("Name"),
+            describe_recipe(&emulator, name, Some("LATEST_WORKING"))
+                .await
+                .text("Name"),
             name,
             "case {name:?}: the stored recipe must be addressable by that name"
         );
@@ -389,7 +397,7 @@ async fn a_recipe_name_is_unique_and_from_the_documented_character_set() {
     }
     // The refused create stored nothing, read back through the one refused name a URI
     // path can carry unencoded.
-    let ghost = describe_recipe(&emulator, "under_score", None).await;
+    let ghost = describe_recipe(&emulator, "under_score", Some("LATEST_WORKING")).await;
     assert_eq!(
         ghost.status, 404,
         "case \"under_score\": the refused create must store nothing, got {} {:?}",
@@ -414,7 +422,7 @@ async fn a_recipe_name_is_unique_and_from_the_documented_character_set() {
         "case \"duplicate recipe name\": expected ConflictException, got {:?}",
         duplicate.error_type
     );
-    let described = describe_recipe(&emulator, "plain", None).await;
+    let described = describe_recipe(&emulator, "plain", Some("LATEST_WORKING")).await;
     assert_eq!(
         described.text("Description"),
         "first",

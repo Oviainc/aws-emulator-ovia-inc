@@ -35,6 +35,18 @@ pub fn not_found_message(kind: &str, identifier: &str) -> String {
     format!("{kind} {identifier} wasn't found.")
 }
 
+/// The message a lookup that addressed a (recipe, VERSION) pair answers its
+/// `ResourceNotFoundException` with: the recipe name the request carried and the
+/// version identifier that was looked up, which is a different sentence from the
+/// single-resource one [`not_found_message`] builds.
+///
+/// A recipe is versioned, so an operation that takes a `RecipeVersion` never looks a
+/// recipe up on its own: it resolves the pair, and the message names both halves so a
+/// client can tell "no such recipe" from "that recipe holds no such version".
+pub fn recipe_version_not_found_message(name: &str, version: &str) -> String {
+    format!("The recipe {name} for version {version} wasn't found.")
+}
+
 /// The message DataBrew answers a `ConflictException` with when a create names a
 /// resource that already exists: the resource kind, capitalised, and the name the
 /// request carried, so the message states which resource conflicted.
@@ -80,8 +92,20 @@ pub const INITIAL_RECIPE_VERSION: &str = "0.1";
 pub const LATEST_WORKING: &str = "LATEST_WORKING";
 
 /// The alias naming "the most recent published version" (model:
-/// `Recipe$RecipeVersion`).
+/// `Recipe$RecipeVersion`), and the identifier a request that carries no
+/// `RecipeVersion` asks for: "If this parameter isn't specified, then the latest
+/// published version is returned" (model: `DescribeRecipeRequest$RecipeVersion`).
 pub const LATEST_PUBLISHED: &str = "LATEST_PUBLISHED";
+
+/// The version identifier a request looked a recipe version up by: the one it carried,
+/// or — when it carried none — the alias an omitted identifier asks for.
+///
+/// An omitted `RecipeVersion` is not "any version this recipe holds": the model
+/// documents it as asking for the latest published version, so it is exactly
+/// [`LATEST_PUBLISHED`] that resolves, and the same identifier is what a miss reports.
+pub fn requested_recipe_version(requested: Option<&str>) -> &str {
+    requested.unwrap_or(LATEST_PUBLISHED)
+}
 
 /// The most digits one half of a numeric recipe version may carry: "The maximum
 /// length of each is 6 digits" (model: `Recipe$RecipeVersion`).
@@ -467,20 +491,17 @@ impl RecipeRecord {
     ///
     /// The identifier is either a numeric `X.Y` version or one of the two aliases the
     /// model documents, and omitting it asks for "the latest published version"
-    /// (model: `DescribeRecipeRequest$RecipeVersion`). A recipe nobody has published
-    /// holds exactly one version — its working one — so that is what the omitted
-    /// identifier resolves to; asking for `LATEST_PUBLISHED` by name resolves nothing
-    /// until a publish has frozen a version.
+    /// (model: `DescribeRecipeRequest$RecipeVersion`) — so an absent identifier
+    /// resolves exactly what [`LATEST_PUBLISHED`] does and nothing else: a recipe no
+    /// publish has frozen a version of holds no latest-published version, and the
+    /// working draft is NOT a fallback for it. `LATEST_WORKING`, or the working
+    /// version's own number, is how that draft is addressed.
     pub fn resolve_version(&self, requested: Option<&str>) -> Option<&RecipeVersionRecord> {
-        match requested {
-            None => self.published.last().or(Some(&self.working)),
-            Some(LATEST_PUBLISHED) => self.published.last(),
-            Some(LATEST_WORKING) => Some(&self.working),
-            Some(version) if version == self.working.version => Some(&self.working),
-            Some(version) => self
-                .published
-                .iter()
-                .find(|held| held.version == version),
+        match requested_recipe_version(requested) {
+            LATEST_PUBLISHED => self.published.last(),
+            LATEST_WORKING => Some(&self.working),
+            version if version == self.working.version => Some(&self.working),
+            version => self.published.iter().find(|held| held.version == version),
         }
     }
 }
