@@ -232,17 +232,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(range) => {
                 let start = range.inclusive_start_billing_period.as_str();
                 let end = range.exclusive_end_billing_period.as_str();
+                // Whether a half-open range covers any billing period at all is the
+                // crate's ONE rule, and the refusal an empty range earns is its ONE
+                // refusal, named for this shape's own end member — so this operation
+                // cannot answer an empty range any differently from the operations that
+                // take the same range under another shape.
+                if let Err((reason, field, message)) =
+                    crate::state::check_half_open_billing_period_range_is_ordered(
+                        Some(start),
+                        Some(end),
+                        "BillingPeriodRange.ExclusiveEndBillingPeriod",
+                    )
+                {
+                    return Err(validation(reason, field, message));
+                }
                 let covered =
                     crate::state::billing_period_range_length(start, end).unwrap_or_default();
-                if covered <= 0 {
-                    return Err(validation(
-                        "ILLEGAL_BILLING_PERIOD_RANGE",
-                        "BillingPeriodRange.ExclusiveEndBillingPeriod",
-                        "the exclusive end billing period must be later than the inclusive \
-                         start billing period"
-                            .to_string(),
-                    ));
-                }
                 let at_most =
                     i64::try_from(crate::state::MAX_BILLING_PERIODS_PER_RANGE).unwrap_or(i64::MAX);
                 if covered > at_most {

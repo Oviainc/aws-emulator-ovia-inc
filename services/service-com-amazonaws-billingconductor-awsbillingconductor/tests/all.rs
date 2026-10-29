@@ -125,6 +125,8 @@ mod reserved_tag_keys;
 mod resource_association_billing_periods;
 #[path = "all/resource_re_association_restores_billing_periods.rs"]
 mod resource_re_association_restores_billing_periods;
+#[path = "all/shared_ordered_billing_period_range_check.rs"]
+mod shared_ordered_billing_period_range_check;
 #[path = "all/shared_tag_dispatch.rs"]
 mod shared_tag_dispatch;
 #[path = "all/state_roundtrip.rs"]
