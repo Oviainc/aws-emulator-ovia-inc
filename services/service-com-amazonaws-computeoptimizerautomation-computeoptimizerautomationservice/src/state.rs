@@ -519,6 +519,97 @@ pub fn page_fingerprint<T: std::fmt::Debug + ?Sized>(operation: &str, query: &T)
     fingerprint(&(operation, query))
 }
 
+/// `values` as the SET the walk reads it as: every distinct entry once, in one
+/// order.
+///
+/// A query member a walk reads only by MEMBERSHIP — `contains`, or `any` over
+/// its entries — names a set, not a sequence: neither the order the request
+/// spells the entries in nor an entry it repeats changes which items are
+/// selected, and the order a page advances in is the store's record order. So
+/// what a page token digests for such a member is the set ([`page_fingerprint`]),
+/// which is what makes two spellings of one selection continue ONE walk. A
+/// member a walk reads in order would keep its spelling: there the order is part
+/// of the sequence a page is a window onto.
+///
+/// Not [`distinct_account_ids`], which drops repeats but keeps the order the
+/// request first names each account, because that order is the one an
+/// association response reports back; here the request's order is exactly what
+/// must not matter.
+pub fn canonical_membership(values: &[String]) -> Vec<String> {
+    let mut canonical = values.to_vec();
+    canonical.sort_unstable();
+    canonical.dedup();
+    canonical
+}
+
+/// One `name`/`values` filter of a paginated listing, read as the filter
+/// evaluators of this service read it.
+///
+/// The three filter shapes this service models — of an automation rule, of a
+/// recommended action and of an automation event — carry the same two members
+/// and are selected on the same way ([`rule_matches_filters`],
+/// [`recommended_action_matches_filters`], [`event_matches_filters`]), so
+/// [`canonical_filters`] normalises all three through this one reading.
+pub trait SelectionFilter: Clone {
+    /// The dimension this filter selects on.
+    fn filter_name(&self) -> &str;
+    /// The alternatives the filter accepts for that dimension.
+    fn filter_values(&self) -> &[String];
+    /// The same filter carrying `values` instead.
+    fn with_filter_values(self, values: Vec<String>) -> Self;
+}
+
+macro_rules! impl_selection_filter {
+    ($($shape:ident),+ $(,)?) => {
+        $(impl SelectionFilter for $shape {
+            fn filter_name(&self) -> &str {
+                &self.name
+            }
+
+            fn filter_values(&self) -> &[String] {
+                &self.values
+            }
+
+            fn with_filter_values(mut self, values: Vec<String>) -> Self {
+                self.values = values;
+                self
+            }
+        })+
+    };
+}
+
+impl_selection_filter!(AutomationEventFilter, Filter, RecommendedActionFilter);
+
+/// A listing's filter list as the SELECTION it performs, for a page token to
+/// digest: every filter's alternatives as the set they are
+/// ([`canonical_membership`]), the filters themselves in one order, and a filter
+/// the request spelled twice only once.
+///
+/// Every filter evaluator of this service requires ALL of the request's filters
+/// to hold and reads each filter's `values` by membership, so the order of the
+/// filters, the order of the values inside one and a filter repeated verbatim
+/// cannot change which items a walk selects or the order it serves them in. Two
+/// filters that share a name and differ in their values are two conditions and
+/// stay two, so a selection that really constrains differently still digests
+/// differently.
+pub fn canonical_filters<F: SelectionFilter>(filters: &[F]) -> Vec<F> {
+    let mut canonical: Vec<F> = filters
+        .iter()
+        .map(|filter| {
+            filter
+                .clone()
+                .with_filter_values(canonical_membership(filter.filter_values()))
+        })
+        .collect();
+    canonical.sort_by(|left, right| {
+        (left.filter_name(), left.filter_values()).cmp(&(right.filter_name(), right.filter_values()))
+    });
+    canonical.dedup_by(|left, right| {
+        left.filter_name() == right.filter_name() && left.filter_values() == right.filter_values()
+    });
+    canonical
+}
+
 // ---------------------------------------------------------------------------
 // Error wording
 //
@@ -1521,17 +1612,22 @@ pub fn preview_selection_violation(
 ///
 /// What it digests is the selection as [`previewed_actions`] PERFORMS it: the
 /// accounts the rule type and `organizationScope` derive to
-/// ([`preview_account_scope`]), and the criteria after defaulting and with every
-/// criterion that constrains nothing spelled one way ([`canonical_criteria`]) —
-/// never the raw optional request members. Two spellings of one selection
-/// therefore digest to one fingerprint and continue one walk (`criteria` absent,
-/// `criteria: {}` and a criterion holding no condition all constrain nothing; a
-/// scope carrying no `accountIds` covers the same accounts as no scope at all),
-/// while a selection that really is different digests differently. The two
-/// preview operations are handed the same values they select by, so they cannot
-/// disagree about which requests continue one walk, and the normalisation
-/// matches every other paginated listing of this service, which digests its
-/// optional query member after `unwrap_or_default`.
+/// ([`preview_account_scope`]) as the SET of accounts they cover, the requested
+/// action types as the SET the selection tests membership of
+/// ([`canonical_membership`] for both), and the criteria after defaulting and
+/// with every criterion that constrains nothing spelled one way
+/// ([`canonical_criteria`]) — never the raw optional request members. Two
+/// spellings of one selection therefore digest to one fingerprint and continue
+/// one walk (`criteria` absent, `criteria: {}` and a criterion holding no
+/// condition all constrain nothing; a scope carrying no `accountIds` covers the
+/// same accounts as no scope at all; a reordered or repeat-carrying action-type
+/// or account list covers the same accounts and types), while a selection that
+/// really is different digests differently. The two preview operations are
+/// handed the same values they select by, so they cannot disagree about which
+/// requests continue one walk, and the normalisation matches every other
+/// paginated listing of this service, which digests its optional query member
+/// after `unwrap_or_default` and its filter list as the selection it performs
+/// ([`canonical_filters`]).
 pub fn preview_selection_fingerprint(
     operation: &str,
     scope: Option<&[String]>,
@@ -1540,7 +1636,11 @@ pub fn preview_selection_fingerprint(
 ) -> String {
     page_fingerprint(
         operation,
-        &(scope, recommended_action_types, canonical_criteria(criteria)),
+        &(
+            scope.map(canonical_membership),
+            canonical_membership(recommended_action_types),
+            canonical_criteria(criteria),
+        ),
     )
 }
 

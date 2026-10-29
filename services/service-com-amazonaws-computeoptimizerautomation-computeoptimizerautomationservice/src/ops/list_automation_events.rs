@@ -190,12 +190,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whole query — the filters AND the time window — because both define
         // the sequence a page is a window onto, so resuming with a different
         // query, or with a token another operation issued, is refused instead of
-        // answered with a page of a different result set:
+        // answered with a page of a different result set. The filters are
+        // digested as the SELECTION they perform, so another spelling of one
+        // selection continues one walk: `crate::state::canonical_filters` and
         // `crate::state::page_fingerprint`.
         let query_fingerprint = crate::state::page_fingerprint(
             Self::NAME,
             &(
-                &filters,
+                crate::state::canonical_filters(&filters),
                 input.start_time_inclusive.map(crate::state::instant_key),
                 input.end_time_exclusive.map(crate::state::instant_key),
             ),

@@ -61,6 +61,8 @@ mod filter_name_refusals;
 mod member_account_association_gate;
 #[path = "all/member_account_initiation_gate.rs"]
 mod member_account_initiation_gate;
+#[path = "all/membership_page_token_spellings.rs"]
+mod membership_page_token_spellings;
 #[path = "all/not_found_wording.rs"]
 mod not_found_wording;
 #[path = "all/organization_rule_scope_gate.rs"]

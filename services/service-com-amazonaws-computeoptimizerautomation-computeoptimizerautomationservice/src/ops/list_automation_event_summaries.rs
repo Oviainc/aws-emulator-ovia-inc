@@ -242,13 +242,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // filters AND the window — because both define the sequence of groups a
         // page is a window onto, so resuming with a different query, or with a
         // token another operation issued, is refused instead of answered with a
-        // page of a different result set. `ListAutomationEvents` digests the
-        // same filters and window over the same events, so the operation name is
-        // what keeps the two walks apart: `crate::state::page_fingerprint`.
+        // page of a different result set. The filters are digested as the
+        // SELECTION they perform, so another spelling of one selection continues
+        // one walk (`crate::state::canonical_filters`).
+        // `ListAutomationEvents` digests the same filters and window over the
+        // same events, so the operation name is what keeps the two walks apart:
+        // `crate::state::page_fingerprint`.
         let query_fingerprint = crate::state::page_fingerprint(
             Self::NAME,
             &(
-                &filters,
+                crate::state::canonical_filters(&filters),
                 start_date.map(crate::state::instant_key),
                 end_date.map(crate::state::instant_key),
             ),

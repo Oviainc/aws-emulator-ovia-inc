@@ -194,13 +194,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operations narrow the same actions with it.
         let filters = input.filters.unwrap_or_default();
 
-        // The page token carries this operation's name and the filters it was
-        // taken with, so resuming a walk with different filters, or with a token
-        // another operation issued, is refused rather than answered with a page
-        // of a different result set — `ListRecommendedActions` digests the same
-        // filter list, so the operation name is what keeps the two walks apart:
+        // The page token carries this operation's name and the SELECTION those
+        // filters perform — every filter's values as the set it tests membership
+        // of, the filters in one order, a filter spelled twice once
+        // (`crate::state::canonical_filters`) — so resuming a walk with
+        // different filters, or with a token another operation issued, is
+        // refused rather than answered with a page of a different result set,
+        // while another spelling of one selection continues one walk.
+        // `ListRecommendedActions` digests the same filter list, so the
+        // operation name is what keeps the two walks apart:
         // `crate::state::page_fingerprint`.
-        let filter_fingerprint = crate::state::page_fingerprint(Self::NAME, &filters);
+        let filter_fingerprint =
+            crate::state::page_fingerprint(Self::NAME, &crate::state::canonical_filters(&filters));
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => {

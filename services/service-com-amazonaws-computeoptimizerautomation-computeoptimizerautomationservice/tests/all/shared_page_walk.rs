@@ -79,7 +79,7 @@ const MAX_PAGES: usize = 1_000;
 
 /// `n` distinct member account ids in the modelled `AccountId` form
 /// (`^[0-9]{12}$`), none of them the calling account.
-fn member_account_ids(n: usize) -> Vec<String> {
+pub(crate) fn member_account_ids(n: usize) -> Vec<String> {
     (0..n)
         .map(|index| format!("{:012}", 700_000_000_000u64 + index as u64))
         .collect()
