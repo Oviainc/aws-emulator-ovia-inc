@@ -25,10 +25,14 @@ use super::harness::{
     SIGNING_REGION,
 };
 
-/// A Cognito user pool this emulator can resolve: one of its own account, in the
-/// region the harness signs for, whose pool id names that same region.
-fn pool_arn() -> String {
-    user_pool_arn(SIGNING_REGION, &format!("{SIGNING_REGION}_1a2b3c4d5"))
+/// A Cognito user pool this emulator can resolve: one freshly created in the
+/// region the harness signs for, so the pool the rows reference really exists
+/// — an identity source can only reference a pool the user-pool service holds.
+async fn pool_arn(router: &MultiServiceRouter) -> String {
+    user_pool_arn(
+        SIGNING_REGION,
+        &super::harness::user_pool(router, "escaping-pool").await,
+    )
 }
 
 /// A Cedar static policy every policy row below carries, so a row differs from
@@ -91,7 +95,8 @@ struct SourcePair {
 /// row is legal input.
 #[tokio::test]
 async fn two_different_identity_source_requests_under_one_client_token_conflict() {
-    let arn = pool_arn();
+    let router = router();
+    let arn = pool_arn(&router).await;
     let pairs: Vec<SourcePair> = vec![
         SourcePair {
             // The separators move the boundary between `principalEntityType`
@@ -315,7 +320,6 @@ async fn two_different_identity_source_requests_under_one_client_token_conflict(
         },
     ];
 
-    let router = router();
     for (index, pair) in pairs.iter().enumerate() {
         let case = pair.case;
         // One store per row, so what a row's store holds is only what that row

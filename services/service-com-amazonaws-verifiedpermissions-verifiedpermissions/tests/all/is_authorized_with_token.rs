@@ -111,15 +111,6 @@ impl SignedIn {
     }
 }
 
-/// Create a user pool and return its id.
-async fn user_pool(router: &MultiServiceRouter, name: &str) -> String {
-    harness::cognito(router, "CreateUserPool", &json!({ "PoolName": name }))
-        .await["UserPool"]["Id"]
-        .as_str()
-        .expect("a minted user pool id")
-        .to_string()
-}
-
 /// Create an app client of `pool` that admin password sign-in is enabled for.
 async fn app_client(router: &MultiServiceRouter, pool: &str, name: &str) -> String {
     harness::cognito(
@@ -341,11 +332,11 @@ enum Expected {
 /// verify is refused rather than decided.
 #[tokio::test]
 async fn a_decision_follows_the_claims_of_a_token_the_issuer_signed() {
-    let (router, _engine) = harness::router_with_user_pools();
+    let (router, _engine) = harness::router_with_engine();
 
     // One pool with two app clients and two users — one in the permitted group, one in no
     // group — plus a SECOND pool nothing in the policy store references.
-    let pool = user_pool(&router, "avp-pool").await;
+    let pool = harness::user_pool(&router, "avp-pool").await;
     let client = app_client(&router, &pool, "avp-client").await;
     let unlisted_client = app_client(&router, &pool, "unlisted-client").await;
     let member = sign_in(
@@ -360,7 +351,7 @@ async fn a_decision_follows_the_claims_of_a_token_the_issuer_signed() {
     let outsider = sign_in(&router, &pool, &client, "outsider", &[], &json!([])).await;
     let through_unlisted = reauthenticate(&router, &pool, &unlisted_client, "member").await;
 
-    let foreign_pool = user_pool(&router, "foreign-pool").await;
+    let foreign_pool = harness::user_pool(&router, "foreign-pool").await;
     let foreign_client = app_client(&router, &foreign_pool, "foreign-client").await;
     let foreign = sign_in(
         &router,
@@ -679,8 +670,8 @@ async fn a_decision_follows_the_claims_of_a_token_the_issuer_signed() {
 /// the identity source configures — or the service's own default where it configures none.
 #[tokio::test]
 async fn a_group_claim_maps_to_the_group_entity_type_the_source_configures() {
-    let (router, _engine) = harness::router_with_user_pools();
-    let pool = user_pool(&router, "group-type-pool").await;
+    let (router, _engine) = harness::router_with_engine();
+    let pool = harness::user_pool(&router, "group-type-pool").await;
     let client = app_client(&router, &pool, "group-type-client").await;
     let member = sign_in(
         &router,
@@ -728,8 +719,8 @@ async fn a_group_claim_maps_to_the_group_entity_type_the_source_configures() {
 /// already in a caller's hands keeps deciding as it did.
 #[tokio::test]
 async fn a_group_change_applies_only_to_a_reissued_token() {
-    let (router, _engine) = harness::router_with_user_pools();
-    let pool = user_pool(&router, "reissue-pool").await;
+    let (router, _engine) = harness::router_with_engine();
+    let pool = harness::user_pool(&router, "reissue-pool").await;
     let client = app_client(&router, &pool, "reissue-client").await;
     let member = sign_in(
         &router,
@@ -795,8 +786,8 @@ async fn a_group_change_applies_only_to_a_reissued_token() {
 /// travels as one space-delimited string, is the set of scopes it lists.
 #[tokio::test]
 async fn a_policy_over_a_claim_reads_it_from_the_principals_attributes() {
-    let (router, _engine) = harness::router_with_user_pools();
-    let pool = user_pool(&router, "claims-pool").await;
+    let (router, _engine) = harness::router_with_engine();
+    let pool = harness::user_pool(&router, "claims-pool").await;
     let client = app_client(&router, &pool, "claims-client").await;
     let listed = sign_in(
         &router,
@@ -892,11 +883,11 @@ async fn a_policy_over_a_claim_reads_it_from_the_principals_attributes() {
 /// does cover decides as it did before the refusal and as it does after.
 #[tokio::test]
 async fn an_issuer_with_no_identity_source_is_refused_naming_the_issuer_and_the_store() {
-    let (router, _engine) = harness::router_with_user_pools();
+    let (router, _engine) = harness::router_with_engine();
 
     // One pool a store's identity source names, and two pools no store references — so a
     // row below differs from the covered call in the `iss` claim alone.
-    let home_pool = user_pool(&router, "home-pool").await;
+    let home_pool = harness::user_pool(&router, "home-pool").await;
     let home_client = app_client(&router, &home_pool, "home-client").await;
     let home = sign_in(
         &router,
@@ -907,7 +898,7 @@ async fn an_issuer_with_no_identity_source_is_refused_naming_the_issuer_and_the_
         &json!([]),
     )
     .await;
-    let second_pool = user_pool(&router, "second-pool").await;
+    let second_pool = harness::user_pool(&router, "second-pool").await;
     let second_client = app_client(&router, &second_pool, "second-client").await;
     let second = sign_in(
         &router,
@@ -918,7 +909,7 @@ async fn an_issuer_with_no_identity_source_is_refused_naming_the_issuer_and_the_
         &json!([]),
     )
     .await;
-    let third_pool = user_pool(&router, "third-pool").await;
+    let third_pool = harness::user_pool(&router, "third-pool").await;
     let third_client = app_client(&router, &third_pool, "third-client").await;
     let third = sign_in(
         &router,
@@ -1188,8 +1179,8 @@ async fn assert_slice(
 /// and which arm of `EntitiesDefinition` the request sent it in.
 #[tokio::test]
 async fn an_entities_slice_of_a_token_call_carries_only_resource_and_action_entities() {
-    let (router, _engine) = harness::router_with_user_pools();
-    let pool = user_pool(&router, "entity-kind-pool").await;
+    let (router, _engine) = harness::router_with_engine();
+    let pool = harness::user_pool(&router, "entity-kind-pool").await;
     let client = app_client(&router, &pool, "entity-kind-client").await;
     let member = sign_in(
         &router,
@@ -1378,8 +1369,8 @@ fn kinds_schema() -> String {
 /// action the schema declares.
 #[tokio::test]
 async fn a_type_the_stores_schema_declares_only_as_a_principal_cannot_be_supplied() {
-    let (router, _engine) = harness::router_with_user_pools();
-    let pool = user_pool(&router, "schema-kind-pool").await;
+    let (router, _engine) = harness::router_with_engine();
+    let pool = harness::user_pool(&router, "schema-kind-pool").await;
     let client = app_client(&router, &pool, "schema-kind-client").await;
     let member = sign_in(
         &router,

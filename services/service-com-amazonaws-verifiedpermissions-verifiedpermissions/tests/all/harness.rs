@@ -20,38 +20,34 @@ use smithy_server_runtime::MultiServiceRouter;
 /// than repeating a literal that could drift.
 pub const SIGNING_REGION: &str = "us-east-1";
 
-/// A router serving only this service, over a fresh shared engine.
+/// A router serving this service — and the Amazon Cognito user-pool service it
+/// resolves pool references against — over a fresh shared engine.
 pub fn router() -> MultiServiceRouter {
     router_with_engine().0
-}
-
-/// A router serving this service AND the Amazon Cognito user-pool service, over one
-/// shared engine.
-///
-/// An identity source references a user pool, and an authorization call that takes its
-/// principal from a token that pool issued verifies the token against the key set the
-/// pool publishes — so a suite about such a call needs the pool to really exist, with
-/// really signed tokens. Mounting both services on one engine is how this emulator serves
-/// them in the router its binary builds, so the suite exercises the same seam.
-pub fn router_with_user_pools() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let (mut router, engine) = router_with_engine();
-    router.register_service(
-        service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    (router, engine)
 }
 
 /// The same router, plus the engine it was built on — for a suite that has to
 /// read or seed state no served request can reach. `router()` delegates here so
 /// there is ONE place that decides how the harness is wired.
+///
+/// It serves this service AND the Amazon Cognito user-pool service, over one shared
+/// engine, which is how the emulator's own binary wires them: an identity source
+/// references a user pool, so this service RESOLVES that reference against the
+/// user-pool service's state, and an authorization call that takes its principal from
+/// a token that pool issued verifies the token against the key set the pool publishes.
+/// Mounting both here is what lets a suite reference a pool that really exists, with
+/// really signed tokens.
 pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
         service_com_amazonaws_verifiedpermissions_verifiedpermissions::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice::EmulatedService::new(
             Arc::clone(&engine),
         ),
     );
@@ -120,10 +116,23 @@ pub async fn store_with_validation_off(router: &MultiServiceRouter) -> String {
 /// the SAME router, so a pool a suite builds here is the pool this service's identity
 /// sources reference.
 pub async fn cognito(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+    cognito_in(router, SIGNING_REGION, operation, body).await
+}
+
+/// The same call, signed for `region`: a user pool belongs to the region its
+/// creating request was signed for, and its id names that region, so a suite
+/// about which pools a policy store can reference seeds each one in the region it
+/// is supposed to live in.
+pub async fn cognito_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
-        .header("host", format!("cognito-idp.{SIGNING_REGION}.amazonaws.com"))
+        .header("host", format!("cognito-idp.{region}.amazonaws.com"))
         .header("content-type", "application/x-amz-json-1.1")
         .header(
             "x-amz-target",
@@ -133,7 +142,7 @@ pub async fn cognito(router: &MultiServiceRouter, operation: &str, body: &Value)
             "authorization",
             format!(
                 "AWS4-HMAC-SHA256 \
-                 Credential=AKIAEXAMPLE/20260101/{SIGNING_REGION}/cognito-idp/aws4_request, \
+                 Credential=AKIAEXAMPLE/20260101/{region}/cognito-idp/aws4_request, \
                  SignedHeaders=host;x-amz-target, Signature=0"
             ),
         )
@@ -194,6 +203,34 @@ pub fn user_pool_arn(region: &str, pool: &str) -> String {
         "arn:aws:cognito-idp:{region}:{}:userpool/{pool}",
         engine::emulator_account_id()
     )
+}
+
+/// Create an Amazon Cognito user pool named `name` through the user-pool service
+/// mounted on the same engine, and return the id it MINTED.
+///
+/// An identity source can only reference a user pool that exists, so a suite that
+/// creates one seeds its pool here instead of inventing a pool id: the id is the
+/// one the service that owns pools generated, which is what makes the reference
+/// resolvable. The ONE pool-seeding helper this test crate has.
+pub async fn user_pool(router: &MultiServiceRouter, name: &str) -> String {
+    user_pool_in(router, SIGNING_REGION, name).await
+}
+
+/// The same, in `region`: the id a pool is minted with names the region it was
+/// created in, and an identity source can only reference a pool in its policy
+/// store's own region, so the region a pool is seeded in is part of what a suite
+/// chooses.
+pub async fn user_pool_in(router: &MultiServiceRouter, region: &str, name: &str) -> String {
+    cognito_in(
+        router,
+        region,
+        "CreateUserPool",
+        &json!({ "PoolName": name }),
+    )
+    .await["UserPool"]["Id"]
+        .as_str()
+        .expect("a minted user pool id")
+        .to_string()
 }
 
 /// The `message` an awsJson1_0 fault carries. The modelled member is `message`;

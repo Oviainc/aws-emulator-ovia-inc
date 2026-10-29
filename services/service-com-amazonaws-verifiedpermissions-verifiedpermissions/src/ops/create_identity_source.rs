@@ -24,17 +24,11 @@
 //! [`crate::ops::update_identity_source`] — the other writer of the same stored
 //! field — so the two accept the same providers and store the same values.
 //!
-//! LIMIT OF THAT CHECK, stated plainly: a well-formed ARN in this emulator's
-//! account and in the request's own region is accepted even when no
-//! `CreateUserPool` ever minted that pool. Whether a pool exists is knowledge
-//! the cognito-idp emulator holds in ITS OWN state struct, and per-service state
-//! is reached through the engine BY TYPE
-//! ([`crate::state::service_state`]) — the type lives in that service's crate,
-//! which this crate does not (and by the project's one-crate-per-service layout
-//! must not) depend on, and no shared crate publishes a pool registry. So the
-//! account, the region and the region the pool id itself names are the whole of
-//! what this service can resolve; anything beyond them would be a guess, and a
-//! guess is not made.
+//! A `userPoolArn` whose shape this emulator could serve is then resolved
+//! against the pool REGISTRY: the service that owns user pools holds them in its
+//! own state in the one shared engine, and the pool the ARN names has to be in
+//! it, so an ARN naming a pool no `CreateUserPool` ever minted is refused with
+//! that same 400 rather than stored as a live reference to nothing.
 //!
 //! An OIDC `issuer` is a provider OUTSIDE the emulator, and AWS resolves it by
 //! fetching `<issuer>/.well-known/openid-configuration`. This emulator makes no
@@ -72,7 +66,7 @@
 //! * `ServiceQuotaExceededException` (HTTP 402) — the store is at
 //!   [`crate::state::MAX_IDENTITY_SOURCES_PER_STORE`].
 //! * `ValidationException` (HTTP 400) — the configuration names a provider this
-//!   emulator cannot resolve.
+//!   emulator cannot resolve, including a user pool that does not exist.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -197,6 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request this service cannot resolve must change nothing.
         let region = crate::state::request_region(ctx.parts());
         let configuration = crate::ops::persisted_identity_source_configuration(
+            &*self.engine,
             &input.configuration,
             &region,
         )

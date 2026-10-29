@@ -16,6 +16,7 @@
 //! each answer is the one a client would really receive.
 
 use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
     call, error_code, ok, router, store_with_validation_off, user_pool_arn, SIGNING_REGION,
@@ -66,10 +67,14 @@ fn unreachable_pool_arn() -> String {
     user_pool_arn(SIGNING_REGION, "eu-west-1_1a2b3c4d5")
 }
 
-/// A Cognito user pool ARN this service resolves: the emulator's one account and
-/// the region the harness signs for, with a pool id naming that same region.
-fn reachable_pool_arn() -> String {
-    user_pool_arn(SIGNING_REGION, &format!("{SIGNING_REGION}_1a2b3c4d5"))
+/// A Cognito user pool ARN this service resolves: the emulator's one account,
+/// the region the harness signs for, and a pool the user-pool service really
+/// holds — the three things that make a reference resolve.
+async fn reachable_pool_arn(router: &MultiServiceRouter) -> String {
+    user_pool_arn(
+        SIGNING_REGION,
+        &super::harness::user_pool(router, "precedence-pool").await,
+    )
 }
 
 /// One request whose PAYLOAD this service refuses on its own checks.
@@ -277,6 +282,7 @@ struct Expect {
 async fn an_unresolvable_policy_store_outranks_a_payload_refusal() {
     let router = router();
     let live_store = store_with_validation_off(&router).await;
+    let live_pool_arn = reachable_pool_arn(&router).await;
     // One identity source to update: the `UpdateIdentitySource` rows reference a
     // source that really exists, so the only resource missing on a 404 row is the
     // store.
@@ -286,7 +292,7 @@ async fn an_unresolvable_policy_store_outranks_a_payload_refusal() {
         &json!({
             "policyStoreId": live_store,
             "configuration": {
-                "cognitoUserPoolConfiguration": { "userPoolArn": reachable_pool_arn() }
+                "cognitoUserPoolConfiguration": { "userPoolArn": live_pool_arn }
             },
         }),
     )
@@ -390,13 +396,14 @@ async fn an_unresolvable_policy_store_outranks_a_payload_refusal() {
 async fn an_unresolvable_identity_source_outranks_a_payload_refusal() {
     let router = router();
     let store = store_with_validation_off(&router).await;
+    let live_pool_arn = reachable_pool_arn(&router).await;
     let created = ok(
         &router,
         "CreateIdentitySource",
         &json!({
             "policyStoreId": store,
             "configuration": {
-                "cognitoUserPoolConfiguration": { "userPoolArn": reachable_pool_arn() }
+                "cognitoUserPoolConfiguration": { "userPoolArn": live_pool_arn }
             },
         }),
     )
@@ -455,7 +462,7 @@ async fn an_unresolvable_identity_source_outranks_a_payload_refusal() {
     .await;
     assert_eq!(
         read_back["configuration"]["cognitoUserPoolConfiguration"]["userPoolArn"].as_str(),
-        Some(reachable_pool_arn().as_str()),
+        Some(live_pool_arn.as_str()),
         "case \"a refused update changes nothing\": the stored pool must be unchanged, got \
          {read_back}"
     );

@@ -111,8 +111,11 @@ async fn an_updated_identity_source_is_read_back_as_the_new_provider() {
     // (case, create members, updateConfiguration + optional principalEntityType,
     //  the `configuration` GetIdentitySource must report, the
     //  `principalEntityType` it must report)
-    let pool = format!("{REGION}_1a2b3c4d5");
-    let other_pool = format!("{REGION}_9z8y7x6w5");
+    let router = router();
+    // Both pools the rows reference are created first: an identity source can
+    // only reference a user pool that exists, on the create and on the update.
+    let pool = crate::harness::user_pool(&router, "lifecycle-pool").await;
+    let other_pool = crate::harness::user_pool(&router, "lifecycle-other-pool").await;
     let arn = user_pool_arn(REGION, &pool);
     let other_arn = user_pool_arn(REGION, &other_pool);
     let cognito_issuer = format!("https://cognito-idp.{REGION}.amazonaws.com/{other_pool}");
@@ -273,8 +276,6 @@ async fn an_updated_identity_source_is_read_back_as_the_new_provider() {
             "MyCorp::User",
         ),
     ];
-
-    let router = router();
 
     for (case, create, update, expected_configuration, expected_entity_type) in &cases {
         // Each row gets its own store, so one row's sources cannot be seen by

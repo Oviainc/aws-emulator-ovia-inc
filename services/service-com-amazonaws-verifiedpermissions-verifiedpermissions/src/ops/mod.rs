@@ -398,15 +398,21 @@ fn listed(values: Option<&[String]>) -> Vec<String> {
 /// exactly what a create carrying the same provider stores, accepts exactly the
 /// pools a create accepts, and gains any rule added here without a second edit.
 /// A Cognito pool reference goes through [`crate::state::resolve_user_pool_arn`],
-/// the one implementation of THAT rule; an OIDC `issuer` names a provider outside
-/// the emulator and is accepted as given.
+/// the one implementation of THAT rule — which resolves it against the state of
+/// the service that owns user pools, in `engine`, so a reference to a pool that
+/// does not exist is refused instead of stored; an OIDC `issuer` names a provider
+/// outside the emulator and is accepted as given.
 ///
 /// The `Err` names the member the caller has to fix, for the modelled
 /// `ValidationException`'s `fieldList`: the check reports the member relative to
 /// the configuration, and the pointer is rooted here at `C::MEMBER_PATH` — the
 /// member THIS operation's input declares — so the refusal never addresses a
 /// member the request it refused has not got.
-pub fn persisted_identity_source_configuration<C: DescribesIdentityProvider + ?Sized>(
+pub fn persisted_identity_source_configuration<
+    C: DescribesIdentityProvider + ?Sized,
+    Eng: Send + Sync + 'static,
+>(
+    engine: &Eng,
     configuration: &C,
     request_region: &str,
 ) -> Result<crate::state::IdentitySourceConfiguration, InvalidInput> {
@@ -417,7 +423,7 @@ pub fn persisted_identity_source_configuration<C: DescribesIdentityProvider + ?S
             group_entity_type,
         } => {
             let (region, user_pool_id) =
-                crate::state::resolve_user_pool_arn(user_pool_arn, request_region)
+                crate::state::resolve_user_pool_arn(engine, user_pool_arn, request_region)
                     .map_err(|invalid| invalid.within(C::MEMBER_PATH))?;
             Ok(crate::state::IdentitySourceConfiguration::CognitoUserPool(
                 crate::state::CognitoUserPoolSource {

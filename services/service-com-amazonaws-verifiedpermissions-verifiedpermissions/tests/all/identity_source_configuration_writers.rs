@@ -42,16 +42,13 @@ const OIDC_ISSUER: &str = "https://accounts.example.com";
 
 /// The provider an update's source is seeded with before the row replaces it: a
 /// Cognito pool, so a row replacing it with an OIDC provider crosses union arms.
-fn seed_provider() -> Value {
+/// The pool is created first, because an identity source can only reference a
+/// pool the user-pool service holds.
+async fn seed_provider(router: &MultiServiceRouter) -> Value {
+    let pool = crate::harness::user_pool(router, "writers-seed-pool").await;
     json!({
-        "cognitoUserPoolConfiguration": { "userPoolArn": user_pool_arn(REGION, &seed_pool()) }
+        "cognitoUserPoolConfiguration": { "userPoolArn": user_pool_arn(REGION, &pool) }
     })
-}
-
-/// The seed source's user pool id. A pool id names the region the pool was
-/// created in (`<region>_<suffix>`), which is what makes it resolvable here.
-fn seed_pool() -> String {
-    format!("{REGION}_0a0b0c0d0")
 }
 
 /// Create an identity source carrying `provider` as its `configuration`, and
@@ -76,7 +73,7 @@ async fn created_with(router: &MultiServiceRouter, store_id: &str, provider: &Va
 /// Create an identity source on the seed provider, then UPDATE it to `provider`,
 /// and return its id.
 async fn updated_to(router: &MultiServiceRouter, store_id: &str, provider: &Value) -> String {
-    let id = created_with(router, store_id, &seed_provider()).await;
+    let id = created_with(router, store_id, &seed_provider(router).await).await;
     ok(
         router,
         "UpdateIdentitySource",
@@ -128,7 +125,8 @@ fn field_list(body: &Value) -> Vec<(String, String)> {
 /// `entityIdPrefix` and `groupConfiguration` present and absent.
 #[tokio::test]
 async fn both_writers_store_one_provider_description_the_same_way() {
-    let pool = format!("{REGION}_1a2b3c4d5");
+    let router = router();
+    let pool = crate::harness::user_pool(&router, "writers-pool").await;
     let arn = user_pool_arn(REGION, &pool);
     // The issuer and discovery URL the model documents for a Cognito user pool:
     // `https://cognito-idp.<region>.amazonaws.com/<user-pool-id>`, and that URL
@@ -273,7 +271,6 @@ async fn both_writers_store_one_provider_description_the_same_way() {
         ),
     ];
 
-    let router = router();
     let store_id = store_with_validation_off(&router).await;
     for (case, provider, configuration, details) in cases {
         let created = created_with(&router, &store_id, &provider).await;
@@ -318,7 +315,8 @@ async fn both_writers_store_one_provider_description_the_same_way() {
 /// the update), so the two refusals differ in that root and in nothing else.
 ///
 /// The rows differ along WHY the reference does not resolve: the ARN's account,
-/// its region, the region the pool id itself names, and its partition. An ARN
+/// its region, the region the pool id itself names, its partition, and a pool id
+/// no user pool carries. An ARN
 /// that does not even have a user pool ARN's SHAPE is refused by the modelled
 /// pattern on the member before either handler runs, so it says nothing about the
 /// translation and is not a row here.
@@ -354,13 +352,19 @@ async fn both_writers_refuse_an_unresolvable_pool_reference_identically() {
             "arn:aws-us-gov:cognito-idp:us-east-1:210987654321:userpool/us-east-1_9z8y7x6w5"
                 .to_string(),
         ),
+        (
+            // The ARN has every segment this emulator serves, and still names no
+            // pool: nothing ever created one with that id.
+            "a pool that was never created",
+            user_pool_arn(REGION, &format!("{REGION}_nevercreated")),
+        ),
     ];
 
     let router = router();
     let store_id = store_with_validation_off(&router).await;
     // One live source the update rows aim at, so a refusal is the configuration's
     // and not the source's absence — and so "nothing was written" is observable.
-    let target = created_with(&router, &store_id, &seed_provider()).await;
+    let target = created_with(&router, &store_id, &seed_provider(&router).await).await;
     let before = read(&router, &store_id, &target).await;
 
     for (case, arn) in cases {

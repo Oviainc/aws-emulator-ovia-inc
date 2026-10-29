@@ -37,7 +37,10 @@ use smithy_server_runtime::MultiServiceRouter;
 // The wire harness (`router`, `call`, `ok`, `store_with_mode`, `error_code`)
 // lives once in `tests/all/harness.rs` and is shared with every suite in this
 // crate.
-use crate::harness::{call, error_code, fault_message, ok, router, store_with_mode};
+use crate::harness::{
+    call, error_code, fault_message, ok, router, store_with_mode, user_pool, user_pool_arn,
+    SIGNING_REGION,
+};
 
 /// The one message every `ResourceNotFoundException` of this service carries.
 ///
@@ -118,17 +121,14 @@ const STATEMENT: &str = "permit(principal, action, resource);";
 /// rather than on the template text.
 const TEMPLATE_STATEMENT: &str = "permit(principal == ?principal, action, resource);";
 
-/// A well-formed Cognito identity-source configuration, in the account and the
-/// region this emulator presents, so a `CreateIdentitySource` row fails on the
-/// missing store rather than on its provider reference.
-fn cognito_configuration() -> Value {
+/// A well-formed Cognito identity-source configuration naming `user_pool_arn`,
+/// so a `CreateIdentitySource` row fails on what the row is about rather than on
+/// its provider reference. The ARN is passed in because an identity source can
+/// only reference a user pool that EXISTS, and the pool a test seeds is minted
+/// with an id only that test knows.
+fn cognito_configuration(user_pool_arn: &str) -> Value {
     json!({
-        "cognitoUserPoolConfiguration": {
-            "userPoolArn": format!(
-                "arn:aws:cognito-idp:us-east-1:{}:userpool/us-east-1_1a2b3c4d5",
-                engine::emulator_account_id()
-            ),
-        },
+        "cognitoUserPoolConfiguration": { "userPoolArn": user_pool_arn },
     })
 }
 
@@ -178,6 +178,12 @@ async fn store_arn(router: &MultiServiceRouter, store_id: &str) -> String {
 #[tokio::test]
 async fn every_control_plane_not_found_path_answers_the_same_constant_message() {
     let router = router();
+    // The pool an identity-source row references really exists, so such a row
+    // fails on the resource the row is about.
+    let seeded_pool_arn = user_pool_arn(
+        SIGNING_REGION,
+        &user_pool(&router, "not-found-row-pool").await,
+    );
 
     // A live store with one policy in it, so a row can miss the POLICY inside a
     // store that really exists.
@@ -434,7 +440,7 @@ async fn every_control_plane_not_found_path_answers_the_same_constant_message() 
             operation: "CreateIdentitySource",
             request: json!({
                 "policyStoreId": unknown_store,
-                "configuration": cognito_configuration(),
+                "configuration": cognito_configuration(&seeded_pool_arn),
             }),
             reference: unknown_store.clone(),
             resource_id: unknown_store.clone(),
@@ -792,6 +798,12 @@ const OTHER_STATEMENT: &str = "forbid(principal, action, resource);";
 #[tokio::test]
 async fn every_conflict_path_answers_the_same_constant_message() {
     let router = router();
+    // As above: the identity-source rows reference a pool that exists, so the
+    // only thing they can fail on is the conflict.
+    let seeded_pool_arn = user_pool_arn(
+        SIGNING_REGION,
+        &user_pool(&router, "conflict-row-pool").await,
+    );
     let store_a = store_with_mode(&router, "OFF").await;
     let store_b = store_with_mode(&router, "OFF").await;
 
@@ -910,7 +922,7 @@ async fn every_conflict_path_answers_the_same_constant_message() {
         "CreateIdentitySource",
         &json!({
             "policyStoreId": store_a,
-            "configuration": cognito_configuration(),
+            "configuration": cognito_configuration(&seeded_pool_arn),
             "principalEntityType": "MyCorp::User",
             "clientToken": source_token,
         }),
@@ -1038,7 +1050,7 @@ async fn every_conflict_path_answers_the_same_constant_message() {
             operation: "CreateIdentitySource",
             request: json!({
                 "policyStoreId": store_a,
-                "configuration": cognito_configuration(),
+                "configuration": cognito_configuration(&seeded_pool_arn),
                 "principalEntityType": "MyCorp::Employee",
                 "clientToken": source_token,
             }),

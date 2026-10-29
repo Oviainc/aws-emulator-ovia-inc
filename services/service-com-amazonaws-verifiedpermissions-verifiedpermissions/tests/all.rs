@@ -35,6 +35,8 @@ mod idempotency_parameter_escaping;
 mod identity_source_configuration_writers;
 #[path = "all/identity_source_refusal_pointers.rs"]
 mod identity_source_refusal_pointers;
+#[path = "all/identity_source_user_pool_existence.rs"]
+mod identity_source_user_pool_existence;
 #[path = "all/identity_sources.rs"]
 mod identity_sources;
 #[path = "all/is_authorized_with_token.rs"]

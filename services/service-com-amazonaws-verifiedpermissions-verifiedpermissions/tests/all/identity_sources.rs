@@ -14,13 +14,23 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A router serving only this service, over a fresh shared engine.
+/// A router serving this service and the Amazon Cognito user-pool service it
+/// resolves a `userPoolArn` against, over a fresh shared engine. This suite signs
+/// requests for several regions, so it wires its own router rather than taking the
+/// harness's.
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_verifiedpermissions_verifiedpermissions::EmulatedService::new(engine),
+        service_com_amazonaws_verifiedpermissions_verifiedpermissions::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice::EmulatedService::new(
+            engine,
+        ),
     );
     router
 }
@@ -99,7 +109,9 @@ fn error_code(body: &Value) -> String {
 }
 
 /// The ONE pool-ARN helper this test crate has lives in the shared harness; this
-/// suite reaches it rather than shaping a second copy.
+/// suite reaches it rather than shaping a second copy, and seeds the pools it
+/// references through the harness too ([`super::harness::user_pool`]) — an
+/// identity source can only reference a user pool that exists.
 use super::harness::user_pool_arn;
 
 /// `IdentitySourceId`'s published shape: `IS` + 22 base62 characters, inside the
@@ -121,13 +133,16 @@ fn looks_like_an_identity_source_id(id: &str) -> bool {
 /// `principalEntityType`.
 #[tokio::test]
 async fn identity_source_round_trips_every_configuration_it_was_created_with() {
-    let pool = "us-east-1_1a2b3c4d5";
-    let arn = user_pool_arn(REGION, pool);
+    let router = router();
+    let store_id = store(&router).await;
+    let pool = super::harness::user_pool(&router, "round-trip-pool").await;
+    let arn = user_pool_arn(REGION, &pool);
     // The issuer and discovery URL the model documents for a Cognito user pool:
     // `https://cognito-idp.<region>.amazonaws.com/<user-pool-id>`, and that URL
     // plus `/.well-known/openid-configuration`.
     let issuer = format!("https://cognito-idp.{REGION}.amazonaws.com/{pool}");
     let discovery = format!("{issuer}/.well-known/openid-configuration");
+    let arn = arn.as_str();
 
     // (case, request members beside policyStoreId, expected principalEntityType,
     //  expected configuration, expected deprecated details)
@@ -253,8 +268,6 @@ async fn identity_source_round_trips_every_configuration_it_was_created_with() {
         ),
     ];
 
-    let router = router();
-    let store_id = store(&router).await;
     let mut seen: Vec<String> = Vec::new();
     for (case, members, principal_entity_type, configuration, details) in cases {
         let mut request = members;
@@ -368,6 +381,10 @@ async fn a_user_pool_this_emulator_cannot_resolve_is_refused() {
 
     let router = router();
     let store_id = store(&router).await;
+    // The pool the fallback row below references really exists, so the only reason
+    // a row is refused is the segment of ITS ARN that row changed.
+    let live_pool_arn =
+        user_pool_arn(REGION, &super::harness::user_pool(&router, "live-pool").await);
     for (case, arn) in cases {
         let (status, body) = call(
             &router,
@@ -399,9 +416,7 @@ async fn a_user_pool_this_emulator_cannot_resolve_is_refused() {
                 "policyStoreId": store_id,
                 "clientToken": format!("token-{case}"),
                 "configuration": {
-                    "cognitoUserPoolConfiguration": {
-                        "userPoolArn": user_pool_arn(REGION, "us-east-1_1a2b3c4d5"),
-                    }
+                    "cognitoUserPoolConfiguration": { "userPoolArn": live_pool_arn },
                 },
             }),
         )
@@ -420,19 +435,22 @@ async fn a_user_pool_this_emulator_cannot_resolve_is_refused() {
 /// another.
 #[tokio::test]
 async fn the_signed_region_decides_which_user_pools_resolve() {
-    // (case, signing region, pool region, pool id, expected status)
-    let cases: &[(&str, &str, &str, &str, u16)] = &[
-        ("home-region", "us-east-1", "us-east-1", "us-east-1_1a2b3c4d5", 200),
-        ("other-home-region", "eu-west-1", "eu-west-1", "eu-west-1_5d4c3b2a1", 200),
-        ("ap-home-region", "ap-southeast-2", "ap-southeast-2", "ap-southeast-2_abcde1234", 200),
-        ("cross-region", "eu-west-1", "us-east-1", "us-east-1_1a2b3c4d5", 400),
-        ("cross-region-reversed", "us-east-1", "ap-southeast-2", "ap-southeast-2_abcde1234", 400),
+    // (case, signing region, the region the pool is created in, expected status)
+    let cases: &[(&str, &str, &str, u16)] = &[
+        ("home-region", "us-east-1", "us-east-1", 200),
+        ("other-home-region", "eu-west-1", "eu-west-1", 200),
+        ("ap-home-region", "ap-southeast-2", "ap-southeast-2", 200),
+        ("cross-region", "eu-west-1", "us-east-1", 400),
+        ("cross-region-reversed", "us-east-1", "ap-southeast-2", 400),
     ];
 
     let router = router();
     let store_id = store(&router).await;
-    for (case, signing_region, pool_region, pool, expected) in cases {
-        let arn = user_pool_arn(pool_region, pool);
+    for (case, signing_region, pool_region, expected) in cases {
+        // Each row's pool is seeded in the region the row names, so its id names
+        // that region and the pool really exists there.
+        let pool = super::harness::user_pool_in(&router, pool_region, &format!("pool-{case}")).await;
+        let arn = user_pool_arn(pool_region, &pool);
         let (status, body) = call_in(
             &router,
             signing_region,
@@ -535,16 +553,13 @@ async fn an_unknown_policy_store_or_identity_source_is_not_found() {
     let router = router();
     let store_id = store(&router).await;
     let other_store_id = store(&router).await;
+    let pool_arn = user_pool_arn(REGION, &super::harness::user_pool(&router, "not-found-pool").await);
     let created = ok(
         &router,
         "CreateIdentitySource",
         &json!({
             "policyStoreId": store_id,
-            "configuration": {
-                "cognitoUserPoolConfiguration": {
-                    "userPoolArn": user_pool_arn(REGION, "us-east-1_1a2b3c4d5"),
-                }
-            },
+            "configuration": { "cognitoUserPoolConfiguration": { "userPoolArn": pool_arn } },
         }),
     )
     .await;
@@ -561,9 +576,7 @@ async fn an_unknown_policy_store_or_identity_source_is_not_found() {
             json!({
                 "policyStoreId": "PSdoesnotexist11111111",
                 "configuration": {
-                    "cognitoUserPoolConfiguration": {
-                        "userPoolArn": user_pool_arn(REGION, "us-east-1_1a2b3c4d5"),
-                    }
+                    "cognitoUserPoolConfiguration": { "userPoolArn": pool_arn },
                 },
             }),
             "POLICY_STORE",
@@ -574,9 +587,7 @@ async fn an_unknown_policy_store_or_identity_source_is_not_found() {
             json!({
                 "policyStoreId": "policy-store-alias/not-an-alias",
                 "configuration": {
-                    "cognitoUserPoolConfiguration": {
-                        "userPoolArn": user_pool_arn(REGION, "us-east-1_1a2b3c4d5"),
-                    }
+                    "cognitoUserPoolConfiguration": { "userPoolArn": pool_arn },
                 },
             }),
             // The reference named an ALIAS, so the alias is the resource reported
@@ -633,7 +644,11 @@ async fn an_unknown_policy_store_or_identity_source_is_not_found() {
 async fn a_replayed_client_token_answers_with_the_identity_source_it_created() {
     let router = router();
     let store_id = store(&router).await;
-    let arn = user_pool_arn(REGION, "us-east-1_1a2b3c4d5");
+    let arn = user_pool_arn(REGION, &super::harness::user_pool(&router, "replay-pool").await);
+    // The row that changes the pool names a SECOND pool that also exists, so what
+    // the conflict is about is the changed parameter and not an unresolvable ARN.
+    let other_arn =
+        user_pool_arn(REGION, &super::harness::user_pool(&router, "replay-other-pool").await);
     let first = json!({
         "policyStoreId": store_id,
         "clientToken": "11111111-2222-3333-4444-555555555555",
@@ -666,9 +681,7 @@ async fn a_replayed_client_token_answers_with_the_identity_source_it_created() {
                 "policyStoreId": store_id,
                 "clientToken": "11111111-2222-3333-4444-555555555555",
                 "configuration": {
-                    "cognitoUserPoolConfiguration": {
-                        "userPoolArn": user_pool_arn(REGION, "us-east-1_9z8y7x6w5"),
-                    }
+                    "cognitoUserPoolConfiguration": { "userPoolArn": other_arn },
                 },
                 "principalEntityType": "MyCorp::User",
             }),
@@ -758,6 +771,9 @@ async fn a_store_at_its_identity_source_bound_refuses_the_next_one() {
     let store_id = store(&router).await;
     let mut first_id = String::new();
     for index in 0..bound {
+        // Each source references a pool of its own, every one of them seeded, so
+        // the only thing that stops the next create is the bound.
+        let pool = super::harness::user_pool(&router, &format!("bound-pool{index}")).await;
         let created = ok(
             &router,
             "CreateIdentitySource",
@@ -765,7 +781,7 @@ async fn a_store_at_its_identity_source_bound_refuses_the_next_one() {
                 "policyStoreId": store_id,
                 "configuration": {
                     "cognitoUserPoolConfiguration": {
-                        "userPoolArn": user_pool_arn(REGION, &format!("us-east-1_pool{index}")),
+                        "userPoolArn": user_pool_arn(REGION, &pool),
                     }
                 },
             }),
@@ -779,6 +795,7 @@ async fn a_store_at_its_identity_source_bound_refuses_the_next_one() {
         }
     }
 
+    let one_too_many = super::harness::user_pool(&router, "bound-pool-one-too-many").await;
     let (status, body) = call(
         &router,
         "CreateIdentitySource",
@@ -786,7 +803,7 @@ async fn a_store_at_its_identity_source_bound_refuses_the_next_one() {
             "policyStoreId": store_id,
             "configuration": {
                 "cognitoUserPoolConfiguration": {
-                    "userPoolArn": user_pool_arn(REGION, "us-east-1_onetoomany"),
+                    "userPoolArn": user_pool_arn(REGION, &one_too_many),
                 }
             },
         }),

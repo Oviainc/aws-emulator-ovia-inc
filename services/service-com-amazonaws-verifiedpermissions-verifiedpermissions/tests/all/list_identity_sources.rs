@@ -15,10 +15,15 @@ use super::harness::{
     call, error_code, ok, store_with_validation_off as store, user_pool_arn, SIGNING_REGION,
 };
 
-/// A Cognito user pool this emulator can resolve: one of its own account, in the
-/// region the harness signs for, whose pool id names that same region.
-fn pool_arn() -> String {
-    user_pool_arn(SIGNING_REGION, &format!("{SIGNING_REGION}_1a2b3c4d5"))
+/// A Cognito user pool this emulator can resolve: one freshly created in the
+/// region the harness signs for, which is how it comes to exist at all — an
+/// identity source can only reference a pool the user-pool service holds — and so
+/// one of this emulator's own account, with a pool id naming that same region.
+async fn pool_arn(router: &MultiServiceRouter) -> String {
+    user_pool_arn(
+        SIGNING_REGION,
+        &super::harness::user_pool(router, "list-pool").await,
+    )
 }
 
 /// Create one Cognito identity source whose principals carry
@@ -28,13 +33,14 @@ async fn create_source(
     store_id: &str,
     principal_entity_type: &str,
 ) -> String {
+    let arn = pool_arn(router).await;
     let created = ok(
         router,
         "CreateIdentitySource",
         &json!({
             "policyStoreId": store_id,
             "principalEntityType": principal_entity_type,
-            "configuration": { "cognitoUserPoolConfiguration": { "userPoolArn": pool_arn() } },
+            "configuration": { "cognitoUserPoolConfiguration": { "userPoolArn": arn } },
         }),
     )
     .await;
@@ -110,7 +116,8 @@ async fn walk(
 /// group configuration, entity-id prefix and `principalEntityType`.
 #[tokio::test]
 async fn a_listed_identity_source_reports_what_get_identity_source_reports() {
-    let arn = pool_arn();
+    let router = super::harness::router();
+    let arn = pool_arn(&router).await;
     // (case, request members beside policyStoreId)
     let cases: Vec<(&str, Value)> = vec![
         (
@@ -173,7 +180,6 @@ async fn a_listed_identity_source_reports_what_get_identity_source_reports() {
         ),
     ];
 
-    let router = super::harness::router();
     let store_id = store(&router).await;
     let mut created_ids: Vec<(String, String)> = Vec::new();
     for (case, members) in &cases {

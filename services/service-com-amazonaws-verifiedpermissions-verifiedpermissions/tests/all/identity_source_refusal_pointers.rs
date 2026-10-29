@@ -60,9 +60,13 @@ const USER_POOL_ARN_MAX_LENGTH: usize = 255;
 const PRINCIPAL_ENTITY_TYPE: &str = "MyCorp::User";
 
 /// A pool ARN this emulator resolves: its one account, the region the harness
-/// signs for, and a pool id naming that same region.
-fn reachable_pool_arn() -> String {
-    user_pool_arn(SIGNING_REGION, &format!("{SIGNING_REGION}_1a2b3c4d5"))
+/// signs for, and a pool the user-pool service really holds — which is what makes
+/// it resolvable, so a row carrying it is refused only for the member it is about.
+async fn reachable_pool_arn(router: &MultiServiceRouter) -> String {
+    user_pool_arn(
+        SIGNING_REGION,
+        &super::harness::user_pool(router, "pointer-pool").await,
+    )
 }
 
 /// A well-formed pool ARN padded to `bytes` characters through its POOL ID, so
@@ -122,12 +126,14 @@ async fn refuse(
 /// The rows span WHICH HALF of the crate refuses (this service's own resolution
 /// of the provider reference, and the modelled constraints the boundary checks),
 /// the arm of the union the offending member sits in (Cognito, OIDC), the
-/// constraint class broken (an unresolvable reference, a length maximum, a
-/// length minimum, a pattern) and the depth of the member below the
-/// configuration (two levels and three).
+/// constraint class broken (an unresolvable reference, a pool that does not
+/// exist, a length maximum, a length minimum, a pattern) and the depth of the
+/// member below the configuration (two levels and three).
 #[tokio::test]
 async fn a_refusal_addresses_the_member_the_refused_operation_declares() {
     let account = engine::emulator_account_id();
+    let router = router();
+    let reachable = reachable_pool_arn(&router).await;
 
     // (case, the pointer the refusal must name WITHIN the configuration, the
     //  provider description both operations carry)
@@ -161,6 +167,14 @@ async fn a_refusal_addresses_the_member_the_refused_operation_declares() {
                 format!("arn:aws-us-gov:cognito-idp:{SIGNING_REGION}:{account}:userpool/{SIGNING_REGION}_1a2b3c4d5") } }),
         ),
         (
+            // This service's own resolution again, on the pool itself: an ARN with
+            // every segment this emulator serves, naming a pool nothing created.
+            "a pool ARN naming a pool that was never created",
+            POOL_ARN_IN_CONFIGURATION,
+            json!({ "cognitoUserPoolConfiguration": { "userPoolArn":
+                user_pool_arn(SIGNING_REGION, &format!("{SIGNING_REGION}_nevercreated")) } }),
+        ),
+        (
             // The MODELLED length maximum, on a value that satisfies the pattern:
             // the boundary refuses it, and must name the same member.
             "a pool ARN one character past the modelled maximum",
@@ -180,7 +194,7 @@ async fn a_refusal_addresses_the_member_the_refused_operation_declares() {
             "a group entity type below the modelled length minimum",
             GROUP_ENTITY_TYPE_IN_CONFIGURATION,
             json!({ "cognitoUserPoolConfiguration": {
-                "userPoolArn": reachable_pool_arn(),
+                "userPoolArn": reachable,
                 "groupConfiguration": { "groupEntityType": "" },
             } }),
         ),
@@ -196,7 +210,6 @@ async fn a_refusal_addresses_the_member_the_refused_operation_declares() {
         ),
     ];
 
-    let router = router();
     let store_id = store_with_validation_off(&router).await;
     // One live identity source for the update rows to aim at, so an update is
     // refused for its configuration and not for a source that does not exist.
@@ -206,7 +219,7 @@ async fn a_refusal_addresses_the_member_the_refused_operation_declares() {
         &json!({
             "policyStoreId": store_id,
             "principalEntityType": PRINCIPAL_ENTITY_TYPE,
-            "configuration": { "cognitoUserPoolConfiguration": { "userPoolArn": reachable_pool_arn() } },
+            "configuration": { "cognitoUserPoolConfiguration": { "userPoolArn": reachable } },
         }),
     )
     .await;
@@ -249,7 +262,7 @@ async fn a_refusal_addresses_the_member_the_refused_operation_declares() {
 async fn a_refused_write_leaves_the_identity_source_as_it_was() {
     let router = router();
     let store_id = store_with_validation_off(&router).await;
-    let arn = reachable_pool_arn();
+    let arn = reachable_pool_arn(&router).await;
     let created = ok(
         &router,
         "CreateIdentitySource",

@@ -648,14 +648,13 @@ pub enum OpenIdConnectTokens {
 /// ([`crate::ops::persisted_identity_source_configuration`]), because the two
 /// writers of an identity source spell it differently.
 ///
-/// What this CANNOT check: whether a pool with that id was ever created. The
-/// cognito-idp emulator holds its user pools in its own state struct, and
-/// [`service_state`] reaches per-service state BY TYPE — that type lives in the
-/// cognito-idp crate, which this crate does not depend on (one crate per
-/// service), and no shared crate publishes a pool registry. The partition, the
-/// account, the region and the region the pool id names are therefore the whole
-/// of the resolution this service can perform.
-pub fn resolve_user_pool_arn(
+/// Once the ARN names a pool this service could reach, the pool itself is looked
+/// up in the state of the service that OWNS user pools, in this same engine
+/// ([`holds_user_pool`]): a reference to a pool nothing ever created resolves to
+/// no pool, so it is refused here rather than stored and discovered later by the
+/// authorization call that needs the pool's key set.
+pub fn resolve_user_pool_arn<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     arn: &str,
     request_region: &str,
 ) -> Result<(String, String), crate::ops::InvalidInput> {
@@ -703,7 +702,45 @@ pub fn resolve_user_pool_arn(
              id names the region the pool was created in"
         )));
     }
+    // The last question the shape cannot answer: does the pool exist? It is
+    // answered where the answer lives — the user-pool service's own state.
+    if !holds_user_pool(engine, user_pool_id) {
+        return Err(invalid(format!(
+            "no Amazon Cognito user pool {user_pool_id} exists in region {region}; an identity \
+             source can only reference a user pool that exists"
+        )));
+    }
     Ok((region.to_string(), user_pool_id.to_string()))
+}
+
+/// Whether the service that owns Amazon Cognito user pools holds one with
+/// `user_pool_id`, in this same engine.
+///
+/// A user pool is another service's resource, and in this emulator that service
+/// keeps its pools in its own state in the ONE shared engine — so the registry a
+/// stored reference is resolved against is that state, read exactly as
+/// [`token::published_key_set`] reads the key set a pool publishes. Only the
+/// pool's existence is read, and nothing is written.
+///
+/// `false` when that state cannot be reached at all, which a request this service
+/// serves never sees: a handler reaches its own state through [`service_state`]
+/// first and answers a server fault when that fails, and both resolve through the
+/// same engine.
+///
+/// LOCK ORDER: this takes the user-pool service's state lock while its caller
+/// holds this service's, which is the order [`token::published_key_set`] takes
+/// them in as well. Nothing in the user-pool service reads this service's state,
+/// so that order is the only one taken — a future reader of ITS state from here
+/// must keep it.
+fn holds_user_pool<Eng: Send + Sync + 'static>(engine: &Eng, user_pool_id: &str) -> bool {
+    let Some(pools) =
+        ::service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice
+            ::state::service_state(engine)
+    else {
+        return false;
+    };
+    let pools = pools.lock();
+    pools.pool(user_pool_id).is_some()
 }
 
 /// The region the request was signed for, or [`DEFAULT_REGION`] when it carries
