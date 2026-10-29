@@ -47,7 +47,7 @@ fn policy_operations() -> Vec<(&'static str, Vec<(&'static str, String)>)> {
 /// An XML text node, decoded: the awsQuery envelope escapes the five XML entities
 /// and emits tab/LF/CR as numeric references, so a message carrying a quote or a
 /// newline arrives encoded.
-fn decode_xml_text(text: &str) -> String {
+pub(crate) fn decode_xml_text(text: &str) -> String {
     text.replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&lt;", "<")

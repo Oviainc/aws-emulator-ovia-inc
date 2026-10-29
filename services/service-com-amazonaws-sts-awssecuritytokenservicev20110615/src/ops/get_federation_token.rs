@@ -377,7 +377,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
             NewSession {
                 tags: crate::state::tag_pairs(input.tags.as_deref()),
-                packed_policy_size: packed_policy,
+                packed_policy_size: Some(packed_policy),
                 ..NewSession::new(identity, SessionKind::FederationToken, duration_seconds)
             },
         );
@@ -405,7 +405,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 federated_user_id,
                 arn: federated_user_arn,
             }),
-            packed_policy_size: packed_policy,
+            packed_policy_size: Some(packed_policy),
             session_token_utilization: Some(session_token_utilization),
             session_token_size: Some(session_token_size),
         })

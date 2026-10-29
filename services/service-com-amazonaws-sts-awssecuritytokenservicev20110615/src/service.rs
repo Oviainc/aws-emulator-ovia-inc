@@ -288,6 +288,122 @@ fn addresses_unattributed_query_request(parts: &http::request::Parts) -> bool {
         && form_encoded
 }
 
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`StatedPerOperation`] and keyed by its operation shape name — the routing key
+/// [`smithy_server_runtime::ServerHttpProtocol::routing_key`] resolves and the generated
+/// table is keyed by.
+macro_rules! wrap_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                ::std::boxed::Box::new(StatedPerOperation::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
+}
+
+/// One modelled operation, served so that a refused request is stated the way AWS states
+/// it: with the value as SUBMITTED between the quotes.
+///
+/// The framework hands [`Service::override_refusal`] the violations ALONE, and the walk
+/// that found them stores an ELIDED rendering of each value — a bounded prefix followed by
+/// a byte count — because the clause interpolates whatever is stored and a caller controls
+/// the length. An AWS constraint message quotes the value the caller sent, which is the one
+/// place the server reports the offending input back, so the value has to be restored from
+/// the request; and the request is reachable only HERE, per operation.
+///
+/// Nothing else is re-implemented. A request this wrapper does not refuse is handed to the
+/// generated [`ErasedOperation::run`], which owns deserialize -> validate -> handle ->
+/// serialize, telemetry and every modelled error. The violations come from the framework's
+/// own machinery (`service_common::validation::refusing_violations`), so this cannot refuse
+/// a request the framework's own walk would accept, nor accept one it would refuse, and the
+/// WORDING is the same [`stated_violations`] that [`Service::override_refusal`] uses — so
+/// the two refusal paths cannot drift. The cost is that a request this wrapper does not
+/// refuse is read twice, once here and once in the operation's own sequence, because the
+/// framework hands no already-built input to an operation.
+struct StatedPerOperation<O> {
+    operation: O,
+}
+
+impl<O> StatedPerOperation<O> {
+    /// Wrap one operation, already constructed from the shared engine.
+    fn new(operation: O) -> Self {
+        Self { operation }
+    }
+}
+
+/// How this service words a constraint refusal: the violations the framework's own walk
+/// finds over `req`, each value echo restored to the bytes the caller sent, under the error
+/// code STS answers a constraint violation with.
+///
+/// `None` when the request breaks no constraint, and for a failure that is NOT a refusal (a
+/// body the codec cannot read at all, a member of the wrong type), which the framework's own
+/// walk answers in its own envelope.
+fn stated_refusal<O: smithy_server_runtime::Operation>(
+    protocol: &dyn smithy_server_runtime::ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<(Vec<aws_smithy_schema_server::Violation>, Refused)> {
+    let violations = ::service_common::validation::refusing_violations::<O>(protocol, req);
+    let stated = stated_violations(&violations)?;
+    Some((violations, stated))
+}
+
+/// The ONE renderer both of this service's refusal paths go through —
+/// [`StatedPerOperation`] for a request a wrapped operation refuses, and
+/// [`Service::override_refusal`] for one the centralized walk refuses — so a caller cannot
+/// be told the same broken constraint two ways.
+fn stated_violations(violations: &[aws_smithy_schema_server::Violation]) -> Option<Refused> {
+    if violations.is_empty() {
+        return None;
+    }
+    ::service_common::validation_message::aws_validation_refusal(&Refusal::Invalid(
+        violations.to_vec(),
+    ))
+    .map(|stated| Refused {
+        code: crate::scaffolded::VALIDATION_ERROR_CODE.to_string(),
+        message: stated.message,
+    })
+}
+
+impl<O> ErasedOperation for StatedPerOperation<O>
+where
+    O: smithy_server_runtime::Operation + ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r smithy_server_runtime::OperationContext<'r>,
+    ) -> smithy_server_runtime::BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // The protocol is read, used and dropped inside this statement: neither it nor
+            // `&dyn ErasedServiceDefinition` is `Sync`, so holding one across the await
+            // below would make this future non-`Send`. It is the protocol this service
+            // SERVES with, so the re-read sees the call where the request carries it (see
+            // [`QuerySignedCalls`]).
+            let refused = match svc.override_protocol() {
+                Some(protocol) => stated_refusal::<O>(protocol, req),
+                None => stated_refusal::<O>(svc.definition().protocol(), req),
+            };
+            if let Some((violations, stated)) = refused {
+                return svc
+                    .definition()
+                    .refusal_response(ProtocolError::Invalid(violations), Some(stated));
+            }
+            self.operation.run(svc, req, ctx).await
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not change
+    /// which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
+    }
+}
+
 /// The `com-amazonaws-sts-awssecuritytokenservicev20110615` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -305,6 +421,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// it. One instance for every request, as the framework's own protocols are
     /// ("Server protocols are stateless").
     protocol: QuerySignedCalls,
+    /// Every modelled operation of this service, each wrapped in [`StatedPerOperation`]
+    /// and keyed by the routing key the protocol resolves — the table
+    /// [`Service::override_operation`] serves a request from, so a refused request is
+    /// stated with the value it was refused for whichever operation it named.
+    stated: smithy_server_runtime::OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -312,10 +433,27 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut stated = smithy_server_runtime::OperationRoutingTable::new();
+        wrap_operations!(
+            stated,
+            engine,
+            assume_role::AssumeRole,
+            assume_role_with_saml::AssumeRoleWithSAML,
+            assume_role_with_web_identity::AssumeRoleWithWebIdentity,
+            assume_root::AssumeRoot,
+            decode_authorization_message::DecodeAuthorizationMessage,
+            get_access_key_info::GetAccessKeyInfo,
+            get_caller_identity::GetCallerIdentity,
+            get_delegated_access_token::GetDelegatedAccessToken,
+            get_federation_token::GetFederationToken,
+            get_session_token::GetSessionToken,
+            get_web_identity_token::GetWebIdentityToken,
+        );
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             engine,
             protocol: QuerySignedCalls::new(),
+            stated,
         }
     }
 
@@ -401,19 +539,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // The ROUTER names the operation from the model-derived protocol's routing key,
-        // which reads the form-encoded BODY — so the one request this service's routing
-        // key cannot name is a call signed under SigV4's query-parameter scheme, which
-        // carries its whole call in the query string and no body at all (see
-        // [`QuerySignedCalls`], the protocol that then READS that call). The two use the
-        // SAME reader, so the operation this resolves and the members the walk
-        // deserializes come from the same place; a body-carried call is left to the
-        // generated routing table exactly as before, and a query `Action` naming no
-        // modelled operation resolves to nothing, which leaves the request on the
-        // router's own routing-error path and this service's protocol-correct answer.
-        let query = call_in_query_string(req)?;
-        let action = ::service_common::query_parameter(query, ACTION_FIELD)?;
-        self.entry.routing_table().get(action)
+        // Every modelled operation is served WRAPPED. This is NOT a re-route: the key is
+        // the one this service's own protocol resolves — which reads the call from the
+        // query string when that is where SigV4 put it and from the form-encoded BODY
+        // otherwise (see [`QuerySignedCalls`]) — and the operation it names is the one
+        // served, wrapped in [`StatedPerOperation`] so a refused request quotes the value
+        // it refused. A key the model does not name resolves to `None` here exactly as it
+        // does in the generated table, which leaves the request on the router's own
+        // routing-error path and this service's protocol-correct answer.
+        let action = self.protocol.routing_key(req).ok()?;
+        self.stated.get(action)
     }
 
     fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {

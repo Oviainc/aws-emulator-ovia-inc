@@ -49,6 +49,8 @@ Issue-Commit: 2e744e838767d761bb8115d027d1acb9d75669f4
 
 # STS sessions carry no policy scoping, PackedPolicySize/oversized-policy classification is wrong, and GetDelegatedAccessToken plus the outbound web-identity federation operations are unserved (8 causes)
 
+> _STATUS: causes 2, 3 and 7 are fixed — `PackedPolicySize` is reported by every mint whose response models it (zero when the request packs nothing), an inline session policy over the 2,048-character plaintext limit is refused as a validation error naming the member and the bound BEFORE the packed-size rule is applied, and a constraint refusal quotes the value as submitted (bounded by the one ceiling a clause carries) with the `@pattern` as the model states it. Causes 4 and 6 were already correct in the tree by the time that fix landed: `GetDelegatedAccessToken` is implemented with its own suite, and an unsigned `awsQuery` request reaches STS and is answered in the protocol's XML envelope (pinned by `core/router/tests/all/unsigned_entry_points_reach_their_service.rs`). Causes 1, 5 and 8 — no session-scoped authorization is evaluated anywhere, the JWT-vending surface is unserved, and the fifteen refusal/expiry checks that depend on the first of those — are re-filed with their replay keys as `issues/things-that-do-not-work/20261029T120000Z-sts-3-of-the-8-session-scoping-causes-remain-open.md`, so none of them is recorded as working._
+
 > _Note: this issue was identified against the code base at commit `2e744e838767d761bb8115d027d1acb9d75669f4`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

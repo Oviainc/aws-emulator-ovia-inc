@@ -1572,19 +1572,70 @@ pub fn packed_policy_bytes(policy: Option<&str>, policy_arns: &[String], tags: &
 }
 
 /// The percentage of [`SESSION_TOKEN_SIZE_LIMIT`] a request's session policies and
-/// session tags take up, or `None` when the request carries none of them — which is
-/// when AWS reports no `PackedPolicySize` at all.
+/// session tags take up — "a percentage value that indicates the packed size of the
+/// session policies and session tags combined passed in the request" (`PackedPolicySize`,
+/// this service's model).
+///
+/// It is a measurement of the mint, so EVERY mint has one: a request that carries no
+/// session policy and no session tag packs nothing, which is zero percent of the budget
+/// and inside the member's modelled `0..` range — not an absent measurement. Every
+/// operation whose response models the member therefore reports it, so two mints AWS
+/// answers alike cannot differ in the shape of their response.
 ///
 /// The percentage is rounded up, so anything packed at all reports at least one percent,
 /// and it passes 100 exactly when the packed size passes the byte limit — the one
 /// condition `PackedPolicyTooLargeException` is answered for.
-pub fn packed_policy_size(policy: Option<&str>, policy_arns: &[String], tags: &[Tag]) -> Option<i32> {
+pub fn packed_policy_size(policy: Option<&str>, policy_arns: &[String], tags: &[Tag]) -> i32 {
     let packed = packed_policy_bytes(policy, policy_arns, tags);
-    if packed == 0 {
+    let percent = packed.saturating_mul(100).div_ceil(SESSION_TOKEN_SIZE_LIMIT);
+    i32::try_from(percent).unwrap_or(i32::MAX)
+}
+
+/// The most characters an inline session policy's PLAINTEXT may carry: "The plaintext
+/// that you use for both inline and managed session policies can't exceed 2,048
+/// characters" (`AssumeRoleRequest$Policy`, this service's model).
+///
+/// The model states that maximum as the `@length` of `sessionPolicyDocumentType`, the
+/// shape every OTHER operation's `Policy` member targets — so for those the framework
+/// refuses an over-long document before a handler runs. `AssumeRole`'s member targets
+/// `unrestrictedSessionPolicyDocumentType`, which carries the same documented limit and
+/// no `@length` maximum, so the same constraint is checked by the handler instead
+/// ([`session_policy_over_plaintext_limit`]).
+pub const MAX_SESSION_POLICY_PLAINTEXT_CHARS: usize = 2048;
+
+/// How a request whose inline session policy passes
+/// [`MAX_SESSION_POLICY_PLAINTEXT_CHARS`] is refused, and `None` for a document within
+/// it.
+///
+/// The limit is on the policy's PLAINTEXT, so it is measured in characters of the document
+/// as submitted, and the refusal is stated as the constraint class it is — the framework's
+/// own clause for a `@length` maximum, at `member_path`, quoting the document — rather than
+/// as a sentence of this service's own: a caller that reads the message to find the
+/// offending input sees the same wording whichever operation refused it, and the plaintext
+/// limit is answered BEFORE the request's session state is packed, so "your policy text is
+/// too long" and "your session state does not fit" stay two distinct refusals.
+///
+/// The quoting goes through [`::service_common::validation::quoted_echo`], the ceiling
+/// every clause this service states carries: the member this check exists for declares no
+/// `@length` maximum of its own, so without it one message would be sized by the request.
+/// The CHECK is made against the document as sent, never against that rendering.
+pub fn session_policy_over_plaintext_limit(member_path: &str, policy: &str) -> Option<String> {
+    if policy.chars().count() <= MAX_SESSION_POLICY_PLAINTEXT_CHARS {
         return None;
     }
-    let percent = packed.saturating_mul(100).div_ceil(SESSION_TOKEN_SIZE_LIMIT);
-    Some(i32::try_from(percent).unwrap_or(i32::MAX))
+    let violation = ::aws_smithy_schema_server::Violation {
+        path: member_path.to_string(),
+        kind: ::aws_smithy_schema_server::ViolationKind::MaxLength(
+            i64::try_from(MAX_SESSION_POLICY_PLAINTEXT_CHARS).unwrap_or(i64::MAX),
+        ),
+        value: Some(
+            ::service_common::validation::quoted_echo(policy).into_owned(),
+        ),
+    };
+    ::service_common::validation_message::aws_validation_refusal(
+        &::smithy_server_runtime::Refusal::Invalid(vec![violation]),
+    )
+    .map(|stated| stated.message)
 }
 
 /// How AWS words `PackedPolicyTooLarge`: the size the request's session policies and

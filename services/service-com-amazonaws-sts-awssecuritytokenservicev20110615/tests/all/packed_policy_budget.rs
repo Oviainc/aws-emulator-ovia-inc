@@ -16,6 +16,12 @@
 //! one byte either side of it), and which operation is minting (`AssumeRole`,
 //! `GetFederationToken`). The recorded case — fifty session tags of 128-character keys and
 //! 256-character values — is one row.
+//!
+//! The inline policy of every row is within the 2,048-character PLAINTEXT limit the
+//! operation documents for it, because that is a DIFFERENT rule, answered before anything
+//! is packed: a document over it is a validation error naming the member and the bound
+//! (`session_policy_limits.rs`), so the budget rule is reached only by a request whose
+//! plaintext fits.
 
 use super::sts_sessions::{call, element, emulator, member, seed_demo_role, LONG_TERM_KEY};
 
@@ -23,9 +29,14 @@ use super::sts_sessions::{call, element, emulator, member, seed_demo_role, LONG_
 /// range maximum, which is the size of the largest serialized session token STS issues.
 const SESSION_TOKEN_SIZE_LIMIT: usize = 4096;
 
+/// The most characters an inline session policy's plaintext may carry ("The plaintext that
+/// you use for both inline and managed session policies can't exceed 2,048 characters",
+/// `AssumeRoleRequest$Policy`), which is the ceiling every row's own policy stays under.
+const MAX_SESSION_POLICY_PLAINTEXT_CHARS: usize = 2048;
+
 /// A JSON policy document of EXACTLY `bytes` bytes: the fixed skeleton a session policy
 /// has, padded in one of its values.
-fn policy_of(bytes: usize) -> String {
+pub(crate) fn policy_of(bytes: usize) -> String {
     let skeleton = r#"{"Version":"2012-10-17","Comment":""}"#;
     assert!(
         bytes >= skeleton.len(),
@@ -120,39 +131,39 @@ async fn a_packed_token_is_measured_against_one_budget_and_the_refusal_names_bot
     let (few_tags, few_tags_packed) = session_tags(3, 16, 32);
     let (many_arns, many_arns_packed) = policy_arns(10, 450);
     let (one_arn, one_arn_packed) = policy_arns(1, 60);
-    // All three inputs together, one byte over the budget.
-    let mixed_tags = session_tags(2, 32, 64);
-    let mixed_arn = policy_arns(1, 100);
-    let mixed_policy_bytes = SESSION_TOKEN_SIZE_LIMIT + 1 - mixed_tags.1 - mixed_arn.1;
+    // All three inputs together, one byte over the budget: an inline policy at its
+    // plaintext limit, one managed policy ARN and thirteen session tags.
+    let mixed_policy_bytes = MAX_SESSION_POLICY_PLAINTEXT_CHARS;
+    let mixed_arn = policy_arns(1, 99);
+    let mixed_tags = session_tags(13, 50, 100);
+    // Session tags alone, one byte over the budget (4097 = 17 x 241).
+    let tags_over_budget = session_tags(17, 100, 141);
     let federated_tags = session_tags(20, 128, 256);
 
     let rows: Vec<Row> = vec![
         Row {
-            case: "an inline policy exactly at the budget",
+            case: "an inline policy at its plaintext limit",
             action: "AssumeRole",
             params: assume_params(vec![(
                 "Policy".to_string(),
-                policy_of(SESSION_TOKEN_SIZE_LIMIT),
+                policy_of(MAX_SESSION_POLICY_PLAINTEXT_CHARS),
             )]),
-            packed: SESSION_TOKEN_SIZE_LIMIT,
+            packed: MAX_SESSION_POLICY_PLAINTEXT_CHARS,
         },
         Row {
-            case: "an inline policy one byte under the budget",
+            case: "an inline policy one byte under its plaintext limit",
             action: "AssumeRole",
             params: assume_params(vec![(
                 "Policy".to_string(),
-                policy_of(SESSION_TOKEN_SIZE_LIMIT - 1),
+                policy_of(MAX_SESSION_POLICY_PLAINTEXT_CHARS - 1),
             )]),
-            packed: SESSION_TOKEN_SIZE_LIMIT - 1,
+            packed: MAX_SESSION_POLICY_PLAINTEXT_CHARS - 1,
         },
         Row {
-            case: "an inline policy one byte over the budget",
+            case: "session tags one byte over the budget",
             action: "AssumeRole",
-            params: assume_params(vec![(
-                "Policy".to_string(),
-                policy_of(SESSION_TOKEN_SIZE_LIMIT + 1),
-            )]),
-            packed: SESSION_TOKEN_SIZE_LIMIT + 1,
+            params: assume_params(tags_over_budget.0),
+            packed: tags_over_budget.1,
         },
         Row {
             case: "fifty session tags of 128-character keys and 256-character values",

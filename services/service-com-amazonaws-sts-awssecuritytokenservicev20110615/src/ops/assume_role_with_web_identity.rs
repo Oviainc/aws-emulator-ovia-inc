@@ -463,7 +463,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &mut registry,
             now,
             NewSession {
-                packed_policy_size: packed_policy,
+                packed_policy_size: Some(packed_policy),
                 role_arn: Some(role.arn.clone()),
                 ..NewSession::new(session_identity, SessionKind::AssumedRole, duration_seconds)
             },
@@ -492,7 +492,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 assumed_role_id,
                 arn: assumed_role_arn,
             }),
-            packed_policy_size: packed_policy,
+            packed_policy_size: Some(packed_policy),
             // The three facts the token itself carries, as the issuance recorded them:
             // "the value of the `iss` field", the client id the token was issued for, and
             // "the value returned by the identity provider as the token's `sub` claim".

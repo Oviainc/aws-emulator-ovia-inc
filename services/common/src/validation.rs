@@ -384,6 +384,33 @@ pub(crate) fn violations_in<O: Operation>(
     }
 }
 
+/// `value` as a CLAUSE of a refusal quotes it: the value itself when it fits the ceiling
+/// one clause may carry ([`MAX_RESTORED_ECHO`]), and past that a character-boundary-safe
+/// prefix of it followed by the marker naming the whole value's byte count — the same shape
+/// the framework's own constraint walk stores for a value too long to interpolate, and the
+/// shape [`is_elision_of`] recognises.
+///
+/// For a service that words a clause over a value the framework reported NO violation on: a
+/// constraint the model states only in PROSE, which the handler therefore checks itself.
+/// Asking here is what gives that clause the SAME ceiling as every clause restored from the
+/// walk ([`with_submitted_values`]), so the two refusal paths of one service cannot carry
+/// different ceilings and no message is sized by the request.
+///
+/// The CHECK must still be made against the value the caller sent, never against this
+/// rendering: eliding before the check compares text nobody submitted.
+#[must_use]
+pub fn quoted_echo(value: &str) -> ::std::borrow::Cow<'_, str> {
+    if value.len() <= MAX_RESTORED_ECHO {
+        return ::std::borrow::Cow::Borrowed(value);
+    }
+    // Truncate on a character boundary, never mid-UTF-8.
+    let mut end = MAX_RESTORED_ECHO;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    ::std::borrow::Cow::Owned(format!("{}... [{} bytes]", &value[..end], value.len()))
+}
+
 /// The largest single submitted value restored into a clause by default, and the ceiling a
 /// service that states none is held to (see the module docs).
 const MAX_RESTORED_ECHO: usize = 16 * 1024;
@@ -1480,10 +1507,11 @@ impl ShapeSerializer for SubmittedValues {
 #[cfg(test)]
 mod tests {
     use super::{
-        echo_of, is_elision_of, list_of_element, rendered_sequence, rendered_structure, unanchored,
-        unanchored_grouping_alternation, Composite, RenderedChild, Submitted, SubmittedEcho,
-        SubmittedValues, MAX_RECORDED_BYTES, MAX_RECORDED_LEAVES, MAX_RECORDED_RENDERED_BYTES,
-        MAX_RECORDED_RENDERINGS, MAX_RENDERED_CHILDREN, MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
+        echo_of, is_elision_of, list_of_element, quoted_echo, rendered_sequence,
+        rendered_structure, unanchored, unanchored_grouping_alternation, Composite, RenderedChild,
+        Submitted, SubmittedEcho, SubmittedValues, MAX_RECORDED_BYTES, MAX_RECORDED_LEAVES,
+        MAX_RECORDED_RENDERED_BYTES, MAX_RECORDED_RENDERINGS, MAX_RENDERED_CHILDREN,
+        MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
     };
     use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
     use std::collections::HashMap;
@@ -1621,6 +1649,66 @@ mod tests {
             dropping.done() && dropping.skipped,
             "case a walk of oversized values: expected it to be done and incomplete"
         );
+    }
+
+    /// RULE: a clause quotes the value itself up to the ceiling one clause may carry, and
+    /// past that a character-boundary-safe prefix plus the marker naming the whole value's
+    /// byte count — so the quoting is bounded by a constant rather than by the request, and
+    /// what it renders is an elision of the value the walk itself would recognise.
+    #[test]
+    fn a_quoted_echo_is_the_value_itself_up_to_one_ceiling() {
+        // One row: the case, the value, and whether the ceiling leaves it whole.
+        let rows: [(&str, String, bool); 5] = [
+            ("a short value", "bob".to_string(), true),
+            (
+                "a value at the ceiling",
+                "x".repeat(MAX_RESTORED_ECHO),
+                true,
+            ),
+            (
+                "a value one byte over the ceiling",
+                "x".repeat(MAX_RESTORED_ECHO + 1),
+                false,
+            ),
+            (
+                "a value far over the ceiling",
+                "x".repeat(64 * MAX_RESTORED_ECHO),
+                false,
+            ),
+            (
+                // Two bytes per character: the prefix must not split one.
+                "a multi-byte value over the ceiling",
+                "é".repeat(MAX_RESTORED_ECHO),
+                false,
+            ),
+        ];
+        for (case, value, whole) in rows {
+            let quoted = quoted_echo(&value);
+            if whole {
+                assert_eq!(
+                    quoted, value,
+                    "case {case:?}: expected the value itself, got {} bytes",
+                    quoted.len()
+                );
+            } else {
+                assert!(
+                    quoted.len() <= MAX_RESTORED_ECHO + 32,
+                    "case {case:?}: expected a clause bounded by the ceiling, got {} bytes",
+                    quoted.len()
+                );
+                assert!(
+                    quoted.ends_with(&format!("... [{} bytes]", value.len())),
+                    "case {case:?}: expected the marker naming {} bytes, got the tail {:?}",
+                    value.len(),
+                    &quoted[quoted.len().saturating_sub(32)..]
+                );
+                assert!(
+                    is_elision_of(&quoted, &value),
+                    "case {case:?}: the walk must recognise the rendering as this value's \
+                     elision"
+                );
+            }
+        }
     }
 
     /// RULE: a stored echo is the submitted value's elision when it is that value, or a

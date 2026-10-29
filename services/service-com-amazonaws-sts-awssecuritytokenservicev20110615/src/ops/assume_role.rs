@@ -394,6 +394,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // An inline session policy's PLAINTEXT limit is a constraint on the request's
+        // own value, so it is answered before anything is packed: a document over it is
+        // refused as a validation error naming the member and the bound, which is a
+        // different refusal class from a packed session state that does not fit.
+        if let Some(why) = input
+            .policy
+            .as_deref()
+            .and_then(|policy| crate::state::session_policy_over_plaintext_limit("policy", policy))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(why));
+        }
+
         // The size the session policies and session tags pack into, measured in bytes,
         // and the same size as the percentage of the token budget AWS reports. A mint
         // whose packed token passes the budget does not fit, and the refusal names the
@@ -671,7 +683,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 source_identity: source_identity.clone(),
                 tags,
                 transitive_tag_keys,
-                packed_policy_size: packed_policy,
+                packed_policy_size: Some(packed_policy),
                 external_id: input.external_id.clone(),
                 role_arn: Some(role.arn.clone()),
                 ..NewSession::new(identity, SessionKind::AssumedRole, duration_seconds)
@@ -701,7 +713,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 assumed_role_id,
                 arn: assumed_role_arn,
             }),
-            packed_policy_size: packed_policy,
+            packed_policy_size: Some(packed_policy),
             source_identity,
             session_token_utilization: Some(session_token_utilization),
             session_token_size: Some(session_token_size),

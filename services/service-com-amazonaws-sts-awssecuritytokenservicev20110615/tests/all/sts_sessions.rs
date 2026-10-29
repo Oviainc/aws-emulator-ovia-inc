@@ -545,18 +545,21 @@ async fn assume_role_refuses_a_role_arn_that_is_not_one() {
 // ---------------------------------------------------------------------------
 
 /// `PackedPolicySize` is the percentage of the packed token budget the request's session
-/// policies and tags take up: absent when it passes none, rounded up when it passes
-/// any, and over 100 percent — which is over the budget's 4,096 bytes — the request is
-/// refused with `PackedPolicyTooLarge` (the message that refusal carries is pinned by
-/// `packed_policy_budget`). A policy that is not a JSON policy document is refused with
+/// policies and tags take up: reported by every mint whose response models it — zero for a
+/// request that packs none, rounded up for one that packs any — and over 100 percent,
+/// which is over the budget's 4,096 bytes, the request is refused with
+/// `PackedPolicyTooLarge` (the message that refusal carries is pinned by
+/// `packed_policy_budget`). An inline policy over the 2,048-character plaintext limit the
+/// operation documents is refused BEFORE anything is packed, as a validation error
+/// (`session_policy_limits`). A policy that is not a JSON policy document is refused with
 /// `MalformedPolicyDocument`.
 #[tokio::test]
 async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
     let (router, engine) = emulator();
     let (_role_arn, _role_id) = seed_demo_role(&engine);
     let small_policy = r#"{"Version":"2012-10-17","Statement":[]}"#.to_string();
-    // The packed token budget is 4,096 bytes, so a policy well past it packs to more
-    // than 100 percent.
+    // An inline session policy's plaintext is limited to 2,048 characters, so a document
+    // well past that is refused for its length before it is packed.
     let huge_policy = format!(
         r#"{{"Version":"2012-10-17","Comment":"{}"}}"#,
         "x".repeat(4100)
@@ -582,7 +585,7 @@ async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
             ],
             200,
             None,
-            None,
+            Some(0),
         ),
         (
             "assume-role, a small inline policy",
@@ -610,7 +613,7 @@ async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
             Some(1),
         ),
         (
-            "assume-role, a policy past the budget",
+            "assume-role, a policy past its plaintext limit",
             "AssumeRole",
             vec![
                 ("RoleArn", "arn:aws:iam::000000000000:role/demo".to_string()),
@@ -618,7 +621,7 @@ async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
                 ("Policy", huge_policy.clone()),
             ],
             400,
-            Some("PackedPolicyTooLarge"),
+            Some("ValidationError"),
             None,
         ),
         (
@@ -666,7 +669,7 @@ async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
             vec![("Name", "bob".to_string())],
             200,
             None,
-            None,
+            Some(0),
         ),
         (
             "federation-token, a small inline policy",
