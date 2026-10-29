@@ -23,5 +23,7 @@ mod media_insights_pipeline_status;
 mod resource_tagging;
 #[path = "all/service_claim.rs"]
 mod service_claim;
+#[path = "all/speaker_search_task.rs"]
+mod speaker_search_task;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

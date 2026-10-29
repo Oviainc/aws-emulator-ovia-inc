@@ -54,7 +54,7 @@ const STREAM_ARN: &str =
 
 /// Create one media insights pipeline configuration and answer its ARN: the resource a
 /// pipeline runs, so every pipeline row starts from one.
-async fn configuration_arn(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn configuration_arn(emulator: &Emulator, name: &str) -> String {
     let created = emulator
         .call(
             "POST",

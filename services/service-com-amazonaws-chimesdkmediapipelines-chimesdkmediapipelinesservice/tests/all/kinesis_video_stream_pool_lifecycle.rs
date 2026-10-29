@@ -68,14 +68,28 @@ const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
 /// One request/response round trip through the router.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The engine the service is mounted on, kept so a suite can set up the part of the
+    /// store no modelled operation of this service writes (the account's voice-analytics
+    /// enrolment) instead of building a second engine, which would be a private store.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
     pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// This emulator's store, reached exactly as a handler reaches it.
+    pub(crate) fn store(
+        &self,
+    ) -> engine::ServiceState<
+        service_com_amazonaws_chimesdkmediapipelines_chimesdkmediapipelinesservice::state::ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState,
+    > {
+        service_com_amazonaws_chimesdkmediapipelines_chimesdkmediapipelinesservice::state::service_state(&*self.engine)
+            .expect("the in-memory engine serves this service's store")
     }
 
     /// Dispatch one request and return what the rows assert on (`Value::Null` for an empty
@@ -203,8 +217,9 @@ impl Response {
 }
 
 /// Whether `id` is a 36-character GUID, which also satisfies the model's
-/// `KinesisVideoStreamPoolId` (len 1..256, pattern `^[0-9a-zA-Z._-]+$`).
-fn is_guid(id: &str) -> bool {
+/// `KinesisVideoStreamPoolId` (len 1..256, pattern `^[0-9a-zA-Z._-]+$`) and the
+/// `GuidString` every minted id of this service carries.
+pub(crate) fn is_guid(id: &str) -> bool {
     let groups: Vec<&str> = id.split('-').collect();
     groups.len() == 5
         && [8, 4, 4, 4, 12]
@@ -219,7 +234,7 @@ fn is_guid(id: &str) -> bool {
 /// Parse a modelled `Iso8601Timestamp` as the service renders it, returning epoch seconds.
 /// Parsing is what makes the assertion sound: it fails both on the epoch NUMBER the
 /// protocol default would emit and on any other text.
-fn iso8601_seconds(case: &str, value: &str) -> f64 {
+pub(crate) fn iso8601_seconds(case: &str, value: &str) -> f64 {
     aws_smithy_types::DateTime::from_str(value, aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_else(|e| panic!("case {case:?}: {value:?} is not an ISO-8601 date-time: {e}"))
         .as_secs_f64()

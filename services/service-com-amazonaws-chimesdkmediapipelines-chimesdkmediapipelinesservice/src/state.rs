@@ -10,6 +10,10 @@
 //! [`InsightsConfiguration`] and [`StreamPool`] as their operations are implemented, and
 //! `GetMediaPipeline`/`ListMediaPipelines` read over all of them.
 //!
+//! The speaker search TASKS a media insights pipeline runs live here too, beside
+//! [`SpeakerSearchTaskRecord`], together with the account's voice-analytics enrolment,
+//! which every voice-analytics task operation is gated on.
+//!
 //! Besides the store this module holds the few derivations every pipeline handler
 //! shares — the ARN shape, the signed region, the modelled error shapes and the
 //! pagination cursor — so no two handlers spell one of them differently.
@@ -26,14 +30,15 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    BadRequestException, ChimeSdkMeetingConfiguration, ConflictException,
+    BadRequestException, ChimeSdkMeetingConfiguration, ConflictException, ForbiddenException,
     KinesisVideoStreamConfiguration, KinesisVideoStreamPoolConfiguration,
     KinesisVideoStreamPoolSummary, KinesisVideoStreamRecordingSourceRuntimeConfiguration,
-    KinesisVideoStreamSourceRuntimeConfiguration, MediaCapturePipeline,
-    MediaCapturePipelineSummary, MediaInsightsPipeline, MediaInsightsPipelineConfiguration,
-    MediaInsightsPipelineConfigurationElement, MediaPipelineSummary, NotFoundException,
-    RealTimeAlertConfiguration, ResourceLimitExceededException, S3RecordingSinkRuntimeConfiguration,
-    ServiceFailureException, SseAwsKeyManagementParams,
+    KinesisVideoStreamSourceRuntimeConfiguration, KinesisVideoStreamSourceTaskConfiguration,
+    MediaCapturePipeline, MediaCapturePipelineSummary, MediaInsightsPipeline,
+    MediaInsightsPipelineConfiguration, MediaInsightsPipelineConfigurationElement,
+    MediaPipelineSummary, NotFoundException, RealTimeAlertConfiguration,
+    ResourceLimitExceededException, S3RecordingSinkRuntimeConfiguration, ServiceFailureException,
+    SpeakerSearchTask, SseAwsKeyManagementParams,
 };
 
 /// The `MediaPipelineStatus` value a freshly created pipeline carries.
@@ -59,9 +64,22 @@ pub const POOL_STATUS_ACTIVE: &str = "ACTIVE";
 /// The `KinesisVideoStreamPoolStatus` a pool carries while an update is being applied.
 pub const POOL_STATUS_UPDATING: &str = "UPDATING";
 
+/// The `MediaPipelineTaskStatus` a freshly started voice-analytics task carries.
+/// From `smithy_query(query="shape", shape="MediaPipelineTaskStatus")`:
+/// `NotStarted | Initializing | InProgress | Failed | Stopping | Stopped`. That is a
+/// DIFFERENT enum from `MediaPipelineStatus` above, so a task's statuses are named here
+/// rather than borrowed from a pipeline's.
+pub const TASK_STATUS_INITIALIZING: &str = "Initializing";
+
+/// The `MediaPipelineTaskStatus` a task reaches once it is running.
+pub const TASK_STATUS_IN_PROGRESS: &str = "InProgress";
+
 /// The `ErrorCode` enum value a `BadRequestException` carries.
 /// From `smithy_query(query="shape", shape="ErrorCode")`.
 const ERROR_CODE_BAD_REQUEST: &str = "BadRequest";
+
+/// The `ErrorCode` enum value a `ForbiddenException` carries.
+const ERROR_CODE_FORBIDDEN: &str = "Forbidden";
 
 /// The `ErrorCode` enum value a `NotFoundException` carries.
 const ERROR_CODE_NOT_FOUND: &str = "NotFound";
@@ -228,6 +246,25 @@ pub const MAX_INSIGHTS_PIPELINES: usize = 1_000;
 /// to stall a client workflow.
 pub const POOL_TRANSIENT_TO_ACTIVE: Duration = Duration::from_secs(3);
 
+/// How long after a voice-analytics task is started its `Initializing -> InProgress`
+/// transition falls due.
+///
+/// `Initializing` is a NON-TERMINAL `MediaPipelineTaskStatus`, so the real service leaves
+/// that transition to its own clock rather than to a caller's call. AWS publishes no
+/// duration for it, so this span is CHOSEN: never zero, so a caller reading straight back
+/// still observes the transient status, and short enough not to stall a client workflow.
+pub const TASK_INITIALIZING_TO_IN_PROGRESS: Duration = Duration::from_secs(3);
+
+/// The most voice-analytics tasks this store holds at once.
+///
+/// The RESOURCE BOUND for the collection `StartSpeakerSearchTask` grows: the record count
+/// rises once per start, so without a maximum a caller could grow resident memory without
+/// limit and make the per-read `settle_clock` sweep arbitrarily long while holding the
+/// shared lock. The number itself is CHOSEN, not quoted — AWS's concurrent-task quota is
+/// not in the model and is adjustable per account — and set far above any realistic client
+/// workflow.
+pub const MAX_SPEAKER_SEARCH_TASKS: usize = 1_000;
+
 /// How many tags one resource of THIS service carries at once.
 ///
 /// Its own model bounds `TagList` at 200 members, not the 50 the other Chime models
@@ -323,6 +360,30 @@ pub fn service_failure(message: impl Into<String>) -> ServiceFailureException {
         request_id: Some(next_request_id()),
     }
 }
+
+/// The modelled 403 `ForbiddenException`, carrying `message`.
+pub fn forbidden(message: impl Into<String>) -> ForbiddenException {
+    ForbiddenException {
+        code: Some(ERROR_CODE_FORBIDDEN.to_string()),
+        message: Some(message.into()),
+        request_id: Some(next_request_id()),
+    }
+}
+
+/// The `message` every voice-analytics task operation refuses an account that is not
+/// enrolled for the feature with.
+///
+/// Biometric speaker identification is enabled per account out of band, and the model
+/// states no text for the refusal, so this is RECORDED behaviour: a fixed string with no
+/// variable parts — it names neither the account, the pipeline nor the task.
+pub const VOICE_ANALYTICS_NOT_ENABLED_MESSAGE: &str = "AWS account is not enabled";
+
+/// The `message` this service's `NotFoundException` carries.
+///
+/// The model states no text for it, so this is RECORDED behaviour: one fixed string for
+/// every operation and every resource kind, with no variable parts — in particular it
+/// echoes NO identifier from the request.
+pub const NOT_FOUND_MESSAGE: &str = "Unable to find the requested identifier";
 
 /// The modelled 400 `ResourceLimitExceededException`, carrying `message`.
 pub fn resource_limit_exceeded(message: impl Into<String>) -> ResourceLimitExceededException {
@@ -421,6 +482,16 @@ pub enum StreamPoolRefused {
 pub enum InsightsPipelineRefused {
     /// The store already holds [`MAX_INSIGHTS_PIPELINES`] pipelines — the modelled
     /// `ResourceLimitExceededException` (HTTP 400).
+    LimitReached,
+}
+
+/// Why the store refused to persist a voice-analytics task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeakerSearchTaskRefused {
+    /// The store already holds [`MAX_SPEAKER_SEARCH_TASKS`] tasks. `StartSpeakerSearchTask`
+    /// models no resource-limit error, so a start refused for the store's bound is reported
+    /// as the modelled `ThrottledClientException` (HTTP 429) — the allowance refusal the
+    /// operation does model.
     LimitReached,
 }
 
@@ -706,6 +777,42 @@ impl InsightsPipeline {
     }
 }
 
+/// One persisted speaker search task: what `StartSpeakerSearchTask` minted and stored,
+/// which is what every later read of the task renders from.
+///
+/// The task's own resources — the voice profile domain its matches are drawn from and the
+/// Kinesis video stream source it reads — are kept exactly as the caller submitted them, so
+/// the record says what the task was started on and no read has to recover it from a
+/// request.
+#[derive(Debug, Clone)]
+pub struct SpeakerSearchTaskRecord {
+    pub speaker_search_task_id: String,
+    /// The `MediaPipelineId` of the media insights pipeline the task runs on: a task is
+    /// addressed under its pipeline, so the pair is what identifies it.
+    pub media_pipeline_id: String,
+    pub voice_profile_domain_arn: String,
+    pub kinesis_video_stream_source_task_configuration:
+        Option<KinesisVideoStreamSourceTaskConfiguration>,
+    pub status: String,
+    pub created_timestamp: DateTime,
+    pub updated_timestamp: DateTime,
+    /// When the `Initializing -> InProgress` transition the clock owes falls due, or `None`
+    /// once it has been materialised.
+    pub in_progress_due_at: Option<SystemTime>,
+}
+
+impl SpeakerSearchTaskRecord {
+    /// This task as the modelled `SpeakerSearchTask` the start and every later read return.
+    pub fn as_modeled(&self) -> SpeakerSearchTask {
+        SpeakerSearchTask {
+            speaker_search_task_id: Some(self.speaker_search_task_id.clone()),
+            speaker_search_task_status: Some(self.status.clone()),
+            created_timestamp: Some(self.created_timestamp),
+            updated_timestamp: Some(self.updated_timestamp),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-chimesdkmediapipelines-chimesdkmediapipelinesservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState {
@@ -745,6 +852,18 @@ pub struct ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState 
     insights_pipeline_tokens: HashMap<String, String>,
     /// The next creation sequence to hand out.
     next_seq: u64,
+    /// Every started speaker search task, in start order.
+    speaker_search_tasks: Vec<SpeakerSearchTaskRecord>,
+    /// `ClientRequestToken -> the task ID`, so a replayed start answers with the task the
+    /// first one minted instead of starting a second. Bounded exactly as
+    /// [`Self::request_tokens`] is.
+    speaker_search_task_tokens: HashMap<String, String>,
+    /// Whether this account is enrolled for the Chime SDK's voice-analytics features.
+    ///
+    /// Biometric speaker identification is enabled per account out of band — no modelled
+    /// operation of this service turns it on — so the stored default is NOT enrolled, which
+    /// is what every voice-analytics task operation refuses against.
+    voice_analytics_enabled: bool,
     /// The id counter, seeded from the clock on first use and advanced through
     /// `splitmix64` once per minted id, so no id is ever a function of a request.
     id_seed: u64,
@@ -761,6 +880,12 @@ impl ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState {
     /// bounds that id at 1..256 characters matching `^[0-9a-zA-Z._-]+$`, which a v4 GUID
     /// satisfies, so the two ids are minted by ONE derivation rather than two.
     pub fn mint_stream_pool_id(&mut self) -> String {
+        self.mint_guid()
+    }
+
+    /// Mint a fresh `SpeakerSearchTaskId`, drawn from the same counter: the model bounds
+    /// that id by the same 36-character `GuidString` pattern a `MediaPipelineId` carries.
+    pub fn mint_speaker_search_task_id(&mut self) -> String {
         self.mint_guid()
     }
 
@@ -801,6 +926,17 @@ impl ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState {
             }
             pipeline.status = STATUS_IN_PROGRESS.to_string();
             pipeline.in_progress_due_at = None;
+        }
+        for task in &mut self.speaker_search_tasks {
+            let Some(due) = task.in_progress_due_at else {
+                continue;
+            };
+            if now < due {
+                continue;
+            }
+            task.status = TASK_STATUS_IN_PROGRESS.to_string();
+            task.updated_timestamp = timestamp(due);
+            task.in_progress_due_at = None;
         }
         for pool in &mut self.stream_pools {
             let Some(due) = pool.active_due_at else {
@@ -1085,6 +1221,68 @@ impl ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState {
         };
         pipeline.in_progress_due_at = None;
         Ok(pipeline)
+    }
+
+    /// Whether this account is enrolled for the voice-analytics features, which is what
+    /// every voice-analytics task operation is gated on.
+    pub fn voice_analytics_enabled(&self) -> bool {
+        self.voice_analytics_enabled
+    }
+
+    /// Record whether this account is enrolled for the voice-analytics features. The
+    /// enrolment is made out of band — no modelled operation of this service carries it —
+    /// so this is the one way the store's flag moves.
+    pub fn set_voice_analytics_enabled(&mut self, enabled: bool) {
+        self.voice_analytics_enabled = enabled;
+    }
+
+    /// Persist `task` (and, when the start carried one, the `ClientRequestToken` that minted
+    /// it) and hand back the STORED record, so a start renders its response from the store.
+    ///
+    /// THE STORE'S BOUND: refuses before growing either collection once the store already
+    /// holds [`MAX_SPEAKER_SEARCH_TASKS`] tasks.
+    pub fn insert_speaker_search_task(
+        &mut self,
+        task: SpeakerSearchTaskRecord,
+        request_token: Option<String>,
+    ) -> Result<&SpeakerSearchTaskRecord, SpeakerSearchTaskRefused> {
+        if self.speaker_search_tasks.len() >= MAX_SPEAKER_SEARCH_TASKS {
+            return Err(SpeakerSearchTaskRefused::LimitReached);
+        }
+        if let Some(token) = request_token {
+            self.speaker_search_task_tokens
+                .insert(token, task.speaker_search_task_id.clone());
+        }
+        self.speaker_search_tasks.push(task);
+        Ok(self
+            .speaker_search_tasks
+            .last()
+            .expect("a task was just pushed"))
+    }
+
+    /// The speaker search task `task_id` names ON the media insights pipeline
+    /// `media_pipeline_id`, or `None` when that pipeline has no such task: a task is
+    /// addressed under the pipeline it was started on, so the same id under another pipeline
+    /// resolves to nothing.
+    pub fn speaker_search_task(
+        &self,
+        media_pipeline_id: &str,
+        task_id: &str,
+    ) -> Option<&SpeakerSearchTaskRecord> {
+        self.speaker_search_tasks.iter().find(|task| {
+            task.media_pipeline_id == media_pipeline_id && task.speaker_search_task_id == task_id
+        })
+    }
+
+    /// The task a previous start minted under `token`, for the idempotent replay.
+    pub fn speaker_search_task_for_request_token(
+        &self,
+        token: &str,
+    ) -> Option<&SpeakerSearchTaskRecord> {
+        let task_id = self.speaker_search_task_tokens.get(token)?;
+        self.speaker_search_tasks
+            .iter()
+            .find(|task| task.speaker_search_task_id == *task_id)
     }
 
     /// Persist `configuration` (and, when the create carried one, the

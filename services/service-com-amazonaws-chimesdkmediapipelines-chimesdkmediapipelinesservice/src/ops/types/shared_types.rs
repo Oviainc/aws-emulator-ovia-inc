@@ -1430,13 +1430,107 @@ pub struct MediaStreamPipeline {
     pub sinks: Option<Vec<MediaStreamSink>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.chimesdkmediapipelines#SpeakerSearchTask")]
+// `SpeakerSearchTask`'s schema is written out by hand for the reason the note on
+// `MediaCapturePipeline` states: the model targets both timestamp members at
+// `Iso8601Timestamp`, which carries `@timestampFormat("date-time")`
+// (`smithy_query(query="shape", shape="SpeakerSearchTask")`), and the derive does not carry
+// that trait onto the member schema.
 #[derive(Debug, Clone, Default)]
 pub struct SpeakerSearchTask {
     pub speaker_search_task_id: Option<String>,
     pub speaker_search_task_status: Option<String>,
     pub created_timestamp: Option<::aws_smithy_types::DateTime>,
     pub updated_timestamp: Option<::aws_smithy_types::DateTime>,
+}
+
+impl SpeakerSearchTask {
+    // Associated member-schema consts, in the model's member order.
+    const M_SPEAKER_SEARCH_TASK_ID: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#SpeakerSearchTask$SpeakerSearchTaskId",
+        "SpeakerSearchTaskId",
+        ::aws_smithy_schema::ShapeType::String,
+        0,
+    );
+    const M_SPEAKER_SEARCH_TASK_STATUS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#SpeakerSearchTask$SpeakerSearchTaskStatus",
+        "SpeakerSearchTaskStatus",
+        ::aws_smithy_schema::ShapeType::String,
+        1,
+    );
+    /// `@timestampFormat("date-time")`, from the `Iso8601Timestamp` shape this member
+    /// targets. THE reason this schema is hand-written.
+    const M_CREATED_TIMESTAMP: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#SpeakerSearchTask$CreatedTimestamp",
+        "CreatedTimestamp",
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        2,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    /// `@timestampFormat("date-time")`, as `CreatedTimestamp` above.
+    const M_UPDATED_TIMESTAMP: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#SpeakerSearchTask$UpdatedTimestamp",
+        "UpdatedTimestamp",
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        3,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.chimesdkmediapipelines#SpeakerSearchTask",
+            "com.amazonaws.chimesdkmediapipelines",
+            "SpeakerSearchTask",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_SPEAKER_SEARCH_TASK_ID,
+            &Self::M_SPEAKER_SEARCH_TASK_STATUS,
+            &Self::M_CREATED_TIMESTAMP,
+            &Self::M_UPDATED_TIMESTAMP,
+        ],
+    );
+}
+
+pub static SPEAKER_SEARCH_TASK_SCHEMA: &::aws_smithy_schema::Schema = &SpeakerSearchTask::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for SpeakerSearchTask {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.speaker_search_task_id.as_ref() {
+            s.write_string(&Self::M_SPEAKER_SEARCH_TASK_ID, v.as_str())?;
+        }
+        if let Some(v) = self.speaker_search_task_status.as_ref() {
+            s.write_string(&Self::M_SPEAKER_SEARCH_TASK_STATUS, v.as_str())?;
+        }
+        if let Some(v) = self.created_timestamp.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_TIMESTAMP, v)?;
+        }
+        if let Some(v) = self.updated_timestamp.as_ref() {
+            s.write_timestamp(&Self::M_UPDATED_TIMESTAMP, v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for SpeakerSearchTask {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.speaker_search_task_id = Some(d.read_string(member)?),
+                Some(1) => out.speaker_search_task_status = Some(d.read_string(member)?),
+                Some(2) => out.created_timestamp = Some(d.read_timestamp(member)?),
+                Some(3) => out.updated_timestamp = Some(d.read_timestamp(member)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.chimesdkmediapipelines#VoiceToneAnalysisTask")]

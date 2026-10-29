@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSpeakerSearchTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSpeakerSearchTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a speaker search task on a stored media insights pipeline and persists it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSpeakerSearchTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Speaker search is a BIOMETRIC feature, enabled per account out of band, so the first
+//! thing this operation decides is whether the account is enrolled for voice analytics: an
+//! account that is not is permanently forbidden (the modelled 403 `ForbiddenException`),
+//! and that refusal is made BEFORE any resource is looked up, so the identifiers a refused
+//! request carried are never resolved and nothing is stored. For an enrolled account the
+//! task is minted against the stored pipeline, starts in the non-terminal `Initializing`
+//! status the clock moves to `InProgress`, and `GetSpeakerSearchTask` reads it back; an
+//! identifier the store holds no media insights pipeline under is the modelled 404
+//! `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +168,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSpeakerSearchTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSpeakerSearchTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSpeakerSearchTask"))
+        let _ = ctx;
+        // Modelled constraints — the `Identifier` label's `\S` pattern, the
+        // `VoiceProfileDomainArn`'s 1..1024 length and `^arn…$` pattern, and the
+        // `ClientRequestToken`'s 2..64 length and pattern — are refused BEFORE this handler
+        // runs, and `service.rs` words that refusal as this service's 400
+        // `BadRequestException`.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartSpeakerSearchTaskErrorModeled::ServiceFailureException(
+                crate::state::service_failure("The media pipeline store is unavailable."),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The statuses this start reports are decided against the ones the clock already
+        // owes, not the ones the records happen to still carry.
+        store.settle_clock(now);
+
+        // Speaker search identifies a speaker from stored voice prints, which an account is
+        // enrolled for out of band. An account that is not enrolled is permanently forbidden
+        // from starting the task, and the refusal is decided here — ahead of any lookup — so
+        // neither the pipeline nor the voice profile domain the request names is resolved,
+        // and a request naming nothing that exists is still this refusal rather than a
+        // not-found.
+        if !store.voice_analytics_enabled() {
+            return Err(StartSpeakerSearchTaskErrorModeled::ForbiddenException(
+                crate::state::forbidden(crate::state::VOICE_ANALYTICS_NOT_ENABLED_MESSAGE),
+            )
+            .into());
+        }
+
+        // Idempotent replay: the same `ClientRequestToken` answers with the task the first
+        // start minted rather than starting a second.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(existing) = store.speaker_search_task_for_request_token(token) {
+                return Ok(StartSpeakerSearchTaskOutput {
+                    speaker_search_task: Some(existing.as_modeled()),
+                });
+            }
+        }
+
+        // A task runs ON a media insights pipeline, so an identifier — its id or its ARN —
+        // that names none the store holds names a resource that does not exist. The task is
+        // keyed by the pipeline's own id, so whichever identifying form a later read carries
+        // addresses the one task.
+        let Some(media_pipeline_id) = store
+            .insights_pipeline(&input.identifier)
+            .map(|pipeline| pipeline.media_pipeline_id.clone())
+        else {
+            return Err(StartSpeakerSearchTaskErrorModeled::NotFoundException(
+                crate::state::not_found(crate::state::NOT_FOUND_MESSAGE),
+            )
+            .into());
+        };
+
+        let speaker_search_task_id = store.mint_speaker_search_task_id();
+        let task = crate::state::SpeakerSearchTaskRecord {
+            speaker_search_task_id,
+            media_pipeline_id,
+            voice_profile_domain_arn: input.voice_profile_domain_arn,
+            kinesis_video_stream_source_task_configuration: input
+                .kinesis_video_stream_source_task_configuration,
+            // `Initializing` is a non-terminal `MediaPipelineTaskStatus`: the move to
+            // `InProgress` is the clock's, not a caller's.
+            status: crate::state::TASK_STATUS_INITIALIZING.to_string(),
+            created_timestamp: crate::state::timestamp(now),
+            updated_timestamp: crate::state::timestamp(now),
+            in_progress_due_at: Some(now + crate::state::TASK_INITIALIZING_TO_IN_PROGRESS),
+        };
+
+        match store.insert_speaker_search_task(task, input.client_request_token) {
+            Ok(stored) => Ok(StartSpeakerSearchTaskOutput {
+                speaker_search_task: Some(stored.as_modeled()),
+            }),
+            // The store is full. This operation models no resource-limit error, so its
+            // bound is reported as the allowance refusal it does model.
+            Err(crate::state::SpeakerSearchTaskRefused::LimitReached) => Err(
+                StartSpeakerSearchTaskErrorModeled::ThrottledClientException(
+                    ThrottledClientException {
+                        code: None,
+                        message: Some(format!(
+                            "The maximum number of speaker search tasks ({}) are already \
+                             running. Stop a task before starting another.",
+                            crate::state::MAX_SPEAKER_SEARCH_TASKS
+                        )),
+                        request_id: Some(crate::state::next_request_id()),
+                    },
+                )
+                .into(),
+            ),
+        }
     }
 }

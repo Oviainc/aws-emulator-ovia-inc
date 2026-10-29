@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSpeakerSearchTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSpeakerSearchTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the speaker search task a `SpeakerSearchTaskId` names on a media insights
+//! pipeline, from the stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSpeakerSearchTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Speaker search is a BIOMETRIC feature, enabled per account out of band, so this read is
+//! gated exactly as the start is: an account that is not enrolled for voice analytics is
+//! permanently forbidden (the modelled 403 `ForbiddenException`), decided BEFORE either
+//! identifier is resolved, so a request naming nothing that exists is still that refusal
+//! and not a not-found. For an enrolled account an identifier naming no stored pipeline, or
+//! a task id that pipeline holds no task under, is the modelled 404 `NotFoundException`.
+//!
+//! A report, not a mutation: the only write is materialising the status transition the
+//! clock already owed.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +158,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSpeakerSearchTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSpeakerSearchTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSpeakerSearchTask"))
+        let _ = ctx;
+        // Both labels' modelled patterns — `\S` on the `Identifier` and the 36-character
+        // GUID on the `SpeakerSearchTaskId` — are refused BEFORE this handler runs, and
+        // `service.rs` words that refusal as this service's 400 `BadRequestException`.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSpeakerSearchTaskErrorModeled::ServiceFailureException(
+                crate::state::service_failure("The media pipeline store is unavailable."),
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // A report, not a mutation: the only write is materialising the status transition
+        // the clock already owed.
+        store.settle_clock(::std::time::SystemTime::now());
+
+        // The account's enrolment for the biometric feature is decided ahead of any lookup,
+        // so an unenrolled account learns nothing about which resources exist.
+        if !store.voice_analytics_enabled() {
+            return Err(GetSpeakerSearchTaskErrorModeled::ForbiddenException(
+                crate::state::forbidden(crate::state::VOICE_ANALYTICS_NOT_ENABLED_MESSAGE),
+            )
+            .into());
+        }
+
+        // A task is addressed under the pipeline it was started on — by that pipeline's id
+        // or its ARN — so the pair is resolved, and either half naming nothing the store
+        // holds is the one not-found.
+        store
+            .insights_pipeline(&input.identifier)
+            .map(|pipeline| pipeline.media_pipeline_id.clone())
+            .and_then(|media_pipeline_id| {
+                store.speaker_search_task(&media_pipeline_id, &input.speaker_search_task_id)
+            })
+            .map(|task| GetSpeakerSearchTaskOutput {
+                speaker_search_task: Some(task.as_modeled()),
+            })
+            .ok_or_else(|| {
+                GetSpeakerSearchTaskErrorModeled::NotFoundException(crate::state::not_found(
+                    crate::state::NOT_FOUND_MESSAGE,
+                ))
+                .into()
+            })
     }
 }
