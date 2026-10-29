@@ -7,7 +7,7 @@
 //! and nothing is echoed straight back out of a request without being stored first.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::RangeInclusive;
 use std::time::{Duration, SystemTime};
 
@@ -149,6 +149,64 @@ pub const DEFAULT_POOL_SLOTS: i64 = 128;
 
 /// The description [`DEFAULT_POOL_NAME`] carries, as Apache Airflow seeds it.
 pub const DEFAULT_POOL_DESCRIPTION: &str = "Default pool";
+
+/// How many distinct metric series — one metric name together with one dimension set — this
+/// emulator holds published datapoints for, per environment.
+///
+/// A `PublishMetrics` request names both the metric and its dimensions, so the series a
+/// caller can bring into existence are caller-driven growth: without a ceiling a loop
+/// publishing fresh names would grow this process's memory without bound. The number is the
+/// emulator's own, not a fidelity claim about a published quota; a request that would take an
+/// environment past it is refused, so a caller is told its metric was not stored rather than
+/// having it silently dropped.
+pub const MAX_METRIC_SERIES: usize = 500;
+
+/// How many datapoints one metric series keeps: the most recent ones, oldest first out.
+///
+/// A series is unbounded in time, so a retention window is what keeps it finite. The count
+/// is the emulator's own; eviction rather than refusal is how a time series ages, so a
+/// publish into a full series stores its datapoint and drops the oldest.
+pub const MAX_METRIC_DATAPOINTS_PER_SERIES: usize = 1_000;
+
+/// How many dimensions one published metric may carry — the number Amazon CloudWatch, where
+/// these metrics land, documents for a metric ("each metric can have up to 30 dimensions").
+///
+/// `Dimensions` carries no modelled `@length`, so the boundary validator cannot express the
+/// bound and `PublishMetrics` enforces it.
+pub const MAX_METRIC_DIMENSIONS: usize = 30;
+
+/// The longest metric name, dimension name or dimension value this store keeps, in
+/// characters — the length Amazon CloudWatch, where these metrics land, documents for each
+/// of them ("the name ... must contain 255 or fewer characters").
+///
+/// None of the three members carries a modelled `@length`, so the boundary validator cannot
+/// express the bound and `PublishMetrics` enforces it; it is also what keeps the stored size
+/// of one series key bounded by something other than whatever a request carried.
+pub const MAX_METRIC_LABEL_LENGTH: usize = 255;
+
+/// The exponent of the magnitude a metric value stays inside.
+///
+/// Amazon CloudWatch documents that a metric value must lie in the range -2^360 to 2^360 and
+/// that special values (NaN, +Infinity, -Infinity) are not supported. `Double` carries no
+/// modelled `@range`, so `PublishMetrics` enforces both — see [`is_publishable_metric_value`].
+pub const MAX_METRIC_VALUE_EXPONENT: i32 = 360;
+
+/// The largest magnitude a metric value may have: 2 to the power of
+/// [`MAX_METRIC_VALUE_EXPONENT`], computed rather than written out so the bound and its
+/// exponent cannot drift apart.
+#[must_use]
+pub fn max_metric_value_magnitude() -> f64 {
+    2f64.powi(MAX_METRIC_VALUE_EXPONENT)
+}
+
+/// Whether `value` is a number a published metric may carry: finite, and no larger in
+/// magnitude than [`max_metric_value_magnitude`]. The one place the question is asked, so
+/// every number a datum carries — a plain value and each member of a statistic set alike —
+/// is judged by the same rule.
+#[must_use]
+pub fn is_publishable_metric_value(value: f64) -> bool {
+    value.is_finite() && value.abs() <= max_metric_value_magnitude()
+}
 
 /// `EnvironmentStatus` while the environment is being created — "The request to create
 /// the environment is in progress." (the `Status` member's own doc).
@@ -886,6 +944,10 @@ pub struct EnvironmentRecord {
     /// Apache Airflow REST API (`InvokeRestApi`) reads and writes. Per environment,
     /// because two environments run two web servers over two databases.
     pub airflow: AirflowMetadata,
+    /// The environment health metrics published for this environment (`PublishMetrics`), by
+    /// series. On the record, so they are scoped to the one environment they describe and go
+    /// when its teardown retires it.
+    pub metrics: EnvironmentMetrics,
 }
 
 impl EnvironmentRecord {
@@ -1165,6 +1227,203 @@ impl AirflowMetadata {
 impl Default for AirflowMetadata {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The statistics of a set of observations of one metric, which is what a datapoint of a
+/// metric series holds.
+///
+/// A metric datum states its observations either as ONE value or as a set summarised by its
+/// count, sum, minimum and maximum; both are kept in this one shape, so a series computed
+/// from a mixture of the two needs no case for which form each datapoint arrived in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetricStatistics {
+    /// How many observations the set holds. Always at least 1.
+    pub sample_count: i64,
+    pub sum: f64,
+    pub minimum: f64,
+    pub maximum: f64,
+}
+
+impl MetricStatistics {
+    /// The statistics of ONE observation of `value`: a single observation is its own sum,
+    /// minimum and maximum, and there is one of it.
+    #[must_use]
+    pub fn of_value(value: f64) -> Self {
+        Self {
+            sample_count: 1,
+            sum: value,
+            minimum: value,
+            maximum: value,
+        }
+    }
+
+    /// The statistics of the two sets of observations TOGETHER: the counts and sums add, and
+    /// the extremes are the extremes of both. Saturating on the count, so a caller that
+    /// publishes enough samples to overflow the counter reports the ceiling rather than
+    /// wrapping to a smaller number than it has already reported.
+    #[must_use]
+    pub fn merged(self, other: Self) -> Self {
+        Self {
+            sample_count: self.sample_count.saturating_add(other.sample_count),
+            sum: self.sum + other.sum,
+            minimum: self.minimum.min(other.minimum),
+            maximum: self.maximum.max(other.maximum),
+        }
+    }
+
+    /// The mean observation of the set, or `None` when it holds none to average.
+    #[must_use]
+    pub fn average(&self) -> Option<f64> {
+        (self.sample_count > 0).then(|| self.sum / self.sample_count as f64)
+    }
+}
+
+/// One datapoint of one metric series, as a `PublishMetrics` request stated it.
+///
+/// The instant is kept as epoch MILLISECONDS rather than a `SystemTime`: the modelled
+/// `Timestamp` accepts instants before 1970, which a `SystemTime` cannot hold on every
+/// platform without signed arithmetic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricDatapoint {
+    /// `MetricDatum.Timestamp`, in epoch milliseconds (negative before 1970).
+    pub timestamp_millis: i64,
+    /// `MetricDatum.Unit`, or `None` where the request named none. The unit belongs to the
+    /// datapoint rather than to the series: a publisher may change the unit a metric is
+    /// reported in, and what was already stored keeps the unit it was published with.
+    pub unit: Option<String>,
+    /// What was observed: the datum's `Value` as a single observation, or its
+    /// `StatisticValues` set.
+    pub statistics: MetricStatistics,
+}
+
+/// How a metric series is addressed: the metric's name, then its dimension set.
+///
+/// A metric is identified by its name TOGETHER with its dimensions — two datums of the same
+/// name under different dimensions are different series — and the dimension set is unordered,
+/// so the key holds it as a sorted map and the order dimensions arrive in cannot split one
+/// series into two.
+pub type MetricSeriesKey = (String, BTreeMap<String, String>);
+
+/// Every datapoint published for ONE metric series.
+#[derive(Debug, Clone, Default)]
+pub struct MetricSeries {
+    /// `MetricDatum.MetricName`, as published.
+    pub metric_name: String,
+    /// The dimensions that identify this series, by dimension name.
+    pub dimensions: BTreeMap<String, String>,
+    /// The datapoints, ascending by instant, holding at most
+    /// [`MAX_METRIC_DATAPOINTS_PER_SERIES`] of the most recent.
+    pub datapoints: Vec<MetricDatapoint>,
+}
+
+impl MetricSeries {
+    /// The statistics of every datapoint this series holds, together — the aggregation a
+    /// metric read over the whole series answers with. `None` for a series holding no
+    /// datapoint, which has nothing to aggregate.
+    #[must_use]
+    pub fn statistics(&self) -> Option<MetricStatistics> {
+        self.datapoints
+            .iter()
+            .map(|datapoint| datapoint.statistics)
+            .reduce(MetricStatistics::merged)
+    }
+}
+
+/// One datapoint to publish, together with the series it addresses: what one `MetricDatum`
+/// of a `PublishMetrics` request means once its rules have been checked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublishedMetric {
+    pub metric_name: String,
+    pub dimensions: BTreeMap<String, String>,
+    pub datapoint: MetricDatapoint,
+}
+
+/// Why a datapoint a request carried was not stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricRejection {
+    /// The datapoint would open a series past [`MAX_METRIC_SERIES`].
+    SeriesLimitExceeded,
+}
+
+/// Every metric series published for ONE environment, by [`MetricSeriesKey`] so a listing of
+/// them has a deterministic order.
+#[derive(Debug, Clone, Default)]
+pub struct EnvironmentMetrics {
+    pub series: BTreeMap<MetricSeriesKey, MetricSeries>,
+}
+
+impl EnvironmentMetrics {
+    /// Store a whole batch of datapoints, or none of it.
+    ///
+    /// The ONE fallible step is the series ceiling, and it is taken first: it is judged
+    /// against the series the batch would OPEN, counted together (several datapoints of one
+    /// new series open one series between them), so a batch past the ceiling is refused as a
+    /// whole and leaves no trace — not even an empty series. Past that check nothing can
+    /// fail, so no datapoint of a refused batch can already have been written.
+    pub fn record_all(&mut self, batch: &[PublishedMetric]) -> Result<(), MetricRejection> {
+        let opening: BTreeSet<MetricSeriesKey> = batch
+            .iter()
+            .map(|metric| (metric.metric_name.clone(), metric.dimensions.clone()))
+            .filter(|key| !self.series.contains_key(key))
+            .collect();
+        if self.series.len() + opening.len() > MAX_METRIC_SERIES {
+            return Err(MetricRejection::SeriesLimitExceeded);
+        }
+        for metric in batch {
+            self.append(metric);
+        }
+        Ok(())
+    }
+
+    /// Append one datapoint to the series it addresses, keeping the series ascending by
+    /// instant and inside [`MAX_METRIC_DATAPOINTS_PER_SERIES`]. INFALLIBLE, and private:
+    /// whether the series may be opened at all is [`Self::record_all`]'s decision, taken for
+    /// the whole batch before any of this runs.
+    ///
+    /// A datapoint published at an instant the series already holds is kept BESIDE the one
+    /// there: two observations of a metric at one instant are two observations, not a
+    /// correction of the first, so both count towards the series' statistics.
+    fn append(&mut self, metric: &PublishedMetric) {
+        let key: MetricSeriesKey = (metric.metric_name.clone(), metric.dimensions.clone());
+        let series = self.series.entry(key).or_insert_with(|| MetricSeries {
+            metric_name: metric.metric_name.clone(),
+            dimensions: metric.dimensions.clone(),
+            datapoints: Vec::new(),
+        });
+        // `partition_point` lands AFTER every datapoint at the same instant, so datapoints
+        // published at one instant stay in the order they were published in.
+        let at = series
+            .datapoints
+            .partition_point(|held| held.timestamp_millis <= metric.datapoint.timestamp_millis);
+        series.datapoints.insert(at, metric.datapoint.clone());
+        // The window holds the most recent datapoints, so what ages out is the oldest.
+        let overflow = series
+            .datapoints
+            .len()
+            .saturating_sub(MAX_METRIC_DATAPOINTS_PER_SERIES);
+        series.datapoints.drain(..overflow);
+    }
+
+    /// The series `metric_name` and `dimensions` identify, or `None` when nothing was ever
+    /// published for that pair.
+    #[must_use]
+    pub fn series_of(
+        &self,
+        metric_name: &str,
+        dimensions: &BTreeMap<String, String>,
+    ) -> Option<&MetricSeries> {
+        self.series
+            .get(&(metric_name.to_string(), dimensions.clone()))
+    }
+
+    /// How many datapoints this environment holds across every series.
+    #[must_use]
+    pub fn datapoint_count(&self) -> usize {
+        self.series
+            .values()
+            .map(|series| series.datapoints.len())
+            .sum()
     }
 }
 

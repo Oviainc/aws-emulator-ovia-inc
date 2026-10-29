@@ -464,6 +464,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The Apache Airflow metadata database the new environment's web server
             // serves: empty but for the pool Apache Airflow seeds every database with.
             airflow: crate::state::AirflowMetadata::new(),
+            // Nothing has been published for a new environment yet; `PublishMetrics` opens
+            // each series on its first datapoint.
+            metrics: crate::state::EnvironmentMetrics::default(),
         });
 
         // Answer with the ARN read back out of the stored record, so this response cannot
