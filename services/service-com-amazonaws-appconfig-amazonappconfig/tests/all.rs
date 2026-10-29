@@ -73,6 +73,8 @@ mod list_configuration_profiles;
 mod list_deployment_strategies;
 #[path = "all/list_deployments.rs"]
 mod list_deployments;
+#[path = "all/list_deployments_configuration_sources.rs"]
+mod list_deployments_configuration_sources;
 #[path = "all/list_environments.rs"]
 mod list_environments;
 #[path = "all/list_experiment_definitions.rs"]
