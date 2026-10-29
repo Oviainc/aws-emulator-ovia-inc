@@ -64,7 +64,12 @@
 //! [`ClusterOperation::to_cluster_operation_info`] and
 //! `DescribeClusterOperationV2` with
 //! [`ClusterOperation::to_cluster_operation_v2`] — one stored record, two
-//! renderings, so the V1 and V2 readers of one operation cannot disagree.
+//! renderings, so the V1 and V2 readers of one operation cannot disagree. A
+//! cluster's whole history is derived once, by
+//! [`ComAmazonawsKafkaKafkaState::cluster_operation_history`], which is what
+//! `ListClusterOperations` pages: the listing reports the same records the
+//! by-ARN readers resolve, in the one order
+//! [`ClusterOperation::history_key`] defines.
 //!
 //! The channel registry lives beside it, keyed by channel ARN and indexed by
 //! (cluster ARN, channel name) — a channel is a sub-resource of the cluster it
@@ -1189,6 +1194,26 @@ impl ClusterOperation {
         } else {
             OPERATION_STATE_IN_PROGRESS
         }
+    }
+
+    /// The instant this operation was filed, in whole milliseconds since the
+    /// Unix epoch — the granularity a listing's pagination token can carry, so
+    /// it is also the granularity [`Self::history_key`] orders by.
+    pub fn creation_millis(&self) -> u128 {
+        self.creation_time
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis())
+    }
+
+    /// The key a cluster's operation history is ordered by: the instant the
+    /// operation was filed, latest first, with its own ARN breaking a tie so
+    /// the order is TOTAL.
+    ///
+    /// A listing resumes by comparing this key against the one its page token
+    /// carries, so the order the page is built in and the order the token
+    /// resumes in are the same key rather than two that can drift apart.
+    pub fn history_key(&self) -> (std::cmp::Reverse<u128>, &str) {
+        (std::cmp::Reverse(self.creation_millis()), self.arn.as_str())
     }
 
     /// The operation as `ClusterOperationInfo`, the shape
@@ -2964,6 +2989,24 @@ impl ComAmazonawsKafkaKafkaState {
         self.cluster_operations
             .get(arn)
             .filter(|operation| operation.region == region)
+    }
+
+    /// The operations `cluster` has recorded, latest first.
+    ///
+    /// The cluster's own index into the operation registry, resolved through it
+    /// and ordered by [`ClusterOperation::history_key`]: ONE derivation of a
+    /// cluster's operation history, so a listing of it reports exactly the
+    /// records [`Self::cluster_operation_in`] resolves for the same ARNs, in
+    /// one order. An index entry whose record the history bound has already
+    /// evicted is skipped rather than reported as a gap.
+    pub fn cluster_operation_history(&self, cluster: &Cluster) -> Vec<&ClusterOperation> {
+        let mut history: Vec<&ClusterOperation> = cluster
+            .operation_arns
+            .iter()
+            .filter_map(|arn| self.cluster_operations.get(arn))
+            .collect();
+        history.sort_by(|left, right| left.history_key().cmp(&right.history_key()));
+        history
     }
 
     /// Start an update on the cluster `arn` names, as an endpoint for `region`
