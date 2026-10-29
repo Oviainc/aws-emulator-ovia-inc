@@ -101,6 +101,8 @@ mod state_roundtrip;
 mod time_windows;
 #[path = "all/unknown_ids.rs"]
 mod unknown_ids;
+#[path = "all/unsettled_store_listings.rs"]
+mod unsettled_store_listings;
 #[path = "all/validation_envelope.rs"]
 mod validation_envelope;
 #[path = "all/validation_messages.rs"]

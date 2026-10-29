@@ -6,15 +6,18 @@
 //!
 //! ## What this operation does
 //!
-//! A pure report, computed from the stored agreements and the quotes they were accepted
-//! from: the charges of an agreement are the `ChargeSummary$expectedCharges` its quote
-//! minted (`crate::state::charges_of`), each reported with the agreement that resulted
-//! in it and the purchase-order association recorded on it — "all charges regardless of
-//! whether a purchase order is linked to each charge". `agreementId`, `agreementType`
-//! and `catalog` select on the agreement; an `agreementId` the store holds no agreement
-//! for is refused as an invalid value for that member, as the sibling listings of this
-//! service refuse it, and so is an `agreementType` or a `catalog` outside the value set
-//! the service publishes for it.
+//! A report, computed from the stored agreements as the clock has already left them and
+//! the quotes they were accepted from: the charges of an agreement are the
+//! `ChargeSummary$expectedCharges` its quote minted (`crate::state::charges_of`), each
+//! reported with the agreement that resulted in it and the purchase-order association
+//! recorded on it — "all charges regardless of whether a purchase order is linked to
+//! each charge". Because the report is over every agreement the store holds, the
+//! end-date transitions the clock has already made due are materialised over the whole
+//! store first (`crate::state::settle_agreements`), as the sibling scanning report does.
+//! `agreementId`, `agreementType` and `catalog` select on the agreement; an
+//! `agreementId` the store holds no agreement for is refused as an invalid value for
+//! that member, as the sibling listings of this service refuse it, and so is an
+//! `agreementType` or a `catalog` outside the value set the service publishes for it.
 //!
 //! ## Shape of an operation
 //!
@@ -179,9 +182,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListAgreementChargesErrorModeled::ValidationException(refusal).into());
         }
 
-        // A pure report: it reads the stored agreements and their quotes and
-        // writes nothing.
-        let store = state.lock();
+        // A report, of the agreements as the clock has already left them: one
+        // past its own stored end date reached that date whether or not anybody
+        // listed, so the transitions that date owes — the expiry, and the
+        // renewal agreement with the quote and the charges of its own that an
+        // auto-renewing agreement's end date creates — are materialised over
+        // every agreement the store holds before anything is selected or
+        // refused. This report is over every agreement rather than over one, so
+        // it is the whole store that is brought up to date, which is what makes
+        // the charges of a renewal the clock already owed part of this answer
+        // and the renewal's own id one this listing holds an agreement for,
+        // whether or not some unrelated call read something else first. Nothing
+        // else here writes: every charge is read from the quote that minted it.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_agreements(now);
 
         // "The unique identifier of the agreement": an `agreementId` the store
         // holds no agreement for names no agreement of this account, so it is

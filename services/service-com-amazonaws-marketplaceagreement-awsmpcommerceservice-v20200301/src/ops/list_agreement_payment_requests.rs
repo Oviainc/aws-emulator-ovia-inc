@@ -195,9 +195,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A pure report: it reads the stored payment requests and writes
-        // nothing.
-        let store = state.lock();
+        // A report, over the agreements as the clock has already left them: the
+        // `agreementId` selector is resolved against every agreement the store
+        // holds, so the end-date transitions already due are materialised over
+        // the whole store first — an agreement an end date created exists
+        // because that date passed, not because some unrelated call read it
+        // first. Nothing else here writes: every member of a summary is read
+        // from the stored payment request and the agreement it was sent under.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_agreements(now);
 
         // "An optional parameter to list payment requests for a specific
         // agreement": an `agreementId` the store holds no agreement for names no

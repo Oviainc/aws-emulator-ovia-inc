@@ -229,6 +229,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
+        // The `agreementId` selector below is resolved against every agreement
+        // the store holds, so the end-date transitions already due are
+        // materialised over the whole store first — an agreement an end date
+        // created exists because that date passed, not because some unrelated
+        // call read it first.
+        store.settle_agreements(now);
         // "The unique identifier of the agreement": an `agreementId` the store
         // holds no agreement for names no agreement of this account, so it is
         // not a valid value for the member rather than a filter that selects

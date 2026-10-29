@@ -131,7 +131,11 @@ struct Renewing {
 }
 
 /// A prepaid purchase of `length` whose acceptor asked for auto-renewal.
-fn renewing_terms(length: &str) -> Vec<Value> {
+///
+/// `pub(crate)` because the suite over the listings that report on the store as
+/// the clock has left it (`tests/all/unsettled_store_listings.rs`) ages the same
+/// kind of purchase rather than spelling a second copy of the request shape.
+pub(crate) fn renewing_terms(length: &str) -> Vec<Value> {
     vec![
         upfront_term("cfg", length, &[("Users", 2)]),
         renewal_term("renew", true),
