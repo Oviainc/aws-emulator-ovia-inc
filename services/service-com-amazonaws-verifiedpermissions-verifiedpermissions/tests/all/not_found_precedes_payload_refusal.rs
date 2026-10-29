@@ -245,7 +245,9 @@ const FAULTS: &[Fault] = &[
     Fault {
         operation: "UpdateIdentitySource",
         fault: "a user pool ARN naming no reachable pool",
-        field: "/configuration/cognitoUserPoolConfiguration/userPoolArn",
+        // The update carries its provider in `updateConfiguration`, so the
+        // pointer this operation's refusal names is rooted there.
+        field: "/updateConfiguration/cognitoUserPoolConfiguration/userPoolArn",
         body: |store, source| {
             json!({
                 "policyStoreId": store,

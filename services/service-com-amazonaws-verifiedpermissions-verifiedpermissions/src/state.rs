@@ -606,9 +606,13 @@ pub enum OpenIdConnectTokens {
 /// carries the region it was created in (`<region>_<suffix>`), so an id that
 /// disagrees with its own ARN names no pool either.
 ///
-/// The `Err` is an [`crate::ops::InvalidInput`] naming
-/// `configuration.cognitoUserPoolConfiguration.userPoolArn`, so the caller is
-/// told which member — and which segment of the ARN in it — to fix.
+/// The `Err` is an [`crate::ops::InvalidInput`] naming the
+/// `cognitoUserPoolConfiguration.userPoolArn` member WITHIN the configuration it
+/// was given, so the caller is told which member — and which segment of the ARN
+/// in it — to fix. The member that carries that configuration is named by
+/// whichever operation ran the check
+/// ([`crate::ops::persisted_identity_source_configuration`]), because the two
+/// writers of an identity source spell it differently.
 ///
 /// What this CANNOT check: whether a pool with that id was ever created. The
 /// cognito-idp emulator holds its user pools in its own state struct, and
@@ -622,7 +626,10 @@ pub fn resolve_user_pool_arn(
     request_region: &str,
 ) -> Result<(String, String), crate::ops::InvalidInput> {
     let invalid = |reason: String| {
-        crate::ops::InvalidInput::new(crate::ops::paths::COGNITO_USER_POOL_ARN, reason)
+        crate::ops::InvalidInput::new(
+            crate::ops::paths::COGNITO_USER_POOL_ARN_IN_CONFIGURATION,
+            reason,
+        )
     };
     let fields: Vec<&str> = arn.splitn(6, ':').collect();
     let ["arn", partition, "cognito-idp", region, account, resource] = fields[..] else {

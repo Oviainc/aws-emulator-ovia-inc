@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{call, error_code, ok, router, store_with_validation_off, user_pool_arn};
+use crate::identity_source_refusal_pointers::POOL_ARN_IN_CONFIGURATION;
 
 /// The region every request in this suite is signed for, from the harness, so a
 /// Cognito pool ARN and the emulator agree on the region.
@@ -311,8 +312,10 @@ async fn both_writers_store_one_provider_description_the_same_way() {
 
 /// RULE: a provider reference this emulator cannot resolve is refused the same
 /// way whichever writer carried it — the same HTTP 400 `ValidationException`
-/// naming the same member for the same reason — and neither writer persists
-/// anything.
+/// refusing the same member for the same reason — and neither writer persists
+/// anything. The `fieldList` pointer is rooted at the request member the refused
+/// OPERATION declares (`configuration` on the create, `updateConfiguration` on
+/// the update), so the two refusals differ in that root and in nothing else.
 ///
 /// The rows differ along WHY the reference does not resolve: the ARN's account,
 /// its region, the region the pool id itself names, and its partition. An ARN
@@ -409,12 +412,31 @@ async fn both_writers_refuse_an_unresolvable_pool_reference_identically() {
             1,
             "case {case:?}: expected one refused member for {arn}, got {refused:?}"
         );
+        let answered = field_list(&update_body);
         assert_eq!(
-            field_list(&update_body),
-            refused,
-            "case {case:?}: expected the update to refuse the same member for the same reason \
-             ({refused:?}), got {:?}",
-            field_list(&update_body)
+            answered.len(),
+            1,
+            "case {case:?}: expected one refused member from the update for {arn}, got {answered:?}"
+        );
+        // The REASON comes from the one shared translation, so it is identical;
+        // the pointer differs only in the input member each operation declares,
+        // which `identity_source_refusal_pointers` pins per operation.
+        assert_eq!(
+            answered[0].1, refused[0].1,
+            "case {case:?}: expected the update to refuse for the same reason ({:?}), got {:?}",
+            refused[0].1, answered[0].1
+        );
+        let (create_root, update_root) = (
+            refused[0].0.strip_suffix(POOL_ARN_IN_CONFIGURATION),
+            answered[0].0.strip_suffix(POOL_ARN_IN_CONFIGURATION),
+        );
+        assert_eq!(
+            (create_root, update_root),
+            (Some("/configuration"), Some("/updateConfiguration")),
+            "case {case:?}: expected each refusal to name {POOL_ARN_IN_CONFIGURATION} under its \
+             own operation's input member, got {:?} and {:?}",
+            refused[0].0,
+            answered[0].0
         );
 
         // Neither writer wrote: the live source still reads back as it was, and

@@ -44,16 +44,28 @@ impl InvalidInput {
         }
     }
 
+    /// This member, re-rooted under the request member whose pointer is
+    /// `member_path`.
+    ///
+    /// A check shared by two operations names the member it validated RELATIVE to
+    /// the member that carries it, and the operation that ran the check prefixes
+    /// the pointer of its OWN input member — which is per-operation even when the
+    /// shape under it is the same. One check therefore reports the spelling of
+    /// whichever request it refused, and pointer construction stays here rather
+    /// than at each call site.
+    pub fn within(mut self, member_path: &str) -> Self {
+        self.path.insert_str(0, member_path);
+        self
+    }
+
     /// This member, re-rooted under one request of a batch.
     ///
     /// A check that evaluates ONE authorization request names the member as that
     /// request carries it (`/principal`); inside a batch the same member lives at
     /// `/requests/1/principal`, so the check keeps one implementation and the
-    /// batch says which of its requests it was. Pointer construction stays here
-    /// rather than at each call site.
-    pub fn within_batch_request(mut self, index: usize) -> Self {
-        self.path = format!("{}/{index}{}", paths::REQUESTS, self.path);
-        self
+    /// batch says which of its requests it was.
+    pub fn within_batch_request(self, index: usize) -> Self {
+        self.within(&format!("{}/{index}", paths::REQUESTS))
     }
 }
 
@@ -153,9 +165,20 @@ pub mod paths {
     pub const ALIAS_NAME: &str = "/aliasName";
     /// `CreateIdentitySource`/`UpdateIdentitySource`'s principal entity type.
     pub const PRINCIPAL_ENTITY_TYPE: &str = "/principalEntityType";
-    /// The Cognito user pool an identity source's configuration references.
-    pub const COGNITO_USER_POOL_ARN: &str =
-        "/configuration/cognitoUserPoolConfiguration/userPoolArn";
+    /// `CreateIdentitySource`'s identity-source configuration — the request
+    /// member that carries the provider union on a CREATE.
+    pub const CONFIGURATION: &str = "/configuration";
+    /// `UpdateIdentitySource`'s identity-source configuration — the request
+    /// member that carries the provider union on an UPDATE. The two writers
+    /// describe the same provider under DIFFERENT member names, so a refusal is
+    /// rooted at the one the operation it refuses actually takes.
+    pub const UPDATE_CONFIGURATION: &str = "/updateConfiguration";
+    /// The Cognito user pool a configuration references, WITHIN the member that
+    /// carries the configuration ([`CONFIGURATION`] or [`UPDATE_CONFIGURATION`],
+    /// prefixed by [`super::InvalidInput::within`]): the union's members are
+    /// named the same whichever writer carried it, and only its root differs.
+    pub const COGNITO_USER_POOL_ARN_IN_CONFIGURATION: &str =
+        "/cognitoUserPoolConfiguration/userPoolArn";
     /// An authorization request's `principal`.
     pub const PRINCIPAL: &str = "/principal";
     /// The access token an authorization call takes its principal from.
@@ -260,13 +283,21 @@ pub enum OpenIdConnectTokenDescription<'a> {
 /// The two impls below are the only per-union code there is: each one BORROWS its
 /// own union's members into [`IdentityProviderDescription`] and decides nothing —
 /// no resolution, no default, no refusal — so the rules all live in
-/// [`persisted_identity_source_configuration`].
+/// [`persisted_identity_source_configuration`]. Each also states the pointer of
+/// the request member that CARRIES it, which is what lets the shared refusal name
+/// the member the operation it refused actually takes.
 pub trait DescribesIdentityProvider {
+    /// The JSON pointer of the request member this union arrives in, as the model
+    /// names that member for the operation taking this union ([`paths`]).
+    const MEMBER_PATH: &'static str;
+
     /// This union's provider, as the shared translation reads it.
     fn provider_description(&self) -> IdentityProviderDescription<'_>;
 }
 
 impl DescribesIdentityProvider for types::Configuration {
+    const MEMBER_PATH: &'static str = paths::CONFIGURATION;
+
     fn provider_description(&self) -> IdentityProviderDescription<'_> {
         match self {
             Self::cognitoUserPoolConfiguration(cognito) => {
@@ -308,6 +339,8 @@ impl DescribesIdentityProvider for types::Configuration {
 }
 
 impl DescribesIdentityProvider for types::UpdateConfiguration {
+    const MEMBER_PATH: &'static str = paths::UPDATE_CONFIGURATION;
+
     fn provider_description(&self) -> IdentityProviderDescription<'_> {
         match self {
             Self::cognitoUserPoolConfiguration(cognito) => {
@@ -369,9 +402,12 @@ fn listed(values: Option<&[String]>) -> Vec<String> {
 /// the emulator and is accepted as given.
 ///
 /// The `Err` names the member the caller has to fix, for the modelled
-/// `ValidationException`'s `fieldList`.
-pub fn persisted_identity_source_configuration(
-    configuration: &impl DescribesIdentityProvider,
+/// `ValidationException`'s `fieldList`: the check reports the member relative to
+/// the configuration, and the pointer is rooted here at `C::MEMBER_PATH` — the
+/// member THIS operation's input declares — so the refusal never addresses a
+/// member the request it refused has not got.
+pub fn persisted_identity_source_configuration<C: DescribesIdentityProvider + ?Sized>(
+    configuration: &C,
     request_region: &str,
 ) -> Result<crate::state::IdentitySourceConfiguration, InvalidInput> {
     match configuration.provider_description() {
@@ -381,7 +417,8 @@ pub fn persisted_identity_source_configuration(
             group_entity_type,
         } => {
             let (region, user_pool_id) =
-                crate::state::resolve_user_pool_arn(user_pool_arn, request_region)?;
+                crate::state::resolve_user_pool_arn(user_pool_arn, request_region)
+                    .map_err(|invalid| invalid.within(C::MEMBER_PATH))?;
             Ok(crate::state::IdentitySourceConfiguration::CognitoUserPool(
                 crate::state::CognitoUserPoolSource {
                     user_pool_arn: user_pool_arn.to_string(),
