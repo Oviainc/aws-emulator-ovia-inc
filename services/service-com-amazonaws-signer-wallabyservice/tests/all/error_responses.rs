@@ -28,8 +28,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_signer_wallabyservice::state::{
-    ERROR_CODE_INVALID_NEXT_TOKEN, ERROR_CODE_JOB_NOT_FOUND, ERROR_CODE_PROFILE_NOT_FOUND,
-    ERROR_CODE_VALIDATION,
+    ERROR_CODE_INVALID_NEXT_TOKEN, ERROR_CODE_JOB_NOT_FOUND, ERROR_CODE_NOT_FOUND,
+    ERROR_CODE_PROFILE_NOT_FOUND, ERROR_CODE_VALIDATION,
 };
 use service_com_amazonaws_signer_wallabyservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -366,7 +366,11 @@ async fn every_refusal_names_its_condition_in_the_modelled_code_member() {
             })),
             status: 404,
             shape: "ResourceNotFoundException",
-            code: ERROR_CODE_PROFILE_NOT_FOUND.to_string(),
+            // The PROFILE was resolved and a sub-resource of it was not, which is
+            // a different condition from a profile that does not exist — so the
+            // code is the shape's own name here, not the profile-not-found code
+            // the rows above carry.
+            code: ERROR_CODE_NOT_FOUND.to_string(),
         },
         RefusalCase {
             case: "StartSigningJob whose source names no S3 object",

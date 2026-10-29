@@ -53,6 +53,13 @@ pub const PROFILE_STATUS_REVOKED: &str = "Revoked";
 
 /// No profile of that name (or not one this account holds).
 pub const ERROR_CODE_PROFILE_NOT_FOUND: &str = "ProfileNotFound";
+/// A SUB-RESOURCE of a profile the request's own values named — a version of the
+/// profile, one of its permission statements — does not exist, while the profile
+/// itself was resolved. Signer publishes no per-resource code for these, so the
+/// refusal carries the modelled shape's own name; the profile being absent is a
+/// DIFFERENT condition and carries [`ERROR_CODE_PROFILE_NOT_FOUND`], so a client
+/// branching on `code` can tell "no such profile" from "no such part of it".
+pub const ERROR_CODE_NOT_FOUND: &str = "ResourceNotFoundException";
 /// No signing job of that id.
 pub const ERROR_CODE_JOB_NOT_FOUND: &str = "JobNotFound";
 /// No signing platform of that id — this service publishes a fixed catalog, so a
@@ -1490,6 +1497,16 @@ pub fn signing_platform(platform_id: &str) -> Option<&'static SigningPlatformEnt
 /// a different answer ([`platform_id_pattern_refusal`]).
 pub fn platform_not_found_message(platform_id: &str) -> String {
     format!("Platform with id {platform_id} does not exist")
+}
+
+/// The refusal prose for a `profileVersion` the named profile has never had.
+///
+/// Names the profile that WAS resolved and the version that was not, so the
+/// caller can tell which half of the request the endpoint could not reach. Shared
+/// by every operation that resolves a version of a profile, so the one condition
+/// reads the same whichever one refused it.
+pub fn profile_version_not_found_message(profile_name: &str, profile_version: &str) -> String {
+    format!("profile with name {profile_name} has no version {profile_version}")
 }
 
 /// The character class a `platformId` carried by `GET /revocations` is published

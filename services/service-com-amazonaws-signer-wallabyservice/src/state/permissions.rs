@@ -17,11 +17,6 @@ use std::collections::BTreeMap;
 
 use super::SigningProfileRecord;
 
-/// A resource the request's own values named — a statement id, a profile version —
-/// does not exist: the modelled shape's own name, which is all a 404 for a
-/// sub-resource Signer publishes no code for can say.
-pub const ERROR_CODE_NOT_FOUND: &str = "ResourceNotFoundException";
-
 /// The request lost an optimistic-concurrency check, or asked for something the
 /// resource's current state already holds: the modelled shape's own name.
 pub const ERROR_CODE_CONFLICT: &str = "ConflictException";

@@ -131,7 +131,7 @@ fn statement_not_found(profile_name: &str, statement_id: &str) -> RemoveProfileP
             "statement id {statement_id} does not exist in the permissions of profile \
              {profile_name}"
         )),
-        code: Some(crate::state::permissions::ERROR_CODE_NOT_FOUND.to_string()),
+        code: Some(crate::state::ERROR_CODE_NOT_FOUND.to_string()),
     })
     .into()
 }

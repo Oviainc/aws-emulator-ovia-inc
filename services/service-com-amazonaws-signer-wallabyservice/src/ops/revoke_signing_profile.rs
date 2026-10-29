@@ -155,16 +155,34 @@ impl From<RevokeSigningProfileErrorModeled> for RevokeSigningProfileError {
     }
 }
 
-/// The modelled 404 for a profile, or a profile version, this account holds none
-/// of.
+/// The modelled 404 for a profile name this account holds no profile for.
 ///
-/// `code` names the condition a client branches on: the profile resource the
-/// request named — a name, or a version of that name — does not exist. Both are
-/// the same condition to a caller, which is why they carry the one code.
-fn not_found(message: String) -> RevokeSigningProfileError {
+/// `code` names the condition a client branches on — there is no profile of that
+/// name — which is the only machine-readable discriminator a 404 body has.
+fn profile_not_found(profile_name: &str) -> RevokeSigningProfileError {
     RevokeSigningProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(message),
+        message: Some(format!("profile with name {profile_name} does not exists")),
         code: Some(crate::state::ERROR_CODE_PROFILE_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 404 for a `profileVersion` the profile has never had.
+///
+/// The profile itself was resolved, so what the request failed to name is a
+/// SUB-RESOURCE of it: the refusal carries [`crate::state::ERROR_CODE_NOT_FOUND`]
+/// and not the profile-not-found code, so a client branching on `code` is not
+/// told a profile that is present is absent.
+fn profile_version_not_found(
+    profile_name: &str,
+    profile_version: &str,
+) -> RevokeSigningProfileError {
+    RevokeSigningProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::profile_version_not_found_message(
+            profile_name,
+            profile_version,
+        )),
+        code: Some(crate::state::ERROR_CODE_NOT_FOUND.to_string()),
     })
     .into()
 }
@@ -230,18 +248,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         let Some(profile) = store.profile_mut(&region, &input.profile_name) else {
-            return Err(not_found(format!(
-                "profile with name {} does not exists",
-                input.profile_name
-            )));
+            return Err(profile_not_found(&input.profile_name));
         };
         // `profileVersion` names WHICH version of the profile is revoked, so a
         // version this profile has never had names no revocable resource.
         if !profile.versions.contains(&input.profile_version) {
-            return Err(not_found(format!(
-                "Signing profile {} has no version {}",
-                input.profile_name, input.profile_version
-            )));
+            return Err(profile_version_not_found(
+                &input.profile_name,
+                &input.profile_version,
+            ));
         }
 
         // Recording is idempotent: a profile already revoked keeps the instant,

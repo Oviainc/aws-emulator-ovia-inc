@@ -139,15 +139,20 @@ fn profile_not_found(profile_name: &str) -> AddProfilePermissionError {
 /// The modelled 404 for a `profileVersion` the profile has never had: a
 /// permission statement names the version it applies to, so a version that does
 /// not exist is a resource this grant could not be written against.
+///
+/// The profile itself WAS resolved, so this is a 404 about a sub-resource of it
+/// and carries [`crate::state::ERROR_CODE_NOT_FOUND`] rather than the
+/// profile-not-found code.
 fn profile_version_not_found(
     profile_name: &str,
     profile_version: &str,
 ) -> AddProfilePermissionError {
     AddProfilePermissionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!(
-            "profile with name {profile_name} has no version {profile_version}"
+        message: Some(crate::state::profile_version_not_found_message(
+            profile_name,
+            profile_version,
         )),
-        code: Some(crate::state::permissions::ERROR_CODE_NOT_FOUND.to_string()),
+        code: Some(crate::state::ERROR_CODE_NOT_FOUND.to_string()),
     })
     .into()
 }
