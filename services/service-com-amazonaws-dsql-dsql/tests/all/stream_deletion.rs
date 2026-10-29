@@ -434,6 +434,9 @@ fn seeded_cluster(region: &str, identifier: &str, status: &str, stream: Stream) 
             due_at: SystemTime::now() + NOT_DUE_YET,
             next_status,
         }),
+        // Seeded with its encryption configuration already in place, so the
+        // clock owes it nothing on that member.
+        encryption_pending: None,
     }
 }
 

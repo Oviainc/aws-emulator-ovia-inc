@@ -336,11 +336,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lives in and not in the one this request was signed for.
         if let Some(kms_encryption_key) = input.kms_encryption_key.as_deref() {
             let customer_key = crate::state::customer_managed_key(Some(kms_encryption_key));
-            cluster.encryption_details = Some(crate::state::encryption_details(
+            // The re-encryption is asynchronous, exactly as the cluster's own
+            // reconfiguration is: the member reports the configuration the call
+            // asked for with `UPDATING` for the window the change is in flight,
+            // and the clock settles it to `ENABLED` when it is done — which is
+            // what lets a client poll for the change to complete. EVERY change
+            // of configuration is such a window, including one back to the
+            // Amazon-owned key: the cluster already holds data under the key it
+            // is leaving, which is what a cluster being created does not. A
+            // request that asks for the configuration the cluster already has
+            // asks for no re-encryption, so it leaves the configuration and its
+            // status alone.
+            let requested = crate::state::encryption_details(
                 &cluster_region,
                 customer_key,
-            ));
-            cluster.kms_encryption_key = customer_key.map(str::to_string);
+                crate::state::ENCRYPTION_STATUS_UPDATING,
+            );
+            if crate::state::encryption_configuration_changed(
+                cluster.encryption_details.as_ref(),
+                &requested,
+            ) {
+                cluster.encryption_details = Some(requested);
+                cluster.encryption_pending = crate::state::encryption_settlement(
+                    crate::state::ENCRYPTION_STATUS_UPDATING,
+                    now,
+                );
+                // The verbatim key and the configuration derived from it are
+                // written by the same decision, so the two can never disagree
+                // about which key the cluster is on: a request whose value only
+                // SPELLS the stored configuration differently changes neither.
+                cluster.kms_encryption_key = customer_key.map(str::to_string);
+            }
         }
         if let Some(multi_region_properties) = input.multi_region_properties {
             cluster.multi_region_properties = Some(multi_region_properties);

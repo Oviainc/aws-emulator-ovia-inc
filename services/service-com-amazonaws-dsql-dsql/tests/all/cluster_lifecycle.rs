@@ -1027,6 +1027,9 @@ pub fn retiring_cluster(identifier: &str, due_at: SystemTime) -> Cluster {
             due_at,
             next_status: STATUS_DELETED,
         }),
+        // Seeded with its encryption configuration already in place, so the
+        // clock owes it nothing on that member.
+        encryption_pending: None,
     }
 }
 

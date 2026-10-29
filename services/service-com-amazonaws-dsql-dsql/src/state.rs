@@ -105,8 +105,18 @@ pub const ENCRYPTION_AWS_OWNED: &str = "AWS_OWNED_KMS_KEY";
 /// See [`ENCRYPTION_AWS_OWNED`].
 pub const ENCRYPTION_CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED_KMS_KEY";
 /// `EncryptionStatus` value for a cluster whose encryption is in place
-/// (`smithy_query(query="shape", shape="EncryptionStatus")`).
+/// (`smithy_query(query="shape", shape="EncryptionStatus")`: ENABLED | UPDATING |
+/// KMS_KEY_INACCESSIBLE | ENABLING).
 pub const ENCRYPTION_STATUS_ENABLED: &str = "ENABLED";
+/// See [`ENCRYPTION_STATUS_ENABLED`]: the status of a cluster whose encryption is
+/// being established for the first time — the window the cluster itself is being
+/// created in, before any data of it is protected by the configuration it asked
+/// for.
+pub const ENCRYPTION_STATUS_ENABLING: &str = "ENABLING";
+/// See [`ENCRYPTION_STATUS_ENABLED`]: the status of a cluster whose encryption
+/// configuration is being CHANGED to another one, reported for as long as the
+/// change is in flight, so a client can poll for it to finish.
+pub const ENCRYPTION_STATUS_UPDATING: &str = "UPDATING";
 
 /// The region an ARN and an endpoint are scoped to when the request carries no
 /// SigV4 credential scope to read one from.
@@ -284,6 +294,16 @@ pub struct Cluster {
     pub streams: BTreeMap<String, Stream>,
     /// The status change the clock owes this cluster, if any.
     pub pending: Option<PendingTransition>,
+    /// The `EncryptionStatus` change the clock owes this cluster's
+    /// `encryptionDetails`, if any: an encryption configuration this cluster is
+    /// still establishing ([`ENCRYPTION_STATUS_ENABLING`]) or changing to
+    /// ([`ENCRYPTION_STATUS_UPDATING`]) reaches
+    /// [`ENCRYPTION_STATUS_ENABLED`] at `due_at`, whether or not anybody calls.
+    /// Kept apart from [`Self::pending`] because the configuration's progress is
+    /// not the cluster's own status: a cluster waiting for its multi-Region
+    /// peering has finished encrypting long before it is usable, and an update
+    /// that touches no key leaves the configuration where it was.
+    pub encryption_pending: Option<PendingTransition>,
 }
 
 impl Cluster {
@@ -854,6 +874,7 @@ impl ComAmazonawsDsqlDsqlState {
         };
         let anything_due = self.clusters.values().any(|cluster| {
             is_due(&cluster.pending)
+                || is_due(&cluster.encryption_pending)
                 || cluster
                     .streams
                     .values()
@@ -893,6 +914,20 @@ impl ComAmazonawsDsqlDsqlState {
                 }
                 for stream_identifier in &removed_streams {
                     cluster.streams.remove(stream_identifier);
+                }
+                // The encryption configuration whose establishment or change came
+                // due: from here on `encryptionDetails` reports the configuration
+                // as in place rather than as still arriving.
+                let settled = cluster
+                    .encryption_pending
+                    .as_ref()
+                    .filter(|pending| pending.due_at <= now)
+                    .map(|pending| pending.next_status);
+                if let Some(next_status) = settled {
+                    if let Some(details) = cluster.encryption_details.as_mut() {
+                        details.encryption_status = next_status.to_string();
+                    }
+                    cluster.encryption_pending = None;
                 }
             }
             for stream_identifier in &removed_streams {
@@ -1522,19 +1557,83 @@ pub fn customer_managed_key(kms_encryption_key: Option<&str>) -> Option<&str> {
 /// [`resource_region`]), which for the call that mints the cluster is the request's
 /// own. A key supplied as a full ARN already names its region and is kept as it was
 /// given.
-pub fn encryption_details(region: &str, kms_encryption_key: Option<&str>) -> EncryptionDetails {
+///
+/// `encryption_status` is how far the cluster is from actually being protected by
+/// this configuration: a configuration a call has just asked for is reported as
+/// arriving ([`ENCRYPTION_STATUS_ENABLING`] for the cluster's first one,
+/// [`ENCRYPTION_STATUS_UPDATING`] for a change to another one) and reaches
+/// [`ENCRYPTION_STATUS_ENABLED`] when the clock settles it
+/// ([`Cluster::encryption_pending`]), so the member carries the state machine the
+/// enum models rather than one of its values.
+pub fn encryption_details(
+    region: &str,
+    kms_encryption_key: Option<&str>,
+    encryption_status: &str,
+) -> EncryptionDetails {
     match customer_managed_key(kms_encryption_key) {
         Some(key) => EncryptionDetails {
             encryption_type: ENCRYPTION_CUSTOMER_MANAGED.to_string(),
             kms_key_arn: Some(kms_key_arn(region, key)),
-            encryption_status: ENCRYPTION_STATUS_ENABLED.to_string(),
+            encryption_status: encryption_status.to_string(),
         },
         None => EncryptionDetails {
             encryption_type: ENCRYPTION_AWS_OWNED.to_string(),
             kms_key_arn: None,
-            encryption_status: ENCRYPTION_STATUS_ENABLED.to_string(),
+            encryption_status: encryption_status.to_string(),
         },
     }
+}
+
+/// The `EncryptionStatus` the FIRST configuration of a cluster starts in, for the
+/// `kmsEncryptionKey` the creating call supplied.
+///
+/// A cluster created on the key owned by Amazon Web Services has nothing to put in
+/// place: that key protects the service's clusters before any of them exists, and
+/// no data of a cluster being created was ever under another key — so the
+/// configuration is already in place in the create's own answer
+/// ([`ENCRYPTION_STATUS_ENABLED`]). A customer-managed key has to be established
+/// for this cluster, which is work the clock owes, so it is reported as arriving
+/// ([`ENCRYPTION_STATUS_ENABLING`]) until [`encryption_settlement`] comes due.
+pub fn initial_encryption_status(kms_encryption_key: Option<&str>) -> &'static str {
+    match customer_managed_key(kms_encryption_key) {
+        Some(_) => ENCRYPTION_STATUS_ENABLING,
+        None => ENCRYPTION_STATUS_ENABLED,
+    }
+}
+
+/// What the clock owes a cluster's `encryptionDetails` once a call has asked for
+/// `encryption_status`: an encryption configuration still being put in place
+/// reaches [`ENCRYPTION_STATUS_ENABLED`] a settle span later, and one already in
+/// place is owed nothing.
+///
+/// Every caller that writes the member goes through here, so none of them can
+/// decide differently when the configuration a request asked for becomes the one
+/// the cluster's data is actually protected by.
+pub fn encryption_settlement(
+    encryption_status: &str,
+    now: SystemTime,
+) -> Option<PendingTransition> {
+    (encryption_status != ENCRYPTION_STATUS_ENABLED).then(|| PendingTransition {
+        due_at: now + SETTLE_AFTER,
+        next_status: ENCRYPTION_STATUS_ENABLED,
+    })
+}
+
+/// Whether `requested` protects the cluster's data differently from `stored`: a
+/// different `EncryptionType`, or a different key under the customer-managed one.
+///
+/// The CONFIGURATION is the type and the key, never the `encryptionStatus`, which
+/// only says how far a configuration has got. A request that asks for the
+/// configuration a cluster already has asks for no re-encryption, so nothing is in
+/// flight for it to report.
+pub fn encryption_configuration_changed(
+    stored: Option<&EncryptionDetails>,
+    requested: &EncryptionDetails,
+) -> bool {
+    stored.is_none_or(|stored| {
+        stored.encryption_type != requested.encryption_type
+            || stored.kms_key_arn != requested.kms_key_arn
+    })
 }
 
 /// Expand a `kmsEncryptionKey` (an ARN, an alias, or a bare key id) into a KMS

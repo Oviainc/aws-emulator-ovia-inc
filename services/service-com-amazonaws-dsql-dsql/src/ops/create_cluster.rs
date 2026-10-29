@@ -363,12 +363,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // customer key, exactly as a request carrying no `kmsEncryptionKey` is.
         let customer_key =
             crate::state::customer_managed_key(input.kms_encryption_key.as_deref());
+        // A cluster created on the key owned by Amazon Web Services has nothing to
+        // put in place, so its encryption is in place in this call's own answer; a
+        // customer-managed key has to be established for this cluster, which is
+        // work the clock owes, so the member reports it as arriving until then
+        // (`crate::state::initial_encryption_status`).
+        let encryption_status = crate::state::initial_encryption_status(customer_key);
         let mut cluster = crate::state::Cluster {
             arn,
             status: crate::state::STATUS_CREATING.to_string(),
             creation_time: now,
             deletion_protection_enabled: input.deletion_protection_enabled,
-            encryption_details: Some(crate::state::encryption_details(&region, customer_key)),
+            encryption_details: Some(crate::state::encryption_details(
+                &region,
+                customer_key,
+                encryption_status,
+            )),
+            encryption_pending: crate::state::encryption_settlement(encryption_status, now),
             kms_encryption_key: customer_key.map(str::to_string),
             multi_region_properties: input.multi_region_properties.clone(),
             endpoint: Some(crate::state::cluster_endpoint(&region, &identifier)),
