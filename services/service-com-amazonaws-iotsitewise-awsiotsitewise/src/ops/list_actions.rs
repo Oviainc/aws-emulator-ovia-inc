@@ -283,11 +283,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|record| record.summary())
                 .collect(),
             // "The token for the next set of results, or null if there are no
-            // additional results", on a member the model marks REQUIRED: a page
-            // that leaves nothing to resume from reports the empty token, which
-            // is the only value a required token can take when there is no next
-            // page.
-            next_token: page.next_token.unwrap_or_default(),
+            // additional results": the page that leaves nothing to resume from
+            // reports NO token, exactly as every other paginated listing of
+            // this service does. The token's own shape admits only 1..4096
+            // characters matching ^[A-Za-z0-9+/=]+$, so there is no in-range
+            // value standing for "no next page" — absence is the only one.
+            next_token: page.next_token,
         })
     }
 }

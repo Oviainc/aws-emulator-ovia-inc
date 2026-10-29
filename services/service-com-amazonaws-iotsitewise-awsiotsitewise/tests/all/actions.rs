@@ -367,16 +367,38 @@ fn reported_ids(body: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The resume point a listing body carries, or `None` when it reports the empty
-/// token the required member takes on a page with nothing left to resume from.
+/// The resume point a listing body carries, or `None` when the page leaves
+/// nothing to resume from — which the member reports by being ABSENT, as
+/// "the token for the next set of results, or null if there are no additional
+/// results" states.
 ///
-/// `None` also covers an absent member, so this oracle states "nothing left to
-/// resume from" rather than one encoding of it.
+/// A token that IS reported has to lie inside the value space of `NextToken`,
+/// the shape the member targets, so this oracle checks that on the way past:
+/// the empty string — the only value "present but nothing to resume from" could
+/// take — is outside it.
 fn resume_point(body: &Value) -> Option<String> {
-    match body["nextToken"].as_str() {
-        Some("") | None => None,
-        Some(token) => Some(token.to_string()),
+    match body.get("nextToken") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(token)) => {
+            assert!(
+                in_next_token_value_space(token),
+                "a reported nextToken must lie inside the modelled NextToken value \
+                 space, got {token:?} in {body}"
+            );
+            Some(token.clone())
+        }
+        other => panic!("nextToken must be a string when reported, got {other:?} in {body}"),
     }
+}
+
+/// Whether `token` lies inside the value space of `NextToken`. Source:
+/// `smithy_query(query="operation", operation="ListActions")` — the paging
+/// members target `NextToken`, `length 1..4096`, `pattern ^[A-Za-z0-9+/=]+$`.
+pub(crate) fn in_next_token_value_space(token: &str) -> bool {
+    (1..=4096).contains(&token.len())
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
 }
 
 /// Assert one reported summary carries exactly what its row was seeded with.
@@ -446,18 +468,16 @@ async fn a_listing_reports_every_stored_action_of_the_target_resource_it_names()
         }
 
         // A single page holds the whole listing, so there is nothing to resume
-        // from.
+        // from — and the member reports that by being absent.
         assert_eq!(
             resume_point(&body),
             None,
             "case {target:?}: a complete page must leave no resume point, got {body}"
         );
-        // The member is modelled REQUIRED, so the page with nothing left to
-        // resume from still carries it, as the empty token.
-        assert_eq!(
-            body["nextToken"],
-            json!(""),
-            "case {target:?}: a complete page must carry the empty token, got {body}"
+        assert!(
+            body.get("nextToken").is_none(),
+            "case {target:?}: a complete page must report no nextToken member at \
+             all, got {body}"
         );
     }
 }
@@ -610,6 +630,146 @@ async fn paging_a_listing_walks_the_whole_order_once_and_resumes_where_it_stoppe
             walked.len(),
             "case {page_size}: paging must report no row twice, got {walked:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn only_a_page_with_a_further_page_behind_it_reports_a_next_token() {
+    let fixture = fixture().await;
+    let model = create_model(&fixture.router, "Pump", property_catalog()).await;
+    let untouched = create_asset(&fixture.router, "Pump-1", &model).await;
+
+    // The actions of asset A that resolve to A itself, taken from the seeded
+    // table rather than written out, so this row stays a narrowed enumeration
+    // however the table changes.
+    let resolving_to_a: Vec<String> = fixture
+        .ordered_rows(Target::AssetA)
+        .iter()
+        .filter(|row| row.resolve_to == Some(Target::AssetA))
+        .map(|row| row.id.to_string())
+        .collect();
+
+    // Every enumeration this listing can answer, spanning how many rows it holds
+    // — none, one, and several — and how it is scoped: each kind of target
+    // resource, and one narrowed by the `resolveTo` filter.
+    let enumerations: Vec<(&str, String, Vec<String>)> = vec![
+        (
+            "asset A, several actions",
+            fixture.target_query(Target::AssetA),
+            fixture.ordered_ids(Target::AssetA),
+        ),
+        (
+            "asset B, one action",
+            fixture.target_query(Target::AssetB),
+            fixture.ordered_ids(Target::AssetB),
+        ),
+        (
+            "the computation model, two actions",
+            fixture.target_query(Target::ComputationModel),
+            fixture.ordered_ids(Target::ComputationModel),
+        ),
+        (
+            "an asset nothing has acted on, no actions",
+            format!("targetResourceType=ASSET&targetResourceId={untouched}"),
+            Vec::new(),
+        ),
+        (
+            "asset A narrowed to the actions resolving to A",
+            format!(
+                "{}&resolveToResourceType=ASSET&resolveToResourceId={}",
+                fixture.target_query(Target::AssetA),
+                fixture.id_of(Target::AssetA)
+            ),
+            resolving_to_a,
+        ),
+    ];
+
+    for (enumeration, query, order) in enumerations {
+        // No `maxResults` at all, then every page size from one row up to one
+        // more than the enumeration holds, plus the published upper bound of the
+        // member's range (1..250). A size the range forbids is left out: the
+        // boundary refuses it before this listing runs.
+        let mut sizes: Vec<Option<usize>> = vec![None, Some(1), Some(2), Some(250)];
+        sizes.push(Some(order.len()));
+        sizes.push(Some(order.len() + 1));
+        sizes.retain(|size| size.is_none_or(|size| (1..=250).contains(&size)));
+
+        for size in sizes {
+            let case = format!("{enumeration} / maxResults {size:?}");
+            let mut walked: Vec<String> = Vec::new();
+            let mut token: Option<String> = None;
+            let mut pages = 0usize;
+            loop {
+                let mut paged = query.clone();
+                if let Some(size) = size {
+                    paged.push_str(&format!("&maxResults={size}"));
+                }
+                if let Some(token) = token.as_deref() {
+                    paged.push_str(&format!("&nextToken={token}"));
+                }
+                // A token this listing reported is followable: the call that
+                // echoes it back is served, not refused.
+                let (status, body) = list_actions(&fixture.router, &paged).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected 200 for {paged}, got {status} {body}"
+                );
+                walked.extend(reported_ids(&body));
+                pages += 1;
+                assert!(
+                    pages <= order.len() + 1,
+                    "case {case:?}: paging must terminate, walked {walked:?}"
+                );
+
+                match body.get("nextToken") {
+                    // The last page leaves nothing to resume from, and reports
+                    // that by carrying no `nextToken` member at all.
+                    None => {
+                        assert_eq!(
+                            walked, order,
+                            "case {case:?}: the page that reports no nextToken must be \
+                             the one that ends the enumeration, got {body}"
+                        );
+                        break;
+                    }
+                    Some(Value::String(reported)) => {
+                        assert!(
+                            in_next_token_value_space(reported),
+                            "case {case:?}: a reported nextToken must lie inside the \
+                             modelled NextToken value space, got {reported:?} in {body}"
+                        );
+                        assert!(
+                            walked.len() < order.len(),
+                            "case {case:?}: a nextToken may only be reported while rows \
+                             remain, got {body} after walking {walked:?}"
+                        );
+                        token = Some(reported.clone());
+                    }
+                    other => panic!(
+                        "case {case:?}: nextToken must be absent or a string, got \
+                         {other:?} in {body}"
+                    ),
+                }
+            }
+
+            let expected_pages = match size {
+                Some(size) => order.len().div_ceil(size).max(1),
+                // The page size this listing picks for a caller that asks for
+                // none is the service's choice, so only termination is pinned
+                // here.
+                None => pages,
+            };
+            assert_eq!(
+                pages, expected_pages,
+                "case {case:?}: unexpected page count for {order:?}"
+            );
+            let unique: HashSet<&String> = walked.iter().collect();
+            assert_eq!(
+                unique.len(),
+                walked.len(),
+                "case {case:?}: paging must report no row twice, got {walked:?}"
+            );
+        }
     }
 }
 
