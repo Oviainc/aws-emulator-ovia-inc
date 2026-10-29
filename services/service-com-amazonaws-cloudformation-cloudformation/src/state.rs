@@ -1342,6 +1342,42 @@ pub struct OwedRollback {
     pub applied: Vec<StoredResource>,
 }
 
+/// The stack's OWN record of what is deployed on it: the configuration members an update
+/// replaces when it is applied, as distinct from the resources the owning services hold.
+///
+/// CloudFormation "rolls back the stack to the previous stack configuration" when an update
+/// fails, and the configuration is the whole revision the last operation that COMPLETED
+/// installed — not only its resources: the template the stack carries (with the processed
+/// stage computed over it) and every member a client reads back as the stack's
+/// (`Stack$Parameters`, `Stack$Tags`, `Stack$Capabilities`, `Stack$NotificationARNs`,
+/// `Stack$RoleARN`, `Stack$RollbackConfiguration`, `Stack$DeploymentConfig`). The values a
+/// REJECTED update submitted are discarded with the rest of that revision, so the
+/// configuration in force before the update is snapshotted by the handler that applies one
+/// ([`StoredStack::hold_previous_configuration`]) and put back when the rollback opens
+/// ([`StoredStack::begin_update_rollback`]).
+///
+/// Not part of it: the per-operation instructions a caller gives
+/// (`DisableRollback`, `RetainExceptOnCreate`) and the stack policy a request installs,
+/// which say what to do with THIS operation rather than what the stack deploys, and the
+/// timestamps and operation records, which report that the update was attempted.
+#[derive(Debug, Clone)]
+pub struct StackConfiguration {
+    pub template_body: Option<String>,
+    pub template_description: Option<String>,
+    pub processed_template: template::Processed,
+    /// The body that stage was computed over: the stored body with any `AWS::Include`
+    /// snippet spliced in ([`StoredStack::included_template_body`]).
+    pub processed_template_body: Option<String>,
+    pub parameters: Vec<StoredParameter>,
+    pub tags: Vec<StoredTag>,
+    pub notification_arns: Vec<String>,
+    pub capabilities: Vec<String>,
+    pub role_arn: Option<String>,
+    pub rollback_configuration: Option<StoredRollbackConfiguration>,
+    pub deployment_config: Option<StoredDeploymentConfig>,
+    pub resource_types: Vec<String>,
+}
+
 /// What a ROLLBACK a client ASKED for ([`StoredStack::begin_requested_rollback`]) has to do
 /// in the services that own the stack's resources.
 ///
@@ -1519,6 +1555,18 @@ pub struct StoredStack {
     /// [`settle_due_rollbacks`] — called by the operations a client drives a stack
     /// through — is what performs it and clears it.
     pub owed_rollback: Option<OwedRollback>,
+    /// The stack CONFIGURATION in force before the update in flight applied its own
+    /// ([`StackConfiguration`]) — snapshotted by the handler that applies one, because the
+    /// members it replaces are written onto the stack when the update starts rather than
+    /// staged like its resources.
+    ///
+    /// A failed update is rolled back "to the previous stack configuration", so this is
+    /// what [`Self::begin_update_rollback`] puts back and what a rollback a client asks for
+    /// on a stack whose failed state was kept ([`Self::begin_requested_rollback`]) goes back
+    /// to. Retired by [`Self::settle`] when the operation holding it settles in a terminal
+    /// `*_COMPLETE` status, whose configuration is the stack's from then on; one that settles
+    /// in a FAILED status keeps it, since a rollback can still be asked for.
+    pub previous_configuration: Option<StackConfiguration>,
     /// The rollback this stack still OWES the services that own its resources, held while it
     /// is in `UPDATE_ROLLBACK_FAILED`: what the previous configuration is, and what those
     /// services are still holding ([`OwedRollback`]).
@@ -1646,6 +1694,7 @@ impl StoredStack {
             stabilisations: Vec::new(),
             rollback_plan: None,
             owed_rollback: None,
+            previous_configuration: None,
             unreverted_rollback: None,
             operations: ::std::collections::VecDeque::new(),
             creation_time: now,
@@ -2650,6 +2699,12 @@ impl StoredStack {
         // place a terminal status is installed.
         if is_stable_status(&self.status) {
             self.last_stable_status = Some(self.status.clone());
+            // ...and the configuration that operation applied is the stack's from here on,
+            // so the revision it replaced is no longer anything to go back to. An operation
+            // that settled in a FAILED status keeps it: that stack is one a rollback can
+            // still be asked for ([`Self::begin_requested_rollback`]), and the revision it
+            // would put back is held nowhere else.
+            self.previous_configuration = None;
         }
         // The reason the terminal status carries: the one the operation failed with, and
         // nothing for one that completed.
@@ -3161,6 +3216,64 @@ impl StoredStack {
         self.rollback_plan = plan;
     }
 
+    /// The stack's own record of the configuration in force on it right now
+    /// ([`StackConfiguration`]).
+    pub fn configuration(&self) -> StackConfiguration {
+        StackConfiguration {
+            template_body: self.template_body.clone(),
+            template_description: self.template_description.clone(),
+            processed_template: self.processed_template.clone(),
+            processed_template_body: self.processed_template_body.clone(),
+            parameters: self.parameters.clone(),
+            tags: self.tags.clone(),
+            notification_arns: self.notification_arns.clone(),
+            capabilities: self.capabilities.clone(),
+            role_arn: self.role_arn.clone(),
+            rollback_configuration: self.rollback_configuration.clone(),
+            deployment_config: self.deployment_config.clone(),
+            resource_types: self.resource_types.clone(),
+        }
+    }
+
+    /// Hold the configuration in force BEFORE the update that is being applied, so a
+    /// failure of that update has the revision to go back to.
+    ///
+    /// Called by the handler that applies an update, with [`Self::configuration`] read
+    /// before it writes any of those members onto the stack — an update replaces them where
+    /// it starts, so the stack is the only place the previous revision was recorded.
+    pub fn hold_previous_configuration(&mut self, configuration: Option<StackConfiguration>) {
+        self.previous_configuration = configuration;
+    }
+
+    /// Put a configuration back on the stack: the whole revision, so every member a client
+    /// reads back reports the one that is really deployed.
+    fn restore_configuration(&mut self, configuration: StackConfiguration) {
+        self.template_body = configuration.template_body;
+        self.template_description = configuration.template_description;
+        self.processed_template = configuration.processed_template;
+        self.processed_template_body = configuration.processed_template_body;
+        self.parameters = configuration.parameters;
+        self.tags = configuration.tags;
+        self.notification_arns = configuration.notification_arns;
+        self.capabilities = configuration.capabilities;
+        self.role_arn = configuration.role_arn;
+        self.rollback_configuration = configuration.rollback_configuration;
+        self.deployment_config = configuration.deployment_config;
+        self.resource_types = configuration.resource_types;
+    }
+
+    /// Roll the stack's own configuration record back to the revision in force before the
+    /// update that failed ([`Self::previous_configuration`]), where one is held.
+    ///
+    /// The counterpart, for the stack's own record, of abandoning the failed update's
+    /// pending deployment: a rolled-back update deployed nothing, so what the stack reports
+    /// as its configuration is the last revision that really was deployed.
+    fn roll_configuration_back(&mut self) {
+        if let Some(configuration) = self.previous_configuration.take() {
+            self.restore_configuration(configuration);
+        }
+    }
+
     /// The rollback this stack owes the owning services right now, taken for the caller
     /// that is about to perform it.
     pub fn take_owed_rollback(&mut self) -> Option<OwedRollback> {
@@ -3630,6 +3743,11 @@ impl StoredStack {
         // A failed update deploys nothing: its pending deployment is what the stack would
         // have reported had it completed, and the rollback is the decision not to.
         self.pending_deployment = None;
+        // ...and the stack's OWN record goes back with it: the template, the parameters and
+        // the rest of the revision the update replaced are the previous stack
+        // configuration, and the values the failed update submitted are discarded with that
+        // update ([`Self::previous_configuration`]).
+        self.roll_configuration_back();
         self.status = status::UPDATE_ROLLBACK_IN_PROGRESS.to_string();
         self.status_reason = Some(reason.clone());
         let operation_id = self
@@ -3797,6 +3915,10 @@ impl StoredStack {
         // failure itself owed ([`Self::begin_update_rollback`]): the stack keeps the
         // resources, outputs and template stage its last completed operation left.
         self.pending_deployment = None;
+        // ...and the configuration record of the operation that failed goes back with it, to
+        // the revision in force before it — the same restore a rollback the failure itself
+        // owed performs, read before the transition below opens this one.
+        self.roll_configuration_back();
         self.begin_transition(
             now,
             status::UPDATE_ROLLBACK_IN_PROGRESS,

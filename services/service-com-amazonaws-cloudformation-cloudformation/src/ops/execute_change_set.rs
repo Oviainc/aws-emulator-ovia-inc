@@ -409,6 +409,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // PROCESSED stage it carries is the one the change set computed and stored
             // when it was created, so the deployment carried out here is exactly the one
             // `DescribeChangeSet` described.
+            //
+            // The revision those members REPLACE is snapshotted first, exactly as
+            // `UpdateStack` snapshots it: an UPDATE this execution fails is rolled back to
+            // the previous stack configuration, and the stack's own record of it is held
+            // nowhere else ([`crate::state::StackConfiguration`]). Only an UPDATE has one
+            // to put back — a failed CREATE's rollback disposes of what it made instead.
+            if !creates_the_stack {
+                stack.hold_previous_configuration(Some(stack.configuration()));
+            }
             stack.set_template_body(template_body, processed_template);
             stack.parameters = parameters;
             stack.capabilities = capabilities;

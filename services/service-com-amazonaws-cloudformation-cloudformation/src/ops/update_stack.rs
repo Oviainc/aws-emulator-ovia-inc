@@ -885,6 +885,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // What the stack's resources are BEFORE this deployment: what the update has
             // to keep, replace or delete in the services that own them.
             let previous_resources = stack.current_resources().to_vec();
+            // ...and what the stack's own CONFIGURATION record is before it: the revision a
+            // failure of this update is rolled back to. The members below are written onto
+            // the stack where the update starts rather than staged like its resources, so
+            // the revision they replace is snapshotted here, while it is still in force
+            // ([`crate::state::StackConfiguration`]).
+            stack.hold_previous_configuration(Some(stack.configuration()));
             // The update's template and the PROCESSED stage of it this service computed:
             // the stage is what the update deploys. Where the submitted body named an
             // `AWS::Include`, the spliced document is recorded too — it is the body that

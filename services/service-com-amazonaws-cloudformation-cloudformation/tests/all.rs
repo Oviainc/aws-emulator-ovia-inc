@@ -185,6 +185,8 @@ mod resource_scans;
 mod resource_signals;
 #[path = "all/rolled_back_resource_records.rs"]
 mod rolled_back_resource_records;
+#[path = "all/rolled_back_stack_configuration.rs"]
+mod rolled_back_stack_configuration;
 #[path = "all/s3vectors_resource_types.rs"]
 mod s3vectors_resource_types;
 #[path = "all/resolved_properties.rs"]
