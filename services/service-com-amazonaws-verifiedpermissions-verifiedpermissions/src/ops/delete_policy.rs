@@ -3,7 +3,9 @@
 //! @op DeletePolicy
 //!
 //! Removes a policy from its store, so a following `GetPolicy` answers
-//! `ResourceNotFoundException` and `IsAuthorized` no longer evaluates it.
+//! `ResourceNotFoundException` and `IsAuthorized` no longer evaluates it. A
+//! policy reference that resolves to nothing in a store that exists is the
+//! documented idempotent success, not a not-found.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -123,11 +125,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::policy_store_reference(&input.policy_store_id).not_found(),
             )
         };
-        let policy_not_found = || {
-            DeletePolicyErrorModeled::ResourceNotFoundException(
-                crate::state::policy_reference(&input.policy_id).not_found(),
-            )
-        };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeletePolicyErrorModeled::InternalServerException(InternalServerException {
@@ -142,9 +139,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .policy_stores
             .get_mut(&store_id)
             .ok_or_else(store_not_found)?;
-        let policy_id = store
-            .resolve_policy_id(&input.policy_id)
-            .ok_or_else(policy_not_found)?;
+        // A `policyId` that resolves to nothing in a store that EXISTS is a
+        // success, not a 404: this operation documents the absent policy as an
+        // idempotent no-op — "This operation is idempotent; if you specify a
+        // policy that doesn't exist, the request response returns a successful
+        // HTTP 200 status code." Nothing is written on that path, so a repeat
+        // delete and a delete of a never-created policy answer the same empty
+        // 200 as the delete that removed it. The modelled
+        // `ResourceNotFoundException` stays reachable above, for a
+        // `policyStoreId` that names no store: that reference has no documented
+        // success.
+        let Some(policy_id) = store.resolve_policy_id(&input.policy_id) else {
+            crate::ops::audit(ctx, "DeletePolicy", &input.policy_id, "already absent");
+            return Ok(DeletePolicyOutput {});
+        };
         store.policies.remove(&policy_id);
         crate::ops::audit(ctx, "DeletePolicy", &policy_id, "deleted");
 

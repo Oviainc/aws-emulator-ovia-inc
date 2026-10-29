@@ -311,12 +311,18 @@ async fn every_control_plane_not_found_path_answers_the_same_constant_message() 
             resource_type: "POLICY",
         },
         NotFound {
-            case: "DeletePolicy, live store and unknown policy id",
+            // `DeletePolicy` documents the absent POLICY as a successful HTTP
+            // 200 ("This operation is idempotent; if you specify a policy that
+            // doesn't exist, the request response returns a successful HTTP 200
+            // status code"), so the reference of this delete that still answers
+            // 404 is the STORE — pinned here, with the idempotent success itself
+            // in `tests/all/delete_policy_idempotency.rs`.
+            case: "DeletePolicy, unknown store",
             operation: "DeletePolicy",
-            request: json!({ "policyStoreId": live_store, "policyId": unknown_policy }),
-            reference: unknown_policy.clone(),
-            resource_id: unknown_policy.clone(),
-            resource_type: "POLICY",
+            request: json!({ "policyStoreId": unknown_store, "policyId": unknown_policy }),
+            reference: unknown_store.clone(),
+            resource_id: unknown_store.clone(),
+            resource_type: "POLICY_STORE",
         },
         NotFound {
             case: "ListPolicies, unknown store",

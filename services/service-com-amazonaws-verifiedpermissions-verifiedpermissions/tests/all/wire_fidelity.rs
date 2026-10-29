@@ -405,12 +405,15 @@ async fn a_not_found_error_names_the_referenced_resource_and_its_bare_id() {
             "POLICY",
             "absent".to_string(),
         ),
+        // `DeletePolicy` answers the documented idempotent 200 for a policy
+        // reference that resolves to nothing, so the reference it reports as
+        // missing is the STORE — by id here, by alias above.
         (
-            "DeletePolicy, absent policy name reference",
+            "DeletePolicy, absent store id with a name/ policy reference",
             "DeletePolicy",
-            json!({ "policyStoreId": store_id, "policyId": format!("{POLICY_NAME_PREFIX}gone") }),
-            "POLICY",
-            "gone".to_string(),
+            json!({ "policyStoreId": "PSabsent", "policyId": format!("{POLICY_NAME_PREFIX}gone") }),
+            "POLICY_STORE",
+            "PSabsent".to_string(),
         ),
     ];
 
