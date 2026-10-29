@@ -12,11 +12,14 @@
 //! the request names — every session that stage has had, in start order, the ones that
 //! have ended included — paged at `maxResults` (default 50), each session reported with
 //! the id it was opened under, the instant it began and, only once it has ended, the
-//! instant it ended. A `nextToken` this operation did not issue is refused with
-//! `ValidationException` (400), as is a `maxResults` outside the modelled range; a
-//! `stageArn` the store holds no session for is not an error (the model declares no
-//! `ResourceNotFoundException` here) and reports no session. Being a read, repeating
-//! any of it leaves every answer and every stored record exactly as it was.
+//! instant it ended. A `nextToken` this operation did not issue FOR THE STAGE the
+//! resuming request names — a token of another listing, one it issued while paging
+//! another stage, or a value it never minted — names no position among the sessions
+//! that request pages, so it is refused with `ValidationException` (400), as is a
+//! `maxResults` outside the modelled range; a `stageArn` the store holds no session for
+//! is not an error (the model declares no `ResourceNotFoundException` here) and reports
+//! no session. Being a read, repeating any of it leaves every answer and every stored
+//! record exactly as it was.
 //!
 //! Nothing in the IVS RealTime control plane OPENS a stage session: the model's
 //! `StageSession` doc fixes one as beginning "when the first participant joins a stage"
@@ -636,6 +639,153 @@ async fn list_stage_sessions_refuses_a_page_token_it_did_not_issue() {
         expected_ids,
         "an empty nextToken is the first page, got {response}"
     );
+}
+
+/// One row of the cross-stage token table: the stage whose page issues the token and the
+/// sessions that stage has had, then the stage the token is offered to and the sessions
+/// IT holds.
+struct ForeignStageTokenCase<'a> {
+    case: &'a str,
+    issuer: &'a str,
+    issuer_holds: &'a [String],
+    resumed: &'a str,
+    resumed_holds: &'a [String],
+}
+
+/// A `nextToken` this operation issued while paging ONE stage names a position among that
+/// stage's sessions only: offered while paging another stage it names no position among
+/// the sessions that call reports, so it is refused rather than served as a page that
+/// silently omits them.
+///
+/// The same rule, for every listing of this service and every term of each one's scope,
+/// is exercised in `tests/all/page_token_scope.rs`; this case is the stage-session view
+/// of it, and adds the row that suite cannot hold — a resuming stage that has had no
+/// session at all, where a bare position is served as an empty page rather than refused.
+/// Keep the two in step.
+#[tokio::test]
+async fn list_stage_sessions_refuses_a_token_issued_for_another_stage() {
+    let emulator = Emulator::new();
+
+    // The histories are driven in this order, so the two stages' sessions interleave in
+    // the store: every session of `earlier` was opened before every session of `later`,
+    // and `quiet` has never had a session at all.
+    let (earlier, earlier_ids) = history(&emulator, "earlier-stage", &[1, 2, 1], true).await;
+    let (later, later_ids) = history(&emulator, "later-stage", &[2, 1], true).await;
+    let quiet = emulator.create_stage("quiet-stage").await;
+
+    // Rows differ in which stage issued the token and which stage is offered it, so the
+    // position it names lies PAST every session of the resuming stage (the reading under
+    // which a token carrying a bare position answers an empty page), BEFORE them, and
+    // among a stage holding no session at all.
+    let cases = vec![
+        ForeignStageTokenCase {
+            case: "a later stage's token, offered to an earlier stage",
+            issuer: &later,
+            issuer_holds: &later_ids,
+            resumed: &earlier,
+            resumed_holds: &earlier_ids,
+        },
+        ForeignStageTokenCase {
+            case: "an earlier stage's token, offered to a later stage",
+            issuer: &earlier,
+            issuer_holds: &earlier_ids,
+            resumed: &later,
+            resumed_holds: &later_ids,
+        },
+        ForeignStageTokenCase {
+            case: "a token offered to a stage that has had no session",
+            issuer: &later,
+            issuer_holds: &later_ids,
+            resumed: &quiet,
+            resumed_holds: &[],
+        },
+    ];
+
+    for ForeignStageTokenCase {
+        case,
+        issuer,
+        issuer_holds,
+        resumed,
+        resumed_holds,
+    } in cases
+    {
+        // What the resuming stage reports before any token is in play.
+        let (status, held) = emulator.list(resumed, &json!({})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the resuming stage's own listing got {status} {held}"
+        );
+        assert_eq!(
+            listed_ids(case, &held),
+            resumed_holds.to_vec(),
+            "case {case:?}: expected {resumed_holds:?}, got {held}"
+        );
+
+        // A page of one over the issuing stage, and the token it ends with.
+        let (status, first) = emulator.list(issuer, &json!({ "maxResults": 1 })).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a page of one got {status} {first}"
+        );
+        let token = first["nextToken"].as_str().unwrap_or_default().to_string();
+        assert!(
+            !token.is_empty(),
+            "case {case:?}: a page of one with sessions left over must carry a nextToken, \
+             got {first}"
+        );
+
+        // Within the stage that issued it the token resumes exactly where that page
+        // ended, so what the refusal below turns on is the stage and nothing else.
+        let (status, continued) = emulator
+            .list(issuer, &json!({ "nextToken": token.as_str() }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: its own stage must resume the token, got {status} {continued}"
+        );
+        assert_eq!(
+            listed_ids(case, &continued),
+            issuer_holds[1..].to_vec(),
+            "case {case:?}: expected {:?}, got {continued}",
+            &issuer_holds[1..]
+        );
+
+        // Offered while paging another stage, it names no position among that stage's
+        // sessions and is refused.
+        let (status, refused) = emulator
+            .list(resumed, &json!({ "nextToken": token.as_str() }))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400 for a token of another stage, got {status} {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {refused}"
+        );
+        assert_eq!(
+            refused["Message"].as_str().unwrap_or("<absent>"),
+            state::foreign_page_token_message("ListStageSessions"),
+            "case {case:?}: expected this service's one foreign-token sentence, got {refused}"
+        );
+        assert!(
+            refused["stageSessions"].as_array().is_none(),
+            "case {case:?}: a refused listing reports no page, got {refused}"
+        );
+
+        // And the refusal left the resuming stage's sessions exactly as they were.
+        let (status, after) = emulator.list(resumed, &json!({})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the listing after the refusal got {status} {after}"
+        );
+        assert_eq!(
+            listed_ids(case, &after),
+            resumed_holds.to_vec(),
+            "case {case:?}: expected {resumed_holds:?} after the refusal, got {after}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
