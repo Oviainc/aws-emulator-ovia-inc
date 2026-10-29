@@ -192,13 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request carrying one is refused rather than answered with a listing it
         // did not ask for.
         let filters = input.filters.unwrap_or_default();
-        if filters.len() > MAX_FILTERS {
-            return Err(bad_request(format!(
-                "Filters carries {} filters, which is more than the {MAX_FILTERS} this \
-                 emulator applies in one call",
-                filters.len(),
-            )));
-        }
+        // How many entries one call applies is this service's one shared bound, so
+        // this listing caps the work one request asks for exactly as every other
+        // `Filters`-taking listing of the service does — and does it here, before
+        // the store lock below is taken.
+        crate::state::check_filters(filters.len()).map_err(bad_request)?;
         for filter in &filters {
             if !GROUP_FILTER_NAME_VALUES.contains(&filter.name.as_str()) {
                 return Err(bad_request(format!(
@@ -291,17 +289,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// token codec ([`crate::state::encode_page_token`]), since this listing
 /// enumerates one region's groups.
 const LISTING: &str = "groups";
-
-/// The most `Filters` entries this operation applies to one call.
-///
-/// NOT an AWS quota: the modelled `GroupFilterList` declares no length, and each
-/// entry's `Values` is modelled `1..5`. This is the emulator's own bound on the
-/// work ONE request can ask for, since every entry is evaluated against every
-/// group of the region: it caps that product beside the bound the store already
-/// puts on the groups themselves. The modelled `GroupFilterName` declares five
-/// names, so a caller can still send several value sets per name. Reaching it is
-/// a `BadRequestException`.
-const MAX_FILTERS: usize = 10;
 
 /// The modelled `GroupFilterName` value whose attribute is read out of a group's
 /// stored resource query — the one a listing reads per group rather than per

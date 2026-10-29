@@ -219,6 +219,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let filters = input.filters.unwrap_or_default();
+        // How many entries one call applies is this service's one shared bound, so
+        // this listing caps the work one request asks for exactly as every other
+        // `Filters`-taking listing of the service does — and does it here, before the
+        // store lock below is taken: every entry is evaluated against every
+        // membership of the addressed group.
+        crate::state::check_filters(filters.len()).map_err(bad_request)?;
         for filter in &filters {
             if filter.name != "resource-type" {
                 return Err(bad_request(format!(

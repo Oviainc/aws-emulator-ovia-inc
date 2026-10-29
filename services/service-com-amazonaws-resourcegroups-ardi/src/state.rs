@@ -1836,6 +1836,40 @@ pub fn page_size(max_results: Option<i32>) -> Result<usize, String> {
     }
 }
 
+/// The most `Filters` entries any listing of this service applies to one call.
+///
+/// NOT an AWS quota: not one of the filter lists these listings model
+/// (`GroupFilterList`, `ResourceFilterList`, `ListGroupingStatusesFilterList`,
+/// `ListTagSyncTasksFilterList`) declares a length, so the request boundary admits
+/// any number of entries, and each entry's own `Values` is bounded on its own
+/// (`1..5` or `1..10`). This is the emulator's own bound on the work ONE request
+/// can ask for, since every entry is evaluated against every item the listing
+/// covers: it caps that product beside the bound the store already puts on the
+/// items themselves. Reaching it is a `BadRequestException`.
+pub const MAX_FILTERS: usize = 10;
+
+/// `Ok(())` when a request's `Filters` carries a number of entries this service
+/// applies to one call, else the message the refusal reports.
+///
+/// The ONE place this service bounds a filter list, so every listing it serves —
+/// of groups, of one group's memberships, of its grouping statuses and of the
+/// account's tag-sync tasks — caps the entries one call carries at
+/// [`MAX_FILTERS`] and refuses a longer list with the same sentence, and the bound
+/// and that sentence cannot drift apart between them.
+///
+/// The count is judged from the request alone, so a caller is refused BEFORE the
+/// store lock is taken: a request past the bound costs no scan and blocks no other
+/// operation of the service.
+pub fn check_filters(count: usize) -> Result<(), String> {
+    if count > MAX_FILTERS {
+        return Err(format!(
+            "Filters carries {count} filters, which is more than the {MAX_FILTERS} this \
+             emulator applies in one call"
+        ));
+    }
+    Ok(())
+}
+
 /// The marker every pagination token this service mints carries, before the
 /// region and listing name it was issued for and its resume key. It is what makes
 /// a token verifiable: a string that merely happens to be base64 is not a resume

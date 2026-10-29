@@ -21,6 +21,8 @@ mod cancel_tag_sync_task;
 mod delete_group_protection;
 #[path = "all/delete_group_tag_sync_tasks.rs"]
 mod delete_group_tag_sync_tasks;
+#[path = "all/filters_bound_rule.rs"]
+mod filters_bound_rule;
 #[path = "all/get_tag_sync_task.rs"]
 mod get_tag_sync_task;
 #[path = "all/get_tags_identity_forms.rs"]

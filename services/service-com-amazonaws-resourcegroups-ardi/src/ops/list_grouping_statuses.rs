@@ -187,6 +187,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // did not ask for. The names are the modelled `ListGroupingStatusesFilterName`
         // values, and each one's values must lie in the domain it selects over.
         let filters = input.filters.unwrap_or_default();
+        // How many entries one call applies is this service's one shared bound, so
+        // this listing caps the work one request asks for exactly as every other
+        // `Filters`-taking listing of the service does — and does it here, before the
+        // store lock below is taken: every entry is evaluated against every record of
+        // the addressed group, so an unbounded list would hold that lock for work no
+        // bound limits.
+        crate::state::check_filters(filters.len()).map_err(bad_request)?;
         for filter in &filters {
             match filter.name.as_str() {
                 FILTER_STATUS => {

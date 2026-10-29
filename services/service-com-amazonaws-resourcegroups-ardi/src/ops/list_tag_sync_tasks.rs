@@ -186,13 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let filters = input.filters.unwrap_or_default();
-        if filters.len() > MAX_FILTERS {
-            return Err(bad_request(format!(
-                "Filters carries {} filters, which is more than the {MAX_FILTERS} this \
-                 emulator applies in one call",
-                filters.len(),
-            )));
-        }
+        // How many entries one call applies is this service's one shared bound, so
+        // this listing caps the work one request asks for exactly as every other
+        // `Filters`-taking listing of the service does — and does it here, before
+        // the store lock below is taken.
+        crate::state::check_filters(filters.len()).map_err(bad_request)?;
         // A filter entry names the application group whose tasks are listed, so an
         // entry carrying neither of the two ways of naming one narrows the listing to
         // no group at all; it is refused rather than answered with a listing the
@@ -308,15 +306,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// token codec ([`crate::state::encode_page_token`]), since this listing
 /// enumerates one region's tasks.
 const LISTING: &str = "tag-sync-tasks";
-
-/// The most `Filters` entries this operation applies to one call.
-///
-/// NOT an AWS quota: the modelled `ListTagSyncTasksFilterList` declares no length.
-/// This is the emulator's own bound on the work ONE request can ask for, since
-/// every entry is evaluated against every task of the region; it sits beside the
-/// bound the store already puts on the tasks themselves. Reaching it is a
-/// `BadRequestException`.
-const MAX_FILTERS: usize = 10;
 
 /// What every ARN starts with, and so what tells an ARN from a bare name: the
 /// modelled `GroupArnV2` writes one and the modelled `GroupName` cannot.
