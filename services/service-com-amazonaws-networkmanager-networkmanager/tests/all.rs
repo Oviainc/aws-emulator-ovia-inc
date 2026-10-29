@@ -159,6 +159,8 @@ mod network_resources;
 mod network_telemetry;
 #[path = "all/organization_service_access.rs"]
 mod organization_service_access;
+#[path = "all/page_token_canonical_spelling.rs"]
+mod page_token_canonical_spelling;
 #[path = "all/policy_topology_derivation.rs"]
 mod policy_topology_derivation;
 #[path = "all/register_transit_gateway_account_ownership.rs"]

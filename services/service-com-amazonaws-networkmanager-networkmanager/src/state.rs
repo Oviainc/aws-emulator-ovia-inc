@@ -8794,9 +8794,16 @@ fn encode_page_token(last_key: &str) -> String {
 
 /// Decode a continuation token minted by [`encode_page_token`], or `None` when the token
 /// is not one this service produced — the caller answers that with a `ValidationException`.
+///
+/// Only the ONE spelling [`encode_page_token`] writes for a position names that position: a
+/// token is accepted only when it is byte-identical to the token this service would mint
+/// for the key it decodes to. `hex::decode` is laxer than `hex::encode` — it reads
+/// `A-F` as well as the `a-f` the minter emits — so without that check a re-cased copy of a
+/// token, a string no response of this service ever carried, would resume a listing.
 pub fn decode_page_token(token: &str) -> Option<String> {
     let text = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    text.strip_prefix(PAGE_TOKEN_PREFIX).map(str::to_string)
+    let last_key = text.strip_prefix(PAGE_TOKEN_PREFIX)?;
+    (encode_page_token(last_key) == token).then(|| last_key.to_string())
 }
 
 /// Decode a continuation token with [`decode_page_token`], or answer the ONE refusal every
