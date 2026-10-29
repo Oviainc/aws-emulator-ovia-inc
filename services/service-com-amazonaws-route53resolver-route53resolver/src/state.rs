@@ -333,6 +333,18 @@ pub const RSLVR_CODE_INVALID_IAM_POLICY: &str = "RSLVR-02035";
 /// [`query_log_config_policy_access_denied`].
 pub const RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_ACCESS_DENIED: &str = "RSLVR-01600";
 
+/// The Route 53 Resolver service error code reported when a request names an
+/// association between a VPC and a query logging configuration that the service
+/// holds nothing under.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP
+/// status (400) and the exception shape name together do not say which Resolver
+/// fault occurred, and the model states no message text, so this code comes
+/// from the recorded responses of the operation that addresses one of those
+/// associations by its own id. See
+/// [`resolver_query_log_config_association_not_found`].
+pub const RSLVR_CODE_QUERY_LOG_CONFIG_ASSOCIATION_NOT_FOUND: &str = "RSLVR-01602";
+
 /// The Route 53 Resolver service error code reported when a DNS Firewall
 /// rule-group association is asked for a `Priority` another association of the
 /// same VPC already holds.
@@ -3615,12 +3627,18 @@ pub fn resolver_query_log_config_not_found(
 /// The `ResourceNotFoundException` the query-logging operations answer for an
 /// association id they hold no association under, built here so every operation
 /// that resolves a `ResolverQueryLogConfigAssociationId` reports the same body.
-pub fn resolver_query_log_config_association_not_found(
-    resolver_query_log_config_association_id: &str,
-) -> ResourceNotFoundException {
+///
+/// The sentence is the service's own for this fault
+/// ([`RSLVR_CODE_QUERY_LOG_CONFIG_ASSOCIATION_NOT_FOUND`]) and is ENTIRELY
+/// fixed text: Resolver names neither the association the caller asked for nor
+/// the configuration it would belong to, so a caller that cannot address an
+/// association learns nothing else about it — the same reticence as
+/// [`resource_not_found_message`].
+pub fn resolver_query_log_config_association_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
-            r#"Resolver query log config association with ID "{resolver_query_log_config_association_id}" does not exist."#
+        message: Some(rslvr_message(
+            RSLVR_CODE_QUERY_LOG_CONFIG_ASSOCIATION_NOT_FOUND,
+            "The specified query logging configuration association doesn't exist",
         )),
         resource_type: Some(RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG_ASSOCIATION.to_string()),
     }
@@ -3696,6 +3714,78 @@ impl ResolverQueryLogConfigAssociationRecord {
             error: None,
             error_message: None,
             creation_time: Some(self.creation_time.clone()),
+        }
+    }
+
+    /// Whether this association satisfies one
+    /// `ListResolverQueryLogConfigAssociations` filter: whether the value it
+    /// presents for that member is among the filter's values, as
+    /// [`ResolverQueryLogConfigRecord::matches_filter`] decides it for a
+    /// configuration. The status it is matched on is the one it reports as of
+    /// `now`, so a filtered page and a read of the same association cannot
+    /// disagree.
+    pub fn matches_filter(
+        &self,
+        key: QueryLogConfigAssociationFilterKey,
+        values: &HashSet<String>,
+        now: Instant,
+    ) -> bool {
+        match key {
+            // `Filter$Name`'s `CreationTime` entry spells this member's values
+            // "in Unix time format and Coordinated Universal Time (UTC)", while
+            // every read reports the modelled RFC 3339 string, so a filter value
+            // in either spelling selects the association: the whole-second Unix
+            // form names the second the VPC was associated in.
+            QueryLogConfigAssociationFilterKey::CreationTime => {
+                values.contains(self.creation_time.as_str())
+                    || values.contains(&rfc3339_unix_seconds(&self.creation_time))
+            }
+            // "If the value of `Status` is a value other than `FAILED`, `Error`
+            // is null": [`Self::to_association`] reports no `Error` for any
+            // association this slice stores, because it leaves none failed, so a
+            // filter on that member selects none of them.
+            QueryLogConfigAssociationFilterKey::Error => false,
+            QueryLogConfigAssociationFilterKey::Id => values.contains(self.id.as_str()),
+            QueryLogConfigAssociationFilterKey::ResolverQueryLogConfigId => {
+                values.contains(self.resolver_query_log_config_id.as_str())
+            }
+            QueryLogConfigAssociationFilterKey::ResourceId => {
+                values.contains(self.resource_id.as_str())
+            }
+            QueryLogConfigAssociationFilterKey::Status => values.contains(self.status_at(now)),
+        }
+    }
+
+    /// The value this association is ordered by when a request sorts on `key`:
+    /// the member's own value, as a number for the one member that is a point in
+    /// time and as text for the rest (see [`QueryLogConfigSortValue`]).
+    pub fn sort_value(
+        &self,
+        key: QueryLogConfigAssociationSortKey,
+        now: Instant,
+    ) -> QueryLogConfigSortValue {
+        match key {
+            QueryLogConfigAssociationSortKey::CreationTime => {
+                QueryLogConfigSortValue::Number(rfc3339_epoch_nanos(&self.creation_time))
+            }
+            // Null on every association this slice stores, for the reason
+            // [`Self::matches_filter`] gives, so every association ties on it
+            // and the stable sort leaves them in association order.
+            QueryLogConfigAssociationSortKey::Error => {
+                QueryLogConfigSortValue::Text(String::new())
+            }
+            QueryLogConfigAssociationSortKey::Id => {
+                QueryLogConfigSortValue::Text(self.id.clone())
+            }
+            QueryLogConfigAssociationSortKey::ResolverQueryLogConfigId => {
+                QueryLogConfigSortValue::Text(self.resolver_query_log_config_id.clone())
+            }
+            QueryLogConfigAssociationSortKey::ResourceId => {
+                QueryLogConfigSortValue::Text(self.resource_id.clone())
+            }
+            QueryLogConfigAssociationSortKey::Status => {
+                QueryLogConfigSortValue::Text(self.status_at(now).to_string())
+            }
         }
     }
 }
@@ -4032,7 +4122,8 @@ impl QueryLogConfigSortKey {
     }
 }
 
-/// The value one configuration is ordered by under a `SortBy`.
+/// The value one configuration, or one of its VPC associations, is ordered by
+/// under a `SortBy`.
 ///
 /// `AssociationCount` is a count and `CreationTime` a point in time, so both are
 /// ordered as NUMBERS — a count of 10 after one of 9, and an earlier instant
@@ -4044,6 +4135,107 @@ impl QueryLogConfigSortKey {
 pub enum QueryLogConfigSortValue {
     Number(i128),
     Text(String),
+}
+
+/// The member a `ListResolverQueryLogConfigAssociations` filter selects on.
+///
+/// The catalog is exactly the one the model documents for this operation
+/// (`smithy_query(query="doc",shape="Filter",member="Name")`, section
+/// **ListResolverQueryLogConfigAssociations**): `CreationTime`, `Error`, `Id`,
+/// `ResolverQueryLogConfigId`, `ResourceId`, `Status`. It is a different catalog
+/// from [`QueryLogConfigFilterKey`]'s, because the valid filter names "depend on
+/// the action that you're including the filter in": an association is selected
+/// on the configuration and the VPC it joins, a configuration on its own
+/// members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryLogConfigAssociationFilterKey {
+    CreationTime,
+    /// "If the value of `Status` is `FAILED`, specify the cause:
+    /// `DESTINATION_NOT_FOUND` or `ACCESS_DENIED`."
+    Error,
+    Id,
+    ResolverQueryLogConfigId,
+    ResourceId,
+    Status,
+}
+
+impl QueryLogConfigAssociationFilterKey {
+    /// The canonical name of this key, used to describe a filter set in a
+    /// pagination cursor's scope.
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::CreationTime => "CreationTime",
+            Self::Error => "Error",
+            Self::Id => "Id",
+            Self::ResolverQueryLogConfigId => "ResolverQueryLogConfigId",
+            Self::ResourceId => "ResourceId",
+            Self::Status => "Status",
+        }
+    }
+
+    /// Resolve a wire filter name, or `None` when it is outside the documented
+    /// catalog. The name is folded by [`fold_filter_name`], as
+    /// [`QueryLogConfigFilterKey::parse`] folds the configuration catalog's
+    /// names.
+    pub fn parse(name: &str) -> Option<Self> {
+        match fold_filter_name(name).as_str() {
+            "CREATIONTIME" => Some(Self::CreationTime),
+            "ERROR" => Some(Self::Error),
+            "ID" => Some(Self::Id),
+            "RESOLVERQUERYLOGCONFIGID" => Some(Self::ResolverQueryLogConfigId),
+            "RESOURCEID" => Some(Self::ResourceId),
+            "STATUS" => Some(Self::Status),
+            _ => None,
+        }
+    }
+}
+
+/// The member a `ListResolverQueryLogConfigAssociations` request sorts its
+/// associations by.
+///
+/// The catalog is exactly the one that operation's `SortBy` documents
+/// (`smithy_query(query="doc",shape="ListResolverQueryLogConfigAssociationsRequest",member="SortBy")`):
+/// `CreationTime`, `Error`, `Id`, `ResolverQueryLogConfigId`, `ResourceId`,
+/// `Status` — the same six members the filter catalog carries, so every member
+/// an association can be selected on it can also be ordered by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryLogConfigAssociationSortKey {
+    CreationTime,
+    Error,
+    Id,
+    ResolverQueryLogConfigId,
+    ResourceId,
+    Status,
+}
+
+impl QueryLogConfigAssociationSortKey {
+    /// The canonical name of this key, used to describe one query's ordering in
+    /// a pagination cursor's scope.
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::CreationTime => "CreationTime",
+            Self::Error => "Error",
+            Self::Id => "Id",
+            Self::ResolverQueryLogConfigId => "ResolverQueryLogConfigId",
+            Self::ResourceId => "ResourceId",
+            Self::Status => "Status",
+        }
+    }
+
+    /// Resolve a wire `SortBy`, or `None` when it names no member of the
+    /// documented catalog. Folded by [`fold_filter_name`] for the same reason a
+    /// filter name is.
+    pub fn parse(name: &str) -> Option<Self> {
+        match fold_filter_name(name).as_str() {
+            "CREATIONTIME" => Some(Self::CreationTime),
+            "ERROR" => Some(Self::Error),
+            "ID" => Some(Self::Id),
+            "RESOLVERQUERYLOGCONFIGID" => Some(Self::ResolverQueryLogConfigId),
+            "RESOURCEID" => Some(Self::ResourceId),
+            "STATUS" => Some(Self::Status),
+            _ => None,
+        }
+    }
 }
 
 /// A stored `Rfc3339TimeString` as nanoseconds since the epoch, so two
@@ -4955,6 +5147,27 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         all
     }
 
+    /// Every VPC-to-configuration association the store holds, in association
+    /// order — the order `ListResolverQueryLogConfigAssociations`' unsorted
+    /// pages and its cursor are defined over, for the same reason as
+    /// [`Self::query_log_configs_in_creation_order`]: a page is cut at an offset
+    /// into this sequence, so the sequence must not depend on the hash order of
+    /// the map that holds the configurations the associations live on.
+    ///
+    /// Both collections are bounded ([`MAX_STORED_QUERY_LOG_CONFIGS`],
+    /// [`MAX_QUERY_LOG_CONFIG_ASSOCIATIONS`]).
+    pub fn query_log_config_associations_in_creation_order(
+        &self,
+    ) -> Vec<&ResolverQueryLogConfigAssociationRecord> {
+        let mut all: Vec<&ResolverQueryLogConfigAssociationRecord> = self
+            .resolver_query_log_configs
+            .values()
+            .flat_map(|config| config.associations.iter())
+            .collect();
+        all.sort_by_key(|record| record.seq);
+        all
+    }
+
     /// Every stored Resolver on an Outpost in creation order — the order
     /// `ListOutpostResolvers`' pages and its cursor are defined over.
     pub fn outpost_resolvers_in_creation_order(&self) -> Vec<&OutpostResolverRecord> {
@@ -5530,6 +5743,28 @@ pub fn query_log_config_list_scope(
             .map(|(key, values)| (key.canonical_name(), values)),
     );
     let sort_by = sort_by.map_or("", QueryLogConfigSortKey::canonical_name);
+    format!("{base}/{sort_by}/{}", sort_order.unwrap_or_default())
+}
+
+/// The cursor scope of one `ListResolverQueryLogConfigAssociations` query, for
+/// the same reason and in the same shape as [`query_log_config_list_scope`]'s:
+/// the offset a cursor carries is an index into the filtered, ordered
+/// collection, and "you must use the same value for `SortBy` / `SortOrder`, if
+/// any, as in the previous request", so a resume that changes the filters or the
+/// ordering is answered as a cursor this query does not accept rather than with
+/// a page cut at the wrong position.
+pub fn query_log_config_association_list_scope(
+    filters: &[(QueryLogConfigAssociationFilterKey, HashSet<String>)],
+    sort_by: Option<QueryLogConfigAssociationSortKey>,
+    sort_order: Option<&str>,
+) -> String {
+    let base = filter_list_scope(
+        "ListResolverQueryLogConfigAssociations",
+        filters
+            .iter()
+            .map(|(key, values)| (key.canonical_name(), values)),
+    );
+    let sort_by = sort_by.map_or("", QueryLogConfigAssociationSortKey::canonical_name);
     format!("{base}/{sort_by}/{}", sort_order.unwrap_or_default())
 }
 

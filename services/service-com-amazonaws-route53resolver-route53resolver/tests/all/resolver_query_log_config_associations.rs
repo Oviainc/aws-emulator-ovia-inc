@@ -485,11 +485,29 @@ async fn an_unknown_association_id_is_reported_as_missing() {
         expect_error(
             &router,
             "GetResolverQueryLogConfigAssociation",
-            json!({ "ResolverQueryLogConfigAssociationId": id }),
+            json!({ "ResolverQueryLogConfigAssociationId": id.clone() }),
             case,
             "ResourceNotFoundException",
         )
         .await;
+
+        // Every Resolver fault answers HTTP 400, so the bracketed service error
+        // code inside `Message` is what tells this one apart. The sentence is
+        // the service's own and is entirely fixed text: it names neither the
+        // association the caller asked for nor the configuration it would
+        // belong to, so the SAME body comes back whichever id was named.
+        let (_, body) = call(
+            &router,
+            "GetResolverQueryLogConfigAssociation",
+            json!({ "ResolverQueryLogConfigAssociationId": id.clone() }),
+        )
+        .await;
+        let message = string_member(&body, "Message");
+        assert_eq!(
+            message,
+            "[RSLVR-01602] The specified query logging configuration association doesn't exist.",
+            "case {case:?}: the refusal must carry the service's own coded sentence, got {body}"
+        );
     }
 
     // The refusals above are about the id, not about refusing every read.
