@@ -119,6 +119,130 @@ async fn enrolling_with_member_accounts_moves_every_account_of_the_organization(
     }
 }
 
+/// An account id the store knows nothing about — twelve digits, as the
+/// `AccountId` shape's `^[0-9]{12}$` pattern admits, and none of [`MEMBERS`] nor
+/// the caller — so a write that invented records would be observable as a record
+/// held for it.
+const UNKNOWN_ACCOUNT: &str = "999988887777";
+
+/// The organization's write reaches exactly the accounts the store records,
+/// however many they are, and creates a record for no other account.
+///
+/// The table spans the COUNT of member accounts the organization holds: none,
+/// where the write addresses the caller alone, through all three.
+#[tokio::test]
+async fn the_write_reaches_every_account_the_organization_holds_and_no_other() {
+    for members in 0..=MEMBERS.len() {
+        let case = format!("{members} member accounts recorded");
+        let (router, store) = management_account_router_with_store();
+        for (account, status) in &MEMBERS[..members] {
+            record_enrollment(&store, account, status, *status == "Active");
+        }
+
+        ok(
+            &router,
+            "UpdateEnrollmentStatus",
+            &json!({"status": "Active", "includeMemberAccounts": true}),
+        )
+        .await;
+
+        let mut expected: Vec<Record> = vec![(
+            engine::emulator_account_id().to_string(),
+            "Active".to_string(),
+        )];
+        for (account, _) in &MEMBERS[..members] {
+            expected.push((account.to_string(), "Active".to_string()));
+        }
+        expected.sort();
+        let payload = ok(
+            &router,
+            "ListEnrollmentStatuses",
+            &json!({"includeOrganizationInfo": true}),
+        )
+        .await;
+        let answered = listed(&payload);
+        assert_eq!(
+            answered, expected,
+            "case {case}: expected {expected:?}, got {answered:?} in {payload}"
+        );
+
+        let unknown = ok(
+            &router,
+            "ListEnrollmentStatuses",
+            &json!({"accountId": UNKNOWN_ACCOUNT}),
+        )
+        .await;
+        let answered = listed(&unknown);
+        assert!(
+            answered.is_empty(),
+            "case {case}: expected no record for an account the store never knew, got \
+             {answered:?} in {unknown}"
+        );
+    }
+}
+
+/// A member account the organization's write MOVES keeps the instant its record
+/// was created, and carries the instant of that write as its last update: the
+/// write updates the organization's existing records rather than replacing them.
+#[tokio::test]
+async fn a_member_the_organization_moves_keeps_its_creation_instant() {
+    for status in ENROLLMENT_STATUS_WIRE_VALUES {
+        let case = format!("status {status}");
+        let (router, store) = management_account_router_with_store();
+        let (member, started_at) = MEMBERS[0];
+        record_enrollment(&store, member, started_at, false);
+        let (created_before, updated_before) = timestamps(&router, member, &case).await;
+
+        // The write has to land at a later instant than the one the record was
+        // created at for "the last update moved" to be observable at all.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        ok(
+            &router,
+            "UpdateEnrollmentStatus",
+            &json!({"status": status, "includeMemberAccounts": true}),
+        )
+        .await;
+
+        let (created_after, updated_after) = timestamps(&router, member, &case).await;
+        assert_eq!(
+            created_before, created_after,
+            "case {case}: expected the creation instant {created_before} kept, got {created_after}"
+        );
+        assert!(
+            updated_after > updated_before,
+            "case {case}: expected the last update to move past {updated_before}, got \
+             {updated_after}"
+        );
+        assert!(
+            updated_after >= created_after,
+            "case {case}: expected the last update at or after the creation instant \
+             {created_after}, got {updated_after}"
+        );
+    }
+}
+
+/// The `(createdTimestamp, lastUpdatedTimestamp)` pair `ListEnrollmentStatuses`
+/// reports for one named account, as epoch seconds.
+async fn timestamps(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    account: &str,
+    case: &str,
+) -> (f64, f64) {
+    let payload: Value = ok(
+        router,
+        "ListEnrollmentStatuses",
+        &json!({"accountId": account}),
+    )
+    .await;
+    let item = &payload["items"][0];
+    let read = |member: &str| {
+        item[member]
+            .as_f64()
+            .unwrap_or_else(|| panic!("case {case}: expected {member} on {payload}"))
+    };
+    (read("createdTimestamp"), read("lastUpdatedTimestamp"))
+}
+
 /// The member-account flag addresses the organization for the organization's
 /// MANAGEMENT account only: any other caller's write moves that caller's own
 /// record and nobody else's, whatever the flag says.
