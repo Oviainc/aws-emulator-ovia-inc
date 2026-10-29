@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTrafficPolicyInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTrafficPolicyInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTrafficPolicyInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +64,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::no_such_traffic_policy_instance;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -142,20 +135,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTrafficPolicyInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTrafficPolicyInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTrafficPolicyInstance"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`; `InvalidInput` is the only error this
+            // operation models that can carry the reason at all.
+            DeleteTrafficPolicyInstanceErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // `PriorRequestNotComplete` reports that the service "can't process a
+        // request before the next request arrives" for the same hosted zone — a
+        // concurrency condition of the real service's change pipeline. The
+        // store below is taken for the whole of this delete, so no delete it
+        // accepts overlaps another one and that condition never arises.
+        let mut store = state.lock();
+
+        // An instance is addressed by the bare id the create minted, which is
+        // the id the store is keyed by. Taking the record out IS the delete, and
+        // an id the account holds no instance for is the modelled 404.
+        let deleted = store
+            .traffic_policy_instances
+            .remove(&input.id)
+            .ok_or_else(|| {
+                DeleteTrafficPolicyInstanceErrorModeled::NoSuchTrafficPolicyInstance(
+                    no_such_traffic_policy_instance(&input.id),
+                )
+            })?;
+
+        // "Deletes a traffic policy instance AND ALL OF THE RESOURCE RECORD SETS
+        // that Amazon Route 53 created when you created the instance" — the
+        // record sets go with the instance, so the zone stops answering for the
+        // name the instance was applied to and `ListResourceRecordSets` stops
+        // reporting them. They are found by the OWNERSHIP the create recorded
+        // (`ResourceRecordSet$TrafficPolicyInstanceId`, "the ID of the traffic
+        // policy instance that Route 53 created this resource record set for")
+        // rather than by recomputing the key from the instance's name and type,
+        // so every record set this instance generated goes and no record set
+        // another writer owns at the same name is touched. The zone always
+        // resolves while the instance exists: a zone holding a record set the
+        // instance generated is not one `DeleteHostedZone` will delete (it
+        // refuses a zone holding anything but its own SOA and NS records), so
+        // the zone outlives every instance created in it.
+        if let Some(zone) = store.zones.get_mut(&deleted.hosted_zone_id) {
+            zone.records.retain(|_, record| {
+                record.traffic_policy_instance_id.as_deref() != Some(deleted.id.as_str())
+            });
+        }
+
+        Ok(DeleteTrafficPolicyInstanceOutput {})
     }
 }

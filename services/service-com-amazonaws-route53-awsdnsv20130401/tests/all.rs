@@ -104,6 +104,8 @@ mod traffic_policies;
 mod traffic_policy_comment_updates;
 #[path = "all/traffic_policy_instance_count.rs"]
 mod traffic_policy_instance_count;
+#[path = "all/traffic_policy_instance_deletion.rs"]
+mod traffic_policy_instance_deletion;
 #[path = "all/traffic_policy_instances.rs"]
 mod traffic_policy_instances;
 #[path = "all/traffic_policy_listing.rs"]
