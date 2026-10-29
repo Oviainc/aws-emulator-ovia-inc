@@ -141,17 +141,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
-        // A MUTATION, so it advances this state's clock: the instant it hands out is
-        // when the deletion was accepted, and what the DELETED transition is owed
-        // from.
-        let now = state.tick_millis();
 
-        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+        // Every refusal is classified over an IMMUTABLE borrow, BEFORE the clock
+        // moves, so a refused delete leaves nothing observable behind: not the
+        // detector, not the id, and not the service clock either.
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
             // Classified from the REQUEST, the way every other IPSet operation
             // classifies a `DetectorId` it cannot resolve.
             return Err(crate::scaffolded::Scaffolded::invalid_input(
                 crate::state::detector_id_rejection(&input.detector_id),
             ));
+        };
+        if !detector.ip_sets.contains_key(&input.ip_set_id) {
+            // An `IpSetId` this detector does not hold, classified from the REQUEST
+            // like every other id this service refuses.
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::ip_set_id_rejection(&input.ip_set_id),
+            ));
+        }
+
+        // Past the refusals this is a MUTATION, so it advances this state's clock:
+        // the instant it hands out is when the deletion was accepted, and what the
+        // DELETED transition is owed from.
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // The detector resolved above under the same lock, so this cannot be
+            // reached; answering the modelled server fault keeps it from panicking.
+            return Err(DeleteIPSetErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
         };
 
         // "Deletes the IPSet specified by the ipSetId" (this operation's own
@@ -161,13 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // something a read reports rather than a refusal. A second delete of the same
         // id is accepted and moves nothing: the id still resolves, and deleting an
         // already-deleted list asks for the state it is already in.
-        let Some(accepted) = detector.delete_ip_set(&input.ip_set_id, now) else {
-            // An `IpSetId` this detector does not hold, classified from the REQUEST
-            // like every other id this service refuses.
-            return Err(crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::ip_set_id_rejection(&input.ip_set_id),
-            ));
-        };
+        let accepted = detector
+            .delete_ip_set(&input.ip_set_id, now)
+            .unwrap_or(false);
         if accepted {
             // The detector holds one fewer LIVE sub-resource than before, which is
             // the same change `CreateIPSet` records on it in the other direction. A

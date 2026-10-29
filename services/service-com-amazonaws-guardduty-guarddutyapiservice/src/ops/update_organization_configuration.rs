@@ -193,18 +193,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         let mut state = state.lock();
-        // A MUTATION of the detector's own record, so the clock is read here — and
-        // before the record is borrowed, because `tick_millis` and the detector both
-        // borrow the store mutably.
-        let now = state.tick_millis();
-        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+
+        // Every refusal is classified over an IMMUTABLE borrow, BEFORE the clock
+        // moves, so a refused update leaves nothing behind: not the configuration,
+        // and not the service clock either.
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
             // Well formed (checked above) but not this account's in this Region:
             // the ownership failure the same classifier answers with.
             return Err(crate::scaffolded::Scaffolded::invalid_input(
                 crate::state::detector_id_rejection(&input.detector_id),
             ));
         };
-        let configuration = &mut detector.organization;
 
         // `AutoEnableMembers` and the `Features` members are enums, so a value
         // outside them is already refused at the boundary; what is left here is the
@@ -213,11 +212,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // configuration is in hand, and still before anything is written, so a
         // rejected update leaves the configuration exactly as it was.
         if let Err(message) = crate::state::validate_org_feature_configurations(
-            configuration,
+            &detector.organization,
             input.features.as_ref(),
         ) {
             return Err(crate::scaffolded::Scaffolded::invalid_input(message));
         }
+
+        // Past the refusals this is a MUTATION of the detector's own record, so the
+        // clock is read here.
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // The detector resolved above under the same lock, so this cannot be
+            // reached; answering the modelled server fault keeps it from panicking.
+            return Err(
+                UpdateOrganizationConfigurationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let configuration = &mut detector.organization;
 
         // Exactly one of the two views is present (checked above), so neither
         // overwrites the other: the deprecated boolean becomes the

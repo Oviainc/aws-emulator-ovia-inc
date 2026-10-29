@@ -43,14 +43,14 @@ const KEY_ARN: &str = "arn:aws:kms:us-east-1:111122223333:key/1234abcd-12ab-34cd
 /// clock BEFORE it refuses spends at least one millisecond of it per refused call,
 /// and the burst must advance that clock by more than [`READING_SLACK_MILLIS`] past
 /// the wall-clock time the burst itself takes for the difference to be an assertion.
-const REFUSALS_PER_BURST: usize = 300;
+pub(crate) const REFUSALS_PER_BURST: usize = 300;
 
 /// What the measurement below allows on top of the wall-clock time that really
 /// passed: the clock is strictly monotonic, so the accepted create that closes the
 /// measurement sits one millisecond past the instant that opened it even when no
 /// time passed at all, and the wall-clock reading that opens the measurement is
 /// taken a request later than the mutation that stamped that instant.
-const READING_SLACK_MILLIS: i64 = 25;
+pub(crate) const READING_SLACK_MILLIS: i64 = 25;
 
 /// One row: a family of detector sub-resource create, one way of refusing it, and an
 /// accepted create whose timestamp shows what the refusals did to the clock.
@@ -237,7 +237,7 @@ fn rows() -> Vec<Row> {
 /// The epoch milliseconds an ISO-8601 instant names, so two of the strings a client
 /// is given can be subtracted. Read through the same date-time implementation the
 /// service renders them with, rather than by picking the text apart here.
-fn as_millis(text: &str, case: &str) -> i64 {
+pub(crate) fn as_millis(text: &str, case: &str) -> i64 {
     let seconds = ::aws_smithy_types::DateTime::from_str(
         text,
         ::aws_smithy_types::date_time::Format::DateTime,
@@ -248,7 +248,7 @@ fn as_millis(text: &str, case: &str) -> i64 {
 }
 
 /// The detector's own `UpdatedAt`, as the string a client sees.
-async fn detector_updated_at(router: &Router, detector_id: &str, case: &str) -> String {
+pub(crate) async fn detector_updated_at(router: &Router, detector_id: &str, case: &str) -> String {
     let (status, got) = call(router, "GET", &format!("/detector/{detector_id}"), None).await;
     assert_eq!(
         status, 200,

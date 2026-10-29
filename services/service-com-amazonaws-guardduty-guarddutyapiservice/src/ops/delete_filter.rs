@@ -138,10 +138,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
 
         let mut state = state.lock();
-        // Taken before the detector is borrowed, so the instant a successful delete
-        // records on the detector comes from the same clock every mutation here uses.
-        let now = state.tick_millis();
-        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+        // Every refusal is classified over an IMMUTABLE borrow, BEFORE the clock
+        // moves, so a refused delete leaves nothing behind: not the filter, and not
+        // the service clock either.
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
             // Classified from the REQUEST the way every detector-scoped operation
             // classifies it: a value that cannot be a detector id is a parameter
             // failure, a well-formed one this account does not hold an ownership
@@ -156,10 +156,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `FilterName` is a plain `String` URI label here
         // (`smithy_query(operation="DeleteFilter")`), so it carries no modelled
         // constraint and a malformed name reaches this handler.
-        if detector.filters.remove(&input.filter_name).is_none() {
+        if !detector.filters.contains_key(&input.filter_name) {
             return Err(bad_request(crate::state::filter_name_rejection(
                 &input.filter_name,
             )));
+        }
+
+        // Past the refusals this is a MUTATION, so the instant a successful delete
+        // records on the detector comes from the same clock every mutation here uses.
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // The detector resolved above under the same lock, so this cannot be
+            // reached; answering the modelled server fault keeps it from panicking.
+            return Err(DeleteFilterErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        if detector.filters.remove(&input.filter_name).is_none() {
+            // The name resolved above under the same lock, so this cannot be reached.
+            return Err(DeleteFilterErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
         }
 
         // The detector holds one fewer sub-resource than before, which is the same

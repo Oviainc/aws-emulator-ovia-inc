@@ -166,11 +166,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
-        // A MUTATION: the instant this hands out is the IPSet's new `UpdatedAt` and,
-        // when `Activate` moves the status, what the transition is owed from.
-        let now = state.tick_millis();
 
-        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+        // Every refusal is classified over an IMMUTABLE borrow, BEFORE the clock
+        // moves, so a refused update leaves nothing behind: not the list, and not
+        // the service clock either.
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
             // Classified from the REQUEST, the way every other IPSet operation
             // classifies a `DetectorId` it cannot resolve.
             return Err(crate::scaffolded::Scaffolded::invalid_input(
@@ -183,14 +183,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusal (`crate::state::not_owned_message`). The delete itself stays
         // idempotent — it asks for the state the record is already in — while an
         // update would otherwise walk a DELETED record back into use.
-        let ip_set = detector
+        if detector
             .ip_sets
-            .get_mut(&input.ip_set_id)
-            .filter(|ip_set| !ip_set.is_deleting());
-        let Some(ip_set) = ip_set else {
+            .get(&input.ip_set_id)
+            .is_none_or(crate::state::IpSetRecord::is_deleting)
+        {
             return Err(crate::scaffolded::Scaffolded::invalid_input(
                 crate::state::ip_set_id_rejection(&input.ip_set_id),
             ));
+        }
+
+        // Past the refusals this is a MUTATION: the instant this hands out is the
+        // IPSet's new `UpdatedAt` and, when `Activate` moves the status, what the
+        // transition is owed from.
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // The detector resolved above under the same lock, so this cannot be
+            // reached; answering the modelled server fault keeps it from panicking.
+            return Err(UpdateIPSetErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let Some(ip_set) = detector.ip_sets.get_mut(&input.ip_set_id) else {
+            // The id resolved above under the same lock, so this cannot be reached.
+            return Err(UpdateIPSetErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
         };
 
         // Every member but the two ids is OPTIONAL and documented as "the updated

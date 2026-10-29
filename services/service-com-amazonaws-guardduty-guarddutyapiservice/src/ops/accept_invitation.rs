@@ -156,10 +156,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut state = state.lock();
-        // A MUTATION, so the clock is read here: the instant is what the accepted
-        // relationship moves the detector's `UpdatedAt` to.
-        let now = state.tick_millis();
-        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+        // Every refusal is classified over an IMMUTABLE borrow, BEFORE the clock
+        // moves, so a refused acceptance leaves nothing behind: not the inbox, not
+        // the relationship, and not the service clock either.
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
             // Classified from the REQUEST, the way every other operation on this
             // service classifies a `DetectorId` it cannot resolve.
             return Err(crate::scaffolded::Scaffolded::invalid_input(
@@ -174,10 +174,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `smithy_query(operation="AcceptInvitation")` — so the absence case is
         // the 400, never a hollow 200 that would let a caller believe an
         // administrator relationship now exists.
-        if !detector.accept_invitation(&input.master_id, &input.invitation_id, now) {
+        if !detector.invitation_pending(&input.master_id, &input.invitation_id) {
             return Err(crate::scaffolded::Scaffolded::invalid_input(
                 crate::state::invitation_not_pending_message(),
             ));
+        }
+
+        // Past the refusals this is a MUTATION, so the clock is read here: the
+        // instant is what the accepted relationship moves the detector's
+        // `UpdatedAt` to.
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // The detector resolved above under the same lock, so this cannot be
+            // reached; answering the modelled server fault keeps it from panicking.
+            return Err(AcceptInvitationErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        if !detector.accept_invitation(&input.master_id, &input.invitation_id, now) {
+            // The invitation was pending above under the same lock, so this cannot
+            // be reached.
+            return Err(AcceptInvitationErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
         }
 
         // `AcceptInvitationResponse` declares no members

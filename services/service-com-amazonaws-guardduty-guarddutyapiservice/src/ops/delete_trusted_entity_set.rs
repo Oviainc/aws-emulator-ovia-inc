@@ -144,29 +144,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
-        // A MUTATION, so it advances this state's clock: the instant it hands out is
-        // when the deletion was accepted, and what the `DELETED` transition is owed
-        // from.
-        let now = state.tick_millis();
 
-        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+        // Every refusal is classified over an IMMUTABLE borrow, BEFORE the clock
+        // moves, so a refused delete leaves nothing observable behind: not the
+        // detector, not the id, and not the service clock either.
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
             // Classified from the REQUEST, the way every other trusted-entity-set
             // operation classifies a `DetectorId` it cannot resolve.
             return Err(crate::scaffolded::Scaffolded::invalid_input(
                 crate::state::detector_id_rejection(&input.detector_id),
             ));
         };
-
-        // "Deletes the trusted entity set that is associated with the specified
-        // trustedEntitySetId" (this operation's own documentation): the set moves to
-        // `DELETE_PENDING` and the clock owes it `DELETED` —
-        // `GetTrustedEntitySet`'s `Status` is `@required` and its enum carries both
-        // (`smithy_query(operation="GetTrustedEntitySet")`), so the status after a
-        // delete is something a read reports rather than a refusal. A second delete
-        // of the same id is accepted and moves nothing: the id still resolves, and
-        // deleting an already-deleted set asks for the state it is already in.
-        let Some(accepted) = detector.delete_trusted_entity_set(&input.trusted_entity_set_id, now)
-        else {
+        if !detector
+            .trusted_entity_sets
+            .contains_key(&input.trusted_entity_set_id)
+        {
             // An id this detector does not hold, classified from the REQUEST like
             // every other id this service refuses: a value that cannot be an
             // entity-set id at all is a parameter failure, a well-formed one this
@@ -177,7 +169,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &input.trusted_entity_set_id,
                 ),
             ));
+        }
+
+        // Past the refusals this is a MUTATION, so it advances this state's clock:
+        // the instant it hands out is when the deletion was accepted, and what the
+        // `DELETED` transition is owed from.
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // The detector resolved above under the same lock, so this cannot be
+            // reached; answering the modelled server fault keeps it from panicking.
+            return Err(
+                DeleteTrustedEntitySetErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
         };
+
+        // "Deletes the trusted entity set that is associated with the specified
+        // trustedEntitySetId" (this operation's own documentation): the set moves to
+        // `DELETE_PENDING` and the clock owes it `DELETED` —
+        // `GetTrustedEntitySet`'s `Status` is `@required` and its enum carries both
+        // (`smithy_query(operation="GetTrustedEntitySet")`), so the status after a
+        // delete is something a read reports rather than a refusal. A second delete
+        // of the same id is accepted and moves nothing: the id still resolves, and
+        // deleting an already-deleted set asks for the state it is already in.
+        let accepted = detector
+            .delete_trusted_entity_set(&input.trusted_entity_set_id, now)
+            .unwrap_or(false);
         if accepted {
             // The detector holds one fewer LIVE sub-resource than before, which is
             // the same change `CreateTrustedEntitySet` records on it in the other

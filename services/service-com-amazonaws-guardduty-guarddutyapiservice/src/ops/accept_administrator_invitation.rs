@@ -162,23 +162,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut state = state.lock();
-        // A MUTATION, so the clock is read here.
-        let now = state.tick_millis();
-        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+        // Every refusal is classified over an IMMUTABLE borrow, BEFORE the clock
+        // moves, so a refused acceptance leaves nothing behind — the service clock
+        // included.
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
             return Err(crate::scaffolded::Scaffolded::invalid_input(
                 crate::state::detector_id_rejection(&input.detector_id),
             ));
         };
 
-        // The same write `AcceptInvitation` drives, through the same state helper:
-        // the two operations are one behaviour under two names, so neither can
-        // accept an invitation the other would refuse.
-        if !detector.accept_invitation(&input.administrator_id, &input.invitation_id, now) {
+        // The same condition `AcceptInvitation` accepts on, read through the same
+        // state helper: the two operations are one behaviour under two names, so
+        // neither can accept an invitation the other would refuse.
+        if !detector.invitation_pending(&input.administrator_id, &input.invitation_id) {
             return Err(crate::scaffolded::Scaffolded::invalid_input(
                 crate::state::invitation_not_pending_message_for(
                     crate::state::ADMINISTRATOR_ID_MEMBER,
                 ),
             ));
+        }
+
+        // Past the refusals this is a MUTATION, so the clock is read here.
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // The detector resolved above under the same lock, so this cannot be
+            // reached; answering the modelled server fault keeps it from panicking.
+            return Err(
+                AcceptAdministratorInvitationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        // The same write `AcceptInvitation` drives, through the same state helper.
+        if !detector.accept_invitation(&input.administrator_id, &input.invitation_id, now) {
+            // The invitation was pending above under the same lock, so this cannot
+            // be reached.
+            return Err(
+                AcceptAdministratorInvitationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
         }
 
         Ok(AcceptAdministratorInvitationOutput {})

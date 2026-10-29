@@ -2814,6 +2814,19 @@ impl Detector {
             .map(String::as_str)
     }
 
+    /// Is an invitation pending for this detector's account under exactly the pair
+    /// `(administrator_account_id, invitation_id)`?
+    ///
+    /// The condition [`Self::accept_invitation`] accepts on, read over an IMMUTABLE
+    /// borrow so the operations bound to it can classify their refusal before they
+    /// touch anything — one definition, so the check and the write cannot disagree
+    /// on what is pending.
+    pub fn invitation_pending(&self, administrator_account_id: &str, invitation_id: &str) -> bool {
+        self.received_invitations
+            .get(administrator_account_id)
+            .is_some_and(|invitation| invitation.invitation_id == invitation_id)
+    }
+
     /// Accept the invitation `(administrator_account_id, invitation_id)` names, if
     /// this detector's account has one pending under exactly that pair.
     ///
@@ -2833,11 +2846,7 @@ impl Detector {
         invitation_id: &str,
         now: i64,
     ) -> bool {
-        let matches = self
-            .received_invitations
-            .get(administrator_account_id)
-            .is_some_and(|invitation| invitation.invitation_id == invitation_id);
-        if !matches {
+        if !self.invitation_pending(administrator_account_id, invitation_id) {
             return false;
         }
         let Some(invitation) = self.received_invitations.remove(administrator_account_id) else {

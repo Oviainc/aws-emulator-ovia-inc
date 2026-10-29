@@ -138,14 +138,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
-        // A MUTATION, so it advances this state's clock: the instant it hands out is
-        // when the deletion landed. Taken before the lookups the way every other
-        // detector sub-resource delete on this service takes it — a refused call
-        // leaves every record exactly as it was, and the counter itself is not
-        // something any read reports.
-        let now = state.tick_millis();
 
-        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+        // Every refusal is classified over an IMMUTABLE borrow, BEFORE the clock
+        // moves, so a refused delete leaves nothing observable behind: not the
+        // detector, not the destination, and not the service clock either.
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
             // Classified from the REQUEST the way every detector-scoped operation
             // classifies it: a value that cannot be a detector id is a parameter
             // failure, a well-formed one this account/Region does not hold an
@@ -153,6 +150,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(crate::state::detector_id_rejection(
                 &input.detector_id,
             )));
+        };
+        if !detector
+            .publishing_destinations
+            .contains_key(&input.destination_id)
+        {
+            return Err(bad_request(crate::state::destination_id_rejection(
+                &input.destination_id,
+            )));
+        }
+
+        // Past the refusals this is a MUTATION, so it advances this state's clock:
+        // the instant it hands out is when the deletion landed.
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // The detector resolved above under the same lock, so this cannot be
+            // reached; answering the modelled server fault keeps it from panicking.
+            return Err(
+                DeletePublishingDestinationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
         };
 
         // "Deletes the publishing definition with the specified destinationId" (this
@@ -173,9 +192,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove(&input.destination_id)
             .is_none()
         {
-            return Err(bad_request(crate::state::destination_id_rejection(
-                &input.destination_id,
-            )));
+            // The destination resolved above under the same lock, so this cannot be
+            // reached.
+            return Err(
+                DeletePublishingDestinationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
         }
         // The detector holds one fewer sub-resource than before, which is the change
         // `CreatePublishingDestination` records on it in the other direction.

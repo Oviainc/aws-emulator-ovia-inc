@@ -167,6 +167,8 @@ mod publishing_destination_listing;
 mod publishing_destination_update;
 #[path = "all/refused_create_clock.rs"]
 mod refused_create_clock;
+#[path = "all/refused_mutation_clock.rs"]
+mod refused_mutation_clock;
 #[path = "all/request_region_partition_bounds.rs"]
 mod request_region_partition_bounds;
 #[path = "all/resource_tag_addition.rs"]
