@@ -8,8 +8,10 @@
 //! A delete is ASYNCHRONOUS, like every other change this service starts: the call puts
 //! the image set into the `LOCKED` / `DELETING` pair and the CLOCK, not a later reader,
 //! lands it on `DELETED` / `DELETED` once [`crate::state::IMAGE_SET_DELETION_DELAY`] has
-//! passed — which is when the image set gets its `deletedAt` and loses the pixel data it
-//! held. The `LOCKED` and `DELETED` state reaches EVERY version of the image set, because
+//! passed — which is when the image set gets its `deletedAt` and gives up the DICOM
+//! content it held: its pixel data and the DICOM attributes describing it alike
+//! ([`crate::state::ImageSet::release_content`]). The `LOCKED` and `DELETED` state reaches
+//! EVERY version of the image set, because
 //! the state is whether the image set can be read and written rather than a property of
 //! one snapshot of it, while the workflow status — what last happened — is recorded on
 //! the latest version. The record itself stays readable through `GetImageSet` as a
@@ -224,7 +226,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // when the deletion lands.
                 delivered_image_frames: None,
                 // Nor any DICOM attributes: a delete takes content away rather than
-                // bringing any.
+                // bringing any — the attributes the image set held go with the landing
+                // too ([`crate::state::ImageSet::release_content`]).
                 delivered_attributes: None,
                 retires_image_set: true,
             });

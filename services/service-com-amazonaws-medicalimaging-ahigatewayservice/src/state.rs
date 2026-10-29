@@ -1124,8 +1124,9 @@ pub struct PendingImageSetTransition {
     /// Whether this transition RETIRES the image set — the landing of the delete a
     /// `DeleteImageSet` call started. The record stays readable afterwards, because
     /// `deletedAt` ("the timestamp when the image set properties were deleted") is a
-    /// reported member, but the pixel data goes with the deletion: nothing holds it
-    /// once the image set is gone.
+    /// reported member, but the CONTENT goes with the deletion — pixel data and DICOM
+    /// attributes alike ([`ImageSet::release_content`]): nothing holds it once the image
+    /// set is gone.
     pub retires_image_set: bool,
 }
 
@@ -1240,7 +1241,8 @@ impl ImageSet {
 
     /// Whether this image set has been deleted — the terminal state a delete lands on,
     /// after which the record is a tombstone: it still reports its properties and its
-    /// `deletedAt`, but holds no pixel data and takes part in no further work.
+    /// `deletedAt`, but holds none of the content it held
+    /// ([`ImageSet::release_content`]) and takes part in no further work.
     pub fn is_deleted(&self) -> bool {
         self.latest_version.image_set_state == ImageSetState::Deleted
     }
@@ -1339,6 +1341,27 @@ impl ImageSet {
         )
     }
 
+    /// Give up the DICOM content this image set holds: the pixel data it was serving,
+    /// the DICOM attributes describing it — the modelled ones a search filters on and
+    /// the ones held at the path they were written at alike — and the snapshot every
+    /// superseded version kept of those attributes.
+    ///
+    /// What the landing of a deletion leaves behind is a record that reports an image
+    /// set's PROPERTIES (its identifiers, its states, its timestamps and the tags kept
+    /// on the record) and holds none of the content those properties described, so no
+    /// reader can report content of an image set the service reports as deleted.
+    pub fn release_content(&mut self) {
+        self.image_frames.clear();
+        self.set_attributes(ImageSetAttributes::default());
+        // A superseded version's snapshot is the content a revert to that version would
+        // put back, so it is released with the rest: once the content is given up there
+        // is no version of it left to restore. The latest version keeps its `None`,
+        // which is the attributes the image set holds — now none.
+        for version in &mut self.earlier_versions {
+            version.superseded_attributes = Some(ImageSetAttributes::default());
+        }
+    }
+
     /// Put EVERY version of this image set into `image_set_state`.
     ///
     /// Used where a change concerns the whole image set rather than one snapshot of it —
@@ -1385,11 +1408,12 @@ impl ImageSet {
             self.set_attributes(delivered);
         }
         // A deletion the clock owed lands the same way, at the DUE instant rather than at
-        // `now`, so `deletedAt` does not move between reads — and the pixel data this
-        // image set held goes with it, because a deleted image set holds none.
+        // `now`, so `deletedAt` does not move between reads — and the content this image
+        // set held goes with it ([`ImageSet::release_content`]), because a deleted image
+        // set holds none.
         if pending.retires_image_set {
             self.deleted_at = Some(pending.due_at);
-            self.image_frames.clear();
+            self.release_content();
             // Retiring the image set reaches EVERY version of it. `ImageSetState` is
             // whether the image set can be read and written, which is a property of the
             // image set rather than of one snapshot of it, so no version of a retired
