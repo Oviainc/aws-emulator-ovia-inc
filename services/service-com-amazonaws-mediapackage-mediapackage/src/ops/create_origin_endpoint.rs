@@ -250,8 +250,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The access-control and packaging members are judged by CONTENT too, not only by
         // size: a whitelist entry that is not an address range, an ARN that names no
         // resource of the documented service, a CMAF package that publishes no child
-        // manifest and one that publishes two children under a single id are each refused
-        // before anything is stored — by the one function the update calls as well.
+        // manifest, one that publishes two children under a single id, a manifest that
+        // selects DATERANGE ad markers without the date-time interval that option requires
+        // and a SPEKE 2.0 encryption contract asked for on a format that does not use it or
+        // beside live key rotation are each refused before anything is stored — by the one
+        // function the update calls as well.
         crate::state::check_origin_endpoint_members(
             input.whitelist.as_deref(),
             input.authorization.as_ref(),

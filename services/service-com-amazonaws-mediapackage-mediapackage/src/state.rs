@@ -1191,8 +1191,273 @@ pub fn require_unique_cmaf_hls_manifest_ids(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Members that are only acceptable TOGETHER with a particular value of another member
+//
+// A few packaging members state a requirement on ANOTHER member of the same
+// configuration: selecting one option of an enum requires a second member to carry a value
+// in a narrower domain, and specifying one block requires a second member to carry a
+// particular value. The model states each of these in the MEMBER'S OWN prose rather than as
+// a constraint, so neither the framework's constraint walk nor any per-member rule above
+// can refuse the pair — the combination has to be judged as a pair, which is what the
+// functions below do.
+//
+// Each pair is judged for EVERY packaging block that can carry it, by the one function both
+// the create and the update call, so a combination refused under one block or one operation
+// cannot be stored under another. The refusal is this service's usual
+// `UnprocessableEntityException` (422), keyed by the member the caller has to change, and
+// nothing is stored.
+// ---------------------------------------------------------------------------
+
+/// The `AdMarkers` option that signals ad and program transitions with EXT-X-DATERANGE
+/// tags — one of the values the member's enum admits
+/// (`crate::ops::types::AD_MARKERS_VALUES`), and the only one whose documentation states a
+/// requirement on another member.
+pub const DATERANGE_AD_MARKERS: &str = "DATERANGE";
+
+/// The value a `ProgramDateTimeIntervalSeconds` has to EXCEED in a manifest configuration
+/// that selects [`DATERANGE_AD_MARKERS`].
+///
+/// `HlsPackage$AdMarkers` and `HlsManifestCreateOrUpdateParameters$AdMarkers` carry the
+/// same sentence — for the DATERANGE option "you must set a
+/// programDateTimeIntervalSeconds value that is greater than 0"
+/// (`smithy_query(query="doc",shape="com.amazonaws.mediapackage#HlsPackage",member="AdMarkers",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`)
+/// — because the EXT-X-DATERANGE tags that option writes are positioned by the
+/// EXT-X-PROGRAM-DATE-TIME tags that interval inserts, and an interval of zero inserts
+/// none at all.
+pub const DATERANGE_PROGRAM_DATE_TIME_INTERVAL_FLOOR: i32 = 0;
+
+/// The requirement a manifest configuration selecting [`DATERANGE_AD_MARKERS`] failed: the
+/// value its interval has to exceed and the ad-marker option that requires it, in the
+/// wording every other refused numeric member here uses.
+///
+/// Built here rather than written at the call site, so the sentence and the floor it states
+/// cannot disagree and the suite asserting it reads the service's own words.
+pub fn daterange_interval_requirement() -> String {
+    format!(
+        "must be greater than {DATERANGE_PROGRAM_DATE_TIME_INTERVAL_FLOOR} when adMarkers is \
+         {DATERANGE_AD_MARKERS}"
+    )
+}
+
+/// Refuse ONE manifest configuration that selects [`DATERANGE_AD_MARKERS`] without a
+/// date-time interval above [`DATERANGE_PROGRAM_DATE_TIME_INTERVAL_FLOOR`], keyed by the
+/// interval member under `prefix` — the member the caller has to change.
+///
+/// An interval the request OMITS is refused on the same footing as an explicit zero,
+/// because an omitted one is stored and reported as
+/// [`DEFAULT_PROGRAM_DATE_TIME_INTERVAL_SECONDS`]: what the service would keep for such a
+/// request is exactly the pair the member's documentation forbids. `prefix` is anything
+/// that renders itself, so a caller with a list index passes `format_args!`, and the path
+/// costs nothing until this is the member being refused.
+fn check_daterange_interval(
+    prefix: impl std::fmt::Display,
+    ad_markers: Option<&str>,
+    program_date_time_interval_seconds: Option<i32>,
+) -> Result<(), ServiceError> {
+    if ad_markers != Some(DATERANGE_AD_MARKERS) {
+        return Ok(());
+    }
+    let interval =
+        program_date_time_interval_seconds.unwrap_or(DEFAULT_PROGRAM_DATE_TIME_INTERVAL_SECONDS);
+    if interval > DATERANGE_PROGRAM_DATE_TIME_INTERVAL_FLOOR {
+        return Ok(());
+    }
+    Err(member_invalid(
+        &format!("{prefix}programDateTimeIntervalSeconds"),
+        daterange_interval_requirement(),
+    ))
+}
+
+/// Refuse an OriginEndpoint create or update whose HLS manifest configuration selects
+/// DATERANGE ad markers without the date-time interval that option requires.
+///
+/// Judged on EVERY manifest configuration the request carries: the `HlsPackage` and each
+/// child manifest of a `CmafPackage` are the complete set of members targeting `AdMarkers`
+/// on this operation's input (a DASH or MSS package has no such member), and they are
+/// judged in the request's own member order, so one request is always refused by the same
+/// member.
+pub fn check_origin_endpoint_ad_markers(
+    hls_package: Option<&HlsPackage>,
+    cmaf_package: Option<&CmafPackageCreateOrUpdateParameters>,
+) -> Result<(), ServiceError> {
+    if let Some(package) = hls_package {
+        check_daterange_interval(
+            "hlsPackage.",
+            package.ad_markers.as_deref(),
+            package.program_date_time_interval_seconds,
+        )?;
+    }
+    if let Some(package) = cmaf_package {
+        for (index, manifest) in package.hls_manifests.iter().flatten().enumerate() {
+            check_daterange_interval(
+                format_args!("cmafPackage.hlsManifests[{index}]."),
+                manifest.ad_markers.as_deref(),
+                manifest.program_date_time_interval_seconds,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The `KeyRotationIntervalSeconds` value that DISABLES key rotation, which is what an
+/// endpoint carrying a SPEKE 2.0 encryption contract has to ask for.
+pub const DISABLED_KEY_ROTATION_INTERVAL_SECONDS: i32 = 0;
+
+/// The wire path of a packaging block's key-rotation member, under that block.
+const KEY_ROTATION_MEMBER: &str = "encryption.keyRotationIntervalSeconds";
+
+/// The wire path of a packaging block's SPEKE 2.0 encryption contract, under that block.
+const ENCRYPTION_CONTRACT_MEMBER: &str =
+    "encryption.spekeKeyProvider.encryptionContractConfiguration";
+
+/// The requirement a key-rotation interval failed by being asked for beside a SPEKE 2.0
+/// encryption contract.
+///
+/// `EncryptionContractConfiguration`'s documentation states "You must disable key rotation
+/// for this endpoint by setting keyRotationIntervalSeconds to 0"
+/// (`smithy_query(query="doc",shape="com.amazonaws.mediapackage#EncryptionContractConfiguration",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`),
+/// so the contract and a live rotation cannot be stored together: the keys the contract
+/// names are the keys the endpoint encrypts with, and a rotation would replace them.
+pub fn disabled_key_rotation_requirement() -> String {
+    format!(
+        "must be {DISABLED_KEY_ROTATION_INTERVAL_SECONDS} when \
+         encryptionContractConfiguration is specified"
+    )
+}
+
+/// The requirement a SPEKE 2.0 encryption contract failed by being specified on a
+/// packaging format that does not use SPEKE 2.0.
+///
+/// The same documentation states that the block "can be used for DASH or CMAF endpoints
+/// that use SPEKE 2.0": the contract names the audio and video keys a CPIX 2.3 key request
+/// asks for, which is a request only those two formats' packagers make, so an HLS or MSS
+/// endpoint has nothing to act on it with. The member exists on every format's provider
+/// only because all four share the one `SpekeKeyProvider` shape.
+pub fn encryption_contract_packaging_requirement() -> String {
+    "may be specified only for a DASH or CMAF endpoint that uses SPEKE 2.0".to_string()
+}
+
+/// One packaging block's encryption, flattened to what the encryption-contract rules read:
+/// which block it is, whether its SPEKE key provider names a 2.0 encryption contract, the
+/// key rotation the block asks for, and whether the block's format uses SPEKE 2.0 at all.
+///
+/// Each format declares its own `Encryption` shape — and only three of the four carry a
+/// key-rotation member (`MssEncryption` has none, so an MSS endpoint can never ask for a
+/// rotation) — so the four are read into this one view and judged by the one rule, rather
+/// than each format's block being judged on its own.
+#[derive(Debug)]
+struct EncryptionBlock {
+    /// The wire name of the packaging block, which a refusal's member path starts with.
+    block: &'static str,
+    /// Whether the block's SPEKE key provider carries an `EncryptionContractConfiguration`.
+    encryption_contract: bool,
+    /// The `KeyRotationIntervalSeconds` the block asks for, or `None` when it asks for no
+    /// rotation — either because the request omitted the member or because the format has
+    /// none.
+    key_rotation_interval_seconds: Option<i32>,
+    /// Whether this block's packaging format is one SPEKE 2.0 serves; see
+    /// [`encryption_contract_packaging_requirement`].
+    speke_2_0: bool,
+}
+
+/// The encryption block of every packaging format an OriginEndpoint create or update
+/// request carries, in the request's own member order.
+///
+/// The one walk of the four formats' encryption blocks, so no rule below can judge a block
+/// another does not see. A format the request does not name, and one named without an
+/// `Encryption`, carries no block.
+fn origin_endpoint_encryption_blocks(
+    hls_package: Option<&HlsPackage>,
+    dash_package: Option<&DashPackage>,
+    cmaf_package: Option<&CmafPackageCreateOrUpdateParameters>,
+    mss_package: Option<&MssPackage>,
+) -> Vec<EncryptionBlock> {
+    let mut blocks: Vec<EncryptionBlock> = Vec::new();
+    if let Some(encryption) = hls_package.and_then(|package| package.encryption.as_ref()) {
+        blocks.push(EncryptionBlock {
+            block: "hlsPackage",
+            encryption_contract: has_encryption_contract(&encryption.speke_key_provider),
+            key_rotation_interval_seconds: encryption.key_rotation_interval_seconds,
+            speke_2_0: false,
+        });
+    }
+    if let Some(encryption) = dash_package.and_then(|package| package.encryption.as_ref()) {
+        blocks.push(EncryptionBlock {
+            block: "dashPackage",
+            encryption_contract: has_encryption_contract(&encryption.speke_key_provider),
+            key_rotation_interval_seconds: encryption.key_rotation_interval_seconds,
+            speke_2_0: true,
+        });
+    }
+    if let Some(encryption) = cmaf_package.and_then(|package| package.encryption.as_ref()) {
+        blocks.push(EncryptionBlock {
+            block: "cmafPackage",
+            encryption_contract: has_encryption_contract(&encryption.speke_key_provider),
+            key_rotation_interval_seconds: encryption.key_rotation_interval_seconds,
+            speke_2_0: true,
+        });
+    }
+    if let Some(encryption) = mss_package.and_then(|package| package.encryption.as_ref()) {
+        blocks.push(EncryptionBlock {
+            block: "mssPackage",
+            encryption_contract: has_encryption_contract(&encryption.speke_key_provider),
+            // `MssEncryption` declares no key-rotation member at all.
+            key_rotation_interval_seconds: None,
+            speke_2_0: false,
+        });
+    }
+    blocks
+}
+
+/// Whether `provider` names a SPEKE 2.0 encryption contract.
+fn has_encryption_contract(provider: &SpekeKeyProvider) -> bool {
+    provider.encryption_contract_configuration.is_some()
+}
+
+/// Refuse an OriginEndpoint create or update whose SPEKE 2.0 encryption contract is asked
+/// for in a configuration that cannot serve it: on a packaging format that does not use
+/// SPEKE 2.0, or beside key rotation the same block leaves enabled.
+///
+/// Every encryption block the request carries is judged
+/// ([`origin_endpoint_encryption_blocks`]), in the request's own member order, so one
+/// request is always refused by the same member. A block carrying no contract has nothing
+/// to judge: the key-rotation interval it asks for is bounded by the shared duration floor
+/// alone.
+pub fn check_origin_endpoint_encryption_contracts(
+    hls_package: Option<&HlsPackage>,
+    dash_package: Option<&DashPackage>,
+    cmaf_package: Option<&CmafPackageCreateOrUpdateParameters>,
+    mss_package: Option<&MssPackage>,
+) -> Result<(), ServiceError> {
+    for block in
+        origin_endpoint_encryption_blocks(hls_package, dash_package, cmaf_package, mss_package)
+    {
+        if !block.encryption_contract {
+            continue;
+        }
+        if !block.speke_2_0 {
+            return Err(member_invalid(
+                &format!("{}.{ENCRYPTION_CONTRACT_MEMBER}", block.block),
+                encryption_contract_packaging_requirement(),
+            ));
+        }
+        if block
+            .key_rotation_interval_seconds
+            .is_some_and(|seconds| seconds != DISABLED_KEY_ROTATION_INTERVAL_SECONDS)
+        {
+            return Err(member_invalid(
+                &format!("{}.{KEY_ROTATION_MEMBER}", block.block),
+                disabled_key_rotation_requirement(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Refuse an OriginEndpoint create or update whose access-control or packaging members name
-/// something this service could not act on.
+/// something this service could not act on, or combine two members the service does not
+/// serve together.
 ///
 /// Both handlers call this, so the rules one enforces cannot drift from the other's: an
 /// update must not be able to store a whitelist entry, an ARN or a packaging block a create
@@ -1217,7 +1482,9 @@ pub fn check_origin_endpoint_members(
         check_arn_member(&member, value, requirement)?;
     }
     require_cmaf_hls_manifests(cmaf_package)?;
-    require_unique_cmaf_hls_manifest_ids(cmaf_package)
+    require_unique_cmaf_hls_manifest_ids(cmaf_package)?;
+    check_origin_endpoint_ad_markers(hls_package, cmaf_package)?;
+    check_origin_endpoint_encryption_contracts(hls_package, dash_package, cmaf_package, mss_package)
 }
 
 /// Every IAM role an OriginEndpoint create or update asks MediaPackage to ASSUME, by the
@@ -1662,6 +1929,11 @@ pub const DEFAULT_PLAYLIST_WINDOW_SECONDS: i32 = 60;
 
 /// `ProgramDateTimeIntervalSeconds`' default: no `EXT-X-PROGRAM-DATE-TIME` tags are
 /// inserted, which the member reports as an interval of zero.
+///
+/// This is why a manifest configuration selecting [`DATERANGE_AD_MARKERS`] has to SEND an
+/// interval above [`DATERANGE_PROGRAM_DATE_TIME_INTERVAL_FLOOR`]
+/// ([`check_origin_endpoint_ad_markers`]): filling this default into such a request would
+/// store the combination the member's documentation forbids.
 pub const DEFAULT_PROGRAM_DATE_TIME_INTERVAL_SECONDS: i32 = 0;
 
 /// `IncludeIframeOnlyStream`'s default: no I-Frame-only stream is added to the output.

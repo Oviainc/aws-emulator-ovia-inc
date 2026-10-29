@@ -279,8 +279,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // And the CONTENT rules the create applies to the same members, by the same
         // function: a whitelist entry that is not an address range, an ARN that names no
         // resource of the documented service, a CMAF package that publishes no child
-        // manifest and one that repeats a child manifest id are refused here too, leaving
-        // the stored record exactly as it was.
+        // manifest, one that repeats a child manifest id, a manifest that selects DATERANGE
+        // ad markers without the date-time interval that option requires and a SPEKE 2.0
+        // encryption contract asked for on a format that does not use it or beside live key
+        // rotation are refused here too, leaving the stored record exactly as it was.
         crate::state::check_origin_endpoint_members(
             input.whitelist.as_deref(),
             input.authorization.as_ref(),

@@ -53,6 +53,8 @@ mod origin_endpoint_defaults;
 mod origin_endpoint_durations;
 #[path = "all/origin_endpoint_packaging_bounds.rs"]
 mod origin_endpoint_packaging_bounds;
+#[path = "all/packaging_combination_rules.rs"]
+mod packaging_combination_rules;
 #[path = "all/page_token_authenticity.rs"]
 mod page_token_authenticity;
 #[path = "all/playback_path_is_one_rule.rs"]
