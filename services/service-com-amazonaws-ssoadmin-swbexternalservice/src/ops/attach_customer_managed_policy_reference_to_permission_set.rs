@@ -181,55 +181,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // at this instant would resolve.
         store.on_request(&region, ::std::time::SystemTime::now());
 
-        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: permission
-        // sets are a feature of an organization instance, so on an account instance no
-        // permission set can ever exist and the refusal does not depend on whether this
-        // one does. An ARN this account holds no instance for is NOT this refusal — it
-        // falls through to the 404 below.
-        if store.permission_set_surface_withdrawn(&input.instance_arn) {
-            return Err(
-                AttachCustomerManagedPolicyReferenceToPermissionSetErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(
-                            crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
-                        ),
-                        // The model's `ValidationExceptionReason` enum carries only KMS
-                        // key states, none of which this refusal is.
-                        reason: None,
-                    },
-                )
-                .into(),
-            );
-        }
-
-        if store.instance(&input.instance_arn).is_none() {
-            return Err(
-                AttachCustomerManagedPolicyReferenceToPermissionSetErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::instance_not_found_message(
-                            &input.instance_arn,
-                        )),
-                        reason: None,
-                    },
-                )
-                .into(),
-            );
-        }
-
+        // The surface this write runs against — the ACCOUNT-INSTANCE restriction, asked
+        // before any resource lookup, then the instance, then the permission set itself
+        // (absent, belonging to another instance, or already deleted are the same answer)
+        // — is resolved by the ONE rule the whole permission-set surface shares
+        // (`crate::state::...::permission_set_target_mut`); this handler only maps the
+        // refusal it answers onto the errors THIS operation models.
         let permission_set_arn = input.permission_set_arn.clone();
-        // Absent, or belonging to another instance, or already deleted — all the same
-        // answer: there is no such permission set to attach a policy reference to.
         let record = store
-            .permission_set_mut(&input.instance_arn, &input.permission_set_arn)
-            .ok_or_else(|| {
-                AttachCustomerManagedPolicyReferenceToPermissionSetErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "No permission set found with the ARN {permission_set_arn}"
-                        )),
-                        reason: None,
-                    },
-                )
+            .permission_set_target_mut(&input.instance_arn, &input.permission_set_arn)
+            .map_err(|refusal| match refusal {
+                crate::state::PermissionSetSurfaceRefusal::Unsupported(message) => {
+                    AttachCustomerManagedPolicyReferenceToPermissionSetErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(message),
+                            reason: None,
+                        },
+                    )
+                }
+                crate::state::PermissionSetSurfaceRefusal::NotFound(message) => {
+                    AttachCustomerManagedPolicyReferenceToPermissionSetErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                            reason: None,
+                        },
+                    )
+                }
             })?;
 
         let identity = reference.identity();

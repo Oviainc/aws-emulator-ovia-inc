@@ -234,54 +234,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &crate::state::request_region(ctx.parts()),
                 ::std::time::SystemTime::now(),
             );
-            // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup:
-            // permission sets are a feature of an organization instance, so on an account
-            // instance none can ever be provisioned anywhere and the enumeration is
-            // refused rather than answered empty. An ARN this account holds no instance
-            // for is NOT this refusal — it falls through to the 404 below.
-            if store.permission_set_surface_withdrawn(&input.instance_arn) {
-                return Err(
-                    ListAccountsForProvisionedPermissionSetErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(
-                                crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
-                            ),
-                            reason: None,
-                        },
-                    )
-                    .into(),
-                );
-            }
-            if store.instance(&input.instance_arn).is_none() {
-                return Err(
-                    ListAccountsForProvisionedPermissionSetErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(crate::state::instance_not_found_message(
-                                &input.instance_arn,
-                            )),
-                            reason: None,
-                        },
-                    )
-                    .into(),
-                );
-            }
-            if store
-                .permission_set(&input.instance_arn, &input.permission_set_arn)
-                .is_none()
-            {
-                return Err(
-                    ListAccountsForProvisionedPermissionSetErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(format!(
-                                "No permission set found with the ARN {}",
-                                input.permission_set_arn
-                            )),
-                            reason: None,
-                        },
-                    )
-                    .into(),
-                );
-            }
+            // The surface this enumeration runs against — the ACCOUNT-INSTANCE
+            // restriction, asked before any resource lookup (on an account instance no
+            // permission set can ever be provisioned anywhere, so the enumeration is
+            // refused rather than answered empty), then the instance, then the permission
+            // set itself — is resolved by the ONE rule the whole permission-set surface
+            // shares (`crate::state::...::permission_set_target`); this handler only maps
+            // the refusal it answers onto the errors THIS operation models.
+            store
+                .permission_set_target(&input.instance_arn, &input.permission_set_arn)
+                .map_err(|refusal| match refusal {
+                    crate::state::PermissionSetSurfaceRefusal::Unsupported(message) => {
+                        ListAccountsForProvisionedPermissionSetErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(message),
+                                reason: None,
+                            },
+                        )
+                    }
+                    crate::state::PermissionSetSurfaceRefusal::NotFound(message) => {
+                        ListAccountsForProvisionedPermissionSetErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(message),
+                                reason: None,
+                            },
+                        )
+                    }
+                })?;
             // Every account the permission set is provisioned into, each once and with the
             // provisioning status it is in, kept only when it is the status the request
             // asked for. The account id is the page key: `AccountId` is 12 digits

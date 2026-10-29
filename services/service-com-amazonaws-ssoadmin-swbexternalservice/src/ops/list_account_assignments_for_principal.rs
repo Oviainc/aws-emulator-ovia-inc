@@ -228,43 +228,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &crate::state::request_region(ctx.parts()),
                 ::std::time::SystemTime::now(),
             );
-            // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: account
-            // assignments are a feature of an organization instance ("This action is not
-            // valid for account instances of IAM Identity Center"), so on an account
-            // instance none can ever exist and the enumeration is refused rather than
-            // answered empty. An ARN this account holds no instance for is NOT this
-            // refusal — it falls through to the 404 below.
-            if store.permission_set_surface_withdrawn(&input.instance_arn) {
-                return Err(
-                    ListAccountAssignmentsForPrincipalErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(
-                                crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
-                            ),
-                            reason: None,
-                        },
-                    )
-                    .into(),
-                );
-            }
-            // Assignments are enumerated UNDER an instance, so an `InstanceArn` this
-            // account holds no instance for is refused rather than answered with an empty
-            // page that would read as "this principal has access to no account".
-            if store.instance(&input.instance_arn).is_none() {
-                return Err(
-                    ListAccountAssignmentsForPrincipalErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(crate::state::instance_not_found_message(
-                                &input.instance_arn,
-                            )),
-                            // The model's `ResourceNotFoundExceptionReason` enum carries
-                            // only KMS key states, none of which this refusal is.
-                            reason: None,
-                        },
-                    )
-                    .into(),
-                );
-            }
+            // The surface this enumeration runs against — the ACCOUNT-INSTANCE
+            // restriction, asked before any resource lookup ("This action is not valid for
+            // account instances of IAM Identity Center", so the enumeration is refused
+            // rather than answered empty), and then the instance itself (assignments are
+            // enumerated UNDER an instance, so an `InstanceArn` this account holds no
+            // instance for is refused rather than answered with an empty page that would
+            // read as "this principal has access to no account") — is resolved by the ONE
+            // rule the whole permission-set / account-assignment surface shares
+            // (`crate::state::...::permission_set_surface`); this handler only maps the
+            // refusal it answers onto the errors THIS operation models.
+            store
+                .permission_set_surface(&input.instance_arn)
+                .map_err(|refusal| match refusal {
+                    crate::state::PermissionSetSurfaceRefusal::Unsupported(message) => {
+                        ListAccountAssignmentsForPrincipalErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(message),
+                                reason: None,
+                            },
+                        )
+                    }
+                    crate::state::PermissionSetSurfaceRefusal::NotFound(message) => {
+                        ListAccountAssignmentsForPrincipalErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(message),
+                                reason: None,
+                            },
+                        )
+                    }
+                })?;
 
             // Exactly the stored rows granted to the principal asked for under the instance
             // asked for, keyed and ordered by the part of an assignment's identity the

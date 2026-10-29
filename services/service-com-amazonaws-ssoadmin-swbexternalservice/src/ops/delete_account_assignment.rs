@@ -193,51 +193,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // at this instant would resolve.
         store.on_request(&region, now);
 
-        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: account
-        // assignments are a feature of an organization instance, so on an account
-        // instance none can ever exist and the refusal does not depend on whether this
-        // request's assignment does. An ARN this account holds no instance for is NOT
-        // this refusal — it falls through to the 404 below.
-        if store.permission_set_surface_withdrawn(&input.instance_arn) {
-            return Err(DeleteAccountAssignmentErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(
-                        crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
-                    ),
-                    // The model's `ValidationExceptionReason` enum carries only KMS key
-                    // states, none of which this refusal is.
-                    reason: None,
-                },
-            )
-            .into());
-        }
-
-        if store.instance(&input.instance_arn).is_none() {
-            return Err(DeleteAccountAssignmentErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::instance_not_found_message(
-                        &input.instance_arn,
-                    )),
-                    reason: None,
-                },
-            )
-            .into());
-        }
-        if store
-            .permission_set(&input.instance_arn, &input.permission_set_arn)
-            .is_none()
-        {
-            return Err(DeleteAccountAssignmentErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "No permission set found with the ARN {}",
-                        input.permission_set_arn
-                    )),
-                    reason: None,
-                },
-            )
-            .into());
-        }
+        // The surface this delete runs against — the ACCOUNT-INSTANCE restriction, asked
+        // before any resource lookup (on an account instance no assignment can ever exist,
+        // so the refusal does not depend on whether this request's assignment does), then
+        // the instance, then the permission set itself — is resolved by the ONE rule the
+        // whole permission-set / account-assignment surface shares
+        // (`crate::state::...::permission_set_target`); this handler only maps the refusal
+        // it answers onto the errors THIS operation models.
+        store
+            .permission_set_target(&input.instance_arn, &input.permission_set_arn)
+            .map_err(|refusal| match refusal {
+                crate::state::PermissionSetSurfaceRefusal::Unsupported(message) => {
+                    DeleteAccountAssignmentErrorModeled::ValidationException(ValidationException {
+                        message: Some(message),
+                        reason: None,
+                    })
+                }
+                crate::state::PermissionSetSurfaceRefusal::NotFound(message) => {
+                    DeleteAccountAssignmentErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                            reason: None,
+                        },
+                    )
+                }
+            })?;
 
         // The assignment's identity is the whole (instance, account, permission set,
         // principal type, principal id) tuple, and a delete is not idempotent on a

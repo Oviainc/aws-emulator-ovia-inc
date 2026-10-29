@@ -175,26 +175,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read at this instant would resolve.
         store.on_request(&region, now);
 
-        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: ABAC is a
-        // feature of the organization instance, so on an account instance no attribute
-        // configuration can ever exist, whatever the rest of the request says. An ARN
-        // this account holds no instance for is NOT this refusal — it falls through to
-        // the 404 below.
-        if store.abac_surface_withdrawn(&input.instance_arn) {
-            return Err(
+        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup and BEFORE the
+        // request's own consistency: ABAC is a feature of the organization instance, so on
+        // an account instance no attribute configuration can ever exist, whatever the rest
+        // of the request says. It is step 1 of the ONE resolution the whole permission-set
+        // surface shares (`crate::state::...::permission_set_surface_gate`); this handler
+        // only maps the refusal it answers onto the errors THIS operation models.
+        store
+            .permission_set_surface_gate(&input.instance_arn)
+            .map_err(|message| {
                 CreateInstanceAccessControlAttributeConfigurationErrorModeled::ValidationException(
                     ValidationException {
-                        message: Some(
-                            crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
-                        ),
-                        // The model's `ValidationExceptionReason` enum carries only KMS
-                        // key states, none of which this refusal is.
+                        message: Some(message),
                         reason: None,
                     },
                 )
-                .into(),
-            );
-        }
+            })?;
 
         // The request's own consistency, checked where the modeled constraints leave off
         // and before any resource is resolved: a mapping cannot give one key two values.
@@ -213,21 +209,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The instance ABAC is enabled on must exist: a syntactically valid ARN for an
-        // instance that does not is a missing resource, not a bad request.
-        let Some(instance) = store.instance_mut(&input.instance_arn) else {
-            return Err(
-                CreateInstanceAccessControlAttributeConfigurationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::instance_not_found_message(
-                            &input.instance_arn,
-                        )),
-                        reason: None,
-                    },
-                )
-                .into(),
-            );
-        };
+        // Step 2: the instance ABAC is enabled on, resolved by that same shared rule.
+        let instance = store
+            .abac_surface_mut(&input.instance_arn)
+            .map_err(|refusal| match refusal {
+                crate::state::PermissionSetSurfaceRefusal::Unsupported(message) => {
+                    CreateInstanceAccessControlAttributeConfigurationErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(message),
+                            reason: None,
+                        },
+                    )
+                }
+                crate::state::PermissionSetSurfaceRefusal::NotFound(message) => {
+                    CreateInstanceAccessControlAttributeConfigurationErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                            reason: None,
+                        },
+                    )
+                }
+            })?;
 
         // A CREATE of a resource that already exists: the instance carries at most one
         // ABAC configuration, so enabling ABAC on an instance that already has one is the

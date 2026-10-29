@@ -12,9 +12,12 @@
 //! whole permission-set / account-assignment surface is withdrawn on it — see
 //! [`ComAmazonawsSsoadminSwbexternalserviceState::permission_set_surface_withdrawn`] and
 //! [`ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE`], which every operation of that surface asks
-//! before looking anything up. The account's AMBIENT instance — the one `ListInstances`
-//! hands out ([`SEED_INSTANCE_TYPE`]) — is an ACCOUNT instance, so that surface is
-//! withdrawn on it until an `UpdateInstance` enables permission sets.
+//! before looking anything up, through the ONE resolution they all share
+//! ([`ComAmazonawsSsoadminSwbexternalserviceState::permission_set_surface`] and
+//! [`ComAmazonawsSsoadminSwbexternalserviceState::permission_set_target`]). The account's
+//! AMBIENT instance — the one `ListInstances` hands out ([`SEED_INSTANCE_TYPE`]) — is an
+//! ACCOUNT instance, so that surface is withdrawn on it until an `UpdateInstance` enables
+//! permission sets.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -258,6 +261,46 @@ pub const CLIENT_TOKEN_MISMATCH_MESSAGE: &str =
 /// Built from the request: it names the ARN that resolved to nothing.
 pub fn instance_not_found_message(instance_arn: &str) -> String {
     format!("No IAM Identity Center instance {instance_arn} exists in this account")
+}
+
+/// The refusal a `PermissionSetArn` that names no permission set of the resolved instance
+/// earns, as the message of the modelled `ResourceNotFoundException`.
+///
+/// One condition reads ONE way, exactly as [`instance_not_found_message`] keeps it for the
+/// instance: every operation that names a permission set reports it through
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::permission_set_target`], so a client that
+/// branches on the detail text sees the same sentence whichever operation it called.
+///
+/// Built from the request: it names the ARN that resolved to nothing. Never created,
+/// already deleted, gone with its instance, or held under another instance — the same
+/// answer either way ([`ComAmazonawsSsoadminSwbexternalserviceState::permission_set`]).
+pub fn permission_set_not_found_message(permission_set_arn: &str) -> String {
+    format!("No permission set found with the ARN {permission_set_arn}")
+}
+
+/// Why a request on the permission-set / account-assignment / ABAC surface never reached
+/// the resource its ARNs named, as resolved by
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::permission_set_surface`],
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::abac_surface_mut`],
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::permission_set_target`] and
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::permission_set_target_mut`].
+///
+/// Each operation declares its own error enum, so the resolution answers the refusal and
+/// the handler maps it onto the variant its model carries — the division [`TagWriteRefusal`]
+/// already keeps for the tag surface. The error shape a handler builds from it carries this
+/// message and no `reason`: the model's `ValidationExceptionReason` and
+/// `ResourceNotFoundExceptionReason` enums carry only KMS key states, none of which these
+/// refusals is.
+#[derive(Debug)]
+pub enum PermissionSetSurfaceRefusal {
+    /// The instance the request resolved is an ACCOUNT instance, on which this whole
+    /// surface is withdrawn: the operation's modelled `ValidationException` carries this
+    /// message ([`ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE`]).
+    Unsupported(String),
+    /// Nothing the request named is held: no instance under the `InstanceArn`, or no
+    /// permission set under the `PermissionSetArn` within it. The operation's modelled
+    /// `ResourceNotFoundException` carries this message.
+    NotFound(String),
 }
 
 /// The refusal an operation OTHER than the instance's own describe and delete earns while
@@ -2998,22 +3041,6 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
             .is_some_and(|instance| !instance.permission_sets_enabled)
     }
 
-    /// Whether the attribute-based access control (ABAC) surface is WITHDRAWN on the
-    /// instance `instance_arn` names, i.e. it is an account instance.
-    ///
-    /// ABAC maps identity-store attributes into the session tags that the policies of
-    /// multi-account AWS access are evaluated against (`AccessControlAttribute`: "You can
-    /// create permissions policies that determine who can access your Amazon Web Services
-    /// resources based upon the configured attribute values"), so it is a feature of the
-    /// SAME organization-instance surface as permission sets and the account assignments
-    /// built from them — which is why this asks exactly
-    /// [`Self::permission_set_surface_withdrawn`] rather than a second flag. As there, an
-    /// ARN this account holds no instance for is NOT this refusal: it is a missing
-    /// resource.
-    pub fn abac_surface_withdrawn(&self, instance_arn: &str) -> bool {
-        self.permission_set_surface_withdrawn(instance_arn)
-    }
-
     /// The instance a previous `CreateInstance` minted under `client_token`, if that
     /// token was ever used. A retry of the same call answers from it instead of being
     /// refused as a duplicate, which is what `@idempotencyToken` asks of the member.
@@ -3061,6 +3088,116 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         self.permission_sets
             .values()
             .any(|record| record.instance_arn == instance_arn && record.name == name)
+    }
+
+    /// THE resolution the whole permission-set / account-assignment surface shares, for an
+    /// operation whose request names an instance and nothing finer: the instance that
+    /// request runs against, or the refusal it earns instead.
+    ///
+    /// The two steps, in this order and for the same reason every operation of the surface
+    /// takes them:
+    ///
+    /// 1. the ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup — permission
+    ///    sets and the assignments built from them are a feature of an organization
+    ///    instance, so on an account instance none can ever exist and the refusal does not
+    ///    depend on whether the resource the request names does
+    ///    ([`Self::permission_set_surface_withdrawn`], [`ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE`]);
+    /// 2. the instance itself — a syntactically valid `InstanceArn` this account holds no
+    ///    instance for is a missing resource, not a bad request
+    ///    ([`instance_not_found_message`]), and it is NOT the restriction above, which
+    ///    belongs to a RESOLVED instance.
+    ///
+    /// Answers the stored instance, so a handler that needs its canonical ARN or its
+    /// fields reads them from the record the resolution already resolved.
+    pub fn permission_set_surface(
+        &self,
+        instance_arn: &str,
+    ) -> Result<&Instance, PermissionSetSurfaceRefusal> {
+        self.permission_set_surface_gate(instance_arn)
+            .map_err(PermissionSetSurfaceRefusal::Unsupported)?;
+        self.instance(instance_arn).ok_or_else(|| {
+            PermissionSetSurfaceRefusal::NotFound(instance_not_found_message(instance_arn))
+        })
+    }
+
+    /// Step 1 of that resolution ON ITS OWN, as the message of the `ValidationException`
+    /// the caller models — for an operation whose own request-consistency check sits
+    /// between the two steps (the ABAC writes, which refuse a mapping that gives one key
+    /// two values once the surface is known to serve them at all, and before the instance
+    /// holding the mapping is resolved).
+    ///
+    /// This step has ONE refusal, so it answers that message directly and needs no refusal
+    /// enum — the division [`TagWriteRefusal`] keeps for the reporting side of the tag
+    /// surface. The same rule either way: [`Self::permission_set_surface`] asks exactly
+    /// this first, so the gate has one implementation and an operation that takes both
+    /// steps together cannot answer it differently from one that takes them apart.
+    pub fn permission_set_surface_gate(&self, instance_arn: &str) -> Result<(), String> {
+        if self.permission_set_surface_withdrawn(instance_arn) {
+            return Err(ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string());
+        }
+        Ok(())
+    }
+
+    /// The same resolution for an operation that CHANGES the instance it resolves — the
+    /// attribute-based access control (ABAC) writes, whose resource lives ON the instance
+    /// record.
+    ///
+    /// ABAC maps identity-store attributes into the session tags that the policies of
+    /// multi-account AWS access are evaluated against (`AccessControlAttribute`: "You can
+    /// create permissions policies that determine who can access your Amazon Web Services
+    /// resources based upon the configured attribute values"), so it is a feature of the
+    /// SAME organization-instance surface as permission sets and the account assignments
+    /// built from them — which is why its operations take exactly the two steps of
+    /// [`Self::permission_set_surface`] rather than a rule of their own, and why the ABAC
+    /// read resolves through that function itself. Resolves exactly as it does, so a read
+    /// and a write of the same ARN never disagree about which instance it names.
+    pub fn abac_surface_mut(
+        &mut self,
+        instance_arn: &str,
+    ) -> Result<&mut Instance, PermissionSetSurfaceRefusal> {
+        self.permission_set_surface(instance_arn)?;
+        self.instance_mut(instance_arn).ok_or_else(|| {
+            PermissionSetSurfaceRefusal::NotFound(instance_not_found_message(instance_arn))
+        })
+    }
+
+    /// The same resolution for an operation whose request also names a PERMISSION SET: the
+    /// stored permission set, having taken the two steps of [`Self::permission_set_surface`]
+    /// first, or the refusal the request earns instead.
+    ///
+    /// The third step is the permission set itself, resolved as [`Self::permission_set`]
+    /// resolves it: never created, already deleted, or held under another instance is the
+    /// same answer either way ([`permission_set_not_found_message`]).
+    pub fn permission_set_target(
+        &self,
+        instance_arn: &str,
+        permission_set_arn: &str,
+    ) -> Result<&PermissionSetRecord, PermissionSetSurfaceRefusal> {
+        self.permission_set_surface(instance_arn)?;
+        self.permission_set(instance_arn, permission_set_arn)
+            .ok_or_else(|| {
+                PermissionSetSurfaceRefusal::NotFound(permission_set_not_found_message(
+                    permission_set_arn,
+                ))
+            })
+    }
+
+    /// The same resolution for an operation that CHANGES the permission set (attaching a
+    /// policy or a permissions boundary, say). Resolves exactly as
+    /// [`Self::permission_set_target`], so a write and a read of the same ARNs never
+    /// disagree about which surface and which permission set they name.
+    pub fn permission_set_target_mut(
+        &mut self,
+        instance_arn: &str,
+        permission_set_arn: &str,
+    ) -> Result<&mut PermissionSetRecord, PermissionSetSurfaceRefusal> {
+        self.permission_set_surface(instance_arn)?;
+        self.permission_set_mut(instance_arn, permission_set_arn)
+            .ok_or_else(|| {
+                PermissionSetSurfaceRefusal::NotFound(permission_set_not_found_message(
+                    permission_set_arn,
+                ))
+            })
     }
 
     /// The trusted token issuer `trusted_token_issuer_arn` names, or `None` when no

@@ -173,36 +173,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.on_request(&region, now);
 
-        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: on an
+        // The surface this read runs against — the ACCOUNT-INSTANCE restriction (on an
         // account instance no ABAC configuration can ever exist, so the answer is this
-        // refusal rather than a 404 that would tell a client to create one and retry.
-        if store.abac_surface_withdrawn(&input.instance_arn) {
-            return Err(
-                DescribeInstanceAccessControlAttributeConfigurationErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(
-                            crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
-                        ),
-                        // The model's `ValidationExceptionReason` enum carries only KMS
-                        // key states, none of which this refusal is.
-                        reason: None,
-                    },
-                )
-                .into(),
-            );
-        }
-
+        // refusal rather than a not-found that would tell a client to create one and
+        // retry), and then the instance itself — is resolved by the ONE rule the whole
+        // permission-set surface shares, ABAC being a feature of the same organization
+        // instance (`crate::state::...::permission_set_surface`); this handler only maps
+        // the refusal it answers onto the errors THIS operation models.
         let configuration = store
-            .instance(&input.instance_arn)
-            .ok_or_else(|| {
-                DescribeInstanceAccessControlAttributeConfigurationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::instance_not_found_message(
-                            &input.instance_arn,
-                        )),
-                        reason: None,
-                    },
-                )
+            .permission_set_surface(&input.instance_arn)
+            .map_err(|refusal| match refusal {
+                crate::state::PermissionSetSurfaceRefusal::Unsupported(message) => {
+                    DescribeInstanceAccessControlAttributeConfigurationErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(message),
+                            reason: None,
+                        },
+                    )
+                }
+                crate::state::PermissionSetSurfaceRefusal::NotFound(message) => {
+                    DescribeInstanceAccessControlAttributeConfigurationErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                            reason: None,
+                        },
+                    )
+                }
             })?
             .access_control_attributes
             .clone()

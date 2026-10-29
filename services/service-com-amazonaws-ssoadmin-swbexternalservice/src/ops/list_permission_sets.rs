@@ -183,35 +183,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &crate::state::request_region(ctx.parts()),
                 ::std::time::SystemTime::now(),
             );
-            // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup:
-            // permission sets are a feature of an organization instance, so on an
-            // account instance none can ever exist and the enumeration is refused
-            // rather than answered empty. An ARN this account holds no instance for is
-            // NOT this refusal — it falls through to the 404 below.
-            if store.permission_set_surface_withdrawn(&input.instance_arn) {
-                return Err(ListPermissionSetsErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(
-                            crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
-                        ),
-                        // The model's `ValidationExceptionReason` enum carries only KMS
-                        // key states, none of which this refusal is.
-                        reason: None,
-                    },
-                )
-                .into());
-            }
-            if store.instance(&input.instance_arn).is_none() {
-                return Err(ListPermissionSetsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::instance_not_found_message(
-                            &input.instance_arn,
-                        )),
-                        reason: None,
-                    },
-                )
-                .into());
-            }
+            // The surface this enumeration runs against — the ACCOUNT-INSTANCE
+            // restriction, asked before any resource lookup (on an account instance no
+            // permission set can ever exist, so the enumeration is refused rather than
+            // answered empty), and then the instance itself — is resolved by the ONE rule
+            // the whole permission-set surface shares
+            // (`crate::state::...::permission_set_surface`); this handler only maps the
+            // refusal it answers onto the errors THIS operation models.
+            store
+                .permission_set_surface(&input.instance_arn)
+                .map_err(|refusal| match refusal {
+                    crate::state::PermissionSetSurfaceRefusal::Unsupported(message) => {
+                        ListPermissionSetsErrorModeled::ValidationException(ValidationException {
+                            message: Some(message),
+                            reason: None,
+                        })
+                    }
+                    crate::state::PermissionSetSurfaceRefusal::NotFound(message) => {
+                        ListPermissionSetsErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(message),
+                                reason: None,
+                            },
+                        )
+                    }
+                })?;
             // Exactly the ARNs currently stored for this instance, in ARN order, which
             // is both the page order and the cursor order.
             store

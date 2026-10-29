@@ -211,55 +211,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // at this instant would resolve.
         store.on_request(&region, now);
 
-        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: permission
-        // sets are a feature of an organization instance, so on an account instance no
-        // permission set and no assignment can ever exist and the refusal does not
-        // depend on whether this request's permission set does. An ARN this account
-        // holds no instance for is NOT this refusal — it falls through to the 404 below.
-        if store.permission_set_surface_withdrawn(&input.instance_arn) {
-            return Err(CreateAccountAssignmentErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(
-                        crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
-                    ),
-                    // The model's `ValidationExceptionReason` enum carries only KMS key
-                    // states, none of which this refusal is.
-                    reason: None,
-                },
-            )
-            .into());
-        }
-
-        if store.instance(&input.instance_arn).is_none() {
-            return Err(CreateAccountAssignmentErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::instance_not_found_message(
-                        &input.instance_arn,
-                    )),
-                    reason: None,
-                },
-            )
-            .into());
-        }
+        // The surface this create runs against — the ACCOUNT-INSTANCE restriction, asked
+        // before any resource lookup (on an account instance no permission set and no
+        // assignment can ever exist, so the refusal does not depend on whether this
+        // request's permission set does), then the instance, then the permission set
+        // itself — is resolved by the ONE rule the whole permission-set /
+        // account-assignment surface shares
+        // (`crate::state::...::permission_set_target`); this handler only maps the refusal
+        // it answers onto the errors THIS operation models.
+        //
         // Granting an assignment PROVISIONS the permission set into the target account, so
         // the account is given the definition that is current at this instant. That
         // revision is recorded on the row below, which is what lets a later read tell an
         // account holding the permission set's latest definition from one left behind by a
         // change to it.
-        let Some(permission_set) =
-            store.permission_set(&input.instance_arn, &input.permission_set_arn)
-        else {
-            return Err(CreateAccountAssignmentErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "No permission set found with the ARN {}",
-                        input.permission_set_arn
-                    )),
-                    reason: None,
-                },
-            )
-            .into());
-        };
+        let permission_set = store
+            .permission_set_target(&input.instance_arn, &input.permission_set_arn)
+            .map_err(|refusal| match refusal {
+                crate::state::PermissionSetSurfaceRefusal::Unsupported(message) => {
+                    CreateAccountAssignmentErrorModeled::ValidationException(ValidationException {
+                        message: Some(message),
+                        reason: None,
+                    })
+                }
+                crate::state::PermissionSetSurfaceRefusal::NotFound(message) => {
+                    CreateAccountAssignmentErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                            reason: None,
+                        },
+                    )
+                }
+            })?;
         let provisioned_revision = permission_set.definition_revision();
 
         let created_date = ::aws_smithy_types::DateTime::from(now);

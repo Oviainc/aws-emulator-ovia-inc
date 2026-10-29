@@ -189,40 +189,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // at this instant would resolve.
         store.on_request(&region, now);
 
-        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: permission
-        // sets are a feature of an organization instance, so on an account instance one
-        // can never be created, whatever the rest of the request says. An ARN this
-        // account holds no instance for is NOT this refusal — it falls through to the
-        // 404 below.
-        if store.permission_set_surface_withdrawn(&input.instance_arn) {
-            return Err(CreatePermissionSetErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(
-                        crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
-                    ),
-                    // The model's `ValidationExceptionReason` enum carries only KMS key
-                    // states, none of which this refusal is.
-                    reason: None,
-                },
-            )
-            .into());
-        }
-
-        // The instance the permission set will live under must exist: a syntactically
-        // valid ARN for an instance that does not is a missing resource, not a bad
-        // request.
+        // The surface this create runs against — the ACCOUNT-INSTANCE restriction, asked
+        // before any resource lookup, and then the instance the permission set will live
+        // under — is resolved by the ONE rule the whole permission-set surface shares
+        // (`crate::state::...::permission_set_surface`); this handler only maps the
+        // refusal it answers onto the errors THIS operation models.
         let instance_arn = store
-            .instance(&input.instance_arn)
+            .permission_set_surface(&input.instance_arn)
             .map(|instance| instance.instance_arn.clone())
-            .ok_or_else(|| {
-                CreatePermissionSetErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::instance_not_found_message(
-                            &input.instance_arn,
-                        )),
+            .map_err(|refusal| match refusal {
+                crate::state::PermissionSetSurfaceRefusal::Unsupported(message) => {
+                    CreatePermissionSetErrorModeled::ValidationException(ValidationException {
+                        message: Some(message),
                         reason: None,
-                    },
-                )
+                    })
+                }
+                crate::state::PermissionSetSurfaceRefusal::NotFound(message) => {
+                    CreatePermissionSetErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                            reason: None,
+                        },
+                    )
+                }
             })?;
 
         // A permission set's name is unique within its instance.

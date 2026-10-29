@@ -166,39 +166,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // at this instant would resolve.
         store.on_request(&region, now);
 
-        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: ABAC is a
-        // feature of the organization instance, so on an account instance there is never
-        // an attribute configuration to delete. An ARN this account holds no instance for
-        // is NOT this refusal — it falls through to the 404 below.
-        if store.abac_surface_withdrawn(&input.instance_arn) {
-            return Err(
-                DeleteInstanceAccessControlAttributeConfigurationErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(
-                            crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
-                        ),
-                        // The model's `ValidationExceptionReason` enum carries only KMS
-                        // key states, none of which this refusal is.
-                        reason: None,
-                    },
-                )
-                .into(),
-            );
-        }
-
-        let Some(instance) = store.instance_mut(&input.instance_arn) else {
-            return Err(
-                DeleteInstanceAccessControlAttributeConfigurationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::instance_not_found_message(
-                            &input.instance_arn,
-                        )),
-                        reason: None,
-                    },
-                )
-                .into(),
-            );
-        };
+        // The surface this delete runs against — the ACCOUNT-INSTANCE restriction (ABAC is
+        // a feature of the organization instance, so on an account instance there is never
+        // an attribute configuration to delete), and then the instance itself — is
+        // resolved by the ONE rule the whole permission-set surface shares
+        // (`crate::state::...::abac_surface_mut`); this handler only maps the refusal it
+        // answers onto the errors THIS operation models.
+        let instance = store
+            .abac_surface_mut(&input.instance_arn)
+            .map_err(|refusal| match refusal {
+                crate::state::PermissionSetSurfaceRefusal::Unsupported(message) => {
+                    DeleteInstanceAccessControlAttributeConfigurationErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(message),
+                            reason: None,
+                        },
+                    )
+                }
+                crate::state::PermissionSetSurfaceRefusal::NotFound(message) => {
+                    DeleteInstanceAccessControlAttributeConfigurationErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                            reason: None,
+                        },
+                    )
+                }
+            })?;
 
         // "Disables the ABAC feature … and deletes all of the attribute mappings that
         // have been configured": with ABAC not enabled there is no configuration for the

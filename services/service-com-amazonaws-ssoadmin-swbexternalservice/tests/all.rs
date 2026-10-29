@@ -135,6 +135,8 @@ mod permission_set_provisioning_status_list;
 mod permission_set_provisioning_status_poll;
 #[path = "all/permission_set_provisioning_targets.rs"]
 mod permission_set_provisioning_targets;
+#[path = "all/permission_set_surface_resolution.rs"]
+mod permission_set_surface_resolution;
 #[path = "all/permission_set_update.rs"]
 mod permission_set_update;
 #[path = "all/permission_sets_provisioned_to_account.rs"]

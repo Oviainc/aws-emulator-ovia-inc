@@ -204,39 +204,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // an earlier provisioning has become due to deliver: enumerating tracked
             // workflows neither advances one nor creates one.
             store.on_request(&crate::state::request_region(ctx.parts()), now);
-            // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup:
-            // permission sets are a feature of an organization instance, so on an account
-            // instance no provisioning can ever have run and the enumeration is refused
-            // rather than answered empty. An ARN this account holds no instance for is NOT
-            // this refusal — it falls through to the 404 below.
-            if store.permission_set_surface_withdrawn(&input.instance_arn) {
-                return Err(
-                    ListPermissionSetProvisioningStatusErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(
-                                crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
-                            ),
-                            // The model's `ValidationExceptionReason` enum carries only
-                            // KMS key states, none of which this refusal is.
-                            reason: None,
-                        },
-                    )
-                    .into(),
-                );
-            }
-            if store.instance(&input.instance_arn).is_none() {
-                return Err(
-                    ListPermissionSetProvisioningStatusErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(crate::state::instance_not_found_message(
-                                &input.instance_arn,
-                            )),
-                            reason: None,
-                        },
-                    )
-                    .into(),
-                );
-            }
+            // The surface this enumeration runs against — the ACCOUNT-INSTANCE
+            // restriction, asked before any resource lookup (on an account instance no
+            // provisioning can ever have run, so the enumeration is refused rather than
+            // answered empty), and then the instance itself — is resolved by the ONE rule
+            // the whole permission-set surface shares
+            // (`crate::state::...::permission_set_surface`); this handler only maps the
+            // refusal it answers onto the errors THIS operation models.
+            store
+                .permission_set_surface(&input.instance_arn)
+                .map_err(|refusal| match refusal {
+                    crate::state::PermissionSetSurfaceRefusal::Unsupported(message) => {
+                        ListPermissionSetProvisioningStatusErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(message),
+                                reason: None,
+                            },
+                        )
+                    }
+                    crate::state::PermissionSetSurfaceRefusal::NotFound(message) => {
+                        ListPermissionSetProvisioningStatusErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(message),
+                                reason: None,
+                            },
+                        )
+                    }
+                })?;
             // Exactly the provisionings this instance tracks, each once, in the order the
             // history happened, kept only when the status the clock implies for it at this
             // instant is the one the request asked for. Ordered by the page key explicitly:

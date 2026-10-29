@@ -171,25 +171,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // at this instant would resolve.
         store.on_request(&region, now);
 
-        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: ABAC is a
-        // feature of the organization instance, so on an account instance there is never
-        // an attribute configuration to update. An ARN this account holds no instance for
-        // is NOT this refusal — it falls through to the 404 below.
-        if store.abac_surface_withdrawn(&input.instance_arn) {
-            return Err(
+        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup and BEFORE the
+        // request's own consistency: ABAC is a feature of the organization instance, so on
+        // an account instance there is never an attribute configuration to update. It is
+        // step 1 of the ONE resolution the whole permission-set surface shares
+        // (`crate::state::...::permission_set_surface_gate`); this handler only maps the
+        // refusal it answers onto the error THIS operation models.
+        store
+            .permission_set_surface_gate(&input.instance_arn)
+            .map_err(|message| {
                 UpdateInstanceAccessControlAttributeConfigurationErrorModeled::ValidationException(
                     ValidationException {
-                        message: Some(
-                            crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
-                        ),
-                        // The model's `ValidationExceptionReason` enum carries only KMS
-                        // key states, none of which this refusal is.
+                        message: Some(message),
                         reason: None,
                     },
                 )
-                .into(),
-            );
-        }
+            })?;
 
         // The request's own consistency, as the create checks it: a mapping cannot give
         // one key two values.
@@ -208,19 +205,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let Some(instance) = store.instance_mut(&input.instance_arn) else {
-            return Err(
-                UpdateInstanceAccessControlAttributeConfigurationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::instance_not_found_message(
-                            &input.instance_arn,
-                        )),
-                        reason: None,
-                    },
-                )
-                .into(),
-            );
-        };
+        // Step 2: the instance whose configuration this updates, resolved by that same
+        // shared rule.
+        let instance = store
+            .abac_surface_mut(&input.instance_arn)
+            .map_err(|refusal| match refusal {
+                crate::state::PermissionSetSurfaceRefusal::Unsupported(message) => {
+                    UpdateInstanceAccessControlAttributeConfigurationErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(message),
+                            reason: None,
+                        },
+                    )
+                }
+                crate::state::PermissionSetSurfaceRefusal::NotFound(message) => {
+                    UpdateInstanceAccessControlAttributeConfigurationErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                            reason: None,
+                        },
+                    )
+                }
+            })?;
 
         // An UPDATE of the configuration a create stored: with ABAC not enabled there is
         // nothing to update, and enabling it is the create's job, so this is a missing

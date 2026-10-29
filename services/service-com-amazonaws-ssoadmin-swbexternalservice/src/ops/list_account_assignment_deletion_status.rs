@@ -221,37 +221,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // enumerating tracked operations advances none of them, and each status is
             // derived from the due instant the delete that started it stored.
             store.on_request(&region, now);
-            // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: account
-            // assignments are a feature of an organization instance, so on an account
-            // instance no assignment deletion can ever have run and the enumeration is
-            // refused rather than answered empty. An ARN this account holds no instance
-            // for is NOT this refusal — it falls through to the 404 below.
-            if store.permission_set_surface_withdrawn(&input.instance_arn) {
-                return Err(
-                    ListAccountAssignmentDeletionStatusErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(
-                                crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
-                            ),
-                            reason: None,
-                        },
-                    )
-                    .into(),
-                );
-            }
-            if store.instance(&input.instance_arn).is_none() {
-                return Err(
-                    ListAccountAssignmentDeletionStatusErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(crate::state::instance_not_found_message(
-                                &input.instance_arn,
-                            )),
-                            reason: None,
-                        },
-                    )
-                    .into(),
-                );
-            }
+            // The surface this enumeration runs against — the ACCOUNT-INSTANCE
+            // restriction, asked before any resource lookup (on an account instance no
+            // assignment deletion can ever have run, so the enumeration is refused rather
+            // than answered empty), and then the instance itself — is resolved by the ONE
+            // rule the whole permission-set / account-assignment surface shares
+            // (`crate::state::...::permission_set_surface`); this handler only maps the
+            // refusal it answers onto the errors THIS operation models.
+            store
+                .permission_set_surface(&input.instance_arn)
+                .map_err(|refusal| match refusal {
+                    crate::state::PermissionSetSurfaceRefusal::Unsupported(message) => {
+                        ListAccountAssignmentDeletionStatusErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(message),
+                                reason: None,
+                            },
+                        )
+                    }
+                    crate::state::PermissionSetSurfaceRefusal::NotFound(message) => {
+                        ListAccountAssignmentDeletionStatusErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(message),
+                                reason: None,
+                            },
+                        )
+                    }
+                })?;
             // The stored deletion history of THIS instance, in the chronological order its
             // page key imposes, keeping only the rows whose status as of `now` is the one
             // the filter asked for.
