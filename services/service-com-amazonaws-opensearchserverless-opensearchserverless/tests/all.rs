@@ -29,6 +29,8 @@ mod collection_group_lifecycle;
 mod collection_lifecycle;
 #[path = "all/encryption_indexes_and_tagging.rs"]
 mod encryption_indexes_and_tagging;
+#[path = "all/index_name_rule.rs"]
+mod index_name_rule;
 #[path = "all/lifecycle_policy.rs"]
 mod lifecycle_policy;
 #[path = "all/lifecycle_policy_delete.rs"]

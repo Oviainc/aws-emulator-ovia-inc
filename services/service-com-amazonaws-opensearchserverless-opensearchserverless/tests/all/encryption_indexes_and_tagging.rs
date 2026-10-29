@@ -180,7 +180,7 @@ async fn await_status(router: &MultiServiceRouter, id: &str, wanted: &str) -> Va
 }
 
 /// Create a collection encrypted with the AWS-owned key and wait for it to be usable.
-async fn active_collection(router: &MultiServiceRouter, name: &str) -> Value {
+pub(crate) async fn active_collection(router: &MultiServiceRouter, name: &str) -> Value {
     let detail = create_collection(
         router,
         json!({ "name": name, "encryptionConfig": { "aWSOwnedKey": true } }),

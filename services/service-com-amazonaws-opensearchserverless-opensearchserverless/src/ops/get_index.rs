@@ -2,8 +2,9 @@
 
 //! @op GetIndex
 //! IMPLEMENTED: reports the `indexSchema` stored on the `IndexRecord` the requested
-//! collection id and index name name. Refuses an id that names no collection, and an
-//! index name that names no index in it, with `ResourceNotFoundException`.
+//! collection id and index name name. Refuses an index name the `IndexName` rule rejects
+//! with `ValidationException`, and an id that names no collection, or an index name that
+//! names no index in it, with `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -151,6 +152,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // `IndexName` carries no `@pattern`, so the boundary validator does not narrow it;
+        // the rule lives in the member's own documentation ("Index names must be lowercase
+        // and can't begin with underscores (_) or hyphens (-)") and belongs to the member,
+        // not to the operation that writes it — so a name the rule refuses is invalid input
+        // HERE too, answered before any lookup, rather than reported as merely absent.
+        // Held by the one helper `CreateIndex` uses, so the two cannot disagree about one
+        // and the same string.
+        if let Err(reason) = crate::state::validate_index_name(&input.index_name) {
+            return Err(
+                GetIndexErrorModeled::ValidationException(ValidationException {
+                    message: Some(reason),
+                })
+                .into(),
+            );
+        }
 
         let mut store = state.lock();
         store.settle_due_transitions();
