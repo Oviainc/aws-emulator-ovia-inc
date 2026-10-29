@@ -3,9 +3,10 @@
 //! @op ListChannelGroups
 //! IMPLEMENTED. Pages over the channel groups persisted in [`crate::state`], in name
 //! order, reporting one list configuration per group. Purely reporting: it writes
-//! nothing. A `NextToken` this service did not issue is a modeled 400
-//! `ValidationException` with `ValidationExceptionType` `INVALID_PAGINATION_TOKEN` —
-//! never a server fault, which an SDK would retry forever.
+//! nothing. A `NextToken` this service did not issue for THIS collection — including one
+//! another of its lists issued — is a modeled 400 `ValidationException` with
+//! `ValidationExceptionType` `INVALID_PAGINATION_TOKEN` — never a server fault, which an
+//! SDK would retry forever.
 //!
 //! `handle` below is the implementation; `crate::state` holds the store it reads.
 //!
@@ -181,13 +182,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this service's lists share decides the page size.
         let page_size = crate::state::page_size(input.max_results);
 
+        // The collection being paged: a token is issued for it and read back against it,
+        // so a cursor another list handed out names no position here.
+        let scope = crate::state::PageScope::ChannelGroups { region: &region };
+
         // A token names the group the previous page stopped after. A token this service
-        // did not issue does not decode, and is the modeled 400 the
+        // did not issue for this collection does not decode, and is the modeled 400 the
         // `INVALID_PAGINATION_TOKEN` discriminator names — not a 501, which would tell an
-        // SDK to retry a request that can never succeed.
+        // SDK to retry a request that can never succeed, and not a page starting at a
+        // position that was never a boundary.
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::page_resume_after(token) {
+            Some(token) => match crate::state::page_resume_after(scope, token) {
                 Some(after) => Some(after),
                 None => {
                     return Err(ListChannelGroupsErrorModeled::ValidationException(
@@ -200,6 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let (page, next_token) = crate::state::page(
             store.channel_groups_in(&region),
+            scope,
             resume_after.as_deref(),
             page_size,
         );

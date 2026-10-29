@@ -252,10 +252,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this service's lists share decides the page size.
         let page_size = crate::state::page_size(input.max_results);
 
-        // A token names the endpoint the previous page stopped after.
+        // The collection being paged: a token is issued for it and read back against it,
+        // so a cursor another list handed out names no position here.
+        let scope = crate::state::PageScope::OriginEndpoints {
+            region: &region,
+            channel_group: &input.channel_group_name,
+            channel: &input.channel_name,
+        };
+
+        // A token names the endpoint the previous page stopped after. A token this service
+        // did not issue for this collection does not decode.
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::page_resume_after(token) {
+            Some(token) => match crate::state::page_resume_after(scope, token) {
                 Some(after) => Some(after),
                 None => {
                     return Err(ListOriginEndpointsErrorModeled::ValidationException(
@@ -268,6 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let (page, next_token) = crate::state::page(
             channel.origin_endpoints.iter(),
+            scope,
             resume_after.as_deref(),
             page_size,
         );

@@ -106,3 +106,5 @@ mod harvest_job_name_namespace;
 mod harvest_job_multiview_refusal;
 #[path = "all/inverted_deny_statements.rs"]
 mod inverted_deny_statements;
+#[path = "all/pagination_token_scope.rs"]
+mod pagination_token_scope;

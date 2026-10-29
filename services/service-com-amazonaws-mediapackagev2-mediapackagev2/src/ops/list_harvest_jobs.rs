@@ -224,13 +224,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolver, so the bounds and the default cannot drift between two lists.
         let page_size = crate::state::page_size(input.max_results);
 
+        // The collection being paged: the group's whole job order, which the channel,
+        // endpoint and status members narrow. A token is issued for that collection and
+        // read back against it, so a cursor another list handed out names no position here.
+        let scope = crate::state::PageScope::HarvestJobs {
+            region: &region,
+            channel_group: &input.channel_group_name,
+        };
+
         // A token names the job the previous page stopped after, so this page starts
         // strictly beyond it: no job is returned twice and none is skipped. A token this
-        // service did not issue does not decode, and is the one refusal every paged list
-        // here shares, built by the shared helper so no list words it its own way.
+        // service did not issue for this collection does not decode, and is the one refusal
+        // every paged list here shares, built by the shared helper so no list words it its
+        // own way.
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::page_resume_after(token) {
+            Some(token) => match crate::state::page_resume_after(scope, token) {
                 Some(after) => Some(after),
                 None => {
                     return Err(ListHarvestJobsErrorModeled::ValidationException(
@@ -281,7 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = page
             .last()
             .filter(|_| remaining.next().is_some())
-            .map(|(key, _)| crate::state::page_token(key));
+            .map(|(key, _)| crate::state::page_token(scope, key));
 
         Ok(ListHarvestJobsOutput {
             items: Some(page.iter().map(|(_, job)| list_item(job)).collect()),

@@ -3543,17 +3543,118 @@ pub fn speke_role_arn_rejection(segment: Option<&Segment>) -> Option<ValidationE
     })
 }
 
-/// The pagination token for a list that stopped after `last` — opaque to the caller,
-/// and decoded by [`page_resume_after`].
-pub fn page_token(last: &str) -> String {
-    hex::encode(last.as_bytes())
+/// The collection a pagination token was issued for.
+///
+/// A token names a position in ONE collection, so what it resumes has to be read against
+/// the collection the request is paging: every list here walks a name-ordered map of the
+/// same shape, so without that binding a cursor issued for one of them is a
+/// plausible-looking cursor in each of the others. The variants are the collections the
+/// model declares a paged list over, each carrying the names that identify it — the
+/// Region included, since the Region is part of every resource's identity here.
+#[derive(Debug, Clone, Copy)]
+pub enum PageScope<'a> {
+    /// The channel groups one Region holds.
+    ChannelGroups { region: &'a str },
+    /// The channels of one channel group.
+    Channels {
+        region: &'a str,
+        channel_group: &'a str,
+    },
+    /// The origin endpoints of one channel.
+    OriginEndpoints {
+        region: &'a str,
+        channel_group: &'a str,
+        channel: &'a str,
+    },
+    /// The harvest jobs of one channel group: the cursor keys that group's whole job
+    /// order, and the request's channel, endpoint and status members narrow what that
+    /// order reports rather than naming a collection of their own.
+    HarvestJobs {
+        region: &'a str,
+        channel_group: &'a str,
+    },
+}
+
+impl PageScope<'_> {
+    /// What identifies this collection: the level it is at, then the names of the
+    /// resources above it.
+    fn parts(&self) -> Vec<&str> {
+        match self {
+            Self::ChannelGroups { region } => vec!["channelGroups", region],
+            Self::Channels {
+                region,
+                channel_group,
+            } => vec!["channels", region, channel_group],
+            Self::OriginEndpoints {
+                region,
+                channel_group,
+                channel,
+            } => vec!["originEndpoints", region, channel_group, channel],
+            Self::HarvestJobs {
+                region,
+                channel_group,
+            } => vec!["harvestJobs", region, channel_group],
+        }
+    }
+}
+
+/// How many hex characters of the binding digest a pagination token opens with.
+const PAGE_TOKEN_DIGEST_LEN: usize = 24;
+
+/// The digest that binds a token to the collection it walks AND to the position it names.
+///
+/// [`short_digest`] length-prefixes each part, so no two collections — a Region's groups
+/// and a group's channels, two groups of the same name in two Regions — share a digest,
+/// and no edit of the cursor keeps one: the token reads only as the whole value a list
+/// handed out. The digest is not a secret and is not an authentication of the caller —
+/// what it decides is whether a token names a page of THIS collection at all.
+fn page_token_digest(scope: PageScope<'_>, last: &str) -> String {
+    let mut parts = scope.parts();
+    parts.push(last);
+    short_digest(&parts, PAGE_TOKEN_DIGEST_LEN)
+}
+
+/// Whether `text` is the lowercase hexadecimal this service's tokens are written in.
+fn is_lowercase_hex(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+/// The pagination token a list of `scope` that stopped after `last` issues — opaque to
+/// the caller, and decoded by [`page_resume_after`].
+///
+/// The token is that binding digest followed by the hex of the name the page stopped
+/// after, so it is self-describing: resuming it needs no server-side cursor record, and
+/// a reporting operation never has to write one to serve a page.
+pub fn page_token(scope: PageScope<'_>, last: &str) -> String {
+    format!(
+        "{}{}",
+        page_token_digest(scope, last),
+        hex::encode(last.as_bytes())
+    )
 }
 
 /// The name a pagination token resumes after, or `None` when the token is not one this
-/// service issued.
-pub fn page_resume_after(token: &str) -> Option<String> {
-    let bytes = hex::decode(token).ok()?;
-    String::from_utf8(bytes).ok()
+/// service issued FOR `scope`.
+///
+/// The strict inverse of [`page_token`]: the token has to carry the lowercase hex of a
+/// non-empty name behind the digest that name has for `scope`. Every token this service
+/// issues for this collection satisfies that, so anything else — a cursor another of this
+/// service's lists issued, a hand-written hex run, a token whose digest or cursor was
+/// edited or truncated — resumes nothing, and the list answers the modelled
+/// [`invalid_pagination_token`] refusal instead of seeking to a position that was never a
+/// page boundary of this collection.
+pub fn page_resume_after(scope: PageScope<'_>, token: &str) -> Option<String> {
+    let digest = token.get(..PAGE_TOKEN_DIGEST_LEN)?;
+    let cursor = token.get(PAGE_TOKEN_DIGEST_LEN..)?;
+    if !is_lowercase_hex(cursor) {
+        return None;
+    }
+    let name = String::from_utf8(hex::decode(cursor).ok()?).ok()?;
+    if name.is_empty() || digest != page_token_digest(scope, &name) {
+        return None;
+    }
+    Some(name)
 }
 
 /// The smallest `MaxResults` the model's `ListResourceMaxResults` range allows.
@@ -3580,13 +3681,15 @@ pub fn page_size(max_results: i32) -> usize {
 /// One page of a name-keyed collection: the records this page reports, and the token the
 /// next page resumes from (`None` once nothing is left).
 ///
-/// `records` is a name-ordered map's iterator, `resume_after` the name the previous page
-/// stopped at (from [`page_resume_after`]), and `size` the resolved [`page_size`]. This
-/// page starts strictly beyond `resume_after`, so no record is returned twice and none is
-/// skipped, and a token is issued only when a record is actually left over. Shared by
-/// every paged list so the two cannot drift.
+/// `records` is a name-ordered map's iterator, `scope` the collection being walked (what
+/// the issued token is bound to, see [`PageScope`]), `resume_after` the name the previous
+/// page stopped at (from [`page_resume_after`]) and `size` the resolved [`page_size`].
+/// This page starts strictly beyond `resume_after`, so no record is returned twice and
+/// none is skipped, and a token is issued only when a record is actually left over.
+/// Shared by every paged list so the two cannot drift.
 pub fn page<'a, T>(
     records: impl Iterator<Item = (&'a String, &'a T)>,
+    scope: PageScope<'_>,
     resume_after: Option<&str>,
     size: usize,
 ) -> (Vec<&'a T>, Option<String>) {
@@ -3596,7 +3699,7 @@ pub fn page<'a, T>(
     let next_token = page
         .last()
         .filter(|_| remaining.next().is_some())
-        .map(|(last, _)| page_token(last));
+        .map(|(last, _)| page_token(scope, last));
     (page.into_iter().map(|(_, record)| record).collect(), next_token)
 }
 
@@ -3779,23 +3882,80 @@ mod tests {
         }
     }
 
+    /// Every collection a paged list of this service walks, as a token is bound to it.
+    fn page_scopes() -> Vec<PageScope<'static>> {
+        vec![
+            PageScope::ChannelGroups {
+                region: "us-east-1",
+            },
+            PageScope::ChannelGroups {
+                region: "eu-west-1",
+            },
+            PageScope::Channels {
+                region: "us-east-1",
+                channel_group: "grp",
+            },
+            PageScope::OriginEndpoints {
+                region: "us-east-1",
+                channel_group: "grp",
+                channel: "chan",
+            },
+            PageScope::HarvestJobs {
+                region: "us-east-1",
+                channel_group: "grp",
+            },
+        ]
+    }
+
     #[test]
     fn a_page_token_round_trips_the_name_it_stopped_after() {
-        for name in ["a", "endpoint-1", "A_long_Name-with-9-digits"] {
-            assert_eq!(
-                page_resume_after(&page_token(name)).as_deref(),
-                Some(name),
-                "token for {name:?} must decode back to it"
-            );
+        for scope in page_scopes() {
+            for name in ["a", "endpoint-1", "A_long_Name-with-9-digits"] {
+                let token = page_token(scope, name);
+                assert_eq!(
+                    page_resume_after(scope, &token).as_deref(),
+                    Some(name),
+                    "case {scope:?}/{name:?}: the token {token:?} must decode back to the name"
+                );
+            }
         }
     }
 
     #[test]
     fn a_token_this_service_did_not_issue_does_not_decode() {
-        assert!(
-            page_resume_after("not-a-token").is_none(),
-            "a non-hex token must be rejected, not silently treated as a name"
-        );
+        let scope = PageScope::ChannelGroups {
+            region: "us-east-1",
+        };
+        let issued = page_token(scope, "grp");
+        // Tokens differing in FORM, none of them one this service issued: prose, non-hex
+        // characters, an odd-length hex run, a base64-shaped string, a bare hex run that
+        // decodes to a name but carries no binding digest, a digest with no cursor behind
+        // it, and an issued token with its cursor truncated.
+        for token in [
+            "not-a-token",
+            "zzzz",
+            "abc",
+            "eyJrZXkiOiAidmFsdWUifQ==",
+            "6d",
+            &issued[..PAGE_TOKEN_DIGEST_LEN],
+            &issued[..issued.len() - 2],
+        ] {
+            assert!(
+                page_resume_after(scope, token).is_none(),
+                "case {token:?}: a token this service did not issue must not decode"
+            );
+        }
+        // And a token this service DID issue, for another of its collections: the digest
+        // binds the cursor to the collection, so it is not readable outside it.
+        for other in page_scopes().into_iter().skip(1) {
+            let token = page_token(other, "grp");
+            assert!(
+                page_resume_after(scope, &token).is_none(),
+                "case {other:?}: a token issued for another collection must not decode, \
+                 got {:?}",
+                page_resume_after(scope, &token)
+            );
+        }
     }
 
     #[test]
