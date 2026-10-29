@@ -27,8 +27,10 @@
 //!    sentence, built from the id the request named, whatever the shape of that value — by
 //!    EVERY operation that resolves one;
 //! 7. the describe REPORTS THE STORE, narrowed by the `AssociationIds` and `Filters` the
-//!    request names and cut into `MaxResults`-sized pages, and it is a READ: no shape of
-//!    request changes what a later caller sees, beyond the clock-owed moves above;
+//!    request names and cut into `MaxResults`-sized pages — a page size the published range
+//!    bounds, walked by a `NextToken` this operation minted and nothing else — and it is a
+//!    READ: no shape of request changes what a later caller sees, beyond the clock-owed
+//!    moves above;
 //! 8. `ReplaceIamInstanceProfileAssociation` SWAPS the profile an instance runs as: the
 //!    association the request names is GONE and a NEW association over the same instance —
 //!    its own id, its own timestamp and its own `associating` span — carries the profile the
@@ -46,7 +48,7 @@ use std::time::Duration;
 use ec2::state::{
     IAM_INSTANCE_PROFILE_ASSOCIATION_ID_PREFIX, IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_ASSOCIATED,
     IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_ASSOCIATING,
-    IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_DISASSOCIATING,
+    IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_DISASSOCIATING, MAX_ECHOED_PAGE_TOKEN_CHARS,
     MAX_IAM_INSTANCE_PROFILE_NAME_CHARACTERS, TRANSITION_DELAY,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
@@ -83,6 +85,9 @@ const INCORRECT_STATE: &str = "IncorrectState";
 
 /// The EC2 code for an instance id the account holds no instance for.
 const INVALID_INSTANCE_ID_NOT_FOUND: &str = "InvalidInstanceID.NotFound";
+
+/// The EC2 code for a `NextToken` this service did not issue.
+const INVALID_PAGINATION_TOKEN: &str = "InvalidPaginationToken";
 
 /// The EC2 code for a value that is not an instance id at all.
 const INVALID_INSTANCE_ID_MALFORMED: &str = "InvalidInstanceID.Malformed";
@@ -1245,5 +1250,265 @@ async fn the_describe_reports_the_store_narrowed_by_ids_and_filters() {
         elements(&body, "nextToken"),
         Vec::<String>::new(),
         "the last page must carry no token, got {body}"
+    );
+}
+
+/// Give `count` freshly launched instances a profile each, and answer their association ids
+/// in `AssociationId` order — the order the describe reports the store in, and the order a
+/// page token names a position in.
+async fn seeded_association_ids(
+    case: &str,
+    router: &MultiServiceRouter,
+    count: usize,
+) -> Vec<String> {
+    let mut ids = Vec::with_capacity(count);
+    for index in 0..count {
+        let instance_id = launch(case, router).await;
+        let (status, body) =
+            associate(router, &instance_id, &by_name(&format!("paged-profile-{index}"))).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the associate must succeed, got {status}: {body}"
+        );
+        ids.push(one_association(case, &body).id);
+    }
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn the_describe_holds_max_results_to_its_published_range() {
+    // The rows span the range the model publishes for this operation's page size —
+    // `DescribeIamInstanceProfileAssociationsMaxResults`, range 5..1000
+    // (`smithy_query(query="shape",shape="DescribeIamInstanceProfileAssociationsMaxResults")`)
+    // — at each published bound, inside it, one past each bound, and at two values no page
+    // size can take. `inside` is whether the value is one the operation admits.
+    let rows: [(&str, &str, bool); 7] = [
+        ("one below the published minimum", "4", false),
+        ("the published minimum", "5", true),
+        ("inside the published range", "640", true),
+        ("the published maximum", "1000", true),
+        ("one above the published maximum", "1001", false),
+        ("a page of none", "0", false),
+        ("a negative page size", "-1", false),
+    ];
+
+    let router = emulator();
+    // The account holds one association, so an admitted page size is answered by the store
+    // rather than by an empty one, and a refused page size reports nothing rather than that
+    // same association.
+    let seeded = seeded_association_ids("the page-size store", &router, 1).await;
+
+    for (case, max_results, inside) in rows {
+        let (status, body) =
+            describe_associations(&router, &[param("MaxResults", max_results)]).await;
+        if inside {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: MaxResults={max_results} is inside the published range, got \
+                 {status}: {body}"
+            );
+            assert_eq!(
+                reported_ids(case, &body),
+                seeded,
+                "case {case:?}: expected the stored associations, got {body}"
+            );
+            // Every admitted page size is larger than this store, so no association follows
+            // the page it answers.
+            assert_eq!(
+                elements(&body, "nextToken"),
+                Vec::<String>::new(),
+                "case {case:?}: a page nothing follows carries no token, got {body}"
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: MaxResults={max_results} is outside the published range, got \
+                 {status}: {body}"
+            );
+            assert_eq!(
+                reported_ids(case, &body),
+                Vec::<String>::new(),
+                "case {case:?}: a refused request reports no association, got {body}"
+            );
+        }
+    }
+
+    // The refusals changed nothing a later caller sees: the store still reports exactly what
+    // it held before them.
+    let (status, body) = describe_associations(&router, &[]).await;
+    assert_eq!(status, 200, "the describe must succeed: {body}");
+    assert_eq!(
+        reported_ids("after the page sizes", &body),
+        seeded,
+        "the page-size refusals must leave the store alone, got {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_next_token_the_describe_did_not_mint_is_refused() {
+    let router = emulator();
+    // The account holds associations, so no row below can be answered by an empty store.
+    let seeded = seeded_association_ids("the token store", &router, 2).await;
+
+    // Each row is wrong about the token in a different way: not hex at all, hex of text this
+    // service never marked, a marked token whose checksum is not the one its cursor hashes
+    // to, a marked token carrying no checksum at all, an association id sent unencoded, an
+    // empty token, and one far longer than the refusal's message repeats back.
+    let long_token = "ab".repeat(MAX_ECHOED_PAGE_TOKEN_CHARS);
+    let rows: Vec<(&str, String)> = vec![
+        ("a value that is not hex at all", "not-a-token".to_string()),
+        (
+            "hex of text this service never marked",
+            hex::encode("iip-assoc-0123456789abcdef0".as_bytes()),
+        ),
+        (
+            "a marked token whose checksum is not its cursor's",
+            hex::encode("ec2-1:0000000000000000:iip-assoc-0123456789abcdef0".as_bytes()),
+        ),
+        (
+            "a marked token carrying no checksum",
+            hex::encode("ec2-1:iip-assoc-0123456789abcdef0".as_bytes()),
+        ),
+        (
+            "an association id sent unencoded",
+            "iip-assoc-0123456789abcdef0".to_string(),
+        ),
+        ("an empty token", String::new()),
+        (
+            "a token longer than the refusal repeats back",
+            long_token.clone(),
+        ),
+    ];
+
+    for (case, token) in &rows {
+        let (status, body) = describe_associations(&router, &[param("NextToken", token)]).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected NextToken {token:?} to be refused, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            INVALID_PAGINATION_TOKEN,
+            "case {case:?}: expected {INVALID_PAGINATION_TOKEN}, got {body}"
+        );
+        // The message names the token the request sent, up to the characters the service
+        // repeats back of an arbitrarily long one.
+        let echoed: String = token.chars().take(MAX_ECHOED_PAGE_TOKEN_CHARS).collect();
+        assert_eq!(
+            error_message(&body),
+            format!("Next token '{echoed}' is invalid"),
+            "case {case:?}: expected the refusal to name the token it would not read, got \
+             {body}"
+        );
+        assert_eq!(
+            reported_ids(case, &body),
+            Vec::<String>::new(),
+            "case {case:?}: a refused request reports no association, got {body}"
+        );
+    }
+
+    // A token this service did not mint is refused rather than read as a position WHATEVER
+    // else the request carries, so a bogus token beside an unresolvable association id and
+    // an undocumented filter is still answered by the token.
+    let mut params = vec![param("NextToken", "not-a-token")];
+    params.extend(indexed("AssociationId", &["iip-assoc-0123456789abcdef0"]));
+    params.extend(filters(&[("profile-name", &["paged-profile-0"])]));
+    let (status, body) = describe_associations(&router, &params).await;
+    assert_eq!(
+        status, 400,
+        "a bogus token beside other bad members must be refused, got {status}: {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        INVALID_PAGINATION_TOKEN,
+        "expected the token to be the refusal, got {body}"
+    );
+
+    // None of the refusals changed what a later caller sees.
+    let (status, body) = describe_associations(&router, &[]).await;
+    assert_eq!(status, 200, "the describe must succeed: {body}");
+    assert_eq!(
+        reported_ids("after the tokens", &body),
+        seeded,
+        "the token refusals must leave the store alone, got {body}"
+    );
+}
+
+#[tokio::test]
+async fn every_admitted_page_size_walks_the_store_exactly_once() {
+    let router = emulator();
+    // More associations than the smallest page the model admits, so a walk at that size
+    // takes several pages rather than one.
+    let seeded = seeded_association_ids("the walked store", &router, 7).await;
+
+    // A walk at each published bound of the page size, at sizes between the minimum and the
+    // store's own count, and with no page size at all — which is not paged, so it reports
+    // every association in one answer.
+    let page_sizes: [Option<&str>; 5] = [None, Some("5"), Some("6"), Some("7"), Some("1000")];
+    for page_size in page_sizes {
+        let case = match page_size {
+            None => "no MaxResults at all".to_string(),
+            Some(page_size) => format!("MaxResults={page_size}"),
+        };
+        let mut walked: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        // A walk can never take more pages than there are associations plus the page that
+        // ends it, so a token that never clears fails the assertion below instead of
+        // spinning.
+        for page_index in 0..=seeded.len() {
+            let mut params: Vec<Param> = Vec::new();
+            if let Some(page_size) = page_size {
+                params.push(param("MaxResults", page_size));
+            }
+            if let Some(cursor) = &cursor {
+                params.push(param("NextToken", cursor));
+            }
+            let (status, body) = describe_associations(&router, &params).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: page {page_index} must succeed, got {status}: {body}"
+            );
+            let page = reported_ids(&case, &body);
+            if let Some(page_size) = page_size {
+                let limit: usize = page_size.parse().expect("a numeric page size");
+                assert!(
+                    page.len() <= limit,
+                    "case {case:?}: page {page_index} holds at most {limit} associations, got \
+                     {}",
+                    page.len()
+                );
+            }
+            walked.extend(page);
+            let carried = elements(&body, "nextToken");
+            match carried.as_slice() {
+                [] => {
+                    cursor = None;
+                    break;
+                }
+                [token] => cursor = Some(token.clone()),
+                many => panic!(
+                    "case {case:?}: page {page_index} must carry at most one token, got \
+                     {many:?} in {body}"
+                ),
+            }
+        }
+        assert!(
+            cursor.is_none(),
+            "case {case:?}: the walk must end on a page that carries no token, got {cursor:?}"
+        );
+        assert_eq!(
+            walked, seeded,
+            "case {case:?}: expected every association exactly once in id order, got {walked:?}"
+        );
+    }
+
+    // The walks are READS: the store reports exactly what it held before them.
+    let (status, body) = describe_associations(&router, &[]).await;
+    assert_eq!(status, 200, "the describe must succeed: {body}");
+    assert_eq!(
+        reported_ids("after the walks", &body),
+        seeded,
+        "the walks must leave the store alone, got {body}"
     );
 }
