@@ -167,10 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The monitor and the policy in force, under a SHORT read lock: the decision
-        // below reads the IAM and STS stores and needs no lock of this service's.
+        // below reads the IAM and STS stores and needs no lock of this service's. The
+        // `Name` names a monitor of the region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let (resource_arn, held_policy) = {
             let store = state.lock();
-            let Some(record) = store.app_monitors.get(&input.name) else {
+            let Some(record) = store.app_monitor(&region, &input.name) else {
                 return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
                     crate::state::app_monitor_not_found(&input.name),
                 )
@@ -198,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The monitor is resolved again under the write lock: the decision above held no
         // lock, so a concurrent `DeleteAppMonitor` may have removed it — with its policy
         // — in between.
-        let Some(record) = store.app_monitors.get_mut(&input.name) else {
+        let Some(record) = store.app_monitor_mut(&region, &input.name) else {
             return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
                 crate::state::app_monitor_not_found(&input.name),
             )

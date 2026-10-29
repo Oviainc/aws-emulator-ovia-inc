@@ -145,10 +145,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The monitor and its resource policy, under a SHORT read lock: the decision
-        // below reads the IAM and STS stores and needs no lock of this service's.
+        // below reads the IAM and STS stores and needs no lock of this service's. The
+        // name is resolved in the region this request was signed for, the one that owns
+        // the monitor.
+        let region = crate::state::request_region(ctx.parts());
         let (resource_arn, resource_policy) = {
             let store = state.lock();
-            let Some(record) = store.app_monitors.get(&input.name) else {
+            let Some(record) = store.app_monitor(&region, &input.name) else {
                 return Err(DeleteAppMonitorErrorModeled::ResourceNotFoundException(
                     crate::state::app_monitor_not_found(&input.name),
                 )
@@ -177,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // tags and its event buffer, which live on it — and its id leaves the index, so
         // a later `GetAppMonitor` by name and a later `PutRumEvents` with the old id both
         // answer `ResourceNotFoundException`.
-        if store.remove_app_monitor(&input.name).is_none() {
+        if store.remove_app_monitor(&region, &input.name).is_none() {
             return Err(DeleteAppMonitorErrorModeled::ResourceNotFoundException(
                 crate::state::app_monitor_not_found(&input.name),
             )

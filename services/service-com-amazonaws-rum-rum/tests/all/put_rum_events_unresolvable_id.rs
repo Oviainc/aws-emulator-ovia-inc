@@ -27,7 +27,7 @@ use service_com_amazonaws_rum_rum::state::CALLER_LACKS_PERMISSIONS_MESSAGE;
 use service_com_amazonaws_rum_rum::ComAmazonawsRumRumState;
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
-use crate::support::{call, create, emulator, message, rum_events_body};
+use crate::support::{call, create, emulator, message, rum_events_body, REGION};
 
 /// Well-formed `AppMonitorId` values that no create in these tests mints.
 ///
@@ -131,14 +131,13 @@ async fn an_unresolvable_id_is_refused_as_an_authorization_failure() {
     let state = engine.state::<ComAmazonawsRumRumState>();
     let store = state.lock();
     assert_eq!(
-        store.app_monitors.len(),
+        store.app_monitor_count(REGION),
         1,
         "case \"store after refusals\": expected the one seeded monitor, got {}",
-        store.app_monitors.len()
+        store.app_monitor_count(REGION)
     );
     let stored = store
-        .app_monitors
-        .get("events-present")
+        .app_monitor(REGION, "events-present")
         .expect("the seeded monitor");
     assert_eq!(
         stored.events.len(),

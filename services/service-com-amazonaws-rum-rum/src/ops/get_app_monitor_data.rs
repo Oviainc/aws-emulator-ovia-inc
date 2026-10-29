@@ -203,10 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // May this caller read THIS app monitor's collected data? Decided per call, like
         // every other operation's, with the monitor and the policy in force read under a
-        // SHORT lock ([`crate::state::authorization`]).
+        // SHORT lock ([`crate::state::authorization`]). The `Name` names a monitor of the
+        // region this request was signed for: a monitor of another region is not found.
+        let region = crate::state::request_region(ctx.parts());
         let (resource_arn, held_policy) = {
             let store = state.lock();
-            let Some(record) = store.app_monitors.get(&input.name) else {
+            let Some(record) = store.app_monitor(&region, &input.name) else {
                 return Err(GetAppMonitorDataErrorModeled::ResourceNotFoundException(
                     crate::state::app_monitor_not_found(&input.name),
                 )
@@ -234,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         // The events are held ON the app monitor record, so a request naming no stored
         // monitor has no data to report rather than an empty page.
-        let Some(monitor) = store.app_monitors.get(&input.name) else {
+        let Some(monitor) = store.app_monitor(&region, &input.name) else {
             return Err(GetAppMonitorDataErrorModeled::ResourceNotFoundException(
                 crate::state::app_monitor_not_found(&input.name),
             )

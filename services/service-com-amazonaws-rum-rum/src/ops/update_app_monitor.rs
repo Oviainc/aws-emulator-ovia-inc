@@ -238,15 +238,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The region the log group's ARN is taken in; `ctx` is the only place it is
-        // readable from.
+        // The region the log group's ARN is taken in, and the region whose monitors this
+        // request's `Name` is resolved against; `ctx` is the only place it is readable
+        // from.
         let region = crate::state::request_region(ctx.parts());
         // The monitor and the resource policy the decision reads, under a SHORT read
         // lock: everything between here and the write below — the authorization
         // decisions and provisioning the log group — holds no lock of this service's.
         let (resource_arn, resource_policy) = {
             let store = state.lock();
-            let Some(record) = store.app_monitors.get(&input.name) else {
+            let Some(record) = store.app_monitor(&region, &input.name) else {
                 return Err(UpdateAppMonitorErrorModeled::ResourceNotFoundException(
                     crate::state::app_monitor_not_found(&input.name),
                 )
@@ -317,7 +318,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let modified = crate::state::current_iso_timestamp();
         let mut store = state.lock();
-        let Some(record) = store.app_monitors.get_mut(&input.name) else {
+        let Some(record) = store.app_monitor_mut(&region, &input.name) else {
             return Err(UpdateAppMonitorErrorModeled::ResourceNotFoundException(
                 crate::state::app_monitor_not_found(&input.name),
             )

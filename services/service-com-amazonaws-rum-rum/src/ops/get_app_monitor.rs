@@ -150,10 +150,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The monitor and its resource policy, under a SHORT read lock: the decision
-        // below reads the IAM and STS stores and needs no lock of this service's.
+        // below reads the IAM and STS stores and needs no lock of this service's. A
+        // monitor lives in the region its create was signed for, so the name is resolved
+        // within the region THIS request was signed for and a monitor of another region
+        // is not found.
+        let region = crate::state::request_region(ctx.parts());
         let (resource_arn, resource_policy) = {
             let store = state.lock();
-            let Some(record) = store.app_monitors.get(&input.name) else {
+            let Some(record) = store.app_monitor(&region, &input.name) else {
                 return Err(GetAppMonitorErrorModeled::ResourceNotFoundException(
                     crate::state::app_monitor_not_found(&input.name),
                 )
@@ -178,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let store = state.lock();
-        let Some(record) = store.app_monitors.get(&input.name) else {
+        let Some(record) = store.app_monitor(&region, &input.name) else {
             return Err(GetAppMonitorErrorModeled::ResourceNotFoundException(
                 crate::state::app_monitor_not_found(&input.name),
             )

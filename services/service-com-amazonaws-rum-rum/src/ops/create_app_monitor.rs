@@ -332,26 +332,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The two refusals this create is subject to, read off the store under a SHORT
+        // The refusals this create is subject to, read off the store under a SHORT
         // lock so the group below is provisioned with no lock held.
         {
             let store = state.lock();
-            // A name identifies an app monitor for every other operation, so a second
-            // monitor cannot take one that is in use.
-            if store.app_monitors.contains_key(&input.name) {
+            // A name identifies an app monitor for every other operation IN THIS REGION,
+            // so a second monitor of this region cannot take one that is in use there —
+            // while the same name in another region names a different, independent
+            // monitor and is free.
+            if store.contains_app_monitor(&region, &input.name) {
                 return Err(CreateAppMonitorErrorModeled::ConflictException(
                     crate::state::app_monitor_already_exists(&input.name),
                 )
                 .into());
             }
-            if store.app_monitors.len() >= crate::state::MAX_APP_MONITORS {
+            if store.app_monitor_count(&region) >= crate::state::MAX_APP_MONITORS {
                 return Err(CreateAppMonitorErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: format!(
-                            "The maximum number of app monitors ({}) has already been created.",
-                            crate::state::MAX_APP_MONITORS
-                        ),
-                    },
+                    crate::state::app_monitor_quota_exceeded(crate::state::MAX_APP_MONITORS),
+                )
+                .into());
+            }
+            // The per-region allowance bounds each region's monitors; this bounds how
+            // many regions hold any, so the store's total stays finite whatever region a
+            // caller signs for (`crate::state::MAX_REGIONS`).
+            if store.region_bucket_exhausted(&region) {
+                return Err(CreateAppMonitorErrorModeled::ServiceQuotaExceededException(
+                    crate::state::app_monitor_quota_exceeded(
+                        crate::state::MAX_REGIONS * crate::state::MAX_APP_MONITORS,
+                    ),
                 )
                 .into());
             }
@@ -387,23 +395,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::current_iso_timestamp();
 
         let mut store = state.lock();
-        // Both refusals are taken again under the write lock: the checks above held no
+        // Every refusal is taken again under the write lock: the checks above held no
         // lock across the provisioning step, so a concurrent create may have taken this
-        // name or the last slot in between.
-        if store.app_monitors.contains_key(&input.name) {
+        // name, the region's last slot or the last region bucket in between.
+        if store.contains_app_monitor(&region, &input.name) {
             return Err(CreateAppMonitorErrorModeled::ConflictException(
                 crate::state::app_monitor_already_exists(&input.name),
             )
             .into());
         }
-        if store.app_monitors.len() >= crate::state::MAX_APP_MONITORS {
+        if store.app_monitor_count(&region) >= crate::state::MAX_APP_MONITORS {
             return Err(CreateAppMonitorErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
-                        "The maximum number of app monitors ({}) has already been created.",
-                        crate::state::MAX_APP_MONITORS
-                    ),
-                },
+                crate::state::app_monitor_quota_exceeded(crate::state::MAX_APP_MONITORS),
+            )
+            .into());
+        }
+        if store.region_bucket_exhausted(&region) {
+            return Err(CreateAppMonitorErrorModeled::ServiceQuotaExceededException(
+                crate::state::app_monitor_quota_exceeded(
+                    crate::state::MAX_REGIONS * crate::state::MAX_APP_MONITORS,
+                ),
             )
             .into());
         }
@@ -413,6 +424,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: resource_arn,
             id: id.clone(),
             name: input.name,
+            // The monitor belongs to the region this request was signed for: that is
+            // where its name is unique, and the only region any later call can reach it
+            // from.
+            region,
             domain: input.domain,
             domain_list: input.domain_list,
             // `Created` is the instant of the call that created the monitor;

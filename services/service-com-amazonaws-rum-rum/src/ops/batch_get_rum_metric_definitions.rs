@@ -223,10 +223,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // May this caller read THIS app monitor's metric definitions? Decided per call,
         // like every other operation's, with the monitor and the policy in force read
-        // under a SHORT lock.
+        // under a SHORT lock. The `AppMonitorName` names a monitor of the region this
+        // request was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let (resource_arn, held_policy) = {
             let store = state.lock();
-            let Some(record) = store.app_monitors.get(&input.app_monitor_name) else {
+            let Some(record) = store.app_monitor(&region, &input.app_monitor_name) else {
                 return Err(
                     BatchGetRumMetricDefinitionsErrorModeled::ResourceNotFoundException(
                         crate::state::app_monitor_not_found(&input.app_monitor_name),
@@ -253,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let store = state.lock();
-        let Some(monitor) = store.app_monitors.get(&input.app_monitor_name) else {
+        let Some(monitor) = store.app_monitor(&region, &input.app_monitor_name) else {
             return Err(
                 BatchGetRumMetricDefinitionsErrorModeled::ResourceNotFoundException(
                     crate::state::app_monitor_not_found(&input.app_monitor_name),

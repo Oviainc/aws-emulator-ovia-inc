@@ -203,10 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in this service makes the decision on every call, from the caller's
         // identity-based policies and the monitor's resource policy
         // ([`crate::state::authorization`]); the monitor and the policy in force are read
-        // under a SHORT lock, because the decision needs no lock of this service's.
+        // under a SHORT lock, because the decision needs no lock of this service's. The
+        // `AppMonitorName` names a monitor of the region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let (resource_arn, held_policy) = {
             let store = state.lock();
-            let Some(record) = store.app_monitors.get(&input.app_monitor_name) else {
+            let Some(record) = store.app_monitor(&region, &input.app_monitor_name) else {
                 return Err(
                     PutRumMetricsDestinationErrorModeled::ResourceNotFoundException(
                         crate::state::app_monitor_not_found(&input.app_monitor_name),
@@ -256,7 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // A destination belongs to one app monitor, so there is nothing to attach it to
         // until that monitor exists.
-        let Some(monitor) = store.app_monitors.get_mut(&input.app_monitor_name) else {
+        let Some(monitor) = store.app_monitor_mut(&region, &input.app_monitor_name) else {
             return Err(
                 PutRumMetricsDestinationErrorModeled::ResourceNotFoundException(
                     crate::state::app_monitor_not_found(&input.app_monitor_name),

@@ -529,13 +529,16 @@ async fn one_resources_tags_are_not_another_resources_tags() {
 }
 
 #[tokio::test]
-async fn the_resource_an_arn_names_is_reachable_from_any_signing_region() {
-    // The ARN is the whole identity, and it is the one the create minted: the region the
-    // READ is signed for plays no part, just as it plays none in `GetAppMonitor`.
+async fn an_arn_resolves_only_from_the_region_that_owns_the_resource() {
+    // The ARN is the whole identity, and the region it carries is part of it: a RUM
+    // endpoint serves the resources of the region it is signed for, so the ARN of a
+    // monitor created in another region names nothing here — the same scope
+    // `GetAppMonitor` resolves a NAME in, so the two resolutions agree.
     let (router, _engine) = emulator();
     // (case, the region the create is signed for, the region the reads are signed for)
-    let rows: [(&str, &str, &str); 3] = [
-        ("one region", "us-east-1", "us-east-1"),
+    let rows: [(&str, &str, &str); 4] = [
+        ("read where it was created", "us-east-1", "us-east-1"),
+        ("read where another region's was created", "eu-west-1", "eu-west-1"),
         ("created in another region", "us-west-2", "us-east-1"),
         ("read from another region", "eu-west-1", "ap-south-1"),
     ];
@@ -561,6 +564,30 @@ async fn the_resource_an_arn_names_is_reachable_from_any_signing_region() {
 
         let minted = app_monitor_arn(create_region, ACCOUNT, &name);
         let reply = list_tags_in(&router, read_region, &minted).await;
+        if create_region != read_region {
+            // The read is signed for a region that owns no such resource.
+            assert_eq!(
+                reply.status,
+                404,
+                "case {case:?}: expected ListTagsForResource signed for {read_region} to \
+                 answer 404 for a {create_region} ARN, got {} {:?}",
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
+            );
+            assert_eq!(
+                reply.error_code(case),
+                NOT_FOUND_ERROR_CODE,
+                "case {case:?}: expected {NOT_FOUND_ERROR_CODE}, got {:?}",
+                String::from_utf8_lossy(&reply.body)
+            );
+            assert_eq!(
+                message(&reply.json(case)),
+                Some(NOT_FOUND_MESSAGE),
+                "case {case:?}: expected the refusal to carry {NOT_FOUND_MESSAGE:?}, got {:?}",
+                String::from_utf8_lossy(&reply.body)
+            );
+            continue;
+        }
         assert_eq!(
             reply.status,
             200,

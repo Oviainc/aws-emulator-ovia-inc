@@ -279,13 +279,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // value differing in any component (partition, region, account, resource type or
         // name) names a resource this emulator does not hold and is refused with 404, the
         // same resolution and the same refusal the sibling `UntagResource` answers with.
+        // The search is over the monitors of the region the request was signed for, so a
+        // monitor of another region is no more reachable by its ARN than by its name.
         // That covers the deleted monitor too: a delete takes the record and its tags
         // together, so its ARN resolves to nothing afterwards. Read under a SHORT lock,
         // because the decision that follows reads the IAM and STS stores and needs no lock
         // of this service's.
+        let region = crate::state::request_region(ctx.parts());
         let (resource_arn, resource_policy, tags) = {
             let store = state.lock();
-            let Some(record) = store.app_monitor_by_arn(&input.resource_arn) else {
+            let Some(record) = store.app_monitor_by_arn(&region, &input.resource_arn) else {
                 return Err(ListTagsForResourceError::NotFound(
                     crate::state::tagged_resource_not_found(),
                 ));

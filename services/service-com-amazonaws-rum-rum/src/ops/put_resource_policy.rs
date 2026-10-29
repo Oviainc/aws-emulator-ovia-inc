@@ -180,13 +180,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The policy belongs to one app monitor (the `@httpLabel` `Name`), so a name no
-        // stored monitor holds — never created, or already deleted — has nothing to
-        // attach a policy to. Resolved under a SHORT read lock, together with the policy
-        // in force, because what comes next is the authorization decision, which reads
-        // the IAM and STS stores and needs no lock of this service's.
+        // stored monitor of the region this request was signed for holds — never created,
+        // created in another region, or already deleted — has nothing to attach a policy
+        // to. Resolved under a SHORT read lock, together with the policy in force,
+        // because what comes next is the authorization decision, which reads the IAM and
+        // STS stores and needs no lock of this service's.
+        let region = crate::state::request_region(ctx.parts());
         let (resource_arn, held_policy) = {
             let store = state.lock();
-            let Some(record) = store.app_monitors.get(&input.name) else {
+            let Some(record) = store.app_monitor(&region, &input.name) else {
                 return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
                     crate::state::app_monitor_not_found(&input.name),
                 )
@@ -214,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // The monitor is resolved again under the write lock: the decision above held no
         // lock, so a concurrent `DeleteAppMonitor` may have removed it in between.
-        if !store.app_monitors.contains_key(&input.name) {
+        if !store.contains_app_monitor(&region, &input.name) {
             return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
                 crate::state::app_monitor_not_found(&input.name),
             )
@@ -253,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // revision id has been assigned a request that names none is refused too, rather
         // than overwriting the policy unconditionally. The check happens before anything
         // is written, so a refused put leaves the stored policy exactly as it was.
-        if let Some(mismatch) = store.app_monitors.get(&input.name).and_then(|record| {
+        if let Some(mismatch) = store.app_monitor(&region, &input.name).and_then(|record| {
             record.policy_revision_refusal_on_current(input.policy_revision_id.as_deref())
         }) {
             return Err(
@@ -261,8 +263,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let Some(record) = store.app_monitors.get_mut(&input.name) else {
-            // Unreachable: the same lock has been held since the `contains_key` above.
+        let Some(record) = store.app_monitor_mut(&region, &input.name) else {
+            // Unreachable: the same lock has been held since the existence check above.
             return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
                 crate::state::app_monitor_not_found(&input.name),
             )

@@ -171,8 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The route names the monitor by its MINTED id, so the batch is resolved through
-        // the stored id index — an id no stored monitor holds (never minted, or minted for
-        // a monitor since deleted) resolves to nothing. That is not reported as a missing
+        // the stored id index, within the region this request was signed for — the data
+        // plane is as regional as the control plane, so an id no monitor OF THAT REGION
+        // holds (never minted, minted in another region, or minted for a monitor since
+        // deleted) resolves to nothing. That is not reported as a missing
         // resource: this write is authorized AGAINST the monitor the id names (its ARN and
         // its resource-based policy are what the decision below is made from), so an id
         // that resolves to nothing leaves no resource to establish the grant against and
@@ -181,9 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Resolved under a SHORT read lock, because what comes next is the authorization
         // decision, which reads the IAM and STS stores and needs no lock of this
         // service's.
+        let region = crate::state::request_region(ctx.parts());
         let (resource_arn, resource_policy) = {
             let store = state.lock();
-            let Some(record) = store.app_monitor_by_id(&input.id) else {
+            let Some(record) = store.app_monitor_by_id(&region, &input.id) else {
                 return Err(PutRumEventsErrorModeled::AccessDeniedException(
                     crate::state::caller_lacks_permissions(),
                 )
@@ -255,7 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An id that no longer resolves is refused the same way it is above — the
             // monitor the grant was decided against is gone, so the write is no longer
             // authorized.
-            let Some(record) = store.app_monitor_by_id_mut(&input.id) else {
+            let Some(record) = store.app_monitor_by_id_mut(&region, &input.id) else {
                 return Err(PutRumEventsErrorModeled::AccessDeniedException(
                     crate::state::caller_lacks_permissions(),
                 )
@@ -270,7 +273,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         if let Some(log_group) = log_group {
-            let region = crate::state::request_region(ctx.parts());
             let log_stream = crate::state::cw_log_delivery::delivery_stream_name(
                 session_id.as_deref(),
                 &input.id,

@@ -379,14 +379,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Removes one or more tags from the specified resource": the resource is the one
-        // whose stored ARN the request names, and an ARN naming none is refused with 404
-        // (see [`UntagResourceError::NotFound`]) rather than answered as a silent success.
-        // Resolved under a SHORT read lock, together with the policy in force, because
-        // what comes next is the authorization decision, which reads the IAM and STS
-        // stores and needs no lock of this service's.
+        // whose stored ARN the request names, and an ARN naming none — including one
+        // naming a monitor of another region, which this regional endpoint does not serve
+        // — is refused with 404 (see [`UntagResourceError::NotFound`]) rather than
+        // answered as a silent success. Resolved under a SHORT read lock, together with
+        // the policy in force, because what comes next is the authorization decision,
+        // which reads the IAM and STS stores and needs no lock of this service's.
+        let region = crate::state::request_region(ctx.parts());
         let (resource_arn, resource_policy) = {
             let store = state.lock();
-            let Some(record) = store.app_monitor_by_arn(&input.resource_arn) else {
+            let Some(record) = store.app_monitor_by_arn(&region, &input.resource_arn) else {
                 return Err(UntagResourceError::NotFound(
                     crate::state::tagged_resource_not_found(),
                 ));
@@ -412,7 +414,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // Resolved again under the WRITE lock: the decision above held no lock, so a
         // concurrent `DeleteAppMonitor` may have removed the resource in between.
-        let Some(record) = store.app_monitor_by_arn_mut(&resource_arn) else {
+        let Some(record) = store.app_monitor_by_arn_mut(&region, &resource_arn) else {
             return Err(UntagResourceError::NotFound(
                 crate::state::tagged_resource_not_found(),
             ));

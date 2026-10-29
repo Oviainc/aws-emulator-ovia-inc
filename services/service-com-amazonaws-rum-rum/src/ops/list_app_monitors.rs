@@ -153,11 +153,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // May this caller list the account's app monitors? The action is taken on the
         // account's whole collection rather than on one monitor, so there is no resource
         // policy to consult and the resource is the collection's ARN.
+        let region = crate::state::request_region(ctx.parts());
         if let Err(denial) = crate::state::authorization::authorize_identity(
             &*self.engine,
             ctx,
             crate::state::authorization::LIST_APP_MONITORS,
-            &crate::state::app_monitor_collection_arn(&crate::state::request_region(ctx.parts())),
+            &crate::state::app_monitor_collection_arn(&region),
         ) {
             return Err(ListAppMonitorsErrorModeled::AccessDeniedException(
                 crate::state::access_denied(&denial),
@@ -185,16 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::page_size(input.max_results);
 
         let store = state.lock();
-        // A range query over the name-ordered map, not a scan: resuming costs
+        // A range query over the name-ordered monitors OF THE SIGNED REGION, not a scan
+        // of every region's: RUM is regional, so a listing reports the monitors the
+        // region this request was signed for owns and nothing else. Resuming costs
         // O(log n) + O(page) and a page boundary cannot drift from the map it indexes.
-        let start = match resume_after.as_deref() {
-            Some(after) => ::std::ops::Bound::Excluded(after),
-            None => ::std::ops::Bound::Unbounded,
-        };
-        let mut remaining = store
-            .app_monitors
-            .range::<str, _>((start, ::std::ops::Bound::Unbounded))
-            .map(|(_, record)| record);
+        let mut remaining = store.app_monitors_from(&region, resume_after.as_deref());
 
         let app_monitor_summaries: Vec<AppMonitorSummary> = remaining
             .by_ref()

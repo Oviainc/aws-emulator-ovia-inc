@@ -128,16 +128,33 @@ pub const CW_LOG_GROUP_PREFIX: &str = "/aws/vendedlogs/RUMService_";
 /// [`crate::ops::types::ResourceNotFoundException`]).
 pub const APP_MONITOR_RESOURCE_TYPE: &str = "RUM application";
 
-/// The most app monitors this emulator holds at once.
+/// The most app monitors this emulator holds at once IN ONE REGION.
 ///
 /// `app_monitors` grows by one record per `CreateAppMonitor` request and shrinks only on
 /// an explicit delete, so without a ceiling its entry count — and with it the heap this
 /// emulator holds — is set by how many requests a caller makes. AWS bounds the same
-/// thing with an adjustable per-account app-monitor quota whose value is not in the
-/// model, so this number is the EMULATOR's own bound, while the refusal it produces is
+/// thing with an adjustable app-monitor quota held per account AND region (every RUM
+/// endpoint is regional, and a quota value is a per-region setting), whose value is not
+/// in the model, so this number is the EMULATOR's own bound, counted the way AWS counts
+/// its own — over the monitors of the region the request was signed for
+/// ([`ComAmazonawsRumRumState::app_monitor_count`]) — while the refusal it produces is
 /// the error `CreateAppMonitor` models for exactly this case:
 /// `ServiceQuotaExceededException` (HTTP 402).
 pub const MAX_APP_MONITORS: usize = 1000;
+
+/// How many distinct regions this store keeps app monitors for.
+///
+/// [`MAX_APP_MONITORS`] alone would not bound the store: the region keying it is the
+/// request's own SigV4 credential-scope region, which this emulator does not
+/// authenticate, so without this cap a caller could open a fresh per-region bucket per
+/// request. With it the store holds at most `MAX_REGIONS` buckets, and so at most
+/// `MAX_REGIONS * MAX_APP_MONITORS` monitors in total (and
+/// `MAX_REGIONS * MAX_APP_MONITORS * MAX_EVENTS_PER_APP_MONITOR` buffered events). AWS
+/// operates on the order of 36 commercial regions, so this bound is this emulator's own
+/// and is comfortably above the real surface; a create that would pass it answers the
+/// same modelled `ServiceQuotaExceededException` (HTTP 402) as one that would exceed the
+/// per-region allowance.
+pub const MAX_REGIONS: usize = 64;
 
 /// The most RUM events this emulator keeps per app monitor.
 ///
@@ -723,6 +740,16 @@ impl ResourcePolicyRecord {
 #[derive(Debug, Clone)]
 pub struct AppMonitorRecord {
     pub name: String,
+    /// The region of the endpoint the `CreateAppMonitor` request that created this
+    /// monitor was signed for — the region that OWNS it.
+    ///
+    /// RUM is a regional service: a monitor exists in exactly one region, its name only
+    /// has to be unique within that region, and no request signed for another region can
+    /// see it. So the region is part of the resource's identity and is the first half of
+    /// the key the record is stored under
+    /// ([`ComAmazonawsRumRumState::app_monitors`]), not just a segment of the derived
+    /// [`Self::arn`].
+    pub region: String,
     /// The minted `AppMonitorId`: a UUID, as `AppMonitorId`'s 36-character pattern asks.
     pub id: String,
     /// `arn:aws:rum:<region>:<account>:appmonitor/<name>`, derived once at create time.
@@ -1102,14 +1129,21 @@ impl AppMonitorRecord {
 /// Per-service state for com-amazonaws-rum-rum. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsRumRumState {
-    /// Every app monitor that currently exists, keyed by its `Name` (unique per
-    /// account). A `BTreeMap` so `ListAppMonitors` pages in a stable, resumable order.
-    /// Bounded by [`MAX_APP_MONITORS`]; write it through [`Self::insert_app_monitor`] /
-    /// [`Self::remove_app_monitor`] so the id index below cannot drift from it.
-    pub app_monitors: BTreeMap<String, AppMonitorRecord>,
-    /// Secondary index `Id` -> `Name`, so the data-plane `PutRumEvents` — which names a
-    /// monitor by its minted id, not its name — resolves one in O(1) without scanning.
-    pub monitor_ids: HashMap<String, String>,
+    /// Every app monitor that currently exists, keyed by the region that owns it
+    /// ([`AppMonitorRecord::region`]) and, under that, by its `Name` — which is unique
+    /// per account AND region, since every RUM endpoint is regional and a monitor of one
+    /// region is invisible from another. `BTreeMap`s so `ListAppMonitors` pages the one
+    /// region it is signed for in a stable, resumable order. Each region's map is bounded
+    /// by [`MAX_APP_MONITORS`]; read it through [`Self::app_monitor`] /
+    /// [`Self::app_monitor_mut`] and write it through [`Self::insert_app_monitor`] /
+    /// [`Self::remove_app_monitor`] so no two operations can disagree about which region
+    /// owns a monitor and the id index below cannot drift from it.
+    pub app_monitors: BTreeMap<String, BTreeMap<String, AppMonitorRecord>>,
+    /// Secondary index `Id` -> `(region, Name)`, so the data-plane `PutRumEvents` — which
+    /// names a monitor by its minted id, not its name — resolves one in O(1) without
+    /// scanning. The region is part of the entry because it is part of the monitor's
+    /// identity: an id is resolved WITHIN the region the request was signed for.
+    pub monitor_ids: HashMap<String, (String, String)>,
     /// Per-state seed the minted ids are derived from, set on the first mint from the
     /// nanosecond clock so two runs of the emulator do not hand out the same ids. Only
     /// ever read by [`Self::mint_app_monitor_id`]; it is NOT an id itself.
@@ -1169,63 +1203,154 @@ impl ComAmazonawsRumRumState {
         uuid_v4_shaped(domain, self.id_seed, self.next_id_seq)
     }
 
-    /// Store `record`, keeping the `Id` -> `Name` index in step with the primary map.
+    /// Store `record` in the region it names, keeping the `Id` -> `(region, Name)` index
+    /// in step with the primary map.
     pub fn insert_app_monitor(&mut self, record: AppMonitorRecord) {
-        self.monitor_ids
-            .insert(record.id.clone(), record.name.clone());
-        self.app_monitors.insert(record.name.clone(), record);
+        self.monitor_ids.insert(
+            record.id.clone(),
+            (record.region.clone(), record.name.clone()),
+        );
+        self.app_monitors
+            .entry(record.region.clone())
+            .or_default()
+            .insert(record.name.clone(), record);
     }
 
-    /// Remove the monitor named `name` — with its tags and its event buffer, which live
-    /// on the record — and drop its id from the index. `None` when no monitor has that
-    /// name, which every caller renders as `ResourceNotFoundException`.
-    pub fn remove_app_monitor(&mut self, name: &str) -> Option<AppMonitorRecord> {
-        let removed = self.app_monitors.remove(name)?;
+    /// The monitor named `name` in `region`, for a caller that only REPORTS it.
+    ///
+    /// The ONE name-addressed lookup of this service: a monitor belongs to the region its
+    /// create was signed for, so a name is resolved within THAT region's monitors and a
+    /// request signed for any other region finds nothing — which every caller renders as
+    /// `ResourceNotFoundException`.
+    pub fn app_monitor(&self, region: &str, name: &str) -> Option<&AppMonitorRecord> {
+        self.app_monitors.get(region)?.get(name)
+    }
+
+    /// The same lookup for a caller that MUTATES the monitor it resolves, so a read and a
+    /// write of one name can never disagree about which region owns it.
+    pub fn app_monitor_mut(&mut self, region: &str, name: &str) -> Option<&mut AppMonitorRecord> {
+        self.app_monitors.get_mut(region)?.get_mut(name)
+    }
+
+    /// Whether `region` already holds a monitor named `name` — the condition a create's
+    /// duplicate-name conflict is taken on, and the reason a name only has to be unique
+    /// within one region.
+    pub fn contains_app_monitor(&self, region: &str, name: &str) -> bool {
+        self.app_monitor(region, name).is_some()
+    }
+
+    /// How many monitors `region` holds: what [`MAX_APP_MONITORS`] bounds, counted per
+    /// region because that is the scope AWS's own app-monitor quota is held at.
+    pub fn app_monitor_count(&self, region: &str) -> usize {
+        self.app_monitors
+            .get(region)
+            .map_or(0, ::std::collections::BTreeMap::len)
+    }
+
+    /// Whether storing a monitor in `region` would open a new per-region bucket beyond
+    /// [`MAX_REGIONS`]. The region comes from the request's own credential scope, so the
+    /// number of buckets is capped as well as the monitors in each.
+    pub fn region_bucket_exhausted(&self, region: &str) -> bool {
+        !self.app_monitors.contains_key(region) && self.app_monitors.len() >= MAX_REGIONS
+    }
+
+    /// The monitors `region` owns in `Name` order, resuming strictly after `after` when a
+    /// page token named one — the range query `ListAppMonitors` pages over.
+    ///
+    /// A listing reports the monitors of the region it was signed for and no others, so
+    /// the range is taken over that region's map alone: resuming still costs
+    /// O(log n) + O(page), and a page boundary cannot drift from the map it indexes.
+    pub fn app_monitors_from<'state>(
+        &'state self,
+        region: &str,
+        after: Option<&'state str>,
+    ) -> impl Iterator<Item = &'state AppMonitorRecord> {
+        let start = match after {
+            Some(after) => ::std::ops::Bound::Excluded(after),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        self.app_monitors
+            .get(region)
+            .into_iter()
+            .flat_map(move |monitors| monitors.range::<str, _>((start, ::std::ops::Bound::Unbounded)))
+            .map(|(_, record)| record)
+    }
+
+    /// Remove the monitor named `name` in `region` — with its tags and its event buffer,
+    /// which live on the record — and drop its id from the index. `None` when that region
+    /// holds no monitor of that name, which every caller renders as
+    /// `ResourceNotFoundException`.
+    pub fn remove_app_monitor(&mut self, region: &str, name: &str) -> Option<AppMonitorRecord> {
+        let monitors = self.app_monitors.get_mut(region)?;
+        let removed = monitors.remove(name)?;
+        if monitors.is_empty() {
+            self.app_monitors.remove(region);
+        }
         self.monitor_ids.remove(&removed.id);
         Some(removed)
     }
 
-    /// The stored monitor whose minted id is `id`, for a caller that mutates it (the
+    /// The monitor of `region` whose minted id is `id`, for a caller that mutates it (the
     /// data-plane `PutRumEvents`). The id index and the primary map are kept in step by
     /// the two writers above, so this is the ONE place the two-step lookup lives.
-    pub fn app_monitor_by_id_mut(&mut self, id: &str) -> Option<&mut AppMonitorRecord> {
-        let name = self.monitor_ids.get(id)?.clone();
-        self.app_monitors.get_mut(&name)
+    ///
+    /// The index entry carries the region that owns the monitor, so an id minted in
+    /// another region resolves to nothing here: the data plane is as regional as the
+    /// control plane.
+    pub fn app_monitor_by_id_mut(&mut self, region: &str, id: &str) -> Option<&mut AppMonitorRecord> {
+        let (owner, name) = self.monitor_ids.get(id)?.clone();
+        (owner == region)
+            .then(|| self.app_monitors.get_mut(&owner)?.get_mut(&name))
+            .flatten()
     }
 
     /// The same lookup for a caller that only READS the monitor — the authorization
     /// evaluation, which needs the monitor's ARN and its resource policy before any write
     /// is decided on.
-    pub fn app_monitor_by_id(&self, id: &str) -> Option<&AppMonitorRecord> {
-        let name = self.monitor_ids.get(id)?;
-        self.app_monitors.get(name)
+    pub fn app_monitor_by_id(&self, region: &str, id: &str) -> Option<&AppMonitorRecord> {
+        let (owner, name) = self.monitor_ids.get(id)?;
+        (owner == region)
+            .then(|| self.app_monitors.get(owner)?.get(name))
+            .flatten()
     }
 
-    /// The stored monitor whose ARN is exactly `arn`, for a caller that mutates it (the
-    /// tagging operations, which name a resource by `ResourceArn` and by nothing else).
+    /// The monitor of `region` whose ARN is exactly `arn`, for a caller that mutates it
+    /// (the tagging operations, which name a resource by `ResourceArn` and by nothing
+    /// else).
     ///
-    /// The comparison is against [`AppMonitorRecord::arn`] in full — partition, service,
-    /// region, account and resource segment — because that whole string is the resource's
-    /// identity: an ARN that differs in any component names a DIFFERENT resource, which
-    /// this emulator does not hold, so the caller renders `None` as
-    /// `ResourceNotFoundException` (see [`tagged_resource_not_found`]). App monitors are
+    /// The search is over the monitors `region` owns, and the comparison is against
+    /// [`AppMonitorRecord::arn`] in full — partition, service, region, account and
+    /// resource segment — because that whole string is the resource's identity: an ARN
+    /// that differs in any component names a DIFFERENT resource, which this emulator does
+    /// not hold here, so the caller renders `None` as `ResourceNotFoundException` (see
+    /// [`tagged_resource_not_found`]). Scoping the search to the signed region is what
+    /// makes the ARN-addressed resolution agree with the name-addressed one: a monitor of
+    /// another region is no more reachable by its ARN than by its name. App monitors are
     /// the only taggable RUM resource (`TagResource`: "Currently, the only resources that
     /// can be tagged app monitors"), so this one lookup covers every ARN a tag call can
     /// name.
-    pub fn app_monitor_by_arn_mut(&mut self, arn: &str) -> Option<&mut AppMonitorRecord> {
+    pub fn app_monitor_by_arn_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut AppMonitorRecord> {
         self.app_monitors
+            .get_mut(region)?
             .values_mut()
             .find(|record| record.arn == arn)
     }
 
-    /// The stored monitor whose ARN is exactly `arn`, for a caller that only REPORTS it
-    /// (`ListTagsForResource`).
+    /// The monitor of `region` whose ARN is exactly `arn`, for a caller that only REPORTS
+    /// it (`ListTagsForResource`).
     ///
     /// The same identity comparison as [`Self::app_monitor_by_arn_mut`] — the two differ
     /// only in mutability, so a tag read and a tag write can never disagree about which
     /// resource one `ResourceArn` names.
-    pub fn app_monitor_by_arn(&self, arn: &str) -> Option<&AppMonitorRecord> {
-        self.app_monitors.values().find(|record| record.arn == arn)
+    pub fn app_monitor_by_arn(&self, region: &str, arn: &str) -> Option<&AppMonitorRecord> {
+        self.app_monitors
+            .get(region)?
+            .values()
+            .find(|record| record.arn == arn)
     }
 }
 
@@ -2621,6 +2746,19 @@ pub fn app_monitor_already_exists(name: &str) -> ConflictException {
 pub const CONFLICT_MESSAGE_PREFIX: &str = "Resource ";
 /// See [`CONFLICT_MESSAGE_PREFIX`].
 pub const CONFLICT_MESSAGE_SUFFIX: &str = " already exists";
+
+/// `ServiceQuotaExceededException` for a create that would take the store past an
+/// app-monitor ceiling, naming the ceiling it reached.
+///
+/// ONE wording for both ceilings a create is subject to — the per-region allowance
+/// ([`MAX_APP_MONITORS`]) and, for a create that would open a bucket past
+/// [`MAX_REGIONS`], the store's total — so the two refusals cannot drift apart. The
+/// shape models `message` and nothing else, so the whole body is this one member.
+pub fn app_monitor_quota_exceeded(ceiling: usize) -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: format!("The maximum number of app monitors ({ceiling}) has already been created."),
+    }
+}
 
 /// The media type RUM announces for the JSON body of an answer to a request that carried
 /// no payload, and so declared no media type of its own.

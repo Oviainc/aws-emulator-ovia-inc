@@ -220,8 +220,7 @@ async fn get_app_monitor_rebuilds_every_member_from_the_created_state() {
         let stored_arn = engine
             .state::<ComAmazonawsRumRumState>()
             .lock()
-            .app_monitors
-            .get(&name)
+            .app_monitor(REGION, &name)
             .map(|record| record.arn.clone());
         assert_eq!(
             stored_arn.as_deref(),
@@ -255,8 +254,7 @@ async fn an_arn_is_derived_from_the_region_the_request_was_signed_for() {
         let stored_arn = engine
             .state::<ComAmazonawsRumRumState>()
             .lock()
-            .app_monitors
-            .get(&name)
+            .app_monitor(region, &name)
             .map(|record| record.arn.clone());
         assert_eq!(
             stored_arn.as_deref(),
@@ -449,8 +447,7 @@ async fn put_rum_events_appends_to_the_monitor_its_id_names() {
         let state = engine.state::<ComAmazonawsRumRumState>();
         let store = state.lock();
         let stored = store
-            .app_monitors
-            .get("events-first")
+            .app_monitor(REGION, "events-first")
             .expect("the first monitor is stored");
         assert_eq!(
             stored.events.len(),
@@ -487,8 +484,7 @@ async fn put_rum_events_appends_to_the_monitor_its_id_names() {
 
         // The other monitor saw none of it.
         let untouched = store
-            .app_monitors
-            .get("events-second")
+            .app_monitor(REGION, "events-second")
             .expect("the second monitor is stored");
         assert!(
             untouched.events.is_empty(),
@@ -517,8 +513,7 @@ async fn put_rum_events_appends_to_the_monitor_its_id_names() {
         let state = engine.state::<ComAmazonawsRumRumState>();
         let store = state.lock();
         let stored = store
-            .app_monitors
-            .get("events-second")
+            .app_monitor(REGION, "events-second")
             .expect("the second monitor is stored");
         assert_eq!(
             stored.events.len(),
@@ -785,7 +780,7 @@ async fn deleting_a_monitor_removes_it_from_every_index() {
             "case \"id index\": the monitor that was not deleted keeps its id"
         );
         assert!(
-            !store.app_monitors.contains_key(name),
+            !store.contains_app_monitor(REGION, name),
             "case \"name index\": the deleted monitor must leave the store"
         );
     }

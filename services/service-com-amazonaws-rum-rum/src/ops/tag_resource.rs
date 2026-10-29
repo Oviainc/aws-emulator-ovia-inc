@@ -318,10 +318,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The addressed resource and the policy in force on it, under a SHORT read lock:
         // the decision below reads the IAM and STS stores and needs no lock of this
-        // service's.
+        // service's. The ARN is resolved among the monitors of the region this request was
+        // signed for, so an ARN naming a monitor of another region names nothing here.
+        let region = crate::state::request_region(ctx.parts());
         let (resource_arn, resource_policy) = {
             let store = state.lock();
-            let Some(record) = store.app_monitor_by_arn(&input.resource_arn) else {
+            let Some(record) = store.app_monitor_by_arn(&region, &input.resource_arn) else {
                 return Err(TagResourceError::NotFound(
                     crate::state::tagged_resource_not_found(),
                 ));
@@ -347,7 +349,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // Resolved again under the WRITE lock: the decision above held no lock, so a
         // concurrent `DeleteAppMonitor` may have removed the resource in between.
-        let Some(record) = store.app_monitor_by_arn_mut(&resource_arn) else {
+        let Some(record) = store.app_monitor_by_arn_mut(&region, &resource_arn) else {
             return Err(TagResourceError::NotFound(
                 crate::state::tagged_resource_not_found(),
             ));

@@ -206,10 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // May this caller change THIS app monitor's metrics? Decided per call from the
         // caller's identity-based policies and the monitor's resource policy, with the
-        // monitor and the policy in force read under a SHORT lock.
+        // monitor and the policy in force read under a SHORT lock. The `AppMonitorName`
+        // names a monitor of the region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let (resource_arn, held_policy) = {
             let store = state.lock();
-            let Some(record) = store.app_monitors.get(&input.app_monitor_name) else {
+            let Some(record) = store.app_monitor(&region, &input.app_monitor_name) else {
                 return Err(
                     UpdateRumMetricDefinitionErrorModeled::ResourceNotFoundException(
                         crate::state::app_monitor_not_found(&input.app_monitor_name),
@@ -234,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
-        let Some(monitor) = store.app_monitors.get_mut(&input.app_monitor_name) else {
+        let Some(monitor) = store.app_monitor_mut(&region, &input.app_monitor_name) else {
             return Err(
                 UpdateRumMetricDefinitionErrorModeled::ResourceNotFoundException(
                     crate::state::app_monitor_not_found(&input.app_monitor_name),

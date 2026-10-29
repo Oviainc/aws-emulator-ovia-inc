@@ -161,10 +161,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The monitor and the policy in force, under a SHORT read lock: the decision
-        // below reads the IAM and STS stores and needs no lock of this service's.
+        // below reads the IAM and STS stores and needs no lock of this service's. The
+        // `Name` names a monitor of the region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let (resource_arn, held_policy) = {
             let store = state.lock();
-            let Some(record) = store.app_monitors.get(&input.name) else {
+            let Some(record) = store.app_monitor(&region, &input.name) else {
                 return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
                     crate::state::app_monitor_not_found(&input.name),
                 )
@@ -191,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@readonly`: the lock is taken for reading only, so what this call reports is
         // exactly what the next caller sees.
         let store = state.lock();
-        let Some(record) = store.app_monitors.get(&input.name) else {
+        let Some(record) = store.app_monitor(&region, &input.name) else {
             return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
                 crate::state::app_monitor_not_found(&input.name),
             )
