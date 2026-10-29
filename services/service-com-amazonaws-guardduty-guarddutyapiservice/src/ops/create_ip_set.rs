@@ -183,49 +183,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
-        let now = state.tick_millis();
 
-        // Resolve the detector this IPSet hangs off, and — under the same borrow —
-        // the IPSet a replayed `ClientToken` already minted. `ClientToken` is
-        // `@idempotencyToken` (`smithy_query(operation="CreateIPSet")`), so a
-        // replayed create returns the first call's IPSet instead of minting a
-        // second one.
+        // `ClientToken` is `@idempotencyToken`
+        // (`smithy_query(operation="CreateIPSet")`), so a replayed create returns
+        // the first call's IPSet instead of minting a second one.
         let token = input
             .client_token
             .as_deref()
             .filter(|token| !token.is_empty())
             .map(str::to_string);
-        let already_minted = {
-            let Some(detector) = state.detector_in(&region, &input.detector_id) else {
-                // Classified from the REQUEST, the way every reporting operation
-                // here classifies a `DetectorId` it cannot resolve.
-                return Err(detector_rejection(&input.detector_id));
-            };
-            let replayed = token
-                .as_deref()
-                .and_then(|token| detector.ip_set_for_token(token))
-                .map(|ip_set| ip_set.id.clone());
-            // Nothing is minted past the per-detector maximum: this is the branch
-            // that BOUNDS `Detector::ip_sets`, so the store a caller can make this
-            // service retain is at most `IP_SETS_PER_DETECTOR` LIVE records per
-            // detector, released with the detector by `DeleteDetector`. A list
-            // whose delete has been accepted is no longer live and occupies no
-            // slot, which is why the count is `live_ip_set_count` and not the map's
-            // length. Checked after the idempotency lookup, because a replay mints
-            // nothing.
-            if replayed.is_none()
-                && detector.live_ip_set_count() >= crate::state::IP_SETS_PER_DETECTOR
-            {
-                return Err(crate::scaffolded::Scaffolded::invalid_input(
-                    crate::state::ip_set_limit_message(),
-                ));
-            }
-            replayed
+
+        // Everything that can refuse the request — and the replay that writes
+        // nothing — is decided over an IMMUTABLE borrow, so a refused create
+        // neither mints an id nor advances the clock. Resolve the detector this
+        // IPSet hangs off, and under the same borrow the IPSet a replayed
+        // `ClientToken` already minted.
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            // Classified from the REQUEST, the way every reporting operation
+            // here classifies a `DetectorId` it cannot resolve.
+            return Err(detector_rejection(&input.detector_id));
         };
-        if let Some(ip_set_id) = already_minted {
-            return Ok(CreateIPSetOutput { ip_set_id });
+        if let Some(replayed) = token
+            .as_deref()
+            .and_then(|token| detector.ip_set_for_token(token))
+        {
+            return Ok(CreateIPSetOutput {
+                ip_set_id: replayed.id.clone(),
+            });
+        }
+        // Nothing is minted past the per-detector maximum: this is the branch
+        // that BOUNDS `Detector::ip_sets`, so the store a caller can make this
+        // service retain is at most `IP_SETS_PER_DETECTOR` LIVE records per
+        // detector, released with the detector by `DeleteDetector`. A list
+        // whose delete has been accepted is no longer live and occupies no
+        // slot, which is why the count is `live_ip_set_count` and not the map's
+        // length. Checked after the idempotency lookup, because a replay mints
+        // nothing.
+        if detector.live_ip_set_count() >= crate::state::IP_SETS_PER_DETECTOR {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::ip_set_limit_message(),
+            ));
         }
 
+        // Past every refusal: this call is going to write, so now it may read the
+        // "this resource changed now" clock and mint an id.
+        let now = state.tick_millis();
         let id = state.mint_id();
         let record = crate::state::IpSetRecord::created(
             id.clone(),

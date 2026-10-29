@@ -177,7 +177,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
-        let now = state.tick_millis();
 
         // `ClientToken` is `@idempotencyToken`
         // (`smithy_query(operation="CreatePublishingDestination")`), so a replayed
@@ -190,37 +189,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .filter(|token| !token.is_empty())
             .map(str::to_string);
-        let already_minted = {
-            let Some(detector) = state.detector_in(&region, &input.detector_id) else {
-                return Err(bad_request(crate::state::detector_id_rejection(
-                    &input.detector_id,
-                )));
-            };
-            let replayed = token
-                .as_deref()
-                .and_then(|token| detector.publishing_destination_for_token(token))
-                .map(|destination| destination.id.clone());
-            // Nothing is minted past the per-detector maximum: this is the branch
-            // that BOUNDS `Detector::publishing_destinations` (and with it the
-            // `ClientToken` index each record carries), so the store a caller can
-            // make this service retain is at most
-            // `PUBLISHING_DESTINATIONS_PER_DETECTOR` records per detector,
-            // released with the detector by `DeleteDetector`. Checked after the
-            // idempotency lookup, because a replay mints nothing.
-            if replayed.is_none()
-                && detector.publishing_destinations.len()
-                    >= crate::state::PUBLISHING_DESTINATIONS_PER_DETECTOR
-            {
-                return Err(bad_request(
-                    crate::state::publishing_destination_limit_message(),
-                ));
-            }
-            replayed
+
+        // Everything that can refuse the request — and the replay that writes
+        // nothing — is decided over an IMMUTABLE borrow, so a refused create
+        // neither mints an id nor advances the clock.
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            return Err(bad_request(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
         };
-        if let Some(destination_id) = already_minted {
-            return Ok(CreatePublishingDestinationOutput { destination_id });
+        if let Some(replayed) = token
+            .as_deref()
+            .and_then(|token| detector.publishing_destination_for_token(token))
+        {
+            return Ok(CreatePublishingDestinationOutput {
+                destination_id: replayed.id.clone(),
+            });
+        }
+        // Nothing is minted past the per-detector maximum: this is the branch
+        // that BOUNDS `Detector::publishing_destinations` (and with it the
+        // `ClientToken` index each record carries), so the store a caller can
+        // make this service retain is at most
+        // `PUBLISHING_DESTINATIONS_PER_DETECTOR` records per detector,
+        // released with the detector by `DeleteDetector`. Checked after the
+        // idempotency lookup, because a replay mints nothing.
+        if detector.publishing_destinations.len()
+            >= crate::state::PUBLISHING_DESTINATIONS_PER_DETECTOR
+        {
+            return Err(bad_request(
+                crate::state::publishing_destination_limit_message(),
+            ));
         }
 
+        // Past every refusal: this call is going to write, so now it may read the
+        // "this resource changed now" clock and mint an id.
+        let now = state.tick_millis();
         let minted = state.mint_id();
         let record = crate::state::PublishingDestinationRecord {
             id: minted.clone(),
