@@ -1,0 +1,49 @@
+Issue-Severity: CRITICAL
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: guardduty.create-investigation-without-permission-denied guardduty.update-ipset-without-permission-denied guardduty.get-custom-detection-rule-cross-account-denied guardduty.delete-org-config-conflict-when-associations-exist guardduty.delete-custom-detection-rule-org-configuration-conflict-when-associations-exist guardduty.concurrent-update-custom-detection-rule-org-config-conflict
+Issue-Shape-Id: com.amazonaws.guardduty#GuardDutyAPIService
+Issue-Key: guardduty.create-investigation-without-permission-denied|_error_code#12|AssertionError|raise AssertionError(f"expected AccessDeniedException, but the call SUCCEEDED and returned {result!r}")
+Issue-Key: guardduty.update-ipset-without-permission-denied|_client_error#21|AssertionError|raise AssertionError(f"expected the call to be rejected, but it succeeded with {result!r}")
+Issue-Key: guardduty.get-custom-detection-rule-cross-account-denied|_poll_until#19|Timeout|time.sleep(interval_s)
+Issue-Key: guardduty.delete-org-config-conflict-when-associations-exist|_error_code#6|AssertionError|raise AssertionError(f"expected AccessDeniedException, but the call SUCCEEDED and returned {result!r}")
+Issue-Key: guardduty.delete-custom-detection-rule-org-configuration-conflict-when-associations-exist|_error_code#16|AssertionError|raise AssertionError(f"expected a rejection, but the call SUCCEEDED and returned {result!r}")
+Issue-Key: guardduty.concurrent-update-custom-detection-rule-org-config-conflict|run#9|AssertionError|assert kind == "err" and code == "AccessDeniedException", (
+Issue-Commit: d4c3381173b09dc1be1da315e64a87a78d438272
+
+# GuardDuty performs no authorization: identity-policy Deny is ignored and the org-configuration delegated-admin gate is absent
+
+> _Note: this issue was identified against the code base at commit `d4c3381173b09dc1be1da315e64a87a78d438272`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateInvestigation
+
+## Description
+This issue bundles 2 distinct root causes, both in the guardduty crate: the service never refuses a caller on authorization grounds. Fix both before submitting.
+
+Cause 1 of 2: an identity-based policy that explicitly denies a guardduty action does not deny the call.
+AWS: Smithy CreateInvestigation models AccessDeniedException (httpError 403, http response code 202 on success); UpdateIPSet and the custom-detection-rule reads model AccessDeniedException 403 as well. Recorded behavior: a session assumed into a role carrying an explicit Deny on the single action is refused HTTP 403 AccessDeniedException whose message follows IAM's standard template — fixed text 'User: ', the caller's principal ARN (arn:aws:sts::<account>:assumed-role/<role-name>/<session-name>), ' is not authorized to perform: ', the action (e.g. guardduty:CreateInvestigation), ' on resource: ', the target resource ARN (e.g. arn:aws:guardduty:<region>:<account>:detector/<detectorId>/investigation), ' with an explicit deny in an identity-based policy'. Every variable part comes from the request's credentials and target; none of it is a fixed value.
+Emulator: the denied principal's call succeeds — CreateInvestigation returns HTTP 202 with an InvestigationId, UpdateIPSet returns HTTP 200, and the GetCustomDetectionRule probe that polls for the deny to take effect never observes one (the check runs out its 60s budget).
+Why: a client or test that asserts least-privilege (a role must NOT be able to create an investigation, mutate an IPSet, or read a detection rule) passes against the emulator and then breaks against AWS; worse, security regressions in the caller's own policies cannot be detected at all because every principal is omnipotent.
+Fix: request authorization for the guardduty operations — the per-operation permission check that must run before the handler mutates state (services/service-com-amazonaws-guardduty-guarddutyapiservice/src/ops/create_investigation.rs, update_ip_set.rs, get_custom_detection_rule.rs and the shared auth layer they call).
+Traces: guardduty.create-investigation-without-permission-denied, guardduty.update-ipset-without-permission-denied, guardduty.get-custom-detection-rule-cross-account-denied (this last one times out rather than asserting, because the check polls a fresh role session waiting for a denial that never arrives).
+
+Cause 2 of 2: the custom-detection-rule org-configuration family is not gated on the Organizations delegated administrator.
+AWS: Smithy CreateCustomDetectionRuleOrgConfiguration / UpdateCustomDetectionRuleOrgConfiguration / DeleteCustomDetectionRuleOrgConfiguration / ListCustomDetectionRuleOrgConfigurations all model AccessDeniedException (httpError 403); the model documents them as available only to the delegated administrator account. Recorded behavior: for a caller that is not the GuardDuty delegated admin, Create, Delete, Update and List on that family are all refused AccessDeniedException with the fixed text 'The request is rejected because the caller is not authorized to call this API.' (no variable parts), uniformly and deterministically even under five concurrent racers, while the non-gated ListCustomDetectionRules keeps answering. Corroborating recorded behavior on the same account: DescribeOrganizationConfiguration is refused BadRequestException with the fixed text 'The request failed because a delegated administrator account has not been enabled.'
+Emulator: CreateCustomDetectionRuleOrgConfiguration and DeleteCustomDetectionRuleOrgConfiguration return HTTP 200 with an empty body, and UpdateCustomDetectionRuleOrgConfiguration returns ResourceNotFoundException instead of AccessDeniedException — so the org-wide configuration surface is writable by any account.
+Why: whole-organization LIVE/DRY_RUN configuration of a detection rule is an org-admin-only control; letting a non-delegated-admin caller write it both hides the entitlement boundary a client must handle (403 + the quoted text) and lets the emulator hold org state AWS would never have accepted. The ResourceNotFoundException on Update additionally mis-routes the caller to a create-the-resource retry instead of an entitlement failure.
+Fix: a delegated-administrator precondition in front of the custom-detection-rule org-configuration handlers in the guardduty crate (src/ops/create_custom_detection_rule_org_configuration.rs, update_custom_detection_rule_org_configuration.rs, delete_custom_detection_rule_org_configuration.rs, list_custom_detection_rule_org_configurations.rs), plus the matching refusal in DescribeOrganizationConfiguration when no delegated admin is enabled. Note: open issue 20261028T180651Z-guardduty-updateorganizationconfiguration-wrong-behavior--r2.md concerns auto-enablement propagation and does not cover this gate.
+Traces: guardduty.delete-org-config-conflict-when-associations-exist, guardduty.delete-custom-detection-rule-org-configuration-conflict-when-associations-exist, guardduty.concurrent-update-custom-detection-rule-org-config-conflict.
+
+## Evidence
+- guardduty.create-investigation-without-permission-denied: 'expected AccessDeniedException, but the call SUCCEEDED and returned {'ResponseMetadata': {'HTTPStatusCode': 202, ...}, 'InvestigationId': '...'}' after assuming a role with an explicit Deny on guardduty:CreateInvestigation. Expected 403 AccessDeniedException with the IAM explicit-deny message template quoted in the description.
+- guardduty.update-ipset-without-permission-denied: 'expected the call to be rejected, but it succeeded with {'ResponseMetadata': {'HTTPStatusCode': 200, ...}}'.
+- guardduty.get-custom-detection-rule-cross-account-denied: 'Check timed out after 60.0s' — the check loops on fresh role sessions waiting for the Deny to be honoured; no denial is ever returned.
+- guardduty.delete-org-config-conflict-when-associations-exist: CreateCustomDetectionRuleOrgConfiguration 'expected AccessDeniedException, but the call SUCCEEDED and returned {'ResponseMetadata': {'HTTPStatusCode': 200, ... 'content-length': '2'}}'. Expected AccessDeniedException / 'The request is rejected because the caller is not authorized to call this API.'
+- guardduty.delete-custom-detection-rule-org-configuration-conflict-when-associations-exist: 'expected a rejection, but the call SUCCEEDED and returned {'ResponseMetadata': {'HTTPStatusCode': 200, ...}}'.
+- guardduty.concurrent-update-custom-detection-rule-org-config-conflict: 'expected every concurrent UpdateCustomDetectionRuleOrgConfiguration racer to be denied for this non-delegated-admin caller, got kind=err code=ResourceNotFoundException'.
+
+## Steps to Reproduce
+1. Run the six guardduty checks in trace_ids.
+2. Cause 1 manual repro: iam.CreateRole with a trust policy for the account root, put_role_policy with {'Effect':'Deny','Action':['guardduty:CreateInvestigation'],'Resource':'*'}, sts.AssumeRole, then call CreateInvestigation(DetectorId, TriggerPrompt='x') with those credentials — the emulator answers 202. Repeat with guardduty:UpdateIPSet / guardduty:GetCustomDetectionRule.
+3. Cause 2 manual repro: as a plain account (no delegated admin enabled), call ListCustomDetectionRules to pick a RuleId, then CreateCustomDetectionRuleOrgConfiguration(RuleId, Mode='DRY_RUN'), UpdateCustomDetectionRuleOrgConfiguration(RuleId, Mode='DRY_RUN', IncludeAccountIds=['999999999000']), DeleteCustomDetectionRuleOrgConfiguration and ListCustomDetectionRuleOrgConfigurations — expect 403 AccessDeniedException with the quoted text for all four; also call DescribeOrganizationConfiguration and expect BadRequestException 'The request failed because a delegated administrator account has not been enabled.'
