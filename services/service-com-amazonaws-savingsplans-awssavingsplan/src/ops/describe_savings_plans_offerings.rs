@@ -219,7 +219,9 @@ fn validation(message: String) -> DescribeSavingsPlansOfferingsError {
 ///
 /// Each list-shaped filter admits the values it names and, when absent or
 /// empty, constrains nothing; `productType` matches an offering that covers
-/// that product; `filters` match the offering's own properties.
+/// that product; a `filters` entry names one of the offering's own properties,
+/// so it follows the offering's own rule
+/// ([`crate::state::Offering::matches_filter`]), the crate's one home for it.
 fn admits(
     input: &DescribeSavingsPlansOfferingsInput,
     offering: &crate::state::Offering,
@@ -247,21 +249,12 @@ fn admits(
             return false;
         }
     }
-    for filter in input.filters.iter().flatten() {
-        let Some(name) = filter.name.as_deref() else {
-            continue;
-        };
-        let admitted = match offering.property(name) {
-            Some(value) => crate::state::filter_admits(filter.values.as_ref(), value),
-            // An offering that does not carry the property cannot satisfy a
-            // filter on it, unless that filter names no value at all.
-            None => filter.values.as_ref().is_none_or(Vec::is_empty),
-        };
-        if !admitted {
-            return false;
-        }
-    }
-    true
+    input.filters.iter().flatten().all(|filter| {
+        filter
+            .name
+            .as_deref()
+            .is_none_or(|name| offering.matches_filter(name, filter.values.as_ref()))
+    })
 }
 
 /// Project a stored catalog entry onto the wire shape.

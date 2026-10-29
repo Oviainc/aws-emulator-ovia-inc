@@ -27,6 +27,8 @@ mod offering_product_type_coverage;
 mod offering_rate_catalog;
 #[path = "all/plan_rate_card.rs"]
 mod plan_rate_card;
+#[path = "all/property_filter_rule.rs"]
+mod property_filter_rule;
 #[path = "all/queued_plan_wire_rules.rs"]
 mod queued_plan_wire_rules;
 #[path = "all/queued_purchase_deletion.rs"]

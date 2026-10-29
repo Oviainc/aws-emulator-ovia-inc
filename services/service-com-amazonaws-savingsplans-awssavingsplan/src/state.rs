@@ -507,10 +507,27 @@ pub const DEFAULT_OFFERINGS_PAGE_SIZE: usize = 20;
 
 /// Whether a list-shaped request filter admits `value`: an absent or empty list
 /// constrains nothing, a populated one admits only the values it names.
+///
+/// A value a resource always carries, so the admission rule is
+/// [`property_filter_admits`] with the property present.
 pub fn filter_admits(filter: Option<&Vec<String>>, value: &str) -> bool {
-    match filter {
-        Some(values) if !values.is_empty() => values.iter().any(|v| v == value),
-        _ => true,
+    property_filter_admits(filter, Some(value))
+}
+
+/// Whether a filter on ONE named property admits a resource whose value for
+/// that property is `field` — `None` when the resource does not carry the
+/// property at all.
+///
+/// The crate's one home for the property-filter rule, which every search that
+/// narrows by a named property follows: a filter with no values constrains
+/// nothing, a resource that is not dimensioned by the property a filter names
+/// cannot satisfy it, and otherwise the filter admits the values it names.
+pub fn property_filter_admits(values: Option<&Vec<String>>, field: Option<&str>) -> bool {
+    match (values, field) {
+        (Some(values), _) if values.is_empty() => true,
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(values), Some(field)) => values.iter().any(|value| value == field),
     }
 }
 
@@ -743,6 +760,15 @@ impl Offering {
             .iter()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.as_str())
+    }
+
+    /// Whether a `SavingsPlanOfferingFilterElement` admits this offering.
+    /// `name` is a `SavingsPlanOfferingFilterAttribute` — one of the properties
+    /// an offering is scoped by — and the rule is the crate's one
+    /// property-filter rule ([`property_filter_admits`]): an offering that does
+    /// not carry the property a filter names cannot satisfy it.
+    pub fn matches_filter(&self, name: &str, values: Option<&Vec<String>>) -> bool {
+        property_filter_admits(values, self.property(name))
     }
 
     /// The term, in hours — what an hourly commitment is multiplied by to get
@@ -1439,7 +1465,8 @@ impl RateLineItem {
     /// the product, the service that bills it, its usage type or its billing
     /// operation — or one of the properties the item is priced along, and a line
     /// item that is not dimensioned by the property a filter names cannot
-    /// satisfy it.
+    /// satisfy it — the crate's one property-filter rule
+    /// ([`property_filter_admits`]), over the fields a rate filter can name.
     pub fn matches_filter(&self, name: &str, values: Option<&Vec<String>>) -> bool {
         let field = match name {
             "productType" => Some(self.product_type.as_str()),
@@ -1448,12 +1475,7 @@ impl RateLineItem {
             "operation" => Some(self.operation.as_str()),
             property => self.property(property),
         };
-        match (values, field) {
-            (Some(values), _) if values.is_empty() => true,
-            (None, _) => true,
-            (Some(_), None) => false,
-            (Some(values), Some(field)) => values.iter().any(|value| value == field),
-        }
+        property_filter_admits(values, field)
     }
 }
 

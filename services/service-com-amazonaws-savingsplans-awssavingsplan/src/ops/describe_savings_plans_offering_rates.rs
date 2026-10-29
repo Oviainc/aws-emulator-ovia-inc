@@ -270,8 +270,10 @@ fn offering_admits(
 /// Whether every filter on the RATE itself admits `item`.
 ///
 /// Each list-shaped filter admits the values it names and, when absent or empty,
-/// constrains nothing; `filters` match the line item's own dimensions, so a line
-/// item that is not priced along the property a filter names cannot satisfy it.
+/// constrains nothing; `filters` match the line item's own dimensions, so the
+/// rule a `filters` entry follows is the line item's own
+/// ([`crate::state::RateLineItem::matches_filter`]), the crate's one home for
+/// it.
 fn item_admits(
     input: &DescribeSavingsPlansOfferingRatesInput,
     item: &crate::state::RateLineItem,
@@ -285,21 +287,12 @@ fn item_admits(
     {
         return false;
     }
-    for filter in input.filters.iter().flatten() {
-        let Some(name) = filter.name.as_deref() else {
-            continue;
-        };
-        let admitted = match item.property(name) {
-            Some(value) => filter_admits(filter.values.as_ref(), value),
-            // A line item that is not priced along the property cannot satisfy a
-            // filter on it, unless that filter names no value at all.
-            None => filter.values.as_ref().is_none_or(Vec::is_empty),
-        };
-        if !admitted {
-            return false;
-        }
-    }
-    true
+    input.filters.iter().flatten().all(|filter| {
+        filter
+            .name
+            .as_deref()
+            .is_none_or(|name| item.matches_filter(name, filter.values.as_ref()))
+    })
 }
 
 /// Project a priced line item, and the offering pricing it, onto the wire shape.
