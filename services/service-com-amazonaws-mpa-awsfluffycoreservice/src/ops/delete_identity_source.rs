@@ -270,7 +270,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        source.begin_deletion(now);
+        // The instant the removal comes due is computed with checked arithmetic BEFORE the
+        // record is touched, so a `now` the service cannot add that span to is the modelled
+        // server error this operation declares and leaves the source exactly as it was —
+        // never a panic, and never a source in `DELETING` whose removal is owed at no
+        // instant at all.
+        if !source.begin_deletion(now) {
+            return Err(
+                DeleteIdentitySourceErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the identity source's removal instant could not be computed"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
 
         Ok(DeleteIdentitySourceOutput)
     }

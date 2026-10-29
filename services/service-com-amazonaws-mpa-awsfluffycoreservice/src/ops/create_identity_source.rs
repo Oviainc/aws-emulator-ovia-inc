@@ -321,9 +321,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries the region this request was signed for — not the `Region` of the IAM
         // Identity Center instance, which is the instance's own and is stored as such.
         let region = crate::state::request_region(ctx.parts());
+
+        // The activation instant this create owes is computed with checked arithmetic
+        // BEFORE anything is written — not even the creation-order id the ARN carries is
+        // consumed — so a `now` the service cannot add that span to is the modelled server
+        // error this operation declares, and never a panic or a stored source whose
+        // activation is owed at no instant at all.
+        let activation_not_computable = || {
+            CreateIdentitySourceError::Modeled(
+                CreateIdentitySourceErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the identity source's activation instant could not be computed"
+                            .to_string(),
+                    },
+                ),
+            )
+        };
+        if now
+            .checked_add(crate::state::IDENTITY_SOURCE_ACTIVATION_DELAY)
+            .is_none()
+        {
+            return Err(activation_not_computable());
+        }
         let seq = state.next_identity_source_seq();
         let arn = crate::state::identity_source_arn(&region, seq);
-        let source = crate::state::IdentitySource::creating(
+        let Some(source) = crate::state::IdentitySource::creating(
             arn.clone(),
             source_type,
             parameters.instance_arn.clone(),
@@ -339,7 +361,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default(),
             now,
             seq,
-        );
+        ) else {
+            return Err(activation_not_computable());
+        };
         state.insert_identity_source(source);
         if let Some(token) = client_token {
             state.idempotency_tokens.insert(token, arn.clone());

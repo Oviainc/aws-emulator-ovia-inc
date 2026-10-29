@@ -341,6 +341,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
+            // The same rule for the invitation an approver this change ADDS is owed: the
+            // approver set is built after the update session is recorded, so the instant
+            // its response comes due is checked here, through the one helper that computes
+            // it (`crate::state::invitation_response_due`), before anything is written.
+            if input.approvers.is_some()
+                && crate::state::invitation_response_due(now).is_none()
+            {
+                return Err(UpdateApprovalTeamErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::UNCOMPUTABLE_INVITATION_RESPONSE.to_string(),
+                    },
+                )
+                .into());
+            }
+
             // The store is bounded, so a caller looping on this operation cannot grow
             // this process's memory without end (`crate::state::MAX_SESSIONS`). This
             // operation declares `ServiceQuotaExceededException` (402), which is the
@@ -401,7 +416,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.approvers.as_ref(),
                 &existing_approvers,
                 now,
-            )
+            )?
             .unwrap_or(existing_approvers);
             if synchronize_mfa_devices {
                 for approver in &mut requested_approvers {
@@ -441,7 +456,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.approvers.as_ref(),
             &existing_approvers,
             now,
-        );
+        )?;
         let team = state.team_mut(&input.arn).ok_or_else(not_found)?;
         let mut applied = false;
         if let Some(description) = input.description.as_ref() {
@@ -470,22 +485,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The approver set this request produces, or `None` when it names no `Approvers` and the
-/// team therefore keeps the set it has.
+/// The approver set this request produces, or `Ok(None)` when it names no `Approvers` and
+/// the team therefore keeps the set it has.
 ///
 /// Built through the one store path that mints an approver id
 /// ([`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::invite_requested_approvers`]),
 /// which ADVANCES the store's approver sequence: this is called only once every refusal
 /// the request can earn has been decided, so a refused request consumes no id and the
 /// next accepted one mints the id that follows the last one really recorded.
+///
+/// That store path computes the instant an invited approver's response comes due with
+/// checked arithmetic before it mints anything, so a `now` it cannot add that span to is
+/// the modelled server error this operation declares — and writes nothing.
 fn requested_approver_set(
     state: &mut crate::state::ComAmazonawsMpaAwsfluffycoreserviceState,
     requested: Option<&Vec<ApprovalTeamRequestApprover>>,
     existing: &[crate::state::Approver],
     now: ::std::time::SystemTime,
-) -> Option<Vec<crate::state::Approver>> {
-    let requested = requested?;
-    Some(state.invite_requested_approvers(
+) -> Result<Option<Vec<crate::state::Approver>>, UpdateApprovalTeamError> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    let invited = state.invite_requested_approvers(
         requested.iter().map(|approver| {
             (
                 approver.primary_identity_id.as_str(),
@@ -494,5 +515,14 @@ fn requested_approver_set(
         }),
         existing,
         now,
-    ))
+    );
+    match invited {
+        Some(approvers) => Ok(Some(approvers)),
+        None => Err(UpdateApprovalTeamErrorModeled::InternalServerException(
+            InternalServerException {
+                message: crate::state::UNCOMPUTABLE_INVITATION_RESPONSE.to_string(),
+            },
+        )
+        .into()),
+    }
 }

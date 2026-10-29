@@ -357,7 +357,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reached only here, once every refusal this request can earn has been decided: a
         // refused create consumes no id. The team has no approver yet, so every approver
         // the request names is newly invited.
-        let approvers: Vec<crate::state::Approver> = state.invite_requested_approvers(
+        //
+        // The instant each invitation's response comes due is computed with checked
+        // arithmetic before anything is written, so a `now` the service cannot add that
+        // span to is the modelled server error this operation declares rather than a panic
+        // part-way through the approver set.
+        let Some(approvers) = state.invite_requested_approvers(
             input.approvers.iter().map(|requested| {
                 (
                     requested.primary_identity_id.as_str(),
@@ -366,7 +371,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             &[],
             now,
-        );
+        ) else {
+            return Err(CreateApprovalTeamErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::UNCOMPUTABLE_INVITATION_RESPONSE.to_string(),
+                },
+            )
+            .into());
+        };
 
         let region = crate::state::request_region(ctx.parts());
         let arn = crate::state::team_arn(&region, &input.name);

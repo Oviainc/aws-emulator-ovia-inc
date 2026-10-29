@@ -245,6 +245,25 @@ pub const SYNCHRONIZE_MFA_DEVICES_ACTION: &str = "SYNCHRONIZE_MFA_DEVICES";
 /// observes the transient `PENDING` state and the errors that go with it.
 pub const INVITATION_RESPONSE_DELAY: Duration = Duration::from_millis(500);
 
+/// The instant an approver invited at `now` is owed their invitation response at, or
+/// `None` when `now` names no instant this service could record that response at.
+///
+/// The ONE place that arithmetic lives: [`Approver::invited`] records it, and a write path
+/// that records something else (an update session) before it builds an approver set checks
+/// it ahead of that write, so the two cannot disagree about which requests can be served.
+/// A caller that answers `None` with the modelled server error its operation declares
+/// words it with [`UNCOMPUTABLE_INVITATION_RESPONSE`].
+#[must_use]
+pub fn invitation_response_due(now: SystemTime) -> Option<SystemTime> {
+    now.checked_add(INVITATION_RESPONSE_DELAY)
+}
+
+/// The sentence every write path that invites approvers answers its modelled server error
+/// with when [`invitation_response_due`] names no instant, so the two paths cannot word one
+/// and the same internal failure differently.
+pub const UNCOMPUTABLE_INVITATION_RESPONSE: &str =
+    "the invited approvers' response instant could not be computed";
+
 /// How long after an update is requested the team reports its approvers' approval of
 /// that update (and therefore how long the team waits in `UPDATE_PENDING_APPROVAL`).
 ///
@@ -1083,15 +1102,23 @@ pub struct Approver {
 }
 
 impl Approver {
-    /// A freshly invited approver: `PENDING` until the clock owes its response.
+    /// A freshly invited approver: `PENDING` until the clock owes its response, or `None`
+    /// when `now` names no instant this service could record that response at.
+    ///
+    /// The instant is computed with CHECKED arithmetic, like every other clock-owed
+    /// instant this module records ([`PendingTeamUpdate::requested`],
+    /// [`Session::for_team`], [`deletion_schedule`]): the calling handler answers a
+    /// `None` with the server error it declares, so no approver is ever stored waiting on
+    /// a response owed at no instant at all and no request can panic part-way through an
+    /// approver set.
     #[must_use]
     pub fn invited(
         approver_id: String,
         primary_identity_id: String,
         primary_identity_source_arn: String,
         now: SystemTime,
-    ) -> Self {
-        Self {
+    ) -> Option<Self> {
+        Some(Self {
             approver_id,
             primary_identity_id,
             primary_identity_source_arn,
@@ -1099,9 +1126,9 @@ impl Approver {
             response_time: None,
             last_activity: None,
             last_activity_time: None,
-            invitation_response_due: Some(now + INVITATION_RESPONSE_DELAY),
+            invitation_response_due: Some(invitation_response_due(now)?),
             mfa_methods: initial_mfa_methods(),
-        }
+        })
     }
 
     /// Synchronize this approver's MFA devices with the identity source: every device
@@ -1581,8 +1608,13 @@ pub struct IdentitySource {
 }
 
 impl IdentitySource {
-    /// A freshly created identity source: `CREATING` until the clock owes its
-    /// activation.
+    /// A freshly created identity source: `CREATING` until the clock owes its activation,
+    /// or `None` when `now` names no instant this service could record that activation at.
+    ///
+    /// The instant is computed with CHECKED arithmetic, like every other clock-owed
+    /// instant this module records: the calling handler answers a `None` with the server
+    /// error it declares, so no source is ever stored waiting on an activation owed at no
+    /// instant at all and no request can panic the handler here.
     #[must_use]
     pub fn creating(
         arn: String,
@@ -1592,8 +1624,8 @@ impl IdentitySource {
         tags: BTreeMap<String, String>,
         now: SystemTime,
         seq: u64,
-    ) -> Self {
-        Self {
+    ) -> Option<Self> {
+        Some(Self {
             arn,
             source_type,
             instance_arn,
@@ -1604,11 +1636,11 @@ impl IdentitySource {
             approval_portal_url: None,
             status: IdentitySourceStatus::Creating,
             creation_time: now,
-            activation_due: Some(now + IDENTITY_SOURCE_ACTIVATION_DELAY),
+            activation_due: Some(now.checked_add(IDENTITY_SOURCE_ACTIVATION_DELAY)?),
             deletion_due: None,
             tags,
             seq,
-        }
+        })
     }
 
     /// Materialise the activation the clock owes this source: it becomes `ACTIVE`, and
@@ -1631,13 +1663,24 @@ impl IdentitySource {
     /// its activation is dropped: the clock owes exactly one transition from here, the
     /// removal. Idempotent — a repeat delete keeps the due instant the first one
     /// recorded, so asking twice does not postpone the removal.
-    pub fn begin_deletion(&mut self, now: SystemTime) {
+    ///
+    /// Answers whether this source is now `DELETING` with its removal scheduled. The
+    /// instant is computed with CHECKED arithmetic, like every other clock-owed instant
+    /// this module records, and BEFORE the record is touched: `false` says only that `now`
+    /// names no instant the removal could be recorded at, and leaves the source exactly as
+    /// it was for the calling handler to answer with the server error it declares.
+    #[must_use]
+    pub fn begin_deletion(&mut self, now: SystemTime) -> bool {
         if self.status == IdentitySourceStatus::Deleting {
-            return;
+            return true;
         }
+        let Some(deletion_due) = now.checked_add(IDENTITY_SOURCE_DELETION_DELAY) else {
+            return false;
+        };
         self.status = IdentitySourceStatus::Deleting;
         self.activation_due = None;
-        self.deletion_due = Some(now + IDENTITY_SOURCE_DELETION_DELAY);
+        self.deletion_due = Some(deletion_due);
+        true
     }
 }
 
@@ -3179,15 +3222,25 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     /// to the store and not a local computation: this is the one place either write path
     /// that builds an approver set calls, and a handler calls it only once every refusal
     /// the request can earn has been decided.
+    ///
+    /// `None` says only that `now` names no instant an invited approver's response could
+    /// be recorded at ([`Approver::invited`]), which the calling operation answers with
+    /// the server error it declares. That instant is computed BEFORE the first id is
+    /// minted, so such a refusal writes nothing and consumes no `ApproverId`, exactly as
+    /// [`ComAmazonawsMpaAwsfluffycoreserviceState::start_session`] consumes no
+    /// initiation-order id for a session it cannot build.
     pub fn invite_requested_approvers<'a, I>(
         &mut self,
         requested: I,
         existing: &[Approver],
         now: SystemTime,
-    ) -> Vec<Approver>
+    ) -> Option<Vec<Approver>>
     where
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
+        // Computed before anything is minted, so the store is untouched when the instant
+        // an invitation's response comes due cannot be computed at all.
+        invitation_response_due(now)?;
         requested
             .into_iter()
             .map(|(identity_id, source_arn)| {
@@ -3196,7 +3249,7 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
                         && stored.primary_identity_source_arn == source_arn
                 });
                 match retained {
-                    Some(stored) => stored.clone(),
+                    Some(stored) => Some(stored.clone()),
                     None => Approver::invited(
                         self.mint_approver_id(),
                         identity_id.to_string(),
