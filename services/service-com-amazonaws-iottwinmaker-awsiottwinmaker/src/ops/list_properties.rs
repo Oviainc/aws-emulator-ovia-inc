@@ -11,7 +11,8 @@
 //! ([`crate::state::Workspace::component_property_names`]). Each one is reported with
 //! the definition that gives it its meaning (the component's own, else the inherited
 //! one — [`crate::state::Workspace::effective_property_definition`]) and the value it
-//! reads as: the value written to the property, else the default its definition
+//! reads as: the most recent value written to the property — the last value of its
+//! time series where the data plane has written one — else the default its definition
 //! declares, and no `value` member at all when neither exists
 //! ([`crate::state::latest_property_value`]) — the same answer `GetPropertyValue`
 //! gives for the same property.

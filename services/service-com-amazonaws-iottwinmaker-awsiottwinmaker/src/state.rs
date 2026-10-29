@@ -3172,15 +3172,23 @@ pub fn property_definition_response(
     })
 }
 
-/// The value a read reports for ONE property: the value written to the
-/// property, else the DEFAULT its definition declares, and nothing at all when
-/// neither exists.
+/// The value a read reports for ONE property: the MOST RECENT value written to
+/// the property, else the DEFAULT its definition declares, and nothing at all
+/// when neither exists.
 ///
-/// `defaultValue` is "an object that contains the default value" of the
-/// property, so a property nothing has written to still reads as the value its
-/// definition gave it, and a write to the property replaces it. Shared by every
-/// reader of a property's current value, so one property reads the same way
-/// wherever it is reported; `definition` is the one
+/// A property is written to through either plane, so both are consulted here:
+/// the time-series data plane writes values FOR an instant
+/// ([`PropertyRecord::time_series`], keyed by that instant, so its LAST entry
+/// is the value written for the latest instant), and the control plane writes
+/// one current value ([`PropertyRecord::value`]). The series is preferred where
+/// it holds anything, because a property the data plane has written to carries
+/// its values there and nowhere else; `defaultValue` is "an object that
+/// contains the default value" of the property, so a property nothing has
+/// written to still reads as the value its definition gave it, and either write
+/// replaces it.
+///
+/// Shared by every reader of a property's current value, so one property reads
+/// the same way wherever it is reported; `definition` is the one
 /// [`Workspace::effective_property_definition`] resolved, which is what makes a
 /// default declared only on the component TYPE apply to a component that
 /// restates nothing.
@@ -3189,7 +3197,7 @@ pub fn latest_property_value(
     definition: Option<&crate::ops::types::PropertyDefinitionRequest>,
 ) -> Option<crate::ops::types::DataValue> {
     property
-        .and_then(|property| property.value.clone())
+        .and_then(|property| property.latest_written_value())
         .or_else(|| definition.and_then(|definition| definition.default_value.clone()))
 }
 
@@ -3881,6 +3889,21 @@ impl PropertyRecord {
         while self.time_series.len() > MAX_TIME_SERIES_VALUES_PER_PROPERTY {
             self.time_series.pop_first();
         }
+    }
+
+    /// The most recent value WRITTEN to this property, through either plane —
+    /// `None` for a property nothing has written a value to.
+    ///
+    /// The series is keyed by the instant each value was written FOR
+    /// ([`Self::time_series`]), so its last entry is the value of its latest
+    /// instant and that is this property's current value wherever the data
+    /// plane has written one; a property the data plane never wrote to reads as
+    /// the single value the control plane set on it ([`Self::value`]).
+    pub fn latest_written_value(&self) -> Option<crate::ops::types::DataValue> {
+        if let Some((_, latest)) = self.time_series.last_key_value() {
+            return Some(latest.value.clone());
+        }
+        self.value.clone()
     }
 }
 

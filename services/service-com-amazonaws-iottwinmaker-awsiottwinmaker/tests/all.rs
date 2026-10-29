@@ -173,6 +173,9 @@ mod sync_resource_listing;
 #[path = "all/tabular_page_token_scope.rs"]
 mod tabular_page_token_scope;
 
+#[path = "all/time_series_latest_value.rs"]
+mod time_series_latest_value;
+
 #[path = "all/time_series_property_refusal.rs"]
 mod time_series_property_refusal;
 

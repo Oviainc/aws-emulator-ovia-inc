@@ -1613,9 +1613,13 @@ fn components_document(entity: &crate::state::Entity) -> Document {
                                     "propertyName".to_string(),
                                     text(property_name),
                                 )]);
-                                if let Some(value) = &property.value {
+                                // The most recent value written to the
+                                // property through either plane, so a time
+                                // series property is queried on the value its
+                                // series last carries rather than on nothing.
+                                if let Some(value) = property.latest_written_value() {
                                     property_members
-                                        .insert("propertyValue".to_string(), data_value(value, 0));
+                                        .insert("propertyValue".to_string(), data_value(&value, 0));
                                 }
                                 Document::Object(property_members)
                             })

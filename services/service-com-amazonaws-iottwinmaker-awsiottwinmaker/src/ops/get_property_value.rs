@@ -2,8 +2,9 @@
 
 //! @op GetPropertyValue
 //! Reads the CURRENT value of the selected properties out of stored state. A
-//! property reads as the value written to it, else as the default its
-//! definition declares — the component's own definition, else the one it
+//! property reads as the most recent value written to it — the last value of
+//! its time series where the data plane has written one — else as the default
+//! its definition declares — the component's own definition, else the one it
 //! inherits from the component type it instantiates
 //! ([`crate::state::latest_property_value`] over
 //! [`crate::state::Workspace::effective_property_definition`]) — and the
@@ -659,10 +660,11 @@ fn property_group_names(
         })
 }
 
-/// The value one property of one component reads as: the value written to it,
-/// else the default declared by the definition that gives it its meaning — the
-/// component's own, else the one it inherits from the component type it
-/// instantiates. The one rule every answer here is built from.
+/// The value one property of one component reads as: the most recent value
+/// written to it — the last value of its time series where the data plane has
+/// written one — else the default declared by the definition that gives it its
+/// meaning — the component's own, else the one it inherits from the component
+/// type it instantiates. The one rule every answer here is built from.
 fn property_value(
     workspace: &crate::state::Workspace,
     component: &ScopedComponent<'_>,
