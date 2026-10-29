@@ -12309,6 +12309,15 @@ pub const MAX_CUSTOM_ERROR_RESPONSES_PER_DISTRIBUTION: usize = 25;
 /// you don't specify a value, the default is 10 seconds."
 pub const DEFAULT_ERROR_CACHING_MIN_TTL_SECONDS: i64 = 10;
 
+/// The character a custom error response's `responsePagePath` has to begin with.
+///
+/// The member is modelled as a bare `string`, and its documentation states the
+/// form the model cannot express: "The path to the custom error page that the
+/// distribution returns to the viewer (for example, /404.html). The path must
+/// begin with a forward slash (/) and reference an object that is available from
+/// the origin."
+const CUSTOM_ERROR_PAGE_PATH_PREFIX: char = '/';
+
 /// How many distributions one `GetDistributions` page carries.
 ///
 /// The operation is paginated — its `pageToken` is "The token to advance to the
@@ -12516,7 +12525,8 @@ pub fn distribution_domain_name(id: &str) -> String {
 
 /// The custom error responses `requested` asks a distribution to serve, each with
 /// every member it left out filled in from that member's documented default, or a
-/// refusal when the list carries more entries than one distribution holds.
+/// refusal when the list carries more entries than one distribution holds or an
+/// entry states a page path the distribution could not fetch from its origin.
 ///
 /// A member the model documents a default for is one the SERVICE fills in, so a
 /// stored — and therefore reported — entry carries it whether or not the request
@@ -12524,6 +12534,11 @@ pub fn distribution_domain_name(id: &str) -> String {
 /// `ipAddressType` do. `errorCachingMinTTL` is the only member of
 /// `DistributionCustomErrorResponse` whose documentation states a default; the
 /// other three are reported as the request stated them.
+///
+/// `responsePagePath` is the path of an object of the origin, which is what
+/// beginning with [`CUSTOM_ERROR_PAGE_PATH_PREFIX`] says, so an entry stating one
+/// in any other form states no page the distribution could serve. An entry that
+/// carries no page path states no path to check.
 ///
 /// The ONE owner of that rule, so `CreateDistribution` and `UpdateDistribution`
 /// cannot record the list two different ways.
@@ -12536,6 +12551,19 @@ pub fn custom_error_responses_from_request(
             requested.len(),
             MAX_CUSTOM_ERROR_RESPONSES_PER_DISTRIBUTION
         ));
+    }
+    for (index, response) in requested.iter().enumerate() {
+        let Some(path) = response.response_page_path.as_deref() else {
+            continue;
+        };
+        if !path.starts_with(CUSTOM_ERROR_PAGE_PATH_PREFIX) {
+            return Err(format!(
+                "customErrorResponses[{index}].responsePagePath '{path}' is not the path to an \
+                 object of the origin: the path must begin with a forward slash \
+                 ({CUSTOM_ERROR_PAGE_PATH_PREFIX}) and reference an object that is available from \
+                 the origin"
+            ));
+        }
     }
     Ok(requested
         .iter()

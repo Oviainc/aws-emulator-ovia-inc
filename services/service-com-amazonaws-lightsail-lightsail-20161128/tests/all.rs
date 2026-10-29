@@ -135,6 +135,8 @@ mod distribution_certificate_attachment;
 mod distribution_certificate_detach;
 #[path = "all/distribution_create_certificate_validation.rs"]
 mod distribution_create_certificate_validation;
+#[path = "all/distribution_custom_error_page_path.rs"]
+mod distribution_custom_error_page_path;
 #[path = "all/distribution_custom_error_responses.rs"]
 mod distribution_custom_error_responses;
 #[path = "all/distribution_delete.rs"]

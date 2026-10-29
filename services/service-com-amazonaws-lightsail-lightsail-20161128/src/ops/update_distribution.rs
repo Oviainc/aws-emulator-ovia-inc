@@ -288,9 +288,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A request that carries the list replaces the distribution's with the
         // entries it names, each with the documented default of the one member
-        // whose model states one filled in and the list itself within its bound
-        // — the same rule `CreateDistribution` records a new distribution's list
-        // by, asked of the crate's one owner of it.
+        // whose model states one filled in, each page path a path of the origin
+        // and the list itself within its bound — the same rule
+        // `CreateDistribution` records a new distribution's list by, asked of
+        // the crate's one owner of it.
         let custom_error_responses = input
             .custom_error_responses
             .as_deref()

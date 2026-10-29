@@ -287,8 +287,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Every custom error response the distribution records is the entry the
         // request carried, with the documented default of the one member whose
-        // model states one filled in — the crate's one owner of that rule —
-        // and the list itself within its bound.
+        // model states one filled in and the page path of each entry a path of
+        // the origin — the crate's one owner of that rule — and the list itself
+        // within its bound.
         let custom_error_responses = crate::state::custom_error_responses_from_request(
             input.custom_error_responses.as_deref().unwrap_or_default(),
         )
