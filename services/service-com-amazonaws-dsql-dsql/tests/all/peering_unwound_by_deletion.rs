@@ -45,11 +45,14 @@ use crate::multi_region_cluster_status::{FIRST_REGION, SECOND_REGION, WITNESS_RE
 /// The Region the third cluster of a case lives in: a fourth Region, so that no
 /// cluster of the fixture names its own Region as the witness Region (the
 /// constraint both writing operations document).
-const THIRD_REGION: &str = "eu-west-1";
+pub const THIRD_REGION: &str = "eu-west-1";
 
 /// A peer ARN naming a cluster this store does not hold, as `ClusterArn`'s pattern
 /// requires one (`^arn:aws(-[^:]+)?:dsql:[a-z0-9-]{1,20}:[0-9]{12}:cluster/[a-z0-9]{26}$`).
-fn absent_peer_arn() -> String {
+///
+/// Shared with the suites that configure a peer this service holds no cluster for,
+/// so one store never holds a cluster an "absent" peer entry names.
+pub fn absent_peer_arn() -> String {
     expected_arn(THIRD_REGION, &cluster_id_for(7_700))
 }
 
@@ -244,7 +247,7 @@ async fn wait_until_gone(case: &str, client: &Dsql, identifier: &str) {
 
 /// The `clusters` list a `multiRegionProperties` reports, or an empty list when it
 /// reports none.
-fn reported_peers(properties: &Value) -> Vec<String> {
+pub fn reported_peers(properties: &Value) -> Vec<String> {
     properties
         .get("clusters")
         .and_then(Value::as_array)

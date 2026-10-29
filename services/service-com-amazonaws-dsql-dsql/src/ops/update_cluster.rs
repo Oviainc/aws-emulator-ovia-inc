@@ -6,7 +6,10 @@
 //! only the members the request carries, and moves it to `UPDATING` with the clock
 //! owing it the status its new configuration settles into — `ACTIVE` again, or
 //! `PENDING_SETUP` while a multi-Region peering it asks for is not established on
-//! both sides. Unknown identifier -> `ResourceNotFoundException` (404);
+//! both sides. A `multiRegionProperties.clusters` REPLACES the peer list the cluster
+//! carried, so every current peer the new list omits is a peering this call removes:
+//! that peer stops naming this cluster too, and its own status is recomputed from
+//! what the removal leaves it with. Unknown identifier -> `ResourceNotFoundException` (404);
 //! a cluster in a status that does not accept a mutation -> `ConflictException` (409),
 //! except that a cluster waiting in `PENDING_SETUP` takes a request asking for
 //! NOTHING BUT the configuration change that completes its peering;
@@ -317,6 +320,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateClusterErrorModeled::ConflictException(conflict).into());
         }
 
+        // The peers the cluster is part of a peering with GOING INTO this call, read
+        // before the request's configuration is applied: the ones the new peer list
+        // omits are the peerings this call dismantles (see below). A request that
+        // carries no peer list rewrites none, so it needs no copy of the old one.
+        let peers_before: Vec<String> = if input.multi_region_properties.is_some() {
+            stored.multi_region_peers().to_vec()
+        } else {
+            Vec::new()
+        };
+
         // The record this call leaves behind, written back under the same key. It is
         // built beside the store rather than in it so that the status the clock owes
         // it can be read off the OTHER clusters — its peers — at the same time.
@@ -372,6 +385,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cluster.multi_region_properties = Some(multi_region_properties);
         }
 
+        // A peer list REPLACES the one the cluster carried, so every current peer it
+        // omits is a peering this call removes — the member this operation documents
+        // `dsql:RemovePeerCluster` for. Collected here, while both lists are at hand,
+        // and unwound on the other side once the new configuration is persisted.
+        let removed_peers: Vec<String> = peers_before
+            .into_iter()
+            .filter(|peer| !cluster.names_peer(peer))
+            .collect();
+
         // The reconfiguration is asynchronous: the cluster reports `UPDATING` and the
         // clock owes it the status its configuration settles into — `ACTIVE` again,
         // or `PENDING_SETUP` while the multi-Region peering it now asks for is not
@@ -385,8 +407,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let updated = updated_cluster_output(&cluster);
         state.clusters.insert(input.identifier.clone(), cluster);
+        // A peering is a relationship BOTH clusters carry, so the call that stops
+        // naming a peer takes this cluster's half out of THAT peer's configuration
+        // too — the same tear-down a deletion of this cluster performs, reached
+        // through the update instead. Without it the dropped peer keeps reporting a
+        // cluster it is no longer peered with, and the next call that recomputes its
+        // status reads that reference as a peering still waiting to be established.
+        // The peers the new list KEEPS are untouched: their relationship stands.
+        state.unwind_peerings_removed_from(&updated.arn, &removed_peers, now);
         // Configuring one side of a peering can complete the OTHER side's wait, so
-        // the clock now owes `ACTIVE` to every cluster this call finished peering.
+        // the clock now owes `ACTIVE` to every cluster this call finished peering —
+        // the ADD direction, beside the tear-down above, which owes its own.
         state.owe_active_to_clusters_done_waiting(now);
         if let Some(token) = input.client_token {
             state

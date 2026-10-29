@@ -1064,9 +1064,55 @@ impl ComAmazonawsDsqlDsqlState {
     /// cluster's peers, capped at [`MAX_MULTI_REGION_PEERS`], so the cost is
     /// bounded by a constant the way [`Self::settle_once`]'s is.
     pub fn unwind_peerings_with(&mut self, arn: &str, now: SystemTime) {
+        self.unwind_peering_halves(arn, now, |_| true);
+    }
+
+    /// Unwind the peerings of the cluster `arn` names with the clusters
+    /// `removed_peers` names, and with those only.
+    ///
+    /// The same tear-down as [`Self::unwind_peerings_with`], narrowed to the peers
+    /// a rewritten peer list no longer names: a peering is a relationship BOTH
+    /// clusters carry, so a cluster that stops naming a peer dismantles the
+    /// relationship on that peer's side too, while the peers it still names keep
+    /// theirs. Called by the operation that REPLACES a cluster's peer list, which
+    /// is what retires the relationships the new list omits.
+    ///
+    /// A named cluster this store does not hold, and one that was not naming
+    /// `arn` back, are nothing to unwind.
+    ///
+    /// `removed_peers` comes from a peer list the cluster itself carried, capped at
+    /// [`MAX_MULTI_REGION_PEERS`], so the narrowed scan's cost stays bounded by a
+    /// constant the way [`Self::unwind_peerings_with`]'s is.
+    pub fn unwind_peerings_removed_from(
+        &mut self,
+        arn: &str,
+        removed_peers: &[String],
+        now: SystemTime,
+    ) {
+        if removed_peers.is_empty() {
+            return;
+        }
+        self.unwind_peering_halves(arn, now, |cluster| {
+            removed_peers.iter().any(|peer| peer == &cluster.arn)
+        });
+    }
+
+    /// Take the cluster `arn` names out of the configuration of every cluster that
+    /// names it and that `unwinds` selects, and let the clock settle whichever of
+    /// them is no longer left waiting.
+    ///
+    /// The one place a peering's other half is taken away, so a tear-down reached
+    /// through a deletion and one reached through a rewritten peer list leave the
+    /// same end state.
+    fn unwind_peering_halves(
+        &mut self,
+        arn: &str,
+        now: SystemTime,
+        mut unwinds: impl FnMut(&Cluster) -> bool,
+    ) {
         let mut unwound = false;
         for cluster in self.clusters.values_mut() {
-            if !cluster.names_peer(arn) {
+            if !cluster.names_peer(arn) || !unwinds(cluster) {
                 continue;
             }
             unwound = true;

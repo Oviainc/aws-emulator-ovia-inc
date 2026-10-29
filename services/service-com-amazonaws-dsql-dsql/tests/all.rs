@@ -57,6 +57,8 @@ mod nested_arn_not_found;
 mod pagination_token_refusal;
 #[path = "all/peering_unwound_by_deletion.rs"]
 mod peering_unwound_by_deletion;
+#[path = "all/peering_unwound_by_update.rs"]
+mod peering_unwound_by_update;
 #[path = "all/policy_document_class.rs"]
 mod policy_document_class;
 #[path = "all/policy_token_optional_claim_distinctness.rs"]
