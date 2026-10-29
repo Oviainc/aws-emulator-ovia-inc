@@ -52,6 +52,12 @@
 //! each service's model, so the caller decides it and passes the decision to
 //! [`aws_validation_refusal_withholding`]; the clause, the envelope and every other
 //! requirement stay this module's and the framework's.
+//!
+//! One constraint class reaches no refusal seam at all: a map's KEY, which the walk treats
+//! as a path segment rather than as a constrained leaf, so nothing is reported about it and
+//! the HANDLER applies the key shape's own constraints. [`map_key_refusal`] is the message
+//! it states — the framework's envelope and clause, over the map member, listing what a key
+//! has to satisfy — so a request refused for its key reads like one refused for its value.
 
 use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 use smithy_server_runtime::{Refusal, Refused};
@@ -217,6 +223,74 @@ pub fn enum_value_not_found<S: AsRef<str>>(value: &str, permitted: &[S]) -> Stri
 #[must_use]
 pub fn bracketed_findings(findings: &[String]) -> String {
     format!("[{}]", findings.join(", "))
+}
+
+/// The message a service states for a MAP whose KEY broke one of the constraints the
+/// map's KEY SHAPE declares — the one constraint class no walk ahead of a handler
+/// reports, because that walk treats a map's key as a path segment rather than as a
+/// constrained leaf, so the handler applies the key's constraints and words the refusal
+/// with this.
+///
+/// It is the framework's own envelope and clause, over the map MEMBER: the key's
+/// requirements are listed as what a key has to satisfy, each sentence the framework's
+/// (so it cannot drift from the one a reported member gets), and the clause states no
+/// value — a map has no scalar rendering to quote, which is the same half
+/// [`collection_length_clause`] drops for a map's own `@length`.
+///
+/// `min_length` and `max_length` are the key shape's declared `@length` bounds and
+/// `pattern` its declared `@pattern`, quoted as the caller hands it over: a service
+/// whose refusals render an expression AWS's way passes it through
+/// [`crate::validation::unanchored`] first, one that keeps the framework's rendering
+/// passes the model's own.
+#[must_use]
+pub fn map_key_refusal(
+    member_path: &str,
+    min_length: i64,
+    max_length: i64,
+    pattern: &str,
+) -> String {
+    let requirements = [
+        requirement(ViolationKind::MaxLength(max_length)),
+        requirement(ViolationKind::MinLength(min_length)),
+        requirement(ViolationKind::Pattern(pattern.to_string())),
+    ];
+    let clause = format!(
+        "Value at '{member_path}' failed to satisfy constraint: Map keys must satisfy \
+         constraint: {}",
+        bracketed_findings(&requirements)
+    );
+    // The ENVELOPE is the framework's too: one placeholder violation about the same
+    // member renders it, and that violation's own clause is then swapped for the one
+    // about the key — the same substitution [`stated_refusal`] makes on a clause whose
+    // value half it drops. `envelope` answers `None` only for no violation at all.
+    let placeholder = Violation {
+        path: member_path.to_string(),
+        kind: ViolationKind::MissingRequiredMember,
+        value: None,
+    };
+    match envelope(std::slice::from_ref(&placeholder)) {
+        Some(rendered) => rendered.replace(&placeholder.message(), &clause),
+        None => clause,
+    }
+}
+
+/// The REQUIREMENT half of a violation's clause — the `Member must …` sentence — taken
+/// out of the framework's own clause rather than spelled here, so the requirements a
+/// handler lists and the ones a reported member gets are the same sentences.
+fn requirement(kind: ViolationKind) -> String {
+    /// How the framework separates a clause's member half from its requirement.
+    const CLAUSE_SEPARATOR: &str = "failed to satisfy constraint: ";
+
+    let clause = Violation {
+        path: String::new(),
+        kind,
+        value: None,
+    }
+    .message();
+    match clause.split_once(CLAUSE_SEPARATOR) {
+        Some((_, requirement)) => requirement.to_string(),
+        None => clause,
+    }
 }
 
 /// The sentence the resource-tagging layer in front of a service refuses a caller-supplied
@@ -394,8 +468,8 @@ fn stated_refusal(
 mod tests {
     use super::{
         aws_validation_refusal, aws_validation_refusal_with, aws_validation_refusal_withholding,
-        enum_value_not_found, pattern_mismatch, property_count_refusal, string_too_long,
-        string_too_short,
+        enum_value_not_found, map_key_refusal, pattern_mismatch, property_count_refusal,
+        string_too_long, string_too_short,
     };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema_server::{Violation, ViolationKind};
@@ -407,6 +481,49 @@ mod tests {
             path: path.to_owned(),
             kind,
             value: Some(value.to_owned()),
+        }
+    }
+
+    /// RULE: a refusal about a map's KEY is the framework's envelope over a clause that
+    /// names the map MEMBER, states no value (a map has no scalar rendering) and lists
+    /// what a key has to satisfy, in the framework's own requirement sentences.
+    ///
+    /// The rows differ along the member path and along the bounds and pattern the key
+    /// shape declares, so nothing of one caller's shape is baked into the rendering.
+    #[test]
+    fn a_map_key_refusal_states_what_a_key_must_satisfy() {
+        // (case, member path, minimum, maximum, pattern, the message stated)
+        let rows: [(&str, &str, i64, i64, &str, &str); 2] = [
+            (
+                "a top-level map member",
+                "parameters",
+                1,
+                192,
+                "^[.$a-zA-Z0-9_-]+$",
+                "1 validation error detected: Value at 'parameters' failed to satisfy \
+                 constraint: Map keys must satisfy constraint: [Member must have length less \
+                 than or equal to 192, Member must have length greater than or equal to 1, \
+                 Member must satisfy regular expression pattern: ^[.$a-zA-Z0-9_-]+$]",
+            ),
+            (
+                "a map nested under a list element",
+                "entries.2.member.tags",
+                0,
+                128,
+                "[a-z]+",
+                "1 validation error detected: Value at 'entries.2.member.tags' failed to \
+                 satisfy constraint: Map keys must satisfy constraint: [Member must have \
+                 length less than or equal to 128, Member must have length greater than or \
+                 equal to 0, Member must satisfy regular expression pattern: [a-z]+]",
+            ),
+        ];
+
+        for (case, member_path, min, max, pattern, expected) in rows {
+            let stated = map_key_refusal(member_path, min, max, pattern);
+            assert_eq!(
+                stated, expected,
+                "case {case:?}: expected {expected:?}, got {stated:?}"
+            );
         }
     }
 

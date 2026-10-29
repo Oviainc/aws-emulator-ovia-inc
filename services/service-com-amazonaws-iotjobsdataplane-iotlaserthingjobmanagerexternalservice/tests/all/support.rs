@@ -104,6 +104,26 @@ impl Emulator {
             .to_string()
     }
 
+    /// `StartCommandExecution` on `thing` carrying `parameters`, answered as it came
+    /// off the wire — for a suite whose rows are starts the service may REFUSE, so the
+    /// status and the body are the assertion rather than a minted id.
+    pub(crate) async fn start_command_with_parameters(
+        &self,
+        thing: &str,
+        parameters: &Value,
+    ) -> (u16, Value) {
+        self.call(
+            "POST",
+            "/command-executions",
+            Some(json!({
+                "targetArn": format!("arn:aws:iot:us-east-1:111122223333:thing/{thing}"),
+                "commandArn": COMMAND_ARN,
+                "parameters": parameters,
+            })),
+        )
+        .await
+    }
+
     pub(crate) async fn pending(&self, thing: &str) -> (u16, Value) {
         self.call("GET", &format!("/things/{thing}/jobs"), None).await
     }

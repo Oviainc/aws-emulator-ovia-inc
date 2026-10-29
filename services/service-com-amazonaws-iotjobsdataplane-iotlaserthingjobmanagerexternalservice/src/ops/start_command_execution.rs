@@ -3,7 +3,10 @@
 //! @op StartCommandExecution
 //!
 //! Validates the request FIRST — `targetArn` must name an IoT thing (any other
-//! resource type is refused 400 naming the type the request passed) and
+//! resource type is refused 400 naming the type the request passed), every
+//! `parameters` NAME must satisfy the map's key shape `CommandParameterName` (the one
+//! constraint of this request the framework's pre-handler walk does not report, since
+//! it treats a map's key as a path segment rather than as a constrained leaf), and
 //! `commandArn` must name a command that EXISTS in the shared command index the
 //! IoT control plane owns (`service_common::iot_commands`), or the call is refused
 //! 400 `ValidationException` naming the missing command rather than accepting an
@@ -443,6 +446,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let thing_name = thing_name_from_target_arn(&input.target_arn)?;
         let command_name = command_name_from_arn(&input.command_arn)?;
+
+        // What the request's own values have to satisfy is read BEFORE anything is
+        // looked up, so a request the map cannot carry is refused whether or not the
+        // command it names exists. A `parameters` NAME is bounded by the map's KEY
+        // shape (`CommandParameterName`), and the constraint walk the framework runs
+        // ahead of this handler treats a map's key as a path segment rather than as a
+        // constrained leaf — so a name outside that shape's declared length or pattern
+        // arrives unreported and is this handler's to refuse, exactly as the
+        // `statusDetails` name is on the sibling operations
+        // (`service_common::iot_job_executions::check_status_details`). Without it a
+        // name no map admits is baked into the persisted job document the device later
+        // fetches.
+        if let Err(reason) = ::service_common::iot_job_executions::check_command_parameter_names(
+            input.parameters.as_ref(),
+        ) {
+            return Err(invalid_request(reason));
+        }
 
         // An execution can only be started for a command that EXISTS: "using the
         // command created with the CreateCommand API, start a command execution on

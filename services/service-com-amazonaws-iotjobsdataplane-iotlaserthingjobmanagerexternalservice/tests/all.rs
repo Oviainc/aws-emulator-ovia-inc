@@ -15,6 +15,8 @@
 mod clock_driven_timeout_is_materialised;
 #[path = "all/command_execution_concurrency.rs"]
 mod command_execution_concurrency;
+#[path = "all/command_execution_parameter_names.rs"]
+mod command_execution_parameter_names;
 #[path = "all/command_execution_validation.rs"]
 mod command_execution_validation;
 #[path = "all/describe_job_execution_against_the_clock.rs"]

@@ -219,8 +219,76 @@ pub const STATUS_DETAIL_NAME_PATTERN: &str = "^[a-zA-Z0-9:_-]+$";
 /// `statusDetails` member targets: 1..[`MAX_STATUS_DETAIL_NAME_LEN`] characters
 /// matching [`STATUS_DETAIL_NAME_PATTERN`].
 pub fn is_modeled_status_detail_name(name: &str) -> bool {
-    is_restricted_name(name, MAX_STATUS_DETAIL_NAME_LEN)
+    is_bounded_name(
+        name,
+        MAX_STATUS_DETAIL_NAME_LEN,
+        &RESTRICTED_NAME_PUNCTUATION,
+    )
 }
+
+/// `CommandParameterName`'s declared maximum length (`length 1..192`) — the bound on
+/// the NAME of a command execution's `parameters` pair, which is the map's KEY shape's
+/// own and has nothing to do with what the pair's VALUE admits.
+pub const MAX_COMMAND_PARAMETER_NAME_LEN: usize = 192;
+/// `CommandParameterName`'s declared pattern, as a refusal states it: a parameter name
+/// is one or more of these characters and nothing else, so a name carrying a space,
+/// punctuation outside the set or a non-ASCII character is not a name the map admits.
+/// Unlike the name shapes of the job-execution surface it admits `.` and `$` (a
+/// template placeholder's path) and admits no `:`.
+pub const COMMAND_PARAMETER_NAME_PATTERN: &str = "^[.$a-zA-Z0-9_-]+$";
+
+/// Whether `name` satisfies `CommandParameterName`, the KEY shape of the
+/// `CommandExecutionParameterMap` a command execution's `parameters` member targets:
+/// 1..[`MAX_COMMAND_PARAMETER_NAME_LEN`] characters matching
+/// [`COMMAND_PARAMETER_NAME_PATTERN`].
+pub fn is_modeled_command_parameter_name(name: &str) -> bool {
+    is_bounded_name(
+        name,
+        MAX_COMMAND_PARAMETER_NAME_LEN,
+        &COMMAND_PARAMETER_NAME_PUNCTUATION,
+    )
+}
+
+/// Check the NAMES of a command execution's `parameters` against what the map's KEY
+/// shape admits — the same rule, and for the same reason, as the NAME half of
+/// [`check_status_details`]: the constraint walk ahead of a handler treats a map's key
+/// as a path segment rather than as a constrained leaf, so a name outside
+/// `CommandParameterName`'s declared length or pattern reaches the handler unreported
+/// and is the handler's to refuse. `Err` carries the message the caller answers with its
+/// modelled validation error — the same envelope and clause that walk states for a
+/// member it DOES report ([`crate::validation_message::map_key_refusal`]), so a request
+/// refused for a name reads like one refused for a value.
+///
+/// Generic over the pair's VALUE because only the names are checked here: a value's own
+/// declared constraints are leaves the walk does report, so re-checking them would
+/// state one rule in two places.
+pub fn check_command_parameter_names<V>(
+    parameters: Option<&HashMap<String, V>>,
+) -> Result<(), String> {
+    let Some(parameters) = parameters else {
+        return Ok(());
+    };
+    if parameters
+        .keys()
+        .all(|name| is_modeled_command_parameter_name(name))
+    {
+        return Ok(());
+    }
+    Err(crate::validation_message::map_key_refusal(
+        COMMAND_PARAMETERS_MEMBER,
+        MIN_COMMAND_PARAMETER_NAME_LEN,
+        i64::try_from(MAX_COMMAND_PARAMETER_NAME_LEN).unwrap_or(i64::MAX),
+        COMMAND_PARAMETER_NAME_PATTERN,
+    ))
+}
+
+/// The member a command execution's parameters arrive in, as a refusal's clause names
+/// it (`StartCommandExecution$parameters`).
+const COMMAND_PARAMETERS_MEMBER: &str = "parameters";
+
+/// `CommandParameterName`'s declared minimum length (`length 1..192`): a name is at
+/// least one character, which is also what its pattern's `+` requires.
+const MIN_COMMAND_PARAMETER_NAME_LEN: i64 = 1;
 
 /// `stepTimeoutInMinutes`'s documented lower bound: "Valid values for this parameter
 /// range from 1 to 10080 (1 minute to 7 days)."
@@ -246,20 +314,29 @@ pub const MAX_THING_NAME_LEN: usize = 128;
 /// a `/things/{thingName}/...` request, so an execution stored under it would exist
 /// and be unreachable.
 pub fn is_modeled_thing_name(name: &str) -> bool {
-    is_restricted_name(name, MAX_THING_NAME_LEN)
+    is_bounded_name(name, MAX_THING_NAME_LEN, &RESTRICTED_NAME_PUNCTUATION)
 }
 
-/// Whether `text` is 1..=`max` characters of the restricted set the IoT family's
-/// name shapes declare (`^[a-zA-Z0-9:_-]+$`) — the test behind
-/// [`is_modeled_thing_name`] and [`is_modeled_status_detail_name`], which differ only
-/// in the maximum their own shape declares. Smithy `length` counts CHARACTERS, so
-/// this does too.
-fn is_restricted_name(text: &str, max: usize) -> bool {
+/// The punctuation the RESTRICTED name shapes of this family declare beside the
+/// alphanumerics (`^[a-zA-Z0-9:_-]+$`): `ThingName` and `DetailsKey`.
+const RESTRICTED_NAME_PUNCTUATION: [char; 3] = [':', '_', '-'];
+
+/// The punctuation [`COMMAND_PARAMETER_NAME_PATTERN`] declares beside the
+/// alphanumerics (`^[.$a-zA-Z0-9_-]+$`).
+const COMMAND_PARAMETER_NAME_PUNCTUATION: [char; 4] = ['.', '$', '_', '-'];
+
+/// Whether `text` is 1..=`max` characters, each an ASCII alphanumeric or one of
+/// `punctuation` — the test behind every name shape of this family, which differ only
+/// in the maximum and the punctuation their own shape declares
+/// ([`is_modeled_thing_name`], [`is_modeled_status_detail_name`],
+/// [`is_modeled_command_parameter_name`]). Smithy `length` counts CHARACTERS, so this
+/// does too.
+fn is_bounded_name(text: &str, max: usize, punctuation: &[char]) -> bool {
     let length = text.chars().count();
     (1..=max).contains(&length)
         && text
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'))
+            .all(|c| c.is_ascii_alphanumeric() || punctuation.contains(&c))
 }
 
 /// Seconds in one minute, for the timer members documented in MINUTES.
@@ -1162,6 +1239,80 @@ mod tests {
                 is_modeled_status_detail_name(name)
             );
         }
+    }
+
+    /// RULE: a command execution's `parameters` NAME is admitted only within what the
+    /// map's KEY shape declares — 1..[`MAX_COMMAND_PARAMETER_NAME_LEN`] characters of
+    /// [`COMMAND_PARAMETER_NAME_PATTERN`] — which is a different set from the one the
+    /// job-execution surface's name shapes declare, admitting `.` and `$` and no `:`.
+    ///
+    /// The rows span the length (the minimum, the maximum, one past it, far past it)
+    /// and the character classes the pattern admits and does not.
+    #[test]
+    fn a_command_parameter_name_is_admitted_only_within_the_key_constraint() {
+        let at_maximum = "n".repeat(MAX_COMMAND_PARAMETER_NAME_LEN);
+        let past_maximum = "n".repeat(MAX_COMMAND_PARAMETER_NAME_LEN + 1);
+        let far_past_maximum = "n".repeat(MAX_COMMAND_PARAMETER_NAME_LEN * 2);
+
+        // (case, the name, admitted)
+        let rows: &[(&str, &str, bool)] = &[
+            ("one character, the declared minimum", "s", true),
+            ("every character class the pattern admits", "A.b$1_c-9", true),
+            ("the declared maximum length", &at_maximum, true),
+            ("one character past the maximum", &past_maximum, false),
+            ("twice the maximum", &far_past_maximum, false),
+            ("a space", "bad name", false),
+            ("a colon, which this pattern does not admit", "a:b", false),
+            ("punctuation outside the pattern", "level!", false),
+            ("a non-ASCII letter", "niveau²", false),
+            ("empty", "", false),
+        ];
+
+        for (case, name, admitted) in rows {
+            // The value side is irrelevant to a name check, so every row carries the
+            // same one.
+            let parameters: HashMap<String, &str> =
+                HashMap::from([((*name).to_string(), "v")]);
+            let answered = check_command_parameter_names(Some(&parameters));
+            assert_eq!(
+                answered.is_ok(),
+                *admitted,
+                "case {case:?} (a name of {} characters): expected admitted={admitted}, got {answered:?}",
+                name.chars().count()
+            );
+            assert_eq!(
+                is_modeled_command_parameter_name(name),
+                *admitted,
+                "case {case:?}: the name test and the check must agree, got {}",
+                is_modeled_command_parameter_name(name)
+            );
+        }
+
+        // An absent member asks for nothing and is always acceptable; one name the map
+        // does not admit refuses the whole map, whatever else it carries.
+        let absent: Option<&HashMap<String, &str>> = None;
+        assert!(
+            check_command_parameter_names(absent).is_ok(),
+            "case absent: expected an omitted member to be acceptable"
+        );
+        let mixed: HashMap<String, &str> =
+            HashMap::from([("level".to_string(), "v"), ("bad name".to_string(), "v")]);
+        let answered = check_command_parameter_names(Some(&mixed));
+        // The refusal states what a KEY of this map has to satisfy: the member it is
+        // about, the key shape's declared bounds and its declared pattern.
+        let expected = format!(
+            "1 validation error detected: Value at 'parameters' failed to satisfy constraint: \
+             Map keys must satisfy constraint: [Member must have length less than or equal to \
+             {MAX_COMMAND_PARAMETER_NAME_LEN}, Member must have length greater than or equal \
+             to 1, Member must satisfy regular expression pattern: \
+             {COMMAND_PARAMETER_NAME_PATTERN}]"
+        );
+        assert_eq!(
+            answered,
+            Err(expected.clone()),
+            "case one inadmissible name among admissible ones: expected {expected:?}, got \
+             {answered:?}"
+        );
     }
 
     /// A created execution is pending at version 1, execution number 1, and the two
