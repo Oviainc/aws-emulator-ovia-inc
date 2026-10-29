@@ -166,20 +166,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A retried create (same `@idempotencyToken` `RequestId`) must return the
         // partner input the first one created, not a second one. The token map is
         // the input store's, shared with `CreateInput`, so a replay counts only
-        // when the input that token created is a partner OF THE INPUT THIS
-        // REQUEST NAMES: a token spent on some other create names an input this
-        // call was not asked for, and answering with it would report a resource
-        // the request did not ask to exist.
+        // when the token was spent creating a partner OF THE INPUT THIS REQUEST
+        // NAMES (the scope passed below): a token spent on some other create
+        // names an input this call was not asked for, and answering with it
+        // would report a resource the request did not ask to exist.
         if let Some(existing) = input
             .request_id
             .as_deref()
-            .and_then(|token| state.input_for_token(token))
-            .filter(|existing| {
-                state
-                    .inputs
-                    .get(*existing)
-                    .is_some_and(|stored| stored.partner_of.as_deref() == Some(&input.input_id))
-            })
+            .and_then(|token| state.input_for_token(Some(&input.input_id), token))
             .map(str::to_string)
         {
             let created = state.input_description(&existing).ok_or_else(unavailable)?;
@@ -237,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.request_id {
             // Bounded, evicting write: a caller-chosen token can neither
             // accumulate past the cap nor outlive the input it created.
-            state.record_input_idempotency_token(token, &id);
+            state.record_input_idempotency_token(Some(&input.input_id), &token, &id);
         }
 
         // The partner's OWN ingest endpoints are allocated here, where its

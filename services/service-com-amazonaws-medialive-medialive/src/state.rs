@@ -3430,17 +3430,38 @@ impl ComAmazonawsMedialiveMedialiveState {
         ::std::net::Ipv4Addr::from(IP_POOL_BASE + offset).to_string()
     }
 
-    /// Record `token` as having created `input_id`, under the same bounded,
-    /// evicting discipline as the channel tokens.
-    pub fn record_input_idempotency_token(&mut self, token: String, input_id: &str) {
-        self.input_tokens
-            .record(token, input_id, MAX_INPUT_IDEMPOTENCY_TOKENS);
+    /// Record `token` as having created `input_id` for the create that spent it
+    /// — `partner_of` is the input the new input is a partner OF, or `None` for
+    /// a standalone create — under the same bounded, evicting discipline as the
+    /// channel tokens.
+    pub fn record_input_idempotency_token(
+        &mut self,
+        partner_of: Option<&str>,
+        token: &str,
+        input_id: &str,
+    ) {
+        self.input_tokens.record(
+            input_token_key(partner_of, token),
+            input_id,
+            MAX_INPUT_IDEMPOTENCY_TOKENS,
+        );
     }
 
-    /// The input a stored `RequestId` created, if that input still exists.
-    pub fn input_for_token(&self, request_id: &str) -> Option<&str> {
-        let id = self.input_tokens.created(request_id)?;
-        self.inputs.get(id).map(|input| input.id.as_str())
+    /// The input a stored `RequestId` created for the create described by
+    /// `partner_of`, if that input still exists and is still the input that
+    /// create asks for.
+    ///
+    /// The scope is part of the key AND re-checked on the record, so a token
+    /// spent on a different create resolves to nothing here: the create it
+    /// named is not the one this request describes.
+    pub fn input_for_token(&self, partner_of: Option<&str>, request_id: &str) -> Option<&str> {
+        let id = self
+            .input_tokens
+            .created(&input_token_key(partner_of, request_id))?;
+        self.inputs
+            .get(id)
+            .filter(|input| input.partner_of.as_deref() == partner_of)
+            .map(|input| input.id.as_str())
     }
 
     /// The channels whose `InputAttachments` name this input. One predicate, so
@@ -5579,6 +5600,23 @@ impl InputRecord {
         } else {
             input_source_type::STATIC
         }
+    }
+}
+
+/// The key the input idempotency-token map records a token against.
+///
+/// Both input creates spend a `RequestId` against this ONE map, so the create
+/// the token was spent on is part of the key: a standalone create and the
+/// create of a partner for a given input each keep their own entry, and a
+/// token spent on one of them is not a replay of the other. `partner_of` is the
+/// input a partner is created for, or `None` for a standalone create. The scope
+/// is re-checked on the record the token resolves to
+/// ([`ComAmazonawsMedialiveMedialiveState::input_for_token`]), so the key's
+/// shape carries no invariant of its own.
+fn input_token_key(partner_of: Option<&str>, token: &str) -> String {
+    match partner_of {
+        Some(primary) => format!("partner/{primary}/{token}"),
+        None => format!("input/{token}"),
     }
 }
 

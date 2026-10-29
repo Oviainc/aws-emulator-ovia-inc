@@ -201,11 +201,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle(::std::time::SystemTime::now());
 
         // A retried create (same `@idempotencyToken` `RequestId`) must return the
-        // input the first one created, not a second input.
+        // input the first one created, not a second input. The token map is the
+        // input store's, shared with `CreatePartnerInput`, so a replay counts
+        // only when the token was spent on a STANDALONE create like this one
+        // (`None` scope): a token spent creating somebody's partner names an
+        // input this call was not asked for, and answering with it would report
+        // a resource the request did not ask to exist while never creating the
+        // input this request describes.
         if let Some(existing) = input
             .request_id
             .as_deref()
-            .and_then(|token| state.input_for_token(token))
+            .and_then(|token| state.input_for_token(None, token))
             .map(str::to_string)
         {
             let created = state.input_description(&existing).ok_or_else(unavailable)?;
@@ -270,7 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.request_id {
             // Bounded, evicting write: a caller-chosen token can neither
             // accumulate past the cap nor outlive the input it created.
-            state.record_input_idempotency_token(token, &id);
+            state.record_input_idempotency_token(None, &token, &id);
         }
 
         // A push input's ingest endpoint is allocated here, where the
