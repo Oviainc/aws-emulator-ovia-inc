@@ -60,7 +60,7 @@ async fn register_targets(router: &MultiServiceRouter, jobs: &[&str], extra: Val
 }
 
 /// The runs `GetJobRuns` reports for `job`, newest first.
-async fn job_runs(router: &MultiServiceRouter, job: &str) -> Vec<Value> {
+pub(crate) async fn job_runs(router: &MultiServiceRouter, job: &str) -> Vec<Value> {
     let page = ok(router, "GetJobRuns", &json!({ "JobName": job })).await;
     page.get("JobRuns")
         .and_then(Value::as_array)
