@@ -38,6 +38,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Percent-encodes an ARN into the single `@httpLabel` path segment the tagging
+# operations bind it to, the way an AWS SDK client does (tests/all/resource_tags.rs).
+percent-encoding = "2"
 # The S3-sourced deployment suite mounts the S3 service beside Amplify on one engine,
 # because StartDeployment reads its source by calling S3 in process.
 service-com-amazonaws-s3-amazons3 = { workspace = true }

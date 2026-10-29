@@ -5760,6 +5760,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "percent-encoding",
  "serde_json",
  "service-com-amazonaws-s3-amazons3",
  "service-common",

@@ -18,7 +18,7 @@
 //! it shares its branch's lifetime and its `jobId` cannot collide with another
 //! branch's.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::ops::types::{App, BackendEnvironment, Branch, DomainAssociation, Job, Step, Webhook};
 
@@ -825,6 +825,180 @@ impl ComAmazonawsAmplifyAmplifyState {
             .values()
             .find_map(|app| app.webhooks.get(webhook_id))
     }
+
+    /// The tag map of the resource `resource_arn` names, to READ.
+    ///
+    /// Answers the map the resource carries — the empty map when it carries none —
+    /// or, for an ARN that names no resource this store holds, the `message` a 404
+    /// carries for it (see [`not_found_message`]). A clone rather than a borrow:
+    /// reading tags must leave the record untouched, and a resource with no tags yet
+    /// has no map to borrow.
+    pub fn resource_tags(&self, resource_arn: &str) -> Result<HashMap<String, String>, String> {
+        let tags = match tagged_resource(resource_arn) {
+            Some(TaggedResource::App { app_id }) => &self.app_for_tagging(app_id)?.app.tags,
+            Some(TaggedResource::Branch {
+                app_id,
+                branch_name,
+            }) => {
+                let app = self.app_for_tagging(app_id)?;
+                let branch = app
+                    .branches
+                    .get(branch_name)
+                    .ok_or_else(|| tag_not_found_message(BRANCH_ENTITY, branch_name))?;
+                &branch.branch.tags
+            }
+            None => return Err(tag_not_found_message(RESOURCE_ENTITY, resource_arn)),
+        };
+        Ok(tags.clone().unwrap_or_default())
+    }
+
+    /// The tag map of the resource `resource_arn` names, to WRITE.
+    ///
+    /// The map lives ON the resource's own record — `App$tags` for an app,
+    /// `Branch$tags` for a branch — so a tag write is reported by every operation that
+    /// reports that record (`GetApp`, `ListApps`, `GetBranch`, `ListBranches`) as well
+    /// as by `ListTagsForResource`, and the two cannot drift. A resource that carries
+    /// no tags yet gets its (empty) map here, which is what a write then fills — and
+    /// what every reader already reports for such a resource, so materialising it is
+    /// not a change a caller can see.
+    ///
+    /// The error is the `message` a 404 carries for an ARN naming no such resource.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Result<&mut HashMap<String, String>, String> {
+        match tagged_resource(resource_arn) {
+            Some(TaggedResource::App { app_id }) => {
+                let app = self
+                    .apps
+                    .get_mut(app_id)
+                    .ok_or_else(|| tag_not_found_message(APP_ENTITY, app_id))?;
+                Ok(app.app.tags.get_or_insert_with(HashMap::new))
+            }
+            Some(TaggedResource::Branch {
+                app_id,
+                branch_name,
+            }) => {
+                let app = self
+                    .apps
+                    .get_mut(app_id)
+                    .ok_or_else(|| tag_not_found_message(APP_ENTITY, app_id))?;
+                let branch = app
+                    .branches
+                    .get_mut(branch_name)
+                    .ok_or_else(|| tag_not_found_message(BRANCH_ENTITY, branch_name))?;
+                Ok(branch.branch.tags.get_or_insert_with(HashMap::new))
+            }
+            None => Err(tag_not_found_message(RESOURCE_ENTITY, resource_arn)),
+        }
+    }
+
+    /// The app an ARN addressed for tagging, or the `message` its 404 carries.
+    fn app_for_tagging(&self, app_id: &str) -> Result<&AmplifyApp, String> {
+        self.apps
+            .get(app_id)
+            .ok_or_else(|| tag_not_found_message(APP_ENTITY, app_id))
+    }
+}
+
+/// The `message` a tagging 404 carries: the crate's one not-found construction, inside
+/// the length its `message` member is modelled to carry.
+fn tag_not_found_message(entity: &str, identifier: &str) -> String {
+    within_error_message_bound(not_found_message(entity, identifier))
+}
+
+/// The resource an Amplify ARN addresses for TAGGING, and the identifiers that locate
+/// it in this store.
+///
+/// The taggable resources are the ones this service MODELS a tag map on: `App$tags`
+/// and `Branch$tags` are the only `TagMap` members on a resource shape, and `tags` is
+/// accepted only by `CreateApp` and `CreateBranch`
+/// (`smithy_query(query="operation",operation="CreateApp,CreateBranch")`). An ARN
+/// naming anything else carries no tags to report, so tagging answers it as a resource
+/// it does not hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedResource<'a> {
+    /// `arn:aws:amplify:<region>:<account>:apps/<appId>`.
+    App { app_id: &'a str },
+    /// `arn:aws:amplify:<region>:<account>:apps/<appId>/branches/<branchName>`.
+    Branch {
+        app_id: &'a str,
+        branch_name: &'a str,
+    },
+}
+
+/// The resource `resource_arn` addresses, read out of the ARN's own resource part, or
+/// `None` when the ARN addresses no taggable resource of this service.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>` — everything
+/// after the fifth colon is the resource part, which Amplify builds as
+/// `apps/<appId>` and extends per nested resource (an app's branch ARN is the app's
+/// ARN plus `/branches/<branchName>`, see `CreateBranch`). The branch name is taken as
+/// the WHOLE remainder, because `BranchName` is free text and a branch is commonly
+/// named with a slash in it (`release/1.0`).
+///
+/// The ARN's region and account are NOT matched against the request: this store is not
+/// partitioned by region (see [`ComAmazonawsAmplifyAmplifyState`]), so an ARN locates
+/// a resource by the same identifiers `GetApp` and `GetBranch` take.
+pub fn tagged_resource(resource_arn: &str) -> Option<TaggedResource<'_>> {
+    let resource = resource_arn.splitn(6, ':').nth(5)?;
+    let under_apps = resource.strip_prefix("apps/")?;
+    match under_apps.split_once('/') {
+        None => (!under_apps.is_empty()).then_some(TaggedResource::App {
+            app_id: under_apps,
+        }),
+        Some((app_id, nested)) => {
+            let branch_name = nested.strip_prefix("branches/")?;
+            (!app_id.is_empty() && !branch_name.is_empty()).then_some(TaggedResource::Branch {
+                app_id,
+                branch_name,
+            })
+        }
+    }
+}
+
+/// How many tags one resource may carry at once.
+///
+/// `TagMap` is modelled `length 0..50`
+/// (`smithy_query(query="operation",operation="TagResource")`), and the map a resource
+/// carries IS a `TagMap` — it is what `ListTagsForResource` answers with — so the bound
+/// is on the MERGED map a tag write leaves behind, not only on one request's map.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The `message` a `BadRequestException` carries when a tag write would leave the
+/// resource carrying more than [`MAX_TAGS_PER_RESOURCE`] tags.
+///
+/// Like [`not_found_message`] and [`already_exists_message`], the text is built FROM
+/// THE REQUEST and from the state it would produce — the ARN the request named, the
+/// limit, and the number of tags the merged map would hold — and follows the same
+/// `Failed to <verb> …` construction those refusals use, because the model spells no
+/// message out for this exception beyond "A request contains unexpected data".
+pub fn tag_limit_message(resource_arn: &str, merged: usize) -> String {
+    within_error_message_bound(format!(
+        "Failed to tag resource {resource_arn}. A resource can have a maximum of \
+         {MAX_TAGS_PER_RESOURCE} tags, and these tags would leave it with {merged}."
+    ))
+}
+
+/// The `code` an Amplify `ResourceNotFoundException` carries.
+///
+/// `ResourceNotFoundException$code` is `@required` and modelled as plain text
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`): it is the error's
+/// own code, which is the name the protocol reports for it in `x-amzn-errortype`.
+pub const RESOURCE_NOT_FOUND_CODE: &str = "ResourceNotFoundException";
+
+/// `message` cut to the length an Amplify error message is modelled to carry.
+///
+/// `ErrorMessage` is modelled `length 0..255` while `ResourceArn` is `length 0..2048`
+/// (`smithy_query(query="shape",shape="ErrorMessage")`), so a refusal that quotes the
+/// ARN the request carried can be longer than the member reporting it: the text is cut
+/// to the modelled bound, on a character boundary, rather than sent past it.
+pub fn within_error_message_bound(message: String) -> String {
+    const MAX_ERROR_MESSAGE_CHARS: usize = 255;
+    if message.chars().count() <= MAX_ERROR_MESSAGE_CHARS {
+        return message;
+    }
+    message.chars().take(MAX_ERROR_MESSAGE_CHARS).collect()
 }
 
 /// A counter value mixed with the wall clock through the SplitMix64 finaliser: the
@@ -1087,6 +1261,11 @@ pub const DOMAIN_ENTITY: &str = "Domain";
 /// The entity name [`not_found_message`] and [`already_exists_message`] use for a
 /// backend environment addressed by `environmentName`.
 pub const BACKEND_ENVIRONMENT_ENTITY: &str = "Backend environment";
+
+/// The entity name [`not_found_message`] uses for a resource addressed by its ARN
+/// alone — what the tagging operations take, where the ARN itself is the only
+/// identifier the request carries and it names no resource this store holds.
+pub const RESOURCE_ENTITY: &str = "Resource";
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

@@ -33,6 +33,8 @@ mod branch_jobs;
 mod branch_revision_echo;
 #[path = "all/domain_associations.rs"]
 mod domain_associations;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/s3_sourced_deployments.rs"]
 mod s3_sourced_deployments;
 #[path = "all/state_roundtrip.rs"]
