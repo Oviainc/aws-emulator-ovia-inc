@@ -4719,7 +4719,7 @@ impl ComAmazonawsXrayAwsxrayState {
 /// The CHECK half of a `RetrievalToken` whose identifying half is `identity`:
 /// the same deterministic mixing every derived id of this crate uses, so the
 /// check can be recomputed from the token alone
-/// ([`is_retrieval_token_form`]).
+/// ([`retrieval_token_defect`]).
 ///
 /// This makes the token integrity-checked, not unguessable: it tells a damaged
 /// token from an intact one, and nothing authenticates on it.
@@ -4731,9 +4731,31 @@ pub fn retrieval_token_check(identity: &str) -> String {
 /// ([`ComAmazonawsXrayAwsxrayState::mint_retrieval_token`]).
 pub const RETRIEVAL_TOKEN_HEX_DIGITS: usize = 32;
 
-/// Whether `token` is a `RetrievalToken` this service could have ISSUED: the
-/// right number of hexadecimal digits, and a check half that matches its
-/// identifying half ([`retrieval_token_check`]).
+/// Why a submitted `RetrievalToken` is not a value this service ISSUED.
+///
+/// Both classes are a malformed parameter — `InvalidRequestException` at HTTP
+/// 400, decided BEFORE any lookup — and they differ only in what the
+/// execution-id decoder the value was handed can say about it
+/// ([`malformed_retrieval_token_message`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrievalTokenDefect {
+    /// The value is not of the form a `RetrievalToken` has at all: a width other
+    /// than [`RETRIEVAL_TOKEN_HEX_DIGITS`], or a digit outside the hexadecimal
+    /// alphabet. The decoder was handed something that is not an execution id,
+    /// so it can say only that the execution id was invalid.
+    NotTokenForm,
+    /// The value has the minted width and the minted alphabet, but its check
+    /// half does not derive from its identifying half
+    /// ([`retrieval_token_check`]) — a token damaged after it was issued. The
+    /// decoder read an execution id of the right shape and could not decode it,
+    /// so it names the value it could not decode.
+    UndecodableExecutionId,
+}
+
+/// How `token` misses the `RetrievalToken` values this service mints, or `None`
+/// when it is one this service could have ISSUED: the right number of
+/// hexadecimal digits, and a check half that matches its identifying half
+/// ([`retrieval_token_check`]).
 ///
 /// The only retrieval tokens that exist are the ones `StartTraceRetrieval`
 /// minted, and every one of them carries that check, so a value whose check does
@@ -4748,39 +4770,69 @@ pub const RETRIEVAL_TOKEN_HEX_DIGITS: usize = 32;
 /// Case-insensitive: the mint emits lowercase, but a token differing only in the
 /// case of its digits carries the same value, so it is answered as a retrieval
 /// that is not there rather than as a request that is wrong.
-pub fn is_retrieval_token_form(token: &str) -> bool {
+pub fn retrieval_token_defect(token: &str) -> Option<RetrievalTokenDefect> {
     if token.len() != RETRIEVAL_TOKEN_HEX_DIGITS
         || !token.chars().all(|digit| digit.is_ascii_hexdigit())
     {
-        return false;
+        return Some(RetrievalTokenDefect::NotTokenForm);
     }
     let lowered = token.to_ascii_lowercase();
     let (identity, check) = lowered.split_at(RETRIEVAL_TOKEN_HEX_DIGITS / 2);
-    retrieval_token_check(identity) == check
+    if retrieval_token_check(identity) == check {
+        None
+    } else {
+        Some(RetrievalTokenDefect::UndecodableExecutionId)
+    }
 }
 
-/// What a `RetrievalToken` that is not of [`is_retrieval_token_form`] is refused
-/// with, before any lookup: the name the operation gives the member, the value
-/// the request submitted, and why it could not be read.
+/// What a `RetrievalToken` carrying `defect` ([`retrieval_token_defect`]) is
+/// refused with, before any lookup: the name the operation gives the member, the
+/// value the request submitted, and what the execution-id decoder made of it.
 ///
-/// X-Ray words this refusal as TWO clauses: an outer one naming the parameter
-/// and the value the request submitted — "Invalid <member> <value> passed: " —
-/// and then the fixed cause clause of the execution-id decoder the token is
-/// handed to ([`MALFORMED_RETRIEVAL_TOKEN_CAUSE`]).
+/// X-Ray words this refusal as TWO clauses: an outer one naming the parameter and
+/// the value the request submitted — "Invalid <member> <value> passed: " — and
+/// then the clause of the execution-id decoder the value was handed to. The
+/// request's value is the sentence's ONLY variable; how often it appears is what
+/// the decoder's clause decides:
 ///
-/// The rejected value is the sentence's ONLY variable, and it appears once, in
-/// the outer clause: the decoder's clause states only WHY the value could not be
-/// read, in the same words whatever the operation and whatever the value, so it
-/// never echoes the value a second time. The sentence is built here once and each
-/// reader passes the member name it uses (`retrieval token`, `execution id`).
-pub fn malformed_retrieval_token_message(member: &str, token: &str) -> String {
-    format!("Invalid {member} {token} passed: {MALFORMED_RETRIEVAL_TOKEN_CAUSE}")
+/// * a value that is not of the token form at all got no further than the
+///   decoder's own entry check, which states that the execution id was invalid
+///   and names nothing ([`MALFORMED_RETRIEVAL_TOKEN_CAUSE`]) — so the value
+///   appears once, in the outer clause; and
+/// * a value of the token form whose check does not verify was DECODED and
+///   rejected, and the decoder names the value it could not decode
+///   ([`UNDECODABLE_EXECUTION_ID_CAUSE`]) — so the value appears twice, once per
+///   clause.
+///
+/// The sentence is built here once and each reader passes the member name it uses
+/// (`retrieval token`, `execution id`), so the two readers of one class never
+/// disagree about its wording.
+pub fn malformed_retrieval_token_message(
+    member: &str,
+    token: &str,
+    defect: RetrievalTokenDefect,
+) -> String {
+    match defect {
+        RetrievalTokenDefect::NotTokenForm => {
+            format!("Invalid {member} {token} passed: {MALFORMED_RETRIEVAL_TOKEN_CAUSE}")
+        }
+        RetrievalTokenDefect::UndecodableExecutionId => {
+            format!(
+                "Invalid {member} {token} passed: {UNDECODABLE_EXECUTION_ID_CAUSE}{token}"
+            )
+        }
+    }
 }
 
-/// The inner, decoder clause of a malformed-`RetrievalToken` refusal
-/// ([`malformed_retrieval_token_message`]): fixed text, capitalised exactly this
-/// way, whatever the operation and whatever the value.
+/// The decoder clause a value that is not of the token form at all is refused
+/// with ([`malformed_retrieval_token_message`]): fixed text, capitalised exactly
+/// this way, naming no value, whatever the operation and whatever the value.
 pub const MALFORMED_RETRIEVAL_TOKEN_CAUSE: &str = "Invalid Execution Id";
+
+/// The decoder clause a value of the token form whose check does not verify is
+/// refused with ([`malformed_retrieval_token_message`]): fixed text, sentence
+/// cased, followed by the value the decoder could not decode.
+pub const UNDECODABLE_EXECUTION_ID_CAUSE: &str = "Invalid execution id provided: ";
 
 // ---------------------------------------------------------------------------
 // Sampling rules

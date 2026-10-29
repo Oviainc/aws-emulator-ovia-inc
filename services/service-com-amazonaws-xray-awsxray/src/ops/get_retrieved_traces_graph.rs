@@ -16,10 +16,12 @@
 //! Three refusals, and the ORDER is part of the contract \u2014 the request's own
 //! form is judged before the store is consulted:
 //!
-//! * a `RetrievalToken` that is not of the form this service issues
-//!   ([`crate::state::is_retrieval_token_form`]) could never have named a
-//!   retrieval, so it is refused with `InvalidRequestException` (400);
-//! * a well-formed token this service never issued, or whose retrieval has timed
+//! * a `RetrievalToken` this service could not have ISSUED
+//!   ([`crate::state::retrieval_token_defect`]) \u2014 one that is not of the token
+//!   form at all, or one of that form whose integrity check does not verify \u2014
+//!   could never have named a retrieval, so it is refused with
+//!   `InvalidRequestException` (400), each class in its own words;
+//! * a token that VERIFIES but names no retrieval, or whose retrieval has timed
 //!   out, names no retrieval and is refused with `ResourceNotFoundException`
 //!   (404); and
 //! * a `NextToken` that names no service at or after it was never issued by this
@@ -184,18 +186,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = crate::state::now_epoch_seconds();
-        // VALIDATED BEFORE THE TOKEN IS RESOLVED: a `RetrievalToken` that is not
-        // of the form this service issues could never have named a retrieval, so
-        // it is a malformed parameter (`InvalidRequestException`, 400) rather
-        // than a retrieval that is gone (`ResourceNotFoundException`, 404) — the
-        // distinction the long-term retrieval workflow polls on.
-        if !crate::state::is_retrieval_token_form(&input.retrieval_token) {
+        // VALIDATED BEFORE THE TOKEN IS RESOLVED: the token is INTEGRITY-CHECKED,
+        // not looked up, so a `RetrievalToken` this service could not have issued
+        // — of the token form or not — is a malformed parameter
+        // (`InvalidRequestException`, 400) rather than a retrieval that is gone
+        // (`ResourceNotFoundException`, 404) — the distinction the long-term
+        // retrieval workflow polls on.
+        if let Some(defect) = crate::state::retrieval_token_defect(&input.retrieval_token) {
             return Err(
                 GetRetrievedTracesGraphErrorModeled::InvalidRequestException(
                     InvalidRequestException {
                         message: Some(crate::state::malformed_retrieval_token_message(
                             "execution id",
                             &input.retrieval_token,
+                            defect,
                         )),
                     },
                 )

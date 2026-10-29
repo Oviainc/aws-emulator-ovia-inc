@@ -6,13 +6,17 @@
 //!
 //! The rule the rows below generalise over: the refusal is TWO clauses — the
 //! operation's own clause naming the parameter and the value the request
-//! submitted, then the fixed cause clause of the execution-id decoder the value
-//! was handed to. The rejected value is the sentence's only variable and it
-//! appears once, in the outer clause; the cause clause is the same text whatever
-//! operation was called and whatever the value was.
+//! submitted, then the clause of the execution-id decoder the value was handed
+//! to. The submitted value is the sentence's only variable, and WHICH decoder
+//! clause follows depends on how far the value got: a value that is not of the
+//! issued token form at all never decoded, so the clause states only that the
+//! execution id was invalid and names nothing; a value of the issued form whose
+//! integrity check does not verify WAS decoded and rejected, so the clause names
+//! the value it could not decode. Both classes are the same refusal class — 400
+//! `InvalidRequestException`, before any lookup.
 //!
 //! Rows differ along what that rule generalises over: how the value misses the
-//! minted form (a character flipped inside the minted alphabet and width, a
+//! issued value (a character flipped inside the minted alphabet and width, a
 //! width either side of it, a digit outside the alphabet, another service's id
 //! form, prose, the longest value the model allows), which operation was called,
 //! and therefore which parameter the outer clause names; and, for the cause
@@ -47,9 +51,43 @@ const TOKEN_READERS: [(&str, &str, &str); 3] = [
     ),
 ];
 
-/// The decoder's cause clause, as X-Ray words it: fixed text, capitalised
-/// exactly this way, and naming no value.
+/// The decoder's clause for a value that is not of the issued token form at all:
+/// fixed text, capitalised exactly this way, and naming no value.
 const DECODER_CLAUSE: &str = "Invalid Execution Id";
+
+/// The decoder's clause for a value of the issued token form whose integrity
+/// check does not verify: fixed text, then the value the decoder could not
+/// decode.
+const UNDECODABLE_CLAUSE: &str = "Invalid execution id provided: ";
+
+/// Which of the two bad-token classes a submitted value falls in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// Not of the issued token form at all.
+    NotTokenForm,
+    /// Of the issued token form, but its integrity check does not verify.
+    Undecodable,
+}
+
+/// The refusal `token` must draw from the reader that names the member
+/// `member`, by the rule in this module's header.
+fn expected_message(member: &str, token: &str, class: Class) -> String {
+    match class {
+        Class::NotTokenForm => format!("Invalid {member} {token} passed: {DECODER_CLAUSE}"),
+        Class::Undecodable => {
+            format!("Invalid {member} {token} passed: {UNDECODABLE_CLAUSE}{token}")
+        }
+    }
+}
+
+/// How often the rule has the sentence name the submitted value: once for a
+/// value that never decoded, twice for one the decoder rejected by name.
+fn expected_echoes(class: Class) -> usize {
+    match class {
+        Class::NotTokenForm => 1,
+        Class::Undecodable => 2,
+    }
+}
 
 /// The request body a reader needs to reach its token check: `TraceFormat` is a
 /// member of `ListRetrievedTraces` alone, and that operation judges it first.
@@ -109,35 +147,76 @@ fn flip_digit(token: &str, index: usize) -> String {
 }
 
 #[tokio::test]
-async fn a_malformed_retrieval_token_is_named_in_both_clauses_of_the_refusal() {
+async fn a_malformed_retrieval_token_is_refused_in_the_words_of_its_own_class() {
     let xray = Xray::new();
     let real = genuine_token(&xray).await;
+
+    // The minted width and alphabet over a check half that is deliberately NOT
+    // the one the mint derives for that identifying half, upper-cased: a value of
+    // the issued form that this service could not have issued however it is
+    // cased.
+    let identity = "0123456789abcdef";
+    let miscased =
+        format!("{identity}{}", flip_digit(&retrieval_token_check(identity), 0)).to_uppercase();
 
     let rejected = [
         // The class the integrity check exists for: a genuine token damaged in
         // transit, its width and alphabet intact.
-        ("a genuine token with its middle digit flipped", flip_digit(&real, real.len() / 2)),
-        ("a genuine token with its first digit flipped", flip_digit(&real, 0)),
-        ("a genuine token with its last digit flipped", flip_digit(&real, real.len() - 1)),
+        (
+            "a genuine token with its middle digit flipped",
+            flip_digit(&real, real.len() / 2),
+            Class::Undecodable,
+        ),
+        (
+            "a genuine token with its first digit flipped",
+            flip_digit(&real, 0),
+            Class::Undecodable,
+        ),
+        (
+            "a genuine token with its last digit flipped",
+            flip_digit(&real, real.len() - 1),
+            Class::Undecodable,
+        ),
+        (
+            "the minted width and alphabet, carrying no check",
+            "c".repeat(32),
+            Class::Undecodable,
+        ),
+        (
+            "the minted width and alphabet upper-cased, carrying no check",
+            miscased,
+            Class::Undecodable,
+        ),
         // Widths either side of the minted one, a digit outside the alphabet,
         // another id form, prose, and the longest value `RetrievalToken`'s
         // modelled `@length` 0..1020 admits
         // (`smithy_query(query="shape",shape="RetrievalToken")`).
-        ("one digit short of the minted width", "c".repeat(31)),
-        ("one digit past the minted width", "c".repeat(33)),
-        ("a digit outside the hexadecimal alphabet", format!("{}z", "c".repeat(31))),
+        ("one digit short of the minted width", "c".repeat(31), Class::NotTokenForm),
+        ("one digit past the minted width", "c".repeat(33), Class::NotTokenForm),
+        (
+            "a digit outside the hexadecimal alphabet",
+            format!("{}z", "c".repeat(31)),
+            Class::NotTokenForm,
+        ),
         (
             "a UUID, which is not the form this service mints",
             "59adda79-1d1f-4b1e-9f3a-2c7d5e8a9b01".to_string(),
+            Class::NotTokenForm,
         ),
-        ("prose", "not-a-retrieval-token".to_string()),
-        ("the longest token the model allows", "c".repeat(1_020)),
+        ("prose", "not-a-retrieval-token".to_string(), Class::NotTokenForm),
+        (
+            "the longest token the model allows",
+            "c".repeat(1_020),
+            Class::NotTokenForm,
+        ),
     ];
 
-    for (case, token) in &rejected {
+    for (case, token, class) in &rejected {
         for (operation, path, member) in TOKEN_READERS {
-            let expected = format!("Invalid {member} {token} passed: {DECODER_CLAUSE}");
+            let expected = expected_message(member, token, *class);
             let refused = xray.call(path, &body(path, token)).await;
+            // BOTH classes are the request being wrong, never the retrieval
+            // being gone: the 404 is reserved for a token that verifies.
             assert_eq!(
                 (refused.status, refused.error_type.as_deref()),
                 (400, Some("InvalidRequestException")),
@@ -150,7 +229,7 @@ async fn a_malformed_retrieval_token_is_named_in_both_clauses_of_the_refusal() {
             );
             // The outer clause names the rejected value, which is what tells an
             // operator WHICH of several concurrent tokens failed; the cause
-            // clause states only why it could not be read.
+            // clause names it again only when the decoder read it.
             let (outer, inner) = said
                 .split_once(" passed: ")
                 .unwrap_or_else(|| panic!("case {case:?} on {operation}: expected two clauses, got {said:?}"));
@@ -158,9 +237,19 @@ async fn a_malformed_retrieval_token_is_named_in_both_clauses_of_the_refusal() {
                 outer.contains(token.as_str()),
                 "case {case:?} on {operation}: the parameter clause must name the value, got {outer:?}"
             );
+            let expected_inner = match class {
+                Class::NotTokenForm => DECODER_CLAUSE.to_string(),
+                Class::Undecodable => format!("{UNDECODABLE_CLAUSE}{token}"),
+            };
             assert_eq!(
-                inner, DECODER_CLAUSE,
-                "case {case:?} on {operation}: the cause clause is fixed text, got {inner:?}"
+                inner, expected_inner,
+                "case {case:?} on {operation}: expected the cause clause {expected_inner:?}, got {inner:?}"
+            );
+            assert_eq!(
+                said.matches(token.as_str()).count(),
+                expected_echoes(*class),
+                "case {case:?} on {operation}: expected the value named {} time(s), got {said:?}",
+                expected_echoes(*class)
             );
         }
     }
@@ -170,18 +259,12 @@ async fn a_malformed_retrieval_token_is_named_in_both_clauses_of_the_refusal() {
 async fn the_cause_clause_is_one_phrase_whatever_the_value_or_the_other_members() {
     let xray = Xray::new();
 
-    // The minted width and alphabet, upper-cased, over a check half that is
-    // deliberately NOT the one the mint derives for that identifying half — so
-    // the value is one this service could not have issued however it is cased.
-    let identity = "0123456789abcdef";
-    let miscased =
-        format!("{identity}{}", flip_digit(&retrieval_token_check(identity), 0)).to_uppercase();
-
     // Rows differ in the CHARACTERS the value carries rather than only in how it
     // misses the minted form: the submitted value is echoed into the sentence
     // verbatim, and `RetrievalToken` is modelled `@length` 0..1020 with no
     // `@pattern` (`smithy_query(query="shape",shape="RetrievalToken")`), so each
-    // of these reaches the handler rather than the request layer.
+    // of these reaches the handler rather than the request layer. None of them is
+    // of the issued token form, so each draws the decoder's entry clause.
     let rows: Vec<(&str, String)> = vec![
         (
             "a value carrying JSON metacharacters",
@@ -191,19 +274,15 @@ async fn the_cause_clause_is_one_phrase_whatever_the_value_or_the_other_members(
         ("a value of non-ASCII text", "\u{30c8}\u{30fc}\u{30af}\u{30f3}".to_string()),
         ("a value of spaces alone", "   ".to_string()),
         ("the clause separator inside the value", "a passed: b".to_string()),
-        (
-            "the minted width and alphabet upper-cased, carrying no check",
-            miscased,
-        ),
     ];
 
     // Every cause clause the matrix below produced: the rule is that there is
-    // exactly ONE, whatever the operation and whatever the value.
+    // exactly ONE for this class, whatever the operation and whatever the value.
     let mut causes: BTreeSet<String> = BTreeSet::new();
 
     for (case, token) in &rows {
         for (operation, path, member) in TOKEN_READERS {
-            let expected = format!("Invalid {member} {token} passed: {DECODER_CLAUSE}");
+            let expected = expected_message(member, token, Class::NotTokenForm);
             let refused = xray.call(path, &body(path, token)).await;
             assert_eq!(
                 (refused.status, refused.error_type.as_deref()),

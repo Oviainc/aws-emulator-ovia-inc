@@ -686,17 +686,18 @@ async fn a_resource_arn_is_refused_only_for_its_arn_syntax() {
 async fn a_token_of_no_minted_form_is_refused_with_the_services_template() {
     let xray = Xray::new();
 
-    // Rows differ in how the token misses the minted form: prose, one digit
-    // short, one digit long, a non-hexadecimal digit, a value of another
-    // service's token shape, and one of the right width and charset whose check
-    // half does not derive from its identifying half.
+    // Rows differ in how the token misses the minted FORM: prose, one digit
+    // short, one digit long, a non-hexadecimal digit, and a value of another
+    // service's token shape. A value that is of the minted form but whose check
+    // half does not verify was decoded and rejected rather than refused at the
+    // decoder's entry, so it carries the other cause clause and is asserted in
+    // `super::malformed_retrieval_token_message`.
     let tokens = [
         ("prose", "sim2real-behav-not-a-real-token".to_string()),
         ("one digit short", "a".repeat(31)),
         ("one digit long", "a".repeat(33)),
         ("a non-hexadecimal digit", format!("{}g", "a".repeat(31))),
         ("a dashed identifier", "11111111-2222-3333-4444-555555".to_string()),
-        ("the minted width, carrying no check", "a".repeat(32)),
     ];
     for (label, token) in tokens {
         // Every operation that takes a `RetrievalToken`

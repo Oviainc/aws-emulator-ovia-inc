@@ -18,11 +18,13 @@
 //! * an absent or blank `TraceFormat` is refused with `InvalidRequestException`
 //!   (400): the member says what the answer is rendered in, so there is nothing
 //!   to answer in without it;
-//! * a `RetrievalToken` that is not of the form this service issues
-//!   ([`crate::state::is_retrieval_token_form`]) is refused with
-//!   `InvalidRequestException` (400) BEFORE the store is consulted \u2014 it could
-//!   never have named a retrieval;
-//! * a well-formed token this service never issued, or whose retrieval has timed
+//! * a `RetrievalToken` this service could not have ISSUED
+//!   ([`crate::state::retrieval_token_defect`]) \u2014 one that is not of the token
+//!   form at all, or one of that form whose integrity check does not verify \u2014
+//!   is refused with `InvalidRequestException` (400) BEFORE the store is
+//!   consulted, each class in its own words: it could never have named a
+//!   retrieval;
+//! * a token that VERIFIES but names no retrieval, or whose retrieval has timed
 //!   out, names no retrieval and is refused with `ResourceNotFoundException`
 //!   (404);
 //! * a `NextToken` this operation never issued for this retrieval is refused
@@ -197,9 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // VALIDATED BEFORE THE TOKEN IS RESOLVED, because a request that is
         // wrong in itself is wrong whatever the token names: X-Ray refuses an
         // absent `TraceFormat` ("TraceFormat cannot be empty. Valid values are:
-        // XRAY, OTEL") and a `RetrievalToken` that is not of the form it issues
-        // with `InvalidRequestException` at HTTP 400, and reserves the 404 for a
-        // well-formed token whose retrieval is gone — which is exactly the
+        // XRAY, OTEL") and a `RetrievalToken` it could not have issued with
+        // `InvalidRequestException` at HTTP 400, and reserves the 404 for a token
+        // that VERIFIES but whose retrieval is gone — which is exactly the
         // distinction a polling client branches on.
         //
         // `TraceFormat` carries no `@required` in the model, but the service
@@ -209,13 +211,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(format) if !format.is_empty() => format,
             _ => return Err(refuse(trace_format_required())),
         };
-        if !crate::state::is_retrieval_token_form(&input.retrieval_token) {
+        if let Some(defect) = crate::state::retrieval_token_defect(&input.retrieval_token) {
             // The name the refusal gives the member is the one X-Ray's recorded
             // answer for THIS operation uses — "execution id", as
             // `GetRetrievedTracesGraph`'s does — not the member's modelled name.
             return Err(refuse(crate::state::malformed_retrieval_token_message(
                 "execution id",
                 &input.retrieval_token,
+                defect,
             )));
         }
 
