@@ -141,3 +141,5 @@ mod update_custom_line_item_billing_period_window;
 mod validation_exception_message;
 #[path = "all/validation_messages.rs"]
 mod validation_messages;
+#[path = "all/write_audit_records.rs"]
+mod write_audit_records;

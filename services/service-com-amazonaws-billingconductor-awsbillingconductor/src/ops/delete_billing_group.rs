@@ -155,7 +155,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteBillingGroupErrorModeled::InternalServerException(
                 InternalServerException {
@@ -208,6 +207,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         debug_assert!(
             removed.is_some(),
             "the group was read from the same guarded state this removal writes to"
+        );
+
+        // The audit record for a state-changing call, as `CreateBillingGroup` and
+        // `UpdateBillingGroup` write it for the same resource: who asked, what changed
+        // and that it succeeded. Never a `@sensitive` member (the group's name and
+        // description) — only the access key id the caller presented and the ARN it
+        // addressed.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            billing_group_arn = %group_arn,
+            outcome = "deleted",
+            "billing group deleted"
         );
 
         Ok(DeleteBillingGroupOutput {

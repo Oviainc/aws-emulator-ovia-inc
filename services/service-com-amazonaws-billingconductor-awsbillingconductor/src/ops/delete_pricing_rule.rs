@@ -145,7 +145,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeletePricingRuleErrorModeled::InternalServerException(
                 InternalServerException {
@@ -207,6 +206,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // because of it: its name-index entry (so the name can be reused) and the
         // idempotency entries that named it.
         state.remove_pricing_rule(&rule_arn);
+
+        // The audit record for a state-changing call, as `DeletePricingPlan` writes it
+        // for the sibling resource: who asked, what changed and that it succeeded. Never
+        // a `@sensitive` member (the rule's name and description) — only the access key
+        // id the caller presented and the ARN it addressed.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            pricing_rule_arn = %rule_arn,
+            outcome = "deleted",
+            "pricing rule deleted"
+        );
 
         Ok(DeletePricingRuleOutput {
             arn: Some(rule_arn),

@@ -205,8 +205,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-
         // Tag-on-create takes caller-supplied tag keys, so the reserved `aws:` namespace
         // is refused here exactly as `TagResource` refuses it: from the request alone,
         // before anything is minted, so a create naming such a key leaves no resource
@@ -375,6 +373,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // How many resources this create associated to the item, read off before the
+        // list is moved into the record it is stored in.
+        let associated_count = associated_resources.len();
+
         // 10 characters, the width the `CustomLineItemArn` pattern allows.
         let id = state.mint_resource_id(10);
         let arn = crate::state::custom_line_item_arn(&id);
@@ -417,6 +419,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.custom_line_items.insert(arn.clone(), record);
         state.record_idempotent_arn(Self::NAME, input.client_token.as_deref(), &arn);
 
+        // The audit record for a state-changing call, as `UpdateCustomLineItem` and
+        // `DeleteCustomLineItem` write it for the same resource: who asked, what was
+        // minted and that it succeeded. Never a `@sensitive` member — the item's name
+        // and its description are both `@sensitive` — only the access key id the caller
+        // presented, the ARN this call created and how many resources it associated.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            custom_line_item_arn = %arn,
+            associated_resources = associated_count,
+            outcome = "created",
+            "custom line item created"
+        );
         Ok(CreateCustomLineItemOutput { arn: Some(arn) })
     }
 }

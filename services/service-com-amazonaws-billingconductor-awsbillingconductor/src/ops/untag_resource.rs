@@ -157,7 +157,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The `TagKeys` list's own length bound is refused by the boundary before this
         // runs; the `ResourceArn` pattern is not (see this module's header).
-        let _ = ctx;
 
         // A reserved key is refused from the REQUEST alone, before the store is reached:
         // a caller may not DELETE a tag Amazon Web Services generated either, so the
@@ -180,17 +179,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
-        let Some(stored) = state.resource_tags_mut(&input.resource_arn) else {
+        // The resource this call addresses, in the ONE spelling this service's maps are
+        // keyed by, so the audit record below names one identity whatever spelling the
+        // request used ([`crate::state::parse_taggable_arn`], the same read the tag
+        // accessor makes). An ARN that names no resource of this service is the surface's
+        // not-found, exactly as an ARN whose resource is not stored is.
+        let Some(addressed) = crate::state::parse_taggable_arn(&input.resource_arn) else {
+            return Err(crate::state::tagging_not_found());
+        };
+        let Some(stored) = state.resource_tags_mut(&addressed.arn) else {
             return Err(crate::state::tagging_not_found());
         };
 
         // "Deletes specified tags from a resource." — exactly the named keys: a key the
         // resource does not carry is already in the state the request asks for, and the
-        // keys it does not name are left alone.
+        // keys it does not name are left alone. A key that WAS carried is one the removal
+        // wrote, which is the outcome the audit record below reports.
+        let mut removed = 0usize;
         for key in &input.tag_keys {
-            stored.remove(key);
+            if stored.remove(key).is_some() {
+                removed += 1;
+            }
         }
 
+        // The audit record for a state-changing call: who asked, what it addressed and
+        // what the write did. Never a tag key the request carried — only the access key
+        // id the caller presented, the ARN it addressed and how many pairs the removal
+        // wrote.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            resource_arn = %addressed.arn,
+            removed_tags = removed,
+            outcome = if removed == 0 { "unchanged" } else { "untagged" },
+            "tags removed from a resource"
+        );
         Ok(UntagResourceOutput {})
     }
 }

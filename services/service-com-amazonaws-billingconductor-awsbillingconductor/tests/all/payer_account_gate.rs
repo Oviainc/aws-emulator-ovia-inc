@@ -258,7 +258,10 @@ pub(crate) fn assert_denied(case: &str, operation: &str, answered: &(u16, Value,
 }
 
 /// Every operation the model declares, as `(name, method, uri)`.
-fn modelled_operations() -> BTreeSet<(String, String, String)> {
+///
+/// `pub(crate)` because `tests/all/write_audit_records.rs` checks its own row set against
+/// the same model surface, and the model reader has one home.
+pub(crate) fn modelled_operations() -> BTreeSet<(String, String, String)> {
     let model: Value = serde_json::from_str(MODEL).expect("parse the Smithy model");
     let shapes = model["shapes"]
         .as_object()

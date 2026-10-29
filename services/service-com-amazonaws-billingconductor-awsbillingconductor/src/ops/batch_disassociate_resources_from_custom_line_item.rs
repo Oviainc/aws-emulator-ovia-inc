@@ -241,7 +241,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 BatchDisassociateResourcesFromCustomLineItemErrorModeled::InternalServerException(
@@ -351,6 +350,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut disassociated = Vec::new();
         let mut failures = Vec::new();
+        // Whether this call WROTE to the stored item: an element naming a resource the
+        // item holds no association for succeeds and changes nothing, so the outcome the
+        // audit record below reports is read off the writes, not off the successes.
+        let mut changed = false;
         for (requested, outcome) in resolved {
             let resource_arn = match outcome {
                 Err((reason, message)) => {
@@ -370,6 +373,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 match apply_disassociation(&mut target.associated_resources, index, &removed) {
                     crate::state::PeriodsRemoval::Changed => {
                         target.last_modified_time_millis = now;
+                        changed = true;
                     }
                     crate::state::PeriodsRemoval::Unchanged => {}
                     // One stretch of billing periods more than a stored association
@@ -394,6 +398,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 error: None,
             });
         }
+
+        // The audit record for a state-changing call, as `DisassociatePricingRules`
+        // writes it for the analogous surface: who asked, what it addressed and what the
+        // write did. Never a `@sensitive` member of the item — only the access key id the
+        // caller presented, the ARN it addressed and how many of the requested resources
+        // each list carries.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            custom_line_item_arn = %target_arn,
+            disassociated_resources = disassociated.len(),
+            failed_resources = failures.len(),
+            outcome = if changed { "disassociated" } else { "unchanged" },
+            "resources disassociated from a custom line item"
+        );
 
         Ok(BatchDisassociateResourcesFromCustomLineItemOutput {
             successfully_disassociated_resources: Some(disassociated),

@@ -165,7 +165,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The `Tags` map's own length bound is refused by the boundary before this runs;
         // the `ResourceArn` pattern is not (see this module's header), so the ARN is
         // resolved here.
-        let _ = ctx;
 
         // A key in the reserved `aws:` namespace is refused from the REQUEST alone —
         // before the store is reached, so nothing is written and a resource that does
@@ -192,7 +191,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
-        let Some(stored) = state.resource_tags_mut(&input.resource_arn) else {
+        // The resource this call addresses, in the ONE spelling this service's maps are
+        // keyed by, so the audit record below names one identity whatever spelling the
+        // request used ([`crate::state::parse_taggable_arn`], the same read the tag
+        // accessor makes). An ARN that names no resource of this service is the surface's
+        // not-found, exactly as an ARN whose resource is not stored is.
+        let Some(addressed) = crate::state::parse_taggable_arn(&input.resource_arn) else {
+            return Err(crate::state::tagging_not_found());
+        };
+        let Some(stored) = state.resource_tags_mut(&addressed.arn) else {
             return Err(crate::state::tagging_not_found());
         };
 
@@ -224,10 +231,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // existing tags on a resource are not specified in the request parameters, they
         // are not changed." — a MERGE, not a replacement: a key the request names takes
         // the request's value, every other stored key is left alone.
+        //
+        // How many pairs the merge WRITES: a pair the resource already carries with the
+        // same value leaves the stored map exactly as it was, which is the outcome the
+        // audit record below reports.
+        let written = input
+            .tags
+            .iter()
+            .filter(|(key, value)| stored.get(*key) != Some(*value))
+            .count();
         for (key, value) in input.tags {
             stored.insert(key, value);
         }
 
+        // The audit record for a state-changing call: who asked, what it addressed and
+        // what the write did. Never a tag key or value the request carried — only the
+        // access key id the caller presented, the ARN it addressed and how many pairs the
+        // merge wrote.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            resource_arn = %addressed.arn,
+            written_tags = written,
+            outcome = if written == 0 { "unchanged" } else { "tagged" },
+            "tags merged onto a resource"
+        );
         Ok(TagResourceOutput {})
     }
 }

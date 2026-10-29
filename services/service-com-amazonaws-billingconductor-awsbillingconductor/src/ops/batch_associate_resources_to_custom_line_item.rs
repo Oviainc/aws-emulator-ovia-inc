@@ -207,7 +207,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 BatchAssociateResourcesToCustomLineItemErrorModeled::InternalServerException(
@@ -332,6 +331,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut associated = Vec::new();
         let mut failures = Vec::new();
+        // Whether this call WROTE to the stored item: an element that asks for periods
+        // the association already covers succeeds and changes nothing, so the outcome
+        // the audit record below reports is read off the writes, not off the successes.
+        let mut changed = false;
         for (requested, outcome) in resolved {
             let resource_arn = match outcome {
                 Err((reason, message)) => {
@@ -361,6 +364,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 match outcome {
                     crate::state::PeriodsAddition::Changed => {
                         target.last_modified_time_millis = now;
+                        changed = true;
                     }
                     crate::state::PeriodsAddition::Unchanged => {}
                     // One stretch of billing periods more than a stored association may
@@ -410,11 +414,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     resource_arn, added,
                 ));
             target.last_modified_time_millis = now;
+            changed = true;
             associated.push(AssociateResourceResponseElement {
                 arn: Some(requested.clone()),
                 error: None,
             });
         }
+
+        // The audit record for a state-changing call, as `AssociatePricingRules` writes
+        // it for the analogous surface: who asked, what it addressed and what the write
+        // did. Never a `@sensitive` member of the item — only the access key id the
+        // caller presented, the ARN it addressed and how many of the requested resources
+        // each list carries.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            custom_line_item_arn = %target_arn,
+            associated_resources = associated.len(),
+            failed_resources = failures.len(),
+            outcome = if changed { "associated" } else { "unchanged" },
+            "resources associated with a custom line item"
+        );
 
         Ok(BatchAssociateResourcesToCustomLineItemOutput {
             successfully_associated_resources: Some(associated),
