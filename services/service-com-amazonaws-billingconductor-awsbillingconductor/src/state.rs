@@ -4011,10 +4011,10 @@ pub const NEXT_TOKEN_MEMBER: &str = "NextToken";
 /// The separator between the SCOPE a pagination token was minted for and the cursor it
 /// carries, inside the bytes the token encodes.
 ///
-/// A unit separator occurs in no scope ([`page_scope_within`] joins with
-/// [`PAGE_SCOPE_SEPARATOR`] instead) and in none of the keys this service pages over (ARNs,
-/// account ids, fixed-width indices), and only the FIRST one is read as the separator, so a
-/// cursor is handed back exactly as it was minted.
+/// A unit separator occurs in no scope ([`page_scope_within`] and [`page_scope_shaped`]
+/// join with [`PAGE_SCOPE_SEPARATOR`] instead) and in none of the keys this service pages
+/// over (ARNs, account ids, fixed-width indices), and only the FIRST one is read as the
+/// separator, so a cursor is handed back exactly as it was minted.
 const PAGE_TOKEN_SEPARATOR: char = '\u{1f}';
 
 /// The separator between the parts of a SCOPE that names more than the operation, distinct
@@ -4052,15 +4052,16 @@ pub fn encode_next_token(scope: &str, cursor: &str) -> String {
 
 /// A CHOSEN ceiling on the characters a `NextToken` this service will even decode may
 /// have. The model constrains `Token` not at all, so the value is caller-sized: the
-/// longest token this service mints is an operation name, a resource ARN and a store key,
-/// all far inside this, and anything longer was not minted here, so it is refused before
-/// its length decides any work.
+/// longest token this service mints is an operation name, a resource ARN, the request
+/// values that shape the sequence being read ([`page_scope_shaped`]) and a store key, all
+/// far inside this, and anything longer was not minted here, so it is refused before its
+/// length decides any work.
 const MAX_PAGE_TOKEN_LENGTH: usize = 1024;
 
 /// The cursor `token` carries for the listing `scope`, or `None` when `token` is not one
 /// this service minted for that listing — a value longer than any token it mints, one that
 /// is not hex, is too short to carry a tag, does not agree with the tag it carries, does
-/// not decode to UTF-8, carries no scope at all, or carries a different listing's scope.
+/// not decode to UTF-8, carries no scope at all, or carries a different sequence's scope.
 pub fn decode_next_token(scope: &str, token: &str) -> Option<String> {
     if token.len() > MAX_PAGE_TOKEN_LENGTH {
         return None;
@@ -4097,6 +4098,32 @@ fn page_token_tag(payload: &[u8]) -> Vec<u8> {
 /// which elements of the one sequence are reported, not which sequence is being read.
 pub fn page_scope_within(operation: &str, resource_arn: &str) -> String {
     format!("{operation}{PAGE_SCOPE_SEPARATOR}{resource_arn}")
+}
+
+/// The scope of the tokens a read WITHIN one resource mints when the REQUEST, and not that
+/// resource alone, decides which sequence is being read: the operation, the resource, and
+/// each request value that shapes the sequence.
+///
+/// [`page_scope_within`] is the whole scope of a read whose request members only SELECT
+/// elements of one fixed sequence. A member that decides what ONE element IS — which
+/// attributes a reported group aggregates over, and so what the cursor key of an element
+/// even spells, or which periods an element's amounts cover — names a DIFFERENT sequence
+/// for every value it takes, and a cursor into one of those sequences names no position in
+/// another, so it travels in the scope: a token minted under one shape is then refused with
+/// [`invalid_next_token`], the answer every token this service did not mint for the
+/// sequence being read gets, instead of being read as a cut point into a keyspace it names
+/// nothing in.
+///
+/// Each shaping value is passed ALREADY CANONICAL — one spelling per sequence, and the
+/// values that merely order or repeat within it normalised away — so two requests that name
+/// the same sequence resume the same one however they spelled it.
+pub fn page_scope_shaped(operation: &str, resource_arn: &str, shaping: &[&str]) -> String {
+    let mut scope = page_scope_within(operation, resource_arn);
+    for value in shaping {
+        scope.push(PAGE_SCOPE_SEPARATOR);
+        scope.push_str(value);
+    }
+    scope
 }
 
 /// The modelled refusal every paginated read of this service answers a `NextToken` it did

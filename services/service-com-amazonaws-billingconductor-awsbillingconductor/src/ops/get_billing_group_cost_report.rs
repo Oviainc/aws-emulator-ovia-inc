@@ -6,6 +6,8 @@
 //! billing periods the request's range covers — the actual Amazon Web Services charges of
 //! the group, the pro forma charges computed from the custom line items the store holds
 //! for it, and the margin between them — broken down by the attributes `GroupBy` names.
+//! The group, that breakdown and those periods together name the sequence a page is cut
+//! out of, so all three travel in the scope of the `NextToken` a truncated page mints.
 //! It writes nothing. This file is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -102,6 +104,13 @@ const GROUP_BY_BILLING_PERIOD: &str = "BILLING_PERIOD";
 /// charges are presented under.
 const GROUP_BY_PRODUCT_NAME: &str = "PRODUCT_NAME";
 
+/// How the several values of ONE request member travel inside the scope of this read's
+/// pagination tokens ([`crate::state::page_scope_shaped`]).
+///
+/// Neither an enumerated breakdown attribute (`^[A-Z_]+$`) nor a canonical billing period
+/// (`YYYY-MM`) contains it, so a list of them reads back as the list it was minted from.
+const SCOPE_VALUE_SEPARATOR: &str = ",";
+
 /// One row of the margin summary: the charges of one group of the requested breakdown.
 #[derive(Debug, Default)]
 struct ReportRow {
@@ -116,6 +125,11 @@ struct ReportRow {
 /// It is built from the row's OWN attribute values, so the rows run by billing period
 /// (chronological, since a period is enumerated in the canonical zero-padded spelling)
 /// and then by product name, and resuming from a token lands on the row it named.
+///
+/// Each half is present only where the breakdown asked for that attribute, so the KEYSPACE
+/// a cursor points into has a different shape for every breakdown — which is why the
+/// breakdown is part of the scope a token is minted under
+/// ([`crate::state::page_scope_shaped`]).
 fn row_key(billing_period: Option<&str>, product_name: Option<&str>) -> String {
     format!(
         "{}#{}",
@@ -351,8 +365,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
+        // The sequence this read pages over is NOT fixed by the billing group alone: the
+        // breakdown decides what one row IS and what its cursor key spells, and the range
+        // decides which periods a row's amounts cover and so which rows exist at all. Both
+        // therefore travel in the scope of the token a truncated page mints, so a cursor
+        // minted under one breakdown or range is refused rather than read as a cut point
+        // into another's keyspace. The attributes travel as the SET they are, in canonical
+        // order: naming the same attributes in another order, or naming one twice, reports
+        // the same rows under the same keys, so such a request resumes the same sequence.
+        // The periods travel as the canonical months the range enumerates, so the two
+        // spellings a bound may take name the one sequence.
+        let mut breakdown: Vec<&str> = group_by.clone();
+        breakdown.sort_unstable();
+        let breakdown = breakdown.join(SCOPE_VALUE_SEPARATOR);
+        let periods_covered = billing_periods.join(SCOPE_VALUE_SEPARATOR);
+
         let (billing_group_cost_report_results, next_token) = crate::state::paginate_bounded(
-            &crate::state::page_scope_within(Self::NAME, &group.arn),
+            &crate::state::page_scope_shaped(
+                Self::NAME,
+                &group.arn,
+                &[&breakdown, &periods_covered],
+            ),
             results,
             input.next_token.as_deref(),
             input.max_results,

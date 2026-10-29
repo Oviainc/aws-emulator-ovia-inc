@@ -85,7 +85,10 @@ fn linked_account(index: usize) -> String {
 ///
 /// Read off the service's own clock rather than fixed, because a write may only take
 /// effect in the current or the previous billing period.
-fn period(months: i64) -> String {
+///
+/// `pub(crate)` because the sibling suite `tests/all/cost_report_token_breakdown_scope.rs`
+/// names the same periods relative to the same clock rather than re-spelling this.
+pub(crate) fn period(months: i64) -> String {
     let current =
         service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period();
     let (year, month) = current
