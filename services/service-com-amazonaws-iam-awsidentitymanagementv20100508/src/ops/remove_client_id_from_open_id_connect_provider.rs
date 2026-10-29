@@ -214,9 +214,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 RemoveClientIDFromOpenIDConnectProviderErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {
-                        message: Some(format!(
-                            "OpenIDConnect Provider not found for arn {}",
-                            input.open_id_connect_provider_arn
+                        message: Some(crate::state::open_id_connect_provider_not_found(
+                            &input.open_id_connect_provider_arn,
                         )),
                     },
                 )

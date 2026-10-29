@@ -131,6 +131,15 @@ pub(crate) fn expected_arn(url: &str) -> String {
     )
 }
 
+/// The `NoSuchEntityException` message IAM refuses a request naming an ARN the account
+/// holds no OIDC provider under with: its fixed text around the ARN the request carried.
+///
+/// ONE reader of that wording for this crate's test tree, so every suite that drives an
+/// absent provider asserts the same message.
+pub(crate) fn absence_message(arn: &str) -> String {
+    format!("OpenId connect Provider {arn} cannot be found.")
+}
+
 /// The ISSUER form of a URL: the URL with its `https://` scheme removed, which is what a
 /// provider is stored and reported under (and the resource portion of its ARN).
 pub(crate) fn issuer_of(url: &str) -> &str {

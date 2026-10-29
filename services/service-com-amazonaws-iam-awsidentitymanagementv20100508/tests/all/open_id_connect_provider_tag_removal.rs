@@ -40,7 +40,9 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::open_id_connect_provider_tag_updates::{
     assert_reads, create_provider, stored_tags, tag_provider,
 };
-use crate::open_id_connect_providers::{client_ids, issuer_of, list_members, thumbprint};
+use crate::open_id_connect_providers::{
+    absence_message, client_ids, issuer_of, list_members, thumbprint,
+};
 use crate::role_lifecycle::{borrowed, param};
 use crate::role_tag_removal::{fixture, keys, with_key_params};
 use crate::role_tags::{expected_map, tags};
@@ -382,7 +384,7 @@ async fn a_non_arn_is_invalid_and_an_unheld_provider_is_not_found() {
     for absent in unheld {
         // IAM names the ARN it found no provider under, so the message's variable part is
         // the ARN the request carried and its fixed text does not depend on the row.
-        let expected_message = format!("OpenIDConnect Provider not found for arn {absent}");
+        let expected_message = absence_message(&absent);
         let (status, body) = untag_provider(&router, &absent, &removed).await;
         assert_eq!(
             status, 404,

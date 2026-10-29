@@ -121,6 +121,8 @@ mod open_id_connect_client_id_registration;
 mod open_id_connect_client_ids;
 #[path = "all/open_id_connect_provider_listing.rs"]
 mod open_id_connect_provider_listing;
+#[path = "all/open_id_connect_provider_tag_listing.rs"]
+mod open_id_connect_provider_tag_listing;
 #[path = "all/open_id_connect_provider_tag_removal.rs"]
 mod open_id_connect_provider_tag_removal;
 #[path = "all/open_id_connect_provider_tag_updates.rs"]

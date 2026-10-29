@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOpenIDConnectProviderTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOpenIDConnectProviderTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOpenIDConnectProviderTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +161,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOpenIDConnectProviderTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOpenIDConnectProviderTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOpenIDConnectProviderTags"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListOpenIDConnectProviderTagsErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `arnType` asks only for a 20..2048 character string, so the value still has to
+        // BE an ARN — one "begins with arn:" (Amazon Resource Names, Amazon Web Services
+        // General Reference) — and anything else is an "invalid … value … supplied for an
+        // input parameter". A well-formed ARN naming no held provider is the DIFFERENT
+        // answer the entity-absent error carries, the same split
+        // `GetOpenIDConnectProvider` makes on this member.
+        if !input.open_id_connect_provider_arn.starts_with("arn:") {
+            return Err(
+                ListOpenIDConnectProviderTagsErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "Invalid OpenIDConnectProviderArn {}: the value is not an ARN",
+                            input.open_id_connect_provider_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `maxItemsType` is range 1..1000 and the boundary validator has already refused
+        // anything outside it, so the only choice left here is the default for an absent
+        // `MaxItems`: "if you do not include this parameter, the number of items defaults
+        // to 100". `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // A read: it reports the tags the provider persists and writes nothing, so a
+        // later caller sees exactly what this one did.
+        let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any tag is reported, and before the store is consulted for the
+        // provider — so a caller that may not read a provider's tags learns that it may
+        // not, never whether the account holds that provider. The decision is made on the
+        // ARN the request addresses, and the refusal names the resource the way every
+        // other call on an OIDC provider names it.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_OPEN_ID_CONNECT_PROVIDER_TAGS,
+            &input.open_id_connect_provider_arn,
+            &format!("oidc-provider {}", input.open_id_connect_provider_arn),
+        )?;
+
+        // The read is addressed exactly as a write of the same ARN is, so it reports the
+        // one record `TagOpenIDConnectProvider` writes; an ARN the account holds no
+        // provider under "referenced a resource entity that does not exist", worded the
+        // one way every OIDC-provider operation words it — by naming the ARN it found
+        // none under.
+        let Some(provider) = store
+            .open_id_connect_providers
+            .get(&input.open_id_connect_provider_arn)
+        else {
+            return Err(
+                ListOpenIDConnectProviderTagsErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(crate::state::open_id_connect_provider_not_found(
+                            &input.open_id_connect_provider_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The page resumes strictly after the POSITION the marker names in THIS
+        // provider's tag order, so a token this service did not issue while paging this
+        // provider's tags is refused as an "invalid … value … supplied for an input
+        // parameter" rather than read as "start from the beginning". A token that decodes
+        // but names a tag removed since the previous page is NOT an error: paging resumes
+        // from the position, and that tag is simply no longer in the range.
+        let scope =
+            crate::state::entity_tags_marker_scope(&input.open_id_connect_provider_arn);
+        let resume_after = match &input.marker {
+            Some(marker) => match crate::state::decode_marker(&scope, marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(
+                        ListOpenIDConnectProviderTagsErrorModeled::InvalidInputException(
+                            InvalidInputException {
+                                message: Some(
+                                    "Invalid Marker: the value is not a marker this \
+                                     service issued for this OpenID Connect provider's \
+                                     tags"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        // ONE page of a tagged entity's tags, the shared rule every IAM tag listing
+        // reports through: sorted by tag key, at most `page_size` long, and truncated
+        // with the marker that resumes after it.
+        let page = crate::state::tag_page(
+            provider.tags.as_ref(),
+            &scope,
+            resume_after.as_deref(),
+            page_size,
+        );
+        Ok(ListOpenIDConnectProviderTagsOutput {
+            // "If no tags are attached to the specified resource, the response contains
+            // an empty list" — the member is required, and empty is that answer.
+            tags: page.tags,
+            is_truncated: page.is_truncated,
+            marker: page.marker,
+        })
     }
 }

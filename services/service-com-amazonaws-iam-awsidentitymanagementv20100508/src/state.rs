@@ -4456,6 +4456,18 @@ pub fn policy_not_found(arn: &str) -> String {
     format!("Policy {arn} was not found.")
 }
 
+/// The message IAM refuses an operation addressed by `OpenIDConnectProviderArn` with
+/// when the account holds no OIDC identity provider under that ARN — the
+/// `NoSuchEntityException` message, whose fixed text is `OpenId connect Provider ` and
+/// ` cannot be found.` around the ARN the request supplied.
+///
+/// ONE wording, shared by every operation taking an `OpenIDConnectProviderArn`, so a
+/// read, a tag call and a thumbprint update cannot describe the same missing provider
+/// three different ways.
+pub fn open_id_connect_provider_not_found(arn: &str) -> String {
+    format!("OpenId connect Provider {arn} cannot be found.")
+}
+
 /// The message IAM refuses an operation of the policy-ATTACHMENT family with when the
 /// account holds no managed policy under the `PolicyArn` it was addressed by — the
 /// `NoSuchEntityException` message, whose fixed text is `Policy ` and ` does not exist or

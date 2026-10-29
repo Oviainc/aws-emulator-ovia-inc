@@ -22,7 +22,7 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::open_id_connect_providers::list_members;
+use crate::open_id_connect_providers::{absence_message, list_members};
 use crate::role_lifecycle::{borrowed, param, reported_tags};
 use crate::user_lifecycle::{account_id, call, element, error_code, router};
 
@@ -391,7 +391,7 @@ async fn removing_from_a_provider_the_account_does_not_hold_is_refused() {
         let message = element(&body, "Message");
         assert_eq!(
             message,
-            format!("OpenIDConnect Provider not found for arn {arn}"),
+            absence_message(arn),
             "case {arn:?}: the message must describe the ARN the request named, got \
              {message:?}"
         );
@@ -406,7 +406,7 @@ async fn removing_from_a_provider_the_account_does_not_hold_is_refused() {
         let read_message = element(&read_body, "Message");
         assert_eq!(
             read_message,
-            format!("OpenIDConnect Provider not found for arn {arn}"),
+            absence_message(arn),
             "case {arn:?}: the read must describe the same missing provider, got \
              {read_message:?}"
         );

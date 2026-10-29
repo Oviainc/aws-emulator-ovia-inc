@@ -173,6 +173,9 @@ pub const LIST_POLICY_TAGS: &str = "iam:ListPolicyTags";
 /// `iam:ListInstanceProfileTags`.
 pub const LIST_INSTANCE_PROFILE_TAGS: &str = "iam:ListInstanceProfileTags";
 
+/// `iam:ListOpenIDConnectProviderTags`.
+pub const LIST_OPEN_ID_CONNECT_PROVIDER_TAGS: &str = "iam:ListOpenIDConnectProviderTags";
+
 /// `iam:TagPolicy`.
 pub const TAG_POLICY: &str = "iam:TagPolicy";
 
