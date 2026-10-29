@@ -227,7 +227,9 @@ impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
     /// `target`, and answer its `ActivityId`.
     ///
     /// The activity is non-terminal for [`ACTIVITY_FULFILMENT`] and `Successful`
-    /// afterwards: this service moved the capacity, so the movement is fulfilled.
+    /// afterwards: this service moved the capacity, so the movement is fulfilled — unless
+    /// a LATER movement of the same scalable target takes its capacity over first, which
+    /// is what [`Self::override_unfulfilled_activities`] resolves.
     pub fn record_capacity_change(
         &mut self,
         target: &TargetKey,
@@ -235,10 +237,13 @@ impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
         cause: impl Into<String>,
         at: SystemTime,
     ) -> String {
-        let noun = capacity_noun(&target.scalable_dimension);
         let sequence = self.activities_recorded;
         self.activities_recorded += 1;
         let activity_id = scaling_activity_id(sequence, target);
+        // This movement is what the target is driven to from here on, so a movement of the
+        // same target that had not been fulfilled yet is displaced by it, and this capacity
+        // is the one that takes effect instead of the capacity it named.
+        self.override_unfulfilled_activities(target, capacity, at);
         // The resource the target scales is owed this capacity: queued here, because the
         // owning service's store cannot be written under this service's lock.
         self.pending_capacity.insert(target.clone(), capacity);
@@ -246,15 +251,12 @@ impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
             activity_id: activity_id.clone(),
             sequence,
             target: target.clone(),
-            description: format!("Setting {noun} to {capacity}."),
+            description: movement_description(target, capacity),
             cause: cause.into(),
             start_time: at,
             fulfilled_at: Some(at + ACTIVITY_FULFILMENT),
             terminal_status_code: ACTIVITY_SUCCESSFUL.to_string(),
-            terminal_status_message: Some(format!(
-                "Successfully set {noun} to {capacity}. Change successfully fulfilled by {}.",
-                target.service_namespace
-            )),
+            terminal_status_message: Some(fulfilled_status_message(target, capacity)),
             details: None,
             not_scaled_reasons: Vec::new(),
         });
@@ -265,6 +267,57 @@ impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
             self.activities.drain(..overflow);
         }
         activity_id
+    }
+
+    /// Resolve every activity of `target` that has not reached fulfilment by `at` as
+    /// [`ACTIVITY_OVERRIDDEN`], ended at that instant.
+    ///
+    /// A capacity movement is fulfilled when the capacity it set has taken effect, and only
+    /// one capacity is in force per scalable target at a time: a movement recorded while an
+    /// earlier one is still on its way to fulfilment REPLACES the capacity that earlier one
+    /// named, which is therefore never reached. The model keeps `Overridden` beside
+    /// `Successful` for exactly that outcome, so a displaced movement ends there and only a
+    /// movement whose capacity took effect ends `Successful` — otherwise the log cannot tell
+    /// a change that happened from one that was overtaken.
+    ///
+    /// A status is terminal once the clock has reached it: a movement already fulfilled at
+    /// `at` keeps the status it reported, and an activity recorded in a terminal status
+    /// (`fulfilled_at` of `None`) moved no capacity that could be taken over. The walk is
+    /// newest-first and stops at the first activity of this target that was fulfilled,
+    /// because everything recorded before it is terminal too — passing over an activity that
+    /// starts after `at`, which this movement cannot have displaced.
+    ///
+    /// The displaced activity keeps the `Description` of the change IT intended, and its
+    /// `StatusMessage` names the capacity that took effect instead — `capacity`, the one the
+    /// displacing movement set, stated as that movement's own description
+    /// ([`movement_description`]) states it: what this activity asked for is its description,
+    /// and what became of the scalable target is its message.
+    fn override_unfulfilled_activities(
+        &mut self,
+        target: &TargetKey,
+        capacity: i32,
+        at: SystemTime,
+    ) {
+        for activity in self
+            .activities
+            .iter_mut()
+            .rev()
+            .filter(|activity| &activity.target == target)
+        {
+            // An activity that STARTS after this movement is not one this movement displaced:
+            // the log is ordered by when each movement was recorded, and a movement can be
+            // recorded for an instant in the past — the scheduled-action dispatcher records an
+            // occurrence at the instant it was DUE, which is the instant it acted at.
+            if activity.start_time > at {
+                continue;
+            }
+            if activity.fulfilled_at.is_none_or(|due| due <= at) {
+                break;
+            }
+            activity.fulfilled_at = Some(at);
+            activity.terminal_status_code = ACTIVITY_OVERRIDDEN.to_string();
+            activity.terminal_status_message = Some(movement_description(target, capacity));
+        }
     }
 
     /// Mark an update of `target` as in flight, answering `false` when another update of
@@ -365,6 +418,11 @@ pub const ACTIVITY_FULFILMENT: Duration = Duration::from_millis(600);
 pub const ACTIVITY_IN_PROGRESS: &str = "InProgress";
 /// The status a fulfilled capacity movement ends in. See [`ACTIVITY_IN_PROGRESS`].
 pub const ACTIVITY_SUCCESSFUL: &str = "Successful";
+/// The status a capacity movement ends in when a later movement of the same scalable target
+/// took its capacity over before it was fulfilled
+/// ([`ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState::override_unfulfilled_activities`]).
+/// See [`ACTIVITY_IN_PROGRESS`].
+pub const ACTIVITY_OVERRIDDEN: &str = "Overridden";
 
 // ---------------------------------------------------------------------------
 // Request-derived values
@@ -748,6 +806,32 @@ pub fn capacity_noun(scalable_dimension: &str) -> String {
         }
     }
     words.join(" ")
+}
+
+/// What a capacity movement of `target` to `capacity` is described as: "a simple description
+/// of what action the scaling activity intends to accomplish", in the words the model's own
+/// `DescribeScalingActivities` example carries ("Setting desired count to 1.").
+pub fn movement_description(target: &TargetKey, capacity: i32) -> String {
+    format!(
+        "Setting {} to {capacity}.",
+        capacity_noun(&target.scalable_dimension)
+    )
+}
+
+/// The `StatusMessage` of a capacity movement that has TAKEN EFFECT on a scalable target:
+/// the capacity the target was set to, and the service that owns the resource it was set
+/// on, in the shape the model's own `DescribeScalingActivities` example carries
+/// ("Successfully set desired count to 1. Change successfully fulfilled by ecs.").
+///
+/// One template, two readers: the movement that was fulfilled reports the capacity IT set,
+/// and a movement a later one took over reports instead the change that displaced it
+/// ([`ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState::override_unfulfilled_activities`]).
+pub fn fulfilled_status_message(target: &TargetKey, capacity: i32) -> String {
+    format!(
+        "Successfully set {} to {capacity}. Change successfully fulfilled by {}.",
+        capacity_noun(&target.scalable_dimension),
+        target.service_namespace
+    )
 }
 
 /// The `ScalingActivity` a `Describe` returns for a stored record, as of `now`.

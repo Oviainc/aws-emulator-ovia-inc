@@ -47,6 +47,8 @@ mod state_roundtrip;
 mod step_scaling_execution;
 #[path = "all/step_scaling_window_reread.rs"]
 mod step_scaling_window_reread;
+#[path = "all/superseded_scaling_activities.rs"]
+mod superseded_scaling_activities;
 #[path = "all/tags.rs"]
 mod tags;
 #[path = "all/target_tracking_alarms.rs"]

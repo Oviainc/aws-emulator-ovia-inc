@@ -661,12 +661,19 @@ fn apply_breaches(
             "monitor alarm {} in state ALARM triggered policy {}",
             breach.alarm_name, policy.key.policy_name
         );
-        store.record_capacity_change(&policy.key.target, capacity, cause, now);
+        // The instant THIS movement is made at, which is not the instant the pass started:
+        // the pass performs the breaches it found one after another, and two movements that
+        // share an instant have no order in time at all — so the one a later movement
+        // displaces could not be told from the one that displaced it. Never earlier than the
+        // instant the pass read, so the order the pass performs movements in is the order
+        // their instants are in.
+        let moved_at = SystemTime::now().max(now);
+        store.record_capacity_change(&policy.key.target, capacity, cause, moved_at);
         if let Some(target) = store.targets.get_mut(&policy.key.target) {
             target.current_capacity = capacity;
         }
         if let Some(record) = store.policies.get_mut(&policy.key) {
-            record.last_executed = Some(now);
+            record.last_executed = Some(moved_at);
         }
     }
 }
