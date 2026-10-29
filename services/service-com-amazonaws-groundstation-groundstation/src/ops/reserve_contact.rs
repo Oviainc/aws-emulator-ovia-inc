@@ -160,6 +160,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(ReserveContactErrorModeled::InvalidParameterException)?;
 
         let mut guard = state.lock();
+        // Place the pass against the state in force NOW: every move the clock already owed
+        // — a reservation's SCHEDULING -> SCHEDULED, a stop's CANCELLING -> CANCELLED, each
+        // stage of a pass under way — was due whether or not anybody called, and which of
+        // them have landed is what decides whether a contact still holds its antenna
+        // (`crate::state::Contact::reserves_antenna`). Settling first is what makes the
+        // placement depend on the clock alone rather than on which call came before it.
+        guard.settle_due_contacts();
 
         let profile = guard
             .mission_profile_by_arn(&input.mission_profile_arn)
