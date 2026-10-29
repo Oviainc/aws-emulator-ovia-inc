@@ -1,23 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The IAM IDENTITY resources a stack declares — an `AWS::IAM::User` and an
-//! `AWS::IAM::ManagedPolicy` — are real records of IAM, and the identity the stack
-//! publishes for each is the handle IAM itself takes for that kind of resource.
+//! The IAM IDENTITY resources a stack declares — an `AWS::IAM::User`, that user's
+//! `AWS::IAM::AccessKey` and an `AWS::IAM::ManagedPolicy` — are real records of IAM, and the
+//! identity the stack publishes for each is the handle IAM itself takes for that kind of
+//! resource.
 //!
 //! The rule under test: **a stack that reports a resource as created has called the owning
 //! service's own API for it, and what it publishes for that resource is the identifier a
-//! client calls that service with** — a user's own name, and a managed policy's ARN, which
+//! client calls that service with** — a user's own name, a managed policy's ARN, which
 //! is what every IAM operation on a managed policy is addressed by (`GetPolicy$PolicyArn`,
-//! `AttachRolePolicy$PolicyArn`). The same rule run backwards is the other half: a
+//! `AttachRolePolicy$PolicyArn`), and the access key id and secret IAM minted, which is what
+//! a client signs requests with. The same rule run backwards is the other half: a
 //! declaration the owning service REFUSES is no resource, so the stack fails instead of
 //! completing, and a stack's deletion removes what its deployment created.
 //!
 //! The rows differ along what the rule generalises over: the resource type, a resource the
 //! template NAMES and one whose physical id CloudFormation generated, the properties each
 //! type reaches IAM with (a path, an inline policy, an attached managed policy, a console
-//! password, a group membership, tags), the lifecycle stage (create, in-place update,
-//! delete) and both verdicts IAM can give. Every expected value is computed here from what
-//! the row declares, never read back out of the answer being checked.
+//! password, a group membership, tags, a key's status and serial), the lifecycle stage
+//! (create, in-place update, replacement, delete) and both verdicts IAM can give. Every
+//! expected value is computed here from what the row declares, never read back out of the
+//! answer being checked.
 //!
 //! Everything goes over the wire each service speaks — awsQuery for CloudFormation and for
 //! IAM — through the router `stack_lifecycle.rs` builds, which mounts IAM beside
@@ -909,5 +912,425 @@ async fn a_roles_trust_policy_is_iams_verdict_on_create_and_on_update() {
     assert!(
         document.contains("lambda.amazonaws.com") && !document.contains("ec2.amazonaws.com"),
         "expected the trust policy the update declared, got {document:?}"
+    );
+}
+
+/// One `AWS::IAM::AccessKey` row: how the key, and the user that holds it, are declared.
+struct AccessKeyRow {
+    case: &'static str,
+    stack: &'static str,
+    /// The `UserName` the template gives the user the key belongs to, or `None` for a user
+    /// whose name CloudFormation generates.
+    user_name: Option<&'static str>,
+    /// The `Status` the declaration asks the key to be in, or `None` where it declares none
+    /// — in which case the key carries the status every minted key does.
+    status: Option<&'static str>,
+    /// The `Serial` the declaration carries, or `None` where it declares none.
+    serial: Option<u64>,
+}
+
+/// The status a key carries where its declaration states none: "the default status for new
+/// keys is Active" (`CreateAccessKey`).
+const DEFAULT_KEY_STATUS: &str = "Active";
+
+/// The template one [`AccessKeyRow`] deploys at the `status`/`serial` given: a user, that
+/// user's access key, and every value either type publishes as an output — which is how a
+/// client reads back the credential a stack deployed.
+fn access_key_template(row: &AccessKeyRow, status: Option<&str>, serial: Option<u64>) -> String {
+    let mut user = json!({});
+    if let Some(name) = row.user_name {
+        user["UserName"] = json!(name);
+    }
+    let mut key = json!({"UserName": {"Ref": "User"}});
+    if let Some(status) = status {
+        key["Status"] = json!(status);
+    }
+    if let Some(serial) = serial {
+        key["Serial"] = json!(serial);
+    }
+    json!({
+        "Resources": {
+            "User": {"Type": "AWS::IAM::User", "Properties": user},
+            "Key": {"Type": "AWS::IAM::AccessKey", "Properties": key},
+        },
+        "Outputs": {
+            "UserName": {"Value": {"Ref": "User"}},
+            "AccessKeyId": {"Value": {"Ref": "Key"}},
+            "SecretAccessKey": {"Value": {"Fn::GetAtt": ["Key", "SecretAccessKey"]}},
+        },
+    })
+    .to_string()
+}
+
+/// The `(AccessKeyId, Status)` pairs IAM reports for one user, which is the only read that
+/// service publishes of a user's keys.
+async fn held_keys(router: &MultiServiceRouter, user_name: &str) -> Vec<(String, String)> {
+    let (code, body) = iam(router, "ListAccessKeys", &[("UserName", user_name)]).await;
+    assert_eq!(
+        code, 200,
+        "expected ListAccessKeys({user_name:?}) to answer, got {code}: {body}"
+    );
+    xml_texts(&body, "AccessKeyId")
+        .into_iter()
+        .zip(xml_texts(&body, "Status"))
+        .collect()
+}
+
+/// The status IAM reports for one of a user's keys, or `None` where that user holds no such
+/// key any more.
+async fn held_status(
+    router: &MultiServiceRouter,
+    user_name: &str,
+    access_key_id: &str,
+) -> Option<String> {
+    held_keys(router, user_name)
+        .await
+        .into_iter()
+        .find(|(id, _)| id == access_key_id)
+        .map(|(_, status)| status)
+}
+
+/// A secret access key IAM mints on its own wire, for a user created here: the CONTROL a
+/// stack's published secret is compared against, so what a row asserts about that secret is
+/// the shape IAM gives a credential rather than any particular value.
+async fn minted_secret(router: &MultiServiceRouter, user_name: &str) -> String {
+    for (action, params) in [
+        ("CreateUser", vec![("UserName", user_name)]),
+        ("CreateAccessKey", vec![("UserName", user_name)]),
+    ] {
+        let (code, body) = iam(router, action, &params).await;
+        assert_eq!(
+            code, 200,
+            "the control credential needs {action} to answer, got {code}: {body}"
+        );
+        if action == "CreateAccessKey" {
+            return xml_text(&body, "SecretAccessKey")
+                .unwrap_or_else(|| panic!("expected a minted secret, got {body}"));
+        }
+    }
+    unreachable!("the loop returns on CreateAccessKey")
+}
+
+/// RULE: every output of a settled stack carries a VALUE — the one the type's published
+/// return values define — so a `Ref` to a deployed access key resolves to the access key id
+/// IAM minted and an `Fn::GetAtt` of its `SecretAccessKey` to the secret IAM answered with,
+/// never to a name CloudFormation generated or to no value at all.
+///
+/// The rows differ along what the rule generalises over: whether the template names the user
+/// its key belongs to or leaves the name to CloudFormation, and which `Status`/`Serial` the
+/// declaration carries.
+#[tokio::test]
+async fn a_deployed_access_key_is_published_with_the_credential_iam_minted() {
+    let rows = &[
+        AccessKeyRow {
+            case: "a key of a user the template names, declaring neither status nor serial",
+            stack: "cfnkey-named",
+            user_name: Some("cfn-named-key-user"),
+            status: None,
+            serial: None,
+        },
+        AccessKeyRow {
+            case: "a key the declaration asks for Active, of a user CloudFormation names",
+            stack: "cfnkey-active",
+            user_name: None,
+            status: Some("Active"),
+            serial: Some(1),
+        },
+        AccessKeyRow {
+            case: "a key the declaration asks for Inactive",
+            stack: "cfnkey-inactive",
+            user_name: Some("cfn-inactive-key-user"),
+            status: Some("Inactive"),
+            serial: Some(7),
+        },
+    ];
+    for row in rows {
+        let case = row.case;
+        let router = router();
+        let control = minted_secret(&router, "cfnkey-control-user").await;
+        let (status, reason) = deploy(
+            &router,
+            row.stack,
+            &access_key_template(row, row.status, row.serial),
+        )
+        .await;
+        assert_eq!(
+            status.as_deref(),
+            Some("CREATE_COMPLETE"),
+            "case {case:?}: expected the create to complete, got {status:?} ({reason:?})"
+        );
+
+        // Every declared output is reported, and every one of them has a value: a stack that
+        // settled with an output carrying no `OutputValue` publishes nothing a client can
+        // read the deployed credential out of. WHICH outputs, not in which order — the
+        // protocol fixes no order for `Stack$Outputs`.
+        let reported = outputs(&router, row.stack).await;
+        let mut keys: Vec<&str> = reported.iter().map(|(key, _)| key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["AccessKeyId", "SecretAccessKey", "UserName"],
+            "case {case:?}: expected one entry per declared output, got {reported:?}"
+        );
+        for (key, value) in &reported {
+            assert!(
+                !value.is_empty(),
+                "case {case:?}: expected output {key} to carry a value, got {reported:?}"
+            );
+        }
+
+        let user_name = output(&reported, "UserName");
+        if let Some(declared) = row.user_name {
+            assert_eq!(
+                user_name, declared,
+                "case {case:?}: expected the user the template named"
+            );
+        }
+
+        // The id the stack publishes is the resource's identity AND the one IAM holds the
+        // key under — not the `<stack>-<logical id>-<unique id>` name CloudFormation
+        // generates for a resource whose own service names nothing.
+        let access_key_id = output(&reported, "AccessKeyId");
+        assert_eq!(
+            access_key_id,
+            physical_id(&router, row.stack, "Key").await,
+            "case {case:?}: expected Ref to resolve to the key's physical id"
+        );
+        assert!(
+            !access_key_id.contains(row.stack),
+            "case {case:?}: expected the id IAM minted, got the generated name \
+             {access_key_id:?}"
+        );
+        let held = held_status(&router, &user_name, &access_key_id).await;
+        assert_eq!(
+            held.as_deref(),
+            Some(row.status.unwrap_or(DEFAULT_KEY_STATUS)),
+            "case {case:?}: expected IAM to hold the key in the declared status, got {:?}",
+            held_keys(&router, &user_name).await
+        );
+
+        // The secret is the one IAM answered the create with: a credential of the shape that
+        // service mints, and this key's own rather than any other's.
+        let secret = output(&reported, "SecretAccessKey");
+        assert_eq!(
+            secret.len(),
+            control.len(),
+            "case {case:?}: expected a secret of the length IAM mints, got {secret:?}"
+        );
+        assert!(
+            !secret.contains(char::is_whitespace),
+            "case {case:?}: expected a credential, got {secret:?}"
+        );
+        assert_ne!(
+            secret, control,
+            "case {case:?}: each access key carries its own secret"
+        );
+    }
+}
+
+/// RULE (the in-place update half): `Status` is the one property IAM can change on a key
+/// that exists — "changes the status of the specified access key from Active to Inactive, or
+/// vice versa" — so a stack update that deactivates a deployed key keeps the key's identity:
+/// the same id and the same secret, in the status the template now declares.
+#[tokio::test]
+async fn deactivating_a_deployed_access_key_keeps_the_credential_it_published() {
+    let row = AccessKeyRow {
+        case: "a key whose status the update moves",
+        stack: "cfnkey-deactivated",
+        user_name: Some("cfn-deactivated-key-user"),
+        status: None,
+        serial: Some(1),
+    };
+    let router = router();
+    let (status, reason) = deploy(
+        &router,
+        row.stack,
+        &access_key_template(&row, None, row.serial),
+    )
+    .await;
+    assert_eq!(
+        status.as_deref(),
+        Some("CREATE_COMPLETE"),
+        "expected the create to complete, got {status:?} ({reason:?})"
+    );
+    let before = outputs(&router, row.stack).await;
+    let user_name = output(&before, "UserName");
+    let access_key_id = output(&before, "AccessKeyId");
+
+    // Both directions the one call serves, each from the status the previous deployment left.
+    for asked in ["Inactive", "Active"] {
+        let (status, reason) = redeploy(
+            &router,
+            row.stack,
+            &access_key_template(&row, Some(asked), row.serial),
+        )
+        .await;
+        assert_eq!(
+            status.as_deref(),
+            Some("UPDATE_COMPLETE"),
+            "case {asked:?}: expected the status update to complete, got {status:?} \
+             ({reason:?})"
+        );
+        let held = held_status(&router, &user_name, &access_key_id).await;
+        assert_eq!(
+            held.as_deref(),
+            Some(asked),
+            "case {asked:?}: expected IAM to report the status the template declares, \
+             got {:?}",
+            held_keys(&router, &user_name).await
+        );
+        let after = outputs(&router, row.stack).await;
+        assert_eq!(
+            after, before,
+            "case {asked:?}: an in-place update must leave the published credential as it is"
+        );
+    }
+}
+
+/// RULE (the replacement half): the `Serial` is create-only — "incrementing this value
+/// notifies CloudFormation that you want to rotate your access key… CloudFormation will
+/// replace the AccessKey resource with a new access key" — so a stack update that increments
+/// it publishes a NEW credential and the key it replaced is gone from IAM.
+#[tokio::test]
+async fn rotating_the_serial_replaces_the_key_and_takes_the_old_one_away() {
+    let row = AccessKeyRow {
+        case: "a key the update rotates",
+        stack: "cfnkey-rotated",
+        user_name: Some("cfn-rotated-key-user"),
+        status: None,
+        serial: Some(1),
+    };
+    let router = router();
+    let (status, reason) = deploy(
+        &router,
+        row.stack,
+        &access_key_template(&row, None, Some(1)),
+    )
+    .await;
+    assert_eq!(
+        status.as_deref(),
+        Some("CREATE_COMPLETE"),
+        "expected the create to complete, got {status:?} ({reason:?})"
+    );
+    let before = outputs(&router, row.stack).await;
+    let user_name = output(&before, "UserName");
+    let rotated_out = output(&before, "AccessKeyId");
+
+    let (status, reason) = redeploy(
+        &router,
+        row.stack,
+        &access_key_template(&row, None, Some(2)),
+    )
+    .await;
+    assert_eq!(
+        status.as_deref(),
+        Some("UPDATE_COMPLETE"),
+        "expected the rotation to complete, got {status:?} ({reason:?})"
+    );
+    let after = outputs(&router, row.stack).await;
+    let rotated_in = output(&after, "AccessKeyId");
+    assert_ne!(
+        rotated_in, rotated_out,
+        "expected a rotation to publish a new access key id"
+    );
+    assert_ne!(
+        output(&after, "SecretAccessKey"),
+        output(&before, "SecretAccessKey"),
+        "expected the new key's own secret"
+    );
+    let held = held_keys(&router, &user_name).await;
+    assert!(
+        held.iter().any(|(id, _)| id == &rotated_in),
+        "expected IAM to hold the key the rotation created, got {held:?}"
+    );
+    assert!(
+        !held.iter().any(|(id, _)| id == &rotated_out),
+        "expected the rotated-out key to be gone from IAM, got {held:?}"
+    );
+}
+
+/// RULE (the delete half, and both verdicts IAM can give): deleting the stack deletes the
+/// access key it created before the user that holds it — which is the only order IAM admits,
+/// "you must delete the items attached to the user manually, or the deletion fails" — while
+/// a key declared for a user nothing holds is no credential at all, so the stack fails with
+/// IAM's own refusal instead of completing.
+#[tokio::test]
+async fn an_access_keys_lifecycle_is_iams_verdict_on_create_and_on_delete() {
+    let row = AccessKeyRow {
+        case: "a key the stack's deletion takes away",
+        stack: "cfnkey-cascade",
+        user_name: Some("cfn-cascade-key-user"),
+        status: None,
+        serial: None,
+    };
+    let router = router();
+    let (status, reason) =
+        deploy(&router, row.stack, &access_key_template(&row, None, None)).await;
+    assert_eq!(
+        status.as_deref(),
+        Some("CREATE_COMPLETE"),
+        "expected the create to complete, got {status:?} ({reason:?})"
+    );
+    let user_name = output(&outputs(&router, row.stack).await, "UserName");
+
+    delete_stack(&router, row.stack).await;
+    let (code, body) = iam(&router, "GetUser", &[("UserName", &user_name)]).await;
+    assert_eq!(
+        code, 404,
+        "expected the user and its key to be gone from IAM, got {code}: {body}"
+    );
+
+    // The create half's other verdict: the key names a user the account does not hold, so
+    // IAM refuses and the stack rolls back carrying that refusal.
+    let orphan = "cfn-orphan-key-user";
+    let template = json!({"Resources": {"Key": {
+        "Type": "AWS::IAM::AccessKey",
+        "Properties": {"UserName": orphan},
+    }}})
+    .to_string();
+    let (status, reason) = deploy(&router, "cfnkey-orphan", &template).await;
+    assert_eq!(
+        status.as_deref(),
+        Some("ROLLBACK_COMPLETE"),
+        "expected the stack to roll back, got {status:?} ({reason:?})"
+    );
+    let failure = create_failure(&router, "cfnkey-orphan", "Key").await;
+    assert!(
+        failure.contains(orphan),
+        "expected IAM's refusal to name the user it could not find, got {failure:?}"
+    );
+
+    // And the same verdict on the status the declaration asks for: IAM will not put a key
+    // in a status outside the ones it models, so the resource is not created — and because
+    // the key minted on the way there is withdrawn, the rollback can delete the user the
+    // same deployment created, which IAM refuses while a user still holds a key.
+    let refused = AccessKeyRow {
+        case: "a key declaring a status IAM will not set",
+        stack: "cfnkey-badstatus",
+        user_name: Some("cfn-badstatus-key-user"),
+        status: Some("Disabled"),
+        serial: None,
+    };
+    let (status, reason) = deploy(
+        &router,
+        refused.stack,
+        &access_key_template(&refused, refused.status, None),
+    )
+    .await;
+    assert_eq!(
+        status.as_deref(),
+        Some("ROLLBACK_COMPLETE"),
+        "expected the stack to roll back, got {status:?} ({reason:?})"
+    );
+    let (code, body) = iam(
+        &router,
+        "GetUser",
+        &[("UserName", refused.user_name.unwrap_or_default())],
+    )
+    .await;
+    assert_eq!(
+        code, 404,
+        "expected the rollback to have deleted the user, which it can only do once the \
+         minted key is withdrawn, got {code}: {body}"
     );
 }

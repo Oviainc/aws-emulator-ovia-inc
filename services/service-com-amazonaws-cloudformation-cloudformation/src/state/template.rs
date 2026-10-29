@@ -553,7 +553,7 @@ pub const CAPABILITY_NAMED_IAM: &str = "CAPABILITY_NAMED_IAM";
 /// `CAPABILITY_IAM`, and "you must specify `CAPABILITY_NAMED_IAM` if you have IAM
 /// resources with custom names" for the named form.
 const IAM_CAPABILITY_RESOURCES: &[(&str, Option<&str>)] = &[
-    ("AWS::IAM::AccessKey", None),
+    (IAM_ACCESS_KEY, None),
     ("AWS::IAM::Group", Some("GroupName")),
     ("AWS::IAM::InstanceProfile", Some("InstanceProfileName")),
     ("AWS::IAM::ManagedPolicy", Some("ManagedPolicyName")),
@@ -2244,6 +2244,45 @@ pub fn name_property(resource_type: &str, properties: &Value) -> Option<String> 
         .find(|property| properties.get(property).is_some())
 }
 
+/// The properties of this type a resource cannot take a NEW VALUE for while it goes on
+/// existing — the ones the resource and property types reference publishes with "Update
+/// requires: `Replacement`" — BESIDE the name, which is in that position for every type
+/// ([`name_property`]) and is read from the declaration rather than catalogued.
+///
+/// A resource is created with such a property and nothing changes it afterwards: an IAM
+/// access key belongs to the user `CreateAccessKey` minted it for and carries the `Serial`
+/// the template rotates it with ("incrementing this value notifies CloudFormation that you
+/// want to rotate your access key… CloudFormation will replace the AccessKey resource with
+/// a new access key"), so a declaration that states either differently asks for a DIFFERENT
+/// resource — which CloudFormation replaces rather than updates.
+///
+/// A type with no entry has none beyond its name, so the name alone decides whether a
+/// re-deploy means the same resource ([`super::declared_name`]).
+pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
+    match resource_type {
+        IAM_ACCESS_KEY => &["Serial", "UserName"],
+        _ => &[],
+    }
+}
+
+/// Every property of one declaration whose change RECREATES the resource: the name it takes
+/// its identity from, and the type's other replacement properties
+/// ([`replacement_properties`]).
+///
+/// The one reading of "Update requires: `Replacement`" a change set's `RequiresRecreation`
+/// details and a deployment's own replacement decision share, so a preview cannot say a
+/// change recreates a resource that the deployment then updates in place.
+pub fn replacing_properties(resource_type: &str, properties: &Value) -> Vec<String> {
+    name_property(resource_type, properties)
+        .into_iter()
+        .chain(
+            replacement_properties(resource_type)
+                .iter()
+                .map(ToString::to_string),
+        )
+        .collect()
+}
+
 /// The naming rules of the service that OWNS a resource type: the longest name it accepts
 /// for one, and the characters such a name may carry.
 ///
@@ -2919,6 +2958,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     EVENTS_RULE,
     FIS_EXPERIMENT_TEMPLATE,
     GUARDDUTY_DETECTOR,
+    IAM_ACCESS_KEY,
     "AWS::IAM::Role",
     KMS_KEY,
     FIREHOSE_DELIVERY_STREAM,
@@ -3299,6 +3339,23 @@ fn return_values(
             attributes.insert("Arn".to_string(), arn.clone());
             attributes.insert("WorkflowId".to_string(), workflow_id);
             (arn, attributes)
+        }
+        // "Ref returns the AWS::IAM::AccessKey resource's access key ID"; Fn::GetAtt:
+        // SecretAccessKey — "the secret access key for the specified AWS::IAM::AccessKey
+        // resource". IAM MINTS both: `CreateAccessKey` takes no identifier and answers the
+        // key id and the secret it generated, and the secret "is returned only in response
+        // to CreateAccessKey", so neither is a value these naming rules can compute. The
+        // identifier a declaration reports until that create answers is the name
+        // CloudFormation generated for the resource ([`identity_is_service_assigned`] names
+        // the type, so [`super::provisioning::reconcile`] adopts the minted id over it), and
+        // the secret is a stand-in that same walk re-points at what IAM answered — never an
+        // invented credential.
+        IAM_ACCESS_KEY => {
+            attributes.insert(
+                "SecretAccessKey".to_string(),
+                service_assigned_document(name, "SecretAccessKey"),
+            );
+            (name.to_string(), attributes)
         }
         // "Ref returns the role name"; Fn::GetAtt: Arn. IAM is a global service, so its
         // ARNs carry no region.
@@ -4207,6 +4264,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         "AWS::Logs::LogGroup" => &["Arn"],
         TRANSFER_SERVER => &["Arn", "ServerId"],
         "AWS::Transfer::Workflow" => &["Arn", "WorkflowId"],
+        IAM_ACCESS_KEY => &["SecretAccessKey"],
         "AWS::IAM::Role" => &["Arn"],
         ECR_PUBLIC_REPOSITORY => &["Arn"],
         FIREHOSE_DELIVERY_STREAM => &["Arn"],
@@ -4351,6 +4409,12 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// the record name", which is the `Name` its own declaration states.)
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
     resource_type == APIGATEWAYV2_API
+        // An IAM access key is one more: "Ref returns the AWS::IAM::AccessKey resource's
+        // access key ID", `CreateAccessKey` takes no identifier — the declaration states
+        // only the user the key belongs to — and that id is what every IAM operation on a
+        // key takes (`UpdateAccessKey$AccessKeyId`, `DeleteAccessKey$AccessKeyId`) and what
+        // a client signs requests with, so the identifier in force is the one IAM minted.
+        || resource_type == IAM_ACCESS_KEY
         // An IAM managed policy is one more: "Ref returns the ARN of the managed policy",
         // the handle every IAM operation on one takes (`GetPolicy$PolicyArn`,
         // `AttachRolePolicy$PolicyArn`), and `CreatePolicy` is what answers it — built from
@@ -4447,6 +4511,15 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // then sees the rule the stack already has rather than one to create again.
         || resource_type == SES_RECEIPT_RULE
 }
+
+/// The type of an IAM access key: the long-term credential of an IAM user, under the
+/// namespace the IAM model's own `awsService.cloudFormationName` (`IAM`) spells.
+///
+/// "Ref returns the AWS::IAM::AccessKey resource's access key ID", and `Fn::GetAtt` reads
+/// `SecretAccessKey` — "the secret access key for the specified AWS::IAM::AccessKey
+/// resource". IAM mints both, which is why [`identity_is_service_assigned`] names this type
+/// and why neither value is computed here ([`return_values`]).
+pub const IAM_ACCESS_KEY: &str = "AWS::IAM::AccessKey";
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
 /// The middle segment is the Firehose model's own `awsService.cloudFormationName`

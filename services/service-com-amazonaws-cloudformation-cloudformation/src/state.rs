@@ -1884,10 +1884,11 @@ impl StoredStack {
             // under the same logical id and type IS that resource, because nothing here
             // can recompute the id it was created with — as long as the declaration still
             // asks for the same resource, which for such a type is what the NAME it
-            // declares says. A declaration that RENAMES it is a different resource (AWS
-            // replaces such a resource when the template changes its name), and a type
-            // with no name property declares none on either side, so the test is vacuous
-            // for it.
+            // declares says, beside the type's other create-only properties
+            // ([`declares_the_same_create_only`]). A declaration that RENAMES it, or that
+            // states one of those properties differently, is a different resource (AWS
+            // replaces such a resource when the template changes either), and a type with
+            // neither declares none on either side, so the test is vacuous for it.
             let existing = already_created
                 .iter()
                 .find(|existing| {
@@ -1901,6 +1902,7 @@ impl StoredStack {
                                     && existing.logical_id == resource.logical_id
                                     && existing.resource_type == resource.resource_type
                                     && declared_name(existing) == declared_name(resource)
+                                    && declares_the_same_create_only(existing, resource)
                             })
                         })
                         .flatten()
@@ -3961,6 +3963,21 @@ fn declared_name(resource: &StoredResource) -> Option<String> {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         })
+}
+
+/// Whether two revisions of one declaration state the same CREATE-ONLY properties — the
+/// ones the type publishes as "Update requires: `Replacement`" beside its name
+/// ([`template::replacement_properties`]).
+///
+/// The other half of [`declared_name`]'s question, asked for the same reason: a resource is
+/// created with such a property and no call of its owning service changes it, so a
+/// declaration that states one differently asks for a NEW resource rather than for a change
+/// to the one the stack has. A type that publishes none is unaffected — there is nothing to
+/// compare, so the two revisions always agree.
+fn declares_the_same_create_only(existing: &StoredResource, resource: &StoredResource) -> bool {
+    template::replacement_properties(&resource.resource_type)
+        .iter()
+        .all(|property| existing.properties.get(property) == resource.properties.get(property))
 }
 
 /// The status an operation that cannot be carried out leaves the stack in, by the

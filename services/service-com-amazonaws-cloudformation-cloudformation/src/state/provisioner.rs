@@ -449,7 +449,8 @@ use super::template::{
     ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
-    ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, KINESIS_STREAM,
+    ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, IAM_ACCESS_KEY,
+    KINESIS_STREAM,
     KMS_ALIAS, KMS_KEY,
     MQ_BROKER, MSK_CLUSTER,
     MSK_SERVERLESS_CLUSTER, OPENSEARCH_DOMAIN, REDSHIFT_CLUSTER, ROUTE53RESOLVER_ENDPOINT,
@@ -580,6 +581,10 @@ pub(super) enum Provisioner {
     /// `AddRoleToInstanceProfile` puts the declared role in it.
     IamInstanceProfile,
     IamUser,
+    /// `AWS::IAM::AccessKey`: the long-term credential of one of those users, which
+    /// `CreateAccessKey` mints and `DeleteAccessKey` deletes. Its id and its secret are
+    /// IAM's to generate, so both are read off that create's answer.
+    IamAccessKey,
     IamManagedPolicy,
     CodePipelinePipeline,
     EcsCluster,
@@ -700,6 +705,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         IAM_ROLE => Some(Provisioner::IamRole),
         IAM_INSTANCE_PROFILE => Some(Provisioner::IamInstanceProfile),
         IAM_USER => Some(Provisioner::IamUser),
+        IAM_ACCESS_KEY => Some(Provisioner::IamAccessKey),
         IAM_MANAGED_POLICY => Some(Provisioner::IamManagedPolicy),
         CODEPIPELINE_PIPELINE => Some(Provisioner::CodePipelinePipeline),
         ECS_CLUSTER => Some(Provisioner::EcsCluster),
@@ -843,6 +849,9 @@ impl Provisioner {
             // a profile.
             Self::IamInstanceProfile => create_instance_profile(ctx, region, resource).await,
             Self::IamUser => create_iam_user(ctx, region, resource, propagated).await,
+            // `AWS::IAM::AccessKey` publishes no `Tags` property and `CreateAccessKey` takes
+            // none, so no tags are propagated to an access key.
+            Self::IamAccessKey => create_iam_access_key(ctx, region, resource).await,
             // `AWS::IAM::ManagedPolicy` publishes no `Tags` property and `CreatePolicy`
             // takes none from this arm, so no tags are propagated to a policy.
             Self::IamManagedPolicy => create_managed_policy(ctx, region, resource).await,
@@ -1387,6 +1396,13 @@ impl Provisioner {
             // changed declaration is applied to the user the stack created rather than
             // replacing it ([`update_iam_user`]).
             Self::IamUser => update_iam_user(ctx, region, resource, declared).await,
+            // An access key's `Status` is the one property of a key that exists IAM can
+            // change — `UpdateAccessKey` "changes the status of the specified access key
+            // from Active to Inactive, or vice versa" — so a changed declaration of it is
+            // applied to the key the stack created ([`update_iam_access_key`]), while the
+            // user it belongs to and the `Serial` it is rotated with replace the resource
+            // rather than reaching this call at all.
+            Self::IamAccessKey => update_iam_access_key(ctx, region, resource, declared).await,
             // A managed policy's identity is its ARN, and the document it grants from is
             // changed by adding a new DEFAULT version to the policy that ARN names, so a
             // changed declaration is applied to the policy the stack created rather than
@@ -1593,6 +1609,9 @@ impl Provisioner {
             // The user's password, policies and memberships have to go first, and only the
             // resource's own record says which ones there are.
             Self::IamUser => delete_iam_user(ctx, region, resource).await,
+            // The key is addressed by the PAIR IAM keys one by — the user that holds it and
+            // the id IAM minted — and the user half is on the resource's own declaration.
+            Self::IamAccessKey => delete_iam_access_key(ctx, region, resource).await,
             // The policy's attachments and its non-default versions have to go first, and
             // only the resource's own record says which entities it was attached to.
             Self::IamManagedPolicy => delete_managed_policy(ctx, region, resource).await,
@@ -1878,6 +1897,9 @@ impl Provisioner {
                 describe_instance_profile(ctx, region, physical_resource_id).await
             }
             Self::IamUser => describe_iam_user(ctx, region, physical_resource_id).await,
+            // Read back from the user's own list of keys, IAM publishing no read of ONE
+            // access key.
+            Self::IamAccessKey => describe_iam_access_key(ctx, region, resource).await,
             Self::IamManagedPolicy => {
                 describe_managed_policy(ctx, region, physical_resource_id).await
             }
@@ -6435,9 +6457,223 @@ async fn describe_iam_user(
 }
 
 // ---------------------------------------------------------------------------
-// CodePipeline: AWS::CodePipeline::Pipeline
+// IAM: AWS::IAM::AccessKey
 // ---------------------------------------------------------------------------
 
+/// The property an `AWS::IAM::AccessKey` declaration names the user its key belongs to in:
+/// "the name of the IAM user that the new key will belong to", which is the `UserName`
+/// `CreateAccessKey` takes.
+const ACCESS_KEY_USER_NAME: &str = "UserName";
+
+/// The property it declares the key's status in: "the status of the access key. `Active`
+/// means that the key is valid for API calls, while `Inactive` means it is not" — the values
+/// IAM's own `statusType` spells.
+const ACCESS_KEY_STATUS: &str = "Status";
+
+/// The status every minted key carries: "the default status for new keys is Active"
+/// (`CreateAccessKey`), as `statusType` spells it.
+const ACCESS_KEY_ACTIVE: &str = "Active";
+
+/// The one property of an access key that already exists IAM can change: its status, which
+/// `UpdateAccessKey` moves. The user the key belongs to and the `Serial` a template rotates
+/// it with are create-only ([`super::template::replacement_properties`]), so a declaration
+/// that states either differently REPLACES the resource and never reaches
+/// [`update_iam_access_key`].
+const ACCESS_KEY_IN_PLACE_PROPERTIES: &[&str] = &[ACCESS_KEY_STATUS];
+
+/// Create the access key an `AWS::IAM::AccessKey` declares for the user its declaration
+/// names, and report the identity IAM minted: the access key id this type's `Ref` returns
+/// and the secret its `SecretAccessKey` attribute carries.
+///
+/// Both are IAM's to generate — `CreateAccessKey` "creates a new Amazon Web Services secret
+/// access key and corresponding Amazon Web Services access key ID for the specified user",
+/// and the secret "is returned only in response to CreateAccessKey" — so this one answer is
+/// the only place either value can come from, and nothing here computes one. A user IAM does
+/// not hold, and a user already at its key quota, are that service's own refusals, which
+/// fail the resource like any other: a stack never publishes a credential nothing minted.
+///
+/// Every key is minted `Active`, so a declaration that asks for another status is applied
+/// with the one IAM call that moves it — the same call a client would make next. A status
+/// that call refuses leaves no resource, so the key it just minted is withdrawn before the
+/// refusal is reported rather than left on the user.
+async fn create_iam_access_key(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let client = iam_client(ctx, region);
+    let user_name = required_property(resource, ACCESS_KEY_USER_NAME)?;
+    let answer = client
+        .create_access_key()
+        .user_name(&user_name)
+        .send()
+        .await
+        .map_err(|error| refusal_of(&error))?;
+    let Some(minted) = answer.access_key() else {
+        return Err(Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "IAM answered CreateAccessKey without an AccessKey".to_string(),
+        });
+    };
+    let access_key_id = minted.access_key_id().to_string();
+    let mut attributes = BTreeMap::new();
+    attributes.insert(
+        "SecretAccessKey".to_string(),
+        minted.secret_access_key().to_string(),
+    );
+    if let Some(status) =
+        property(resource, ACCESS_KEY_STATUS).filter(|status| status != ACCESS_KEY_ACTIVE)
+    {
+        if let Err(refusal) = client
+            .update_access_key()
+            .user_name(&user_name)
+            .access_key_id(&access_key_id)
+            .status(::aws_sdk_iam::types::StatusType::from(status.as_str()))
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))
+        {
+            // The key is not the one the declaration asked for and the resource is not
+            // created, so the credential this arm just minted is WITHDRAWN before the
+            // refusal is reported: the stack publishes no id for it, so neither its own
+            // rollback nor its deletion could delete it afterwards — and a user that still
+            // holds an access key is one IAM refuses to delete.
+            client
+                .delete_access_key()
+                .user_name(&user_name)
+                .access_key_id(&access_key_id)
+                .send()
+                .await
+                .map_err(|error| refusal_of(&error))?;
+            return Err(refusal);
+        }
+    }
+    Ok(Created {
+        physical_resource_id: Some(access_key_id),
+        attributes,
+    })
+}
+
+/// Apply a CHANGED `AWS::IAM::AccessKey` declaration to the key the stack already has,
+/// through `UpdateAccessKey` — "changes the status of the specified access key from Active
+/// to Inactive, or vice versa", which is what deactivating a deployed credential is.
+///
+/// The key therefore keeps its identity: the same id and the same secret, so an output that
+/// published either still resolves to the credential the stack deployed. A status the
+/// deployment no longer declares goes back to the one a newly minted key carries, so a
+/// dropped property is reset rather than silently kept.
+///
+/// `Ok(None)` is a change no IAM call makes to a key that exists — a property outside
+/// [`ACCESS_KEY_IN_PLACE_PROPERTIES`] — which the deployment then reports as not applied.
+async fn update_iam_access_key(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    if changed_properties(&resource.properties, declared)
+        .iter()
+        .any(|property| !ACCESS_KEY_IN_PLACE_PROPERTIES.contains(&property.as_str()))
+    {
+        return Ok(None);
+    }
+    let status = declared
+        .get(ACCESS_KEY_STATUS)
+        .and_then(scalar_text)
+        .unwrap_or_else(|| ACCESS_KEY_ACTIVE.to_string());
+    iam_client(ctx, region)
+        .update_access_key()
+        .user_name(required_property(resource, ACCESS_KEY_USER_NAME)?)
+        .access_key_id(&resource.physical_resource_id)
+        .status(::aws_sdk_iam::types::StatusType::from(status.as_str()))
+        .send()
+        .await
+        .map_err(|error| refusal_of(&error))?;
+    // The id and the secret are the ones the create reported and are unchanged by this
+    // call, so the attributes in force are the ones the resource already carries.
+    Ok(Some(Created::attributes(BTreeMap::new())))
+}
+
+/// Delete the access key a stack created, so the credential it published stops signing
+/// requests.
+///
+/// `DeleteAccessKey` addresses a key by the PAIR IAM keys one by — the user that holds it
+/// and the id IAM minted — so the user half comes off the resource's own declaration. A key
+/// IAM no longer has, and a user it no longer has, are both already in the state the delete
+/// asks for ([`tolerated_absence`]).
+async fn delete_iam_access_key(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    match iam_client(ctx, region)
+        .delete_access_key()
+        .user_name(required_property(resource, ACCESS_KEY_USER_NAME)?)
+        .access_key_id(&resource.physical_resource_id)
+        .send()
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) => tolerated_absence(&error),
+    }
+}
+
+/// The access key's configuration as IAM reports it, for drift detection.
+///
+/// IAM publishes no read of ONE access key — "returns information about the access key IDs
+/// associated with the specified IAM user" is the read it has — so the key is looked up in
+/// its user's own list, which carries every key that user holds (IAM bounds the keys per
+/// user, so one page is all of them). A key that list no longer carries, and a user IAM no
+/// longer holds, were deleted. The members compared are the two the resource type and
+/// `AccessKeyMetadata` spell identically and the create sends — `UserName` and `Status` — so
+/// a key deactivated outside the stack is MODIFIED.
+async fn describe_iam_access_key(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let user_name = required_property(resource, ACCESS_KEY_USER_NAME)?;
+    let answer = match iam_client(ctx, region)
+        .list_access_keys()
+        .user_name(&user_name)
+        .send()
+        .await
+    {
+        Ok(answer) => answer,
+        Err(error) => {
+            let refusal = refusal_of(&error);
+            if refusal.code == NO_SUCH_ENTITY {
+                return Ok(None);
+            }
+            return Err(refusal);
+        }
+    };
+    let Some(held) = answer
+        .access_key_metadata()
+        .iter()
+        .find(|metadata| metadata.access_key_id() == Some(resource.physical_resource_id.as_str()))
+    else {
+        return Ok(None);
+    };
+    let mut actual = Map::new();
+    if let Some(holder) = held.user_name() {
+        actual.insert(
+            ACCESS_KEY_USER_NAME.to_string(),
+            Value::String(holder.to_string()),
+        );
+    }
+    if let Some(status) = held.status() {
+        actual.insert(
+            ACCESS_KEY_STATUS.to_string(),
+            Value::String(status.as_str().to_string()),
+        );
+    }
+    Ok(Some(Value::Object(actual)))
+}
+
+// ---------------------------------------------------------------------------
+// CodePipeline: AWS::CodePipeline::Pipeline
+// ---------------------------------------------------------------------------
 /// CodePipeline's signing name and `X-Amz-Target` prefix, from its model
 /// (`sigv4Name: codepipeline`, service shape `CodePipeline_20150709`).
 const CODEPIPELINE_SIGNING_NAME: &str = "codepipeline";

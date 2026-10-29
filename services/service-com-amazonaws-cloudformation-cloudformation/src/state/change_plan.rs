@@ -39,7 +39,8 @@
 //! and property types reference; what this module reads from it is the rule that holds for
 //! EVERY type: a resource's physical name is fixed when it is created, so the property a
 //! resource takes its name from (see [`template::name_property`]) is documented "Update
-//! requires: Replacement" and every other property change is `Never`.
+//! requires: Replacement", and so is each of the type's other create-only properties
+//! ([`template::replacement_properties`]) — every other property change is `Never`.
 //!
 //! Nothing here is computed on a read: `CreateChangeSet` calls [`computed_changes`] once
 //! and stores what it answered.
@@ -466,7 +467,7 @@ fn propagate_recreations(
     if recreated.is_empty() {
         return;
     }
-    let name_property = template::name_property(&resource.resource_type, &resource.properties);
+    let replacing = template::replacing_properties(&resource.resource_type, &resource.properties);
     let mut propagated = Vec::new();
     for property in property_names(&resource.properties) {
         let already_reported = details.iter().any(|detail| {
@@ -503,7 +504,7 @@ fn propagate_recreations(
         propagated.push(StoredChangeDetail {
             attribute: PROPERTIES_ATTRIBUTE.to_string(),
             name: Some(property.to_string()),
-            requires_recreation: if name_property.as_deref() == Some(property) {
+            requires_recreation: if replacing.iter().any(|name| name == property) {
                 requires_recreation::ALWAYS
             } else {
                 requires_recreation::NEVER
@@ -612,10 +613,17 @@ fn property_details(
         .into_iter()
         .chain(property_names(&submitted.properties))
         .collect();
-    let recreating = [
-        template::name_property(&previous.resource_type, &previous.properties),
-        template::name_property(&submitted.resource_type, &submitted.properties),
-    ];
+    // What a change to each property would do to the resource: the properties either
+    // revision states that are the type's replacement ones ([`template::replacing_properties`]
+    // — the name it takes its identity from, and the type's other create-only properties).
+    let recreating: Vec<String> =
+        template::replacing_properties(&previous.resource_type, &previous.properties)
+            .into_iter()
+            .chain(template::replacing_properties(
+                &submitted.resource_type,
+                &submitted.properties,
+            ))
+            .collect();
     let mut details = Vec::new();
     for property in properties {
         let declared_before = previous.properties.get(property);
@@ -651,9 +659,7 @@ fn property_details(
         } else {
             evaluation::STATIC
         };
-        let recreates = recreating
-            .iter()
-            .any(|name| name.as_deref() == Some(property));
+        let recreates = recreating.iter().any(|name| name == property);
         let target = |evaluation: &str, source: &str, causing_entity: Option<String>| {
             StoredChangeDetail {
                 attribute: PROPERTIES_ATTRIBUTE.to_string(),
