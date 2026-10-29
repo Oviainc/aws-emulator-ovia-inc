@@ -16,6 +16,10 @@
 //! An ARN this endpoint resolves no resource for is refused with HTTP 400 under the
 //! `InvalidInputException` class rather than answered with a hollow 204.
 //!
+//! A sub-resource whose delete has already been accepted is one of those: it is
+//! retained only to be REPORTED, so this write is refused exactly like an id the
+//! detector never held, the way `UpdateIPSet` and the sibling updates refuse it.
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation

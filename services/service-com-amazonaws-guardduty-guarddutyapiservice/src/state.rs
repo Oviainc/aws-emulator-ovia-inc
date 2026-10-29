@@ -8359,10 +8359,13 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// The tag map of the resource `arn` names, as `region`'s endpoint holds it,
     /// for an operation that only REPORTS tags.
     ///
-    /// Resolution is exactly [`Self::tagged_resource_tags_mut`]'s — same scope
-    /// check, same records — so a report and a write cannot disagree about which
-    /// ARN names which resource; this one borrows the store immutably, so
-    /// reporting tags cannot move anything a later caller reads.
+    /// Resolution is [`Self::tagged_resource_tags_mut`]'s — same ARN form, same
+    /// scope check, same records — except that this one keeps resolving a
+    /// sub-resource whose delete has been accepted, because such a record is
+    /// RETAINED to be reported and its own `Get` still reports it, so reporting
+    /// its tags is consistent while writing them is not. This one borrows the
+    /// store immutably, so reporting tags cannot move anything a later caller
+    /// reads.
     pub fn tagged_resource_tags(
         &self,
         region: &str,
@@ -8411,6 +8414,16 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// Tags are kept on the resource's own record, so the map this hands back is
     /// the one its read reports: nothing can tag a resource in a place its
     /// `Get`/`Describe` does not look.
+    ///
+    /// A sub-resource whose delete has already been ACCEPTED resolves to `None`
+    /// here, so it is refused exactly like an id the detector never held. A
+    /// record in that state is retained only to be REPORTED — it is named by no
+    /// listing, occupies none of the detector's slots and no update may move it
+    /// ([`IpSetRecord::is_deleting`], [`ThreatIntelSetRecord::is_deleting`],
+    /// [`EntitySetRecord::is_deleting`]) — so a write against it is a write
+    /// against a resource that is out of use. The REPORTING seam
+    /// ([`Self::tagged_resource_tags`]) keeps resolving it, because its own
+    /// `Get` still reports it.
     pub fn tagged_resource_tags_mut(
         &mut self,
         region: &str,
@@ -8428,18 +8441,30 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
             return Some(&mut detector.tags);
         };
         match sub_resource {
+            // A filter and a publishing destination carry no deleting status at
+            // all: their delete DROPS the record, so the id resolving at all is
+            // already the whole liveness check.
             TaggedSubResource::Filter => detector.filters.get_mut(id).map(|f| &mut f.tags),
-            TaggedSubResource::IpSet => detector.ip_sets.get_mut(id).map(|s| &mut s.tags),
-            TaggedSubResource::ThreatIntelSet => {
-                detector.threat_intel_sets.get_mut(id).map(|s| &mut s.tags)
-            }
+            TaggedSubResource::IpSet => detector
+                .ip_sets
+                .get_mut(id)
+                .filter(|s| !s.is_deleting())
+                .map(|s| &mut s.tags),
+            TaggedSubResource::ThreatIntelSet => detector
+                .threat_intel_sets
+                .get_mut(id)
+                .filter(|s| !s.is_deleting())
+                .map(|s| &mut s.tags),
             TaggedSubResource::TrustedEntitySet => detector
                 .trusted_entity_sets
                 .get_mut(id)
+                .filter(|s| !s.is_deleting())
                 .map(|s| &mut s.tags),
-            TaggedSubResource::ThreatEntitySet => {
-                detector.threat_entity_sets.get_mut(id).map(|s| &mut s.tags)
-            }
+            TaggedSubResource::ThreatEntitySet => detector
+                .threat_entity_sets
+                .get_mut(id)
+                .filter(|s| !s.is_deleting())
+                .map(|s| &mut s.tags),
             TaggedSubResource::PublishingDestination => detector
                 .publishing_destinations
                 .get_mut(id)
