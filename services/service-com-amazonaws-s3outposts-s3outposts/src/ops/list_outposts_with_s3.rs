@@ -160,10 +160,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(ListOutpostsWithS3ErrorModeled::ValidationException)?;
 
         let region = crate::state::request_region(ctx.parts());
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
         // The inventory this account reaches: the Outposts its AWS Outposts control
-        // plane has S3 capacity provisioned on, plus any shared with it.
-        let inventory = crate::state::outpost_inventory(&*self.engine, &store);
+        // plane has S3 capacity provisioned on, plus any shared with it — with
+        // everything already owed to this service's own records materialised
+        // against it, so an Outpost this page leaves out carries no endpoint here
+        // any more either.
+        let inventory = crate::state::settled_inventory(&*self.engine, &mut store, now);
 
         // The walk, the page bound, the cursor and the Region a listing serves are
         // the one listing rule this service's listings follow, so they live in

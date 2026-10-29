@@ -39,6 +39,8 @@ mod not_found_messages;
 mod one_listing_rule;
 #[path = "all/one_outpost_resolution_rule.rs"]
 mod one_outpost_resolution_rule;
+#[path = "all/outpost_departure.rs"]
+mod outpost_departure;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
 #[path = "all/shared_endpoint_listing.rs"]

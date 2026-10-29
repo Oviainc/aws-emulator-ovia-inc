@@ -187,14 +187,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let caller = crate::state::caller_account();
         let mut store = state.lock();
-        let inventory = crate::state::outpost_inventory(&*self.engine, &store);
 
-        // Everything the clock already owes is materialised first, so this
-        // create resolves against the endpoints that exist at `now`: an
-        // endpoint whose teardown has completed holds neither its subnet and
-        // security group nor its CIDR any more. Each of those changes was owed
-        // at this instant whether or not this call happened.
-        store.settle_all(now);
+        // Everything already owed is materialised first, so this create resolves
+        // against the endpoints that exist at `now`: an endpoint whose teardown
+        // has completed, and one whose Outpost has left the inventory, hold
+        // neither their subnet and security group nor their CIDR any more. Each
+        // of those changes was owed at this instant whether or not this call
+        // happened.
+        let inventory = crate::state::settled_inventory(&*self.engine, &mut store, now);
 
         // The endpoint hangs off an Outpost: one this caller owns, or one shared
         // with it — and one installed in the Region this request was signed for,

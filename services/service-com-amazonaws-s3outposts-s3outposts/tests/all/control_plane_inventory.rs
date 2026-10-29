@@ -39,7 +39,7 @@ use service_com_amazonaws_s3outposts_s3outposts::state::{
 use service_com_amazonaws_s3outposts_s3outposts::ComAmazonawsS3outpostsS3outpostsState;
 
 /// The Region most cases work in; the Region cases vary it.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The `PaymentOption` every order here is placed on, from the modelled value set
 /// `PAYMENT_OPTION_VALUES`.
@@ -53,12 +53,12 @@ const UNPUBLISHED_SKU: &str = "OR-0000000";
 /// An account that is NOT the one this emulator serves: the owner of an Outpost shared
 /// with the caller through Resource Access Manager. A synthetic, non-routable
 /// placeholder in the same all-zero family as `engine::emulator_account_id`.
-const SHARING_ACCOUNT_ID: &str = "000000000001";
+pub(crate) const SHARING_ACCOUNT_ID: &str = "000000000001";
 
 /// One emulator hosting BOTH services over ONE shared engine — the arrangement the
 /// router builds, and the only one in which `s3-outposts` can report the Outposts
 /// `outposts` owns.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The one engine both services were built over. Reached only to stand up a state
     /// no sequence of AWS API calls can reach (an Outpost shared by another account, a
@@ -68,14 +68,14 @@ struct Emulator {
 }
 
 /// One answer: the HTTP status and the parsed JSON body.
-struct Reply {
-    status: u16,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// The wire error code (`__type`), short form, or the empty string on a success.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.body["__type"]
             .as_str()
             .map(|code| code.rsplit('#').next().unwrap_or(code).to_string())
@@ -84,7 +84,7 @@ impl Reply {
 
     /// The `Message` an error payload carries, or the generic `message` the boundary
     /// validator renders.
-    fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         self.body["Message"]
             .as_str()
             .or_else(|| self.body["message"].as_str())
@@ -102,7 +102,7 @@ fn authorization(signing_name: &str, region: &str) -> String {
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -118,7 +118,7 @@ impl Emulator {
     }
 
     /// Dispatch one request to the service `signing_name` names, addressed to `region`.
-    async fn call(
+    pub(crate) async fn call(
         &self,
         signing_name: &str,
         region: &str,
@@ -155,12 +155,12 @@ impl Emulator {
     }
 
     /// One `outposts` call in `region`.
-    async fn outposts(&self, region: &str, method: &str, path: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn outposts(&self, region: &str, method: &str, path: &str, body: Option<Value>) -> Reply {
         self.call("outposts", region, method, path, body).await
     }
 
     /// One `outposts` call that must be served, returning its body.
-    async fn outposts_ok(
+    pub(crate) async fn outposts_ok(
         &self,
         region: &str,
         method: &str,
@@ -177,18 +177,18 @@ impl Emulator {
     }
 
     /// One `s3-outposts` call in `region`.
-    async fn s3(&self, region: &str, method: &str, path: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn s3(&self, region: &str, method: &str, path: &str, body: Option<Value>) -> Reply {
         self.call("s3-outposts", region, method, path, body).await
     }
 
     /// This service's own store in the shared engine. See [`Emulator::engine`].
-    fn s3_store(&self) -> ::engine::ServiceState<ComAmazonawsS3outpostsS3outpostsState> {
+    pub(crate) fn s3_store(&self) -> ::engine::ServiceState<ComAmazonawsS3outpostsS3outpostsState> {
         service_com_amazonaws_s3outposts_s3outposts::state::service_state(&*self.engine)
             .expect("the S3 on Outposts store is reachable through the shared engine")
     }
 
     /// The AWS Outposts store in the shared engine. See [`Emulator::engine`].
-    fn outposts_store(
+    pub(crate) fn outposts_store(
         &self,
     ) -> ::engine::ServiceState<
         service_com_amazonaws_outposts_outpostsolafservice::ComAmazonawsOutpostsOutpostsolafserviceState,
@@ -199,7 +199,7 @@ impl Emulator {
 
     /// One site and one Outpost on it in `region`, through `outposts:CreateSite` and
     /// `outposts:CreateOutpost`, as that Outpost's `OutpostId`.
-    async fn an_outpost_in(&self, region: &str, name: &str) -> String {
+    pub(crate) async fn an_outpost_in(&self, region: &str, name: &str) -> String {
         let site = self
             .outposts_ok(
                 region,
@@ -226,7 +226,7 @@ impl Emulator {
 
     /// `outposts:CreateOrder` placing `line_items` (SKU and quantity) against
     /// `outpost_id`, as the `OrderId` it minted.
-    async fn an_order_in(
+    pub(crate) async fn an_order_in(
         &self,
         region: &str,
         outpost_id: &str,
@@ -252,7 +252,7 @@ impl Emulator {
     }
 
     /// `outposts:CancelOrder` on `order_id`.
-    async fn cancel_order_in(&self, region: &str, order_id: &str) {
+    pub(crate) async fn cancel_order_in(&self, region: &str, order_id: &str) {
         self.outposts_ok(
             region,
             "POST",
@@ -263,7 +263,7 @@ impl Emulator {
     }
 
     /// `s3-outposts:ListOutpostsWithS3` in `region`, as the `Outposts` it reported.
-    async fn inventory_in(&self, region: &str, query: &str) -> Vec<Value> {
+    pub(crate) async fn inventory_in(&self, region: &str, query: &str) -> Vec<Value> {
         let reply = self
             .s3(
                 region,
@@ -284,12 +284,17 @@ impl Emulator {
     }
 
     /// The whole inventory of `region`, one page of the published ceiling.
-    async fn inventory(&self, region: &str) -> Vec<Value> {
+    pub(crate) async fn inventory(&self, region: &str) -> Vec<Value> {
         self.inventory_in(region, "?maxResults=100").await
     }
 
     /// `s3-outposts:CreateEndpoint` on `outpost_id`, in `region`.
-    async fn create_endpoint_in(&self, region: &str, outpost_id: &str, nth: u8) -> Reply {
+    pub(crate) async fn create_endpoint_in(
+        &self,
+        region: &str,
+        outpost_id: &str,
+        nth: u8,
+    ) -> Reply {
         self.s3(
             region,
             "POST",
@@ -304,7 +309,7 @@ impl Emulator {
     }
 
     /// `s3-outposts:ListSharedEndpoints` scoped to `outpost_id`, in `region`.
-    async fn shared_endpoints_in(&self, region: &str, outpost_id: &str) -> Reply {
+    pub(crate) async fn shared_endpoints_in(&self, region: &str, outpost_id: &str) -> Reply {
         self.s3(
             region,
             "GET",
@@ -315,7 +320,7 @@ impl Emulator {
     }
 
     /// `s3-outposts:ListEndpoints` in `region`.
-    async fn endpoints_in(&self, region: &str) -> Reply {
+    pub(crate) async fn endpoints_in(&self, region: &str) -> Reply {
         self.s3(
             region,
             "GET",
@@ -326,7 +331,12 @@ impl Emulator {
     }
 
     /// `s3-outposts:DeleteEndpoint` on the `(Outpost, endpoint)` pair, in `region`.
-    async fn delete_endpoint_in(&self, region: &str, outpost_id: &str, endpoint_id: &str) -> Reply {
+    pub(crate) async fn delete_endpoint_in(
+        &self,
+        region: &str,
+        outpost_id: &str,
+        endpoint_id: &str,
+    ) -> Reply {
         self.s3(
             region,
             "DELETE",
@@ -350,7 +360,7 @@ impl Emulator {
 /// store seam this suite reaches that control plane through. The next call materialises
 /// what the clock then owes. An order nothing is owed on — a cancelled one — is left
 /// exactly as it is.
-fn deliver_orders(emulator: &Emulator) {
+pub(crate) fn deliver_orders(emulator: &Emulator) {
     let store = emulator.outposts_store();
     let mut store = store.lock();
     let (due, at) = (std::time::Instant::now(), std::time::SystemTime::now());
@@ -364,7 +374,7 @@ fn deliver_orders(emulator: &Emulator) {
 
 /// Which catalog configuration a line item of a case names.
 #[derive(Debug, Clone, Copy)]
-enum Item {
+pub(crate) enum Item {
     /// The nth configuration that supports S3 storage, in the order the `outposts`
     /// catalog publishes them.
     S3(usize),
@@ -387,7 +397,7 @@ type UnprovisionedRow = (&'static str, Orders, bool);
 
 /// The orderable configurations, as a client discovers them: through
 /// `outposts:ListCatalogItems`, filtered by the storage option each supports.
-struct Catalog {
+pub(crate) struct Catalog {
     /// The SKUs of the configurations that support S3 storage, in catalog order.
     s3: Vec<String>,
     /// The SKU of one published configuration that supports no S3 storage.
@@ -400,7 +410,7 @@ struct Catalog {
 
 impl Catalog {
     /// Discover the catalog over the wire.
-    async fn discover(emulator: &Emulator) -> Self {
+    pub(crate) async fn discover(emulator: &Emulator) -> Self {
         let s3 = catalog_skus(emulator, "S3").await;
         assert!(
             s3.len() >= 2,
@@ -462,7 +472,7 @@ impl Catalog {
     }
 
     /// One order's line items, as `(SKU, quantity)` pairs.
-    fn line_items(&self, items: &[(Item, i64)]) -> Vec<(String, i64)> {        items
+    pub(crate) fn line_items(&self, items: &[(Item, i64)]) -> Vec<(String, i64)> {        items
             .iter()
             .map(|(item, quantity)| (self.sku(*item), *quantity))
             .collect()
@@ -498,7 +508,7 @@ async fn catalog_skus(emulator: &Emulator, storage: &str) -> Vec<String> {
 }
 
 /// The string member `name` of `value`, or a panic naming what was there instead.
-fn string_at(value: &Value, name: &str) -> String {
+pub(crate) fn string_at(value: &Value, name: &str) -> String {
     value[name]
         .as_str()
         .unwrap_or_else(|| panic!("{name} must be a string, got {value}"))
@@ -506,7 +516,7 @@ fn string_at(value: &Value, name: &str) -> String {
 }
 
 /// The `OutpostId`s an inventory reports, in the order it reported them.
-fn reported_ids(outposts: &[Value]) -> Vec<String> {
+pub(crate) fn reported_ids(outposts: &[Value]) -> Vec<String> {
     outposts
         .iter()
         .map(|outpost| string_at(outpost, "OutpostId"))

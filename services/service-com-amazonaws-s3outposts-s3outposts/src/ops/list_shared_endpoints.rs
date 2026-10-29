@@ -157,7 +157,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        let inventory = crate::state::outpost_inventory(&*self.engine, &store);
+        // The inventory this listing walks its endpoints against, with everything
+        // already owed materialised: an endpoint whose teardown has completed, or
+        // whose Outpost has left that inventory, is one this page does not report.
+        let inventory = crate::state::settled_inventory(&*self.engine, &mut store, now);
 
         // The cursor is the (Outpost, endpoint) pair the next page starts at, read
         // in the Region this listing walks: a token this listing never issued —

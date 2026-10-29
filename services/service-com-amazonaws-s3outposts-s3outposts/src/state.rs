@@ -33,7 +33,10 @@
 //! ones that control plane holds: this service keeps no copy of them and resolves
 //! the inventory from it on every call ([`outpost_inventory`]), so an Outpost
 //! created, ordered for or decommissioned through the `outposts` API is one this
-//! service answers for at the same instant.
+//! service answers for at the same instant. An Outpost that LEAVES that inventory
+//! takes the endpoints stored on it with it — they are named by it and reached
+//! only through it — which is what [`settled_inventory`] materialises on every
+//! call, beside what the clock owes.
 //!
 //! Which of them belong in the inventory is GATED, not assumed: S3 capacity is
 //! installed on an Outpost by ordering hardware that carries it, so an Outpost
@@ -667,10 +670,12 @@ impl ComAmazonawsS3outpostsS3outpostsState {
     /// mapping for its subnet is dropped once no endpoint is left in that
     /// subnet.
     ///
-    /// This is the END of a teardown, not its start: `DeleteEndpoint` only
-    /// accepts the deletion ([`EndpointRecord::begin_deletion`]), and
-    /// [`Self::settle_all`] calls this for the endpoint whose teardown the clock
-    /// has since completed.
+    /// This is never the START of a teardown: `DeleteEndpoint` only accepts the
+    /// deletion ([`EndpointRecord::begin_deletion`]), and [`Self::settle_all`]
+    /// calls this for the endpoint whose teardown the clock has since completed.
+    /// The other thing that ends an endpoint is its Outpost leaving this
+    /// service's inventory, which
+    /// [`Self::release_endpoints_of_absent_outposts`] releases through here too.
     ///
     /// Releasing the mapping is what keeps [`Self::subnet_vpcs`] bounded by
     /// [`Self::endpoints`]: no sequence of creates and deletes can leave an
@@ -685,6 +690,41 @@ impl ComAmazonawsS3outpostsS3outpostsState {
             self.subnet_vpcs.remove(&removed.subnet_id);
         }
         Some(removed)
+    }
+
+    /// Release every endpoint whose parent Outpost `inventory` no longer holds,
+    /// exactly as [`Self::remove_endpoint`] releases one whose teardown has
+    /// completed, and answer the keys released.
+    ///
+    /// An endpoint exists only ON an Outpost and is reached only THROUGH it: it
+    /// is named by the `(OutpostId, EndpointId)` pair, takes that Outpost's
+    /// Region ([`outpost_region`]) and is reported by no listing and resolved by
+    /// no reference once that Outpost is gone. The Outposts are another control
+    /// plane's resource, resolved afresh on every call ([`outpost_inventory`]),
+    /// so an Outpost leaves this inventory the instant that control plane stops
+    /// holding it with S3 capacity — and the endpoints it carried have to go with
+    /// it, or the store keeps records no operation can report, resolve or remove,
+    /// holding a `/26` [`Self::allocate_cidr_block`] would never offer again and
+    /// a [`Self::subnet_vpcs`] entry for a subnet no reachable endpoint sits in.
+    ///
+    /// Nothing here depends on being called: the release was owed at the instant
+    /// the Outpost left the inventory, whether or not anybody asked, the same way
+    /// a completed teardown is — so two callers reading at the same instant see
+    /// the same endpoints.
+    pub fn release_endpoints_of_absent_outposts(
+        &mut self,
+        inventory: &OutpostInventory,
+    ) -> Vec<(String, String)> {
+        let orphaned: Vec<(String, String)> = self
+            .endpoints
+            .keys()
+            .filter(|(outpost_id, _)| !inventory.contains_key(outpost_id))
+            .cloned()
+            .collect();
+        for key in &orphaned {
+            self.remove_endpoint(key);
+        }
+        orphaned
     }
 }
 
@@ -721,6 +761,29 @@ pub fn outpost_inventory<Eng: Send + Sync + 'static>(
     for record in control_plane_outposts(engine) {
         inventory.insert(record.outpost_id.clone(), record);
     }
+    inventory
+}
+
+/// The inventory this request is served, with everything already owed to this
+/// service's own records materialised against it: every handler starts here.
+///
+/// Two things are owed at the instant a request is served, and neither depends on
+/// being asked for: what the clock owes an endpoint an accepted call is still
+/// working on ([`ComAmazonawsS3outpostsS3outpostsState::settle_all`]), and the
+/// release of every endpoint whose Outpost has left the inventory
+/// ([`ComAmazonawsS3outpostsS3outpostsState::release_endpoints_of_absent_outposts`]).
+/// Resolving the inventory is where this service learns the second, because the
+/// Outposts belong to another control plane and are resolved afresh on every call
+/// ([`outpost_inventory`]) — so both are materialised here, in ONE place, and no
+/// operation answers from records a change was already owed on.
+pub fn settled_inventory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    store: &mut ComAmazonawsS3outpostsS3outpostsState,
+    now: SystemTime,
+) -> OutpostInventory {
+    let inventory = outpost_inventory(engine, store);
+    store.settle_all(now);
+    store.release_endpoints_of_absent_outposts(&inventory);
     inventory
 }
 

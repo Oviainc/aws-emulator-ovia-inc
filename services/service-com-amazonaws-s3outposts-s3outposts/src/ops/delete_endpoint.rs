@@ -173,14 +173,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let caller = crate::state::caller_account();
         let mut store = state.lock();
-        let inventory = crate::state::outpost_inventory(&*self.engine, &store);
 
-        // Everything the clock already owes is materialised first, so this
-        // delete resolves against the endpoints that exist at `now`: one whose
-        // own teardown has completed is gone, and naming it is the modelled 404.
-        // Each of those changes was owed at this instant whether or not this
-        // call happened.
-        store.settle_all(now);
+        // Everything already owed is materialised first, so this delete resolves
+        // against the endpoints that exist at `now`: one whose own teardown has
+        // completed is gone, and so is one whose Outpost has left the inventory
+        // — naming either is the modelled 404. Each of those changes was owed at
+        // this instant whether or not this call happened.
+        let inventory = crate::state::settled_inventory(&*self.engine, &mut store, now);
 
         // The Outpost is resolved FIRST: an endpoint is named by the (Outpost,
         // endpoint) pair, so an Outpost that resolves to nothing this caller has
