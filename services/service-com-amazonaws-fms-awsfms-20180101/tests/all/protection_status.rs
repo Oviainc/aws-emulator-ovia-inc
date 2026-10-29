@@ -9,8 +9,8 @@
 //!
 //! The rule under test is one sentence: `GetProtectionStatus` reports, for the
 //! Shield Advanced policy the request names, exactly the recorded attacks of
-//! THAT policy whose account matches the requested member account and whose
-//! lifetime overlaps the requested period — in chronological order, bounded by
+//! THAT policy whose account — one the policy applies to — matches the requested
+//! member account and whose lifetime overlaps the requested period — in chronological order, bounded by
 //! `MaxResults` and resumable from `NextToken` — beside the administrator
 //! association's account id and the policy's own `SecurityServiceType`; a
 //! policy of any other type is refused, and nothing is written.
@@ -26,8 +26,13 @@
 //! in which policy they belong to; the query rows differ in which bounds are
 //! present, in where each bound falls relative to an attack's start and end
 //! (including exactly ON a boundary, and an inverted period), and in the member
-//! account selected; the page rows span both published `MaxResults` bounds and
-//! one past each.
+//! account selected (including one the policy applies to that no attack names);
+//! the page rows span both published `MaxResults` bounds and one past each.
+//!
+//! The member account a request names is one the policy applies to; that
+//! resolution is asserted over a table of scope shapes by the
+//! `member_account_policy_scope` suite, which shares this suite's document
+//! builder.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -201,24 +206,71 @@ fn resource_type_for(service_type: &str) -> &'static str {
     }
 }
 
-/// A policy document `PutPolicy` accepts, of the given `SecurityServiceType`.
-fn policy_of_type(name: &str, service_type: &str) -> Value {
-    json!({
+/// The accounts the policies under test are scoped to: the three the attack
+/// table names, plus one the policy applies to that no attack names — so an
+/// in-scope account with no attack of its own is a row of the query table and is
+/// told apart from an account the policy does not apply to at all.
+pub(crate) const SCOPED_ACCOUNTS: &[&str] =
+    &["111111111111", "222222222222", "333333333333", "444444444444"];
+
+/// A policy document `PutPolicy` accepts, of the given `SecurityServiceType` and
+/// carrying the given scope maps.
+///
+/// `pub(crate)` so a sibling suite in this test target scopes a policy of this
+/// service type through this one document builder rather than a second copy of
+/// it. A row names at most ONE of the two maps: "You can specify inclusions or
+/// exclusions, but not both" (`Policy$IncludeMap` / `Policy$ExcludeMap`).
+pub(crate) fn policy_scoped(
+    name: &str,
+    service_type: &str,
+    include: Option<Value>,
+    exclude: Option<Value>,
+) -> Value {
+    let mut policy = json!({
         "PolicyName": name,
         "SecurityServicePolicyData": { "Type": service_type },
         "ResourceType": resource_type_for(service_type),
-        "IncludeMap": { "ACCOUNT": ["111111111111", "222222222222", "333333333333"] },
         "ExcludeResourceTags": false,
         "RemediationEnabled": false
-    })
+    });
+    if let Some(include) = include {
+        policy["IncludeMap"] = include;
+    }
+    if let Some(exclude) = exclude {
+        policy["ExcludeMap"] = exclude;
+    }
+    policy
 }
 
-/// Store one policy and return the `PolicyId` the service minted for it.
+/// Store one policy scoped to [`SCOPED_ACCOUNTS`] and return the `PolicyId` the
+/// service minted for it.
 async fn put_policy(router: &MultiServiceRouter, name: &str, service_type: &str) -> String {
+    put_scoped_policy(
+        router,
+        name,
+        service_type,
+        Some(json!({ "ACCOUNT": SCOPED_ACCOUNTS })),
+        None,
+    )
+    .await
+}
+
+/// Store one policy with the given scope maps and return the `PolicyId` the
+/// service minted for it.
+///
+/// `pub(crate)` so a sibling suite in this test target stores its scope rows
+/// through this one writer.
+pub(crate) async fn put_scoped_policy(
+    router: &MultiServiceRouter,
+    name: &str,
+    service_type: &str,
+    include: Option<Value>,
+    exclude: Option<Value>,
+) -> String {
     let (status, body) = call(
         router,
         "PutPolicy",
-        &json!({ "Policy": policy_of_type(name, service_type) }),
+        &json!({ "Policy": policy_scoped(name, service_type, include, exclude) }),
     )
     .await;
     assert_eq!(
@@ -288,7 +340,11 @@ async fn seeded() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>, String, S
 }
 
 /// The `Data` member parsed as the JSON document it is documented to be.
-fn data_entries(case: &str, body: &Value) -> Vec<Value> {
+///
+/// `pub(crate)` so a sibling suite in this test target reads a
+/// `GetProtectionStatus` report through this one parser rather than a second
+/// copy of it.
+pub(crate) fn data_entries(case: &str, body: &Value) -> Vec<Value> {
     let data = body["Data"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: the response carried no Data string: {body}"));
@@ -347,8 +403,12 @@ fn queries() -> Vec<Query> {
             expected: &["a2-other-account", "a6-same-second"],
         },
         Query {
-            case: "a member account no attack names",
-            member_account: Some("999999999999"),
+            // An account the policy DOES apply to, with no attack of its own:
+            // the empty page is the report of that account, and is not how an
+            // account outside the policy's scope is answered (see the
+            // `member_account_policy_scope` suite).
+            case: "an in-scope member account no attack names",
+            member_account: Some("444444444444"),
             start: None,
             end: None,
             expected: &[],

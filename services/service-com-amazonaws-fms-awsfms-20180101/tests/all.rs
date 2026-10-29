@@ -91,6 +91,14 @@ mod pending_transition_settling;
 #[path = "all/policy_document_defaults.rs"]
 mod policy_document_defaults;
 
+// Declared beside them, for the same reason: inserting a `mod` into the sorted
+// list below conflicts with every other fms suite landing in the same window,
+// and this suite's name sorts right into the stretch of that list the
+// late-sorting suites keep landing in. The suite itself is an ordinary
+// `tests/all/<name>.rs` file.
+#[path = "all/member_account_policy_scope.rs"]
+mod member_account_policy_scope;
+
 // Declared beside them, for the same reason: this suite's name sorts right into
 // the contended region of the list below. The suite itself is an ordinary
 // `tests/all/<name>.rs` file.

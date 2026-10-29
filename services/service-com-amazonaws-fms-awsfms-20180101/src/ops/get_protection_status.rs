@@ -9,7 +9,10 @@
 //! association in this account/Region it is refused by
 //! [`crate::state::require_administrator`] BEFORE any identifier is looked up —
 //! and the administrator it resolves is the `AdminAccountId` the response
-//! carries. The attacks come from the store's attack inventory
+//! carries. The policy and, when the request names one, the member account are
+//! then resolved: an account the policy does not apply to is the modelled
+//! not-found, the same answer this service's other member-account readers give.
+//! The attacks come from the store's attack inventory
 //! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::shield_attacks`]),
 //! filtered by the request's policy, member account and time period; nothing is
 //! invented and nothing is written.
@@ -226,6 +229,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `MemberAccountId` names "the Amazon Web Services account that is in
+        // scope of the policy that you want to get the details for", so it is a
+        // MEMBER account of the policy and is RESOLVED against the policy's own
+        // scope, exactly as every other member-account surface of this service
+        // resolves it. An account the policy does not apply to was never
+        // evaluated against this policy, so the policy holds no attack report of
+        // it and the pair is the same modelled not-found as an unknown policy —
+        // not an empty page, which is what "the account IS in scope and no attack
+        // was recorded against it" reports and which a caller must be able to
+        // tell apart.
+        if input
+            .member_account_id
+            .as_deref()
+            .is_some_and(|account| !store.policy_applies_to_account(&policy.policy, account))
+        {
+            return Err(GetProtectionStatusErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+            .into());
+        }
+
         // A token this service did not mint, or one minted for ANOTHER policy's
         // page, names no boundary in this policy's attacks: every key of this
         // policy's range carries the policy's prefix.
@@ -262,10 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .range(lower..)
             .take_while(|(key, _)| key.starts_with(&prefix))
             .map(|(_, attack)| attack)
-            // `MemberAccountId` names "the Amazon Web Services account that is
-            // in scope of the policy that you want to get the details for", so
-            // it selects the attacks on THAT account's resources; absent, every
-            // account in the policy's scope is reported.
+            // The member account the request names is resolved above, so what is
+            // left here is the selection: it picks the attacks on THAT account's
+            // resources; absent, every account in the policy's scope is reported.
             .filter(|attack| {
                 input
                     .member_account_id

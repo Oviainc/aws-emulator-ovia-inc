@@ -1706,6 +1706,18 @@ impl ComAmazonawsFmsAwsfms20180101State {
             .collect()
     }
 
+    /// Whether the stored `policy` applies to the member account `account`.
+    ///
+    /// The ONE resolution every operation that reports about a (policy, member
+    /// account) pair uses: Firewall Manager evaluates a policy only against the
+    /// accounts in the policy's own scope ([`Self::policy_scope_accounts`]), so
+    /// an account outside that scope was never evaluated against this policy and
+    /// no surface of the policy holds anything about it — which is the modelled
+    /// not-found, not an empty report.
+    pub fn policy_applies_to_account(&self, policy: &Policy, account: &str) -> bool {
+        self.policy_scope_accounts(policy).contains(account)
+    }
+
     /// The `CustomerPolicyStatus` of one stored policy: SERVICE-DERIVED, from
     /// the administrative scope that governs the policy rather than from
     /// anything a caller sent.

@@ -201,10 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // was never evaluated against this policy, so it holds no violation of it
         // to detail, and the request is the same modelled not-found as an unknown
         // policy.
-        if !store
-            .policy_scope_accounts(&policy.policy)
-            .contains(&input.member_account)
-        {
+        if !store.policy_applies_to_account(&policy.policy, &input.member_account) {
             return Err(GetViolationDetailsErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(),
             )

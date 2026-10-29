@@ -90,7 +90,10 @@ pub(crate) const ADMIN: &str = "123456789012";
 
 /// Accounts a second stored policy names, so the organisation this store records
 /// holds accounts beside the administrator's own.
-const ROSTER: &[&str] = &["111111111111", "222222222222"];
+///
+/// `pub(crate)` so a sibling suite in this test target reads its scope rows
+/// against the SAME organisation roster [`put_roster`] contributes.
+pub(crate) const ROSTER: &[&str] = &["111111111111", "222222222222"];
 
 /// The instant the stored policy's last update is pinned to, so `LastUpdated` can
 /// be asserted exactly: 2026-01-01T00:00:00Z in Unix seconds, the form Firewall

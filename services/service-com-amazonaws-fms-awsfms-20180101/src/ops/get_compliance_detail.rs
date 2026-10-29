@@ -202,10 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // there is no compliance detail of it to report, and the pair is the same
         // modelled not-found as an unknown policy — rather than an invented
         // evaluation that would contradict the summary.
-        if !store
-            .policy_scope_accounts(&policy.policy)
-            .contains(&input.member_account)
-        {
+        if !store.policy_applies_to_account(&policy.policy, &input.member_account) {
             return Err(GetComplianceDetailErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(),
             )
