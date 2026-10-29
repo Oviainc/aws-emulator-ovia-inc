@@ -5635,8 +5635,9 @@ pub fn arn_resource_type(arn: &str) -> Option<&str> {
     arn.split(':').nth(5)?.split('/').next()
 }
 
-/// The tags attached to the resource `arn` names in `region`'s view, or `None` when that
-/// view holds no such resource.
+/// A kind of resource this store holds — the taggable-resource table of this service,
+/// stated here once for both the read ([`resource_tags`]) and the write
+/// ([`resource_tags_mut`]) side of the `/tags/{resourceArn}` surface.
 ///
 /// A stage, an ingest configuration, an encoder configuration, a storage configuration
 /// and a composition are the resource types this store can hold: `CreateStage`,
@@ -5645,7 +5646,44 @@ pub fn arn_resource_type(arn: &str) -> Option<&str> {
 /// service that mint one, so every other resource type in its ARN shapes names nothing,
 /// and a well-formed ARN naming one is answered exactly as an ARN naming a deleted stage
 /// is — not found. Each remaining create is its own gap issue, and when one lands its
-/// record joins the match below.
+/// kind joins this enum: both functions below dispatch on it exhaustively, so the
+/// compiler then asks each of them where that record lives and the two sides of the
+/// surface cannot disagree about which resources are taggable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedResourceKind {
+    /// A stage, from `CreateStage`.
+    Stage,
+    /// A composition, from `StartComposition`.
+    Composition,
+    /// An ingest configuration, from `CreateIngestConfiguration`.
+    IngestConfiguration,
+    /// An encoder configuration, from `CreateEncoderConfiguration`.
+    EncoderConfiguration,
+    /// A storage configuration, from `CreateStorageConfiguration`.
+    StorageConfiguration,
+}
+
+impl TaggedResourceKind {
+    /// The kind `arn`'s resource-type field names ([`arn_resource_type`]), or `None`
+    /// when that field names a resource type this store never holds — or the string
+    /// carries no such field at all.
+    pub fn from_arn(arn: &str) -> Option<Self> {
+        match arn_resource_type(arn)? {
+            "stage" => Some(Self::Stage),
+            "composition" => Some(Self::Composition),
+            "ingest-configuration" => Some(Self::IngestConfiguration),
+            "encoder-configuration" => Some(Self::EncoderConfiguration),
+            "storage-configuration" => Some(Self::StorageConfiguration),
+            _ => None,
+        }
+    }
+}
+
+/// The tags attached to the resource `arn` names in `region`'s view, or `None` when that
+/// view holds no such resource.
+///
+/// Which resource types can be named at all is [`TaggedResourceKind`]'s table, so this
+/// reader and [`resource_tags_mut`] answer about exactly the same set of resources.
 ///
 /// `region` is the region the tagging request was processed in, and the lookups go
 /// through the region-scoped accessors, so a resource of another region is not found
@@ -5656,9 +5694,9 @@ pub fn resource_tags(
     arn: &str,
     region: &str,
 ) -> Option<HashMap<String, String>> {
-    match arn_resource_type(arn)? {
-        "stage" => state.stage_in(region, arn).map(|stage| stage.tags.clone()),
-        "composition" => state
+    match TaggedResourceKind::from_arn(arn)? {
+        TaggedResourceKind::Stage => state.stage_in(region, arn).map(|stage| stage.tags.clone()),
+        TaggedResourceKind::Composition => state
             .composition_in(region, arn)
             // This reader holds the store immutably, so a composition the clock has
             // already reclaimed is skipped rather than dropped: the reclaim deadline is
@@ -5667,21 +5705,21 @@ pub fn resource_tags(
             // and the next call that can write clears the record.
             .filter(|composition| !composition.is_reclaimed(SystemTime::now()))
             .map(|composition| composition.tags.clone()),
-        "ingest-configuration" => state
+        TaggedResourceKind::IngestConfiguration => state
             .ingest_configuration_in(region, arn)
             .map(|configuration| configuration.tags.clone()),
-        "encoder-configuration" => state
+        TaggedResourceKind::EncoderConfiguration => state
             .encoder_configuration_in(region, arn)
             .map(|configuration| configuration.tags.clone()),
-        "storage-configuration" => state
+        TaggedResourceKind::StorageConfiguration => state
             .storage_configuration_in(region, arn)
             .map(|configuration| configuration.tags.clone()),
-        _ => None,
     }
 }
 
 /// The `tags` of the resource `arn` names in `region`'s view, to be changed in place.
-/// `None` when that view holds no such resource; see [`resource_tags`].
+/// `None` when that view holds no such resource; the resource types it can name are
+/// [`TaggedResourceKind`]'s, the same table [`resource_tags`] reads.
 pub fn resource_tags_mut<'a>(
     state: &'a mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     arn: &str,
@@ -5690,21 +5728,20 @@ pub fn resource_tags_mut<'a>(
     // A composition's own lifetime is the clock's: materialise what it already owed, so
     // a tag cannot be written onto a composition that no longer exists.
     state.materialize_due_compositions(SystemTime::now());
-    match arn_resource_type(arn)? {
-        "stage" => state.stage_in_mut(region, arn).map(|stage| &mut stage.tags),
-        "composition" => state
+    match TaggedResourceKind::from_arn(arn)? {
+        TaggedResourceKind::Stage => state.stage_in_mut(region, arn).map(|stage| &mut stage.tags),
+        TaggedResourceKind::Composition => state
             .composition_in_mut(region, arn)
             .map(|composition| &mut composition.tags),
-        "ingest-configuration" => state
+        TaggedResourceKind::IngestConfiguration => state
             .ingest_configuration_in_mut(region, arn)
             .map(|configuration| &mut configuration.tags),
-        "encoder-configuration" => state
+        TaggedResourceKind::EncoderConfiguration => state
             .encoder_configuration_in_mut(region, arn)
             .map(|configuration| &mut configuration.tags),
-        "storage-configuration" => state
+        TaggedResourceKind::StorageConfiguration => state
             .storage_configuration_in_mut(region, arn)
             .map(|configuration| &mut configuration.tags),
-        _ => None,
     }
 }
 

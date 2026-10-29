@@ -113,6 +113,8 @@ mod stages;
 mod state_roundtrip;
 #[path = "all/storage_configurations.rs"]
 mod storage_configurations;
+#[path = "all/taggable_resource_kinds.rs"]
+mod taggable_resource_kinds;
 #[path = "all/tagging.rs"]
 mod tagging;
 #[path = "all/update_ingest_configuration.rs"]
