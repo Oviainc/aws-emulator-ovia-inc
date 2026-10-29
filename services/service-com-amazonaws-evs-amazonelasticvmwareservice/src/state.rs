@@ -155,6 +155,12 @@ pub const HOST_DELETED: &str = "DELETED";
 pub const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 /// See [`REASON_FIELD_VALIDATION_FAILED`].
 pub const REASON_OTHER: &str = "other";
+/// The reason a refusal carries when the request body could not be read as the
+/// operation's input at all, so no member of it was reached to be checked — the
+/// `ValidationExceptionReason` value for exactly that (`smithy_query(query="shape",
+/// shape="ValidationExceptionReason")` declares `unknownOperation | cannotParse |
+/// fieldValidationFailed | other`).
+pub const REASON_CANNOT_PARSE: &str = "cannotParse";
 
 /// The resource type `ResourceNotFoundException` reports for an environment: the
 /// `EnvironmentResource` the model binds these operations to.
@@ -2482,7 +2488,7 @@ fn exceeds(digits: &str, maximum: u64) -> bool {
 /// by (`settings.<1-based index>.member.<member>`), so a caller reads one member path
 /// whether the setting was refused for its SHAPE or for its DOMAIN, and states the
 /// requirement without quoting the rejected value back (the rule
-/// [`constraint_violation_message`] keeps for the modelled constraints). Every failure is
+/// [`constraint_validation_error`] keeps for the modelled constraints). Every failure is
 /// reported, not just the first, exactly as [`aggregate_validation_error`] does.
 pub fn account_setting_failures(
     settings: &[AccountSetting],
@@ -3369,17 +3375,27 @@ const CONSTRAINT_MARKER: &str = " failed to satisfy constraint: ";
 /// What this service's envelope joins several clauses with: a bare comma, no space.
 const CLAUSE_JOINER: &str = ",";
 
-/// The `ValidationException` message this service states for a request the boundary
-/// validator refused against the model's own constraints — the ONE renderer behind every
-/// operation of this service, reached from `Service::override_refusal`.
+/// The `ValidationException` this service answers for a request the boundary validator
+/// refused against the model's own constraints — the ONE renderer behind every operation
+/// of this service, reached from `Service::override_refusal`.
 ///
-/// The envelope: `1 validation error detected: <clause>` for a single violation and
-/// `<n> validation error(s) detected: <clause>,<clause>` for several, with the clauses
+/// It builds the WHOLE modelled shape, not just its prose, because `reason` is
+/// `@required` on it (`smithy_query(query="shape", shape="ValidationException")`): a
+/// refusal that dropped it would not deserialize as the error the model declares.
+///
+/// The message envelope: `1 validation error detected: <clause>` for a single violation
+/// and `<n> validation error(s) detected: <clause>,<clause>` for several, with the clauses
 /// ordered by the member path they are reported against (never by the order the members
 /// appear in the request) and joined by [`CLAUSE_JOINER`]. A clause is
 /// `Value at '<member path>' failed to satisfy constraint: <requirement>`, with the
 /// rejected value never quoted back and only an ABSENT member keeping
 /// `Value null at '<path>' …`, because absence is the fact that clause states.
+///
+/// The `reason` is [`REASON_FIELD_VALIDATION_FAILED`]: what these violations are is a
+/// member of the input failing a check. The `fieldList` carries one entry per violation —
+/// the member path the clause is reported against, and that clause as its sentence —
+/// exactly as [`aggregate_validation_error`] reports the checks a handler runs, so a
+/// client reads one shape whichever layer refused the request.
 ///
 /// Returns `None` when there is nothing to state, so the caller keeps the framework's
 /// default wording.
@@ -3391,20 +3407,32 @@ const CLAUSE_JOINER: &str = ",";
 /// its indexed path. Other emulated services word these refusals differently again
 /// (`artifact` joins with `"; "` and prints a `@pattern` WITH its anchors), so each
 /// service states its own envelope, as the other service crates carrying this helper do.
-pub fn constraint_violation_message(violations: &[Violation]) -> Option<String> {
+pub fn constraint_validation_error(violations: &[Violation]) -> Option<ValidationException> {
     let mut clauses: Vec<(String, String)> = violations.iter().map(clause).collect();
     // Ordered by the member path the clause names, compared byte-wise. `sort_by` is
     // stable, so two violations of ONE member keep the order the walk found them in.
     clauses.sort_by(|(left, _), (right, _)| left.cmp(right));
-    let rendered: Vec<String> = clauses.into_iter().map(|(_, clause)| clause).collect();
-    match rendered.len() {
-        0 => None,
-        1 => Some(format!("1 validation error detected: {}", rendered[0])),
-        n => Some(format!(
+    let message = match clauses.len() {
+        0 => return None,
+        1 => format!("1 validation error detected: {}", clauses[0].1),
+        n => format!(
             "{n} validation error(s) detected: {}",
-            rendered.join(CLAUSE_JOINER)
-        )),
-    }
+            clauses
+                .iter()
+                .map(|(_, clause)| clause.as_str())
+                .collect::<Vec<_>>()
+                .join(CLAUSE_JOINER)
+        ),
+    };
+    let failures = clauses
+        .into_iter()
+        .map(|(path, clause)| field_failure_stated(&path, clause))
+        .collect();
+    Some(ValidationException {
+        message,
+        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(failures),
+    })
 }
 
 /// One violation as this service states it: the member path it is reported AGAINST

@@ -39,6 +39,16 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! Two of those seams are taken here, and they are two halves of one answer.
+//! `override_refusal` states a framework-level refusal as this service's
+//! `ValidationException`, and `override_operation` serves every routable request through
+//! [`validation_envelope::ModelledRefusal`], which completes that body with the modelled
+//! members a refusal rendering cannot carry — `reason`, which the model marks
+//! `@required`, and the `fieldList` entries the same renderer built. Routing, status,
+//! `__type` and `message` all stay with the framework.
+
+pub mod validation_envelope;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -52,6 +62,10 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The wrapper every routable request is served through, which completes the
+    /// modelled members of a refusal body. Held in a field, built once, because
+    /// `override_operation` hands back a reference to it.
+    modelled_refusal: validation_envelope::ModelledRefusal,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +75,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            modelled_refusal: validation_envelope::ModelledRefusal,
         }
     }
 }
@@ -87,12 +102,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every request the generated routing table can serve is served through the
+        // wrapper below, which delegates to that same table entry and then re-states a
+        // `ValidationException` the framework rendered for it as the whole modelled shape
+        // (see [`validation_envelope`]). The routing stays the model's: a request the
+        // table cannot serve is declined here, so the framework answers it as the
+        // unroutable request it is.
+        validation_envelope::routes(&self.entry, req).then_some(&self.modelled_refusal as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -103,21 +119,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // This service states such a refusal as the AWS validation envelope — the
         // clause naming the member path and the requirement it failed, without
         // quoting the rejected value back — which is a different rule from the
-        // framework's default wording; `crate::state::constraint_violation_message`
+        // framework's default wording; `crate::state::constraint_validation_error`
         // is the one renderer behind every operation of this service and owns that
         // rule. The STATUS and the CODE are already the framework's and are what the
         // model declares (`ValidationException`, `@error(client)`, `@httpError(400)`),
         // so the code is restated unchanged alongside the reworded message: a message
         // without its matching code is worse than leaving both alone.
         //
+        // That renderer states the WHOLE modelled shape, of which only the message fits
+        // through this seam, so the refusal is recorded for the request being served and
+        // [`validation_envelope::ModelledRefusal`] answers it with every member the model
+        // declares: `reason` is `@required`, so a body without it is not the error the
+        // model declares.
+        //
         // An authentication refusal is left to the framework: it is not a
         // modelled-input failure and this service does not restate it.
         let Refusal::Invalid(violations) = refusal else {
             return None;
         };
+        let stated = crate::state::constraint_validation_error(violations)?;
+        validation_envelope::note_worded_refusal(&stated);
         Some(Refused {
             code: "ValidationException".to_string(),
-            message: crate::state::constraint_violation_message(violations)?,
+            message: stated.message,
         })
     }
 

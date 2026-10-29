@@ -118,6 +118,8 @@ mod tagging_not_found;
 mod tagging_resource_arn_resolution;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;
+#[path = "all/validation_reason_completeness.rs"]
+mod validation_reason_completeness;
 #[path = "all/vcf_hostname_uniqueness.rs"]
 mod vcf_hostname_uniqueness;
 #[path = "all/versions_catalog.rs"]
