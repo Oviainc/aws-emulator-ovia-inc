@@ -78,7 +78,7 @@ fn parameters_of_length(length: usize) -> String {
 }
 
 /// An emulator and the engine behind it, so a suite can move a stored record's instants.
-fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_on(engine.clone());
     (router, engine)
@@ -86,7 +86,7 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// Pull a stored blueprint's instants — and those of every run of it — back by `elapsed`, so
 /// a suite can observe what the clock owes them without sleeping for the span.
-fn rewind(engine: &Arc<engine::InMemoryEngine>, name: &str, elapsed: Duration) {
+pub(crate) fn rewind(engine: &Arc<engine::InMemoryEngine>, name: &str, elapsed: Duration) {
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let mut store = state.lock();
     let entry = store
@@ -127,7 +127,7 @@ fn set_due_instants(engine: &Arc<engine::InMemoryEngine>, name: &str, at: System
 }
 
 /// How many runs the store holds of `name`.
-fn stored_runs(engine: &Arc<engine::InMemoryEngine>, name: &str) -> usize {
+pub(crate) fn stored_runs(engine: &Arc<engine::InMemoryEngine>, name: &str) -> usize {
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let store = state.lock();
     store
@@ -137,7 +137,7 @@ fn stored_runs(engine: &Arc<engine::InMemoryEngine>, name: &str) -> usize {
 
 /// Register `name` and move its registration past the span the clock owed it, so it is the
 /// finished registration a run may be started of.
-async fn register_active(
+pub(crate) async fn register_active(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     name: &str,
@@ -155,7 +155,7 @@ async fn register_active(
 }
 
 /// Start a run and return the `RunId` the service minted for it.
-async fn start(router: &MultiServiceRouter, body: &Value) -> String {
+pub(crate) async fn start(router: &MultiServiceRouter, body: &Value) -> String {
     let started = ok(router, "StartBlueprintRun", body).await;
     started
         .get("RunId")
@@ -165,7 +165,7 @@ async fn start(router: &MultiServiceRouter, body: &Value) -> String {
 }
 
 /// The `BlueprintRun` a `GetBlueprintRun` answer reports.
-async fn get_run(router: &MultiServiceRouter, blueprint: &str, run_id: &str) -> Value {
+pub(crate) async fn get_run(router: &MultiServiceRouter, blueprint: &str, run_id: &str) -> Value {
     let read = ok(
         router,
         "GetBlueprintRun",

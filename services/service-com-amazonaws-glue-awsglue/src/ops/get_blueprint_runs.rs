@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBlueprintRuns
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBlueprintRuns`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBlueprintRuns::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the runs of ONE blueprint: every run this account's blueprint of that name holds
+//! ([`crate::state::BlueprintEntry::runs`]), newest started first, one `MaxResults`-sized
+//! page at a time, each projected exactly as the single-run read
+//! ([`crate::ops::get_blueprint_run`]) projects it, so a client working from the listing is
+//! never less informed than one re-reading each run.
+//!
+//! A `BlueprintName` this account holds no blueprint under is refused with the modelled
+//! `EntityNotFoundException`. The one write this read performs is the state the CLOCK had
+//! already made due ([`crate::state::BlueprintEntry::settle_due_runs`]): a run was owed its
+//! next state at its due instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +76,13 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::BlueprintRunEntry;
+
+/// The largest page `MaxResults` accepts, from the member's own range
+/// (`GetBlueprintRunsRequest$MaxResults`, `PageSize` range 1..1000) — and so the page size
+/// for a request that names none.
+const MAX_PAGE_SIZE: i32 = 1_000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +155,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBlueprintRuns` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBlueprintRunsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBlueprintRuns"))
+        // Blueprints live in one per-account namespace, so nothing here depends on the
+        // request's Region, the same way the single-run read serves one.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on, the same way the
+            // single-run read reports it.
+            return Err(GetBlueprintRunsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue blueprint store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The maximum size of a list to return" (`MaxResults`, `PageSize` range 1..1000).
+        // Absent, the page is the largest the model accepts for it; the clamp re-states
+        // that range here so the page size is never 0 even if the boundary validator ever
+        // stops enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // `BlueprintName` is `@required` with `length 1..255`, so an absent or over-long one
+        // is refused at the boundary: reaching here, the only question is whether this
+        // account holds a blueprint of that name, which is the whole key every blueprint
+        // operation addresses one by.
+        let Some(blueprint) = store.blueprint_mut(&input.blueprint_name) else {
+            return Err(GetBlueprintRunsErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::blueprint_not_found(
+                        &input.blueprint_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // The only write a read makes: the state changes the clock had already made due.
+        blueprint.settle_due_runs(now);
+
+        // A run history is reported newest first, the order the sibling run listings of this
+        // service serve (`GetJobRuns`, "with the newest jobs returned first"), taken from
+        // the instant each run STARTED rather than from the order the store happens to hold
+        // the runs in, with the run's own id breaking a tie between two runs started in the
+        // same nanosecond so the order is total and the same on every call.
+        let mut ordered: Vec<&BlueprintRunEntry> = blueprint.runs.iter().collect();
+        ordered.sort_by_cached_key(|run| ::std::cmp::Reverse(page_cursor(run)));
+
+        // "A continuation token, if this is a continuation request": it is the ordering key
+        // of the last run of the previous page, so this page resumes at the first run
+        // strictly older than it, which stays correct across runs started or dropped between
+        // two calls. A token this service never issued is DELIBERATELY a position in that
+        // order rather than a refusal, for the same reason: the cursor is a key in the
+        // listing's own order, so every string names one, exactly as the sibling run
+        // listings of this crate resolve a cursor.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => ordered.partition_point(|run| page_cursor(run).as_str() >= cursor),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(ordered.len());
+        let page = &ordered[start..end];
+
+        // "Returns a list of BlueprintRun objects": element for element the SAME projection
+        // the single-run read serves, so a client that works from the listing is never less
+        // informed than one that re-reads each run.
+        let blueprint_runs: Vec<BlueprintRun> =
+            page.iter().map(|run| run.to_blueprint_run()).collect();
+        // "A continuation token, if not all blueprint runs have been returned": it names the
+        // last entry of the page, taken from the page itself so there is no index arithmetic
+        // to underflow on an empty page, and is absent once the page reaches the end of the
+        // listing.
+        let next_token = if end < ordered.len() {
+            page.last().copied().map(page_cursor)
+        } else {
+            None
+        };
+
+        Ok(GetBlueprintRunsOutput {
+            // `BlueprintRuns` carries no length constraint, so the model admits an empty
+            // list: a blueprint no run has been started of, and a page past the end of its
+            // history, report the list with nothing in it.
+            blueprint_runs: Some(blueprint_runs),
+            next_token,
+        })
     }
+}
+
+/// One run's place in this listing, as the continuation token renders it: the shared history
+/// cursor ([`crate::state::history_page_cursor`]) over the instant this run started and its
+/// own id.
+///
+/// Ordering runs by this key DESCENDING is the newest-first order this listing serves, and
+/// comparing a token against it is what resumes a page, so any string a request sends names
+/// a well-defined place in that order, exactly as it does for the sibling run listings of
+/// this crate.
+fn page_cursor(run: &BlueprintRunEntry) -> String {
+    crate::state::history_page_cursor(run.started_on, &run.run_id)
 }
