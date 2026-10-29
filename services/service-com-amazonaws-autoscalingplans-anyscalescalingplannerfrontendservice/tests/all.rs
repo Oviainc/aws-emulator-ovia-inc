@@ -43,6 +43,8 @@ mod next_token_authenticity;
 mod plan_version_member_validation;
 #[path = "all/policy_name_identity.rs"]
 mod policy_name_identity;
+#[path = "all/predefined_metric_resource_label_identity.rs"]
+mod predefined_metric_resource_label_identity;
 #[path = "all/predictive_scaling_predicate.rs"]
 mod predictive_scaling_predicate;
 #[path = "all/scaling_instruction_validation.rs"]

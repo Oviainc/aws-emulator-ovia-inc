@@ -983,7 +983,9 @@ const INDEX_SEGMENT: &str = "/index/";
 /// did not cover, the disappearance of one it did, an instruction's capacity bounds and
 /// predictive-scaling members, the rest of a tracked metric's configuration (its
 /// cooldowns, its warmup, whether scale-in is disabled), and a whole configuration for a
-/// metric the resource does not track yet.
+/// metric the resource does not track yet — a metric being what
+/// [`target_metric_identity`] renders, so a configuration re-pointed at another resource
+/// tracks a metric no policy is in force for and takes the target value requested.
 pub fn merge_scaling_instructions(
     in_force: &[ScalingInstruction],
     requested: Vec<ScalingInstruction>,
@@ -1079,9 +1081,10 @@ fn resource_identity(instruction: &ScalingInstruction) -> ResourceIdentity<'_> {
 /// "Each of these structures must specify a unique scaling metric and a target value
 /// for the metric" (`ScalingInstruction$TargetTrackingConfigurations`), so a
 /// configuration is identified within its instruction by that metric: the predefined
-/// metric type, or the namespace, name, statistic and dimensions of a customized
-/// metric. `None` for a configuration naming neither metric — which both write paths
-/// refuse before it can be stored.
+/// metric type with the resource label it is measured on, or the namespace, name,
+/// statistic and dimensions of a customized metric — in both cases EVERY modelled part
+/// that says which metric is tracked. `None` for a configuration naming neither metric —
+/// which both write paths refuse before it can be stored.
 ///
 /// A customized metric's parts are caller-supplied text under no modelled pattern at
 /// all (`MetricNamespace`, `MetricName`, `MetricDimensionName` and
@@ -1089,11 +1092,25 @@ fn resource_identity(instruction: &ScalingInstruction) -> ResourceIdentity<'_> {
 /// key and two different metrics cannot render one identity. The dimensions are the set
 /// of dimensions the metric was published with, so they reach the key through
 /// [`set_key_parts`]: a reordered or a repeated dimension is the same set, hence the
-/// same metric. A predefined metric type is one part, and one the model constrains to
-/// its own value list.
+/// same metric.
+///
+/// A predefined metric is identified by the metric TYPE — one part, and one the model
+/// constrains to its own value list — together with the `ResourceLabel` that names what
+/// the metric is measured on where the specification carries one: the label "identifies
+/// the resource associated with the metric type", being "the final portion of the load
+/// balancer ARN and the final portion of the target group ARN", so two specifications of
+/// one metric type naming two labels track two different resources' metrics and must not
+/// render one identity. The label is caller-supplied text (1-1023 characters, the forward
+/// slash its own format relies on included), so it reaches the key through
+/// [`escape_key_part`] like every other such part; a specification that carries no label
+/// renders the type alone, and so stays a third identity.
 pub fn target_metric_identity(configuration: &TargetTrackingConfiguration) -> Option<String> {
     if let Some(predefined) = &configuration.predefined_scaling_metric_specification {
-        return Some(predefined.predefined_scaling_metric_type.clone());
+        let metric_type = escape_key_part(&predefined.predefined_scaling_metric_type);
+        return Some(match &predefined.resource_label {
+            Some(label) => format!("{metric_type}/{}", escape_key_part(label)),
+            None => metric_type,
+        });
     }
     let customized = configuration
         .customized_scaling_metric_specification
