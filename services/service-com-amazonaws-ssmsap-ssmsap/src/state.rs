@@ -139,6 +139,22 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// `OPERATIONS.md` reports it — the `service` segment of every application ARN.
 pub const ARN_SERVICE: &str = "ssm-sap";
 
+/// The resource-type segment of the ARN of a registered application
+/// ([`application_arn`]).
+///
+/// The first segment of an ARN's resource field names the KIND of resource the ARN is
+/// of, so these three constants are both what the ARNs this service mints are built from
+/// and what [`ssm_sap_resource_type`] reads back off one.
+pub const ARN_RESOURCE_TYPE_APPLICATION: &str = "application";
+
+/// The resource-type segment of the ARN of a component of a registration
+/// ([`component_arn`]). See [`ARN_RESOURCE_TYPE_APPLICATION`].
+pub const ARN_RESOURCE_TYPE_COMPONENT: &str = "component";
+
+/// The resource-type segment of the ARN of a SAP HANA database of a registration
+/// ([`database_arn`]). See [`ARN_RESOURCE_TYPE_APPLICATION`].
+pub const ARN_RESOURCE_TYPE_DATABASE: &str = "database";
+
 /// `ApplicationStatus` while registration is still settling. One of the model's
 /// `ApplicationStatus` values (see [`crate::ops::types::APPLICATION_STATUS_VALUES`]).
 pub const APPLICATION_STATUS_REGISTERING: &str = "REGISTERING";
@@ -909,7 +925,9 @@ impl StoredApplication {
     /// * `DatabaseArn` names the application's SAP HANA database by ARN, whose last
     ///   segment is the database's own name ([`database_name_from_arn`]); the ARN the
     ///   registration gave it is that database's ARN, so it is the ARN reported for it
-    ///   rather than one minted here.
+    ///   rather than one minted here. It has to NAME a database to name one
+    ///   ([`arn_names_a_database`]): an ARN of this service that names a resource of
+    ///   another kind names no database of this or of any other application.
     /// * every `ApplicationCredential` names, in `DatabaseName`, the SAP HANA database
     ///   its secret reaches; a database no ARN named is a sub-resource of this
     ///   application, so its ARN is minted from the two ids ([`database_arn`]).
@@ -934,6 +952,7 @@ impl StoredApplication {
         let named_by_arn = self
             .database_arn
             .as_deref()
+            .filter(|arn| arn_names_a_database(arn))
             .and_then(|arn| database_name_from_arn(arn).map(|name| (arn, name)));
         if let Some((arn, database_name)) = named_by_arn {
             let database_id = database_id_from_name(database_name);
@@ -2807,11 +2826,13 @@ impl RegionState {
             // The ARNs this partition STILL holds, enumerated once: the same enumeration
             // [`Self::holds_resource`] resolves an ARN through, so a destroyed ARN is one
             // no call that takes an ARN resolves any more. It is asked of the set rather
-            // than of the resolver per ARN because an ARN can be named by more than one
-            // registration (`RegisterApplication$DatabaseArn` and
-            // `UpdateApplicationSettings$DatabaseArn` take any ARN), so a database another
-            // registration still names must keep what is held on it — and one pass over
-            // this partition answers that for every destroyed ARN at once.
+            // than of the resolver per ARN because one DATABASE can be named by more than
+            // one registration (`RegisterApplication$DatabaseArn` and
+            // `UpdateApplicationSettings$DatabaseArn` name a database that need not be a
+            // resource of the registration naming it, [`arn_names_a_database`]), so a
+            // database another registration still names must keep what is held on it —
+            // and one pass over this partition answers that for every destroyed ARN at
+            // once.
             let live: BTreeSet<String> = self
                 .applications
                 .values()
@@ -3510,7 +3531,7 @@ pub fn application_arn(region: &str, application_id: &str) -> String {
     ::engine::emulator_arn(
         ARN_SERVICE,
         region,
-        &format!("application/{application_id}"),
+        &format!("{ARN_RESOURCE_TYPE_APPLICATION}/{application_id}"),
     )
 }
 
@@ -3634,7 +3655,7 @@ pub fn component_arn(region: &str, application_id: &str, component_id: &str) -> 
     ::engine::emulator_arn(
         ARN_SERVICE,
         region,
-        &format!("component/{application_id}/{component_id}"),
+        &format!("{ARN_RESOURCE_TYPE_COMPONENT}/{application_id}/{component_id}"),
     )
 }
 
@@ -3667,20 +3688,60 @@ pub fn database_arn(region: &str, application_id: &str, database_id: &str) -> St
     ::engine::emulator_arn(
         ARN_SERVICE,
         region,
-        &format!("database/{application_id}/{database_id}"),
+        &format!("{ARN_RESOURCE_TYPE_DATABASE}/{application_id}/{database_id}"),
     )
 }
 
-/// The Region an ARN carries: the fourth colon-separated field of
-/// `arn:<partition>:<service>:<region>:<account>:<resource>`, empty for an ARN that
-/// has none.
+/// The KIND of resource an ARN of THIS service names: the resource type of its resource
+/// field, which is the word the ARN was minted with ([`ARN_RESOURCE_TYPE_APPLICATION`],
+/// [`ARN_RESOURCE_TYPE_COMPONENT`], [`ARN_RESOURCE_TYPE_DATABASE`]).
+///
+/// `None` when the ARN is not this service's — another service's resource, or a value
+/// that is not a well-formed resource ARN at all — because the kind of such a resource is
+/// that service's to decide and is not knowable here.
+///
+/// The ARN itself is read through the ONE parse the services share
+/// (`service_common::arn`), so the fields and the `<type>/<id>` and `<type>:<id>` forms of
+/// a resource are read here exactly as every other service reads them.
+pub fn ssm_sap_resource_type(arn: &str) -> Option<&str> {
+    ::service_common::arn::parse_of(arn, ARN_SERVICE).map(|parsed| parsed.resource_type())
+}
+
+/// Whether `arn` names a SAP HANA DATABASE, which is what the members that carry one are
+/// documented to name — "The Amazon Resource Name of the SAP HANA database"
+/// (`smithy_query(query="doc", shape="com.amazonaws.ssmsap#RegisterApplicationInput",
+/// member="DatabaseArn")`, the same prose `UpdateApplicationSettings$DatabaseArn`
+/// carries).
+///
+/// An ARN of this service names the resource its own resource type and ids identify
+/// ([`ssm_sap_resource_type`]), so one that names a registered application or a component
+/// names no database, whatever the request that carried it says it is: that resource
+/// belongs to the registration whose ids its ARN embeds, and what is held on it — its
+/// tags, the permissions granted on it — is held on THAT resource and goes when it goes
+/// ([`RegionState::forget_resource`]). An ARN of any other service names a resource
+/// outside this store, whose kind this service cannot know and holds nothing of, so a
+/// registration naming one names its database under exactly that ARN.
+pub fn arn_names_a_database(arn: &str) -> bool {
+    ssm_sap_resource_type(arn)
+        .is_none_or(|resource_type| resource_type == ARN_RESOURCE_TYPE_DATABASE)
+}
+
+/// The Region an ARN carries: the `region` field of
+/// `arn:<partition>:<service>:<region>:<account>:<resource>`, empty for an ARN that has
+/// none and for a value that is no resource ARN at all.
 ///
 /// A partition holds the ARNs of ONE Region ([`RegionState`]), so this is how a record
 /// that holds only its own ARN — the one [`RegionState::settle`] is removing, say —
 /// recovers the Region its derived resources' ARNs are minted in
 /// ([`StoredApplication::databases`]) without a handler passing it in.
+///
+/// Read through the ONE parse the services share (`service_common::arn`), the same one
+/// [`ssm_sap_resource_type`] reads a resource's kind off, so this file holds no second
+/// reader of the ARN grammar.
 pub fn arn_region(arn: &str) -> &str {
-    arn.split(':').nth(3).unwrap_or_default()
+    ::service_common::arn::parse(arn)
+        .map(|parsed| parsed.region)
+        .unwrap_or_default()
 }
 
 /// The `DatabaseId` of the SAP HANA database named `database_name`.

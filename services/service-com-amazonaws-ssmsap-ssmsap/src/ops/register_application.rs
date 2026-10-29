@@ -316,8 +316,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.credentials.as_deref().unwrap_or_default(),
             ),
             // The SAP HANA database the registration named by ARN: one of this
-            // application's databases, which `ListDatabases` reports under that ARN
-            // (`crate::state::StoredApplication::databases`).
+            // application's databases, which `ListDatabases` reports under that ARN when
+            // the ARN names a database at all
+            // (`crate::state::StoredApplication::databases`,
+            // `crate::state::arn_names_a_database`).
             database_arn: input.database_arn,
             // Nothing registers the AWS Backint Agent for SAP HANA: its configuration is
             // `UpdateApplicationSettings$Backint`'s to install, so a freshly registered

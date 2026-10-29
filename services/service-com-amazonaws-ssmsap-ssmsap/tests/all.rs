@@ -35,6 +35,8 @@ mod configuration_check_rules;
 mod configuration_checks;
 #[path = "all/configuration_checks_in_flight.rs"]
 mod configuration_checks_in_flight;
+#[path = "all/database_arn_resource_kind.rs"]
+mod database_arn_resource_kind;
 #[path = "all/delete_resource_permission.rs"]
 mod delete_resource_permission;
 #[path = "all/deregistration_window.rs"]
