@@ -31,6 +31,51 @@ const DEFAULT_REGION: &str = "us-east-1";
 /// (`aws.api#service` arnNamespace `fms`).
 const ARN_NAMESPACE: &str = "fms";
 
+/// The status a pending transition `(settles_to, settles_at)` makes due AT
+/// `now`, or `None` while nothing is owed yet.
+///
+/// The ONE place the "is the transition the clock owes due?" test lives: a
+/// transition is due from its instant onwards, so a reader at exactly that
+/// instant already sees the terminal status. Every record type that carries a
+/// pending transition — and the derived read side as well as the write side of
+/// each — decides from here, so no two of them can disagree about when a
+/// transition has come due.
+pub fn pending_transition_due(
+    settles_to: &Option<String>,
+    settles_at: Option<SystemTime>,
+    now: SystemTime,
+) -> Option<&str> {
+    match (settles_to, settles_at) {
+        (Some(settled), Some(at)) if now >= at => Some(settled.as_str()),
+        _ => None,
+    }
+}
+
+/// Materialise the clock-due transition on the `(status, settles_to,
+/// settles_at)` triple a record carries: once the transition is due
+/// ([`pending_transition_due`]) the status IS the one it settles to, and the
+/// pending pair is cleared because nothing is owed any more. Answers whether a
+/// transition was due, so a record with a side effect of its own to apply can
+/// see that it settled.
+///
+/// The ONE copy of the rule, which every record type carrying such a pair
+/// delegates to: writing it once is what keeps the clock-due transition of one
+/// record type from drifting away from another's.
+pub fn settle_pending_transition(
+    status: &mut String,
+    settles_to: &mut Option<String>,
+    settles_at: &mut Option<SystemTime>,
+    now: SystemTime,
+) -> bool {
+    let Some(due) = pending_transition_due(settles_to, *settles_at, now) else {
+        return false;
+    };
+    *status = due.to_string();
+    *settles_to = None;
+    *settles_at = None;
+    true
+}
+
 /// The Firewall Manager administrator account association.
 ///
 /// `role_status` is an `AccountRoleStatus` value (see
@@ -173,7 +218,9 @@ pub const ADMIN_ONBOARDING_SPAN: Duration = Duration::from_millis(500);
 /// `settles_to` / `settles_at` carry the transition the CLOCK owes, exactly as
 /// [`ThirdPartyFirewallRecord`] does: an account being onboarded reaches
 /// `ONBOARDING_COMPLETE` [`ADMIN_ONBOARDING_SPAN`] after the call that started
-/// it, whether or not anybody asks. Readers materialise it with [`Self::settle`].
+/// it, whether or not anybody asks. Readers materialise it with [`Self::settle`],
+/// which is the shared [`settle_pending_transition`] rule applied to this
+/// record's own triple.
 ///
 /// `onboarded_at` / `updated_at` are recorded but reported by no operation: no
 /// modelled member of `AdminAccountSummary` or `GetAdminScopeResponse` carries
@@ -196,26 +243,22 @@ impl OrganizationAdminRecord {
     /// even if nobody had called. Readers answer from here, so none of them can
     /// disagree with another about whether the onboarding has completed.
     pub fn status_at(&self, now: SystemTime) -> &str {
-        match (&self.settles_to, self.settles_at) {
-            (Some(settled), Some(at)) if now >= at => settled.as_str(),
-            _ => self.status.as_str(),
-        }
+        pending_transition_due(&self.settles_to, self.settles_at, now)
+            .unwrap_or(self.status.as_str())
     }
 
     /// Write the clock-due transition into the record — the ONLY write a
     /// reporting operation makes, and the persisted form of what
-    /// [`Self::status_at`] already derives.
+    /// [`Self::status_at`] already derives. The rule itself is
+    /// [`settle_pending_transition`], shared with every other record type that
+    /// carries a pending transition.
     pub fn settle(&mut self, now: SystemTime) {
-        let due = self
-            .settles_at
-            .is_some_and(|at| now >= at)
-            .then(|| self.settles_to.clone())
-            .flatten();
-        if let Some(status) = due {
-            self.status = status;
-            self.settles_to = None;
-            self.settles_at = None;
-        }
+        settle_pending_transition(
+            &mut self.status,
+            &mut self.settles_to,
+            &mut self.settles_at,
+            now,
+        );
     }
 }
 
@@ -609,7 +652,9 @@ impl ProtocolsListRecord {
 /// `settles_at` / `settles_to` carry the transition the CLOCK owes: an
 /// association that is onboarding or offboarding reaches its terminal status
 /// [`ASSOCIATION_SETTLE`] after the call that started it, whether or not anybody
-/// asks. Readers materialise it with [`Self::settle`]; nothing sleeps.
+/// asks. Readers materialise it with [`Self::settle`], which is the shared
+/// [`settle_pending_transition`] rule applied to this record's own triple;
+/// nothing sleeps.
 ///
 /// `marketplace_onboarding_status` is the vendor subscription's own status, which
 /// is reported beside the association's. The emulator holds no Marketplace, so
@@ -643,25 +688,25 @@ impl ThirdPartyFirewallRecord {
         }
     }
 
-    /// Apply the clock-due transition: once `settles_at` has passed, the status
-    /// IS the terminal one, because the transition was owed at that instant even
-    /// if nobody had called. Materialising it is the ONLY write a reporting
-    /// operation makes.
+    /// Apply the clock-due transition ([`settle_pending_transition`], the rule
+    /// this record shares with every other one that carries a pending
+    /// transition): once `settles_at` has passed, the status IS the terminal
+    /// one, because the transition was owed at that instant even if nobody had
+    /// called. Materialising it is the ONLY write a reporting operation makes.
+    ///
+    /// The subscription status is this record's own side effect of settling, so
+    /// it is applied here rather than in the shared rule.
     pub fn settle(&mut self, now: SystemTime) {
-        let due = self
-            .settles_at
-            .is_some_and(|at| now >= at)
-            .then(|| self.settles_to.clone())
-            .flatten();
-        if let Some(status) = due {
-            if status == THIRD_PARTY_FIREWALL_ONBOARD_COMPLETE {
-                // The designation completing is what makes the subscription
-                // active; see the type's docs.
-                self.marketplace_onboarding_status = MARKETPLACE_ONBOARDING_COMPLETE.to_string();
-            }
-            self.status = status;
-            self.settles_to = None;
-            self.settles_at = None;
+        let settled = settle_pending_transition(
+            &mut self.status,
+            &mut self.settles_to,
+            &mut self.settles_at,
+            now,
+        );
+        if settled && self.status == THIRD_PARTY_FIREWALL_ONBOARD_COMPLETE {
+            // The designation completing is what makes the subscription
+            // active; see the type's docs.
+            self.marketplace_onboarding_status = MARKETPLACE_ONBOARDING_COMPLETE.to_string();
         }
     }
 

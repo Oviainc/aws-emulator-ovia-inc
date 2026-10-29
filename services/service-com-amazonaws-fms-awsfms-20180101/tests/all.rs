@@ -76,6 +76,12 @@ mod previous_list_version_archive;
 // Declared beside them, for the same reason: this suite's name sorts right into
 // the contended region of the list below. The suite itself is an ordinary
 // `tests/all/<name>.rs` file.
+#[path = "all/pending_transition_settling.rs"]
+mod pending_transition_settling;
+
+// Declared beside them, for the same reason: this suite's name sorts right into
+// the contended region of the list below. The suite itself is an ordinary
+// `tests/all/<name>.rs` file.
 #[path = "all/policy_document_defaults.rs"]
 mod policy_document_defaults;
 
