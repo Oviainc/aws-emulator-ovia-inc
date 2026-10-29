@@ -876,6 +876,22 @@ impl CampaignState {
     pub fn accepts_configuration_change(self) -> bool {
         !matches!(self, Self::Completed | Self::Failed)
     }
+
+    /// Whether a campaign in this state takes a batch of outbound requests into one of
+    /// its buffers.
+    ///
+    /// A campaign reaches out to anyone only while its run is actually under way, which
+    /// is `Running`: a campaign that has not started yet, one suspended, one whose run
+    /// was ended and one in a terminal state are all placing nothing, so a batch
+    /// submitted to any of them is refused with `InvalidCampaignStateException` — the
+    /// error the model declares for both batch operations — rather than buffered for a
+    /// run that is not happening.
+    ///
+    /// Shared by the batch operations through [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::dialable_campaign`],
+    /// so two of them cannot disagree about which states take requests.
+    pub fn takes_outbound_requests(self) -> bool {
+        matches!(self, Self::Running)
+    }
 }
 
 /// A lifecycle action a `StartCampaign` / `PauseCampaign` / `ResumeCampaign` /
@@ -1914,6 +1930,54 @@ impl ConfigurationRejected {
     }
 }
 
+/// Why the store refused to take a batch of outbound requests into a campaign's
+/// buffer, as
+/// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::dialable_campaign`]
+/// reports it. Nothing is written in either case.
+///
+/// [`Self::message`] carries the sentence the refusal is worded with, so both batch
+/// operations refuse alike while each maps the rejection to the error variant its own
+/// model declares, keeps its own per-request failure catalog and words its own
+/// not-found refusal — which is the one part of this the two do not share (see
+/// [`CAMPAIGN_NOT_FOUND_MESSAGE`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialRejected {
+    /// The region holds no campaign under that id, so there is no buffer to take the
+    /// batch into. The caller answers this with the modelled
+    /// `ResourceNotFoundException` (HTTP 404).
+    NotFound,
+    /// The campaign is at `state` at the instant the call was judged and that state
+    /// takes no outbound requests (see [`CampaignState::takes_outbound_requests`]).
+    /// Carries the id judged, so [`Self::message`] can name the campaign. The caller
+    /// answers this with the modelled `InvalidCampaignStateException` (HTTP 409), whose
+    /// `state` member carries `state.as_wire()`.
+    NotDialable { id: String, state: CampaignState },
+}
+
+impl DialRejected {
+    /// The sentence this refusal is reported with.
+    pub fn message(&self) -> String {
+        match self {
+            Self::NotFound => CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
+            Self::NotDialable { id, state } => format!(
+                "Campaign {id} is {} and takes outbound requests only while Running",
+                state.as_wire()
+            ),
+        }
+    }
+}
+
+/// What a batch operation answers when the campaign it resolved is no longer in the
+/// store by the time a request of the batch is taken into its buffer: a server fault,
+/// since the resolve and the walk happen under the one lock the handler holds, so the
+/// condition is answered rather than panicked on.
+///
+/// Composed from the request, so the fault names the campaign the batch was for. The
+/// one text both batch operations report it with, so neither can drift from the other.
+pub fn campaign_vanished_message(id: &str) -> String {
+    format!("campaign {id} went missing while its batch was being taken")
+}
+
 /// The records of ONE region: everything a client talking to that region's endpoint
 /// can see or change.
 ///
@@ -2215,6 +2279,46 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         let current = stored.state_at(now);
         if !current.accepts_configuration_change() {
             return Err(ConfigurationRejected::NotConfigurable { state: current });
+        }
+        Ok(stored)
+    }
+
+    /// The campaign `campaign` names, for a handler about to take a batch of outbound
+    /// requests into one of its buffers — or the refusal that handler answers instead,
+    /// judged against the state the campaign is at `now`.
+    ///
+    /// The one place the dialability rule of this service lives, so
+    /// `PutOutboundRequestBatch` and `PutProfileOutboundRequestBatch` cannot disagree
+    /// about it: the id is resolved in the region the request was signed for (a campaign
+    /// is reachable only through the endpoint of the region it was created in, so a
+    /// batch never reaches another region's campaign), and the state judged is the
+    /// CLOCK-derived one ([`StoredCampaign::state_at`] — a campaign whose scheduled run
+    /// window has closed is `Completed`, which takes no requests) rather than the one
+    /// the last lifecycle call wrote.
+    ///
+    /// A refusal ([`DialRejected`]) hands back no record, so nothing is written, and
+    /// names the state it judged so the caller's refusal can report it. What belongs to
+    /// the CALLING operation is only which buffer it writes, the per-request failure
+    /// catalog it reports through, and the mapping from a rejection to the error variant
+    /// its model declares.
+    ///
+    /// The resolve and the per-request walk that follows happen under the one lock the
+    /// caller holds, so a concurrent lifecycle call or delete cannot leave a request
+    /// buffered on a campaign that no longer takes one.
+    pub fn dialable_campaign(
+        &self,
+        campaign: CampaignRef<'_>,
+        now: SystemTime,
+    ) -> Result<&StoredCampaign, DialRejected> {
+        let Some(stored) = self.campaign(campaign.region, campaign.id) else {
+            return Err(DialRejected::NotFound);
+        };
+        let current = stored.state_at(now);
+        if !current.takes_outbound_requests() {
+            return Err(DialRejected::NotDialable {
+                id: campaign.id.to_string(),
+                state: current,
+            });
         }
         Ok(stored)
     }

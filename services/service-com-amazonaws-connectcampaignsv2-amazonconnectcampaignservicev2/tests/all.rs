@@ -87,6 +87,8 @@ mod instance_refusal_messages;
 mod integration_config_map_keys;
 #[path = "all/onboarding_job_deletion.rs"]
 mod onboarding_job_deletion;
+#[path = "all/outbound_batch_is_one_rule.rs"]
+mod outbound_batch_is_one_rule;
 #[path = "all/outbound_request_expiration.rs"]
 mod outbound_request_expiration;
 #[path = "all/profile_outbound_requests.rs"]

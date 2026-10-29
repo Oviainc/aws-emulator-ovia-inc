@@ -6,8 +6,10 @@
 //! `ResourceNotFoundException` (HTTP 404) — then its lifecycle state: a campaign takes
 //! outbound requests only while it is `Running`, and any other state is the modelled
 //! `InvalidCampaignStateException` (HTTP 409) carrying that state. Both are the rules
-//! `PutOutboundRequestBatch` applies to a dial batch; the two differ only in which
-//! buffer they write and in the per-request failure catalog they report through.
+//! `PutOutboundRequestBatch` applies to a dial batch, and both are decided once on the
+//! store (`dialable_campaign`) rather than in either handler; the two differ only in
+//! which buffer they write, in the per-request failure catalog they report through, and
+//! in how each words its not-found refusal.
 //!
 //! Each request of the batch is then reported on its own, as the response's two lists
 //! say: one whose `expirationTime` the clock has already passed fails with
@@ -188,40 +190,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and the batch never reaches another region's campaign.
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
-        let Some(campaign) = store.campaign(&region, &input.id) else {
-            return Err(
-                PutProfileOutboundRequestBatchErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
-                        x_amz_error_type: None,
-                    },
-                )
-                .into(),
-            );
-        };
-
-        // A campaign places requests only while it is running: an Initialized, Paused,
-        // Stopped, Completed or Failed campaign is not reaching out to anyone, so it
-        // takes no outbound requests and the refusal names the state it is in. The
-        // state is the one the campaign is at NOW — a campaign whose scheduled run
-        // window has closed is past placing requests even though the last call wrote
-        // `Running`.
-        let current = campaign.state_at(now);
-        if current != crate::state::CampaignState::Running {
-            return Err(
-                PutProfileOutboundRequestBatchErrorModeled::InvalidCampaignStateException(
-                    InvalidCampaignStateException {
-                        state: current.as_wire().to_string(),
-                        message: format!(
-                            "Campaign {} is {} and takes outbound requests only while Running",
-                            input.id,
-                            current.as_wire()
-                        ),
-                        x_amz_error_type: None,
-                    },
-                )
-                .into(),
-            );
+        // Resolving the campaign and judging whether it takes requests at all is the
+        // store's own decision, shared with `PutOutboundRequestBatch` (see
+        // `crate::state::...::dialable_campaign`), so the two batch operations cannot
+        // disagree about which campaign reaches out. What is this operation's own is
+        // the mapping below to the error variants its model declares — and the
+        // not-found wording, which is the text every campaign-id operation but the dial
+        // batch answers with.
+        if let Err(rejected) = store.dialable_campaign(
+            crate::state::CampaignRef {
+                region: &region,
+                id: &input.id,
+            },
+            now,
+        ) {
+            return Err(match &rejected {
+                crate::state::DialRejected::NotFound => {
+                    PutProfileOutboundRequestBatchErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into()
+                }
+                crate::state::DialRejected::NotDialable { state, .. } => {
+                    PutProfileOutboundRequestBatchErrorModeled::InvalidCampaignStateException(
+                        InvalidCampaignStateException {
+                            state: state.as_wire().to_string(),
+                            message: rejected.message(),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into()
+                }
+            });
         }
 
         let mut successful_requests = Vec::new();
@@ -277,10 +280,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         PutProfileOutboundRequestBatchErrorModeled::InternalServerException(
                             InternalServerException {
-                                message: format!(
-                                    "campaign {} went missing while its batch was being taken",
-                                    input.id
-                                ),
+                                message: crate::state::campaign_vanished_message(&input.id),
                                 x_amz_error_type: None,
                             },
                         )
