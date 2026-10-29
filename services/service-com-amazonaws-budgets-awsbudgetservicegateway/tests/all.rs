@@ -65,6 +65,8 @@ mod client_error_envelopes;
 mod create_resource_tag_keys;
 #[path = "all/default_page_sizes.rs"]
 mod default_page_sizes;
+#[path = "all/empty_collection_selections.rs"]
+mod empty_collection_selections;
 #[path = "all/filter_expression_projection.rs"]
 mod filter_expression_projection;
 #[path = "all/notification_alarm_state.rs"]

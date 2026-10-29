@@ -573,6 +573,49 @@ fn apply_cost_type_defaults(cost_types: &mut CostTypes) {
     }
 }
 
+/// A collection member of a `Budget` that the caller may send EMPTY: a map or a list
+/// whose entries are the selection it makes.
+///
+/// `Budget$Metrics` is `@length(min: 0, max: 1)`, and no constraint bounds
+/// `PlannedBudgetLimits` or `CostFilters` below zero entries either, so "present" and
+/// "selects something" are different questions for these members — see [`selection`].
+trait Collected {
+    /// Whether this collection carries any entry at all.
+    fn carries_entry(&self) -> bool;
+}
+
+impl<K, V> Collected for HashMap<K, V> {
+    fn carries_entry(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+impl<T> Collected for Vec<T> {
+    fn carries_entry(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+/// The entries `member` SELECTS, or `None` when it selects nothing.
+///
+/// Every rule in this file that asks "did the caller supply this limit, this filter or
+/// this metric?" asks it through here: a collection member sent empty names no limit, no
+/// filter and no metric, so it is the same answer as a member that was not sent at all.
+/// One home for that question, so the rules that turn on it (the limit a budget must
+/// carry, the two mutually exclusive filter syntaxes, the budget types and granularities
+/// a planned map is available for, and which budgets hold cost types) cannot come to
+/// disagree about one request.
+fn selection<C: Collected>(member: &Option<C>) -> Option<&C> {
+    member
+        .as_ref()
+        .filter(|collection| collection.carries_entry())
+}
+
+/// Whether `member` selects anything — [`selection`] as a predicate.
+fn selects<C: Collected>(member: &Option<C>) -> bool {
+    selection(member).is_some()
+}
+
 /// Whether this budget HAS cost types at all.
 ///
 /// Two documented rules decide it: "`USAGE`, `RI_UTILIZATION`, `RI_COVERAGE`,
@@ -583,10 +626,14 @@ fn apply_cost_type_defaults(cost_types: &mut CostTypes) {
 /// (`CreateBudget`), so a budget written in the `FilterExpression`/`Metrics` syntax has
 /// none either — defaulting them there would store exactly the combination that rule
 /// forbids (and which [`validate_budget`] refuses from a caller).
+///
+/// A budget is written in that other syntax only when it SELECTS something in it: an
+/// empty `Metrics` list chooses no metric ([`selection`]), so it leaves the budget in the
+/// `CostFilters`/`CostTypes` syntax, which a `COST` budget has cost types in.
 fn cost_types_apply(budget: &Budget) -> bool {
     budget.budget_type == COST_BUDGET_TYPE
         && budget.filter_expression.is_none()
-        && budget.metrics.is_none()
+        && !selects(&budget.metrics)
 }
 
 /// Store the cost-types selection the budget HAS, and nothing else.
@@ -1410,7 +1457,7 @@ pub fn project_budget(stored: &StoredBudget, at: SystemTime) -> Budget {
 pub fn budget_as_read(budget: &Budget, at: SystemTime) -> Budget {
     let mut budget = budget.clone();
     if budget.budget_limit.is_none() {
-        if let Some(planned) = &budget.planned_budget_limits {
+        if let Some(planned) = selection(&budget.planned_budget_limits) {
             budget.budget_limit = planned_limit_in_force(planned, at);
         }
     }
@@ -1785,20 +1832,25 @@ pub fn budget_name_violation(member_path: &[&str], name: &str) -> Option<String>
 ///   `BudgetAdjustmentPeriod` (`AutoAdjustData$HistoricalOptions`,
 ///   `HistoricalOptions$BudgetAdjustmentPeriod`) — [`validate_auto_adjust_data`]
 ///
+/// Every rule here is stated over the selections the caller actually MADE: a collection
+/// member sent empty (`PlannedBudgetLimits`, `CostFilters` or the `@length(min: 0)`
+/// `Metrics`) carries no entry, so it names no limit and no filter syntax and is judged
+/// the same way as a member that was not sent at all ([`selection`]).
+///
 /// Every rule holds for the whole `Budget` shape, so both write paths
 /// (`CreateBudget$Budget` and `UpdateBudget$NewBudget`) run all of them before anything
 /// is stored: an update that would leave a budget in a shape a create could not have
 /// produced is refused, and the stored budget is left as it was.
 pub fn validate_budget(budget: &Budget) -> Result<(), String> {
-    if budget.budget_limit.is_some() && budget.planned_budget_limits.is_some() {
+    if budget.budget_limit.is_some() && selects(&budget.planned_budget_limits) {
         return Err(
             "Unable to create/update budget: BudgetLimit can't be used with \
              PlannedBudgetLimits."
                 .to_string(),
         );
     }
-    let legacy_filters = budget.cost_filters.is_some() || budget.cost_types.is_some();
-    let expression_filters = budget.filter_expression.is_some() || budget.metrics.is_some();
+    let legacy_filters = selects(&budget.cost_filters) || budget.cost_types.is_some();
+    let expression_filters = budget.filter_expression.is_some() || selects(&budget.metrics);
     if legacy_filters && expression_filters {
         return Err(
             "Unable to create/update budget: FilterExpression and Metrics can't be used with \
@@ -2063,9 +2115,10 @@ fn validate_time_period_end(budget: &Budget) -> Result<(), String> {
 /// Plans utilization or coverage budgets" (`Budget$BudgetLimit`).
 ///
 /// Three members can carry such a budget's limit, and exactly one of them has to: the
-/// fixed `BudgetLimit`; a non-empty `PlannedBudgetLimits`, which a read derives the
-/// current `BudgetLimit` from ("`DescribeBudget` and `DescribeBudgets` response along
-/// with `PlannedBudgetLimits` also contain `BudgetLimit`"); and `AutoAdjustData`, "the
+/// fixed `BudgetLimit`; a `PlannedBudgetLimits` map that plans at least one period
+/// ([`selection`]), which a read derives the current `BudgetLimit` from ("`DescribeBudget`
+/// and `DescribeBudgets` response along with `PlannedBudgetLimits` also contain
+/// `BudgetLimit`"); and `AutoAdjustData`, "the
 /// parameters that determine the budget amount for an auto-adjusting budget"
 /// (`Budget$AutoAdjustData`), whose amount the service adjusts rather than the caller
 /// setting it.
@@ -2073,11 +2126,10 @@ fn validate_budget_limit_present(budget: &Budget) -> Result<(), String> {
     if !LIMIT_REQUIRED_BUDGET_TYPES.contains(&budget.budget_type.as_str()) {
         return Ok(());
     }
-    let planned = budget
-        .planned_budget_limits
-        .as_ref()
-        .is_some_and(|planned| !planned.is_empty());
-    if budget.budget_limit.is_some() || planned || budget.auto_adjust_data.is_some() {
+    if budget.budget_limit.is_some()
+        || selects(&budget.planned_budget_limits)
+        || budget.auto_adjust_data.is_some()
+    {
         return Ok(());
     }
     Err(
@@ -2130,7 +2182,9 @@ fn validate_percentage_limit_amount(budget: &Budget) -> Result<(), String> {
 /// or granularity, and every key has to be the midnight-UTC start of one of the periods
 /// the budget's own `TimeUnit` names.
 fn validate_planned_budget_limits(budget: &Budget) -> Result<(), String> {
-    let Some(planned) = &budget.planned_budget_limits else {
+    // A map sent empty plans no period at all ([`selection`]), so the budget it is sent
+    // with is written with no planned limits and this rule has nothing to hold over.
+    let Some(planned) = selection(&budget.planned_budget_limits) else {
         return Ok(());
     };
     if !LIMIT_REQUIRED_BUDGET_TYPES.contains(&budget.budget_type.as_str())
