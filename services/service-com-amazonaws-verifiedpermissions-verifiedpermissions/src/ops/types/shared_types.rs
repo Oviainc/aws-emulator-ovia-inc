@@ -199,6 +199,42 @@ pub struct TemplateLinkedPolicyDefinitionDetail {
     pub resource: Option<EntityIdentifier>,
 }
 
+/// `smithy.api#Unit` — the structure with no members that the `default` arm of
+/// this service's two encryption unions targets ([`EncryptionSettings`] on the
+/// request side, [`EncryptionState`] on the response side). It exists because the
+/// JSON codec writes and reads a nested shape through a struct codec, and an
+/// empty one is what carries the `{}` the model's `Unit` denotes. Hand-authored:
+/// the vendored codegen cannot type that arm, because the service's model file
+/// does not define the prelude shape it targets.
+#[derive(Debug, Clone)]
+pub struct UnitStructure;
+
+impl UnitStructure {
+    const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[],
+    );
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for UnitStructure {
+    fn serialize_members(
+        &self,
+        _serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for UnitStructure {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        deserializer.read_struct(&Self::SCHEMA, &mut |_, _| Ok(()))?;
+        Ok(Self)
+    }
+}
+
 /// The values `AliasState` accepts on the wire.
 pub const ALIAS_STATE_VALUES: &[&str] = &["Active", "PendingDeletion"];
 

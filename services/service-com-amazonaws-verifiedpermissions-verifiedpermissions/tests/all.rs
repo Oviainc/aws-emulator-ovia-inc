@@ -55,6 +55,8 @@ mod not_found_precedes_payload_refusal;
 mod policy_store_alias;
 #[path = "all/policy_store_authorization.rs"]
 mod policy_store_authorization;
+#[path = "all/policy_store_encryption_settings.rs"]
+mod policy_store_encryption_settings;
 #[path = "all/policy_store_id_only_references.rs"]
 mod policy_store_id_only_references;
 #[path = "all/policy_store_record_stamp.rs"]

@@ -363,10 +363,9 @@ pub struct PolicyStore {
     /// `CedarVersion`: the Cedar language version this store's policies are
     /// written against, [`DEFAULT_CEDAR_VERSION`] at creation.
     pub cedar_version: String,
-    /// How this store is encrypted. A store is created
-    /// [`StoreEncryption::AwsOwnedKey`] unless a customer-managed key was
-    /// configured for it, and `GetPolicyStore` reports whichever arm is
-    /// persisted here.
+    /// How this store is encrypted: what `CreatePolicyStoreInput$encryptionSettings`
+    /// selected, or [`StoreEncryption::AwsOwnedKey`] when the create named no
+    /// arm. `GetPolicyStore` reports whichever arm is persisted here.
     pub encryption: StoreEncryption,
     pub tags: BTreeMap<String, String>,
     /// The store's policies, keyed by `policyId`.

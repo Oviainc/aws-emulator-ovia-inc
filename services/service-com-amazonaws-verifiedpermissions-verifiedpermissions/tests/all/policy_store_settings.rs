@@ -7,9 +7,10 @@
 //! The rules under test:
 //!
 //! * `GetPolicyStore` reports every modelled member of the policy store OUT OF
-//!   THE RECORD the create/update wrote — including the two members no request
-//!   sets, `cedarVersion` and `encryptionState`, which `CreatePolicyStore`
-//!   persists from the service's own default.
+//!   THE RECORD the create/update wrote — `cedarVersion`, which no request sets,
+//!   and `encryptionState`, which a create may select and otherwise defaults to
+//!   an AWS owned key (the write path has its own suite,
+//!   `tests/all/policy_store_encryption_settings.rs`).
 //! * `UpdatePolicyStore` replaces the store's mutable settings in that record
 //!   and moves `lastUpdatedDate`, leaving `createdDate` where it was; so every
 //!   later reader — `GetPolicyStore` and `DeletePolicyStore`'s
@@ -86,7 +87,8 @@ fn instant(case: &str, member: &str, body: &Value) -> f64 {
 #[tokio::test]
 async fn get_policy_store_reports_the_cedar_version_and_encryption_state_it_persisted() {
     // Rows differ along the members a create carries, none of which has any
-    // bearing on these two: the values are the service's own.
+    // bearing on these two: the Cedar version is the service's own, and no row
+    // selects an encryption key.
     let cases: &[(&str, Value)] = &[
         ("minimal", json!({ "validationSettings": { "mode": "OFF" } })),
         (
@@ -124,9 +126,9 @@ async fn get_policy_store_reports_the_cedar_version_and_encryption_state_it_pers
             CEDAR_VERSION_VALUES.contains(&cedar_version),
             "case {case:?}: cedarVersion must be one of {CEDAR_VERSION_VALUES:?}, got {fetched}"
         );
-        // Every store this slice creates is encrypted with an AWS owned key, so
-        // the union's `default` arm is the one reported — an EMPTY object, which
-        // is what `smithy.api#Unit` denotes.
+        // No row selects a key, so every store these rows create is encrypted
+        // with an AWS owned key and the union's `default` arm is the one
+        // reported — an EMPTY object, which is what `smithy.api#Unit` denotes.
         assert_eq!(
             fetched["encryptionState"],
             json!({ "default": {} }),
@@ -156,9 +158,11 @@ async fn get_policy_store_reports_the_cedar_version_and_encryption_state_it_pers
 /// constant: a store whose record holds the union's `kmsEncryptionState` arm is
 /// reported with that arm, key and encryption context included.
 ///
-/// The arm is seeded directly into state because no served request member
-/// selects a customer-managed key — `CreatePolicyStoreInput$encryptionSettings`
-/// is declared `unsupported` in `types/create_policy_store_types.rs`.
+/// The arm is seeded directly into state so this suite tests the READ in
+/// isolation: that a record holding the arm is reported with it, whatever wrote
+/// the record. `CreatePolicyStoreInput$encryptionSettings`, the request member
+/// that selects the key, has its own suite in
+/// `tests/all/policy_store_encryption_settings.rs`.
 #[tokio::test]
 async fn get_policy_store_reports_a_customer_managed_key_from_the_record() {
     let (router, engine) = router_with_engine();
@@ -429,7 +433,8 @@ async fn update_policy_store_persists_the_settings_a_later_read_reports() {
                 "case {case:?}: unexpected description, got {fetched}"
             );
         }
-        // An update never touches the two members no request sets.
+        // An update never touches the encryption these rows did not select, nor
+        // the Cedar version no request sets.
         assert_eq!(
             fetched["encryptionState"],
             json!({ "default": {} }),

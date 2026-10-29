@@ -10,7 +10,8 @@
 //!    type it and the scaffold generator declined the whole operation
 //!    (`src/ops/SKIPPED_STUBS.md`). The union is written out below instead, with
 //!    both of its modelled arms; the `default` arm writes the empty structure
-//!    `smithy.api#Unit` denotes, which is what puts `{"default":{}}` on the wire.
+//!    `smithy.api#Unit` denotes — [`UnitStructure`], shared with the request-side
+//!    `EncryptionSettings` union — which is what puts `{"default":{}}` on the wire.
 //! 2. `createdDate`/`lastUpdatedDate` carry `@timestampFormat("date-time")`, which
 //!    the derive does not put on a member schema, so this shape's schema and codec
 //!    come from [`vp_schema_and_codec!`] — see `types/date_time_wire.rs` for that
@@ -61,40 +62,10 @@ pub enum EncryptionState {
     ///
     /// The arm's target is `smithy.api#Unit`, a structure with no members, so it
     /// carries no value here and goes on the wire as the empty object
-    /// [`UnitStructure`] writes.
+    /// [`UnitStructure`] writes — the one such structure this service has, in
+    /// `types/shared_types.rs`, because the request-side `EncryptionSettings`
+    /// union carries the same arm.
     Default,
-}
-
-/// `smithy.api#Unit` — the structure with no members that the `default` arm of
-/// [`EncryptionState`] targets. It exists because the JSON codec writes and
-/// reads a nested shape through a struct codec, and an empty one is what carries
-/// the `{}` the model's `Unit` denotes.
-struct UnitStructure;
-
-impl UnitStructure {
-    const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
-        ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
-        ::aws_smithy_schema::ShapeType::Structure,
-        &[],
-    );
-}
-
-impl ::aws_smithy_schema::serde::SerializableStruct for UnitStructure {
-    fn serialize_members(
-        &self,
-        _serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
-    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
-        Ok(())
-    }
-}
-
-impl ::aws_smithy_schema_server::DeserializableStruct for UnitStructure {
-    fn deserialize(
-        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
-    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
-        deserializer.read_struct(&Self::SCHEMA, &mut |_, _| Ok(()))?;
-        Ok(Self)
-    }
 }
 
 #[allow(non_upper_case_globals)]

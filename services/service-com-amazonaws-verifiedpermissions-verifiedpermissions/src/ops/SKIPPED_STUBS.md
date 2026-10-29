@@ -26,9 +26,9 @@ Nothing is currently skipped.
 now hand-authored in `ops/create_policy_store.rs` and `ops/get_policy_store.rs`,
 so both are wired into the service's `operations(...)` allow-list.
 
-`GetPolicyStoreOutput$encryptionState` IS served: `types/get_policy_store_types.rs`
-writes the `EncryptionState` union out by hand, including the empty structure the
-`smithy.api#Unit` arm denotes. `CreatePolicyStoreInput$encryptionSettings` — the
-request member that selects a customer-managed KMS key — is still declared
-`unsupported` on the hand-written input type, so every store this slice creates
-is encrypted with an AWS owned key.
+`GetPolicyStoreOutput$encryptionState` and
+`CreatePolicyStoreInput$encryptionSettings` ARE both served:
+`types/get_policy_store_types.rs` and `types/create_policy_store_types.rs` write
+those two unions out by hand, including the empty structure the `smithy.api#Unit`
+arm denotes, so a create that selects a customer-managed KMS key is persisted and
+reported back.

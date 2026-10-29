@@ -5,8 +5,8 @@
 //! Hand-authored. The scaffold op-stub generator declined this operation because
 //! `CreatePolicyStoreInput$encryptionSettings` targets a union with a
 //! `smithy.api#Unit` arm (see `src/ops/SKIPPED_STUBS.md`); the input type in
-//! `types/create_policy_store_types.rs` declares that one member `unsupported` and
-//! serves every other one, so the operation is wired into the service's
+//! `types/create_policy_store_types.rs` writes that union out by hand and serves
+//! every modelled member, so the operation is wired into the service's
 //! `operations(...)` allow-list like any rendered sibling.
 //!
 //! Creates a policy store and INSERTS it into [`crate::state`]: the id, ARN and
@@ -18,7 +18,9 @@
 //! * `validationSettings` (ValidationSettings) **required** — `mode`: `OFF` | `STRICT`.
 //! * `description` (PolicyStoreDescription, len 0..150, @sensitive)
 //! * `deletionProtection` (DeletionProtection, one of: DISABLED | ENABLED)
-//! * `encryptionSettings` (EncryptionSettings) — not served by this slice.
+//! * `encryptionSettings` (EncryptionSettings) — `kmsEncryptionSettings` (a
+//!   customer-managed KMS `key`, with an optional `encryptionContext`) or
+//!   `default` (an AWS owned key); absent means `default`.
 //! * `tags` (TagMap, len ..200)
 //!
 //! ## Output
@@ -90,12 +92,45 @@ fn canonical_parameters(input: &CreatePolicyStoreInput) -> String {
     // every value, so a tag carrying the separators cannot spell out a
     // neighbouring member.
     let tags = format!("{tags:?}");
+    let encryption = canonical_encryption_settings(input.encryption_settings.as_ref());
     crate::state::idempotency_parameters(&[
         ("mode", Some(input.validation_settings.mode.as_str())),
         ("description", input.description.as_deref()),
         ("deletionProtection", input.deletion_protection.as_deref()),
+        ("encryptionSettings", encryption.as_deref()),
         ("tags", Some(tags.as_str())),
     ])
+}
+
+/// The encryption arm the request named, as ONE escaped value of
+/// [`canonical_parameters`]: a union is one member on the wire, so the rendering
+/// names the active arm and, inside it, that arm's own members. A replay that
+/// switches arms, names a different key or changes one context entry therefore
+/// renders differently and conflicts, exactly as a replay that changes any other
+/// parameter does. An absent member renders as `None`, which no present arm can
+/// render as.
+fn canonical_encryption_settings(settings: Option<&EncryptionSettings>) -> Option<String> {
+    Some(match settings? {
+        EncryptionSettings::KmsEncryptionSettings(kms) => {
+            let mut context: Vec<(&String, &String)> = kms
+                .encryption_context
+                .as_ref()
+                .map(|c| c.iter().collect())
+                .unwrap_or_default();
+            context.sort();
+            let context = format!("{context:?}");
+            let arm = crate::state::idempotency_parameters(&[
+                ("key", Some(kms.key.as_str())),
+                ("encryptionContext", Some(context.as_str())),
+            ]);
+            crate::state::idempotency_parameters(&[("kmsEncryptionSettings", Some(arm.as_str()))])
+        }
+        // The `default` arm's target is the structure with no members, so the
+        // arm's NAME is the whole of what it carries.
+        EncryptionSettings::Default => {
+            crate::state::idempotency_parameters(&[("default", Some(""))])
+        }
+    })
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
@@ -194,12 +229,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Set from the service's own default: no request member of any
             // modelled operation carries a Cedar version.
             cedar_version: crate::state::DEFAULT_CEDAR_VERSION.to_string(),
-            // A store this operation creates is encrypted with an AWS owned
-            // key: the one request member that selects a customer-managed key,
-            // `CreatePolicyStoreInput$encryptionSettings`, is not served by this
-            // slice (it is declared `unsupported` in
-            // `types/create_policy_store_types.rs`), so nothing can ask for one.
-            encryption: crate::state::StoreEncryption::default(),
+            // How the store is encrypted is what `encryptionSettings` selects,
+            // so the request's arm is what is persisted; the service's own
+            // default — an AWS owned key — stands in only for a request that
+            // named no arm. `GetPolicyStore` reports whichever arm is here.
+            encryption: match input.encryption_settings.as_ref() {
+                Some(EncryptionSettings::KmsEncryptionSettings(kms)) => {
+                    crate::state::StoreEncryption::CustomerManagedKey {
+                        key: kms.key.clone(),
+                        encryption_context: kms
+                            .encryption_context
+                            .clone()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect(),
+                    }
+                }
+                Some(EncryptionSettings::Default) | None => {
+                    crate::state::StoreEncryption::default()
+                }
+            },
             tags: input
                 .tags
                 .clone()
