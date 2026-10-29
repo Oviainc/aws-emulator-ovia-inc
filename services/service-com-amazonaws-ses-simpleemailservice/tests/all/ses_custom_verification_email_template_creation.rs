@@ -18,8 +18,8 @@
 //! * a template name is a KEY, compared exactly: a read of a name that misses —
 //!   never created, another case of a stored one, a prefix of it, the empty name
 //!   — is refused with the modelled
-//!   `CustomVerificationEmailTemplateDoesNotExist` and its wording for that
-//!   name.
+//!   `CustomVerificationEmailTemplateDoesNotExist` and its one fixed wording,
+//!   which quotes no name.
 //!
 //! Every call goes through `MultiServiceRouter::dispatch`, so each one is a real
 //! awsQuery request: form-urlencoded body in, XML out, one shared engine behind
@@ -324,8 +324,8 @@ async fn a_template_name_is_a_key_compared_exactly() {
 
     // The rows differ in how a name MISSES: never created, another case of a
     // stored one, a prefix of it, a stored name with trailing space, and the
-    // empty name. Each is refused with the modelled absence, worded for the name
-    // the request carried.
+    // empty name. Each is refused with the modelled absence, worded the same way
+    // whatever name the request carried.
     for (case, name) in [
         ("a name never created", "no-such-template"),
         ("another case of a stored name", "CONFIRM-YOUR-ADDRESS"),
@@ -343,10 +343,8 @@ async fn a_template_name_is_a_key_compared_exactly() {
             (
                 Some("CustomVerificationEmailTemplateDoesNotExist".to_string()),
                 // The wording AWS states for this error class, as a literal here:
-                // only the name is taken from the request.
-                Some(format!(
-                    "Custom verification email template <{name}> does not exist."
-                ))
+                // every word of it is fixed, so nothing is taken from the request.
+                Some("Provided custom verification email template name does not exist.".to_string())
             ),
             "case {case:?}: expected the modelled absence for {name:?}, got {body}"
         );

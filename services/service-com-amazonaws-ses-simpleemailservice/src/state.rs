@@ -2874,12 +2874,15 @@ pub fn daily_quota_exceeded_message(quota: f64, already_sent: f64) -> String {
 ///
 /// `CustomVerificationEmailTemplateDoesNotExistException` is "Indicates that a
 /// custom verification email template with the name you specified does not
-/// exist", so the name the request carried is the one variable part. One
-/// wording, for the same reason as [`illegal_address_message`]: the operations
-/// that resolve a template out of one store report its absence identically.
-pub fn missing_custom_verification_email_template_message(template_name: &str) -> String {
-    format!("Custom verification email template <{template_name}> does not exist.")
-}
+/// exist", and the sentence the service answers for it is FIXED: it speaks of
+/// the provided name without quoting it, so no part of it comes from the
+/// request and two calls differing only in the name they ask for are worded
+/// identically. A constant rather than a formatter, because there is nothing to
+/// interpolate. One wording, for the same reason as [`illegal_address_message`]:
+/// the operations that resolve a template out of one store report its absence
+/// identically.
+pub const MISSING_CUSTOM_VERIFICATION_EMAIL_TEMPLATE_MESSAGE: &str =
+    "Provided custom verification email template name does not exist.";
 
 /// How this service refuses a custom verification email whose sender this
 /// account has not verified, for every operation that gates one on it.

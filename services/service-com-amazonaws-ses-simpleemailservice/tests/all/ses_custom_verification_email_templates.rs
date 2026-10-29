@@ -166,7 +166,8 @@ async fn assert_absent(router: &MultiServiceRouter, case: &str, name: &str) {
         (code(&body).as_str(), message(&body).as_str()),
         (
             "CustomVerificationEmailTemplateDoesNotExist",
-            format!("Custom verification email template <{name}> does not exist.").as_str()
+            // Entirely fixed text: the refusal does not quote the name asked for.
+            "Provided custom verification email template name does not exist."
         ),
         "case {case:?}: expected the modelled absence for {name:?}, got {body}"
     );

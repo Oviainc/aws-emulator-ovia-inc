@@ -167,9 +167,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             input.template_name.clone(),
                         ),
                         message: Some(
-                            crate::state::missing_custom_verification_email_template_message(
-                                &input.template_name,
-                            ),
+                            crate::state::MISSING_CUSTOM_VERIFICATION_EMAIL_TEMPLATE_MESSAGE
+                                .to_string(),
                         ),
                     },
                 )
