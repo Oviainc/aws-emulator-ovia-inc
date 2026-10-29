@@ -2268,6 +2268,39 @@ impl ComAmazonawsMediapackageMediapackageState {
             job.settle(now);
         }
     }
+
+    /// Fail every harvest job OF `region` that has not finished harvesting the origin
+    /// endpoint `origin_endpoint_id`, because that endpoint is being removed.
+    ///
+    /// A harvest exports content the origin endpoint has already published, so a job that
+    /// has not reached a terminal status when its source endpoint is removed can never
+    /// carry that harvest out: it reaches [`HARVEST_FAILED`] — the modelled status for a
+    /// harvest that did not produce its output — and owes no further transition, instead
+    /// of reporting work in progress, and later an outcome, for a source this service no
+    /// longer holds.
+    ///
+    /// Only the unfinished jobs move. A job that already reached a terminal status
+    /// finished its harvest while the endpoint was there, and the record of a submitted
+    /// harvest is HISTORY, not a reference this service resolves on a read: the stored
+    /// `origin_endpoint_id` "cannot be changed after the HarvestJob is submitted", no
+    /// operation of this service removes a stored job, and every read keeps reporting the
+    /// ids the job was submitted under.
+    ///
+    /// A job of another Region harvests that Region's endpoint of the same id, so it is
+    /// not touched here — the same scope every other cross-store read of this regional
+    /// control plane uses ([`origin_endpoints_of`](Self::origin_endpoints_of)).
+    pub fn fail_harvests_of_origin_endpoint(&mut self, region: &str, origin_endpoint_id: &str) {
+        for job in self.harvest_jobs.values_mut() {
+            if job.region != region
+                || job.origin_endpoint_id != origin_endpoint_id
+                || job.is_terminal()
+            {
+                continue;
+            }
+            job.status = HARVEST_FAILED.to_string();
+            job.next_status_due = None;
+        }
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

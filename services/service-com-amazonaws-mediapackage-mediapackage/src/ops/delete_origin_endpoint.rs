@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteOriginEndpoint
-//! Removes the stored OriginEndpoint, so a later DescribeOriginEndpoint answers 404.
+//! Removes the stored OriginEndpoint, so a later DescribeOriginEndpoint answers 404, and
+//! fails every harvest job that was still harvesting it.
 //!
 //! ## Shape of an operation
 //!
@@ -147,10 +148,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut state = state.lock();
+        // The clock, not this call, moves a harvest job's status: materialise first what it
+        // has already made due, so a job that finished its harvest on its own is left in
+        // the status the clock gave it rather than counted among the jobs this delete cuts
+        // short.
+        state.settle_harvest_jobs(std::time::SystemTime::now());
 
         if state.remove_origin_endpoint(&region, &input.id).is_none() {
             return Err(crate::state::origin_endpoint_not_found(&input.id).into());
         }
+
+        // A harvest exports content this endpoint has published, so a job still harvesting
+        // it when it is removed can never finish: the removal settles those jobs into their
+        // terminal failure status instead of leaving them reporting work in progress against
+        // a source this service no longer holds. The stored jobs themselves are kept, with
+        // the ids they were submitted under — a submitted job is the history of a harvest,
+        // which is why a job naming this endpoint does NOT block the delete the way an
+        // OriginEndpoint blocks `DeleteChannel`: a channel's endpoints can be removed first,
+        // while no operation of this service removes a harvest job.
+        state.fail_harvests_of_origin_endpoint(&region, &input.id);
         Ok(DeleteOriginEndpointOutput {})
     }
 }

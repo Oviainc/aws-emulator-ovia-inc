@@ -219,13 +219,15 @@ fn pending_span(engine: &engine::InMemoryEngine, id: &str, from: SystemTime) -> 
 ///
 /// This writes only the due instant the emulator itself stores; the transition is still
 /// the emulator's own, applied by the emulator, when the clock reaches that instant.
-fn hold_transitions_open(engine: &engine::InMemoryEngine) {
+///
+/// Shared with the sibling harvest suites, so no suite writes a second one.
+pub(crate) fn hold_transitions_open(engine: &engine::InMemoryEngine) {
     set_due(engine, SystemTime::now() + Duration::from_secs(3_600));
 }
 
 /// Make every outstanding harvest-job transition due, so the next call materialises it.
 /// See [`hold_transitions_open`] for why writing the due instant is not the transition.
-fn make_transitions_due(engine: &engine::InMemoryEngine) {
+pub(crate) fn make_transitions_due(engine: &engine::InMemoryEngine) {
     set_due(engine, SystemTime::now() - Duration::from_secs(1));
 }
 
