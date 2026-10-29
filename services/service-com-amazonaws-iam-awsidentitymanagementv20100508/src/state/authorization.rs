@@ -11,13 +11,13 @@
 //! deny). A refused call is answered HTTP 403 with the error code `AccessDenied`
 //! ([`crate::scaffolded::Scaffolded::access_denied`]) and a message built from the three
 //! things the decision was made about — the principal, the action and the resource —
-//! closed by why the decision went that way. A refusal that WITHHELD the call — nothing
-//! in force allowed it, the implicit deny — reports an evaluation whose details can be
-//! read, so that sentence continues with where to read them and under which authorization
-//! id ([`not_authorized_with_details`]) for every action AWS words that way
-//! ([`ENDS_AT_THE_REASON`] names the ones it does not); a refusal explained by an explicit
-//! `Deny` is explained by the statement the reason already names, so it ends there
-//! ([`not_authorized`]).
+//! closed by why the decision went that way ([`not_authorized`]) — the refusal AWS
+//! documents. For the few actions whose refusal AWS continues with the pointer at the
+//! request's authorization details ([`NAMES_AUTHORIZATION_DETAILS`]), a refusal that
+//! WITHHELD the call — nothing in force allowed it, the implicit deny — says where those
+//! details are read and under which authorization id ([`not_authorized_with_details`]);
+//! every other refusal, and any refusal explained by an explicit `Deny` (the statement the
+//! reason already names IS the explanation), ends at the reason.
 //!
 //! The four pieces, each held in exactly one place:
 //!
@@ -664,43 +664,56 @@ pub fn authorize_written(
         explicit_deny = decided == Decision::Denied || capped == Decision::Denied,
         "the policies in force on the caller do not permit this call"
     );
-    // A refusal that WITHHELD a grant — nothing in force allowed the call, the implicit
-    // deny — reports an evaluation there are details to read, so it closes with the
-    // pointer at those details, whether or not the principal held a document for the
-    // evaluation to read: the evaluation ran either way, and it is the one the pointer
-    // names. A refusal explained by an explicit `Deny` is explained by that statement,
-    // which the reason already names, so it ends at the reason — as does one for an
-    // action AWS words without the pointer at all ([`ENDS_AT_THE_REASON`]).
-    if decided == Decision::Denied
-        || capped == Decision::Denied
-        || ENDS_AT_THE_REASON.contains(&action)
-    {
-        return Err(not_authorized(&principal, action, named_as, &reason));
+    // AWS's refusal is the sentence that ENDS at the reason, which is what this gate
+    // answers unless the call asked for one of the few actions whose refusal AWS
+    // CONTINUES with the pointer at the request's authorization details
+    // ([`NAMES_AUTHORIZATION_DETAILS`]). For those, the pointer closes a refusal that
+    // WITHHELD a grant — nothing in force allowed the call, the implicit deny — because
+    // that is the refusal reporting an evaluation there are details to read, whether or
+    // not the principal held a document for the evaluation to read: the evaluation ran
+    // either way, and it is the one the pointer names. A refusal explained by an explicit
+    // `Deny` is explained by that statement, which the reason already names, so it ends at
+    // the reason whichever action it refused.
+    let withheld = decided != Decision::Denied && capped != Decision::Denied;
+    if withheld && NAMES_AUTHORIZATION_DETAILS.contains(&action) {
+        return Err(not_authorized_with_details(
+            &principal,
+            action,
+            named_as,
+            &reason,
+            &authorization_id(ctx, &principal, action, resource),
+        ));
     }
-    Err(not_authorized_with_details(
-        &principal,
-        action,
-        named_as,
-        &reason,
-        &authorization_id(ctx, &principal, action, resource),
-    ))
+    Err(not_authorized(&principal, action, named_as, &reason))
 }
 
-/// The actions whose refusal of a WITHHELD call ends at the reason, carrying no pointer at
-/// the authorization details of the evaluation.
+/// The actions whose withheld-grant refusal AWS CONTINUES with the pointer at the
+/// request's authorization details, instead of ending at the reason the decision went that
+/// way.
 ///
-/// The pointer is not part of every action's refusal: AWS words the withheld-grant refusal
-/// of the actions named here as the sentence alone, and of the others as that sentence
-/// continued by the pointer ([`not_authorized_with_details`]). Which of the two an action
-/// carries is a fact about THAT action — nothing about the caller, the resource, the
-/// Region or the request selects it — so it is recorded per action here and nowhere else,
-/// and `tests/all/access_denied_message_wording.rs` is the table that reads both wordings
-/// back.
+/// The refusal AWS documents ("Troubleshoot access denied error messages", IAM User Guide)
+/// is the single sentence naming the principal, the action, the resource and why — which
+/// is what [`not_authorized`] words and what EVERY action here is refused with: this list
+/// is the positive evidence for the continuation, so an action nobody has observed the
+/// pointer for is answered the documented sentence rather than a continuation nothing
+/// supports. Which of the two an action carries is a fact about THAT action — nothing
+/// about the caller, the resource, the Region, the number of attempts or whether the call
+/// reads or writes selects it — and the `AccessDenied` of an authorization refusal is
+/// service-common, its text modelled nowhere (`smithy_query(query="operation",
+/// operation="ListUsers,ListAccessKeys")` declares only `ServiceFailureException` and, for
+/// a request naming an entity, `NoSuchEntityException`), so the continuation cannot be read
+/// off the model either.
 ///
-/// SOURCE, for adding an entry: the message AWS answers that action's withheld call with.
-/// An action nobody has that message for is simply absent from this list, which is why the
-/// list is short rather than one entry per action.
-const ENDS_AT_THE_REASON: &[&str] = &[UNTAG_POLICY, LIST_POLICIES_GRANTING_SERVICE_ACCESS];
+/// SOURCE, for adding an entry: the message the service answers that action's withheld
+/// call with, where it carries the pointer.
+/// `tests/all/access_denied_message_wording.rs` is the table that reads both wordings back.
+const NAMES_AUTHORIZATION_DETAILS: &[&str] = &[
+    GET_USER,
+    LIST_ACCESS_KEYS,
+    LIST_OPEN_ID_CONNECT_PROVIDERS,
+    PUT_ACCOUNT_PROPERTIES,
+    TAG_USER,
+];
 
 /// Where the authorization details of ONE refused request are read: the console page for
 /// an authorization id.
