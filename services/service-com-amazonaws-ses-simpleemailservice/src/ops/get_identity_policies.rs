@@ -165,9 +165,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         // "This operation is for the identity owner only. If you have not
-        // verified the identity, it returns an error" — the same refusal
-        // `ListIdentityPolicies` answers, for the same reason, and the identity
-        // may be named by its name or by its ARN.
+        // verified the identity, it returns an error" — the refusal this
+        // operation's own documentation states, through the service's 400
+        // channel because it models no error of its own. Its sibling
+        // `ListIdentityPolicies` answers an identity the account does not hold
+        // with an empty list instead, which is what the recorded service does
+        // for THAT operation; nothing records this one serving such a call, so
+        // its documented refusal stands. The identity may be named by its name
+        // or by its ARN.
         let Some(policies) = state.identity_policies(&input.identity) else {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "Identity {:?} is not a verified identity of this account; verify it before \
@@ -180,7 +185,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is not attached is ABSENT from the map rather than reported with an
         // invented document, so a caller can tell "no such policy" from one
         // whose body happens to be empty. Each document is the text that was
-        // stored, byte for byte.
+        // stored, byte for byte. The policies are the ACCOUNT's identity's,
+        // whichever API attached them.
         let mut found = std::collections::HashMap::new();
         for requested in &input.policy_names {
             if let Some(document) = policies.get(requested) {

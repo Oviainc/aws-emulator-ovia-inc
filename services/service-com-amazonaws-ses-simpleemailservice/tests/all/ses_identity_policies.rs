@@ -606,10 +606,10 @@ async fn the_size_ceiling_holds_at_the_byte_and_a_refusal_reports_the_size_submi
 }
 
 #[tokio::test]
-async fn an_identity_this_account_does_not_hold_is_refused_by_every_policy_operation() {
+async fn an_identity_this_account_does_not_hold_carries_no_policy() {
     let router = emulator();
-    // One verified identity, so the refusals below are about the identity named,
-    // not about an empty store.
+    // One verified identity carrying a policy, so the answers below are about the
+    // identity named, not about an empty store.
     verify_email(&router, "sender@example.com").await;
     put_accepted(&router, "sender@example.com", "Authorize", &policy()).await;
 
@@ -618,8 +618,24 @@ async fn an_identity_this_account_does_not_hold_is_refused_by_every_policy_opera
         "not-verified.example",
         "arn:aws:ses:us-east-1:000000000000:identity/stranger.example",
     ] {
+        // `ListIdentityPolicies` models no error and has to answer a required
+        // list, and the recorded service answers an identity it does not hold
+        // with an empty one: it is reported as carrying no policy.
+        let (status, body) = list_policies(&router, unknown).await;
+        assert_eq!(
+            status, 200,
+            "case ListIdentityPolicies({unknown}): an identity this account does not hold \
+             carries no policy, got {status} with {body}"
+        );
+        assert!(
+            !body.contains("Authorize"),
+            "case ListIdentityPolicies({unknown}): expected no policy reported, got {body}"
+        );
+
+        // The other two keep the refusal their own documentation states: reading
+        // a document is "for the identity owner only", and a write has no
+        // identity to attach the policy to.
         let calls = [
-            ("ListIdentityPolicies", list_policies(&router, unknown).await),
             (
                 "GetIdentityPolicies",
                 get_policies(&router, unknown, &["Authorize"]).await,
@@ -642,12 +658,12 @@ async fn an_identity_this_account_does_not_hold_is_refused_by_every_policy_opera
         }
     }
 
-    // The verified identity is untouched by any of those refusals.
+    // The verified identity is untouched by any of those calls.
     let listed = policy_names(&router, "sender@example.com").await;
     assert_eq!(
         listed,
         vec!["Authorize".to_string()],
-        "case after the refusals: the verified identity keeps its policy, got {listed:?}"
+        "case after the calls above: the verified identity keeps its policy, got {listed:?}"
     );
 }
 

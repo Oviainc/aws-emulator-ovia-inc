@@ -321,6 +321,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than a re-rendering of it.
         record.policies.insert(input.policy_name, input.policy);
 
+        // Which principals may send through an identity is a fact about the ACCOUNT's
+        // identity, not about this API, so the account's identity registry takes the
+        // new set too and every other API over those identities reports it. Published
+        // after this service's own store is released, which keeps this service's lock
+        // order (its store, then the registry).
+        drop(store);
+        crate::state::publish_identity(&*self.engine, &input.email_identity);
+
         // `CreateEmailIdentityPolicyResponse` has no members: what the call produced
         // is the state it wrote, which the identity's reads report.
         Ok(CreateEmailIdentityPolicyOutput {})

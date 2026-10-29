@@ -736,6 +736,13 @@ pub struct Identity {
     /// (lexicographic) order, and bounded at [`MAX_IDENTITY_POLICIES`] entries
     /// of [`MAX_POLICY_BYTES`] each.
     ///
+    /// The set is the ACCOUNT's identity's, so it is the one the account's identity
+    /// registry carries
+    /// ([`::service_common::ses_identities::SesIdentityRecord::policies`]): a policy
+    /// attached through another API over these identities is listed here, and one
+    /// attached here is listed there. Every write publishes it
+    /// ([`publish_identity`]).
+    ///
     /// The document is kept VERBATIM as the caller submitted it, so
     /// `GetIdentityPolicies` reports back the text that was stored rather than a
     /// re-rendering of it.
@@ -1435,9 +1442,15 @@ impl ComAmazonawsSesSimpleemailserviceState {
     /// The sending-authorization policies attached to `identity`, or `None` when
     /// this account holds no such identity.
     ///
-    /// `None` is what the policy operations refuse on: they are "for the identity
-    /// owner only", so an identity this account has not verified is not an
-    /// identity with no policies.
+    /// The set is the ACCOUNT's identity's, brought into agreement with the
+    /// account's identity registry on every call ([`reconcile_identities`]), so a
+    /// policy attached through another API over these identities is in it.
+    ///
+    /// `None` is "this account holds no such identity": `ListIdentityPolicies`
+    /// answers that with an empty list — it models no error and the recorded
+    /// service serves such a call — while `GetIdentityPolicies`,
+    /// `PutIdentityPolicy` and `DeleteIdentityPolicy` refuse on it, the refusal
+    /// their own documentation states.
     pub fn identity_policies(&self, identity: &str) -> Option<&BTreeMap<String, String>> {
         self.identities
             .get(identity_key(identity))
@@ -2874,11 +2887,26 @@ fn system_entropy() -> u64 {
 pub fn service_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<ComAmazonawsSesSimpleemailserviceState>> {
-    let engine = (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()?;
-    let state = engine.state::<ComAmazonawsSesSimpleemailserviceState>();
-    let registry = engine.state::<::service_common::ses_identities::SesIdentityDirectory>();
+    let state = own_state(engine)?;
+    let registry = identity_registry(engine)?;
     reconcile_identities(&state, &registry, SystemTime::now());
     Some(state)
+}
+
+/// This service's store WITHOUT reconciling it against the account's identity registry
+/// first.
+///
+/// What a writer that has just changed a shared fact publishes FROM
+/// ([`publish_identity`]): reconciling there would read the registry's older copy of
+/// that fact back over the change before it was published, so the publication would
+/// carry what the registry already held instead of what the call wrote. Every other
+/// caller wants [`service_state`].
+fn own_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<ComAmazonawsSesSimpleemailserviceState>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<ComAmazonawsSesSimpleemailserviceState>)
 }
 
 /// Record `name` as an identity of this account of class `identity_type` — in this
@@ -2975,15 +3003,18 @@ pub fn forget_identity<Eng: Send + Sync + 'static>(engine: &Eng, name: &str) {
     registry.forget(name);
 }
 
-/// Publish the identity `name` as this service now holds it — its verification and its
-/// Easy DKIM setup — to the account's identity registry, so every other API over the
-/// account's identities reports what this one last wrote.
+/// Publish the identity `name` as this service now holds it — its verification, its
+/// Easy DKIM setup and its sending-authorization policies — to the account's identity
+/// registry, so every other API over the account's identities reports what this one
+/// last wrote.
 ///
 /// What an operation that CHANGES a shared fact about an identity calls once it has
 /// written it. Changes nothing when the account holds no such identity, and writes
-/// nothing but the registry's record of it.
+/// nothing but the registry's record of it. Reads this service's store WITHOUT
+/// reconciling it ([`own_state`]): the change being published is newer than the
+/// registry's copy of it.
 pub fn publish_identity<Eng: Send + Sync + 'static>(engine: &Eng, name: &str) {
-    let Some(state) = service_state(engine) else {
+    let Some(state) = own_state(engine) else {
         return;
     };
     let Some(registry) = identity_registry(engine) else {
@@ -3070,6 +3101,33 @@ impl ::service_common::ses_identities::AccountIdentityRecord for Identity {
         }
     }
 
+    /// The sending-authorization policies the ACCOUNT's identity holds, which this API
+    /// lists and reports whichever API attached them, and the Easy DKIM setup it holds,
+    /// whose tokens are the records its owner publishes.
+    fn take_shared(
+        &mut self,
+        published: &::service_common::ses_identities::SesIdentityRecord,
+    ) {
+        if let Some(policies) = &published.policies {
+            if self.policies != *policies {
+                self.policies = policies.clone();
+            }
+        }
+        // An Easy DKIM setup the account gained through another API over these
+        // identities AFTER this record was written is the setup whose tokens the
+        // identity's owner publishes, so this record reports it instead of reporting
+        // none. A record already carrying a setup keeps it: the first setup stands,
+        // because its tokens may already be in DNS.
+        let gained = published.dkim.as_ref().filter(|_| self.dkim.is_none());
+        if let Some(shared) = gained {
+            self.dkim = Some(EasyDkimSettings {
+                tokens: shared.tokens.clone(),
+                status: service_status(shared.status),
+            });
+            self.dkim_enabled = shared.signing_enabled;
+        }
+    }
+
     fn published(&self) -> ::service_common::ses_identities::SesIdentityRecord {
         registry_record(self)
     }
@@ -3095,10 +3153,11 @@ impl ::service_common::ses_identities::AccountIdentityRecord for Identity {
             // account holds for it — the tokens its owner publishes and where the
             // search for them stands — and with none when no setup was ever asked for.
             //
-            // Notification topics are set by `SetIdentityNotificationTopic`, a custom
-            // MAIL FROM domain by `SetIdentityMailFromDomain` and a policy by
-            // `PutIdentityPolicy`: an identity recorded elsewhere has had none of them
-            // asked for, so each starts where every identity of this surface starts it.
+            // Notification topics are set by `SetIdentityNotificationTopic` and a
+            // custom MAIL FROM domain by `SetIdentityMailFromDomain`: an identity
+            // recorded elsewhere has had neither asked for, so each starts where every
+            // identity of this surface starts it. Its sending-authorization policies
+            // are the ACCOUNT's, so they are adopted with it.
             dkim: published.dkim.as_ref().map(|shared| EasyDkimSettings {
                 tokens: shared.tokens.clone(),
                 // An identity whose verification succeeded is one whose published
@@ -3120,7 +3179,7 @@ impl ::service_common::ses_identities::AccountIdentityRecord for Identity {
                 }),
             notifications: NotificationSettings::default(),
             mail_from: None,
-            policies: BTreeMap::new(),
+            policies: published.policies.clone().unwrap_or_default(),
             // The identity was added to the account's list when it was recorded, which
             // is not an instant this surface observed; the registry carries the
             // verification it is still owed, which is what a reader of this record
@@ -3158,6 +3217,11 @@ pub fn registry_record(
             status: registry_state(dkim.status),
             tokens: dkim.tokens.clone(),
         }),
+        // The policies that authorize other principals to send through the identity
+        // belong to the account's identity too, and this API attaches and lists them,
+        // so the set it holds is published for every surface over these identities to
+        // report.
+        policies: Some(identity.policies.clone()),
     }
 }
 

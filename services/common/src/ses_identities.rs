@@ -15,10 +15,12 @@
 //! So the set lives HERE, once in the shared engine, rather than in each surface's
 //! own store: a surface PUBLISHES the identities it records and ADOPTS the ones it
 //! does not hold yet, and each keeps beside that only what its own API adds (the
-//! classic surface's sending-authorization policies and notification topics; the v2
-//! surface's tags and certificate associations). What makes an identity the one the
-//! account holds is carried here too — its verification, and the Easy DKIM setup
-//! ([`SesDkimSetup`]) whose tokens its owner publishes in DNS.
+//! classic surface's notification topics; the v2 surface's tags and certificate
+//! associations). What makes an identity the one the account holds is carried here
+//! too — its verification, the Easy DKIM setup ([`SesDkimSetup`]) whose tokens its
+//! owner publishes in DNS, and the sending-authorization policies
+//! ([`SesIdentityRecord::policies`]) that say which other principals may send
+//! through it.
 //!
 //! Nothing here names a wire shape. The registry holds the identity as its creator
 //! spelled it, which class of identity it is, the verification state and the instant
@@ -148,6 +150,19 @@ pub struct SesIdentityRecord {
     /// them: the tokens an owner has already published stay the tokens every API
     /// answers with.
     pub dkim: Option<SesDkimSetup>,
+    /// The sending-authorization policies attached to the account's identity, keyed by
+    /// policy name, and `None` when no API that carries them has published a set yet.
+    ///
+    /// A policy says which other principal may send through the identity, so it is a
+    /// fact about the ACCOUNT's identity rather than about the API that attached it:
+    /// one API's list of policy names and another's name-to-document map are two views
+    /// of this one set, and deleting the identity drops them with it.
+    ///
+    /// `None` is "this publisher's API has no sending-authorization policies at all",
+    /// which is not the same as the empty set: such a publisher must not erase the
+    /// policies another API attached. The document is kept VERBATIM as the caller
+    /// submitted it, so every surface reports back the text that was stored.
+    pub policies: Option<BTreeMap<String, String>>,
 }
 
 impl SesIdentityRecord {
@@ -168,6 +183,9 @@ impl SesIdentityRecord {
             // Easy DKIM is set up by a call of its own, so an identity whose
             // verification has only just been requested holds no setup yet.
             dkim: None,
+            // A sending-authorization policy is attached by a call of its own, so the
+            // surface recording the verification is publishing no set of them.
+            policies: None,
         }
     }
 
@@ -238,6 +256,13 @@ impl SesIdentityDirectory {
                 if let Some(dkim) = record.dkim {
                     held.dkim = Some(dkim);
                 }
+                // The same rule for the identity's sending-authorization policies: the
+                // publisher's set is the account's, and a publisher whose API carries
+                // none of them ([`SesIdentityRecord::policies`] is `None`) leaves the
+                // set another API attached as it stands.
+                if let Some(policies) = record.policies {
+                    held.policies = Some(policies);
+                }
             }
             None => {
                 if self.identities.len() >= MAX_REGISTERED_IDENTITIES {
@@ -302,7 +327,7 @@ impl SesIdentityDirectory {
     /// them.
     ///
     /// The whole reconciliation, written ONCE here rather than per surface, so no two
-    /// of them can resolve a hand-off differently. Four steps, in this order:
+    /// of them can resolve a hand-off differently. Five steps, in this order:
     ///
     /// 1. every registry record carries the verification move the clock already owed
     ///    it ([`Self::settle`]);
@@ -312,7 +337,12 @@ impl SesIdentityDirectory {
     /// 3. an identity the table holds that the registry no longer holds was DELETED
     ///    through another surface, so it goes from the table too;
     /// 4. an identity the registry holds that the table does not is ADOPTED
-    ///    ([`AccountIdentityRecord::adopt`]).
+    ///    ([`AccountIdentityRecord::adopt`]);
+    /// 5. an identity BOTH sides hold takes the facts the account holds for it rather
+    ///    than this surface — its policies and its Easy DKIM setup
+    ///    ([`AccountIdentityRecord::take_shared`]) — which is how a policy attached, or
+    ///    a setup started, through one API becomes visible through the others, instead
+    ///    of only an identity recorded through one.
     ///
     /// The verification state is never copied back ONTO a record the table already
     /// holds: every surface applies the same rule to the same stored due instant, so
@@ -320,7 +350,7 @@ impl SesIdentityDirectory {
     ///
     /// The work is proportional to the account's identity set, which
     /// [`MAX_REGISTERED_IDENTITIES`] bounds, and allocates only when there is a
-    /// publication or an adoption to make.
+    /// publication, an adoption or a shared fact the two sides disagree on.
     pub fn reconcile<R: AccountIdentityRecord>(
         &mut self,
         table: &mut BTreeMap<String, R>,
@@ -368,6 +398,16 @@ impl SesIdentityDirectory {
                     self.adopt_dkim(record.identity_name(), setup);
                 }
                 table.insert(key, record);
+            }
+        }
+
+        // What the ACCOUNT holds for an identity both sides already hold is the
+        // account's, not the holding surface's: a record kept from an earlier call
+        // takes it, so a fact another API wrote after this surface adopted the
+        // identity is reported here too instead of only on the API that wrote it.
+        for held in table.values_mut() {
+            if let Some(published) = self.identities.get(&identity_key(held.identity_name())) {
+                held.take_shared(published);
             }
         }
     }
@@ -431,6 +471,20 @@ pub trait AccountIdentityRecord: Sized {
 
     /// Note that the registry now carries this identity, as `published` holds it.
     fn mark_registered(&mut self, published: &SesIdentityRecord);
+
+    /// Take onto this record the facts the ACCOUNT holds about the identity rather
+    /// than this surface — the sending-authorization policies attached to it, and the
+    /// Easy DKIM setup whose tokens its owner publishes — as `published` holds them.
+    ///
+    /// Called for every identity this surface and the registry BOTH hold, so a fact
+    /// another API wrote after this surface recorded or adopted the identity is
+    /// reported here as well. A surface whose own API carries none of a shared fact
+    /// answers for none of it and leaves it alone; one already carrying an Easy DKIM
+    /// token set keeps it, since those records may already be in DNS.
+    ///
+    /// Idempotent, and it allocates only when the two sides disagree: a
+    /// reconciliation of two sides that already agree changes nothing.
+    fn take_shared(&mut self, published: &SesIdentityRecord);
 
     /// How the registry carries this record: the identity as it was recorded, its
     /// class, the verification this surface holds for it, and the Easy DKIM setup it
@@ -676,6 +730,9 @@ mod tests {
             /// What the surface's own API added to the identity, which an adoption
             /// starts empty and a reconciliation must never clear.
             label: String,
+            /// The account's sending-authorization policies, which this surface's API
+            /// carries and so reports whichever API attached them.
+            policies: BTreeMap<String, String>,
         }
 
         impl AccountIdentityRecord for SurfaceRecord {
@@ -692,8 +749,18 @@ mod tests {
                 self.registered = true;
                 self.token = published.verification_token.clone();
             }
+            fn take_shared(&mut self, published: &SesIdentityRecord) {
+                if let Some(policies) = &published.policies {
+                    if self.policies != *policies {
+                        self.policies = policies.clone();
+                    }
+                }
+            }
             fn published(&self) -> SesIdentityRecord {
-                SesIdentityRecord::requested(&self.name, SesVerificationState::Pending, None)
+                let mut record =
+                    SesIdentityRecord::requested(&self.name, SesVerificationState::Pending, None);
+                record.policies = Some(self.policies.clone());
+                record
             }
             fn adopt(published: &SesIdentityRecord, _now: SystemTime) -> Self {
                 Self {
@@ -701,6 +768,7 @@ mod tests {
                     registered: true,
                     token: published.verification_token.clone(),
                     label: String::new(),
+                    policies: published.policies.clone().unwrap_or_default(),
                 }
             }
         }
@@ -719,6 +787,7 @@ mod tests {
                 registered: true,
                 token: None,
                 label: "ours".to_owned(),
+                policies: BTreeMap::new(),
             },
         );
         // And one written straight into the table, which the registry has never seen.
@@ -729,6 +798,7 @@ mod tests {
                 registered: false,
                 token: None,
                 label: "ours".to_owned(),
+                policies: BTreeMap::new(),
             },
         );
 
@@ -781,6 +851,36 @@ mod tests {
             table, before,
             "case a second reconciliation: expected nothing to change, got {table:?}"
         );
+
+        // (case, the policy set another API publishes for the adopted identity)
+        let rows = [
+            (
+                "a policy attached elsewhere",
+                BTreeMap::from([("Grant".to_owned(), "{\"Version\":\"2012-10-17\"}".to_owned())]),
+            ),
+            (
+                "a second policy attached elsewhere",
+                BTreeMap::from([
+                    ("Grant".to_owned(), "{\"Version\":\"2012-10-17\"}".to_owned()),
+                    ("Audit".to_owned(), "{\"Version\":\"2008-10-17\"}".to_owned()),
+                ]),
+            ),
+            ("every policy detached elsewhere", BTreeMap::new()),
+        ];
+        for (case, attached) in rows {
+            let mut elsewhere = requested("adopted.example.com", None);
+            elsewhere.policies = Some(attached.clone());
+            registry.publish(elsewhere);
+            registry.reconcile(&mut table, now);
+            let shared = table
+                .get(&identity_key("adopted.example.com"))
+                .expect("the adopted identity");
+            assert_eq!(
+                shared.policies, attached,
+                "case {case:?}: expected this surface to report the account's policy set, got {:?}",
+                shared.policies
+            );
+        }
     }
 
     #[test]

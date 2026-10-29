@@ -148,12 +148,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "This operation is for the identity owner only. If you have not
         // verified the identity, it returns an error." So an identity this
-        // account does not hold is REFUSED rather than answered as a delete that
-        // removed nothing: the same refusal `PutIdentityPolicy`,
-        // `ListIdentityPolicies` and `GetIdentityPolicies` answer, through the
-        // service's 400 channel because this operation models no error of its
-        // own. The lookup is keyed by `identity_key`, so the identity may be
-        // named either way the member documents: by its name, or by its ARN.
+        // account does not hold is REFUSED, the refusal this operation's own
+        // documentation states, through the service's 400 channel because it
+        // models no error of its own. The lookup is keyed by `identity_key`, so
+        // the identity may be named either way the member documents: by its
+        // name, or by its ARN.
         let Some(policies) = state.identity_policies_mut(&input.identity) else {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "Identity {:?} is not a verified identity of this account; verify it before \
@@ -169,7 +168,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // success that changes nothing, including a name no put could ever have
         // stored. Only the named policy is touched, so every other policy on the
         // identity, and every other identity, stays as it was.
-        policies.remove(&input.policy_name);
+        let removed = policies.remove(&input.policy_name).is_some();
+
+        // Which principals may send through an identity is a fact about the
+        // ACCOUNT's identity, not about this API, so the account's identity
+        // registry takes the set this call left behind and every other API over
+        // those identities reports it. Published after this service's own store
+        // is released, which keeps this service's lock order (its store, then the
+        // registry), and only when the delete removed something: a delete that
+        // changed nothing has nothing to publish.
+        drop(state);
+        if removed {
+            crate::state::publish_identity(&*self.engine, &input.identity);
+        }
 
         // `DeleteIdentityPolicyResponse` has no members: what the call produced
         // is the state it wrote, which the two read operations report.

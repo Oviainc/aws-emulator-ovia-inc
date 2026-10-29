@@ -1813,6 +1813,23 @@ impl DkimState {
             signing_key_length: None,
         }
     }
+
+    /// The Easy DKIM setup the ACCOUNT holds for the identity `name`, as this surface
+    /// records it.
+    ///
+    /// The setup belongs to the account's identity rather than to the API that asked
+    /// for it, so a record of this surface reports the tokens its owner was told to
+    /// publish, whether messages from it are signed and where the search for the
+    /// records stands exactly as the account's identity registry carries them. Easy
+    /// DKIM by definition: the registry carries a setup only where SES generated the
+    /// key pair and the token set.
+    pub fn shared(name: &str, shared: &::service_common::ses_identities::SesDkimSetup) -> Self {
+        let mut dkim = Self::easy_dkim(name, None);
+        dkim.signing_enabled = shared.signing_enabled;
+        dkim.status = adopted_status(shared.status);
+        dkim.tokens = shared.tokens.clone();
+        dkim
+    }
 }
 
 /// The `BehaviorOnMxFailure` a custom MAIL FROM configuration takes when the
@@ -2020,6 +2037,13 @@ pub struct EmailIdentityRecord {
     /// Tags, in the order they were supplied.
     pub tags: Vec<(String, String)>,
     /// Sending-authorization policies, keyed by policy name.
+    ///
+    /// The set is the ACCOUNT's identity's, so it is the one the account's identity
+    /// registry carries
+    /// ([`::service_common::ses_identities::SesIdentityRecord::policies`]): a policy
+    /// attached through another API over these identities is reported here, and one
+    /// attached here is reported there. Every write publishes it
+    /// ([`publish_identity`]).
     pub policies: BTreeMap<String, String>,
     /// When the identity was created.
     pub created_at: SystemTime,
@@ -2105,11 +2129,12 @@ impl EmailIdentityRecord {
     ///
     /// The account holds the identity in the verification state the registry carries,
     /// so the record is adopted in THAT state rather than started afresh in `PENDING`:
-    /// the identity was recorded through the other SES surface, and both surfaces
-    /// report one state for it. Everything this service's own API adds — tags, a
-    /// default configuration set, a custom MAIL FROM configuration, certificate
-    /// associations — starts where `CreateEmailIdentity` starts it, since none of it
-    /// has been asked for.
+    /// the identity was recorded through another SES surface, and both surfaces report
+    /// one state for it. The same goes for the facts the account holds about it rather
+    /// than this API — its Easy DKIM setup and its sending-authorization policies.
+    /// Everything this service's own API adds — tags, a default configuration set, a
+    /// custom MAIL FROM configuration, certificate associations — starts where
+    /// `CreateEmailIdentity` starts it, since none of it has been asked for.
     pub fn adopted(
         record: &::service_common::ses_identities::SesIdentityRecord,
         now: SystemTime,
@@ -2123,22 +2148,22 @@ impl EmailIdentityRecord {
         // The DKIM configuration this record is adopted with. Easy DKIM is set up for
         // the ACCOUNT's identity, so an identity the account already holds a setup for
         // — recorded through another API over its identities — is adopted with THAT
-        // setup, whose tokens are the records its owner publishes; otherwise it is the
-        // configuration `CreateEmailIdentity` gives an identity whose request carries
-        // no `DkimSigningAttributes`: Easy DKIM for a domain, nothing for an address.
-        let dkim = match (record.dkim.as_ref(), kind) {
-            (Some(shared), _) => {
-                let mut dkim = DkimState::easy_dkim(&identity_key(&record.name), None);
-                dkim.signing_enabled = shared.signing_enabled;
-                dkim.status = adopted_status(shared.status);
-                dkim.tokens = shared.tokens.clone();
-                dkim
-            }
-            (None, IdentityKind::Domain) => DkimState::easy_dkim(&identity_key(&record.name), None),
-            (None, IdentityKind::EmailAddress) => DkimState::not_started(),
+        // setup, whose tokens are the records its owner publishes. An identity the
+        // account holds NO setup for has had DKIM set up for it by nobody, which is
+        // what `NOT_STARTED` reports: a read here must not fabricate a key pair, a
+        // token set and a signing state the identity's owner never asked for and no
+        // other API over these identities reports. Only a create of this surface's own
+        // (`CreateEmailIdentity`) starts Easy DKIM for a domain.
+        let dkim = match record.dkim.as_ref() {
+            Some(shared) => DkimState::shared(&identity_key(&record.name), shared),
+            None => DkimState::not_started(),
         };
         let mut adopted = Self::new(&record.name, kind, dkim, now);
         adopted.registered = true;
+        // The policies that authorize other principals to send through the identity are
+        // the ACCOUNT's identity's, so they are adopted with it; everything else this
+        // service's own API adds starts where `CreateEmailIdentity` starts it.
+        adopted.policies = record.policies.clone().unwrap_or_default();
         adopted.verification_status = adopted_status(record.verification);
         // The registry carries the instant the account owes this identity its move,
         // and carries NONE when it owes it none at all: such an identity keeps the
@@ -4779,11 +4804,50 @@ pub fn decode_page_token(token: &str) -> Option<String> {
 pub fn service_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<ComAmazonawsSesv2SimpleemailserviceV2State>> {
-    let engine = (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()?;
-    let state = engine.state::<ComAmazonawsSesv2SimpleemailserviceV2State>();
-    let registry = engine.state::<::service_common::ses_identities::SesIdentityDirectory>();
+    let state = own_state(engine)?;
+    let registry = identity_registry(engine)?;
     reconcile_identities(&state, &registry, SystemTime::now());
     Some(state)
+}
+
+/// This service's store WITHOUT reconciling it against the account's identity registry
+/// first.
+///
+/// What a writer that has just changed a shared fact publishes FROM
+/// ([`publish_identity`]): reconciling there would read the registry's older copy of
+/// that fact back over the change before it was published, so the publication would
+/// carry what the registry already held instead of what the call wrote. Every other
+/// caller wants [`service_state`].
+fn own_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<ComAmazonawsSesv2SimpleemailserviceV2State>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<ComAmazonawsSesv2SimpleemailserviceV2State>)
+}
+
+/// Publish the identity `name` as this service now holds it — its verification, its
+/// Easy DKIM setup and its sending-authorization policies — to the account's identity
+/// registry, so every other API over the account's identities reports what this one
+/// last wrote.
+///
+/// What an operation that CHANGES a shared fact about an identity calls once it has
+/// written it. Changes nothing when the account holds no such identity, and writes
+/// nothing but the registry's record of it.
+pub fn publish_identity<Eng: Send + Sync + 'static>(engine: &Eng, name: &str) {
+    let Some(state) = own_state(engine) else {
+        return;
+    };
+    let Some(registry) = identity_registry(engine) else {
+        return;
+    };
+    // The lock order of this service: its own store, then the registry.
+    let state = state.lock();
+    let mut registry = registry.lock();
+    let Some(held) = state.identities.get(&identity_key(name)) else {
+        return;
+    };
+    registry.publish(registry_record(held));
 }
 
 /// The account's identity registry in the shared engine, which this service and the
@@ -4848,6 +4912,32 @@ impl ::service_common::ses_identities::AccountIdentityRecord for EmailIdentityRe
         self.registered = true;
     }
 
+    /// The sending-authorization policies the ACCOUNT's identity holds, which this API
+    /// reports whichever API attached them, and the Easy DKIM setup it holds, whose
+    /// tokens are the records its owner publishes.
+    fn take_shared(
+        &mut self,
+        published: &::service_common::ses_identities::SesIdentityRecord,
+    ) {
+        if let Some(policies) = &published.policies {
+            if self.policies != *policies {
+                self.policies = policies.clone();
+            }
+        }
+        // An Easy DKIM setup the account gained through another API over these
+        // identities AFTER this record was written is the setup whose tokens the
+        // identity's owner publishes, so this record reports it instead of reporting
+        // none. A record already carrying a token set of its own keeps it: the first
+        // setup stands, because those records may already be in DNS.
+        let gained = published
+            .dkim
+            .as_ref()
+            .filter(|_| self.dkim.tokens.is_empty());
+        if let Some(shared) = gained {
+            self.dkim = DkimState::shared(&identity_key(&self.name), shared);
+        }
+    }
+
     fn published(&self) -> ::service_common::ses_identities::SesIdentityRecord {
         registry_record(self)
     }
@@ -4901,6 +4991,11 @@ pub fn registry_record(
                 tokens: record.dkim.tokens.clone(),
             },
         ),
+        // The policies that authorize other principals to send through the identity
+        // belong to the account's identity too, and this API attaches and reports them,
+        // so the set it holds is published for every surface over these identities to
+        // report.
+        policies: Some(record.policies.clone()),
     }
 }
 

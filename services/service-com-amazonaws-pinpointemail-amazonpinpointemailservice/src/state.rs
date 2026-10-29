@@ -47,6 +47,8 @@ pub const IDENTITY_TYPE_DOMAIN: &str = "DOMAIN";
 pub const DKIM_STATUS_PENDING: &str = "PENDING";
 /// `DkimStatus` for a domain whose CNAME records have been detected and are correct.
 pub const DKIM_STATUS_SUCCESS: &str = "SUCCESS";
+/// `DkimStatus` for an identity nobody has started the DKIM process for.
+pub const DKIM_STATUS_NOT_STARTED: &str = "NOT_STARTED";
 
 /// How long after `CreateEmailIdentity` an identity's verification is due.
 ///
@@ -190,12 +192,27 @@ impl EmailIdentityRecord {
         // Easy DKIM is set up for the ACCOUNT's identity: when the account already
         // holds a setup for this one — recorded through another of its email APIs —
         // the record is adopted with THOSE tokens, the records the owner publishes,
-        // rather than with a second set of this API's own making.
-        if let (Some(shared), Some(dkim)) = (record.dkim.as_ref(), adopted.dkim.as_mut()) {
-            dkim.signing_enabled = shared.signing_enabled;
-            dkim.status = Some(service_dkim_status(shared.status).to_string());
-            dkim.tokens = Some(shared.tokens.clone());
-        }
+        // rather than with a second set of this API's own making. An identity the
+        // account holds NO setup for has had DKIM started for it by nobody, which is
+        // what `NOT_STARTED` reports: this record must not fabricate a key pair, a token
+        // set and a signing state its owner never asked for and no other API over these
+        // identities reports.
+        let has_dkim = adopted.dkim.is_some();
+        adopted.dkim = match record.dkim.as_ref() {
+            Some(shared) => Some(DkimAttributes {
+                signing_enabled: shared.signing_enabled,
+                status: Some(service_dkim_status(shared.status).to_string()),
+                tokens: Some(shared.tokens.clone()),
+            }),
+            None if has_dkim => Some(DkimAttributes {
+                signing_enabled: false,
+                status: Some(DKIM_STATUS_NOT_STARTED.to_string()),
+                tokens: None,
+            }),
+            // An address identity has no DKIM setup of its own on this surface either
+            // way: DKIM signing is set up for a domain.
+            None => None,
+        };
         match record.verification {
             // Verified: the same three facts this service writes itself when a
             // verification falls due.
@@ -203,9 +220,7 @@ impl EmailIdentityRecord {
                 adopted.verification_due_at = None;
                 adopted.verified_for_sending = true;
                 adopted.sending_enabled = true;
-                if let Some(dkim) = &mut adopted.dkim {
-                    dkim.status = Some(DKIM_STATUS_SUCCESS.to_string());
-                }
+                adopted.settle_dkim_with_verification();
             }
             // Still being verified: the move is owed at the instant the registry
             // carries, so this service reports it exactly when the others do.
@@ -234,8 +249,19 @@ impl EmailIdentityRecord {
         self.verification_due_at = None;
         self.verified_for_sending = true;
         self.sending_enabled = true;
+        self.settle_dkim_with_verification();
+    }
+
+    /// An identity whose verification succeeded is one whose published records the
+    /// service has read, so a DKIM setup still WAITING on them is no longer waiting.
+    ///
+    /// A setup nobody started stays not started: a verification that completed through
+    /// some other route detects no records that were never published.
+    fn settle_dkim_with_verification(&mut self) {
         if let Some(dkim) = &mut self.dkim {
-            dkim.status = Some(DKIM_STATUS_SUCCESS.to_string());
+            if dkim.status.as_deref() == Some(DKIM_STATUS_PENDING) {
+                dkim.status = Some(DKIM_STATUS_SUCCESS.to_string());
+            }
         }
     }
 }
@@ -442,6 +468,32 @@ impl ::service_common::ses_identities::AccountIdentityRecord for EmailIdentityRe
         self.registered = true;
     }
 
+    /// This API has no sending-authorization policy operations at all, so it reports
+    /// none of the account's and takes none: a surface that cannot report a shared fact
+    /// must not disturb it either. The Easy DKIM setup it DOES report, so a setup the
+    /// account gained through another API over these identities after this record was
+    /// written is taken here — its tokens are the records the identity's owner
+    /// publishes. A record already carrying a token set keeps it: the first setup
+    /// stands, because those records may already be in DNS.
+    fn take_shared(
+        &mut self,
+        published: &::service_common::ses_identities::SesIdentityRecord,
+    ) {
+        let held_tokens = self
+            .dkim
+            .as_ref()
+            .and_then(|dkim| dkim.tokens.as_ref())
+            .is_some_and(|tokens| !tokens.is_empty());
+        let gained = published.dkim.as_ref().filter(|_| !held_tokens);
+        if let Some(shared) = gained {
+            self.dkim = Some(DkimAttributes {
+                signing_enabled: shared.signing_enabled,
+                status: Some(service_dkim_status(shared.status).to_string()),
+                tokens: Some(shared.tokens.clone()),
+            });
+        }
+    }
+
     fn published(&self) -> ::service_common::ses_identities::SesIdentityRecord {
         registry_record(self)
     }
@@ -485,20 +537,35 @@ pub fn registry_record(
         // API, so the setup generated here — the tokens the owner publishes as CNAME
         // records, where the search for them stands, and whether messages from the
         // identity are signed — is published for every API over these identities to
-        // report.
-        dkim: record.dkim.as_ref().map(|dkim| SesDkimSetup {
-            signing_enabled: dkim.signing_enabled,
-            status: registry_dkim_state(dkim.status.as_deref()),
-            tokens: dkim.tokens.clone().unwrap_or_default(),
-        }),
+        // report. An identity this API generated no token set for carries no setup to
+        // share: one whose DKIM process nobody started.
+        dkim: record
+            .dkim
+            .as_ref()
+            .filter(|dkim| {
+                dkim.tokens
+                    .as_ref()
+                    .is_some_and(|tokens| !tokens.is_empty())
+            })
+            .map(|dkim| SesDkimSetup {
+                signing_enabled: dkim.signing_enabled,
+                status: registry_dkim_state(dkim.status.as_deref()),
+                tokens: dkim.tokens.clone().unwrap_or_default(),
+            }),
+        // This API has no sending-authorization policy operations, so it publishes no
+        // set of them: the policies another API over these identities attached stay as
+        // that API left them rather than being cleared by a surface that cannot see
+        // them.
+        policies: None,
     }
 }
 
 /// The registry's spelling of a stored `DkimStatus`.
 ///
-/// This surface writes two of the model's values (`DKIM_STATUS_PENDING` and
-/// `DKIM_STATUS_SUCCESS`): a setup is waiting for the records it told the caller to
-/// publish until they have been found.
+/// This surface writes three of the model's values (`DKIM_STATUS_PENDING`,
+/// `DKIM_STATUS_SUCCESS` and `DKIM_STATUS_NOT_STARTED`): a setup is waiting for the
+/// records it told the caller to publish until they have been found, and an identity
+/// nobody started the process for has none to find.
 fn registry_dkim_state(
     status: Option<&str>,
 ) -> ::service_common::ses_identities::SesVerificationState {
@@ -506,6 +573,7 @@ fn registry_dkim_state(
 
     match status {
         Some(DKIM_STATUS_SUCCESS) => SesVerificationState::Success,
+        Some(DKIM_STATUS_NOT_STARTED) => SesVerificationState::NotStarted,
         _ => SesVerificationState::Pending,
     }
 }
@@ -522,6 +590,6 @@ fn service_dkim_status(
         SesVerificationState::Success => DKIM_STATUS_SUCCESS,
         SesVerificationState::Failed => "FAILED",
         SesVerificationState::TemporaryFailure => "TEMPORARY_FAILURE",
-        SesVerificationState::NotStarted => "NOT_STARTED",
+        SesVerificationState::NotStarted => DKIM_STATUS_NOT_STARTED,
     }
 }

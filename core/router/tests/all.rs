@@ -150,6 +150,11 @@ mod ses_identities_shared_across_v1_and_v2;
 // suites add their line to.
 #[path = "all/ses_easy_dkim_shared_across_surfaces.rs"]
 mod ses_easy_dkim_shared_across_surfaces;
+// Declared beside its sibling ses suites, at the head, for the reason the entries above
+// record: the appended tail and the sorted `s…` span are both regions concurrently landing
+// suites add their line to.
+#[path = "all/ses_identity_policies_shared_across_surfaces.rs"]
+mod ses_identity_policies_shared_across_surfaces;
 // Declared beside the suites above, at the head, for the same reason: the appended tail and
 // the sorted `c…` span (where every cloudformation suite lands) are both regions concurrent
 // suites add their line to.

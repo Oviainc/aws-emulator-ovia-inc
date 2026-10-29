@@ -146,29 +146,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = state.lock();
 
-        // "This operation is for the identity owner only. If you have not
-        // verified the identity, it returns an error." So an identity this
-        // account does not hold is REFUSED rather than reported as an identity
-        // carrying no policies — the two are different answers. The operation
-        // models no error of its own, so the refusal goes through the service's
-        // 400 channel.
+        // The policies the account's identity carries, whichever API attached
+        // them, and NONE for a name this account holds no identity under: the
+        // recorded service answers an identity it no longer holds with an EMPTY
+        // `PolicyNames` rather than an error — this operation models no error at
+        // all, and its one output member is a required list. Its siblings
+        // `GetIdentityPolicies` and `DeleteIdentityPolicy` keep the refusal their
+        // own documentation states, which nothing records them serving past.
         //
         // The lookup is keyed by `identity_key`, so the identity may be named
         // either way the member documents: by its name, or by its ARN.
-        let Some(policies) = state.identity_policies(&input.identity) else {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Identity {:?} is not a verified identity of this account; verify it before \
-                 listing its sending authorization policies",
-                input.identity
-            )));
-        };
+        let policies = state.identity_policies(&input.identity);
 
         // "This operation returns only a list" of the names: the policy bodies
         // are `GetIdentityPolicies`'s answer, not this one's. The store is a
         // `BTreeMap`, so the names come out in one stable (lexicographic) order
         // for every caller.
         Ok(ListIdentityPoliciesOutput {
-            policy_names: policies.keys().cloned().collect(),
+            policy_names: policies
+                .map(|policies| policies.keys().cloned().collect())
+                .unwrap_or_default(),
         })
     }
 }
