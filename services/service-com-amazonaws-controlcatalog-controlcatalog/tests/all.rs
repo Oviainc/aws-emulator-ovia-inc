@@ -37,6 +37,8 @@ mod published_controls;
 mod published_ontology;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/related_control_relations.rs"]
+mod related_control_relations;
 #[path = "all/single_resource_filter.rs"]
 mod single_resource_filter;
 #[path = "all/single_resource_filter_paging.rs"]

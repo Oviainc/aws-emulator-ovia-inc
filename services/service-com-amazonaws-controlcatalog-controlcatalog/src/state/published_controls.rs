@@ -994,7 +994,11 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
 /// ALTERNATIVE where either control satisfies the common control the pair implements —
 /// the typical case for the same check published on two surfaces — and COMPLEMENTARY
 /// where both can be enabled and reinforce one another, as a preventive control does
-/// with the detective control that reports what slipped past it. This catalog publishes
+/// with the detective control that reports what slipped past it. So a pair the catalog
+/// publishes on ONE implementation (both rows carrying the same `implementation_type`
+/// and `implementation_identifier`) is always ALTERNATIVE, never COMPLEMENTARY: there
+/// is a single check behind the two controls, so enabling the second one adds no
+/// coverage the first does not already give. This catalog publishes
 /// no pair that conflicts, so it records no MUTUALLY_EXCLUSIVE relation. The seeder
 /// records each row in BOTH directions, because a query filters on one control at a
 /// time and each side has to report the relation when it is the one queried.
@@ -1014,10 +1018,13 @@ pub(super) const RELATED_CONTROLS: &[(&str, &str, &str)] = &[
         "securityhub-cloudtrail-1",
         "ALTERNATIVE",
     ),
+    // One Config rule (`CLOUD_TRAIL_ENABLED`) backs both of these published controls,
+    // and both implement `enable-centralized-logging`: the same check on two surfaces,
+    // so either one satisfies the objective on its own.
     (
         "cloud-trail-enabled",
         "detect-cloud-trail-enabled-on-member-accounts",
-        "COMPLEMENTARY",
+        "ALTERNATIVE",
     ),
     (
         "multi-region-cloud-trail-enabled",

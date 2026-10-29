@@ -39,7 +39,10 @@ pub(crate) const MAPPINGS_KEY: &str = "ControlMappings";
 pub(crate) const MAPPING_TYPES: [&str; 3] = ["FRAMEWORK", "COMMON_CONTROL", "RELATED_CONTROL"];
 
 /// Every value the modeled `ControlRelationType` enum declares.
-const RELATION_TYPES: [&str; 3] = ["COMPLEMENTARY", "ALTERNATIVE", "MUTUALLY_EXCLUSIVE"];
+///
+/// `pub(crate)` so the sibling suites in this test target (see `tests/all.rs`) read the
+/// one list rather than keeping a second copy of it.
+pub(crate) const RELATION_TYPES: [&str; 3] = ["COMPLEMENTARY", "ALTERNATIVE", "MUTUALLY_EXCLUSIVE"];
 
 /// Project a stored mapping record into the JSON the wire carries for the modeled
 /// `ControlMapping`: the `Mapping` union is serialized as the single member naming the
