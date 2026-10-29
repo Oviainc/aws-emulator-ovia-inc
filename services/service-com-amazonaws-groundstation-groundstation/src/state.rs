@@ -2347,7 +2347,7 @@ pub fn contact_mutation_not_found_message(contact_id: &str) -> String {
 /// this is the wording that goes with them, and the ARNs in it are the ones the store
 /// holds rather than anything echoed from the request.
 pub fn config_in_use_message(mission_profile_arns: &[String]) -> String {
-    config_in_use_text("Mission Profiles", mission_profile_arns)
+    resource_in_use_text("Config", "Mission Profiles", mission_profile_arns)
 }
 
 /// What `DeleteConfig` answers while another config this account still holds references
@@ -2359,16 +2359,23 @@ pub fn config_in_use_message(mission_profile_arns: &[String]) -> String {
 /// mission-profile refusal above; only the kind of resource that holds the reference
 /// differs, so the two are composed from one template rather than written twice.
 pub fn config_in_use_by_configs_message(config_arns: &[String]) -> String {
-    config_in_use_text("Configs", config_arns)
+    resource_in_use_text("Config", "Configs", config_arns)
 }
 
-/// The in-use refusal `DeleteConfig` answers, for holders of one kind: the plural name of
-/// the resource kind that holds the inbound references, then the ARNs the store holds.
-fn config_in_use_text(holder_kind_plural: &str, holder_arns: &[String]) -> String {
+/// The in-use refusal a delete of this service answers: the resource that cannot be
+/// deleted, the plural name of the kind of thing that holds it, and the holders the store
+/// holds.
+///
+/// ONE template for every such refusal ([`config_in_use_message`],
+/// [`config_in_use_by_configs_message`], [`mission_profile_in_use_message`],
+/// [`dataflow_endpoint_group_in_use_message`] and [`ephemeris_in_use_message`]), so the
+/// sentence cannot drift between the deletes that answer it; only what is held and what
+/// holds it differs.
+fn resource_in_use_text(resource: &str, holder_kind_plural: &str, holders: &[String]) -> String {
     format!(
-        "Config cannot be deleted; it is currently being used by the following \
+        "{resource} cannot be deleted; it is currently being used by the following \
          {holder_kind_plural}: {}",
-        holder_arns.join(", ")
+        holders.join(", ")
     )
 }
 
@@ -2384,11 +2391,22 @@ fn config_in_use_text(holder_kind_plural: &str, holder_arns: &[String]) -> Strin
 /// request — the same composition as [`config_in_use_message`] and
 /// [`ephemeris_in_use_message`].
 pub fn mission_profile_in_use_message(contact_ids: &[String]) -> String {
-    format!(
-        "Mission Profile cannot be deleted; it is currently being used by the following \
-         contacts: {}",
-        contact_ids.join(", ")
-    )
+    resource_in_use_text("Mission Profile", "contacts", contact_ids)
+}
+
+/// What `DeleteDataflowEndpointGroup` answers while a contact still to be flown is wired to
+/// an endpoint the group holds: the refusal names the contacts that hold it, which is what
+/// tells a caller what has to be flown or released first.
+///
+/// The status (431) and the error code (`InvalidParameterException`) are the contract — this
+/// operation models no `ResourceInUseException` (`smithy_query(query="operation",
+/// operation="DeleteDataflowEndpointGroup")`), so the in-use refusal is the bad-parameter
+/// one its sibling deletes already answer — and this is the wording that goes with it, from
+/// the one template every in-use refusal of this service is composed from
+/// ([`resource_in_use_text`]). The ids in it are the ones the store holds rather than
+/// anything echoed from the request.
+pub fn dataflow_endpoint_group_in_use_message(contact_ids: &[String]) -> String {
+    resource_in_use_text("Dataflow Endpoint Group", "contacts", contact_ids)
 }
 
 /// Why an ARN-valued reference that admits exactly ONE config capability type cannot be
@@ -3298,11 +3316,7 @@ pub const EPHEMERIS_NOT_FOUND: &str = "Ephemeris not found";
 /// than anything echoed from the request — the same composition this service already uses
 /// for a config a mission profile still references ([`config_in_use_message`]).
 pub fn ephemeris_in_use_message(contact_ids: &[String]) -> String {
-    format!(
-        "Ephemeris cannot be deleted; it is currently being used by the following \
-         contacts: {}",
-        contact_ids.join(", ")
-    )
+    resource_in_use_text("Ephemeris", "contacts", contact_ids)
 }
 
 /// Why an ephemeris whose supplied data describes a backwards-running validity range did
@@ -4900,6 +4914,85 @@ impl ComAmazonawsGroundstationGroundstationState {
                 .get_mut(&ephemeris_id)
                 .map(|ephemeris| &mut ephemeris.tags),
         }
+    }
+
+    /// The names of the dataflow endpoints the pass of a contact reserved against the
+    /// mission profile `mission_profile_arn` names is wired to, in a stable order and
+    /// without repeats; empty when that profile wires its dataflows to no endpoint, and
+    /// when the ARN names no profile this account holds.
+    ///
+    /// A dataflow edge ends at the config its `ConfigArn` names, and a
+    /// `dataflowEndpointConfig` selects an endpoint of this account by name
+    /// (`dataflowEndpointName`), so those names are what the pass is wired to. This is the
+    /// resolution a read of the contact already takes when it reports the endpoint behind
+    /// each edge end ([`dataflow_end`]), read from the profile rather than copied into the
+    /// contact, so the in-use question and the read cannot disagree about what a pass is
+    /// wired to.
+    pub fn wired_dataflow_endpoint_names(&self, mission_profile_arn: &str) -> Vec<&str> {
+        let Some(profile) = self.mission_profile_by_arn(mission_profile_arn) else {
+            return Vec::new();
+        };
+        let mut names: Vec<&str> = profile
+            .dataflow_edges
+            .iter()
+            .flatten()
+            .filter_map(|arn| self.config_by_arn(arn))
+            .filter_map(|config| match &config.config_data {
+                ConfigTypeData::dataflowEndpointConfig(endpoint_config) => {
+                    Some(endpoint_config.dataflow_endpoint_name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// The ids of the contacts still to be flown whose dataflows are wired to an endpoint
+    /// the dataflow endpoint group `dataflow_endpoint_group_id` holds, in a stable order;
+    /// empty when nothing holds it, and when no group has that id.
+    ///
+    /// A contact is wired to the endpoints its profile's dataflow edges select by name
+    /// ([`Self::wired_dataflow_endpoint_names`]), and an endpoint carries that name whichever
+    /// member of its group describes it ([`endpoint_name`]), so a contact holds the group
+    /// holding any endpoint its wiring names. It holds it for as long as it is NOT terminal
+    /// ([`Contact::is_non_terminal`]) — once its pass is over or its reservation released,
+    /// nothing of it is still to be flown, so what it was wired to is no longer a live
+    /// dependency. Sorted, so a refusal listing them reads the same on every call whatever
+    /// order the map iterates in.
+    ///
+    /// An endpoint name is unique only WITHIN a group ([`claim_endpoint_name`]), so two
+    /// groups may each hold one by the same name; a read of a contact resolves such a name
+    /// to one of them ([`Self::dataflow_endpoint`]) while the account holds both, so a
+    /// contact wired to that name holds EITHER group — a delete does not decide for the
+    /// caller which of the two their pass was meant to run through.
+    pub fn contacts_using_dataflow_endpoint_group(
+        &self,
+        dataflow_endpoint_group_id: &str,
+    ) -> Vec<String> {
+        let Some(group) = self.dataflow_endpoint_groups.get(dataflow_endpoint_group_id) else {
+            return Vec::new();
+        };
+        let held: Vec<&str> = group
+            .endpoint_details
+            .iter()
+            .filter_map(endpoint_name)
+            .collect();
+        let mut holding: Vec<String> = self
+            .contacts
+            .values()
+            .filter(|contact| {
+                contact.is_non_terminal()
+                    && self
+                        .wired_dataflow_endpoint_names(&contact.mission_profile_arn)
+                        .iter()
+                        .any(|wired| held.contains(wired))
+            })
+            .map(|contact| contact.contact_id.clone())
+            .collect();
+        holding.sort();
+        holding
     }
 
     /// Remove the dataflow endpoint group `dataflow_endpoint_group_id` addresses, along
