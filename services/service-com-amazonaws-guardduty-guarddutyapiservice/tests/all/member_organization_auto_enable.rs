@@ -41,7 +41,7 @@ use crate::organization_configuration::{describe_in, update_ok_in};
 ///
 /// Written out here rather than read from the crate, so the test PINS the catalog:
 /// a feature the model gains has to be added here too.
-const ORG_FEATURES: [&str; 8] = [
+pub(crate) const ORG_FEATURES: [&str; 8] = [
     "S3_DATA_EVENTS",
     "EKS_AUDIT_LOGS",
     "EBS_MALWARE_PROTECTION",
@@ -57,19 +57,20 @@ const ORG_FEATURES: [&str; 8] = [
 /// an account joining the organization and `ALL` for all of them, while `NONE`
 /// auto-enables it for no account at all
 /// (`smithy_query(query="doc",shape="OrganizationFeatureConfiguration",member="AutoEnable")`).
-const ORG_FEATURE_STATUSES: [(&str, bool); 3] = [("NEW", true), ("NONE", false), ("ALL", true)];
+pub(crate) const ORG_FEATURE_STATUSES: [(&str, bool); 3] =
+    [("NEW", true), ("NONE", false), ("ALL", true)];
 
 /// The features a member account starts DISABLED, before any organization setting or
 /// `UpdateMemberDetectors` moves them; every other reported feature starts
 /// `ENABLED`. These are the rows that DISCRIMINATE: an auto-enablement that lands
 /// changes what the member reports only for a feature whose default is off.
-const OPT_IN_FEATURES: [&str; 2] = ["RUNTIME_MONITORING", "RDS_LOGIN_EVENTS"];
+pub(crate) const OPT_IN_FEATURES: [&str; 2] = ["RUNTIME_MONITORING", "RDS_LOGIN_EVENTS"];
 
 /// Every `OrgFeatureAdditionalConfiguration` member
 /// (`smithy_query(shape="OrgFeatureAdditionalConfiguration")`), each paired with a
 /// feature to carry it. The pairs span the whole catalog, including `RDS_DATA_RISK`,
 /// which the cited issue does not name.
-const ADDITIONAL_CONFIGURATIONS: [(&str, &str); 4] = [
+pub(crate) const ADDITIONAL_CONFIGURATIONS: [(&str, &str); 4] = [
     ("RUNTIME_MONITORING", "EKS_ADDON_MANAGEMENT"),
     ("RUNTIME_MONITORING", "ECS_FARGATE_AGENT_MANAGEMENT"),
     ("EKS_RUNTIME_MONITORING", "EC2_AGENT_MANAGEMENT"),
@@ -77,8 +78,8 @@ const ADDITIONAL_CONFIGURATIONS: [(&str, &str); 4] = [
 ];
 
 /// `FeatureStatus` on the member side (`smithy_query(shape="FeatureStatus")`).
-const ENABLED: &str = "ENABLED";
-const DISABLED: &str = "DISABLED";
+pub(crate) const ENABLED: &str = "ENABLED";
+pub(crate) const DISABLED: &str = "DISABLED";
 
 /// The `RelationshipStatus` a recorded, un-invited member carries, read from the
 /// service so the test cannot drift from it.
@@ -87,19 +88,19 @@ const CREATED: &str =
 
 /// Email forms the rows cycle, so a case varies along the account details as well as
 /// along the configuration.
-const EMAIL_FORMS: [&str; 3] = [
+pub(crate) const EMAIL_FORMS: [&str; 3] = [
     "member@example.com",
     "first.last@sub.example-corp.com",
     "m+tag@example.io",
 ];
 
 /// A 12-digit account id of `case`'s own, clear of the administrator's account id.
-fn account_id(case: usize) -> String {
+pub(crate) fn account_id(case: usize) -> String {
     format!("8{case:011}")
 }
 
 /// What a member's feature reports before any organization setting reaches it.
-fn default_status(feature: &str) -> &'static str {
+pub(crate) fn default_status(feature: &str) -> &'static str {
     if OPT_IN_FEATURES.contains(&feature) {
         DISABLED
     } else {
@@ -111,7 +112,7 @@ fn default_status(feature: &str) -> &'static str {
 /// row, with the auto-enablement of GuardDuty itself the operation requires beside
 /// it: "you must provide a value for either `autoEnableOrganizationMembers` or
 /// `autoEnable`" (`smithy_query(query="doc",shape="UpdateOrganizationConfiguration")`).
-fn organization_body(rows: &[(&str, &str)]) -> Value {
+pub(crate) fn organization_body(rows: &[(&str, &str)]) -> Value {
     let features: Vec<Value> = rows
         .iter()
         .map(|(name, auto_enable)| json!({"name": name, "autoEnable": auto_enable}))
@@ -120,7 +121,7 @@ fn organization_body(rows: &[(&str, &str)]) -> Value {
 }
 
 /// The same, for one feature carrying one additional configuration.
-fn organization_body_with_additional(
+pub(crate) fn organization_body_with_additional(
     feature: &str,
     auto_enable: &str,
     additional: &str,
@@ -139,7 +140,13 @@ fn organization_body_with_additional(
 }
 
 /// `CreateMembers` for one account, asserting it processed the account.
-async fn record_member(router: &Router, detector_id: &str, account_id: &str, email: &str, case: &str) {
+pub(crate) async fn record_member(
+    router: &Router,
+    detector_id: &str,
+    account_id: &str,
+    email: &str,
+    case: &str,
+) {
     let (status, body) = create_members(router, detector_id, &[(account_id, email)]).await;
     assert_eq!(
         status, 200,
@@ -154,7 +161,7 @@ async fn record_member(router: &Router, detector_id: &str, account_id: &str, ema
 }
 
 /// The configuration `GetMemberDetectors` reports for `account_id`.
-async fn member_configuration(
+pub(crate) async fn member_configuration(
     router: &Router,
     detector_id: &str,
     account_id: &str,
@@ -176,7 +183,7 @@ async fn member_configuration(
 }
 
 /// One reported `features` entry of a member configuration.
-fn feature_entry<'a>(configuration: &'a Value, name: &str, case: &str) -> &'a Value {
+pub(crate) fn feature_entry<'a>(configuration: &'a Value, name: &str, case: &str) -> &'a Value {
     configuration["features"]
         .as_array()
         .and_then(|features| {
@@ -188,7 +195,7 @@ fn feature_entry<'a>(configuration: &'a Value, name: &str, case: &str) -> &'a Va
 }
 
 /// The status a member's feature reports.
-fn feature_status(configuration: &Value, name: &str, case: &str) -> String {
+pub(crate) fn feature_status(configuration: &Value, name: &str, case: &str) -> String {
     let entry = feature_entry(configuration, name, case);
     entry["status"]
         .as_str()
@@ -198,7 +205,7 @@ fn feature_status(configuration: &Value, name: &str, case: &str) -> String {
 
 /// The instant a member's feature reports (`UpdatedAt` is a `Timestamp`, so the wire
 /// carries epoch seconds).
-fn feature_instant(configuration: &Value, name: &str, case: &str) -> f64 {
+pub(crate) fn feature_instant(configuration: &Value, name: &str, case: &str) -> f64 {
     let entry = feature_entry(configuration, name, case);
     entry["updatedAt"]
         .as_f64()

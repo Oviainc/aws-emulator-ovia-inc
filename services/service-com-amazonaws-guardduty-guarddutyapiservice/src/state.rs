@@ -6109,7 +6109,12 @@ pub fn apply_feature_configurations(
 /// the member side of [`apply_feature_configurations`]. A feature the list does
 /// not name keeps the status it already had, so one request configures only the
 /// switches it names.
-pub fn apply_member_feature_configurations(
+///
+/// Private because a member's switches are the ORGANIZATION's where its
+/// configuration auto-enables them: [`apply_member_configuration`] is the one
+/// entry point a handler writes them through, so no per-account write can bypass
+/// that rule.
+fn apply_member_feature_configurations(
     member: &mut MemberRecord,
     features: Option<
         &Vec<crate::ops::types::update_member_detectors_types::MemberFeaturesConfiguration>,
@@ -6180,6 +6185,122 @@ pub fn apply_organization_auto_enable(
             );
         }
     }
+}
+
+/// Write one member account's REQUESTED configuration onto its stored record under
+/// the organization's auto-enable settings.
+///
+/// A switch the organization auto-enables — a feature, or one of a feature's
+/// additional configurations, whose `OrgFeatureStatus` is anything other than
+/// [`AUTO_ENABLE_NONE`] ([`org_status_flag`]) — belongs to the ORGANIZATION: the
+/// request leaves it exactly where it stood, its instant included, and
+/// [`apply_organization_auto_enable`] then puts the auto-enablement over it, so it
+/// ends ENABLED whatever the request asked for. A switch auto-enabled for no account
+/// is one "the administrator must manage ... for each account individually"
+/// (`smithy_query(query="doc",shape="OrganizationFeatureConfiguration",member="AutoEnable")`,
+/// and the same sentence on `OrganizationAdditionalConfiguration`), so it takes
+/// exactly what the request said.
+///
+/// So a member's stored configuration agrees with what
+/// `DescribeOrganizationConfiguration` reports for the same organization HOWEVER it
+/// was written — the invariant `CreateMembers` states and maintains for the accounts
+/// it records, here for the per-account write of the same stored switches.
+pub fn apply_member_configuration(
+    member: &mut MemberRecord,
+    data_sources: Option<&crate::ops::types::DataSourceConfigurations>,
+    features: Option<
+        &Vec<crate::ops::types::update_member_detectors_types::MemberFeaturesConfiguration>,
+    >,
+    organization: &OrganizationConfiguration,
+    now: i64,
+) {
+    // The configuration as it stood BEFORE the request, so the switches the
+    // organization owns can be put back exactly once the request has passed over
+    // them.
+    let stored = member.features.clone();
+    // The deprecated `DataSources` view is applied first so an explicit `Features`
+    // entry for the same switch wins — the order `CreateDetector` and
+    // `UpdateDetector` apply the two views in.
+    apply_member_data_sources(member, data_sources, now);
+    apply_member_feature_configurations(member, features, now);
+    restore_organization_managed_switches(&mut member.features, &stored, organization);
+    apply_organization_auto_enable(member, organization, now);
+}
+
+/// Put every switch the organization manages back the way `stored` held it, after a
+/// per-account write has passed over the whole configuration.
+///
+/// Restoring rather than filtering the request is what keeps a switch's instant
+/// saying when it last CHANGED ([`set_feature_in`]): a per-account write of a switch
+/// the organization owns moves nothing at all.
+fn restore_organization_managed_switches(
+    features: &mut [FeatureRecord],
+    stored: &[FeatureRecord],
+    organization: &OrganizationConfiguration,
+) {
+    for name in MEMBER_FEATURES {
+        if !org_status_flag(organization.feature_auto_enable(name)) {
+            continue;
+        }
+        let (Some(record), Some(was)) = (
+            features.iter_mut().find(|record| record.name == *name),
+            stored.iter().find(|record| record.name == *name),
+        ) else {
+            continue;
+        };
+        record.status = was.status.clone();
+        record.updated_at_millis = was.updated_at_millis;
+        record.free_trial_started_at_millis = was.free_trial_started_at_millis;
+    }
+    // Each additional configuration is a switch of its own, with its own
+    // auto-enablement, so the organization owns them one at a time: one it
+    // auto-enables goes back even though the feature that carries it is managed per
+    // account, and one auto-enabled for nobody keeps what the request wrote even
+    // though its feature is not.
+    for feature in &organization.features {
+        for additional in &feature.additional_configuration {
+            if !org_status_flag(&additional.auto_enable) {
+                continue;
+            }
+            let (Some(record), Some(was)) = (
+                features.iter_mut().find(|record| record.name == feature.name),
+                stored
+                    .iter()
+                    .find(|record| record.name == feature.name)
+                    .and_then(|record| {
+                        record
+                            .additional_configuration
+                            .iter()
+                            .find(|configured| configured.name == additional.name)
+                    }),
+            ) else {
+                // Nothing to put back: the member did not carry this configuration
+                // before the write, so the auto-enablement is what records it, at
+                // the instant it does.
+                continue;
+            };
+            restore_additional_configuration_in(record, was);
+        }
+    }
+}
+
+/// Put one additional configuration back into a stored feature record, re-inserting
+/// it at its place in the stored order — by NAME, the order
+/// [`set_additional_configuration_status_in`] keeps the set in — when the write that
+/// passed over the feature dropped it.
+fn restore_additional_configuration_in(record: &mut FeatureRecord, was: &AdditionalConfigRecord) {
+    if let Some(existing) = record
+        .additional_configuration
+        .iter_mut()
+        .find(|configured| configured.name == was.name)
+    {
+        *existing = was.clone();
+        return;
+    }
+    let at = record
+        .additional_configuration
+        .partition_point(|configured| configured.name < was.name);
+    record.additional_configuration.insert(at, was.clone());
 }
 
 /// Set one feature's status in a stored feature list, recording `now` as its
@@ -6378,8 +6499,9 @@ pub fn apply_data_sources(
 }
 
 /// Write the deprecated `DataSources` view onto `member`'s stored configuration,
-/// the member side of [`apply_data_sources`].
-pub fn apply_member_data_sources(
+/// the member side of [`apply_data_sources`]. Private for the reason
+/// [`apply_member_feature_configurations`] is.
+fn apply_member_data_sources(
     member: &mut MemberRecord,
     data_sources: Option<&crate::ops::types::DataSourceConfigurations>,
     now: i64,

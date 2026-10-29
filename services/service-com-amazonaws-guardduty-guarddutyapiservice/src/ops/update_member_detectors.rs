@@ -8,6 +8,13 @@
 //! REPORTED in `UnprocessedAccounts`; a request the service cannot understand is refused
 //! with `BadRequestException`.
 //!
+//! A switch this administrator's organization configuration auto-enables is not one the
+//! administrator manages per account, so this per-account write leaves it where it is and
+//! the organization's auto-enablement stands; every other switch takes what the request
+//! said. So a member's `GetMemberDetectors` configuration agrees with what
+//! `DescribeOrganizationConfiguration` reports for the same organization after this write
+//! too, the invariant `CreateMembers` states for the accounts it records.
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -217,6 +224,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_owned(&input.detector_id));
         };
 
+        // The organization's auto-enable settings, read before any member is
+        // written so every account of one call is given the same configuration.
+        // Taken as a copy because it is a sibling field of the members being
+        // written.
+        let organization = detector.organization.clone();
+
         let mut unprocessed = Vec::new();
         let mut seen = ::std::collections::BTreeSet::new();
         for account_id in &input.account_ids {
@@ -227,17 +240,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             match detector.members.get_mut(account_id) {
                 Some(member) if member.is_associated() => {
-                    // The deprecated `DataSources` view is applied first so an
-                    // explicit `Features` entry for the same switch wins — the order
-                    // `CreateDetector` and `UpdateDetector` apply the two views in.
-                    crate::state::apply_member_data_sources(
+                    // Both views of the request's switches are written through the
+                    // one applier that judges them against the organization's
+                    // auto-enable settings, so a switch the organization owns is
+                    // left to it whichever view named it.
+                    crate::state::apply_member_configuration(
                         member,
                         input.data_sources.as_ref(),
-                        now,
-                    );
-                    crate::state::apply_member_feature_configurations(
-                        member,
                         input.features.as_ref(),
+                        &organization,
                         now,
                     );
                 }
