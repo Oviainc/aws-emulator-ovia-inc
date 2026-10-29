@@ -563,15 +563,13 @@ pub struct ScheduledReportRecord {
 impl ScheduledReportRecord {
     /// The `ScheduleState` this report's schedule is in: the stored value, or
     /// [`SCHEDULE_STATE_ENABLED`] for a record stored without one. `state` is resolved
-    /// at write time by [`resolve_schedule_config`], so the fallback only covers a
-    /// record written before that resolution existed; keeping it in ONE place is what
-    /// lets every reader and `ExecuteScheduledReport` agree on whether a report's
+    /// at write time ([`resolve_schedule_config`] on a create,
+    /// [`updated_schedule_config`] on an update), so the fallback only covers a record
+    /// written without one; resolving it in ONE place ([`schedule_config_state`]) is
+    /// what lets every reader and `ExecuteScheduledReport` agree on whether a report's
     /// schedule is enabled.
     pub fn schedule_state(&self) -> &str {
-        self.schedule_config
-            .state
-            .as_deref()
-            .unwrap_or(SCHEDULE_STATE_ENABLED)
+        schedule_config_state(&self.schedule_config)
     }
 
     /// This record projected onto the modelled `ScheduledReport` shape that
@@ -1491,15 +1489,54 @@ pub fn merge_resource_tags(
     merged
 }
 
-/// The `scheduleConfig` to store for a create or an update: the supplied config with
-/// `state` resolved to [`SCHEDULE_STATE_ENABLED`] when the request left it unset, so
-/// every reader sees a schedule whose state is decided once, at write time, rather
-/// than each reader guessing.
-pub fn resolve_schedule_config(mut config: ScheduleConfig) -> ScheduleConfig {
-    if config.state.as_deref().is_none_or(str::is_empty) {
-        config.state = Some(SCHEDULE_STATE_ENABLED.to_string());
-    }
+/// The `ScheduleState` a stored `scheduleConfig` is in: the value it carries, or
+/// [`SCHEDULE_STATE_ENABLED`] for a config that carries none. `state` is resolved at
+/// write time, so the fallback only covers a config written without one; keeping the
+/// fallback in ONE place is what lets every reader, every writer and
+/// `ExecuteScheduledReport` agree on whether a schedule is enabled.
+pub fn schedule_config_state(config: &ScheduleConfig) -> &str {
     config
+        .state
+        .as_deref()
+        .filter(|state| !state.is_empty())
+        .unwrap_or(SCHEDULE_STATE_ENABLED)
+}
+
+/// The `scheduleConfig` to store for a CREATE: the supplied config with `state`
+/// resolved to [`SCHEDULE_STATE_ENABLED`] when the request left it unset, so every
+/// reader sees a schedule whose state is decided once, at write time, rather than each
+/// reader guessing.
+///
+/// The default belongs to the create input alone — `ScheduledReportInput$scheduleConfig`
+/// is the member documented "If the schedule state is not specified, it defaults to
+/// ENABLED" (`smithy_query(query="shape",shape="ScheduledReportInput")`) — so an update
+/// resolves its config through [`updated_schedule_config`] instead.
+pub fn resolve_schedule_config(mut config: ScheduleConfig) -> ScheduleConfig {
+    config.state = Some(schedule_config_state(&config).to_string());
+    config
+}
+
+/// The `scheduleConfig` to store for an UPDATE of a report whose stored config is
+/// `stored`: the submitted config, with the STORED state carried over when the request
+/// left `state` unset.
+///
+/// An update applies only the properties its request names — "Only the parameters
+/// included in the request are updated; all other properties remain unchanged"
+/// (`smithy_query(query="doc",shape="UpdateScheduledReport")`) — and this service spells
+/// out how a caller unsets or re-defaults an optional property: an explicit flag on the
+/// request (`clearWidgetIds`, `clearWidgetDateRangeOverride`). `UpdateScheduledReportRequest`
+/// models no such flag for the schedule state and its `scheduleConfig` member documents no
+/// default of its own, so an omitted `state` is not an instruction to re-default a paused
+/// schedule to [`SCHEDULE_STATE_ENABLED`]: the state the account last decided stands, and a
+/// caller changing a cron expression cannot resume a report it paused.
+pub fn updated_schedule_config(
+    stored: &ScheduleConfig,
+    mut submitted: ScheduleConfig,
+) -> ScheduleConfig {
+    if submitted.state.as_deref().is_none_or(str::is_empty) {
+        submitted.state = Some(schedule_config_state(stored).to_string());
+    }
+    submitted
 }
 
 /// The `@pattern` of `DashboardName` and `ScheduledReportName`, as the model writes it

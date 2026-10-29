@@ -142,10 +142,12 @@ fn cases(other_dashboard: &str, other_widget: &str) -> Vec<UpdateCase> {
             )],
         },
         UpdateCase {
-            // The same resolution the create path applies: a schedule written without a
-            // state is stored ENABLED (`ScheduleState` values, source: the `ScheduleState`
-            // enum in the model).
-            label: "schedule config without a state is stored ENABLED",
+            // No state is named, and nothing on this request can clear or re-default one,
+            // so the state the baseline was created with stands — the ENABLED default the
+            // model documents belongs to the create member alone (`ScheduleState` values,
+            // source: the `ScheduleState` enum in the model). A report created DISABLED is
+            // covered by `update_schedule_state_preservation`.
+            label: "schedule config without a state keeps the stored state",
             request: json!({
                 "scheduleConfig": {"scheduleExpression": "cron(0 6 1 1,4,7,10 ? *)"}
             }),

@@ -73,6 +73,8 @@ mod tag_resource;
 mod untag_resource;
 #[path = "all/update_dashboard_partial_update.rs"]
 mod update_dashboard_partial_update;
+#[path = "all/update_schedule_state_preservation.rs"]
+mod update_schedule_state_preservation;
 #[path = "all/update_scheduled_report.rs"]
 mod update_scheduled_report;
 #[path = "all/validation_pattern_rendering.rs"]

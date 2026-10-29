@@ -7,9 +7,11 @@
 //! (`smithy_query(query="doc",shape="UpdateScheduledReport")`). So every optional member
 //! the request carries REPLACES the stored one and every member it omits leaves the
 //! stored value alone — `name`, `description`, `dashboardArn`,
-//! `scheduledReportExecutionRoleArn`, `scheduleConfig` (whose `state` is resolved through
-//! [`crate::state::resolve_schedule_config`], the same resolution the create path uses, so
-//! a config submitted without a state is stored `ENABLED` rather than stateless),
+//! `scheduledReportExecutionRoleArn`, `scheduleConfig` (whose `state` is carried over from
+//! the stored config when the submitted one names none, through
+//! [`crate::state::updated_schedule_config`]: the ENABLED default the model documents is a
+//! property of the CREATE member, and nothing on this request can clear or re-default a
+//! schedule state, so an update that does not name one leaves a paused report paused),
 //! `widgetIds` and `widgetDateRangeOverride`. `updatedAt` is set to the moment of the
 //! call; `createdAt`, the tags, the execution history and the health the last refresh
 //! established are properties this request does not include, so they are left untouched
@@ -342,9 +344,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             report.execution_role_arn = role_arn;
         }
         if let Some(schedule_config) = input.schedule_config {
-            // Resolved at write time, like every other write of a schedule, so every
-            // reader sees a state that was decided once rather than guessing one.
-            report.schedule_config = crate::state::resolve_schedule_config(schedule_config);
+            // The config the request carries replaces the stored one, with ONE property
+            // carried over: its `state`. The ENABLED default the model documents belongs
+            // to the create member alone, and this request models no flag to clear or
+            // re-default the schedule state, so a request that does not name a state
+            // leaves the report as enabled or as paused as the account last left it
+            // (`crate::state::updated_schedule_config`).
+            report.schedule_config =
+                crate::state::updated_schedule_config(&report.schedule_config, schedule_config);
         }
         if let Some(widget_ids) = input.widget_ids {
             report.widget_ids = Some(widget_ids);
