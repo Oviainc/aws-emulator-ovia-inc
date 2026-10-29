@@ -173,13 +173,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let offset = match &input.next_token {
-            None => 0,
-            Some(token) => match crate::state::decode_page_token(PAGE_KIND, token) {
-                Some(offset) => offset,
-                None => return Err(invalid_next_token()),
-            },
-        };
+        // The row this page starts at, under the one pagination-token rule every
+        // paginated read of this service applies
+        // (`crate::service::page_offset`).
+        let offset =
+            crate::service::page_offset(Self::NAME, PAGE_KIND, input.next_token.as_deref())
+                .map_err(ListEnrollmentStatusesErrorModeled::ValidationException)?;
 
         let caller = crate::state::caller_account_id();
         let (include_member_accounts, mut enrollments) = {
@@ -242,22 +241,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The list a `nextToken` from this operation belongs to.
 const PAGE_KIND: &str = "enrollment-statuses";
-
-/// Refuse a `nextToken` this service did not issue for this list.
-fn invalid_next_token() -> ListEnrollmentStatusesError {
-    ListEnrollmentStatusesErrorModeled::ValidationException(
-        crate::service::stated_validation_exception(
-            "Invalid nextToken specified. The token was not issued by ListEnrollmentStatuses."
-                .to_string(),
-            vec![ValidationExceptionDetail {
-                field_name: "nextToken".to_string(),
-                message: "the value is not a pagination token issued by ListEnrollmentStatuses"
-                    .to_string(),
-            }],
-        ),
-    )
-    .into()
-}
 
 /// Refuse a caller that is not the organization's management account the
 /// enrollment of the organization's member accounts: the modelled

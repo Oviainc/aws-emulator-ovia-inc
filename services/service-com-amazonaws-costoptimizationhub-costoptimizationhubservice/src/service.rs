@@ -84,7 +84,10 @@
 //!   FROM the request, so its message states the rejected member and the rule
 //!   that rejects it ([`stated_validation_exception`]), with the same per-member
 //!   diagnosis still in `fields`. An SDK error surface commonly shows only
-//!   `message`, so the actionable part of such a refusal belongs there.
+//!   `message`, so the actionable part of such a refusal belongs there. A rule
+//!   every operation of a class enforces is written once here — the pagination
+//!   token every paginated read judges is [`page_offset`] — so the operations
+//!   cannot drift apart in how they word one refusal.
 //!
 //! # A member's own value set or bound is the one its operation enforces
 //!
@@ -409,6 +412,43 @@ pub(crate) fn not_in_enum(
         field_name: member.to_string(),
         message,
     }]))
+}
+
+/// The member a refused pagination token is attributed to: the one carrying the
+/// token, so it is the member a caller has to change to get the request served.
+const NEXT_TOKEN_MEMBER: &str = "nextToken";
+
+/// The row a paginated read of `kind` resumes at, for every paginated operation
+/// of this service: no token asks for the first page (offset 0), a token this
+/// service issued for that list resumes where that list's previous page stopped
+/// ([`crate::state::decode_page_token`]), and anything else is refused, because
+/// a token the service cannot read names no row to resume at and serving the
+/// first page in its place would silently repeat rows the caller already has.
+///
+/// `operation` is the operation serving the read — its [`Operation::NAME`] —
+/// which is the list the token has to have been issued by, so the refusal states
+/// which operation would have issued an acceptable one.
+///
+/// The one place this rule's two halves — decode or refuse — are written, so
+/// every paginated operation of this service judges a token and words its
+/// refusal the same way.
+pub(crate) fn page_offset(
+    operation: &str,
+    kind: &str,
+    next_token: Option<&str>,
+) -> Result<usize, ValidationException> {
+    let Some(token) = next_token else {
+        return Ok(0);
+    };
+    crate::state::decode_page_token(kind, token).ok_or_else(|| {
+        stated_validation_exception(
+            format!("Invalid nextToken specified. The token was not issued by {operation}."),
+            vec![ValidationExceptionDetail {
+                field_name: NEXT_TOKEN_MEMBER.to_string(),
+                message: format!("the value is not a pagination token issued by {operation}"),
+            }],
+        )
+    })
 }
 
 /// One `fields` entry per invalid MEMBER — `fields` is "the list of fields that

@@ -27,6 +27,8 @@ mod one_view_for_every_recommendation_reader;
 mod order_by_fidelity;
 #[path = "all/organization_enrollment.rs"]
 mod organization_enrollment;
+#[path = "all/page_token_rule.rs"]
+mod page_token_rule;
 #[path = "all/preference_gates.rs"]
 mod preference_gates;
 #[path = "all/preference_refusal_atomicity.rs"]

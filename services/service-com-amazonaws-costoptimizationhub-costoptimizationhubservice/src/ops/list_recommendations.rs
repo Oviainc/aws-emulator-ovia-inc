@@ -184,13 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListRecommendationsErrorModeled::ValidationException(refused).into());
         }
 
-        let offset = match &input.next_token {
-            None => 0,
-            Some(token) => match crate::state::decode_page_token(PAGE_KIND, token) {
-                Some(offset) => offset,
-                None => return Err(invalid_next_token()),
-            },
-        };
+        // The row this page starts at, under the one pagination-token rule every
+        // paginated read of this service applies
+        // (`crate::service::page_offset`).
+        let offset = crate::service::page_offset(Self::NAME, PAGE_KIND, input.next_token.as_deref())
+            .map_err(ListRecommendationsErrorModeled::ValidationException)?;
 
         // An `orderBy` the request SETS is honoured as a whole, or the request is
         // refused rather than silently served in another order: `dimension` is
@@ -332,22 +330,6 @@ fn render(row: &crate::state::StoredRecommendation, mode: Option<&str>) -> Recom
         source: Some(row.source.clone()),
         tags: row.tag_list(),
     }
-}
-
-/// Refuse a `nextToken` this service did not issue for this list.
-fn invalid_next_token() -> ListRecommendationsError {
-    ListRecommendationsErrorModeled::ValidationException(
-        crate::service::stated_validation_exception(
-            "Invalid nextToken specified. The token was not issued by ListRecommendations."
-                .to_string(),
-            vec![ValidationExceptionDetail {
-                field_name: "nextToken".to_string(),
-                message: "the value is not a pagination token issued by ListRecommendations"
-                    .to_string(),
-            }],
-        ),
-    )
-    .into()
 }
 
 /// The member every refusal of an `orderBy` is attributed to: the one that says

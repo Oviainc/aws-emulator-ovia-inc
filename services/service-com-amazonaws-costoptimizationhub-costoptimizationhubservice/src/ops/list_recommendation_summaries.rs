@@ -255,13 +255,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .is_some_and(|metrics| metrics.iter().any(|metric| metric == SAVINGS_PERCENTAGE));
 
-        let offset = match &input.next_token {
-            None => 0,
-            Some(token) => match crate::state::decode_page_token(PAGE_KIND, token) {
-                Some(offset) => offset,
-                None => return Err(invalid_next_token()),
-            },
-        };
+        // The row this page starts at, under the one pagination-token rule every
+        // paginated read of this service applies
+        // (`crate::service::page_offset`).
+        let offset =
+            crate::service::page_offset(Self::NAME, PAGE_KIND, input.next_token.as_deref())
+                .map_err(ListRecommendationSummariesErrorModeled::ValidationException)?;
 
         // The same shared rule `ListRecommendations` reads its rows through
         // (`crate::state::...::recommendation_view`): the organization gate on
@@ -459,16 +458,6 @@ fn savings_percentage_is_defined(filter: Option<&Filter>) -> bool {
         && filter.implementation_efforts.is_none()
         && filter.resource_types.is_none()
         && filter.action_types.is_none()
-}
-
-/// Refuse a `nextToken` this service did not issue for this list.
-fn invalid_next_token() -> ListRecommendationSummariesError {
-    stated_refusal(
-        "Invalid nextToken specified. The token was not issued by ListRecommendationSummaries."
-            .to_string(),
-        "nextToken",
-        "the value is not a pagination token issued by ListRecommendationSummaries".to_string(),
-    )
 }
 
 /// Refuse a `groupBy` that names no dimension recommendations can be summarised
