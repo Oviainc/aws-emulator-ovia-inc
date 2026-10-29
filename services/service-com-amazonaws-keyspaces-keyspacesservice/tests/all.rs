@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/auto_scaling_propagation.rs"]
 mod auto_scaling_propagation;
+#[path = "all/cdc_specification_tags_on_update.rs"]
+mod cdc_specification_tags_on_update;
 #[path = "all/cdc_stream_tag_lifetime.rs"]
 mod cdc_stream_tag_lifetime;
 #[path = "all/cdc_streams.rs"]

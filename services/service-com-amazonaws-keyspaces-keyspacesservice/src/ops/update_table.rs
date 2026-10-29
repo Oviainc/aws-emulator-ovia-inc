@@ -465,15 +465,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )));
                 }
             }
-            // The tags the specification applies to the stream, under the same
+            // WHICH stream the specification's tags belong to, resolved before anything is
+            // written: the stream this table has once the call is through, whatever status
+            // the specification asks for. Asking for a capturing stream keeps the live one
+            // when the table has one and otherwise mints a fresh stream, which holds no
+            // tags yet; asking for none stops the live stream, and a stopped stream is
+            // still the table's stream — `StreamStatus` models `DISABLED`, so it stays
+            // readable, stays the table's `latestStreamArn` and keeps answering for its
+            // tags through the tagging operations. Only a table that never had a stream is
+            // left without one, and then the specification has no resource to tag.
+            let stream_to_tag = match cdc.enabled {
+                true => live.as_ref().map(|(stream_arn, _)| stream_arn.clone()),
+                false => stream_store
+                    .stream_for_table(&region, &input.keyspace_name, &input.table_name)
+                    .map(|stream| stream.stream_arn.clone()),
+            };
+            // The tags the specification applies to that stream, under the same
             // per-resource rules wherever they are supplied — checked whatever the status
             // asks for, because a reserved key or an oversized list is the same bad input
             // either way — onto the tags that stream already holds when it is one that
             // already exists.
-            let mut stream_tags = live
+            let mut stream_tags = stream_to_tag
                 .as_ref()
-                .filter(|_| cdc.enabled)
-                .and_then(|(stream_arn, _)| table.cdc_stream_tags.get(stream_arn))
+                .and_then(|stream_arn| table.cdc_stream_tags.get(stream_arn))
                 .cloned()
                 .unwrap_or_default();
             let applied =
@@ -490,7 +504,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(to_tag_failure)?;
 
-            match cdc.enabled {
+            // The status the specification asks for, applied to the stream store, which
+            // answers with the stream the table then has: the one the tags above go onto.
+            let tagged_stream = match cdc.enabled {
                 true => {
                     let enabled = stream_store.enable_stream(
                         &region,
@@ -513,24 +529,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         )
                         .into());
                     };
-                    let held = stream_store.stream_arns_for_table(
-                        &region,
-                        &input.keyspace_name,
-                        &input.table_name,
-                    );
-                    table.register_stream_tags(&stream_arn, stream_tags, &held);
+                    Some(stream_arn)
                 }
                 // A table with no live stream has nothing to disable, which is why that
-                // answers nothing: asking for CDC a table does not have is the state it
-                // is already in. A stream that is gone carries no tags either, so the
-                // specification's tags are validated above and stored nowhere.
-                false => {
-                    stream_store.disable_stream(
-                        &region,
-                        &input.keyspace_name,
-                        &input.table_name,
-                    );
-                }
+                // answers nothing: asking for CDC a table does not have is the state it is
+                // already in, so the stream it keeps — one already stopped, or none at all
+                // — is the one resolved above.
+                false => stream_store
+                    .disable_stream(&region, &input.keyspace_name, &input.table_name)
+                    .or(stream_to_tag),
+            };
+            if let Some(stream_arn) = tagged_stream {
+                let held = stream_store.stream_arns_for_table(
+                    &region,
+                    &input.keyspace_name,
+                    &input.table_name,
+                );
+                table.register_stream_tags(&stream_arn, stream_tags, &held);
             }
         }
 
