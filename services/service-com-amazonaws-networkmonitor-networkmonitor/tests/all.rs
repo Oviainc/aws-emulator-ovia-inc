@@ -31,6 +31,8 @@ mod monitor_lifecycle_and_front_door;
 mod monitor_modified_at_follows_probe_writes;
 #[path = "all/monitor_state_follows_probe_activation.rs"]
 mod monitor_state_follows_probe_activation;
+#[path = "all/probe_subnet_identity.rs"]
+mod probe_subnet_identity;
 #[path = "all/probe_teardown.rs"]
 mod probe_teardown;
 #[path = "all/probes_per_monitor_limit.rs"]

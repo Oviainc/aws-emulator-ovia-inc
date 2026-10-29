@@ -770,14 +770,30 @@ pub fn validate_probe_spec(spec: &ProbeSpec, probe_path: &str) -> Result<&'stati
     Ok(address_family)
 }
 
+/// Which source subnet a probe's `sourceArn` counts against, for every bound
+/// and grouping stated per (monitor, source SUBNET) pair.
+///
+/// The subnet the ARN names ([`subnet_id_of`]) — a subnet id identifies the
+/// subnet, so two `sourceArn` strings that name one subnet count as one subnet
+/// however else they are spelled. The whole ARN is the key only for a string
+/// that names no subnet of this account at all, which is a `sourceArn`
+/// [`validate_probe_spec`] refuses outright: such a probe is never stored, so
+/// the fallback only keeps an unnameable source from collapsing into another
+/// one's group.
+pub fn probe_subnet_key(source_arn: &str) -> &str {
+    subnet_id_of(source_arn).unwrap_or(source_arn)
+}
+
 /// Check the per-subnet probe limit for a request that would ADD probes to a
 /// monitor ([`MAX_PROBES_PER_SUBNET`]).
 ///
 /// The limit is counted per (monitor, source subnet) pair, so the probes
-/// `existing` already holds are grouped by their `sourceArn` and each requested
-/// `sourceArn` is counted on top of that group, in request order: one call that
-/// adds several probes to one subnet is bounded exactly as several calls adding
-/// one each are. `existing` is `None` for a monitor the request is creating,
+/// `existing` already holds are grouped by the SUBNET their `sourceArn` names
+/// ([`probe_subnet_key`]) and each requested `sourceArn` is counted on top of
+/// its subnet's group, in request order: one call that adds several probes to
+/// one subnet is bounded exactly as several calls adding one each are, and two
+/// spellings of one subnet's ARN share that subnet's single bound rather than
+/// doubling it. `existing` is `None` for a monitor the request is creating,
 /// which holds no probe yet.
 ///
 /// Shared by every operation that ADDS a probe to a monitor (`CreateProbe`, and
@@ -795,11 +811,13 @@ pub fn check_probes_per_subnet<'a>(
         // attached, and the store drops it once the teardown has run its course
         // ([`Probe::is_forgotten_at`]), which frees the slot.
         for probe in monitor.probes.values() {
-            *per_subnet.entry(probe.source_arn.as_str()).or_default() += 1;
+            *per_subnet
+                .entry(probe_subnet_key(probe.source_arn.as_str()))
+                .or_default() += 1;
         }
     }
     for source_arn in requested {
-        let count = per_subnet.entry(source_arn).or_default();
+        let count = per_subnet.entry(probe_subnet_key(source_arn)).or_default();
         *count += 1;
         if *count > MAX_PROBES_PER_SUBNET {
             return Err(PROBES_PER_SUBNET_MESSAGE.to_string());
