@@ -26,7 +26,11 @@
 //!   expression the service advertises;
 //! * the clauses are counted and joined into the AWS envelope — `1 validation error
 //!   detected: <clause>` for one, `N validation errors detected: <clause>; <clause>`
-//!   for several — in the order the walk found them.
+//!   for several — in the order the walk found them;
+//! * the envelope is written into a member the model BOUNDS, so a refusal states as
+//!   many WHOLE clauses as that bound leaves room for and the count it states is the
+//!   number of clauses it states — a message is never longer than the member it travels
+//!   in can carry (see [`MAX_MESSAGE_LENGTH`] and [`bounded_message`]).
 //!
 //! Both halves of a refusal body are built from the same clause: the `message`
 //! envelope and each `fieldList` entry's own `message` (see
@@ -73,6 +77,31 @@ pub(crate) const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 /// (`MAX_VIOLATIONS` in `aws_smithy_schema_server::constraints`), so the two refusal
 /// paths read alike.
 const MAX_VIOLATIONS: usize = 100;
+
+/// The longest text a message this service answers with may carry.
+///
+/// Every `message` member of every error shape of this model — and a
+/// `ValidationExceptionField`'s own `name` and `message` beside them — targets
+/// `BasicString`, which the model gives `@length(min: 0, max: 1024)`
+/// (`smithy_query(query="shape", shape="ValidationException,BasicString")`). A text past
+/// it is a value the model says that member never holds, so it is the service's to keep
+/// inside the bound, whatever the request that produced it.
+///
+/// `@length` on a string counts CHARACTERS, which is what the boundary validator counts
+/// for a request's own members too.
+pub(crate) const MAX_MESSAGE_LENGTH: usize = 1024;
+
+/// `text` as it can travel in a member the model bounds at [`MAX_MESSAGE_LENGTH`]: the
+/// text itself when it fits, else its first [`MAX_MESSAGE_LENGTH`] characters.
+///
+/// The cut is on a CHARACTER boundary, so what a client reads is still the text's own
+/// prefix rather than a broken encoding.
+pub(crate) fn bounded_message(text: String) -> String {
+    match text.char_indices().nth(MAX_MESSAGE_LENGTH) {
+        Some((end, _)) => text[..end].to_string(),
+        None => text,
+    }
+}
 
 /// The sentence a refusal falls back to when no violation has a wording here: the
 /// documentation of the modelled shape itself (`smithy_query(query="shape",
@@ -146,21 +175,66 @@ pub(crate) fn clause(violation: &Violation) -> Option<String> {
     ))
 }
 
-/// The `message` of a refused request: the AWS envelope over one clause per violation,
-/// in the order the walk found them. `None` declines the whole refusal — see [`clause`].
-pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
+/// The AWS envelope over `clauses`, which COUNTS the clauses it states: `None` for no
+/// clause at all, which is not a refusal.
+fn joined(clauses: &[String]) -> Option<String> {
+    match clauses {
+        [] => None,
+        [only] => Some(format!("1 validation error detected: {only}")),
+        several => Some(format!(
+            "{} validation errors detected: {}",
+            several.len(),
+            several.join("; ")
+        )),
+    }
+}
+
+/// How many of `clauses` one envelope states: as many as [`MAX_MESSAGE_LENGTH`] leaves
+/// room for, and never fewer than one.
+///
+/// A clause is stated WHOLE or not at all, so the last one that fits is where the
+/// envelope stops; joining one more clause only ever makes the envelope longer, so the
+/// first count that does not fit is the first count to stop at. One clause is always
+/// stated: a refusal names the member it refused even when that one clause is longer
+/// than the whole member the envelope travels in, where [`bounded_message`] is what
+/// keeps it inside the bound.
+fn stated_count(clauses: &[String]) -> usize {
+    let mut stated = 1;
+    for count in 2..=clauses.len() {
+        match joined(&clauses[..count]) {
+            Some(text) if text.chars().count() <= MAX_MESSAGE_LENGTH => stated = count,
+            _ => break,
+        }
+    }
+    stated
+}
+
+/// The violations one refusal STATES and the `message` that states them, which both
+/// halves of the body are then built from.
+///
+/// Two bounds apply: at most [`MAX_VIOLATIONS`] violations, and at most as many clauses
+/// as [`MAX_MESSAGE_LENGTH`] leaves room for. `None` declines the whole refusal — see
+/// [`clause`].
+fn stated(violations: &[Violation]) -> Option<(&[Violation], String)> {
+    let violations = &violations[..violations.len().min(MAX_VIOLATIONS)];
     let clauses = violations
         .iter()
         .map(clause)
         .collect::<Option<Vec<String>>>()?;
-    match clauses.len() {
-        0 => None,
-        1 => Some(format!("1 validation error detected: {}", clauses[0])),
-        n => Some(format!(
-            "{n} validation errors detected: {}",
-            clauses.join("; ")
-        )),
+    if clauses.is_empty() {
+        // No violation at all is not a refusal this module words.
+        return None;
     }
+    let count = stated_count(&clauses);
+    let message = bounded_message(joined(&clauses[..count])?);
+    Some((&violations[..count], message))
+}
+
+/// The `message` of a refused request: the AWS envelope over one clause per violation,
+/// in the order the walk found them, inside the bound of the member it travels in.
+/// `None` declines the whole refusal — see [`clause`] and [`stated`].
+pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
+    stated(violations).map(|(_, message)| message)
 }
 
 /// The 400 `ValidationException` that states `violations` — a member constraint the
@@ -172,10 +246,19 @@ pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
 /// `name` the dotted member path, `message` that violation's own clause naming the
 /// constraint it failed. A client can therefore branch on `reason` and report which
 /// member was rejected and why, instead of parsing the prose.
+///
+/// Both halves state the SAME violations: the ones [`stated`] leaves after the count and
+/// the message bounds, so the count the envelope states is the number of entries the
+/// field list carries. Every text is held to [`MAX_MESSAGE_LENGTH`], the bound the model
+/// gives each of the members it travels in.
 pub(crate) fn field_validation_failed(violations: &[Violation]) -> ValidationException {
-    let violations = &violations[..violations.len().min(MAX_VIOLATIONS)];
+    let capped = &violations[..violations.len().min(MAX_VIOLATIONS)];
+    // A violation class with no wording here declines the envelope, which keeps the
+    // shape's own documented sentence and states every violation the count bound admits.
+    let (violations, message) =
+        stated(violations).unwrap_or((capped, VALIDATION_EXCEPTION_DOC.to_string()));
     ValidationException {
-        message: envelope(violations).or_else(|| Some(VALIDATION_EXCEPTION_DOC.to_string())),
+        message: Some(message),
         resource_name: None,
         reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
         // A refusal of the REQUEST is answered by the input validator in FRONT of the
@@ -188,7 +271,7 @@ pub(crate) fn field_validation_failed(violations: &[Violation]) -> ValidationExc
             violations
                 .iter()
                 .map(|violation| ValidationExceptionField {
-                    name: violation.path.clone(),
+                    name: bounded_message(violation.path.clone()),
                     // The same clause the envelope states for this member, so the two
                     // halves of the body cannot word one violation two ways.
                     //
@@ -197,8 +280,10 @@ pub(crate) fn field_validation_failed(violations: &[Violation]) -> ValidationExc
                     // the rejected value with a literal `[redacted]` placeholder, which
                     // no rule of the service produces), so the clause is what the rule
                     // gives rather than what that one body holds.
-                    message: clause(violation)
-                        .unwrap_or_else(|| VALIDATION_EXCEPTION_DOC.to_string()),
+                    message: bounded_message(
+                        clause(violation)
+                            .unwrap_or_else(|| VALIDATION_EXCEPTION_DOC.to_string()),
+                    ),
                 })
                 .collect(),
         ),
@@ -214,7 +299,7 @@ pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
     match refusal {
         Refusal::Invalid(violations) => Some(Refused {
             code: VALIDATION_EXCEPTION.to_string(),
-            message: envelope(&violations[..violations.len().min(MAX_VIOLATIONS)])?,
+            message: envelope(violations)?,
         }),
         _ => None,
     }
@@ -335,5 +420,90 @@ mod tests {
                 "case {violations:?}: expected {expected:?}, got {actual:?}"
             );
         }
+    }
+
+    /// The clauses one envelope states, read back off the envelope: the count it
+    /// announces and the clauses themselves.
+    fn stated_clauses(message: &str) -> (usize, Vec<&str>) {
+        let (count, joined) = message
+            .split_once(" validation error detected: ")
+            .or_else(|| message.split_once(" validation errors detected: "))
+            .unwrap_or_else(|| panic!("an AWS validation envelope, got {message:?}"));
+        (
+            count.parse().expect("the envelope counts its clauses"),
+            joined.split("; ").collect(),
+        )
+    }
+
+    /// Whatever the walk hands over, the envelope fits the modelled maximum of the
+    /// member it travels in, states WHOLE clauses, and counts the clauses it states.
+    #[test]
+    fn the_envelope_fits_the_modelled_message_bound() {
+        // Past `MAX_VIOLATIONS` as well as past the number of clauses that fit, so both
+        // bounds are exercised.
+        for count in [1usize, 2, 5, 11, 100, 200, 400] {
+            let violations: Vec<Violation> = (0..count)
+                .map(|index| Violation {
+                    path: format!("resourceTags.{}.member.key", index + 1),
+                    kind: ViolationKind::MinLength(1),
+                    value: Some(String::new()),
+                })
+                .collect();
+            let message = envelope(&violations).expect("a worded refusal");
+            let length = message.chars().count();
+            assert!(
+                length <= MAX_MESSAGE_LENGTH,
+                "case {count} violations: the message must fit {MAX_MESSAGE_LENGTH} \
+                 characters, got {length}"
+            );
+            let (stated, clauses) = stated_clauses(&message);
+            assert_eq!(
+                stated,
+                clauses.len(),
+                "case {count} violations: the envelope counts the clauses it states, got \
+                 {message:?}"
+            );
+            assert!(
+                stated >= 1 && stated <= count.min(MAX_VIOLATIONS),
+                "case {count} violations: expected between 1 and \
+                 {} clauses, got {stated}",
+                count.min(MAX_VIOLATIONS)
+            );
+            let expected: Vec<String> = violations
+                .iter()
+                .map(|violation| clause(violation).expect("a worded violation class"))
+                .collect();
+            for (position, stated_clause) in clauses.iter().enumerate() {
+                assert_eq!(
+                    *stated_clause,
+                    expected[position].as_str(),
+                    "case {count} violations: clause {position} is stated whole and in the \
+                     order the walk found it, got {message:?}"
+                );
+            }
+        }
+    }
+
+    /// One clause longer than the whole member the envelope travels in is stated as far
+    /// as that member reaches, rather than answered past the bound.
+    #[test]
+    fn one_clause_past_the_bound_is_held_to_it() {
+        let violation = Violation {
+            path: "name".to_string(),
+            kind: ViolationKind::Pattern(format!("^{}$", "a".repeat(2 * MAX_MESSAGE_LENGTH))),
+            value: Some("nope".to_string()),
+        };
+        let message = envelope(std::slice::from_ref(&violation)).expect("a worded refusal");
+        let length = message.chars().count();
+        assert_eq!(
+            length, MAX_MESSAGE_LENGTH,
+            "case one over-long clause: the message is stated as far as the member \
+             reaches, got {length} characters"
+        );
+        assert!(
+            message.starts_with("1 validation error detected: Value at 'name' failed to "),
+            "case one over-long clause: the message is the envelope's own prefix, got \
+             {message:?}"
+        );
     }
 }

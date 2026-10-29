@@ -1023,11 +1023,18 @@ const PROCUREMENT_PORTAL_KIND: &str = "Procurement portal";
 /// `resourceName` is left absent: the model types it as an `InvoiceUnitArnString`
 /// (`smithy_query(query="shape", shape="ResourceNotFoundException")`), so a portal
 /// identifier — which is not an ARN — cannot be reported in it.
+///
+/// The sentence names the identifier the request supplied, and `ProcurementPortalIdString`
+/// is the one input shape of this model with NO maximum length
+/// (`smithy_query(query="operation", operation="ListProcurementPortalSuppliers")`), so the
+/// sentence is held to the bound the model gives the member it travels in
+/// ([`crate::service::validation::bounded_message`]) — a sentence naming a short
+/// identifier is unchanged by it.
 pub fn no_such_procurement_portal(portal_identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
+        message: Some(crate::service::validation::bounded_message(format!(
             "{PROCUREMENT_PORTAL_KIND} with identifier {portal_identifier} does not exist"
-        )),
+        ))),
         resource_id: None,
         message_key: MessageKey::Capitalised,
     }

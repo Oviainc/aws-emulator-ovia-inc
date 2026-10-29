@@ -23,6 +23,8 @@ mod invoice_profiles;
 mod invoice_summaries;
 #[path = "all/invoice_unit_lifecycle.rs"]
 mod invoice_unit_lifecycle;
+#[path = "all/message_fits_the_modelled_bound.rs"]
+mod message_fits_the_modelled_bound;
 #[path = "all/modelled_refusal_on_every_implemented_operation.rs"]
 mod modelled_refusal_on_every_implemented_operation;
 #[path = "all/own_account_and_request_derived_refusals.rs"]
