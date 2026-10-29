@@ -213,9 +213,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the one the request arrived at.
         let modified_at_ms = crate::state::now_ms();
 
-        // "hcx is the only accepted VLAN name at this time" (`vlanName` doc).
-        let vlan_name_is_hcx = input.vlan_name == crate::state::HCX_FUNCTION;
-
         // Regional resource, and one that has reached DELETED is gone as far as this
         // operation is concerned — the same reading `AssociateEipToVlan` takes.
         let environment = state
@@ -226,42 +223,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::environment_not_found(&input.environment_id),
                 )
             })?;
-        if !vlan_name_is_hcx {
-            return Err(DisassociateEipFromVlanErrorModeled::ValidationException(
-                crate::state::field_validation_error(
-                    "vlanName",
-                    &format!(
-                        "must be {}, the only VLAN an Elastic IP address can be disassociated \
-                         from at this time",
-                        crate::state::HCX_FUNCTION
-                    ),
-                ),
-            )
-            .into());
-        }
+        // The gate both Elastic IP operations apply to the `vlanName` a request carries,
+        // stated once in
+        // [`crate::state::StoredEnvironment::addressed_public_hcx_vlan_mut`]: the name is
+        // `hcx`, this environment has that VLAN, and the VLAN is public.
         let vlan = environment
-            .vlans
-            .iter_mut()
-            .find(|vlan| vlan.function_name == crate::state::HCX_FUNCTION)
-            .ok_or_else(|| {
-                DisassociateEipFromVlanErrorModeled::ValidationException(
-                    crate::state::field_validation_error(
-                        "vlanName",
-                        "names no VLAN of this environment",
-                    ),
-                )
-            })?;
-        // "This operation is only allowed for public HCX VLANs at this time."
-        if !vlan.is_public {
-            return Err(DisassociateEipFromVlanErrorModeled::ValidationException(
-                crate::state::field_validation_error(
-                    "vlanName",
-                    "names a private VLAN; an Elastic IP address can only be disassociated \
-                     from a public HCX VLAN",
-                ),
+            .addressed_public_hcx_vlan_mut(
+                &input.vlan_name,
+                crate::state::EipVlanAction::Disassociate,
             )
-            .into());
-        }
+            .map_err(DisassociateEipFromVlanErrorModeled::ValidationException)?;
 
         // `associationId` is a required handle on an association OF THIS VLAN: an id the
         // addressed VLAN has never carried names no association of the resource the

@@ -273,46 +273,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "hcx is the only accepted VLAN name at this time" (`vlanName` doc): every
-        // other VLAN of the environment, and every name that is no VLAN at all, is
-        // refused with the operation's modelled ValidationException.
-        if input.vlan_name != crate::state::HCX_FUNCTION {
-            return Err(AssociateEipToVlanErrorModeled::ValidationException(
-                crate::state::field_validation_error(
-                    "vlanName",
-                    &format!(
-                        "must be {}, the only VLAN an Elastic IP address can be associated \
-                         with at this time",
-                        crate::state::HCX_FUNCTION
-                    ),
-                ),
-            )
-            .into());
-        }
+        // The gate both Elastic IP operations apply to the `vlanName` a request carries,
+        // stated once in [`crate::state::StoredEnvironment::addressed_public_hcx_vlan`]:
+        // the name is `hcx`, this environment has that VLAN, and the VLAN is public.
         let hcx = environment
-            .vlans
-            .iter()
-            .find(|vlan| vlan.function_name == crate::state::HCX_FUNCTION)
-            .ok_or_else(|| {
-                AssociateEipToVlanErrorModeled::ValidationException(
-                    crate::state::field_validation_error(
-                        "vlanName",
-                        "names no VLAN of this environment",
-                    ),
-                )
-            })?;
-        // "This operation is only allowed for public HCX VLANs at this time": a VLAN is
-        // public only when the create asked for it through `isHcxPublic`.
-        if !hcx.is_public {
-            return Err(AssociateEipToVlanErrorModeled::ValidationException(
-                crate::state::field_validation_error(
-                    "vlanName",
-                    "names a private VLAN; an Elastic IP address can only be associated with \
-                     a public HCX VLAN",
-                ),
-            )
-            .into());
-        }
+            .addressed_public_hcx_vlan(&input.vlan_name, crate::state::EipVlanAction::Associate)
+            .map_err(AssociateEipToVlanErrorModeled::ValidationException)?;
         // `@idempotent`: an allocation this VLAN already carries keeps the association
         // it has, and the call reports that association rather than adding a second one.
         let already_associated = hcx.eip_associations.iter().any(|association| {
@@ -430,16 +396,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
         // The environment and its HCX VLAN were both found above, so these lookups
-        // resolve. If one somehow does not, the association Amazon EC2 has just recorded
-        // is released again before the failure is answered: an `Address` record
-        // associated with a VLAN that does not hold it would consume the allocation for
-        // nothing.
+        // resolve — the VLAN through the same shared gate, so the record written to is
+        // the one that gate resolved. If one somehow does not, the association Amazon EC2
+        // has just recorded is released again before the failure is answered: an
+        // `Address` record associated with a VLAN that does not hold it would consume the
+        // allocation for nothing.
         let recorded = match state.environment_in_region_mut(&region, &input.environment_id) {
             Some(environment) => {
                 let wire = environment
-                    .vlans
-                    .iter_mut()
-                    .find(|vlan| vlan.function_name == crate::state::HCX_FUNCTION)
+                    .addressed_public_hcx_vlan_mut(
+                        &input.vlan_name,
+                        crate::state::EipVlanAction::Associate,
+                    )
+                    .ok()
                     .map(|vlan| {
                         if let Some(association) = association.clone() {
                             vlan.eip_associations.push(association);

@@ -1261,6 +1261,31 @@ pub enum EipAssociationHandle {
     Unknown,
 }
 
+/// Which of the two Elastic IP operations is asking, for the refusals
+/// [`StoredEnvironment::addressed_public_hcx_vlan`] words.
+///
+/// The gate those two operations apply to a `vlanName` is one rule; the only part of it
+/// that differs between them is how each names the action on an Elastic IP address, so
+/// that phrase is what the caller supplies and nothing else is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EipVlanAction {
+    /// `AssociateEipToVlan`, which associates an address WITH the VLAN.
+    Associate,
+    /// `DisassociateEipFromVlan`, which disassociates one FROM it.
+    Disassociate,
+}
+
+impl EipVlanAction {
+    /// The past participle and preposition a refusal words the action with, so one
+    /// sentence template serves both operations.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Associate => "associated with",
+            Self::Disassociate => "disassociated from",
+        }
+    }
+}
+
 /// One VLAN subnet of an environment, materialised from an `initialVlans` entry.
 #[derive(Debug, Clone)]
 pub struct StoredVlan {
@@ -1668,6 +1693,80 @@ impl StoredEnvironment {
         self.vlans
             .iter()
             .find(|vlan| vlan.function_name == VMK_MANAGEMENT_FUNCTION)
+    }
+
+    /// Where in [`Self::vlans`] the VLAN an Elastic IP request addresses by `vlan_name`
+    /// sits, or the `ValidationException` that request is refused with.
+    ///
+    /// The one gate both Elastic IP operations apply, so a change to any of its three
+    /// rules is made once and both operations agree:
+    ///
+    /// 1. `vlan_name` is [`HCX_FUNCTION`] — "hcx is the only accepted VLAN name at this
+    ///    time" (`vlanName` doc) — so every other VLAN of the environment, and every
+    ///    name that is no VLAN at all, is refused;
+    /// 2. this environment HAS that VLAN;
+    /// 3. the VLAN is public: the operations are "only allowed for public HCX VLANs at
+    ///    this time", and a VLAN is public only when the create asked for it through
+    ///    `isHcxPublic`.
+    ///
+    /// The index is what the resolution answers with, so the caller takes the borrow it
+    /// needs ([`Self::addressed_public_hcx_vlan`] to report the VLAN,
+    /// [`Self::addressed_public_hcx_vlan_mut`] to change it) off one resolution.
+    fn addressed_public_hcx_vlan_index(
+        &self,
+        vlan_name: &str,
+        action: EipVlanAction,
+    ) -> Result<usize, ValidationException> {
+        if vlan_name != HCX_FUNCTION {
+            return Err(field_validation_error(
+                "vlanName",
+                &format!(
+                    "must be {HCX_FUNCTION}, the only VLAN an Elastic IP address can be {} \
+                     at this time",
+                    action.verb()
+                ),
+            ));
+        }
+        let index = self
+            .vlans
+            .iter()
+            .position(|vlan| vlan.function_name == HCX_FUNCTION)
+            .ok_or_else(|| {
+                field_validation_error("vlanName", "names no VLAN of this environment")
+            })?;
+        if !self.vlans[index].is_public {
+            return Err(field_validation_error(
+                "vlanName",
+                &format!(
+                    "names a private VLAN; an Elastic IP address can only be {} a public \
+                     HCX VLAN",
+                    action.verb()
+                ),
+            ));
+        }
+        Ok(index)
+    }
+
+    /// The VLAN an Elastic IP request addresses, or the refusal
+    /// [`Self::addressed_public_hcx_vlan_index`] states.
+    pub fn addressed_public_hcx_vlan(
+        &self,
+        vlan_name: &str,
+        action: EipVlanAction,
+    ) -> Result<&StoredVlan, ValidationException> {
+        let index = self.addressed_public_hcx_vlan_index(vlan_name, action)?;
+        Ok(&self.vlans[index])
+    }
+
+    /// [`Self::addressed_public_hcx_vlan`] for the caller that goes on to CHANGE the
+    /// VLAN it resolves.
+    pub fn addressed_public_hcx_vlan_mut(
+        &mut self,
+        vlan_name: &str,
+        action: EipVlanAction,
+    ) -> Result<&mut StoredVlan, ValidationException> {
+        let index = self.addressed_public_hcx_vlan_index(vlan_name, action)?;
+        Ok(&mut self.vlans[index])
     }
 
     /// The management IP address the next host of this environment takes: the lowest

@@ -52,6 +52,8 @@ mod eip_association_existence;
 mod eip_ec2_propagation;
 #[path = "all/eip_release_on_environment_deletion.rs"]
 mod eip_release_on_environment_deletion;
+#[path = "all/eip_vlan_gate.rs"]
+mod eip_vlan_gate;
 #[path = "all/entitlement_connector.rs"]
 mod entitlement_connector;
 #[path = "all/entitlement_vm_id_identity.rs"]
