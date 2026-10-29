@@ -4483,15 +4483,21 @@ impl LensShareRecord {
 ///
 /// Each resource kind holds its shares in its own map because the records differ (a
 /// workload share carries a permission and a workload, a lens share carries the lens's
-/// ARN, a profile share the profile's), while an invitation is named by its
-/// `ShareInvitationId` ALONE. This is what lets one resolution span every map and one
-/// answer path do the three things an answer needs of a share whatever resource it shares:
-/// read where it stands, move it, and project it as the invitation it raised.
+/// ARN, a profile share the profile's, a review-template share the template's), while an
+/// invitation is named by its `ShareInvitationId` ALONE. This is what lets one resolution
+/// span every map and one answer path do the three things an answer needs of a share
+/// whatever resource it shares: read where it stands, move it, and project it as the
+/// invitation it raised.
+///
+/// There is one variant per share map this store holds, so every invitation
+/// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::pending_share_invitations_for`]
+/// reports can be answered.
 #[derive(Debug)]
 pub enum ShareByInvitationMut<'a> {
     Workload(&'a mut WorkloadShareRecord),
     Lens(&'a mut LensShareRecord),
     Profile(&'a mut ProfileShareRecord),
+    Template(&'a mut TemplateShareRecord),
 }
 
 impl ShareByInvitationMut<'_> {
@@ -4501,6 +4507,7 @@ impl ShareByInvitationMut<'_> {
             Self::Workload(share) => &share.status,
             Self::Lens(share) => &share.status,
             Self::Profile(share) => &share.status,
+            Self::Template(share) => &share.status,
         }
     }
 
@@ -4510,6 +4517,7 @@ impl ShareByInvitationMut<'_> {
             Self::Workload(share) => share.status = status.to_string(),
             Self::Lens(share) => share.status = status.to_string(),
             Self::Profile(share) => share.status = status.to_string(),
+            Self::Template(share) => share.status = status.to_string(),
         }
     }
 
@@ -4520,6 +4528,7 @@ impl ShareByInvitationMut<'_> {
             Self::Workload(share) => share.to_invitation(),
             Self::Lens(share) => share.to_invitation(),
             Self::Profile(share) => share.to_invitation(),
+            Self::Template(share) => share.to_invitation(),
         }
     }
 }
@@ -4712,6 +4721,29 @@ impl TemplateShareRecord {
             profile_name: None,
             profile_arn: None,
             template_name: template_name.map(ToString::to_string),
+            template_arn: Some(self.template_arn.clone()),
+        }
+    }
+
+    /// The `ShareInvitation` projection `UpdateShareInvitation` answers with: the
+    /// invitation this share raised, named by its own `ShareInvitationId` and by the
+    /// review template it offers.
+    ///
+    /// The review-template counterpart of [`WorkloadShareRecord::to_invitation`],
+    /// [`LensShareRecord::to_invitation`] and [`ProfileShareRecord::to_invitation`],
+    /// filling only the members of the shared resource KIND: `ShareInvitation` carries one
+    /// member for a review template, `TemplateArn` — "The review template ARN" — and the
+    /// workload, lens and profile members belong to invitations of those kinds
+    /// (`smithy_query(query="shape", shape="ShareInvitation")`). The template's NAME is
+    /// not among them, which is why this projection needs nothing read off the template.
+    pub fn to_invitation(&self) -> ShareInvitation {
+        ShareInvitation {
+            share_invitation_id: Some(self.share_invitation_id.clone()),
+            share_resource_type: Some(TEMPLATE_SHARE_RESOURCE_TYPE.to_string()),
+            workload_id: None,
+            lens_alias: None,
+            lens_arn: None,
+            profile_arn: None,
             template_arn: Some(self.template_arn.clone()),
         }
     }
@@ -7940,10 +7972,10 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// names no resource and carries no resource kind, so it is resolved by its own id
     /// across every share this store holds — exactly the shares
     /// [`Self::pending_share_invitations_for`] reports invitations for, so the two sides
-    /// of one invitation cannot disagree about whether it exists. A kind whose shares this
-    /// store does not hold yet (a review-template share, whose create is a stub with its
-    /// own issue) joins both sides by being stored: it is then one more arm here and one
-    /// more map to look in, with the same two conditions.
+    /// of one invitation cannot disagree about whether it exists. Every share map this
+    /// store holds is therefore looked in, under the same two conditions, and a kind whose
+    /// shares it starts holding joins both sides at once: one more map to look in here and
+    /// one more arm of [`ShareByInvitationMut`].
     ///
     /// An invitation addressed to any other principal resolves to nothing — the same
     /// `None` as an id no share carries, so neither discloses the other.
@@ -7984,16 +8016,28 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                 .get_mut(&share_id)
                 .map(ShareByInvitationMut::Lens);
         }
-        let (profile_arn, share_id) = share_key_by_invitation(
+        if let Some((profile_arn, share_id)) = share_key_by_invitation(
             &self.profile_shares,
             share_invitation_id,
             principal,
             |share| (&share.share_invitation_id, &share.shared_with),
+        ) {
+            return self
+                .profile_shares
+                .get_mut(&profile_arn)?
+                .get_mut(&share_id)
+                .map(ShareByInvitationMut::Profile);
+        }
+        let (template_arn, share_id) = share_key_by_invitation(
+            &self.template_shares,
+            share_invitation_id,
+            principal,
+            |share| (&share.share_invitation_id, &share.shared_with),
         )?;
-        self.profile_shares
-            .get_mut(&profile_arn)?
+        self.template_shares
+            .get_mut(&template_arn)?
             .get_mut(&share_id)
-            .map(ShareByInvitationMut::Profile)
+            .map(ShareByInvitationMut::Template)
     }
 }
 

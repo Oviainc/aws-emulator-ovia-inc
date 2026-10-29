@@ -357,9 +357,10 @@ async fn invitations_narrow_by_resource_type_and_by_the_matching_name_prefix() {
 
     for resource_type in SHARE_RESOURCE_TYPES {
         // This suite seeds WORKLOAD shares only, so an invitation of another kind has
-        // never been offered here: a lens share raises its own `LENS` invitation (see
-        // `super::lens_shares`), while `CreateProfileShare` and `CreateTemplateShare` are
-        // still stubs with their own issues.
+        // never been offered here: a share of a lens, of a profile and of a review
+        // template raises an invitation of its own kind, each covered by that resource's
+        // own suite (`super::lens_shares`, `super::profile_shares`,
+        // `super::template_shares`).
         let expected = if resource_type == "WORKLOAD" { SEEDED } else { 0 };
         let listed = client
             .list_share_invitations(&format!("ShareResourceType={resource_type}"))
