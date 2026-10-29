@@ -312,6 +312,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A regular expression a rule carries has to BE a regular expression, by the
+        // same judgement the pattern-set path makes: an expression that does not parse
+        // is refused here, so nothing is stored and the lock token does not rotate.
+        if let Some(pattern) =
+            crate::state::unparseable_rule_regex(input.rules.as_deref().unwrap_or_default())
+        {
+            return Err(UpdateWebACLErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_regex_exception(crate::state::FIELD_STATEMENT, pattern),
+            )
+            .into());
+        }
+
         // A `ChallengeConfig` is "available at the web ACL level and in each rule",
         // and for the Challenge action the immunity time has a floor of its own,
         // above the modelled one that applies to a CAPTCHA immunity: a save carrying

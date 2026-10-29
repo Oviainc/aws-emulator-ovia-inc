@@ -79,6 +79,8 @@ mod regex_pattern_set_lifecycle;
 mod regex_pattern_set_listing;
 #[path = "all/regex_pattern_set_updates.rs"]
 mod regex_pattern_set_updates;
+#[path = "all/regex_syntax_validation.rs"]
+mod regex_syntax_validation;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/resource_untagging.rs"]

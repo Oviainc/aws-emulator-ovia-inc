@@ -189,6 +189,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Each submitted expression has to BE a regular expression: the modelled
+        // constraints on a `RegexString` bound its length only, so whether the text
+        // parses is judged here, before any state is written, and an expression that
+        // does not parse is the parameter WAF does not accept. Nothing is created,
+        // so no listing reports the name the refused request asked for.
+        if let Some(pattern) = crate::state::unparseable_regex(&input.regular_expression_list) {
+            return Err(CreateRegexPatternSetErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_regex_exception(
+                    crate::state::FIELD_REGEX_PATTERN_SET,
+                    pattern,
+                ),
+            )
+            .into());
+        }
+
         // A tag key under the prefix AWS reserves for its own system tags is refused
         // before anything is created, and so is a request carrying more tags than one
         // resource may hold: the same two judgements `TagResource` makes about the

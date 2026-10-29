@@ -2291,13 +2291,13 @@ fn compare_size(length: i64, size: i64, operator: &str) -> bool {
     }
 }
 
-/// The patterns of `patterns` compiled, dropping each one the crate cannot compile.
+/// The patterns of `patterns` compiled, dropping each one the engine cannot compile.
 ///
-/// `Regex$RegexString` is a regular expression, matched with the maintained `regex`
-/// crate under a compiled-size and a match-cache bound: a pattern is caller-supplied,
-/// and the crate's automaton has no backtracking, so a stored pattern can neither blow
-/// up the match time of a request nor be made to consume unbounded memory. A pattern
-/// the crate cannot compile matches nothing — there is no expression to match against.
+/// `Regex$RegexString` is a regular expression, compiled through
+/// [`crate::state::compile_regex`] — the one place this service turns a
+/// caller-supplied expression into something that matches, so an expression a save
+/// accepted is an expression this matches with. A pattern that does not compile
+/// matches nothing; the save path refuses one, so a stored set holds none.
 ///
 /// Compiled once per statement, which is why this answers a vector rather than
 /// matching: the compile is the expensive half and the candidate values of one request
@@ -2305,23 +2305,9 @@ fn compare_size(length: i64, size: i64, operator: &str) -> bool {
 fn compiled_regexes(patterns: &[String]) -> Vec<::regex::bytes::Regex> {
     patterns
         .iter()
-        .filter_map(|pattern| {
-            ::regex::bytes::RegexBuilder::new(pattern)
-                .size_limit(REGEX_SIZE_LIMIT)
-                .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
-                .build()
-                .ok()
-        })
+        .filter_map(|pattern| crate::state::compile_regex(pattern).ok())
         .collect()
 }
-
-/// Emulator resource guard, NOT an AWS quota: the largest compiled form this emulator
-/// builds for one caller-supplied regular expression.
-const REGEX_SIZE_LIMIT: usize = 1 << 20;
-
-/// Emulator resource guard, NOT an AWS quota: the largest cache the matcher may use
-/// while matching one value against one caller-supplied regular expression.
-const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20;
 
 /// The media type a `CustomResponseBody$ContentType` names, as a response header value
 /// (`ResponseContentType`: `APPLICATION_JSON`, `TEXT_HTML`, `TEXT_PLAIN`).

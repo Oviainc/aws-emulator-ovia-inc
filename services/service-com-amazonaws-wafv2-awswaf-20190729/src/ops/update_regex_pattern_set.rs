@@ -249,6 +249,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Each submitted expression has to BE a regular expression, exactly as at
+        // create: judged after the set and its token are resolved but BEFORE anything
+        // is written, so a refused update leaves the stored list and the stored token
+        // as they were.
+        if let Some(pattern) = crate::state::unparseable_regex(&input.regular_expression_list) {
+            crate::state::audit(
+                "UpdateRegexPatternSet",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFInvalidParameterException",
+            );
+            return Err(UpdateRegexPatternSetErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_regex_exception(
+                    crate::state::FIELD_REGEX_PATTERN_SET,
+                    pattern,
+                ),
+            )
+            .into());
+        }
+
         // "This operation completely replaces the mutable specifications that you
         // already have for the regex pattern set with the ones that you provide to
         // this call": `RegularExpressionList` becomes exactly the submitted list, in

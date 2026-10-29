@@ -239,6 +239,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A regular expression a rule carries has to BE a regular expression, by the
+        // same judgement the pattern-set path makes: an expression that does not parse
+        // is refused here, before any rule is stored, and the refusal names it.
+        if let Some(pattern) =
+            crate::state::unparseable_rule_regex(input.rules.as_deref().unwrap_or_default())
+        {
+            return Err(CreateRuleGroupErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_regex_exception(crate::state::FIELD_STATEMENT, pattern),
+            )
+            .into());
+        }
+
         // "You cannot use a rule group reference statement inside another rule
         // group" (`RuleGroupReferenceStatement`'s own doc), and "you cannot use a
         // managed rule group inside another rule group" (`ManagedRuleGroupStatement`'s),

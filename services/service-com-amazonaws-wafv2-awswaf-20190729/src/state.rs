@@ -24,7 +24,8 @@ use ::aws_smithy_schema_server::constraints::{
 use crate::ops::types::{
     BlockAction, ChallengeAction, ChallengeConfig, CountAction, IPSet, LabelSummary,
     LoggingConfiguration, ManagedProductDescriptor, ManagedRuleSet, MobileSdkRelease,
-    MonetizationFilter, OnSourceDDoSProtectionConfig, RegexPatternSet, Rule, RuleAction, RuleGroup,
+    MonetizationFilter, OnSourceDDoSProtectionConfig, Regex, RegexPatternSet, Rule, RuleAction,
+    RuleGroup,
     RuleSummary, SettlementRecord, Statement, Tag, TimeWindow, WAFAssociatedItemException,
     WAFDuplicateItemException, WAFExpiredManagedRuleGroupVersionException,
     WAFFeatureNotIncludedInPricingPlanException, WAFInvalidOperationException,
@@ -4306,6 +4307,10 @@ pub const FIELD_MANAGED_RULE_SET_STATEMENT: &str = "MANAGED_RULE_SET_STATEMENT";
 /// [`FIELD_RESOURCE_ARN`].
 pub const FIELD_SCOPE_VALUE: &str = "SCOPE_VALUE";
 
+/// The `ParameterExceptionField` value naming a regex pattern set. See
+/// [`FIELD_RESOURCE_ARN`].
+pub const FIELD_REGEX_PATTERN_SET: &str = "REGEX_PATTERN_SET";
+
 /// The `ParameterExceptionField` value naming a rule statement. See
 /// [`FIELD_RESOURCE_ARN`].
 pub const FIELD_STATEMENT: &str = "STATEMENT";
@@ -4484,13 +4489,18 @@ pub fn capacity_limit_exceeded_exception(required_capacity: i64) -> WAFInvalidPa
     )
 }
 
-/// The `ErrorReason` WAF carries for a value it cannot decode as an API key, as the
-/// recorded WAF responses show it.
-pub const KEY_FORMAT_NOT_VALID_REASON: &str = "The parameter contains formatting \
+/// The `ErrorReason` WAF carries for a parameter whose text it cannot read in the
+/// form that parameter has to take, as the recorded WAF responses show it.
+///
+/// One sentence for the whole class — a value that does not decode as an API key, a
+/// regular expression that does not parse — because the `Parameter` member carries
+/// the rejected text and `Field` the settings it was found in, so the reason does
+/// not have to distinguish them.
+pub const FORMAT_NOT_VALID_REASON: &str = "The parameter contains formatting \
      that is not valid.";
 
 /// [`invalid_parameter_exception`] for an API key value WAF cannot decode: the
-/// rejected value as `Parameter`, [`KEY_FORMAT_NOT_VALID_REASON`] as `Reason` and NO
+/// rejected value as `Parameter`, [`FORMAT_NOT_VALID_REASON`] as `Reason` and NO
 /// `Field` — `ParameterExceptionField` declares no value naming an API key
 /// (`smithy_query(query="shape",shape="ParameterExceptionField")`), so WAF leaves the
 /// member out, which its message renders as `field: null`.
@@ -4499,7 +4509,95 @@ pub const KEY_FORMAT_NOT_VALID_REASON: &str = "The parameter contains formatting
 /// by every operation that takes one, and is a different failure from a well-formed
 /// key naming nothing stored, which is [`nonexistent_item_exception`].
 pub fn invalid_key_format_exception(api_key: &str) -> WAFInvalidParameterException {
-    invalid_parameter_exception_without_field(api_key, KEY_FORMAT_NOT_VALID_REASON)
+    invalid_parameter_exception_without_field(api_key, FORMAT_NOT_VALID_REASON)
+}
+
+/// Emulator resource guard, NOT an AWS quota: the largest compiled form this
+/// emulator builds for one caller-supplied regular expression.
+const REGEX_SIZE_LIMIT: usize = 1 << 20;
+
+/// Emulator resource guard, NOT an AWS quota: the largest cache the matcher may use
+/// while matching one value against one caller-supplied regular expression.
+const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20;
+
+/// `pattern` compiled, or the engine's error for text that is not a regular
+/// expression.
+///
+/// The ONE place a caller-supplied expression becomes something that matches, so the
+/// engine that decides whether a stored pattern matches a request is the engine that
+/// decides, when the request that carries it is saved, whether it is an expression at
+/// all: no expression can be accepted by one and rejected by the other. Compiled with
+/// the maintained crate — the syntax this service documents for a `RegexString` is
+/// that crate's — under a compiled-size and a match-cache bound, because the pattern
+/// comes from the request.
+pub fn compile_regex(pattern: &str) -> Result<::regex::bytes::Regex, ::regex::Error> {
+    ::regex::bytes::RegexBuilder::new(pattern)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
+        .build()
+}
+
+/// A `RegexString` of `expressions` that is not a regular expression, if any (the
+/// first such the scan reaches).
+///
+/// `Regex$RegexString` is constrained by a length bound and `@pattern(".*")` only
+/// (`smithy_query(query="shape",shape="Regex")`), so the request boundary passes
+/// every byte sequence of legal length and whether the text is an expression at all
+/// is the service's own judgement, made where a save would store it.
+pub fn unparseable_regex(expressions: &[Regex]) -> Option<&str> {
+    expressions
+        .iter()
+        .filter_map(|expression| expression.regex_string.as_deref())
+        .find(|pattern| compile_regex(pattern).is_err())
+}
+
+/// A regular expression `rules` carries that does not parse, if any (the first such
+/// the walk reaches): a `RegexMatchStatement$RegexString` at any nesting depth, or
+/// one of the `ClientSideAction$ExemptUriRegularExpressions` a managed rule group's
+/// configuration carries.
+///
+/// Every expression a save would store is judged alike, whichever member carries it:
+/// a rule's own expression is as unmatchable as a pattern set's when it is not an
+/// expression.
+///
+/// Walked with an explicit worklist, like [`validate_statement_nesting`]: the tree is
+/// supplied by the request.
+pub fn unparseable_rule_regex(rules: &[Rule]) -> Option<&str> {
+    let mut pending: Vec<&Statement> = rules.iter().map(|rule| &rule.statement).collect();
+    while let Some(statement) = pending.pop() {
+        if let Some(regex_match) = statement.regex_match_statement.as_ref() {
+            if compile_regex(&regex_match.regex_string).is_err() {
+                return Some(&regex_match.regex_string);
+            }
+        }
+        if let Some(managed) = statement.managed_rule_group_statement.as_ref() {
+            for config in managed.managed_rule_group_configs.iter().flatten() {
+                let exempt = config
+                    .aws_managed_rules_anti_d_do_s_rule_set
+                    .as_ref()
+                    .and_then(|anti_ddos| {
+                        anti_ddos
+                            .client_side_action_config
+                            .challenge
+                            .exempt_uri_regular_expressions
+                            .as_deref()
+                    })
+                    .unwrap_or_default();
+                if let Some(pattern) = unparseable_regex(exempt) {
+                    return Some(pattern);
+                }
+            }
+        }
+        pending.extend(nested_statements(statement));
+    }
+    None
+}
+
+/// [`invalid_parameter_exception`] for a regular expression WAF cannot parse:
+/// `Field` the settings the expression was found in, `Parameter` the expression as
+/// the request wrote it and `Reason` [`FORMAT_NOT_VALID_REASON`].
+pub fn invalid_regex_exception(field: &str, pattern: &str) -> WAFInvalidParameterException {
+    invalid_parameter_exception(field, pattern, FORMAT_NOT_VALID_REASON)
 }
 
 /// [`invalid_parameter_exception`] for a parameter `ParameterExceptionField`

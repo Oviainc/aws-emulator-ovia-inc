@@ -210,6 +210,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A regular expression a rule carries has to BE a regular expression, exactly
+        // as on the save path: rules WAF would not run cannot be priced, so an
+        // expression that does not parse is refused here too. No audit record, because
+        // this call changes nothing.
+        if let Some(pattern) = crate::state::unparseable_rule_regex(&input.rules) {
+            return Err(CheckCapacityErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_regex_exception(crate::state::FIELD_STATEMENT, pattern),
+            )
+            .into());
+        }
+
         // These are "the rules you want to use in a RuleGroup or WebACL", so a rule's
         // own top-level statement may run a rule group (what a web ACL rule does), while
         // a rule-group-running statement reached THROUGH a nesting is the misplacement
