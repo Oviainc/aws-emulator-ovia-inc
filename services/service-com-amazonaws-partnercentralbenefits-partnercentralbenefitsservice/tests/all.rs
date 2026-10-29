@@ -33,6 +33,8 @@ mod benefit_application_lifecycle;
 mod benefit_catalog_record;
 #[path = "all/catalog_refusal_one_construction.rs"]
 mod catalog_refusal_one_construction;
+#[path = "all/catalog_resolution_one_accessor.rs"]
+mod catalog_resolution_one_accessor;
 #[path = "all/cancel_client_token_idempotency.rs"]
 mod cancel_client_token_idempotency;
 #[path = "all/client_token_idempotency.rs"]

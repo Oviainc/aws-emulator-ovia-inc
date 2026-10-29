@@ -198,19 +198,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::page_size(input.max_results);
 
         let mut store = state.lock();
-        // The catalog the request names is resolved FIRST: the allocations this reports
-        // live inside a catalog, so a catalog that does not exist is the missing resource
-        // and is what the answer names — see [`crate::state::catalog_refusal`].
-        if let Some(missing) = store.catalog_refusal(&input.catalog) {
-            return Err(
-                ListBenefitAllocationsErrorModeled::ResourceNotFoundException(missing).into(),
-            );
-        }
         // An allocation past its `ExpiresAt` is no longer usable whether or not anybody
         // has looked at it, so this report first materialises the expiries the clock has
         // ALREADY made due; it writes nothing else, and a later caller sees exactly what
-        // this one did. See `crate::state::BenefitAllocation::expire_due`.
+        // this one did. See `crate::state::BenefitAllocation::expire_due`. A catalog this
+        // store does not hold carries no allocation, so this is a no-op for exactly the
+        // requests the resolution below refuses.
         store.expire_allocations_due(&input.catalog, now_millis);
+
+        // The catalog the request names, resolved ONCE: the allocations this reports live
+        // inside a catalog, so a catalog that does not exist is the missing resource and is
+        // what the answer names, and the record this resolution found is what the listing
+        // below walks — see
+        // [`crate::state::ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState::catalog`].
+        let catalog = match store.catalog(&input.catalog) {
+            Ok(catalog) => catalog,
+            Err(missing) => {
+                return Err(
+                    ListBenefitAllocationsErrorModeled::ResourceNotFoundException(missing).into(),
+                )
+            }
+        };
 
         // `BenefitIdentifiers` accepts either form the modelled `BenefitId` allows and
         // `BenefitApplicationIdentifiers` either form `BenefitApplicationIdentifier`
@@ -222,17 +230,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.benefit_application_identifiers.as_ref(),
             |identifier| store.resolve_application_id(&input.catalog, identifier),
         );
-
-        // The catalog itself: present, since the lookup above found it and nothing since
-        // could have removed it (the store is locked for the whole body).
-        let Some(catalog) = store.catalogs.get(&input.catalog) else {
-            return Err(ListBenefitAllocationsErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: crate::state::STORE_UNAVAILABLE.to_string(),
-                },
-            )
-            .into());
-        };
         let benefit_filter = crate::state::supplied_filter(
             input.benefit_identifiers.as_ref(),
             |identifier| catalog.resolve_benefit_id(&input.catalog, &region, identifier),

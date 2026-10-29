@@ -200,25 +200,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::page_size(input.max_results);
 
         let store = state.lock();
-        // The catalog the request names is resolved FIRST: the applications this reports
-        // live inside a catalog, so a catalog that does not exist is the missing resource
-        // and is what the answer names — see [`crate::state::catalog_refusal`].
-        if let Some(missing) = store.catalog_refusal(&input.catalog) {
-            return Err(
-                ListBenefitApplicationsErrorModeled::ResourceNotFoundException(missing).into(),
-            );
-        }
-        // The catalog itself: present, since the lookup above found it and nothing since
-        // could have removed it (the store is locked for the whole body).
-        let Some(catalog) = store.catalogs.get(&input.catalog) else {
-            return Err(
-                ListBenefitApplicationsErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: crate::state::STORE_UNAVAILABLE.to_string(),
-                    },
+        // The catalog the request names is resolved FIRST, and ONCE: the applications this
+        // reports live inside a catalog, so a catalog that does not exist is the missing
+        // resource and is what the answer names, and the record this resolution found is
+        // what the listing below walks — see
+        // [`crate::state::ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState::catalog`].
+        let catalog = match store.catalog(&input.catalog) {
+            Ok(catalog) => catalog,
+            Err(missing) => {
+                return Err(
+                    ListBenefitApplicationsErrorModeled::ResourceNotFoundException(missing).into(),
                 )
-                .into(),
-            );
+            }
         };
 
         // A `NextToken` only resumes this listing when it is a cursor this service issued

@@ -265,15 +265,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_millis();
 
         let mut store = state.lock();
-        // The catalog the request names is resolved FIRST: the application this create
-        // would mint lives inside a catalog, so a catalog that does not exist is the
-        // missing resource and is what the answer names — see
-        // [`crate::state::catalog_refusal`].
-        if let Some(missing) = store.catalog_refusal(&input.catalog) {
-            return Err(
-                CreateBenefitApplicationErrorModeled::ResourceNotFoundException(missing).into(),
-            );
-        }
+        // The catalog the request names is resolved FIRST, and ONCE: the application this
+        // create would mint lives inside a catalog, so a catalog that does not exist is the
+        // missing resource and is what the answer names, and the record this resolution
+        // found is the one the benefit below is looked up in — see
+        // [`crate::state::ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState::catalog`].
+        let catalog = match store.catalog(&input.catalog) {
+            Ok(catalog) => catalog,
+            Err(missing) => {
+                return Err(
+                    CreateBenefitApplicationErrorModeled::ResourceNotFoundException(missing).into(),
+                )
+            }
+        };
 
         // The identity of this REQUEST, which is what the `ClientToken` below is judged
         // against: every member the request carries other than the token itself. The
@@ -370,22 +374,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(None) => {}
         }
 
-        // Everything this create reads from the catalog is resolved here, inside one
-        // borrow that ends before the mint and the insert below take a mutable one.
+        // Everything this create reads from the catalog is read here, through the borrow
+        // the resolution above took, which ends before the mint and the insert below take a
+        // mutable one.
         let (benefit_id, programs) = {
-            // The catalog itself: present, since the lookup above found it and nothing
-            // since could have removed it (the store is locked for the whole body).
-            let Some(catalog) = store.catalogs.get(&input.catalog) else {
-                return Err(
-                    CreateBenefitApplicationErrorModeled::InternalServerException(
-                        InternalServerException {
-                            message: crate::state::STORE_UNAVAILABLE.to_string(),
-                        },
-                    )
-                    .into(),
-                );
-            };
-
             // The application requests ONE benefit of this catalog, named either by its
             // bare `ben-...` id or by the ARN this service issues for it in the region the
             // request addressed; anything the catalog does not hold is a 404.
