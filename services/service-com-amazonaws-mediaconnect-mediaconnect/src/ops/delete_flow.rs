@@ -9,6 +9,14 @@
 //! (`Status` carries no terminal `DELETED` value, unlike `GatewayState`, so a deleted flow
 //! is a record the store no longer holds rather than one reporting a deleted state.)
 //!
+//! The delete is refused with the same modelled `BadRequestException` (400) while a BRIDGE
+//! the store holds names the flow in a flow source: that reference is a required member of
+//! the stored source and every path that writes one resolves it against this store, so
+//! taking the flow away would leave the bridge pointing at nothing — see
+//! [`crate::state::ComAmazonawsMediaconnectMediaconnectState::flow_bridge_source_rejection`].
+//! The router references into the flow are OPTIONAL and so are dropped instead, with the one
+//! repair every removal of a flow, a flow source or a flow output performs.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -194,7 +202,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The ARN this call answers with is the STORED flow's own, so it is read off the
+        // record before anything is written.
         let flow_arn = flow.flow_arn.clone();
+
+        // A bridge's flow source names this flow in a REQUIRED member, resolved against this
+        // store by every path that writes such a source, so a reference that outlived the
+        // flow could not be dropped off the bridge and no later call could restate it. The
+        // delete is refused while one exists, as it is for the other required reference this
+        // store resolves (`crate::state::ComAmazonawsMediaconnectMediaconnectState::associated_router_resource_rejection`),
+        // and the flow is left exactly as it was.
+        if let Some(detail) = store.flow_bridge_source_rejection(&flow_arn) {
+            return Err(DeleteFlowErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: crate::state::bad_request_message(&detail),
+                },
+            )
+            .into());
+        }
+
         store.flows.remove(&input.flow_arn);
         // The flow goes, and its sources and outputs go with it, so every record of this
         // store that NAMED one of them stops naming it: the references go with the resources

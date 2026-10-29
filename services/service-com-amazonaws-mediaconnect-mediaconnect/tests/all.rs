@@ -197,3 +197,5 @@ mod flow_removal_clears_router_references;
 mod remove_source_keeps_failover_resolvable;
 #[path = "all/bridge_output_network_name_paths_agree.rs"]
 mod bridge_output_network_name_paths_agree;
+#[path = "all/flow_deletion_bridge_source_integrity.rs"]
+mod flow_deletion_bridge_source_integrity;

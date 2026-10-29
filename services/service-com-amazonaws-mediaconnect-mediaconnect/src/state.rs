@@ -6082,6 +6082,52 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         }
     }
 
+    /// Why the flow `flow_arn` cannot be taken out of the store yet, or `None` when no
+    /// bridge the store holds names it.
+    ///
+    /// A bridge's flow source names the cloud flow it takes its content from in a REQUIRED
+    /// member (`BridgeFlowSource$FlowArn`, "the ARN of the cloud flow used as a source of
+    /// this bridge"), and every path that writes such a source resolves that member against
+    /// this store rather than taking it on trust (CreateBridge's and AddBridgeSources'
+    /// [`Self::bridge_source_reference_rejection`], UpdateBridgeSource's
+    /// [`Self::unknown_flow_rejection`]). Taking the flow away while a bridge still names it
+    /// would therefore leave that bridge holding a reference nothing resolves, which no later
+    /// call could even restate; and unlike a router input's or a router output's connection to
+    /// a flow, which the model makes optional and which a removal therefore DROPS
+    /// ([`Self::clear_unresolvable_flow_references`]), a required member cannot be dropped off
+    /// the record. So the removal is refused while a bridge source names the flow — the same
+    /// reading of the two halves [`Self::associated_router_resource_rejection`] applies to a
+    /// router network interface — and the caller clears the reference first, by removing those
+    /// bridge sources, pointing them at another flow or deleting the bridges.
+    pub fn flow_bridge_source_rejection(&self, flow_arn: &str) -> Option<String> {
+        let bridges = self.bridge_flow_source_count(flow_arn);
+        if bridges == 0 {
+            return None;
+        }
+        Some(format!(
+            "Flow {flow_arn} is still the source of {bridges} bridge(s). Remove those bridge \
+             sources, point them at another flow, or delete the bridges, before deleting the \
+             flow."
+        ))
+    }
+
+    /// How many bridges hold a flow source naming the flow `flow_arn` — the store's ONE
+    /// reading of that relation, which [`Self::flow_bridge_source_rejection`] states its
+    /// refusal from.
+    pub fn bridge_flow_source_count(&self, flow_arn: &str) -> usize {
+        self.bridges
+            .values()
+            .filter(|bridge| {
+                bridge.sources.iter().any(|source| {
+                    source
+                        .flow_source
+                        .as_ref()
+                        .is_some_and(|flow_source| flow_source.flow_arn == flow_arn)
+                })
+            })
+            .count()
+    }
+
     /// The modelled `RouterNetworkInterface` the store holds for `arn`, with both
     /// association counts resolved — the one projection every router network interface
     /// operation answers from, so no two of them can report one interface differently.
