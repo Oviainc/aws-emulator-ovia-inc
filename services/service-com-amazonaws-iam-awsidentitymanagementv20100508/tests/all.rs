@@ -59,6 +59,8 @@ mod fixed_refusal_wording;
 mod group_attached_policies;
 #[path = "all/group_attached_policy_listing.rs"]
 mod group_attached_policy_listing;
+#[path = "all/group_attached_policy_removal.rs"]
+mod group_attached_policy_removal;
 #[path = "all/group_creation.rs"]
 mod group_creation;
 #[path = "all/group_deletion.rs"]
