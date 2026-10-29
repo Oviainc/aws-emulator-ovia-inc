@@ -109,12 +109,21 @@ async fn accept(
 
 /// The `(environment, bandwidth, region)` rows both writers are driven over: every
 /// bandwidth of every environment that takes a connection, alternating the Region.
-fn rows(catalog: &[Value]) -> Vec<(Value, String, &'static str)> {
+///
+/// Each row carries the Environment ITS OWN Region's endpoint offers for that partner
+/// offering, because an Environment belongs to the Region whose connections it
+/// produces.
+async fn rows(emulator: &Emulator) -> Vec<(Value, String, &'static str)> {
+    let catalog = emulator.environments().await;
     let mut out = Vec::new();
-    for environment in creatable_environments(catalog) {
+    for environment in creatable_environments(&catalog) {
         for bandwidth in available_bandwidths(&environment) {
             let region = REGIONS[out.len() % REGIONS.len()];
-            out.push((environment.clone(), bandwidth, region));
+            out.push((
+                emulator.counterpart_in(region, &environment).await,
+                bandwidth,
+                region,
+            ));
         }
     }
     assert!(
@@ -146,11 +155,10 @@ fn identifier_of(attach_point: &Value) -> String {
 #[tokio::test]
 async fn both_attach_point_writers_answer_one_gateway_verdict_the_same_way() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
     let held = gateways.first().expect("the account holds a gateway").clone();
 
-    for (environment, bandwidth, region) in rows(&catalog) {
+    for (environment, bandwidth, region) in rows(&emulator).await {
         let environment_id = text(&environment, "environmentId");
 
         // Rows differ in the SHAPE of the identifier that is not an attach point of the
@@ -266,11 +274,11 @@ async fn both_attach_point_writers_report_an_unreadable_account_the_same_way() {
     let mounted = Emulator::on_engine(Arc::clone(&engine));
     let degraded = Emulator::interconnect_only(engine);
 
-    let catalog = mounted.environments().await;
     let gateways = mounted.ready_gateways(&GATEWAY_ROWS).await;
     let held = gateways.first().expect("the account holds a gateway").clone();
 
-    for (environment, bandwidth, region) in rows(&catalog) {
+    let table = rows(&mounted).await;
+    for (environment, bandwidth, region) in table.clone() {
         let environment_id = text(&environment, "environmentId");
         let case = format!("{environment_id} / {bandwidth} / {region}");
         let attach_point = json!({ "directConnectGateway": held });
@@ -354,7 +362,7 @@ async fn both_attach_point_writers_report_an_unreadable_account_the_same_way() {
     let total: usize = counted.values().sum();
     assert_eq!(
         total,
-        rows(&catalog).len(),
+        table.len(),
         "case \"store\": expected only the proposals the mounted door created, got {counted:?}"
     );
 }

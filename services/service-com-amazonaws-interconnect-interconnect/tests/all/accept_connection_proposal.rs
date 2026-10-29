@@ -113,10 +113,15 @@ impl AcceptCase {
 /// connection, alternating the Region, the gateway the proposal is created on, the
 /// gateway its acceptance selects, the presence of the optional description and the
 /// two tag sets.
-fn accept_table(catalog: &[Value], gateways: &[String]) -> Vec<AcceptCase> {
+///
+/// Each row carries the Environment ITS OWN Region's endpoint offers for that partner
+/// offering: an Environment belongs to the Region whose connections it produces, so a
+/// create signed for a Region names that Region's own `environmentId`.
+async fn accept_table(emulator: &Emulator, gateways: &[String]) -> Vec<AcceptCase> {
+    let catalog = emulator.environments().await;
     let mut rows = Vec::new();
     let mut seed = 0usize;
-    for environment in creatable_environments(catalog) {
+    for environment in creatable_environments(&catalog) {
         for bandwidth in available_bandwidths(&environment) {
             seed += 1;
             let created_on = gateways[seed % gateways.len()].clone();
@@ -128,7 +133,9 @@ fn accept_table(catalog: &[Value], gateways: &[String]) -> Vec<AcceptCase> {
                 gateways[(seed + 1) % gateways.len()].clone()
             };
             rows.push(AcceptCase {
-                environment: environment.clone(),
+                environment: emulator
+                    .counterpart_in(REGIONS[seed % REGIONS.len()], &environment)
+                    .await,
                 bandwidth,
                 region: REGIONS[seed % REGIONS.len()],
                 created_on,
@@ -260,9 +267,8 @@ async fn read_back(emulator: &Emulator, region: &str, identifier: &str) -> Value
 #[tokio::test]
 async fn accepting_a_proposal_makes_the_connection_its_activation_key_names() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let table = accept_table(&catalog, &gateways);
+    let table = accept_table(&emulator, &gateways).await;
     assert!(
         table.len() >= 4,
         "the acceptance table must span several environments and bandwidths, got {} rows",
@@ -407,9 +413,8 @@ async fn accepting_a_proposal_makes_the_connection_its_activation_key_names() {
 #[tokio::test]
 async fn an_acceptance_may_select_an_attach_point_by_arn() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let table = accept_table(&catalog, &gateways);
+    let table = accept_table(&emulator, &gateways).await;
 
     // Rows differ in the Region the ARN is minted in and addressed from, and in the
     // environment and bandwidth the proposal was made on.
@@ -465,9 +470,9 @@ async fn accepting_a_key_that_names_no_proposal_is_refused_and_makes_nothing() {
     use service_com_amazonaws_interconnect_interconnect::state::proposal_not_retrievable_message;
 
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let case = accept_table(&catalog, &gateways)
+    let case = accept_table(&emulator, &gateways)
+        .await
         .into_iter()
         .next()
         .expect("the acceptance table has rows");
@@ -608,9 +613,8 @@ async fn accepting_a_key_that_names_no_proposal_is_refused_and_makes_nothing() {
 #[tokio::test]
 async fn an_attach_point_that_resolves_to_nothing_is_refused_and_accepts_nothing() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let table = accept_table(&catalog, &gateways);
+    let table = accept_table(&emulator, &gateways).await;
     let case = table.first().expect("the acceptance table has rows").clone();
     let account = engine::EMULATOR_ACCOUNT_ID;
     let region = case.region;
@@ -714,9 +718,8 @@ async fn an_attach_point_that_resolves_to_nothing_is_refused_and_accepts_nothing
 #[tokio::test]
 async fn an_accepted_proposal_is_accepted_again_only_as_the_same_acceptance() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let table = accept_table(&catalog, &gateways);
+    let table = accept_table(&emulator, &gateways).await;
 
     for case in table.iter().take(REGIONS.len() * 2) {
         let label = case.label();

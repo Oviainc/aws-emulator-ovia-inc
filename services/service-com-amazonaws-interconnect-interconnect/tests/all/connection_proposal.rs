@@ -122,23 +122,29 @@ impl ProposalCase {
 /// The proposal table: every bandwidth of every environment that can take a
 /// connection, alternating the gateway the connection is attached to, the presence of
 /// the optional description, and the region the request is signed for.
-fn proposal_table(catalog: &[Value], gateways: &[String]) -> Vec<ProposalCase> {
+///
+/// Each row carries the Environment ITS OWN Region's endpoint offers for that partner
+/// offering, because an Environment belongs to the Region whose connections it
+/// produces.
+async fn proposal_table(emulator: &Emulator, gateways: &[String]) -> Vec<ProposalCase> {
+    let catalog = emulator.environments().await;
     let mut rows = Vec::new();
     let mut seed = 0usize;
-    for environment in catalog {
+    for environment in &catalog {
         if text(environment, "state") == "unavailable" {
             continue;
         }
         for bandwidth in available_bandwidths(environment) {
             seed += 1;
+            let region = if seed.is_multiple_of(2) {
+                "eu-west-1"
+            } else {
+                "us-east-1"
+            };
             rows.push(ProposalCase {
-                environment: environment.clone(),
+                environment: emulator.counterpart_in(region, environment).await,
                 bandwidth,
-                region: if seed.is_multiple_of(2) {
-                    "eu-west-1"
-                } else {
-                    "us-east-1"
-                },
+                region,
                 attach_point: json!({
                     "directConnectGateway": gateways[seed % gateways.len()]
                 }),
@@ -211,9 +217,8 @@ fn assert_proposal_matches(case: &str, proposal: &Value, environment: &Value, ba
 #[tokio::test]
 async fn describe_connection_proposal_reports_the_proposal_each_activation_key_names() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let table = proposal_table(&catalog, &gateways);
+    let table = proposal_table(&emulator, &gateways).await;
     assert!(
         table.len() >= 4,
         "the proposal table must span several environments and bandwidths, got {} rows",
@@ -417,9 +422,8 @@ async fn a_deleted_connections_activation_key_names_no_proposal() {
     };
 
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let table = proposal_table(&catalog, &gateways);
+    let table = proposal_table(&emulator, &gateways).await;
     assert!(
         table.len() >= 4,
         "the proposal table must span several environments and bandwidths, got {} rows",
@@ -539,9 +543,9 @@ async fn describe_connection_proposal_refuses_a_key_that_names_no_proposal() {
     use service_com_amazonaws_interconnect_interconnect::state::proposal_not_retrievable_message;
 
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let case = proposal_table(&catalog, &gateways)
+    let case = proposal_table(&emulator, &gateways)
+        .await
         .into_iter()
         .next()
         .expect("the proposal table has rows");

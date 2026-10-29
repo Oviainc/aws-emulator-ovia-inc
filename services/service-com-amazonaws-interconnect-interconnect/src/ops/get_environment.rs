@@ -131,25 +131,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(GetEnvironmentErrorModeled::InterconnectServerException(
-                InterconnectServerException {
-                    message: "the Interconnect environment catalog is not mounted on this engine"
-                        .to_string(),
-                },
-            )
-            .into());
-        };
+        // The record the called Region's catalog holds for this id. An Environment
+        // produces connections that land in ONE AWS Region — the Region of the endpoint
+        // that offers it — so the id is resolved in the catalog of the Region this
+        // request was signed for, which is the catalog `ListEnvironments` answered from.
+        let region = crate::state::request_region(ctx);
+        // Environments are AWS-managed (the model binds no `CreateEnvironment`), so the
+        // catalog is the fixed function `crate::state::environment_catalog` of that
+        // Region and nothing of this service's own store is read or written here.
+        let _ = &self.engine;
 
-        // The SAME record ListEnvironments returns for this id, looked up in the
-        // seeded catalog. There is nothing to synthesize for an id the catalog does
-        // not hold, because no operation creates an Environment: an unresolvable
-        // environment is this service's own client fault, so it is the 400
-        // `InterconnectClientException` every environment-resolving operation gives,
-        // with the message built from the requested id.
-        let found = state.lock().environments.get(&input.id).cloned();
-        let Some(environment) = found else {
+        // There is nothing to synthesize for an id that Region's catalog does not hold,
+        // because no operation creates an Environment: an unresolvable environment is
+        // this service's own client fault, so it is the 400 `InterconnectClientException`
+        // every environment-resolving operation gives, with the message built from the
+        // requested id. An id out of ANOTHER Region's catalog is answered that way too —
+        // it names an Environment whose connections land somewhere this endpoint cannot
+        // place them.
+        let Some(environment) = crate::state::environment_in_region(&region, &input.id) else {
             return Err(GetEnvironmentErrorModeled::InterconnectClientException(
                 InterconnectClientException {
                     message: crate::state::environment_not_found_message(&input.id),

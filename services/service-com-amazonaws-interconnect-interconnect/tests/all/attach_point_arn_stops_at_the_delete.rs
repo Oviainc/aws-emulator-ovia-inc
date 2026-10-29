@@ -25,7 +25,7 @@ use serde_json::{json, Map, Value};
 
 use service_com_amazonaws_interconnect_interconnect::state::attach_point_not_valid_message;
 
-use crate::emulator::{code, message, placements, remote_account_for, text, Emulator};
+use crate::emulator::{code, message, placements_in, remote_account_for, text, Emulator};
 
 /// The Regions the rows sign their requests for, so the rule is checked across the
 /// Region the ARN carries as well as across the state of the connection it names.
@@ -62,7 +62,9 @@ async fn create_in(
     request.insert("environmentId".to_string(), json!(placement.0));
     request.insert("bandwidth".to_string(), json!(placement.1));
     request.insert("attachPoint".to_string(), attach_point.clone());
-    if let Some(remote_account) = remote_account_for(&emulator.environment(&placement.0).await) {
+    if let Some(remote_account) =
+        remote_account_for(&emulator.environment_in(region, &placement.0).await)
+    {
         request.insert("remoteAccount".to_string(), remote_account);
     }
     emulator
@@ -189,11 +191,13 @@ fn assert_not_an_attach_point(
 #[tokio::test]
 async fn a_create_refuses_an_attach_point_arn_whose_delete_was_called() {
     let emulator = Emulator::new();
-    let places = placements(&emulator).await;
     let mut torn_down_mid_flight = 0usize;
 
     for (seed, offering) in OFFERINGS.into_iter().enumerate() {
         for (offset, region) in REGIONS.iter().enumerate() {
+            // The row's placement comes from the catalog of its OWN Region: an
+            // Environment belongs to the Region whose endpoint offers it.
+            let places = placements_in(&emulator, region).await;
             let placement = &places[(seed * REGIONS.len() + offset) % places.len()];
             let case = format!("{offering:?} / {region} / {} / {}", placement.0, placement.1);
 
@@ -270,10 +274,10 @@ async fn a_create_refuses_an_attach_point_arn_whose_delete_was_called() {
 #[tokio::test]
 async fn a_connection_being_torn_down_is_still_readable_by_its_arn() {
     let emulator = Emulator::new();
-    let places = placements(&emulator).await;
     let mut rows_inside_the_window = 0usize;
 
     for (seed, region) in REGIONS.iter().enumerate() {
+        let places = placements_in(&emulator, region).await;
         let placement = &places[seed % places.len()];
         let case = format!("{region} / {} / {}", placement.0, placement.1);
         let doomed = live_connection(&emulator, region, placement).await;
@@ -322,10 +326,10 @@ async fn a_connection_being_torn_down_is_still_readable_by_its_arn() {
 #[tokio::test]
 async fn an_acceptance_refuses_an_attach_point_arn_whose_delete_was_called() {
     let emulator = Emulator::new();
-    let places = placements(&emulator).await;
 
     for (seed, offering) in OFFERINGS.into_iter().enumerate() {
         for (offset, region) in REGIONS.iter().enumerate() {
+            let places = placements_in(&emulator, region).await;
             let placement = &places[(seed * REGIONS.len() + offset + 1) % places.len()];
             let case = format!("{offering:?} / {region} / {} / {}", placement.0, placement.1);
 

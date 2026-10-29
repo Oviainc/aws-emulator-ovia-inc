@@ -389,7 +389,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // under the SAME lock the verdict was made under: it is what scopes
                 // the attach-point judgement below, which runs off the lock.
                 StoreVerdict::Accept { environment_id, .. } => {
-                    let environment = store.environments.get(&environment_id).cloned();
+                    // Resolved in the catalog of the Region the proposal's connection
+                    // belongs to, which is the Region this acceptance was signed for:
+                    // an Environment produces connections that land in its own Region.
+                    let environment =
+                        crate::state::environment_in_region(&region, &environment_id);
                     (environment_id, environment)
                 }
             }

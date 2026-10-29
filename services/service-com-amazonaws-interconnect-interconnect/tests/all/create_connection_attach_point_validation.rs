@@ -98,10 +98,10 @@ async fn stored_connections(emulator: &Emulator) -> Vec<Value> {
     }
 }
 
-/// The `identifier`s `ListAttachPoints` reports for `environment_id`.
-async fn listed_identifiers(emulator: &Emulator, environment_id: &str) -> Vec<String> {
+/// The `identifier`s `ListAttachPoints` reports for `environment_id` in `region`.
+async fn listed_identifiers(emulator: &Emulator, region: &str, environment_id: &str) -> Vec<String> {
     emulator
-        .attach_points(environment_id)
+        .attach_points_in(region, environment_id)
         .await
         .iter()
         .map(|descriptor| text(descriptor, "identifier"))
@@ -140,11 +140,14 @@ async fn an_attach_point_that_resolves_to_nothing_is_refused_and_provisions_noth
     // Region, one in another account.
     let account = engine::EMULATOR_ACCOUNT_ID;
     for (index, environment) in environments.iter().enumerate() {
+        let region = REGIONS[index % REGIONS.len()];
+        // The Environment this row's Region offers for that partner offering: an
+        // Environment belongs to the Region whose connections it produces.
+        let environment = &emulator.counterpart_in(region, environment).await;
         let environment_id = text(environment, "environmentId");
         let bandwidths = available_bandwidths(environment);
         let bandwidth = bandwidths[index % bandwidths.len()].clone();
-        let region = REGIONS[index % REGIONS.len()];
-        let listed = listed_identifiers(&emulator, &environment_id).await;
+        let listed = listed_identifiers(&emulator, region, &environment_id).await;
         assert!(
             listed.contains(&owned),
             "case {environment_id:?}: expected the account's gateway to be a listed attach point, got {listed:?}"
@@ -244,9 +247,10 @@ async fn every_listed_attach_point_is_accepted_and_read_back() {
 
     let mut rows = 0usize;
     for (index, environment) in creatable_environments(&catalog).iter().enumerate() {
-        let environment_id = text(environment, "environmentId");
         let region = REGIONS[index % REGIONS.len()];
-        let listed = listed_identifiers(&emulator, &environment_id).await;
+        let environment = &emulator.counterpart_in(region, environment).await;
+        let environment_id = text(environment, "environmentId");
+        let listed = listed_identifiers(&emulator, region, &environment_id).await;
         for bandwidth in available_bandwidths(environment) {
             for identifier in &listed {
                 let case = format!("{environment_id} / {bandwidth} / {identifier} / {region}");
@@ -309,7 +313,9 @@ async fn a_connection_of_the_account_is_an_attach_point_by_arn() {
     // environment (and so in the `ConnectionId` prefix the ARN carries) and in the
     // bandwidth.
     for (index, region) in REGIONS.iter().enumerate() {
-        let environment = &environments[index % environments.len()];
+        let environment = &emulator
+            .counterpart_in(region, &environments[index % environments.len()])
+            .await;
         let environment_id = text(environment, "environmentId");
         let bandwidths = available_bandwidths(environment);
         let bandwidth = bandwidths[index % bandwidths.len()].clone();

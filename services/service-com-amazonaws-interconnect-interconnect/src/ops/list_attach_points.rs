@@ -141,30 +141,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx);
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(ListAttachPointsErrorModeled::InterconnectServerException(
-                InterconnectServerException {
-                    message: "the Interconnect environment catalog is not mounted on this engine"
-                        .to_string(),
-                },
-            )
-            .into());
-        };
+        // The attach points come from the service that owns the account's gateways and
+        // the Environment from the called Region's catalog, so this operation reads
+        // nothing of this service's own store.
+        let _ = &self.engine;
 
         // The attach points are listed FOR an Environment, so the catalog record the
-        // `environmentId` names is what the listing is scoped by — and an id the catalog
-        // does not hold has no Environment to list anything for. An unresolvable
-        // environment is this service's own client fault — the caller named an
-        // environment model that does not exist — so it is the 400
-        // `InterconnectClientException` every environment-resolving operation gives,
-        // never the connection-scoped 404 and never an empty page, which a caller
-        // could not tell from "this environment offers none". @readonly: nothing here
-        // writes to this service's store, and Environments are AWS-managed (the model
-        // binds no CreateEnvironment), so there is nothing the clock owes either. The
-        // guard is dropped before the cross-service read below, so no lock is held
-        // across an await.
-        let environment = state.lock().environments.get(&input.environment_id).cloned();
-        let Some(environment) = environment else {
+        // `environmentId` names is what the listing is scoped by — looked up in the
+        // catalog of the Region this request was signed for, because an Environment
+        // produces connections that land in that Region alone. An id that Region's
+        // catalog does not hold, one of another Region's catalog included, has no
+        // Environment here to list anything for. An unresolvable environment is this
+        // service's own client fault — the caller named an environment model that does
+        // not exist — so it is the 400 `InterconnectClientException` every
+        // environment-resolving operation gives, never the connection-scoped 404 and
+        // never an empty page, which a caller could not tell from "this environment
+        // offers none". @readonly: nothing here writes to this service's store, and
+        // Environments are AWS-managed (the model binds no CreateEnvironment), so there
+        // is nothing the clock owes either.
+        let Some(environment) = crate::state::environment_in_region(&region, &input.environment_id)
+        else {
             return Err(ListAttachPointsErrorModeled::InterconnectClientException(
                 InterconnectClientException {
                     message: crate::state::environment_not_found_message(&input.environment_id),

@@ -29,7 +29,7 @@ use service_com_amazonaws_interconnect_interconnect::state::{
 };
 
 use crate::emulator::{
-    code, message, placements, remote_account_for, text, Emulator, DEFAULT_SIGNING_REGION,
+    code, message, placements_in, remote_account_for, text, Emulator, DEFAULT_SIGNING_REGION,
 };
 
 /// The account id every emulator ARN carries.
@@ -98,22 +98,28 @@ impl RegionCase {
     }
 }
 
-/// The table: every `(environmentId, bandwidth)` the live catalog offers, each row
-/// placed in the next region of [`CREATE_REGIONS`] so the rows differ in the region
-/// as well as in the environment and the bandwidth.
+/// The table: for every Region under test, the `(environmentId, bandwidth)` pairs ITS
+/// OWN endpoint offers — an Environment belongs to the Region whose connections it
+/// produces — so the rows differ in the region as well as in the environment and the
+/// bandwidth.
 async fn region_table(emulator: &Emulator) -> Vec<RegionCase> {
     let attach_point = emulator.attach_point().await;
     let mut rows = Vec::new();
-    for (seed, (environment_id, bandwidth)) in placements(emulator).await.into_iter().enumerate() {
-        let remote_account = remote_account_for(&emulator.environment(&environment_id).await);
-        rows.push(RegionCase {
-            region: CREATE_REGIONS[seed % CREATE_REGIONS.len()],
-            environment_id,
-            bandwidth,
-            attach_point: attach_point.clone(),
-            remote_account,
-            seed,
-        });
+    let mut seed = 0usize;
+    for region in CREATE_REGIONS {
+        for (environment_id, bandwidth) in placements_in(emulator, region).await {
+            let remote_account =
+                remote_account_for(&emulator.environment_in(region, &environment_id).await);
+            rows.push(RegionCase {
+                region,
+                environment_id,
+                bandwidth,
+                attach_point: attach_point.clone(),
+                remote_account,
+                seed,
+            });
+            seed += 1;
+        }
     }
     assert!(
         rows.len() >= CREATE_REGIONS.len(),
@@ -401,15 +407,31 @@ async fn a_client_token_replays_only_within_the_region_it_was_sent_to() {
         request["clientToken"] = json!(token);
 
         // Rows differ in the pair of regions the same token is sent to: the row's
-        // own region, and the next one along — always a different region, because
-        // the row's own is `CREATE_REGIONS[seed % len]` and this is the next index.
-        let other = CREATE_REGIONS[(case.seed + 1) % CREATE_REGIONS.len()];
+        // own region, and the next one along — always a different region, because the
+        // index of the row's own is skipped.
+        let own = CREATE_REGIONS
+            .iter()
+            .position(|region| *region == case.region)
+            .expect("the row's region is one under test");
+        let other = CREATE_REGIONS[(own + 1) % CREATE_REGIONS.len()];
+
+        // The SAME request, addressed to the other region: an Environment belongs to
+        // the region whose connections it produces, so the token's second request names
+        // that region's own Environment for the same partner offering.
+        let offering = emulator
+            .environment_in(case.region, &case.environment_id)
+            .await;
+        let mut other_request = request.clone();
+        other_request["environmentId"] = json!(text(
+            &emulator.counterpart_in(other, &offering).await,
+            "environmentId"
+        ));
 
         let first = emulator
             .ic_ok_in(case.region, "CreateConnection", request.clone())
             .await;
         let elsewhere = emulator
-            .ic_ok_in(other, "CreateConnection", request.clone())
+            .ic_ok_in(other, "CreateConnection", other_request.clone())
             .await;
         let first_id = text(&first["connection"], "id");
         let other_id = text(&elsewhere["connection"], "id");
@@ -419,9 +441,12 @@ async fn a_client_token_replays_only_within_the_region_it_was_sent_to() {
         );
 
         // Each region replays ITS own connection for that token.
-        for (region, expected) in [(case.region, &first_id), (other, &other_id)] {
+        for (region, expected, replayed_request) in [
+            (case.region, &first_id, &request),
+            (other, &other_id, &other_request),
+        ] {
             let replay = emulator
-                .ic_ok_in(region, "CreateConnection", request.clone())
+                .ic_ok_in(region, "CreateConnection", replayed_request.clone())
                 .await;
             let replayed = text(&replay["connection"], "id");
             assert_eq!(

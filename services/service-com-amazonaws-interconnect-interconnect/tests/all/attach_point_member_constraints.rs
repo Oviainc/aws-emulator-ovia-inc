@@ -342,13 +342,22 @@ async fn stored_ids(emulator: &Emulator, region: &str) -> Vec<String> {
 /// The `(environment, bandwidth, region)` rows the tables are driven over: one row per
 /// environment that takes a connection, with the bandwidth and the Region varying with
 /// it so the rule is never checked on one placement only.
-fn placements(catalog: &[Value]) -> Vec<(Value, String, &'static str)> {
+///
+/// Each row carries the Environment ITS OWN Region's endpoint offers for that partner
+/// offering, because an Environment belongs to the Region whose connections it
+/// produces.
+async fn placements(emulator: &Emulator) -> Vec<(Value, String, &'static str)> {
+    let catalog = emulator.environments().await;
     let mut out = Vec::new();
-    for environment in creatable_environments(catalog) {
+    for environment in creatable_environments(&catalog) {
         let bandwidths = available_bandwidths(&environment);
         let bandwidth = bandwidths[out.len() % bandwidths.len()].clone();
         let region = REGIONS[out.len() % REGIONS.len()];
-        out.push((environment, bandwidth, region));
+        out.push((
+            emulator.counterpart_in(region, &environment).await,
+            bandwidth,
+            region,
+        ));
     }
     assert!(
         !out.is_empty(),
@@ -369,7 +378,6 @@ fn placements(catalog: &[Value]) -> Vec<(Value, String, &'static str)> {
 #[tokio::test]
 async fn a_value_outside_an_attach_point_members_constraints_is_invalid_input() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     // A gateway the account holds, so what the rows below refuse is the value and not an
     // account that holds no attach point at all.
     let held = emulator.attach_point().await;
@@ -385,7 +393,7 @@ async fn a_value_outside_an_attach_point_members_constraints_is_invalid_input() 
         rows.len()
     );
 
-    for (environment, bandwidth, region) in placements(&catalog) {
+    for (environment, bandwidth, region) in placements(&emulator).await {
         let environment_id = text(&environment, "environmentId");
         let before = stored_ids(&emulator, region).await;
         // ONE proposal per placement: every acceptance below is refused, so none of them
@@ -461,10 +469,9 @@ async fn a_value_outside_an_attach_point_members_constraints_is_invalid_input() 
 #[tokio::test]
 async fn a_well_formed_value_that_names_nothing_is_still_the_not_found() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let held = emulator.attach_point().await;
 
-    for (environment, bandwidth, region) in placements(&catalog) {
+    for (environment, bandwidth, region) in placements(&emulator).await {
         let environment_id = text(&environment, "environmentId");
         let awaiting = proposal(&emulator, region, &environment, &bandwidth, &held).await;
         let activation_key = text(&awaiting, "activationKey");
@@ -526,9 +533,8 @@ async fn a_well_formed_value_that_names_nothing_is_still_the_not_found() {
 #[tokio::test]
 async fn the_list_filter_holds_the_same_member_constraints() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let held = emulator.attach_point().await;
-    let placements = placements(&catalog);
+    let placements = placements(&emulator).await;
     let (environment, bandwidth, region) = placements[0].clone();
     let live = proposal(&emulator, region, &environment, &bandwidth, &held).await;
 

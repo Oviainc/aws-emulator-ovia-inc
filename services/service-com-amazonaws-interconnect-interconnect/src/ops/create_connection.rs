@@ -225,11 +225,15 @@ fn judge_against_store(
     }
 
     // The Environment dictates the partner, the location and the product type,
-    // none of which the request carries. An unknown environment has nothing to
-    // create a connection across, and naming one is this service's own client
-    // fault: the 400 `InterconnectClientException` every environment-resolving
-    // operation gives, with the message built from the requested id.
-    let Some(environment) = store.environments.get(&input.environment_id).cloned() else {
+    // none of which the request carries. It is resolved in the catalog of the Region
+    // this create was signed for, because an Environment produces connections that
+    // land in that Region alone: an id this endpoint's catalog does not hold — one of
+    // another Region's catalog included — has nothing to create a connection across,
+    // and naming one is this service's own client fault: the 400
+    // `InterconnectClientException` every environment-resolving operation gives, with
+    // the message built from the requested id.
+    let Some(environment) = crate::state::environment_in_region(region, &input.environment_id)
+    else {
         return Err(CreateConnectionErrorModeled::InterconnectClientException(
             InterconnectClientException {
                 message: crate::state::environment_not_found_message(&input.environment_id),

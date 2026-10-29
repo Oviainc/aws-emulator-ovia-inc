@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
-use crate::emulator::{remote_account_for, Emulator};
+use crate::emulator::{remote_account_for, Emulator, DEFAULT_SIGNING_REGION};
 
 /// The signing name the model gives this service; also its ARN namespace.
 const SIGNING_NAME: &str = "interconnect";
@@ -369,29 +369,59 @@ impl CreateCase {
 /// The create table: every bandwidth of every environment that can take a
 /// connection, alternating the gateway the connection is attached to, the presence of
 /// the two optional members, and the region the request is signed for.
-fn create_table(catalog: &[Value], gateways: &[String]) -> Vec<(Value, CreateCase)> {
+///
+/// Each row carries the Environment ITS OWN Region's endpoint offers for that partner
+/// offering, because an Environment belongs to the Region whose connections it
+/// produces.
+async fn create_table(emulator: &Emulator, gateways: &[String]) -> Vec<(Value, CreateCase)> {
+    build_create_table(emulator, gateways, |seed| {
+        if seed.is_multiple_of(2) {
+            "eu-west-1"
+        } else {
+            "us-east-1"
+        }
+    })
+    .await
+}
+
+/// [`create_table`] with every row placed in ONE Region, for the suites whose rule is
+/// about a single endpoint's store (a listing, the account's connection quota) rather
+/// than about the Region a connection belongs to.
+async fn create_table_in(
+    emulator: &Emulator,
+    gateways: &[String],
+    region: &'static str,
+) -> Vec<(Value, CreateCase)> {
+    build_create_table(emulator, gateways, |_| region).await
+}
+
+/// The create table, with `region_of` choosing each row's Region from its seed.
+async fn build_create_table(
+    emulator: &Emulator,
+    gateways: &[String],
+    region_of: impl Fn(usize) -> &'static str,
+) -> Vec<(Value, CreateCase)> {
+    let catalog = emulator.environments().await;
     let mut rows = Vec::new();
     let mut seed = 0usize;
-    for environment in catalog {
+    for environment in &catalog {
         if text(environment, "state") == "unavailable" {
             continue;
         }
         for bandwidth in available_bandwidths(environment) {
             seed += 1;
+            let region = region_of(seed);
+            let environment = emulator.counterpart_in(region, environment).await;
             rows.push((
                 environment.clone(),
                 CreateCase {
-                    environment_id: text(environment, "environmentId"),
+                    environment_id: text(&environment, "environmentId"),
                     bandwidth,
-                    region: if seed.is_multiple_of(2) {
-                        "eu-west-1"
-                    } else {
-                        "us-east-1"
-                    },
+                    region,
                     attach_point: json!({
                         "directConnectGateway": gateways[seed % gateways.len()]
                     }),
-                    remote_account: remote_account_for(environment),
+                    remote_account: remote_account_for(&environment),
                     description: if seed.is_multiple_of(3) {
                         None
                     } else {
@@ -415,9 +445,8 @@ fn create_table(catalog: &[Value], gateways: &[String]) -> Vec<(Value, CreateCas
 #[tokio::test]
 async fn create_connection_computes_every_server_owned_member_and_persists_it() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let table = create_table(&catalog, &gateways);
+    let table = create_table(&emulator, &gateways).await;
     assert!(
         table.len() >= 4,
         "the create table must span several environments and bandwidths, got {} rows",
@@ -583,17 +612,23 @@ async fn create_connection_computes_every_server_owned_member_and_persists_it() 
 #[tokio::test]
 async fn create_connection_replays_a_repeated_client_token() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let table = create_table(&catalog, &gateways);
+    let table = create_table(&emulator, &gateways).await;
 
     for (index, (environment, case)) in table.into_iter().enumerate() {
+        // Every call of a row addresses the Region that row creates in, which is the
+        // Region its Environment belongs to.
+        let region = case.region;
         let token = format!("token-{index}");
         let mut request = case.request();
         request["clientToken"] = json!(token);
 
-        let first = emulator.ic_ok("CreateConnection", request.clone()).await;
-        let replay = emulator.ic_ok("CreateConnection", request.clone()).await;
+        let first = emulator
+            .ic_ok_in(region, "CreateConnection", request.clone())
+            .await;
+        let replay = emulator
+            .ic_ok_in(region, "CreateConnection", request.clone())
+            .await;
         assert_eq!(
             replay["connection"], first["connection"],
             "case {case:?}: expected the same connection back for client token {token:?}, got {:?}",
@@ -602,7 +637,7 @@ async fn create_connection_replays_a_repeated_client_token() {
 
         let mut other = request.clone();
         other["clientToken"] = json!(format!("{token}-other"));
-        let fresh = emulator.ic_ok("CreateConnection", other).await;
+        let fresh = emulator.ic_ok_in(region, "CreateConnection", other).await;
         assert_ne!(
             fresh["connection"]["id"], first["connection"]["id"],
             "case {case:?}: expected a distinct connection for a distinct client token, got {:?}",
@@ -611,7 +646,8 @@ async fn create_connection_replays_a_repeated_client_token() {
 
         // Exactly two connections exist for this pair of tokens, not three.
         let listed = emulator
-            .ic_ok(
+            .ic_ok_in(
+                region,
                 "ListConnections",
                 json!({ "environmentId": case.environment_id }),
             )
@@ -661,7 +697,9 @@ async fn create_connection_replays_a_repeated_client_token() {
         }
 
         for (label, mismatched) in mismatches {
-            let (status, body) = emulator.ic("CreateConnection", mismatched).await;
+            let (status, body) = emulator
+                .ic_in(region, "CreateConnection", mismatched)
+                .await;
             assert_eq!(
                 status, 400,
                 "case {case:?}/{label}: expected the reused token to be refused, got {status} with {body:?}"
@@ -788,9 +826,11 @@ async fn create_connection_stops_at_the_connection_quota() {
     use service_com_amazonaws_interconnect_interconnect::state::MAX_CONNECTIONS;
 
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let (_, case) = create_table(&catalog, &gateways)
+    // Every row in the Region this test's other calls address, since an Environment is
+    // resolved only through the endpoint of the Region it belongs to.
+    let (_, case) = create_table_in(&emulator, &gateways, DEFAULT_SIGNING_REGION)
+        .await
         .into_iter()
         .next()
         .expect("the create table has rows");
@@ -872,9 +912,10 @@ async fn create_connection_stops_at_the_connection_quota() {
 #[tokio::test]
 async fn list_connections_applies_every_filter_and_pages_with_a_real_cursor() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let table = create_table(&catalog, &gateways);
+    // Every row in ONE Region: this suite is about a listing, which reports the
+    // connections of the Region it is called in.
+    let table = create_table_in(&emulator, &gateways, DEFAULT_SIGNING_REGION).await;
 
     let mut created: Vec<Value> = Vec::new();
     for (_, case) in &table {
@@ -1043,14 +1084,16 @@ async fn list_connections_applies_every_filter_and_pages_with_a_real_cursor() {
 #[tokio::test]
 async fn update_connection_changes_only_the_members_it_is_given() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
     // The clock-settle check costs real wall time, so it is made once rather than
     // on every row; the span is a single constant shared by all of them.
     let mut settle_checked = false;
 
     // Rows: description only, bandwidth only, both, and neither.
-    for (environment, case) in create_table(&catalog, &gateways) {
+    for (environment, case) in create_table(&emulator, &gateways).await {
+        // Every call of a row addresses the Region that row creates in, which is the
+        // Region its Environment and its connection belong to.
+        let region = case.region;
         let available = available_bandwidths(&environment);
         let other_bandwidth = available
             .iter()
@@ -1067,7 +1110,9 @@ async fn update_connection_changes_only_the_members_it_is_given() {
             ),
             ("neither", None, None),
         ] {
-            let created = emulator.ic_ok("CreateConnection", case.request()).await;
+            let created = emulator
+                .ic_ok_in(region, "CreateConnection", case.request())
+                .await;
             let before = created["connection"].clone();
             let id = text(&before, "id");
             let label = format!("{label} on {id}");
@@ -1081,7 +1126,7 @@ async fn update_connection_changes_only_the_members_it_is_given() {
                 request.insert("bandwidth".to_string(), json!(bandwidth));
             }
             let updated = emulator
-                .ic_ok("UpdateConnection", Value::Object(request))
+                .ic_ok_in(region, "UpdateConnection", Value::Object(request))
                 .await;
             let after = updated["connection"].clone();
 
@@ -1153,7 +1198,7 @@ async fn update_connection_changes_only_the_members_it_is_given() {
             // is in flight the reported state may already have settled, so the
             // members under test are compared rather than the whole record.
             let fetched = emulator
-                .ic_ok("GetConnection", json!({ "identifier": id }))
+                .ic_ok_in(region, "GetConnection", json!({ "identifier": id }))
                 .await;
             if changed_bandwidth {
                 for member in ["description", "bandwidth", "billingTier", "id", "arn"] {
@@ -1188,7 +1233,7 @@ async fn update_connection_changes_only_the_members_it_is_given() {
                 settle_checked = true;
                 tokio::time::sleep(SETTLE_WAIT).await;
                 let settled = emulator
-                    .ic_ok("GetConnection", json!({ "identifier": id }))
+                    .ic_ok_in(region, "GetConnection", json!({ "identifier": id }))
                     .await;
                 let state = text(&settled["connection"], "state");
                 let progression = ["requested", "pending", "available"];
@@ -1218,9 +1263,9 @@ async fn update_connection_changes_only_the_members_it_is_given() {
 #[tokio::test]
 async fn update_connection_refuses_an_unknown_or_unofferable_change() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let (environment, case) = create_table(&catalog, &gateways)
+    let (environment, case) = create_table_in(&emulator, &gateways, DEFAULT_SIGNING_REGION)
+        .await
         .into_iter()
         .next()
         .expect("the create table has rows");
@@ -1288,16 +1333,20 @@ async fn update_connection_refuses_an_unknown_or_unofferable_change() {
 #[tokio::test]
 async fn delete_connection_moves_through_deleting_to_deleted() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let mut deleted_ids: Vec<String> = Vec::new();
+    let mut deleted_ids: Vec<(&str, String)> = Vec::new();
 
-    for (_, case) in create_table(&catalog, &gateways) {
-        let created = emulator.ic_ok("CreateConnection", case.request()).await;
+    for (_, case) in create_table(&emulator, &gateways).await {
+        // Every call of a row addresses the Region that row creates in, which is the
+        // Region its Environment and its connection belong to.
+        let region = case.region;
+        let created = emulator
+            .ic_ok_in(region, "CreateConnection", case.request())
+            .await;
         let id = text(&created["connection"], "id");
 
         let deleted = emulator
-            .ic_ok("DeleteConnection", json!({ "identifier": id }))
+            .ic_ok_in(region, "DeleteConnection", json!({ "identifier": id }))
             .await;
         let state = text(&deleted["connection"], "state");
         assert_eq!(
@@ -1312,7 +1361,7 @@ async fn delete_connection_moves_through_deleting_to_deleted() {
 
         // A repeat neither fails nor restarts the transition.
         let repeat = emulator
-            .ic_ok("DeleteConnection", json!({ "identifier": id }))
+            .ic_ok_in(region, "DeleteConnection", json!({ "identifier": id }))
             .await;
         assert_eq!(
             repeat["connection"], deleted["connection"],
@@ -1322,7 +1371,8 @@ async fn delete_connection_moves_through_deleting_to_deleted() {
 
         // While it is on its way out, it is no longer modifiable.
         let (status, body) = emulator
-            .ic(
+            .ic_in(
+                region,
                 "UpdateConnection",
                 json!({ "identifier": id, "description": "too late" }),
             )
@@ -1332,15 +1382,15 @@ async fn delete_connection_moves_through_deleting_to_deleted() {
             "case {id:?}: expected an update of a deleting connection to be refused, got {status} with {body:?}"
         );
 
-        deleted_ids.push(id);
+        deleted_ids.push((region, id));
     }
 
     // One wait covers every row: each transition was due 400 ms after its own
     // delete, and nothing polled in between.
     tokio::time::sleep(SETTLE_WAIT).await;
-    for id in &deleted_ids {
+    for (region, id) in &deleted_ids {
         let fetched = emulator
-            .ic_ok("GetConnection", json!({ "identifier": id }))
+            .ic_ok_in(region, "GetConnection", json!({ "identifier": id }))
             .await;
         let state = text(&fetched["connection"], "state");
         assert_eq!(
@@ -1357,7 +1407,7 @@ async fn delete_connection_moves_through_deleting_to_deleted() {
             ("deleting", false),
         ] {
             let listed = emulator
-                .ic_ok("ListConnections", json!({ "state": wanted }))
+                .ic_ok_in(region, "ListConnections", json!({ "state": wanted }))
                 .await;
             let present = listed["connections"]
                 .as_array()

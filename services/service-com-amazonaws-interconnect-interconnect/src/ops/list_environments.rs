@@ -136,16 +136,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(ListEnvironmentsErrorModeled::InterconnectServerException(
-                InterconnectServerException {
-                    message: "the Interconnect environment catalog is not mounted on this engine"
-                        .to_string(),
-                },
-            )
-            .into());
-        };
+        // "Lists all of the environments that can produce connections that will land
+        // in the called AWS region": the answer is a function of the Region the request
+        // was signed for, which is the Region every connection created through this
+        // endpoint lands in, so the catalog read below is that Region's own.
+        let region = crate::state::request_region(ctx);
+        // Environments are AWS-managed (the model binds no `CreateEnvironment`), so the
+        // catalog is the fixed function `crate::state::environment_catalog` of that
+        // Region and nothing of this service's own store is read or written here.
+        let _ = &self.engine;
 
         // The `provider` filter carries a union whose members are constrained in the
         // model, and nothing before the handler holds a member one level down to those
@@ -164,40 +163,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Read the SEEDED catalog. Environments are AWS-managed — the model binds no
-        // CreateEnvironment — so this store is the only source, and GetEnvironment
-        // answers from the same records.
+        // The catalog of the called Region. Environments are AWS-managed — the model
+        // binds no CreateEnvironment — so this one function is the only source, and
+        // GetEnvironment answers for the same Region from the same records.
         //
-        // Both filters are conjunctive and exact: an environment is listed only when
-        // it matches every filter the caller supplied.
-        let matching: Vec<(String, Environment)> = {
-            let store = state.lock();
-            store
-                .environments
-                .iter()
-                .filter(|(_, environment)| {
-                    input
-                        .provider
+        // The two modelled filters are conjunctive and exact: an environment is listed
+        // only when it matches every filter the caller supplied, on top of the Region
+        // scope the catalog itself is.
+        let matching: Vec<(String, Environment)> = crate::state::environment_catalog(&region)
+            .into_iter()
+            .filter(|(_, environment)| {
+                input
+                    .provider
+                    .as_ref()
+                    .is_none_or(|wanted| crate::state::provider_eq(&environment.provider, wanted))
+                    && input
+                        .location
                         .as_ref()
-                        .is_none_or(|wanted| {
-                            crate::state::provider_eq(&environment.provider, wanted)
-                        })
-                        && input
-                            .location
-                            .as_ref()
-                            .is_none_or(|wanted| environment.location == *wanted)
-                })
-                .map(|(id, environment)| (id.clone(), environment.clone()))
-                .collect()
-        };
+                        .is_none_or(|wanted| environment.location == *wanted)
+            })
+            .collect();
 
         // A cursor this operation did not issue is refused, rather than answered
-        // with an empty page the caller cannot tell from "no more results".
+        // with an empty page the caller cannot tell from "no more results". A cursor
+        // carries the last `environmentId` handed out, and this endpoint only ever
+        // handed out ids of its OWN Region's catalog, so one naming an Environment
+        // this Region does not offer is not a cursor it issued either.
         let cursor = match input.next_token.as_deref() {
             Some(token) => {
-                let Some(key) =
-                    crate::state::decode_cursor(token, crate::state::ENVIRONMENT_CURSOR_TAG)
-                else {
+                let key = crate::state::decode_cursor(token, crate::state::ENVIRONMENT_CURSOR_TAG)
+                    .filter(|key| crate::state::environment_in_region(&region, key).is_some());
+                let Some(key) = key else {
                     return Err(ListEnvironmentsErrorModeled::InterconnectValidationException(
                         InterconnectValidationException {
                             message: "nextToken is not a pagination token issued by ListEnvironments"

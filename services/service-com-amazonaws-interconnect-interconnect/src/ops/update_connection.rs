@@ -155,9 +155,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
         guard.materialise_due_transitions(now);
-        // Dereferenced once so the two stores below are borrowed as the DISJOINT
-        // fields they are: the connection is looked up ONCE, mutably, and the
-        // environment catalog is read beside it. That keeps a single 404 path.
+        // Dereferenced once so the connection is looked up ONCE, mutably, and mutated
+        // in place below. That keeps a single 404 path.
         let store = &mut *guard;
 
         // An identifier that names no stored connection is a 404: an update never
@@ -165,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // own identifier, in this operation's own construction.
         //
         // The same Region scope every connection lookup applies, spelled with the
-        // store's own predicate so this disjoint-field borrow keeps one rule: a
+        // store's own predicate so this field borrow keeps one rule: a
         // connection created through another Region's endpoint is not one this
         // endpoint can update.
         let Some(stored) = store
@@ -221,10 +220,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that environment's currently available set by the one rule both writers
         // of a connection's bandwidth judge their input with
         // (`crate::state::bandwidth_availability_violation`): create and update
-        // cannot drift apart over which bandwidths a connection may hold.
+        // cannot drift apart over which bandwidths a connection may hold. The
+        // environment is read from the catalog of the Region the connection belongs
+        // to, which is the Region its create resolved it in.
         if let Some(bandwidth) = input.bandwidth.as_deref() {
             if let Some(message) = crate::state::bandwidth_availability_violation(
-                store.environments.get(&environment_id),
+                crate::state::environment_in_region(&region, &environment_id).as_ref(),
                 &environment_id,
                 bandwidth,
             ) {

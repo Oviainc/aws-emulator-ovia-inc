@@ -4,11 +4,14 @@
 //!
 //! Two resources live here:
 //!
-//! * **Environments** — AWS-managed. The model binds no `CreateEnvironment`
-//!   operation, so the catalog is SEEDED once, when the engine first touches this
-//!   state, and `ListEnvironments`/`GetEnvironment` read it. Both answer from the
-//!   same records, so a `GetEnvironment` is byte-identical to the entry
-//!   `ListEnvironments` returned for that id.
+//! * **Environments** — AWS-managed and per-Region. The model binds no
+//!   `CreateEnvironment` operation, so nothing stores them: the catalog a regional
+//!   endpoint serves is the fixed function [`environment_catalog`] of the Region the
+//!   request was signed for, and `ListEnvironments`/`GetEnvironment` — and every other
+//!   operation that resolves an `environmentId` — read that one function for the Region
+//!   they were called in. So a `GetEnvironment` is byte-identical to the entry
+//!   `ListEnvironments` returned for that id, and an id of another Region's catalog
+//!   resolves to nothing.
 //! * **Connections** — caller-created. `CreateConnection` allocates one and every
 //!   other connection operation reads or mutates that stored record. This service's
 //!   endpoints are regional, so each record belongs to the Region its create was
@@ -316,8 +319,6 @@ impl IdempotentCreate {
 /// Per-service state for com-amazonaws-interconnect-interconnect. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsInterconnectInterconnectState {
-    /// The seeded Environment catalog, keyed by `environmentId`.
-    pub environments: BTreeMap<String, Environment>,
     /// The live connections, keyed by `id`, each record carrying the Region it
     /// belongs to: an operation reaches them through [`Self::connection_in`] /
     /// [`Self::connections_in`], so one Region's endpoint never answers for
@@ -348,9 +349,7 @@ pub struct ComAmazonawsInterconnectInterconnectState {
 
 impl Default for ComAmazonawsInterconnectInterconnectState {
     fn default() -> Self {
-        let environments = seed_environments();
         Self {
-            environments,
             connections: BTreeMap::new(),
             idempotency_tokens: BTreeMap::new(),
             activation_keys: BTreeMap::new(),
@@ -867,7 +866,7 @@ pub fn judge_attach_point_in_store<E: direct_connect::AttachPointRefusal>(
     let AttachPoint::Arn(arn) = attach_point else {
         return Ok(());
     };
-    if environment_offers_attach_points(store.environments.get(environment_id))
+    if environment_offers_attach_points(environment_in_region(region, environment_id).as_ref())
         && store.attach_point_connection_in(region, arn).is_some()
     {
         return Ok(());
@@ -1685,14 +1684,41 @@ pub fn paginate<T>(
     (page, token)
 }
 
-/// The Environment catalog this emulator presents.
+/// The `environmentId` the catalog entry for the partner offering `slug` carries on
+/// the regional endpoint of `region`.
 ///
-/// AWS manages Environments itself and publishes no list, so the catalog is fixed
-/// here. Every member the model marks `@required` is set, and the three
-/// `EnvironmentState` values are all represented: a `limited` environment offers
-/// fewer `available` bandwidths than it `supported`s (the state's own
-/// documentation), and an `unavailable` one offers none, so `CreateConnection`
-/// refuses on it.
+/// The Region is part of the identifier because an Environment belongs to one: the
+/// same partner offering reached through two regional endpoints is two Environments,
+/// each producing connections that land in its own Region, so no single id can name
+/// both. Well inside the `@length(min: 1, max: 64)` the model gives `EnvironmentId`
+/// for every Region id AWS publishes.
+fn environment_id_in(slug: &str, region: &str) -> String {
+    format!("env-{slug}-{region}")
+}
+
+/// The Environment catalog the regional endpoint of `region` serves.
+///
+/// `ListEnvironments` lists "all of the environments that can produce connections that
+/// will land in the called AWS region", so the catalog is a function OF that Region and
+/// every entry in it belongs to that Region alone. Every operation that resolves an
+/// `environmentId` resolves it here, for the Region it was called in
+/// ([`environment_in_region`]), so what a Region's listing offers is exactly what a
+/// create through that Region's endpoint accepts, and the Region a connection's ARN
+/// carries is always the Region its Environment produces connections in.
+///
+/// Nothing is stored: Environments are AWS-managed (the model binds no
+/// `CreateEnvironment`), so a catalog derived per call is the same catalog on every
+/// call, whoever asks and whenever.
+///
+/// AWS manages Environments itself and publishes no list, so WHICH partner offerings
+/// the catalog presents is fixed here. Every member the model marks `@required` is
+/// set, and the three `EnvironmentState` values are all represented: a `limited`
+/// environment offers fewer `available` bandwidths than it `supported`s (the state's
+/// own documentation), and an `unavailable` one offers none, so `CreateConnection`
+/// refuses on it. An offering's `location` is "the provider specific location on the
+/// remote side" of the connection — the partner's own geography, not the AWS Region the
+/// connection lands in — so it belongs to the offering and reads the same on every
+/// endpoint.
 ///
 /// `ProductType` is an unconstrained string, so the two values used here are taken
 /// from the model's own wording: `"Multicloud"` is the `type` the
@@ -1700,12 +1726,12 @@ pub fn paginate<T>(
 /// `cloudServiceProvider` environment, and `"LastMile"` is how
 /// `Provider$lastMileProvider` names the other side's product ("LastMile
 /// connections").
-fn seed_environments() -> BTreeMap<String, Environment> {
+pub fn environment_catalog(region: &str) -> BTreeMap<String, Environment> {
     let catalog = vec![
         Environment {
             provider: Provider::cloudServiceProvider("Azure".to_string()),
             location: "us-east-1".to_string(),
-            environment_id: "env-csp-azure-us-east-1".to_string(),
+            environment_id: environment_id_in("csp-azure", region),
             state: "available".to_string(),
             bandwidths: Bandwidths {
                 available: Some(vec!["1Gbps".to_string(), "10Gbps".to_string()]),
@@ -1724,7 +1750,7 @@ fn seed_environments() -> BTreeMap<String, Environment> {
         Environment {
             provider: Provider::cloudServiceProvider("GoogleCloud".to_string()),
             location: "us-west-2".to_string(),
-            environment_id: "env-csp-googlecloud-us-west-2".to_string(),
+            environment_id: environment_id_in("csp-googlecloud", region),
             state: "limited".to_string(),
             bandwidths: Bandwidths {
                 available: Some(vec!["1Gbps".to_string()]),
@@ -1739,7 +1765,7 @@ fn seed_environments() -> BTreeMap<String, Environment> {
         Environment {
             provider: Provider::cloudServiceProvider("OracleCloud".to_string()),
             location: "eu-west-1".to_string(),
-            environment_id: "env-csp-oraclecloud-eu-west-1".to_string(),
+            environment_id: environment_id_in("csp-oraclecloud", region),
             state: "available".to_string(),
             bandwidths: Bandwidths {
                 available: Some(vec!["1Gbps".to_string(), "10Gbps".to_string()]),
@@ -1752,7 +1778,7 @@ fn seed_environments() -> BTreeMap<String, Environment> {
         Environment {
             provider: Provider::lastMileProvider("Lumen".to_string()),
             location: "Ashburn, VA".to_string(),
-            environment_id: "env-lmp-lumen-ashburn".to_string(),
+            environment_id: environment_id_in("lmp-lumen", region),
             state: "available".to_string(),
             bandwidths: Bandwidths {
                 available: Some(vec!["100Mbps".to_string(), "1Gbps".to_string()]),
@@ -1771,7 +1797,7 @@ fn seed_environments() -> BTreeMap<String, Environment> {
         Environment {
             provider: Provider::lastMileProvider("Megaport".to_string()),
             location: "Sydney, NSW".to_string(),
-            environment_id: "env-lmp-megaport-sydney".to_string(),
+            environment_id: environment_id_in("lmp-megaport", region),
             state: UNAVAILABLE_ENVIRONMENT_STATE.to_string(),
             bandwidths: Bandwidths {
                 available: Some(Vec::new()),
@@ -1786,6 +1812,17 @@ fn seed_environments() -> BTreeMap<String, Environment> {
         .into_iter()
         .map(|environment| (environment.environment_id.clone(), environment))
         .collect()
+}
+
+/// The Environment `environment_id` names in the catalog of `region`.
+///
+/// `None` when that Region's catalog holds no such Environment — the answer every
+/// environment-resolving operation gives for an id out of ANOTHER Region's catalog,
+/// which is the same answer an id no catalog holds at all gets: an Environment produces
+/// connections that land in its own Region, so it is not one this endpoint can place a
+/// connection on.
+pub fn environment_in_region(region: &str, environment_id: &str) -> Option<Environment> {
+    environment_catalog(region).remove(environment_id)
 }
 
 /// The `AttachPointType` every descriptor carries.

@@ -147,11 +147,16 @@ impl Row {
 /// The table: every wait crossed with the placements the live catalog offers, so each
 /// stage of the clock's progression is exercised on a different environment, bandwidth,
 /// Region, gateway, description and tag set.
-fn table(catalog: &[Value], gateways: &[String]) -> Vec<Row> {
+///
+/// Each row carries the Environment ITS OWN Region's endpoint offers for that partner
+/// offering, because an Environment belongs to the Region whose connections it
+/// produces.
+async fn table(emulator: &Emulator, gateways: &[String]) -> Vec<Row> {
+    let catalog = emulator.environments().await;
     // Every placement the live catalog offers, bounded so the suite's waits stay a few
     // seconds in total: the rows that run still cover every wait, each on a different
     // environment, bandwidth, Region, gateway, description and tag set.
-    let placements: Vec<(Value, String)> = creatable_environments(catalog)
+    let placements: Vec<(Value, String)> = creatable_environments(&catalog)
         .into_iter()
         .flat_map(|environment| {
             available_bandwidths(&environment)
@@ -171,10 +176,11 @@ fn table(catalog: &[Value], gateways: &[String]) -> Vec<Row> {
             } else {
                 gateways[(seed + 1) % gateways.len()].clone()
             };
+            let region = REGIONS[turn % REGIONS.len()];
             rows.push(Row {
-                environment: environment.clone(),
+                environment: emulator.counterpart_in(region, &environment).await,
                 bandwidth: bandwidth.clone(),
-                region: REGIONS[turn % REGIONS.len()],
+                region,
                 created_on: created_on.clone(),
                 accept_on,
                 wait: *wait,
@@ -300,9 +306,8 @@ fn without_state(connection: &Value) -> Value {
 #[tokio::test]
 async fn an_acceptance_applies_its_attach_point_however_long_the_caller_waited() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let rows = table(&catalog, &gateways);
+    let rows = table(&emulator, &gateways).await;
     assert!(
         rows.len() >= WAITS.len() * 2,
         "the table must cover every wait on several placements, got {} rows",
@@ -452,9 +457,8 @@ async fn an_acceptance_applies_its_attach_point_however_long_the_caller_waited()
 #[tokio::test]
 async fn only_an_acceptance_makes_a_proposal_accepted() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let rows = table(&catalog, &gateways);
+    let rows = table(&emulator, &gateways).await;
 
     // Rows differ in the wait before the first acceptance, so the refusal is pinned
     // both for a proposal accepted at once and for one accepted long afterwards.

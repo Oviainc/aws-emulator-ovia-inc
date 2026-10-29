@@ -32,7 +32,7 @@ use service_com_amazonaws_interconnect_interconnect::state::{
 
 use crate::arn_scope_refusals::{arn_operations, Fault};
 use crate::emulator::{
-    code, create_with_tags_in, message, placements, tags_of, text, Emulator,
+    code, create_with_tags_in, message, placements_in, tags_of, text, Emulator,
     DEFAULT_SIGNING_REGION, SIGNING_NAME,
 };
 
@@ -106,13 +106,15 @@ fn assert_refused(case: &str, fault: Fault, region: &str, arn: &str, status: u16
 #[tokio::test]
 async fn an_arn_is_in_scope_only_through_the_region_its_resource_lives_in() {
     let emulator = Emulator::new();
-    let places = placements(&emulator).await;
     let live_tags: BTreeMap<String, String> = [("env", "test"), ("team", "network")]
         .iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
 
     for (seed, region) in LIVE_REGIONS.iter().enumerate() {
+        // The row's resource is created on a placement of ITS OWN Region: an
+        // Environment belongs to the Region whose endpoint offers it.
+        let places = placements_in(&emulator, region).await;
         let placement = &places[seed % places.len()];
         let live = create_with_tags_in(&emulator, region, placement, 2_000 + seed, &live_tags).await;
         let arn = text(&live, "arn");

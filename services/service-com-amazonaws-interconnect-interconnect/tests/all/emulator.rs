@@ -283,22 +283,67 @@ impl Emulator {
         ids
     }
 
-    /// Every seeded Environment, as `ListEnvironments` reports it.
+    /// Every Environment the default signing Region's endpoint offers, as
+    /// `ListEnvironments` reports it there.
     pub(crate) async fn environments(&self) -> Vec<Value> {
-        let listed = self.ic_ok("ListEnvironments", json!({})).await;
+        self.environments_in(DEFAULT_SIGNING_REGION).await
+    }
+
+    /// Every Environment the endpoint of `region` offers.
+    ///
+    /// An Environment belongs to the Region whose endpoint offers it —
+    /// `ListEnvironments` lists the environments "that can produce connections that
+    /// will land in the called AWS region" — so a suite whose rows create through more
+    /// than one Region reads each Region's own catalog rather than carrying one
+    /// Region's ids to another endpoint.
+    pub(crate) async fn environments_in(&self, region: &str) -> Vec<Value> {
+        let listed = self
+            .ic_ok_in(region, "ListEnvironments", json!({}))
+            .await;
         listed["environments"]
             .as_array()
             .expect("environments is a list")
             .clone()
     }
 
-    /// One seeded Environment, as `GetEnvironment` reports it — the record that says
-    /// which bandwidths it offers and what identifying information it asks a create for.
+    /// One Environment of the default signing Region, as `GetEnvironment` reports it —
+    /// the record that says which bandwidths it offers and what identifying information
+    /// it asks a create for.
     pub(crate) async fn environment(&self, environment_id: &str) -> Value {
+        self.environment_in(DEFAULT_SIGNING_REGION, environment_id)
+            .await
+    }
+
+    /// One Environment of `region`, as `GetEnvironment` reports it there.
+    pub(crate) async fn environment_in(&self, region: &str, environment_id: &str) -> Value {
         let fetched = self
-            .ic_ok("GetEnvironment", json!({ "id": environment_id }))
+            .ic_ok_in(region, "GetEnvironment", json!({ "id": environment_id }))
             .await;
         fetched["environment"].clone()
+    }
+
+    /// The Environment the endpoint of `region` offers for the same partner offering
+    /// `environment` is: the same `provider`, the same remote-side `location` and the
+    /// same product `type`, under that Region's own `environmentId`.
+    ///
+    /// What a suite's row needs when it creates through a Region other than the one it
+    /// read the catalog in: the offering is the same, the Environment is that Region's.
+    pub(crate) async fn counterpart_in(&self, region: &str, environment: &Value) -> Value {
+        let catalog = self.environments_in(region).await;
+        catalog
+            .iter()
+            .find(|candidate| {
+                candidate["provider"] == environment["provider"]
+                    && candidate["location"] == environment["location"]
+                    && candidate["type"] == environment["type"]
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {region:?}: expected that Region's catalog to offer the counterpart of \
+                     {environment:?}, got {catalog:?}"
+                )
+            })
     }
 
     /// A Direct Connect gateway of the account that is ready for use, as
@@ -336,9 +381,17 @@ impl Emulator {
         ready.into_iter().next()
     }
 
-    /// Every attach point `ListAttachPoints` reports for `environment_id`, walking the
-    /// pages so the answer is the whole listing however it is windowed.
+    /// Every attach point `ListAttachPoints` reports for `environment_id` in the default
+    /// signing Region, walking the pages so the answer is the whole listing however it
+    /// is windowed.
     pub(crate) async fn attach_points(&self, environment_id: &str) -> Vec<Value> {
+        self.attach_points_in(DEFAULT_SIGNING_REGION, environment_id)
+            .await
+    }
+
+    /// [`Self::attach_points`] through the endpoint of `region`, which is the only one
+    /// that resolves an Environment of that Region's catalog.
+    pub(crate) async fn attach_points_in(&self, region: &str, environment_id: &str) -> Vec<Value> {
         let mut all = Vec::new();
         let mut token: Option<String> = None;
         loop {
@@ -347,7 +400,9 @@ impl Emulator {
             if let Some(token) = &token {
                 request.insert("nextToken".to_string(), json!(token));
             }
-            let listed = self.ic_ok("ListAttachPoints", Value::Object(request)).await;
+            let listed = self
+                .ic_ok_in(region, "ListAttachPoints", Value::Object(request))
+                .await;
             all.extend(
                 listed["attachPoints"]
                     .as_array()
@@ -394,11 +449,18 @@ impl Emulator {
     }
 }
 
-/// The `(environmentId, bandwidth)` pairs a connection can be created on, taken
-/// from the live catalog rather than from a copy of it, so a suite's rows can differ
-/// in the environment and the bandwidth as well as in what they are testing.
+/// The `(environmentId, bandwidth)` pairs a connection can be created on through the
+/// default signing Region's endpoint, taken from the live catalog rather than from a
+/// copy of it, so a suite's rows can differ in the environment and the bandwidth as
+/// well as in what they are testing.
 pub(crate) async fn placements(emulator: &Emulator) -> Vec<(String, String)> {
-    let catalog = emulator.environments().await;
+    placements_in(emulator, DEFAULT_SIGNING_REGION).await
+}
+
+/// [`placements`] for the endpoint of `region`: the pairs a connection can be created
+/// on THERE, since an Environment belongs to the Region whose endpoint offers it.
+pub(crate) async fn placements_in(emulator: &Emulator, region: &str) -> Vec<(String, String)> {
+    let catalog = emulator.environments_in(region).await;
     let mut out = Vec::new();
     for environment in creatable_environments(&catalog) {
         let environment_id = text(&environment, "environmentId");
@@ -408,7 +470,7 @@ pub(crate) async fn placements(emulator: &Emulator) -> Vec<(String, String)> {
     }
     assert!(
         !out.is_empty(),
-        "the seeded catalog must offer at least one environment that takes connections"
+        "case {region:?}: the catalog must offer at least one environment that takes connections"
     );
     out
 }
@@ -466,7 +528,7 @@ pub(crate) async fn create_with_tag_member(
     seed: usize,
     tags: Option<&Value>,
 ) -> Value {
-    let request = create_request(emulator, placement, seed, tags, None).await;
+    let request = create_request(emulator, region, placement, seed, tags, None).await;
     let created = emulator.ic_ok_in(region, "CreateConnection", request).await;
     created["connection"].clone()
 }
@@ -481,6 +543,7 @@ pub(crate) async fn create_with_tag_member(
 /// what judging a repeated `clientToken` takes.
 pub(crate) async fn create_request(
     emulator: &Emulator,
+    region: &str,
     placement: &(String, String),
     seed: usize,
     tags: Option<&Value>,
@@ -494,7 +557,9 @@ pub(crate) async fn create_request(
         json!({ "directConnectGateway": emulator.attach_point().await }),
     );
     request.insert("description".to_string(), json!(format!("tag case {seed}")));
-    if let Some(remote_account) = remote_account_for(&emulator.environment(&placement.0).await) {
+    if let Some(remote_account) =
+        remote_account_for(&emulator.environment_in(region, &placement.0).await)
+    {
         request.insert("remoteAccount".to_string(), remote_account);
     }
     if let Some(tags) = tags {

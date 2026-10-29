@@ -109,10 +109,15 @@ impl CaptureCase {
 /// The table: every environment the catalog offers more than one bandwidth on, once per
 /// bandwidth it offers, each row changing to the NEXT one so the rows differ in the
 /// direction of the change as well as in its size and unit.
-fn capture_table(catalog: &[Value], gateways: &[String]) -> Vec<CaptureCase> {
+///
+/// Each row carries the Environment ITS OWN Region's endpoint offers for that partner
+/// offering, because an Environment belongs to the Region whose connections it
+/// produces.
+async fn capture_table(emulator: &Emulator, gateways: &[String]) -> Vec<CaptureCase> {
+    let catalog = emulator.environments().await;
     let mut rows = Vec::new();
     let mut seed = 0usize;
-    for environment in creatable_environments(catalog) {
+    for environment in creatable_environments(&catalog) {
         let offered = available_bandwidths(&environment);
         // A row needs a second bandwidth to move to; an Environment offering one takes
         // no bandwidth change at all (`bandwidth_availability_violation`).
@@ -122,8 +127,13 @@ fn capture_table(catalog: &[Value], gateways: &[String]) -> Vec<CaptureCase> {
         for (index, created_with) in offered.iter().enumerate() {
             seed += 1;
             let other = offered[(index + 1) % offered.len()].clone();
+            let region = if seed.is_multiple_of(3) {
+                "eu-west-1"
+            } else {
+                "us-east-1"
+            };
             rows.push(CaptureCase {
-                environment: environment.clone(),
+                environment: emulator.counterpart_in(region, &environment).await,
                 created_with: created_with.clone(),
                 // Every other row changes the bandwidth TWICE, the second change
                 // putting back the very value the key captured: what the proposal
@@ -134,11 +144,7 @@ fn capture_table(catalog: &[Value], gateways: &[String]) -> Vec<CaptureCase> {
                 } else {
                     vec![other]
                 },
-                region: if seed.is_multiple_of(3) {
-                    "eu-west-1"
-                } else {
-                    "us-east-1"
-                },
+                region,
                 attach_point: gateways[seed % gateways.len()].clone(),
                 update_once_provisioned: !seed.is_multiple_of(3),
             });
@@ -239,9 +245,8 @@ async fn update(
 #[tokio::test]
 async fn updating_a_connection_leaves_the_proposal_its_key_captured() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let table = capture_table(&catalog, &gateways);
+    let table = capture_table(&emulator, &gateways).await;
     assert!(
         table.len() >= 4,
         "the capture table must span several environments and bandwidths, got {} rows",
@@ -405,9 +410,8 @@ async fn updating_a_connection_leaves_the_proposal_its_key_captured() {
 #[tokio::test]
 async fn an_accepted_proposal_still_reports_its_captured_parameters() {
     let emulator = Emulator::new();
-    let catalog = emulator.environments().await;
     let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
-    let table = capture_table(&catalog, &gateways);
+    let table = capture_table(&emulator, &gateways).await;
     assert!(
         table.len() >= 4,
         "the capture table must span several environments and bandwidths, got {} rows",

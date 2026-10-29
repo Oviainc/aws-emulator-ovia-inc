@@ -23,7 +23,7 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_interconnect_interconnect::state::attach_point_not_valid_message;
 
 use crate::emulator::{
-    code, message, placements, remote_account_for, text, Emulator, DEFAULT_SIGNING_REGION,
+    code, message, placements_in, remote_account_for, text, Emulator, DEFAULT_SIGNING_REGION,
     SIGNING_NAME,
 };
 
@@ -66,7 +66,9 @@ async fn create_in(
     request.insert("environmentId".to_string(), json!(placement.0));
     request.insert("bandwidth".to_string(), json!(placement.1));
     request.insert("attachPoint".to_string(), attach_point.clone());
-    if let Some(remote_account) = remote_account_for(&emulator.environment(&placement.0).await) {
+    if let Some(remote_account) =
+        remote_account_for(&emulator.environment_in(region, &placement.0).await)
+    {
         request.insert("remoteAccount".to_string(), remote_account);
     }
     emulator
@@ -157,9 +159,12 @@ fn assert_not_an_attach_point(
 #[tokio::test]
 async fn an_attach_point_arn_resolves_only_through_the_region_its_connection_lives_in() {
     let emulator = Emulator::new();
-    let places = placements(&emulator).await;
 
     for (seed, region) in LIVE_REGIONS.iter().enumerate() {
+        // Each Region's OWN placements: an Environment belongs to the Region whose
+        // endpoint offers it, so a create names the environment of the Region it
+        // addresses.
+        let places = placements_in(&emulator, region).await;
         let placement = &places[seed % places.len()];
         let live = live_connection(&emulator, region, placement).await;
         let arn = text(&live, "arn");
@@ -178,8 +183,10 @@ async fn an_attach_point_arn_resolves_only_through_the_region_its_connection_liv
             .collect();
         for (offset, caller) in elsewhere.iter().enumerate() {
             // The row's placement varies with the caller too, so the rule is not
-            // checked on one environment and bandwidth only.
-            let caller_placement = &places[(seed + offset + 1) % places.len()];
+            // checked on one environment and bandwidth only — taken from the CALLER's
+            // own catalog, which is the only one its endpoint resolves.
+            let caller_places = placements_in(&emulator, caller).await;
+            let caller_placement = &caller_places[(seed + offset + 1) % caller_places.len()];
             let before = stored_ids(&emulator, caller).await;
 
             // The live connection's own ARN, offered as an attach point through
@@ -254,7 +261,6 @@ async fn an_attach_point_arn_resolves_only_through_the_region_its_connection_liv
 #[tokio::test]
 async fn an_acceptance_resolves_an_attach_point_arn_in_the_region_it_addresses() {
     let emulator = Emulator::new();
-    let places = placements(&emulator).await;
 
     // Rows differ in the Region the ARN's connection lives in, the Region the
     // acceptance is made in, and the placement each one sits on.
@@ -264,8 +270,12 @@ async fn an_acceptance_resolves_an_attach_point_arn_in_the_region_it_addresses()
     ];
 
     for (seed, (home, caller)) in rows.into_iter().enumerate() {
-        let home_placement = &places[seed % places.len()];
-        let caller_placement = &places[(seed + 1) % places.len()];
+        // Each endpoint's own placements, since an Environment belongs to the Region
+        // whose endpoint offers it.
+        let home_places = placements_in(&emulator, home).await;
+        let caller_places = placements_in(&emulator, caller).await;
+        let home_placement = &home_places[seed % home_places.len()];
+        let caller_placement = &caller_places[(seed + 1) % caller_places.len()];
         let foreign_arn = text(&live_connection(&emulator, home, home_placement).await, "arn");
         let local_arn = text(
             &live_connection(&emulator, caller, caller_placement).await,

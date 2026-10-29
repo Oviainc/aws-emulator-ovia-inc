@@ -501,7 +501,7 @@ async fn either_spelling_of_no_tags_is_the_same_request() {
         let created = emulator
             .ic_ok(
                 "CreateConnection",
-                create_request(&emulator, placement, seed, first, Some(&token)).await,
+                create_request(&emulator, DEFAULT_SIGNING_REGION, placement, seed, first, Some(&token)).await,
             )
             .await["connection"]
             .clone();
@@ -510,7 +510,7 @@ async fn either_spelling_of_no_tags_is_the_same_request() {
         let (status, body) = emulator
             .ic(
                 "CreateConnection",
-                create_request(&emulator, placement, seed, repeat, Some(&token)).await,
+                create_request(&emulator, DEFAULT_SIGNING_REGION, placement, seed, repeat, Some(&token)).await,
             )
             .await;
         if same_request {

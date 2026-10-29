@@ -25,7 +25,7 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_interconnect_interconnect::state::attach_point_not_valid_message;
 
 use crate::emulator::{
-    code, message, placements, remote_account_for, text, Emulator, DEFAULT_SIGNING_REGION,
+    code, message, placements_in, remote_account_for, text, Emulator, DEFAULT_SIGNING_REGION,
     SIGNING_NAME,
 };
 
@@ -67,7 +67,9 @@ async fn create_in(
     request.insert("environmentId".to_string(), json!(placement.0));
     request.insert("bandwidth".to_string(), json!(placement.1));
     request.insert("attachPoint".to_string(), attach_point.clone());
-    if let Some(remote_account) = remote_account_for(&emulator.environment(&placement.0).await) {
+    if let Some(remote_account) =
+        remote_account_for(&emulator.environment_in(region, &placement.0).await)
+    {
         request.insert("remoteAccount".to_string(), remote_account);
     }
     emulator
@@ -143,7 +145,6 @@ fn assert_not_an_attach_point(
 #[tokio::test]
 async fn an_acceptance_resolves_an_attach_point_arn_field_for_field_in_the_region_it_addresses() {
     let emulator = Emulator::new();
-    let places = placements(&emulator).await;
 
     // The rows differ in the Region the acceptance addresses and in the OTHER Region a
     // live connection sits in: the Region the rest of this crate signs for, and three
@@ -156,8 +157,13 @@ async fn an_acceptance_resolves_an_attach_point_arn_field_for_field_in_the_regio
 
     let mut refusals: Vec<(u16, String)> = Vec::new();
     for (seed, (caller, elsewhere)) in region_rows.into_iter().enumerate() {
-        let caller_placement = &places[seed % places.len()];
-        let foreign_placement = &places[(seed + 1) % places.len()];
+        // Each Region's OWN placements: an Environment belongs to the Region whose
+        // endpoint offers it, so a create names the environment of the Region it
+        // addresses.
+        let caller_places = placements_in(&emulator, caller).await;
+        let foreign_places = placements_in(&emulator, elsewhere).await;
+        let caller_placement = &caller_places[seed % caller_places.len()];
+        let foreign_placement = &foreign_places[(seed + 1) % foreign_places.len()];
 
         // One live connection of the Region the acceptance addresses, whose ARN is the
         // attach point that DOES resolve, and one live connection of another Region,

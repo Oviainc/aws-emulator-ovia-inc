@@ -174,23 +174,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let captured = &stored.proposal;
                     // `provider` and `location` are documented as belonging to "the
                     // specific Environment of the proposal", so they are read from the
-                    // catalog entry the proposal names; the record's own copies (taken
-                    // from that entry when it was allocated) answer for an environment
-                    // that is no longer in the catalog.
-                    let (provider, location) = store
-                        .environments
-                        .get(&captured.environment_id)
-                        .map_or_else(
-                            || {
-                                (
-                                    stored.connection.provider.clone(),
-                                    stored.connection.location.clone(),
-                                )
-                            },
-                            |environment| {
-                                (environment.provider.clone(), environment.location.clone())
-                            },
-                        );
+                    // catalog entry the proposal names, in the catalog of the Region the
+                    // connection belongs to; the record's own copies (taken from that
+                    // entry when it was allocated) answer for an environment that is no
+                    // longer in the catalog.
+                    let (provider, location) =
+                        crate::state::environment_in_region(&region, &captured.environment_id)
+                            .map_or_else(
+                                || {
+                                    (
+                                        stored.connection.provider.clone(),
+                                        stored.connection.location.clone(),
+                                    )
+                                },
+                                |environment| (environment.provider, environment.location),
+                            );
                     DescribeConnectionProposalOutput {
                         bandwidth: captured.bandwidth.clone(),
                         environment_id: captured.environment_id.clone(),
