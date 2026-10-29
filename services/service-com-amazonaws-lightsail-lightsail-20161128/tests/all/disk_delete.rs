@@ -421,7 +421,7 @@ const NOT_AVAILABLE: &[NotAvailable] = &[
     NotAvailable {
         case: "a disk an instance has in use",
         disk_name: "in-use-disk",
-        availability_zone: "us-west-1b",
+        availability_zone: "us-west-2b",
         size_in_gb: 8,
         attach_to: Some("disk-holder"),
         state: "in-use",

@@ -226,15 +226,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // served in the Region it was signed for, and the service picks the zone.
         let (region, zones) = match &input.availability_zone {
             Some(zone) => {
-                let spec =
-                    crate::state::region_spec_of_availability_zone(zone).ok_or_else(|| {
-                        invalid(format!(
-                            "availabilityZone '{zone}' is not an Availability Zone this service \
-                             publishes: it must be one of the zones GetRegions reports for a \
-                             region of [{}]",
-                            crate::state::region_names()
-                        ))
-                    })?;
+                let spec = crate::state::created_in_availability_zone("availabilityZone", zone)
+                    .map_err(invalid)?;
                 (spec.name.to_string(), spec.zone_names())
             }
             None => {

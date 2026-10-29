@@ -4083,32 +4083,14 @@ fn parse_allowed_range(allowed: &str) -> Option<(f64, f64)> {
 // Locations
 // ---------------------------------------------------------------------------
 
-/// The Lightsail region an availability zone belongs to, or `None` when the zone
-/// is not `<region><zone-letter>` for a region Lightsail serves.
+/// The Region names a stored `ResourceLocation` may carry — the modelled
+/// `RegionName` enum's values (`smithy_query(query="shape",shape="RegionName")`,
+/// generated here as `REGION_NAME_VALUES`) — for a refusal that has to tell the
+/// caller what to send instead.
 ///
-/// `availabilityZone` is documented as "us-east-2a (case sensitive)", and
-/// `ResourceLocation$regionName` targets the modelled `RegionName` enum — so the
-/// zone's region must be one of that enum's values, and the catalog is that enum
-/// (`smithy_query(query="shape",shape="RegionName")`, generated here as
-/// `REGION_NAME_VALUES`).
-///
-/// The enum, not [`REGION_SPECS`]: this is the set of Region names a stored
-/// `ResourceLocation` may carry, which is wider than the Regions `GetRegions`
-/// lists as served.
-pub fn region_of_availability_zone(availability_zone: &str) -> Option<&'static str> {
-    let zone_letter = availability_zone.chars().next_back()?;
-    if !zone_letter.is_ascii_lowercase() {
-        return None;
-    }
-    let region = &availability_zone[..availability_zone.len() - 1];
-    REGION_NAME_VALUES
-        .iter()
-        .find(|known| **known == region)
-        .copied()
-}
-
-/// The regions [`region_of_availability_zone`] accepts, for a refusal that has to
-/// tell the caller what to send instead.
+/// The enum is WIDER than the Regions `GetRegions` lists as served, so a refusal
+/// about where a resource can be CREATED names
+/// [`served_region_names`] instead.
 pub fn region_names() -> String {
     REGION_NAME_VALUES.join(", ")
 }
@@ -4401,15 +4383,53 @@ pub fn region_spec(name: &str) -> Option<&'static RegionSpec> {
 /// The catalog entry for the Region that publishes the Availability Zone `zone`,
 /// or `None` when no Region this service serves publishes it.
 ///
-/// STRICTER than [`region_of_availability_zone`], which checks only that the
-/// zone is a `<region><letter>` for a Region the modelled `RegionName` enum
-/// admits: a letter the Region does not publish names no zone a resource can be
-/// created in, and this is what a caller that resolves a zone through
-/// `GetRegions` gets back.
+/// A zone name is a served Region's name followed by one of the zone letters
+/// THAT Region publishes, so a well-formed `<region><letter>` whose letter the
+/// Region does not publish — and a zone of a Region the catalog does not hold —
+/// resolves to nothing: it names no place a resource can be created.
 pub fn region_spec_of_availability_zone(zone: &str) -> Option<&'static RegionSpec> {
     REGION_SPECS
         .iter()
         .find(|spec| spec.zone_names().iter().any(|name| name == zone))
+}
+
+/// The Regions `GetRegions` reports as served, for a refusal that has to tell
+/// the caller where it can create a resource.
+pub fn served_region_names() -> String {
+    REGION_SPECS
+        .iter()
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The Region a resource the caller asks to create in the Availability Zone
+/// `zone` belongs to, or the sentence that request is refused with.
+///
+/// The ONE resolution every operation that creates a resource in a
+/// caller-named zone goes through, so one zone string cannot be accepted by one
+/// of them and refused by another. `availabilityZone` is documented as a value
+/// the caller takes from `GetRegions` ("Use the `get regions` operation to list
+/// the Availability Zones where Lightsail is currently available"), so the zone
+/// must be one a served Region PUBLISHES — see
+/// [`region_spec_of_availability_zone`] — rather than merely one that reads like
+/// a zone name, and a zone this service publishes nowhere is refused instead of
+/// stored in a `ResourceLocation` no `GetRegions` answer accounts for.
+///
+/// `member` is the path of the member the zone arrived in, so the refusal names
+/// what the CALLER sent rather than the member of whichever operation the
+/// resolution is shared with.
+pub fn created_in_availability_zone(
+    member: &str,
+    zone: &str,
+) -> Result<&'static RegionSpec, String> {
+    region_spec_of_availability_zone(zone).ok_or_else(|| {
+        format!(
+            "{member} '{zone}' is not an Availability Zone this service publishes: it must be \
+             one of the zones GetRegions reports for a region of [{}]",
+            served_region_names()
+        )
+    })
 }
 
 /// The continent code of the Region `name`, or `None` when its geography prefix

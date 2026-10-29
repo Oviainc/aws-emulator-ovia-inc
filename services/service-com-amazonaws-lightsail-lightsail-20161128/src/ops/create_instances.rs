@@ -219,15 +219,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::bundle_sizes()
             ))
         })?;
-        let region = crate::state::region_of_availability_zone(&input.availability_zone)
-            .ok_or_else(|| {
-                invalid(format!(
-                    "availabilityZone '{}' is not a zone of a Lightsail region: it must be \
-                     a region name followed by a zone letter, for one of [{}]",
-                    input.availability_zone,
-                    crate::state::region_names()
-                ))
-            })?;
+        // The zone is resolved the way every other create resolves one: it must
+        // be a zone a served Region PUBLISHES — the member documents `GetRegions`
+        // as where a caller gets it — so a letter that Region does not publish
+        // creates no instance.
+        let region = crate::state::created_in_availability_zone(
+            "availabilityZone",
+            &input.availability_zone,
+        )
+        .map_err(invalid)?
+        .name;
         let ip_address_type = input
             .ip_address_type
             .clone()

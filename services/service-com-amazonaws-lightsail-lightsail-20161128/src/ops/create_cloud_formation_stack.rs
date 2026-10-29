@@ -176,11 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `portInfoSource` enum — is a modelled one, so the centralized walk
         // refused anything outside them before this body ran. What is left is
         // what the model cannot express: one entry per call, an Amazon EC2
-        // instance type, a launch script Amazon EC2 accepts, a zone this service
-        // serves, and a source that is an export snapshot record of this account
-        // whose export has finished and whose region the new instance is created
-        // in. Every one of those is checked BEFORE the first write, so a refused
-        // request creates nothing.
+        // instance type, a launch script Amazon EC2 accepts, a zone a served
+        // Region publishes, and a source that is an export snapshot record of
+        // this account whose export has finished and whose region the new
+        // instance is created in. Every one of those is checked BEFORE the first
+        // write, so a refused request creates nothing.
         //
         // "You can only pass one instance entry at a time in this array. You
         // will get an invalid parameter error if you pass more than one instance
@@ -210,15 +210,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
-        let region = crate::state::region_of_availability_zone(&entry.availability_zone)
-            .ok_or_else(|| {
-                invalid(format!(
-                    "instances[].availabilityZone '{}' is not a zone of a Lightsail region: it \
-                     must be a region name followed by a zone letter, for one of [{}]",
-                    entry.availability_zone,
-                    crate::state::region_names()
-                ))
-            })?;
+        // The new instance is placed in the entry's zone, and it is this
+        // service's own zone catalog the entry resolves against — the same
+        // resolution every other create goes through, so one zone string cannot
+        // be a place here and nowhere else.
+        let region = crate::state::created_in_availability_zone(
+            "instances[].availabilityZone",
+            &entry.availability_zone,
+        )
+        .map_err(invalid)?
+        .name;
 
         let source_name = entry.source_name.clone();
         let location = crate::state::StoredLocation::zonal(&entry.availability_zone, region);

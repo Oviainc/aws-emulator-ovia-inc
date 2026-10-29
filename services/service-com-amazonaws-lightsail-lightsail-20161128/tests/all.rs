@@ -29,6 +29,8 @@ mod alarm_state_test;
 mod auto_snapshot_delete;
 #[path = "all/auto_snapshots.rs"]
 mod auto_snapshots;
+#[path = "all/availability_zone_publication.rs"]
+mod availability_zone_publication;
 #[path = "all/blueprint_catalog.rs"]
 mod blueprint_catalog;
 #[path = "all/bucket_access_keys.rs"]

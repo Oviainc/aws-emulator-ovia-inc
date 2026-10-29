@@ -1327,7 +1327,7 @@ async fn listing_instances_enumerates_the_store_without_repeating() {
             "CreateInstances",
             json!({
                 "instanceNames": names,
-                "availabilityZone": "us-west-1a",
+                "availabilityZone": "us-west-2a",
                 "blueprintId": "amazon_linux_2023",
                 "bundleId": "nano_3_0",
             }),

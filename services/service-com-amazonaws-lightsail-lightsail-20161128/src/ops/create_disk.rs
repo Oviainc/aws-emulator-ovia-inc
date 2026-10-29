@@ -177,21 +177,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `diskName`, `availabilityZone` and `sizeInGb` are modelled `@required`
         // members and every pattern on this input is a modelled constraint, so
         // the centralized walk refused anything outside them before this body
-        // ran. What is left is what the model cannot express: the zone must name
-        // a zone this service serves, the size must be within the range
-        // Lightsail creates a disk in, the add-ons must be ones a disk can
-        // carry, the name must not already be taken, and the caller-sized lists
-        // must be within the store's bounds. Every one of those is checked
-        // BEFORE the first write, so a refused request creates nothing.
-        let region = crate::state::region_of_availability_zone(&input.availability_zone)
-            .ok_or_else(|| {
-                invalid(format!(
-                    "availabilityZone '{}' is not a zone of a Lightsail region: it must be \
-                     a region name followed by a zone letter, for one of [{}]",
-                    input.availability_zone,
-                    crate::state::region_names()
-                ))
-            })?;
+        // ran. What is left is what the model cannot express: the zone must be
+        // one a served Region publishes ("Use the get regions operation to list
+        // the Availability Zones where Lightsail is currently available"), the
+        // size must be within the range Lightsail creates a disk in, the add-ons
+        // must be ones a disk can carry, the name must not already be taken, and
+        // the caller-sized lists must be within the store's bounds. Every one of
+        // those is checked BEFORE the first write, so a refused request creates
+        // nothing.
+        let region = crate::state::created_in_availability_zone(
+            "availabilityZone",
+            &input.availability_zone,
+        )
+        .map_err(invalid)?
+        .name;
         if !(crate::state::MIN_DISK_SIZE_IN_GB..=crate::state::MAX_DISK_SIZE_IN_GB)
             .contains(&input.size_in_gb)
         {

@@ -530,9 +530,10 @@ async fn published_zones_belong_to_their_region() {
             );
             for zone_name in zones {
                 let resolved =
-                    service_com_amazonaws_lightsail_lightsail_20161128::state::region_of_availability_zone(
+                    service_com_amazonaws_lightsail_lightsail_20161128::state::region_spec_of_availability_zone(
                         &zone_name,
-                    );
+                    )
+                    .map(|spec| spec.name);
                 assert_eq!(
                     resolved,
                     Some(*name),

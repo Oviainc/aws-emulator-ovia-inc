@@ -202,23 +202,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `diskName`, `availabilityZone` and `sizeInGb` are modelled `@required`
         // members and every pattern on this input is a modelled constraint, so
         // the centralized walk refused anything outside them before this body
-        // ran. What is left is what the model cannot express: the zone must name
-        // a zone this service serves, the size must be within the range
+        // ran. What is left is what the model cannot express: the zone must be
+        // one a served Region publishes, the size must be within the range
         // Lightsail creates a disk in and no smaller than the snapshotted
         // volume, the add-ons must be ones a disk can carry, exactly one source
         // must be named, the automatic-snapshot members must be used only with
         // that source, the source must be a resource this account holds and the
         // new disk's name must not already be taken. Every one of those is
         // checked BEFORE the first write, so a refused request creates nothing.
-        let region = crate::state::region_of_availability_zone(&input.availability_zone)
-            .ok_or_else(|| {
-                invalid(format!(
-                    "availabilityZone '{}' is not a zone of a Lightsail region: it must be \
-                     a region name followed by a zone letter, for one of [{}]",
-                    input.availability_zone,
-                    crate::state::region_names()
-                ))
-            })?;
+        let region = crate::state::created_in_availability_zone(
+            "availabilityZone",
+            &input.availability_zone,
+        )
+        .map_err(invalid)?
+        .name;
         if !(crate::state::MIN_DISK_SIZE_IN_GB..=crate::state::MAX_DISK_SIZE_IN_GB)
             .contains(&input.size_in_gb)
         {

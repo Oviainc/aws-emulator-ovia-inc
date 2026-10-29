@@ -216,7 +216,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@required` members and every pattern on this input is a modelled
         // constraint, so the centralized walk refused anything outside them
         // before this body ran. What is left is what the model cannot express:
-        // the bundle and the zone must name things this service serves, exactly
+        // the bundle must name a bundle this service publishes and the zone a
+        // zone a served Region publishes, exactly
         // one source must be named, the automatic-snapshot members must be used
         // only with that source, the attached-disk mapping must map names this
         // request creates onto device paths the snapshot captured, the source
@@ -237,15 +238,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::bundle_sizes()
             ))
         })?;
-        let region = crate::state::region_of_availability_zone(&input.availability_zone)
-            .ok_or_else(|| {
-                invalid(format!(
-                    "availabilityZone '{}' is not a zone of a Lightsail region: it must be \
-                     a region name followed by a zone letter, for one of [{}]",
-                    input.availability_zone,
-                    crate::state::region_names()
-                ))
-            })?;
+        let region = crate::state::created_in_availability_zone(
+            "availabilityZone",
+            &input.availability_zone,
+        )
+        .map_err(invalid)?
+        .name;
         let ip_address_type = input
             .ip_address_type
             .clone()

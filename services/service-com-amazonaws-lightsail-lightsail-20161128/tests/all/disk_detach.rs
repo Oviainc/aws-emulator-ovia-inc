@@ -596,7 +596,7 @@ const NOT_STOPPED: &[NotStopped] = &[
         case: "a serving instance",
         disk_name: "running_host_disk",
         instance_name: "running-host",
-        availability_zone: "us-west-1b",
+        availability_zone: "us-west-2b",
         state: "running",
         stop_first: false,
     },
