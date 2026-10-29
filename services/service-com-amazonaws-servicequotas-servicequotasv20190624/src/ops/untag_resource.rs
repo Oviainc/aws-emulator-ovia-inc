@@ -10,8 +10,10 @@
 //! The resource is named only by `ResourceARN`, checked against the ARN this service
 //! reports for an applied quota by
 //! [`crate::state::ComAmazonawsServicequotasServicequotasv20190624State::resolve_quota_arn`]:
-//! an ARN that is not an applied-quota ARN is `IllegalArgumentException`, and one
-//! that names no quota of this account is `NoSuchResourceException`.
+//! an ARN that is not an applied-quota ARN is an illegal value of that member, so it
+//! is `IllegalArgumentException` carrying this service's one illegal-value sentence
+//! ([`crate::service::ILLEGAL_VALUE_MESSAGE`]), and one that names no quota of this
+//! account is `NoSuchResourceException`.
 //!
 //! ---
 //!
@@ -136,9 +138,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(|error| match error {
                 crate::state::ResourceArnError::Malformed => {
                     UntagResourceErrorModeled::IllegalArgumentException(IllegalArgumentException {
-                        message: Some(crate::state::malformed_resource_arn_message(
-                            &input.resource_arn,
-                        )),
+                        message: Some(crate::service::ILLEGAL_VALUE_MESSAGE.to_string()),
                     })
                 }
                 crate::state::ResourceArnError::NoSuchQuota => {

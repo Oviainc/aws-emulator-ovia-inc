@@ -14,7 +14,9 @@
 //!
 //! Refusals, each the error the model declares for it:
 //!
-//! * a `ResourceARN` that is not an applied-quota ARN -> `IllegalArgumentException`;
+//! * a `ResourceARN` that is not an applied-quota ARN -> `IllegalArgumentException`
+//!   carrying this service's one illegal-value sentence
+//!   ([`crate::service::ILLEGAL_VALUE_MESSAGE`]);
 //! * one that names no quota of this account -> `NoSuchResourceException`;
 //! * a `TagKey` in the reserved `aws:` namespace -> `TagPolicyViolationException`;
 //! * a request that would take the quota past
@@ -150,9 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(|error| match error {
                 crate::state::ResourceArnError::Malformed => {
                     TagResourceErrorModeled::IllegalArgumentException(IllegalArgumentException {
-                        message: Some(crate::state::malformed_resource_arn_message(
-                            &input.resource_arn,
-                        )),
+                        message: Some(crate::service::ILLEGAL_VALUE_MESSAGE.to_string()),
                     })
                 }
                 crate::state::ResourceArnError::NoSuchQuota => {

@@ -17,7 +17,9 @@
 //! * `ResourceARN` is checked by the service's own application layer, which states ONE
 //!   sentence for an illegal value and names neither the member nor the rule —
 //!   recorded for an ARN outside its `@pattern`, and asserted here for every
-//!   constraint that member carries, on all three tagging operations;
+//!   constraint that member carries AND for every value that layer itself refuses (a
+//!   string inside the modelled pattern and length that is still not an ARN of one of
+//!   this service's applied quotas), on all three tagging operations;
 //! * an ABSENT `ResourceARN` is not an illegal value and keeps the member-and-rule
 //!   clause, since there was no value for that layer to check;
 //! * every other member keeps its own validator's wording: the modelled
@@ -130,6 +132,76 @@ async fn an_illegal_resource_arn_is_refused_in_the_services_own_words() {
                 message.as_deref(),
                 Some(ILLEGAL_VALUE_MESSAGE),
                 "case {case}: expected the service's own illegal-value sentence"
+            );
+        }
+    }
+}
+
+/// A `ResourceARN` that satisfies every constraint the MODEL declares but is still not
+/// a value this service will accept — it is not an ARN of one of its own applied quotas
+/// — is refused in exactly the same words: the validator is a property of the member, so
+/// the VALUE never decides the wording.
+#[tokio::test]
+async fn a_pattern_passing_resource_arn_that_is_not_a_quota_arn_is_refused_in_the_same_words() {
+    let client = caller("us-east-1");
+
+    // Rows: one per way a value inside `AmazonResourceName`'s `@pattern`
+    // `^arn:aws(-[\w]+)*:*:.+:[0-9]{12}:.+$` and its length bounds is still not an
+    // applied-quota ARN of this service — another service's `arnNamespace`, a namespace
+    // spelled in another case, a segment count this service cannot read, and four
+    // resource parts that are not `<ServiceCode>/<QuotaCode>`.
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "another service's arnNamespace",
+            format!("arn:aws:s3:us-east-1:{ACCOUNT}:bucket/x"),
+        ),
+        (
+            "this service's arnNamespace in another case",
+            format!("arn:aws:ServiceQuotas:us-east-1:{ACCOUNT}:vpc/L-F678F1CE"),
+        ),
+        (
+            "one segment short of an ARN this service can read",
+            format!("arn:aws:servicequotas:{ACCOUNT}:vpc/L-F678F1CE"),
+        ),
+        (
+            "a resource part carrying no quota code",
+            format!("arn:aws:servicequotas:us-east-1:{ACCOUNT}:notaquota"),
+        ),
+        (
+            "a resource part whose service code is empty",
+            format!("arn:aws:servicequotas:us-east-1:{ACCOUNT}:/L-F678F1CE"),
+        ),
+        (
+            "a resource part whose quota code is empty",
+            format!("arn:aws:servicequotas:us-east-1:{ACCOUNT}:vpc/"),
+        ),
+        (
+            "a resource part carrying a third slash-separated segment",
+            format!("arn:aws:servicequotas:us-east-1:{ACCOUNT}:vpc/L-F678F1CE/extra"),
+        ),
+    ];
+
+    for (why, resource_arn) in rows {
+        for (operation, body) in tagging_calls(&resource_arn) {
+            let case = format!("{why} ({operation})");
+            let (status, code, message) = refused(&client, operation, body).await;
+            assert_eq!(
+                status, CLIENT_ERROR_STATUS,
+                "case {case}: expected HTTP {CLIENT_ERROR_STATUS}, got {status} with {code:?}"
+            );
+            assert!(
+                code.contains("IllegalArgumentException"),
+                "case {case}: expected IllegalArgumentException, got {code:?} with {message:?}"
+            );
+            assert_eq!(
+                message.as_deref(),
+                Some(ILLEGAL_VALUE_MESSAGE),
+                "case {case}: expected the service's own illegal-value sentence, got {message:?}"
+            );
+            let message = message.unwrap_or_default();
+            assert!(
+                !message.contains("ResourceARN") && !message.contains(resource_arn.as_str()),
+                "case {case}: the sentence names neither the member nor the value, got {message:?}"
             );
         }
     }

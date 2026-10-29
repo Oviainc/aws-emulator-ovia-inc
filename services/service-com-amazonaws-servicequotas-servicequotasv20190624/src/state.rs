@@ -616,7 +616,11 @@ impl ReportStart {
 pub enum ResourceArnError {
     /// Not an applied-quota ARN: the wrong number of segments, a different service's
     /// `arnNamespace`, or a resource part that is not `<service code>/<quota code>`.
-    /// The model's `IllegalArgumentException` ("Invalid input was provided").
+    /// An illegal VALUE of the member, so it is the model's
+    /// `IllegalArgumentException` carrying this service's one illegal-value sentence
+    /// ([`crate::service::ILLEGAL_VALUE_MESSAGE`]) — the same refusal the member gets
+    /// for a value outside the constraints the model declares, since which validator
+    /// answers is a property of the member and not of the value.
     Malformed,
     /// A readable applied-quota ARN, but no quota of this account answers to it —
     /// another account, a region this emulator does not serve, or a
@@ -1848,16 +1852,6 @@ fn is_aws_partition(partition: &str) -> bool {
 pub fn is_reserved_tag_key(key: &str) -> bool {
     key.get(..RESERVED_TAG_KEY_PREFIX.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
-}
-
-/// How a tagging operation states that `resource_arn` is not one of its ARNs, for the
-/// modelled `IllegalArgumentException`. Built from the request, naming the member and
-/// the form it has to take.
-pub fn malformed_resource_arn_message(resource_arn: &str) -> String {
-    format!(
-        "ResourceARN '{resource_arn}' is not an applied quota ARN of the form \
-         arn:<partition>:{ARN_NAMESPACE}:<region>:<account>:<ServiceCode>/<QuotaCode>"
-    )
 }
 
 /// How this service states that `service_code` names no service it publishes quotas

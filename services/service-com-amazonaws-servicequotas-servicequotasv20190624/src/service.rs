@@ -166,7 +166,14 @@ const SERVICE_OWN_VALIDATED_MEMBERS: &[&str] = &["ResourceARN"];
 /// accept — one sentence for an illegal value, naming neither the member nor the rule.
 /// Recorded for the resource ARN; it covers every member in
 /// [`SERVICE_OWN_VALIDATED_MEMBERS`].
-const ILLEGAL_VALUE_MESSAGE: &str =
+///
+/// Reached from two places, because that layer checks more than the model's constraint
+/// traits: the boundary walk below, for a value outside the constraints the model
+/// declares, and the handlers that read the same member themselves (the tagging
+/// operations, whose `ResourceARN` has to be an ARN of one of this service's own
+/// resources). Which validator answers is a property of the MEMBER, so both state this
+/// one sentence rather than letting the VALUE decide the wording.
+pub const ILLEGAL_VALUE_MESSAGE: &str =
     "The request failed because you provided an illegal value for a parameter.";
 
 /// The `com-amazonaws-servicequotas-servicequotasv20190624` emulated service: the generated [`ServiceDefinition`] plus
